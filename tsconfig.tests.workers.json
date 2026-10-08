@@ -1,0 +1,22 @@
+{
+  // Worker tests (vitest.workers.config.ts): everything under tests/unit except the jsdom and node
+  // paths below. Keep `exclude` identical to the `exclude` of that config.
+  "extends": "./tsconfig.worker.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tests.workers.tsbuildinfo"
+  },
+  "include": [
+    "tests/unit/**/*.ts",
+    "tests/unit/**/*.tsx",
+    // `cloudflare:test` and the provided `holdfastDb`; `Env`, `Cloudflare.Env` and `exports`.
+    "tests/setup/workers-env.d.ts",
+    "src/worker/env.d.ts"
+  ],
+  "exclude": [
+    "tests/unit/client/**",
+    "tests/unit/db/**",
+    "tests/unit/e2e-harness/**",
+    "tests/unit/harness/client/**",
+    "tests/unit/harness/node/**"
+  ]
+}

@@ -13,7 +13,7 @@ afterEach(() => {
 describe("node project", () => {
   it("runs in Node, without a DOM", () => {
     expect(typeof process.versions.node).toBe("string");
-    expect(typeof window).toBe("undefined");
+    expect("window" in globalThis).toBe(false);
   });
 
   it("never loads .env into a local Worker", () => {

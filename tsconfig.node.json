@@ -22,5 +22,20 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["vite.config.ts"]
+  // Everything that runs in plain Node: tool configs, scripts, the shared test setup and the
+  // "node" project of vitest.config.ts (keep the three tests/unit paths in step with its globs).
+  "include": [
+    "vite.config.ts",
+    "vitest.config.ts",
+    "vitest.workers.config.ts",
+    "playwright.config.ts",
+    "scripts/**/*.ts",
+    "tests/setup/**/*.ts",
+    "tests/unit/db/**/*.ts",
+    "tests/unit/harness/node/**/*.ts",
+    "tests/unit/e2e-harness/**/*.ts"
+  ],
+  // jsdom.ts belongs to tsconfig.tests.client.json and workers-env.d.ts to
+  // tsconfig.tests.workers.json. scripts/spikes is git-ignored scratch.
+  "exclude": ["tests/setup/jsdom.ts", "tests/setup/workers-env.d.ts", "scripts/spikes/**"]
 }

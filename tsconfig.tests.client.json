@@ -1,0 +1,14 @@
+{
+  // Client tests (the "jsdom" project of vitest.config.ts). Keep `include` in step with its globs.
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tests.client.tsbuildinfo"
+  },
+  "include": [
+    "tests/unit/client/**/*.ts",
+    "tests/unit/client/**/*.tsx",
+    "tests/unit/harness/client/**/*.ts",
+    "tests/unit/harness/client/**/*.tsx",
+    "tests/setup/jsdom.ts"
+  ]
+}

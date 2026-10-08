@@ -1,0 +1,9 @@
+{
+  // Playwright specs and fixtures: Node, plus the DOM for code passed to `page.evaluate`.
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tests.e2e.tsbuildinfo",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
+  },
+  "include": ["tests/e2e/**/*.ts"]
+}
