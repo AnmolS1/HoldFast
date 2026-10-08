@@ -39,9 +39,17 @@ const port = Number(process.env.HOLDFAST_DEV_PORT ?? process.env.HOLDFAST_PORT ?
 // Open the app as http://localhost:<port>: Vite prints the 127.0.0.1 URL, which the Worker answers
 // with 421 because its host is not APP_ORIGIN.
 const host = "127.0.0.1";
+// The Worker debugger gets its own port per checkout. Left to the default, two dev servers that
+// start at the same moment (two worktrees running e2e) both find 9229 taken, both pick the same
+// next free port, and one of them dies with EADDRINUSE.
+const inspectorPort = port + 4000;
 
 export default defineConfig({
-  plugins: [react(), cloudflare()],
+  // Vite's dependency cache defaults to node_modules/.vite, and worktrees share one node_modules
+  // through a symlink: two checkouts with different imports would rewrite each other's cache and
+  // break each other's running dev server. Keep it inside the checkout (.wrangler/ is ignored).
+  cacheDir: ".wrangler/vite",
+  plugins: [react(), cloudflare({ inspectorPort })],
   server: { host, port, strictPort: true },
   preview: { host, port, strictPort: true },
   define: {

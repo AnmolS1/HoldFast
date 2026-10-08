@@ -1,0 +1,16 @@
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line
+Holdfast fixture: one kilobyte of plain ASCII text, 64 per line

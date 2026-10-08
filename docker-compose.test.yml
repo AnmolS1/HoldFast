@@ -1,0 +1,32 @@
+# Local Postgres for tests and local development. One server; every checkout uses its own database
+# (HOLDFAST_DB, created by scripts/db-reset.sh).
+#
+#   docker compose -f docker-compose.test.yml up -d
+#
+# The project and container names are fixed so that running this from a worktree reuses the same
+# server instead of trying to start a second one on port 5432.
+name: holdfast-test
+
+services:
+  postgres:
+    # Override only when the default cannot be pulled (HOLDFAST_PG_IMAGE=postgres:17-alpine).
+    image: ${HOLDFAST_PG_IMAGE:-postgres:17}
+    container_name: holdfast-test-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: holdfast
+    # Loopback only: this server has a well-known password and must not be reachable from the network.
+    ports:
+      - "127.0.0.1:5432:5432"
+    # The data directory lives in memory: test databases are disposable (scripts/db-reset.sh recreates
+    # one in about a second) and nothing here may depend on surviving a restart of the container.
+    tmpfs:
+      - /var/lib/postgresql/data
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
