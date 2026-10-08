@@ -1,0 +1,189 @@
+// Holdfast Worker configuration.
+//
+// The TOP LEVEL is the DEV environment (worker "holdfast-dev", dev resources), so a stray bare
+// `wrangler deploy` can never touch production. Production is `env.production`.
+//
+// The environment is chosen at BUILD time: `CLOUDFLARE_ENV=production vite build`. The Cloudflare Vite
+// plugin ignores `--env` at deploy time. Before any deploy, read "name" in the emitted
+// dist/<worker>/wrangler.json.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "holdfast-dev",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  // On by default for this compatibility date; kept because the auth library needs AsyncLocalStorage.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+  // Every request reaches the Worker first: the files host must never serve the SPA shell.
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true,
+  },
+  // Declaring routes disables the workers.dev hostname for this Worker. That is intended.
+  "routes": [
+    { "pattern": "holdfast-dev.ponderance.dev", "custom_domain": true },
+    { "pattern": "dev.holdfastusercontent.com", "custom_domain": true },
+  ],
+  // Without this, `vite dev` builds the container image (needs Docker) in every checkout and CI run.
+  "dev": { "enable_containers": false },
+  "vars": {
+    "APP_ORIGIN": "https://holdfast-dev.ponderance.dev",
+    "FILES_ORIGIN": "https://dev.holdfastusercontent.com",
+    "SIGNUP_MODE": "invite",
+    "SIGNUP_ALLOWED_DOMAINS": "",
+    "QUOTA_BYTES": "5368709120",
+    "MAX_FILE_BYTES": "2000000000",
+    "PART_BYTES": "67108864",
+    "CEIL_USER_BYTES_DAY": "21474836480",
+    "CEIL_LINK_BYTES_DAY": "21474836480",
+    "CEIL_LINK_DOWNLOADS_DAY": "1000",
+    "CEIL_IP_BYTES_DAY": "53687091200",
+    "CEIL_UPLOAD_BYTES_DAY": "10737418240",
+    "CEIL_UPLOAD_COUNT_DAY": "2000",
+    "CEIL_EDITOR_UPLOAD_BYTES_DAY": "2147483648",
+    "CEIL_TRANSFORMS_DAY": "2000",
+    "CEIL_SHARES_DAY": "200",
+    "CEIL_LINKS_DAY": "100",
+    "NEW_ACCOUNT_DAYS": "7",
+    "NEW_ACCOUNT_FACTOR": "0.25",
+    "NEW_ACCOUNT_MAX_LINKS": "10",
+    // Public value (it is rendered into the sign-up page). One widget serves dev, prod and localhost.
+    "TURNSTILE_SITEKEY": "0x4AAAAAAFQ7GuCPvHcRBd_q",
+    "PHOTODNA_ENABLED": "false",
+    "EMAIL_TRANSPORT": "resend",
+    // "1" = files are marked clean by a stub instead of a real scan. Dev only.
+    "SCAN_STUB": "0",
+    "SENTRY_ENVIRONMENT": "dev",
+    // Public value (it ships in the browser bundle). Blank until it is set.
+    "SENTRY_DSN_WEB": "https://4fbb40d035e576361455d0c0598fcc2a@o4511527807811584.ingest.us.sentry.io/4512218438172672",
+    "CF_ACCOUNT_ID": "9668af964b3bf13cc286ae6b73097a35",
+    "TERMS_VERSION": "2026-10",
+  },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "097127f66b124f61abf6e7f5d26925ec",
+      // Default local database. Override per process with
+      // CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE (read from the shell, not .dev.vars).
+      "localConnectionString": "postgres://postgres:postgres@localhost:5432/holdfast",
+    },
+  ],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "holdfast-files-dev" }],
+  "queues": {
+    "producers": [{ "binding": "SCAN_QUEUE", "queue": "holdfast-scan-dev" }],
+    "consumers": [
+      {
+        "queue": "holdfast-scan-dev",
+        "max_batch_size": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "holdfast-scan-dev-dlq",
+        "max_concurrency": 2,
+      },
+      { "queue": "holdfast-scan-dev-dlq", "max_batch_size": 10 },
+    ],
+  },
+  "images": { "binding": "IMAGES" },
+  "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "holdfast_metrics_dev" }],
+  "ratelimits": [
+    { "name": "RL_AUTH", "namespace_id": "1001", "simple": { "limit": 20, "period": 60 } },
+    { "name": "RL_API", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
+    { "name": "RL_FILES", "namespace_id": "1003", "simple": { "limit": 300, "period": 60 } },
+    { "name": "RL_LINKS", "namespace_id": "1004", "simple": { "limit": 30, "period": 60 } },
+  ],
+  "containers": [
+    {
+      "class_name": "ScannerContainer",
+      "image": "./containers/clamav/Dockerfile",
+      "max_instances": 2,
+      // Provisional (smallest type with 4 GiB). Revisit once the real scanner image exists.
+      "instance_type": "standard-1",
+    },
+  ],
+  "durable_objects": { "bindings": [{ "name": "SCANNER", "class_name": "ScannerContainer" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ScannerContainer"] }],
+  // 17 */6: purge trash and stale versions · 3 *: stale uploads, abuse anomalies ·
+  // 5 0: link unpause, retention · 0 2: nightly backup, then user purges, then reconcile.
+  "triggers": { "crons": ["17 */6 * * *", "3 * * * *", "5 0 * * *", "0 2 * * *"] },
+  "limits": { "cpu_ms": 120000 },
+  "env": {
+    "production": {
+      // Pinned: without it the name is derived as "<top-level name>-production".
+      "name": "holdfast",
+      // A named environment inherits the top-level routes. This block is what keeps a production
+      // build off the dev hostnames. Never remove it.
+      "routes": [
+        { "pattern": "holdfast.ponderance.dev", "custom_domain": true },
+        { "pattern": "holdfastusercontent.com", "custom_domain": true },
+      ],
+      "vars": {
+        "APP_ORIGIN": "https://holdfast.ponderance.dev",
+        "FILES_ORIGIN": "https://holdfastusercontent.com",
+        "SIGNUP_MODE": "invite",
+        "SIGNUP_ALLOWED_DOMAINS": "",
+        "QUOTA_BYTES": "5368709120",
+        "MAX_FILE_BYTES": "2000000000",
+        "PART_BYTES": "67108864",
+        "CEIL_USER_BYTES_DAY": "21474836480",
+        "CEIL_LINK_BYTES_DAY": "21474836480",
+        "CEIL_LINK_DOWNLOADS_DAY": "1000",
+        "CEIL_IP_BYTES_DAY": "53687091200",
+        "CEIL_UPLOAD_BYTES_DAY": "10737418240",
+        "CEIL_UPLOAD_COUNT_DAY": "2000",
+        "CEIL_EDITOR_UPLOAD_BYTES_DAY": "2147483648",
+        "CEIL_TRANSFORMS_DAY": "2000",
+        "CEIL_SHARES_DAY": "200",
+        "CEIL_LINKS_DAY": "100",
+        "NEW_ACCOUNT_DAYS": "7",
+        "NEW_ACCOUNT_FACTOR": "0.25",
+        "NEW_ACCOUNT_MAX_LINKS": "10",
+        // Public value (it is rendered into the sign-up page). One widget serves dev, prod and localhost.
+        "TURNSTILE_SITEKEY": "0x4AAAAAAFQ7GuCPvHcRBd_q",
+        "PHOTODNA_ENABLED": "false",
+        "EMAIL_TRANSPORT": "resend",
+        // Never "1" in production.
+        "SCAN_STUB": "0",
+        "SENTRY_ENVIRONMENT": "production",
+        // Public value (it ships in the browser bundle). Blank until it is set.
+        "SENTRY_DSN_WEB": "https://4fbb40d035e576361455d0c0598fcc2a@o4511527807811584.ingest.us.sentry.io/4512218438172672",
+        "CF_ACCOUNT_ID": "9668af964b3bf13cc286ae6b73097a35",
+        "TERMS_VERSION": "2026-10",
+      },
+      "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "e899309ce0d543bb99bd09fa582aac90" }],
+      "r2_buckets": [{ "binding": "FILES", "bucket_name": "holdfast-files" }],
+      "queues": {
+        "producers": [{ "binding": "SCAN_QUEUE", "queue": "holdfast-scan" }],
+        "consumers": [
+          {
+            "queue": "holdfast-scan",
+            "max_batch_size": 1,
+            "max_retries": 5,
+            "dead_letter_queue": "holdfast-scan-dlq",
+            "max_concurrency": 2,
+          },
+          { "queue": "holdfast-scan-dlq", "max_batch_size": 10 },
+        ],
+      },
+      "images": { "binding": "IMAGES" },
+      "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "holdfast_metrics" }],
+      "ratelimits": [
+        { "name": "RL_AUTH", "namespace_id": "2001", "simple": { "limit": 20, "period": 60 } },
+        { "name": "RL_API", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
+        { "name": "RL_FILES", "namespace_id": "2003", "simple": { "limit": 300, "period": 60 } },
+        { "name": "RL_LINKS", "namespace_id": "2004", "simple": { "limit": 30, "period": 60 } },
+      ],
+      "containers": [
+        {
+          "class_name": "ScannerContainer",
+          "image": "./containers/clamav/Dockerfile",
+          "max_instances": 2,
+          // Provisional (smallest type with 4 GiB). Revisit once the real scanner image exists.
+          "instance_type": "standard-1",
+        },
+      ],
+      "durable_objects": { "bindings": [{ "name": "SCANNER", "class_name": "ScannerContainer" }] },
+      "triggers": { "crons": ["17 */6 * * *", "3 * * * *", "5 0 * * *", "0 2 * * *"] },
+      "limits": { "cpu_ms": 120000 },
+    },
+  },
+}

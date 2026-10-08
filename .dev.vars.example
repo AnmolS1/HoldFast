@@ -1,0 +1,39 @@
+# Local Worker vars: what `vite dev` loads into the Worker's `env` on this machine, and nothing else.
+# Copy to .dev.vars with `scripts/dev-env.sh <port>` (never edit the origins by hand: the Worker
+# dispatches on the host INCLUDING its port, so they must match the port the dev server runs on).
+# .dev.vars is gitignored. This example is tracked and must hold no real secret.
+#
+# NOT in this file, because they are read from the process environment (which .dev.vars does not feed):
+#   CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE
+#       per-process override of the local database (the default is localConnectionString in wrangler.jsonc)
+#   DATABASE_URL_DIRECT
+#       read by drizzle-kit and the tsx scripts; set it in the shell or in CI
+#
+# `npm run cf-typegen` reads the key names below to type the secrets in src/worker/env.d.ts,
+# so a new secret is added here first.
+
+# ── Secrets (set on the deployed Worker with `wrangler secret put`) ──────────────────────────────
+# Generate the first three locally: `openssl rand -base64 48` (IP_ENC_KEY: `openssl rand -base64 32`).
+BETTER_AUTH_SECRET=
+FILES_TOKEN_SECRET=
+IP_ENC_KEY=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+RESEND_API_KEY=
+SENTRY_DSN=
+ADMIN_EMAILS=
+# Optional, later features:
+PHOTODNA_SUBSCRIPTION_KEY=
+CF_ANALYTICS_TOKEN=
+
+# ── Turnstile: Cloudflare's published always-pass TEST pair (not secrets) ────────────────────────
+TURNSTILE_SITEKEY=1x00000000000000000000AA
+TURNSTILE_SECRET=1x0000000000000000000000000000000AA
+
+# ── Local overrides of public vars from wrangler.jsonc ───────────────────────────────────────────
+# Chrome and Firefox resolve *.localhost to loopback; curl needs `--resolve files.localhost:<port>:127.0.0.1`.
+APP_ORIGIN=http://localhost:5173
+FILES_ORIGIN=http://files.localhost:5173
+EMAIL_TRANSPORT=memory
+SCAN_STUB=1
+SENTRY_DSN_WEB=

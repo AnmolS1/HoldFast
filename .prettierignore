@@ -1,0 +1,12 @@
+dist/
+.wrangler/
+.claude/
+node_modules/
+coverage/
+playwright-report/
+test-results/
+holdfast-plan/
+package-lock.json
+src/worker/env.d.ts
+drizzle/
+*.md
