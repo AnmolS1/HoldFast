@@ -14,7 +14,7 @@
 // So with the defaults the attack does not complete — the victim is simply refused, for good
 // (the stranger's unverifiable account squats the address). The policy here instead lets the
 // first person who PROVES the address have it, clean: auth/hooks.ts `account.create`.
-import { eq, sql } from "drizzle-orm";
+import { eq, like, or, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode, type TestGoogleProfile } from "../../../src/worker/auth/test-outbound";
 import { account, passkey, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
@@ -122,6 +122,32 @@ async function plantedAccount(victimEmail: string) {
       createdAt: stamp,
       updatedAt: stamp,
     });
+  // … and the rows Better Auth and we write that name the account some OTHER way: a passkey
+  // registration challenge in flight (JSON), and the newest TOTP step the account used.
+  await testDb()
+    .insert(verification)
+    .values([
+      {
+        id: crypto.randomUUID(),
+        identifier: crypto.randomUUID().replace(/-/g, ""),
+        value: JSON.stringify({
+          type: "registration",
+          expectedChallenge: "planted-challenge",
+          userData: { id: row.id, name: "planted", displayName: "planted" },
+        }),
+        expiresAt: new Date(Date.now() + 3_600_000),
+        createdAt: stamp,
+        updatedAt: stamp,
+      },
+      {
+        id: crypto.randomUUID(),
+        identifier: `totp-step:${row.id}`,
+        value: "58000000",
+        expiresAt: new Date(Date.now() + 3_600_000),
+        createdAt: stamp,
+        updatedAt: stamp,
+      },
+    ]);
   return { row, attacker, attackerInvite };
 }
 
@@ -130,7 +156,20 @@ const planted = async (userId: string) => ({
   sessions: (await sessionsOf(userId)).length,
   passkeys: (await testDb().select().from(passkey).where(eq(passkey.userId, userId))).length,
   twoFactor: (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, userId))).length,
-  tokens: (await testDb().select().from(verification).where(eq(verification.value, userId))).length,
+  // Every row that names the account: by value, inside a JSON value (a passkey challenge), or in
+  // the identifier (the TOTP step it last used) — T7.
+  tokens: (
+    await testDb()
+      .select()
+      .from(verification)
+      .where(
+        or(
+          eq(verification.value, userId),
+          like(verification.value, `%"${userId}"%`),
+          like(verification.identifier, `%:${userId}`),
+        ),
+      )
+  ).length,
 });
 
 describe("pre-hijacking: a stranger's unverified account at the victim's address", () => {
@@ -142,7 +181,7 @@ describe("pre-hijacking: a stranger's unverified account at the victim's address
       sessions: 1,
       passkeys: 1,
       twoFactor: 1,
-      tokens: 1,
+      tokens: 3,
     });
 
     const inviter = (await verifiedUser()).user;
@@ -193,7 +232,7 @@ describe("pre-hijacking: a stranger's unverified account at the victim's address
     // (there was no proven owner before this sign-in).
     const audit = await auditRows({ action: "auth.prehijack_cleanup", targetId: row.id });
     expect(audit).toHaveLength(1);
-    expect(audit[0]!.meta).toEqual({ accounts: 1, sessions: 1, passkeys: 1, twoFactor: 1, tokens: 1 });
+    expect(audit[0]!.meta).toEqual({ accounts: 1, sessions: 1, passkeys: 1, twoFactor: 1, tokens: 3 });
     expect(JSON.stringify(audit[0])).not.toContain(email);
     expect(mailTo(email, "signInMethodAdded")).toEqual([]);
   });

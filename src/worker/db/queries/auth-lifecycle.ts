@@ -9,7 +9,7 @@
 // something, the row is read and compared in application code. `invites` and
 // `pending_user_purges` are ours (`timestamptz`) and compare with `now()` freely.
 
-import { and, eq, gt, isNotNull, isNull, like, ne, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, isNull, like, ne, or, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import {
@@ -446,6 +446,23 @@ export async function takePendingChange(
 
 // ── an account whose address was never proven ───────────────────────────────────────────────
 
+/**
+ * Every `verification` row that belongs to an account, whichever way it names it:
+ *   - `value` IS the user id (a reset token, a two-factor challenge, a trusted device, our own
+ *     markers);
+ *   - `value` is JSON that carries the user id (a passkey challenge:
+ *     `{"type":"registration","userData":{"id":…}}`, @better-auth/passkey/dist/index.mjs:192);
+ *   - the IDENTIFIER ends with the user id (`totp-step:<id>`, the newest TOTP step it used).
+ * A user id is 32 URL-safe characters, so it cannot contain a LIKE wildcard.
+ */
+function tokensOf(userId: string) {
+  return or(
+    eq(verification.value, userId),
+    and(like(verification.value, "{%"), like(verification.value, `%"${userId}"%`)),
+    like(verification.identifier, `%:${userId}`),
+  );
+}
+
 export type UnprovenReset = {
   /** What the person who now PROVES the address stated at the intent step. */
   termsAcceptedAt: Date;
@@ -501,10 +518,7 @@ export async function clearUnprovenAccount(
       .where(eq(twoFactor.userId, userId))
       .returning({ id: twoFactor.id });
     // Reset, delete-account, two-factor and trusted-device tokens carry the user id as value.
-    const tokens = await tx
-      .delete(verification)
-      .where(eq(verification.value, userId))
-      .returning({ id: verification.id });
+    const tokens = await tx.delete(verification).where(tokensOf(userId)).returning({ id: verification.id });
     await tx
       .update(user)
       .set({
@@ -568,10 +582,7 @@ export async function clearForMailboxProof(
       .delete(twoFactor)
       .where(eq(twoFactor.userId, userId))
       .returning({ id: twoFactor.id });
-    const tokens = await tx
-      .delete(verification)
-      .where(eq(verification.value, userId))
-      .returning({ id: verification.id });
+    const tokens = await tx.delete(verification).where(tokensOf(userId)).returning({ id: verification.id });
     await tx
       .update(user)
       .set({
@@ -626,10 +637,7 @@ export async function sweepAfterLink(
       .delete(twoFactor)
       .where(eq(twoFactor.userId, userId))
       .returning({ id: twoFactor.id });
-    const tokens = await tx
-      .delete(verification)
-      .where(eq(verification.value, userId))
-      .returning({ id: verification.id });
+    const tokens = await tx.delete(verification).where(tokensOf(userId)).returning({ id: verification.id });
     await tx.update(user).set({ twoFactorEnabled: false }).where(eq(user.id, userId));
     return {
       accounts: passwords.length + duplicates.rows.length,
@@ -896,7 +904,7 @@ export async function purgeAuthRows(db: Executor, userId: string): Promise<boole
     await tx.delete(passkey).where(eq(passkey.userId, userId));
     await tx.delete(twoFactor).where(eq(twoFactor.userId, userId));
     // Reset, delete-account, two-factor and trusted-device tokens carry the user id as value.
-    await tx.delete(verification).where(eq(verification.value, userId));
+    await tx.delete(verification).where(tokensOf(userId));
     const removed = await tx.delete(user).where(eq(user.id, userId)).returning({ id: user.id });
     return removed.length > 0;
   });
