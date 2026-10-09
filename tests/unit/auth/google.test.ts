@@ -79,14 +79,14 @@ function expectRefusedAt(location: string, code: string, page = "/signup") {
 }
 
 describe("POST /api/auth-intent", () => {
-  it("sets a signed, HttpOnly, SameSite=Lax, ten-minute cookie scoped to /api/auth", async () => {
+  it("sets a signed, HttpOnly, SameSite=Lax, ten-minute cookie (Path=/, as a __Host- cookie must be)", async () => {
     const client = newClient();
     const { sent } = await intent(client);
     expect(sent.status, sent.text).toBe(200);
     expect(sent.setCookies).toHaveLength(1);
     const cookie = sent.setCookies[0]!;
     expect(cookie).toMatch(
-      /^hf_intent=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+; Max-Age=600; Path=\/api\/auth; HttpOnly; SameSite=Lax$/,
+      /^hf_intent=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+; Max-Age=600; Path=\/; HttpOnly; SameSite=Lax$/,
     );
     // It carries the invite code and a nonce — and nothing about the birth date.
     const payload = JSON.parse(
@@ -96,11 +96,11 @@ describe("POST /api/auth-intent", () => {
     expect(JSON.stringify(payload)).not.toMatch(/1990|birth/);
   });
 
-  it("on an https origin the cookie is Secure and carries the __Secure- prefix", async () => {
+  it("on an https origin the cookie is Secure and carries the __Host- prefix", async () => {
     const client = newClient({ origin: "https://holdfast.example" });
     const { sent } = await intent(client);
     expect(sent.status, sent.text).toBe(200);
-    expect(sent.setCookies[0]).toMatch(/^__Secure-hf_intent=.*; HttpOnly; SameSite=Lax; Secure$/);
+    expect(sent.setCookies[0]).toMatch(/^__Host-hf_intent=.*; Path=\/; HttpOnly; SameSite=Lax; Secure$/);
   });
 
   it("applies the kill switch, assent, age and the invite — and consumes nothing", async () => {

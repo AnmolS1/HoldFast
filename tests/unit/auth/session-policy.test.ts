@@ -32,11 +32,14 @@ import { user } from "../../../src/worker/db/schema";
 import createAuthSource from "../../../src/worker/auth/create-auth.ts?raw";
 import {
   CAPTCHA,
+  createInvite,
+  enableTotp,
   freshEmail,
   getSession,
   linkIn,
   mailTo,
   newClient,
+  nextTotp,
   PASSWORD,
   send,
   sessionsOf,
@@ -132,7 +135,7 @@ describe("the session cookie", () => {
     for (const cookie of sent.setCookies) expect(cookie, cookie.split("=")[0]).toMatch(/; HttpOnly/);
   });
 
-  it("on an https origin is Secure and named __Secure-hf.session_token", async () => {
+  it("on an https origin every cookie is Secure and carries the __Host- prefix (no sibling origin can set it)", async () => {
     const https = { origin: "https://holdfast.example" };
     const client = newClient(https);
     const { email } = await signUp(client);
@@ -142,19 +145,77 @@ describe("the session cookie", () => {
     const verified = await send(client, linkIn(mail));
     expect(verified.status).toBe(302);
     const names = verified.setCookies.map((c) => c.split("=")[0]);
-    expect(names).toContain("__Secure-hf.session_token");
+    expect(names).toContain("__Host-hf.session_token");
     expect(names.filter((name) => name.includes("session_data"))).toEqual([]);
     for (const cookie of verified.setCookies) {
-      expect(cookie.startsWith("__Secure-"), cookie.split("=")[0]).toBe(true);
+      // `__Host-`: the browser accepts it only with Secure, Path=/ and NO Domain — so script on
+      // a sibling subdomain cannot plant one for this host (a `__Secure-` cookie it can).
+      expect(cookie.startsWith("__Host-"), cookie.split("=")[0]).toBe(true);
       expect(cookie).toMatch(/; Secure/);
+      expect(cookie).toMatch(/; Path=\/(;|$)/);
+      expect(cookie).not.toMatch(/Domain=/i);
       expect(cookie).toMatch(/; HttpOnly/);
       expect(cookie).toMatch(/; SameSite=Lax/);
     }
     expect((await getSession(client))?.user.email).toBe(email);
     // The un-prefixed name is not honoured there: a plain-http cookie cannot stand in.
     const downgrade = newClient(https);
-    downgrade.cookies.set("hf.session_token", client.cookies.get("__Secure-hf.session_token")!);
+    downgrade.cookies.set("hf.session_token", client.cookies.get("__Host-hf.session_token")!);
     expect(await getSession(downgrade)).toBeNull();
+    // Nor is a `__Secure-` one, which a sibling subdomain could have set with Domain=<parent>.
+    const tossed = newClient(https);
+    tossed.cookies.set("__Secure-hf.session_token", client.cookies.get("__Host-hf.session_token")!);
+    expect(await getSession(tossed)).toBeNull();
+
+    // Every other cookie the auth layer sets on that origin, flow by flow.
+    const seen: string[] = [...verified.setCookies];
+    const more = newClient(https);
+    seen.push(...(await signUp(more)).sent.setCookies);
+    seen.push(
+      ...(
+        await send(more, "/api/auth-intent", {
+          json: { birthYear: 1990, birthMonth: 5, acceptTerms: true, inviteCode: await createInvite() },
+        })
+      ).setCookies,
+    );
+    seen.push(
+      ...(
+        await send(more, "/api/auth/sign-in/social", {
+          json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login" },
+        })
+      ).setCookies,
+    );
+    seen.push(...(await send(client, "/api/auth/passkey/generate-register-options")).setCookies);
+    seen.push(...(await send(more, "/api/auth/passkey/generate-authenticate-options")).setCookies);
+    const totp = await enableTotp(client);
+    await send(client, "/api/auth/sign-out", { json: {} });
+    const challenge = await signIn(client, email);
+    seen.push(...challenge.setCookies);
+    seen.push(
+      ...(
+        await send(client, "/api/auth/two-factor/verify-totp", {
+          json: { code: await nextTotp(totp.totpURI), trustDevice: true },
+        })
+      ).setCookies,
+    );
+    const namesSeen = new Set(seen.map((cookie) => cookie.split("=")[0]!));
+    for (const expected of [
+      "hf_pending",
+      "hf_intent",
+      "hf.session_token",
+      "hf.two_factor",
+      "hf.trust_device",
+    ]) {
+      expect([...namesSeen], expected).toContain(`__Host-${expected}`);
+    }
+    expect(namesSeen.size).toBeGreaterThanOrEqual(7);
+    for (const cookie of seen) {
+      expect(cookie.startsWith("__Host-"), cookie.split("=")[0]).toBe(true);
+      expect(cookie, cookie.split("=")[0]).toMatch(/; Secure/);
+      expect(cookie, cookie.split("=")[0]).toMatch(/; Path=\/(;|$)/);
+      expect(cookie, cookie.split("=")[0]).not.toMatch(/Domain=/i);
+      expect(cookie, cookie.split("=")[0]).toMatch(/; HttpOnly/);
+    }
   });
 
   it("a session answer never carries the hold flag, the inviter or the suspension note — and no cookie carries a copy of the user", async () => {
@@ -590,7 +651,13 @@ describe("the options object", () => {
         passThroughOnException: () => {},
       }),
     );
-    expect(secure.advanced.useSecureCookies).toBe(true);
+    // `__Host-` cookies: the prefix and the Secure attribute are given explicitly (Better Auth's
+    // own switch can only produce `__Secure-`).
+    expect(secure.advanced).toMatchObject({
+      useSecureCookies: false,
+      cookiePrefix: "__Host-hf",
+      defaultCookieAttributes: { secure: true },
+    });
   });
 
   it("the stand-ins for third parties exist only in test mode", () => {

@@ -21,7 +21,7 @@
 // The rows are what Better Auth itself would have written: ids from its own generator (32
 // characters of [A-Za-z0-9] — never a UUID), the session token likewise, and the cookie signed
 // by the library's own cookie serializer with that environment's secret, under the name the
-// Worker uses there (`__Secure-hf.session_token` on https, `hf.session_token` on plain http).
+// Worker uses there (`__Host-hf.session_token` on https, `hf.session_token` on plain http).
 
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
@@ -232,7 +232,7 @@ async function main(): Promise<void> {
   });
 
   const secure = origin.protocol === "https:";
-  const name = `${secure ? "__Secure-" : ""}hf.session_token`;
+  const name = `${secure ? "__Host-" : ""}hf.session_token`;
   // The library's own signer: `<token>.<signature>`, exactly as its Set-Cookie carries it.
   const serialized = await serializeSignedCookie(name, token, secret, {});
   const value = serialized.slice(name.length + 1);

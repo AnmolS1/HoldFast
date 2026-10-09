@@ -13,8 +13,9 @@
 //                browser in (auth/mailbox-proof.ts): opened anywhere else, the link proves the
 //                mailbox only. 1 hour, and it works only while the account is unverified.
 //
-// Both are `HttpOnly; SameSite=Lax`, `Secure` with the `__Secure-` name prefix on an https
-// origin, scoped by Path to the one place that reads them, and are a base64url JSON payload
+// Both are `HttpOnly; SameSite=Lax; Path=/`, and on an https origin `Secure` with the `__Host-`
+// name prefix (`COOKIE_HOST_PREFIX` below — the same prefix Better Auth's cookies get), and are
+// a base64url JSON payload
 // plus an HMAC-SHA256 under a purpose key of their own (services/keys.ts) — signed, not
 // encrypted: nothing in them is secret from the browser that holds them. A cookie whose
 // signature, version or expiry does not check out is simply absent.
@@ -30,7 +31,8 @@ type CookieSpec = {
 
 export const INTENT_COOKIE: CookieSpec = {
   base: "hf_intent",
-  path: "/api/auth",
+  // `/`: a `__Host-` cookie may have no other path.
+  path: "/",
   maxAge: 600,
   purpose: "intent-cookie",
 };
@@ -65,8 +67,26 @@ function fromBase64Url(text: string): Uint8Array | null {
 
 const isSecure = (env: Pick<Env, "APP_ORIGIN">) => env.APP_ORIGIN.startsWith("https://");
 
+/**
+ * The name prefix of EVERY cookie the auth layer sets on an https origin — these two and Better
+ * Auth's (create-auth.ts `cookiePrefix`).
+ *
+ * `__Host-`, not `__Secure-`. The app lives on a subdomain of a domain it shares with other
+ * sites (and with its own dev deploy). A `__Secure-` cookie can be set for the whole parent
+ * domain by ANY of them (`Domain=<parent>`): script on a sibling could plant a session cookie of
+ * the attacker's own account in a victim's browser, who then uploads into it. A browser accepts
+ * a `__Host-` cookie only with `Secure`, `Path=/` and NO `Domain` — only this exact host can set
+ * it.
+ */
+export const COOKIE_HOST_PREFIX = "__Host-";
+
+/** The session cookie's name on this origin. */
+export function sessionCookieName(env: Pick<Env, "APP_ORIGIN">): string {
+  return `${isSecure(env) ? COOKIE_HOST_PREFIX : ""}hf.session_token`;
+}
+
 export function cookieName(env: Pick<Env, "APP_ORIGIN">, spec: CookieSpec): string {
-  return `${isSecure(env) ? "__Secure-" : ""}${spec.base}`;
+  return `${isSecure(env) ? COOKIE_HOST_PREFIX : ""}${spec.base}`;
 }
 
 /** The attributes as Better Auth's `ctx.setCookie` takes them. */

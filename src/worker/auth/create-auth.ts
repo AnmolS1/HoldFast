@@ -37,6 +37,7 @@ import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
+import { COOKIE_HOST_PREFIX } from "./signed-cookie";
 import { createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
@@ -84,8 +85,14 @@ export function buildAuthOptions(scope: AuthScope) {
     // Warnings and errors only, and every line redacted before it reaches the Worker's log.
     logger: { disabled: false, level: "warn" as const, log: authLog },
     advanced: {
-      useSecureCookies: secure,
-      cookiePrefix: "hf",
+      // On https every cookie is `__Host-hf.<name>; Secure; Path=/` with no Domain (see
+      // COOKIE_HOST_PREFIX in signed-cookie.ts for why not `__Secure-`). Better Auth's own
+      // switch can only produce `__Secure-` (cookies/index.mjs: `secureCookiePrefix`), so it is
+      // left off and the prefix and the Secure attribute are given here; every cookie it and
+      // its plugins create goes through the same `createCookie`, with Path=/ and no Domain.
+      useSecureCookies: false,
+      cookiePrefix: secure ? `${COOKIE_HOST_PREFIX}hf` : "hf",
+      defaultCookieAttributes: secure ? { secure: true } : {},
       database: { joins: true },
       ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] },
       // Passed as a reference: this IS the request's defer.

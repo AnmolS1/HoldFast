@@ -39,6 +39,7 @@ import { db, defer, deps, type AppEnv } from "../services/request-context";
 import { count, record as auditRow } from "./observe";
 import { responseCode } from "./redact";
 import type { AuthScope } from "./scope";
+import { sessionCookieName } from "./signed-cookie";
 
 /** How a completed sign-in is named, by the endpoint that completed it. */
 const SIGN_IN_METHOD: Record<string, string> = {
@@ -81,7 +82,7 @@ export type AuthRequestInfo = {
 
 /** Does the response start a session — set a session-token cookie with a value? */
 export function setsSessionCookie(response: Response, env: Pick<Env, "APP_ORIGIN">): boolean {
-  const name = `${env.APP_ORIGIN.startsWith("https://") ? "__Secure-" : ""}hf.session_token=`;
+  const name = `${sessionCookieName(env)}=`;
   return response.headers.getSetCookie().some((cookie) => {
     if (!cookie.startsWith(name)) return false;
     const value = cookie.slice(name.length).split(";")[0] ?? "";

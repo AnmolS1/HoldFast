@@ -49,7 +49,7 @@ describe("the pending-sign-up cookie", () => {
     // On https it is Secure and prefixed.
     const https = await signUp(newClient({ origin: "https://holdfast.example" }));
     expect(https.sent.setCookies.find((c) => c.includes("hf_pending"))).toMatch(
-      /^__Secure-hf_pending=.*Secure/,
+      /^__Host-hf_pending=.*Secure/,
     );
   });
 });
