@@ -1,5 +1,6 @@
 # Deploys PRODUCTION (Worker "holdfast") on a push to `prod`, after CI is green for that commit.
-# Order: preconditions → build → migrate → deploy → build stamp → files host → Sentry release.
+# Order: preconditions → build → UTC check + migrate → deploy → build stamp → health → files host
+# → Sentry release.
 #
 # This workflow can only REDEPLOY production. It refuses to run unless the production Worker
 # already exists, has a deployment, has its nine secrets, and answers on its custom domain — all of
@@ -71,6 +72,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends postgresql-client
           fi
+          psql --version
 
       # The three preconditions. Nothing below runs — no migration, no deploy — unless they hold.
       - name: The production Worker exists and has its secrets
@@ -79,6 +81,9 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bash .github/workflows/lib/deploy-lib.sh worker-ready holdfast
 
+      # The files-host probe exits 11 (EDGE-CHALLENGE) when Cloudflare challenges the runner
+      # before the Worker runs: while Bot Fight Mode is on for the files zone this precondition
+      # cannot hold from a runner, and production is not deployed. That is a dashboard setting.
       - name: Production already answers on its custom domains
         run: |
           bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
@@ -105,6 +110,8 @@ jobs:
       - name: The build is a production build
         run: bash .github/workflows/lib/deploy-lib.sh built-env production
 
+      # First asserts that the database keeps UTC time (zero offset in January and July); a
+      # database that does not is not migrated and nothing is deployed.
       - name: Migrate the production database
         env:
           DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_PROD }}
@@ -133,6 +140,7 @@ jobs:
       - name: App answers
         run: bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
 
+      # Exit 10 = wrong thing served (dangerous); 11 = edge challenge (dashboard); 12 = no answer.
       - name: Files host answers 404 and nothing else
         run: bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
 
@@ -140,8 +148,12 @@ jobs:
   # release = the commit sha. A separate job, so the Sentry token is never in the deploy job.
   sentry-release:
     needs: deploy
+    if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # SENTRY_AUTH_TOKEN is a secret of the `Production` environment and exists nowhere else: a job
+    # that does not name the environment reads it as empty. Only the one step below references it.
+    environment: Production
     env:
       # "true" once the build emits source maps (a vite.config.ts change that is not made yet).
       SOURCE_MAPS: "false"

@@ -1,5 +1,6 @@
 # Deploys the dev environment (Worker "holdfast-dev") on every push to `dev`, after CI is green
-# for that exact commit. Order: migrate → deploy → build stamp → files host.
+# for that exact commit. Order: preconditions → build → UTC check + migrate → deploy → build stamp
+# → health → files host.
 #
 # The FIRST deploy of an environment is done by hand: the CI token cannot attach a custom domain.
 # This workflow redeploys a Worker that already exists and already has its domains and secrets.
@@ -74,6 +75,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends postgresql-client
           fi
+          psql --version
 
       # CI never creates a Worker: it must exist, with a deployment and its nine secrets.
       - name: The dev Worker exists and has its secrets
@@ -106,6 +108,8 @@ jobs:
       - name: The build is a dev build
         run: bash .github/workflows/lib/deploy-lib.sh built-env dev
 
+      # First asserts that the database keeps UTC time (zero offset in January and July); a
+      # database that does not is not migrated and nothing is deployed.
       - name: Migrate the dev database
         env:
           DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_DEV }}
@@ -134,5 +138,8 @@ jobs:
       - name: App answers
         run: bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
 
+      # Exit 10 = the files host serves the wrong thing (dangerous); 11 = Cloudflare challenged
+      # the runner before the Worker ran (Bot Fight Mode on the files zone — a dashboard setting,
+      # not a code fix; still a failure, because the Worker was not observed); 12 = no answer.
       - name: Files host answers 404 and nothing else
         run: bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
