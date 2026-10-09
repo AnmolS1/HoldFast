@@ -1,6 +1,3 @@
-// CONTRACT STUB (contracts-0). Owner: T07 (worker core), which takes this file over and may add to
-// it but may not change an exported name or shape without a report item.
-//
 // The error vocabulary shared by the Worker and the SPA. The code → status table is the single
 // source; PLAN §10 mirrors it. Compiled for both the browser and the Worker: no runtime-specific
 // imports here.
@@ -55,3 +52,19 @@ export type ErrorEnvelope = {
   requestId: string;
   details?: Record<string, unknown>;
 };
+
+/**
+ * What an unexpected failure answers with (status 500). It is deliberately outside `ErrorCode`:
+ * no route ever chooses it, and the table above stays the list of codes a caller can act on.
+ */
+export const INTERNAL_ERROR = "internal";
+
+export type InternalErrorEnvelope = {
+  error: typeof INTERNAL_ERROR;
+  message: string;
+  requestId: string;
+};
+
+export function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(ERROR_STATUS, value);
+}
