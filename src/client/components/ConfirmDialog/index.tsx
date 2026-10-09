@@ -8,6 +8,7 @@ import Typography from "@mui/material/Typography";
 import { useId, useState, type ReactNode } from "react";
 import { t } from "../../lib/i18n";
 import { hf } from "../../theme/tokens";
+import { useInitialFocus } from "../focus";
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -25,6 +26,24 @@ export interface ConfirmDialogProps {
   busy?: boolean;
   onConfirm(): void;
   onCancel(): void;
+}
+
+/** Cancel takes the initial focus; it is its own component so the focus effect runs when the dialog's content mounts. */
+function CancelButton({
+  onClick,
+  disabled,
+  children,
+}: {
+  onClick(): void;
+  disabled: boolean;
+  children: ReactNode;
+}) {
+  const ref = useInitialFocus<HTMLButtonElement>();
+  return (
+    <Button ref={ref} onClick={onClick} disabled={disabled}>
+      {children}
+    </Button>
+  );
 }
 
 /**
@@ -77,9 +96,9 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
         ) : null}
       </DialogContent>
       <DialogActions>
-        <Button autoFocus onClick={onCancel} disabled={busy}>
+        <CancelButton onClick={onCancel} disabled={busy}>
           {cancelLabel ?? t("app.cancel")}
-        </Button>
+        </CancelButton>
         <Button
           variant="contained"
           color={destructive ? "error" : "primary"}

@@ -1,4 +1,5 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import {
   COMMAND_IDS,
@@ -10,6 +11,7 @@ import {
   usePaletteOpen,
   type Command,
 } from "../../../../src/client/components/CommandPalette";
+import { ConfirmDialog } from "../../../../src/client/components/ConfirmDialog";
 import { buildRoutes } from "../../../../src/client/router";
 import { renderRoutes, renderShell, sessionOf, setupShell, shellFetch } from "./helpers";
 
@@ -132,6 +134,49 @@ describe("CommandPalette", () => {
     expect(dialog.contains(document.activeElement)).toBe(true);
     fireEvent.keyDown(dialog, { key: "Escape" });
     await waitFor(() => expect(screen.getByTestId("open").textContent).toBe("false"));
+  });
+});
+
+describe("initial focus under StrictMode (the app's entry renders in it; dev double-invokes effects)", () => {
+  // `autoFocus` focuses once at mount; the dialog's focus trap is an effect. When strict mode
+  // tears effects down and runs them again, the trap returns focus to the opener and then parks it
+  // on the dialog. The field must end up focused all the same.
+  it("the palette's input has focus after opening", async () => {
+    registerCommands("test", [command("a", "A", "actions")]);
+    renderShell(
+      <StrictMode>
+        <button data-testid="opener" onClick={() => openPalette()}>
+          open
+        </button>
+        <CommandPalette />
+      </StrictMode>,
+    );
+    const opener = screen.getByTestId("opener");
+    opener.focus();
+    fireEvent.click(opener);
+    const input = await screen.findByPlaceholderText("Type a command or search");
+    await waitFor(() => expect(document.activeElement).toBe(input));
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("a confirm dialog's Cancel has focus after opening", async () => {
+    renderShell(
+      <StrictMode>
+        <ConfirmDialog
+          open
+          title="Delete forever?"
+          consequence="This can't be undone."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={() => {}}
+          onCancel={() => {}}
+        />
+      </StrictMode>,
+    );
+    await screen.findByRole("dialog", { name: "Delete forever?" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Cancel" })));
   });
 });
 

@@ -6,6 +6,7 @@ import { useState } from "react";
 import { t, type MessageKey } from "../../lib/i18n";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
+import { useInitialFocus } from "../focus";
 import { Kbd } from "../Kbd";
 import {
   closePalette,
@@ -89,6 +90,32 @@ function Row({ command }: { command: Command }) {
   );
 }
 
+/** The palette's text field. It takes focus whenever the palette opens (see `useInitialFocus`). */
+function PaletteInput({ value, onChange }: { value: string; onChange(next: string): void }) {
+  const ref = useInitialFocus<HTMLInputElement>();
+  return (
+    <Box
+      component={Cmdk.Input}
+      ref={ref}
+      value={value}
+      onValueChange={onChange}
+      placeholder={t("palette.placeholder")}
+      sx={{
+        flex: "1 1 auto",
+        minWidth: 0,
+        height: 32,
+        border: 0,
+        outline: "none",
+        background: "transparent",
+        color: hf.text,
+        font: "inherit",
+        fontSize: { xs: 16, md: 15 },
+        "&::placeholder": { color: hf.textSecondary },
+      }}
+    />
+  );
+}
+
 /**
  * The second navigation. A cmdk list inside a modal dialog; the highlighted row is styled by the
  * theme's selection rule (the list is a `data-hf-list` container). The footer teaches the keys.
@@ -125,25 +152,7 @@ export function CommandPalette() {
           <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
             <Search size={16} />
           </Box>
-          <Box
-            component={Cmdk.Input}
-            autoFocus
-            value={query}
-            onValueChange={setQuery}
-            placeholder={t("palette.placeholder")}
-            sx={{
-              flex: "1 1 auto",
-              minWidth: 0,
-              height: 32,
-              border: 0,
-              outline: "none",
-              background: "transparent",
-              color: hf.text,
-              font: "inherit",
-              fontSize: { xs: 16, md: 15 },
-              "&::placeholder": { color: hf.textSecondary },
-            }}
-          />
+          <PaletteInput value={query} onChange={setQuery} />
           <Kbd>{shortcutLabel("escape")}</Kbd>
         </Box>
         <Box component={Cmdk.List} data-hf-list sx={listSx}>

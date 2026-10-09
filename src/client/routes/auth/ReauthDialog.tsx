@@ -17,6 +17,7 @@ import {
   usePublicConfig,
 } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
+import { useInitialFocus } from "../../components/focus";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
 import { Field, FormError, PasskeyIcon, TurnstileBox } from "./parts";
@@ -33,6 +34,8 @@ function ReauthForm() {
   const [step, setStep] = useState<"password" | "code">("password");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const passwordRef = useInitialFocus<HTMLInputElement>(step === "password");
+  const codeRef = useInitialFocus<HTMLInputElement>(step === "code");
 
   // Replay only for the same account. A passkey (or a 2FA step) can sign a DIFFERENT account in:
   // then the held requests are discarded, the old account's state is purged, and the page starts
@@ -136,7 +139,7 @@ function ReauthForm() {
             type="password"
             name="password"
             autoComplete="current-password"
-            autoFocus
+            inputRef={passwordRef}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
@@ -147,7 +150,7 @@ function ReauthForm() {
           label={t("twoFactor.code")}
           name="code"
           mono
-          autoFocus
+          inputRef={codeRef}
           autoComplete="one-time-code"
           value={code}
           onChange={(e) => setCode(e.target.value)}
