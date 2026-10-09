@@ -352,6 +352,9 @@ describe("sign-in screen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/two-factor"));
     expect(new URLSearchParams(router.state.location.search).get("next")).toBe("/recent");
+    // The router's location moves before React has drawn the new screen (the router hands its
+    // state to React as a transition). Wait for the screen itself before touching its fields.
+    await screen.findByRole("heading", { name: "Enter your code" });
     const verify = vi.spyOn(authClient.twoFactor, "verifyTotp").mockResolvedValue({ data: {}, error: null });
     fireEvent.change(field("code"), { target: { value: "123 456" } });
     fireEvent.click(field("trustDevice"));
