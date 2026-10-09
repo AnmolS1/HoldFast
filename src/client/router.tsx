@@ -19,7 +19,7 @@ import { AuthLayout, ForgotPasswordPage, InvitePage, LoginPage, ResetPasswordPag
 import { Frame } from "./routes/frame/Frame";
 import { HelpPage } from "./routes/help";
 import { AcceptTermsPage } from "./routes/legal-gate";
-import { NotFoundPage, RouteErrorPage } from "./routes/not-found";
+import { NotFoundPage, RouteErrorPage, StartingPage } from "./routes/not-found";
 
 async function loadConfig(): Promise<PublicConfig> {
   const config = await queryClient.fetchQuery(publicConfigQuery);
@@ -108,6 +108,8 @@ export function buildRoutes(): RouteObject[] {
     {
       id: "root",
       errorElement: <RouteErrorPage />,
+      // Shown while the first guard (session + config) is still loading.
+      HydrateFallback: StartingPage,
       children: [
         {
           id: "auth",

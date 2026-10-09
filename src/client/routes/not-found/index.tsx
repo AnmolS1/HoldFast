@@ -2,6 +2,7 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import { isRouteErrorResponse, Link as RouterLink, useRouteError } from "react-router";
 import { EmptyState } from "../../components/EmptyState";
+import { Mark } from "../../components/Mark";
 import { ApiError } from "../../lib/api";
 import { t } from "../../lib/i18n";
 import { reportError } from "../../lib/sentry";
@@ -11,6 +12,15 @@ function Page({ children }: { children: React.ReactNode }) {
   return (
     <Box component="main" id="main" sx={{ minHeight: "100dvh", display: "flex", backgroundColor: hf.bg }}>
       {children}
+    </Box>
+  );
+}
+
+/** The first paint, while the session and the public config load. */
+export function StartingPage() {
+  return (
+    <Box role="status" aria-busy="true" aria-label={t("app.loading")} sx={{ minHeight: "100dvh", display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: hf.bg, color: hf.textSecondary }}>
+      <Mark size={28} />
     </Box>
   );
 }

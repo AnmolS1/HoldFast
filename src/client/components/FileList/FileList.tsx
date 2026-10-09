@@ -555,7 +555,7 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
         <Box role="grid" aria-label={ariaLabel} aria-multiselectable={multi || undefined} aria-rowcount={items.length} aria-busy={loading || undefined}>
           {desktop && !grid ? (
             <Box role="row" sx={{ display: "grid", gridTemplateColumns: template, alignItems: "center", height: HEADER_HEIGHT, padding: "0 12px", color: hf.textSecondary, fontSize: 12, borderBottom: `1px solid ${hf.hairline}`, position: "sticky", top: 0, backgroundColor: hf.surface, zIndex: 1 }}>
-              <Box role="columnheader" aria-hidden="true" />
+              <Box role="presentation" />
               <Box role="columnheader">{t("list.name")}</Box>
               {columns.includes("share") ? <Box role="columnheader" aria-label={t("list.sharing")} /> : null}
               {columns.includes("modified") ? <Box role="columnheader">{t("list.modified")}</Box> : null}
@@ -564,7 +564,7 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
                   {t("list.size")}
                 </Box>
               ) : null}
-              <Box role="columnheader" aria-hidden="true" />
+              <Box role="presentation" />
             </Box>
           ) : null}
           {virtual ? (
