@@ -3,7 +3,7 @@
 // copy, never the caught object. The SDK is replaced by a recorder; the callers are real.
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { captureError, redactOutgoing, sentryOptions } from "../../../src/worker/sentry";
+import { captureError, sentryOptions } from "../../../src/worker/sentry";
 import { audit } from "../../../src/worker/services/audit";
 import { handlePlainError } from "../../../src/worker/services/errors";
 import type { AppEnv } from "../../../src/worker/services/request-context";
@@ -173,8 +173,5 @@ describe("an error on its way to Sentry", () => {
       expect(text).not.toContain(leak);
     expect(out.exception.values[0]!.value).toContain("params: [dropped]");
     expect(out.tags).toEqual({ requestId: "r-1" });
-    // An event without an exception passes through the ordinary redaction unchanged in shape.
-    expect(redactOutgoing({ message: "x for ada@example.test" })).toEqual({ message: "x for [email]" });
-    expect(redactOutgoing(null)).toBeNull();
   });
 });

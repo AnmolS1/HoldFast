@@ -806,8 +806,9 @@ describe("Sentry redaction", () => {
     expect(send({ request: { url: "/s/AbCdEfGhIjKlMnOp", headers: { cookie: "a=b" } } }, {})).toEqual({
       request: { url: "/s/[redacted]", headers: {} },
     });
+    // A value that is a URL keeps its (scanned) path; its query goes whole, whatever is in it.
     expect(crumb({ data: { url: "/d/a/b?token=x" } }, {})).toEqual({
-      data: { url: "/d/[redacted]?token=[redacted]" },
+      data: { url: "/d/[redacted]?[query]" },
     });
   });
 });

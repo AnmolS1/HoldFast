@@ -245,7 +245,8 @@ describe("sentry", () => {
         message: "mail to ada@example.com failed",
       }),
     ).toEqual({
-      request: { url: "https://app.test/reset-password?token=[redacted]", headers: { accept: "text/html" } },
+      // The query of a URL goes whole (a `state`, a name in a redirect have no shape to scan for).
+      request: { url: "https://app.test/reset-password?[query]", headers: { accept: "text/html" } },
       message: "mail to [email] failed",
     });
     reportError(new Error("x"), { where: "test" });

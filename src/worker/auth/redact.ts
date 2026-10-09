@@ -8,8 +8,9 @@
 //    shape that field has (an identifier; for `code`, an error code). Every other field is
 //    dropped, whatever it is called: a user row, a request body, a session, a credential, a
 //    header bag never get as far as being looked at.
-//  - FREE TEXT (a message, an error's message) is scanned, and everything shaped like a secret or
-//    like personal data is replaced: the shared Sentry rules first (src/shared/sentry-redact.ts:
+//  - FREE TEXT (a message, an error's message) is scanned (`scanText`, src/shared/sentry-redact.ts —
+//    one implementation for this layer and for the final Sentry walk), and everything shaped like a
+//    secret or like personal data is replaced: the named rules first (
 //    email addresses, token-bearing path segments, `token=` / `code=` / `password=` values),
 //    then whole URLs, JWTs, long random strings (session tokens, ids, OAuth codes), backup codes,
 //    one-time codes and IP addresses.
@@ -19,65 +20,15 @@
 // the one place a library puts a row into a sentence (the parameter list of a failed query, in
 // the error's message), the whole list is cut off.
 
-import { redactText } from "../../shared/sentry-redact";
+import { scanText } from "../../shared/sentry-redact";
 
-const MAX_TEXT = 500;
-
-// A whole absolute URL: verification, reset and callback links carry their secret anywhere in
-// the path or the query, so none of it is kept.
-const ABSOLUTE_URL = /\b[a-z][a-z0-9+.-]{1,15}:\/\/[^\s"'<>)\]]+/gi;
-const JWT = /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]*)?/g;
-// A run of 20+ token characters. Kept only when it reads as a word or a constant (one case and
-// no digit: INVALID_EMAIL_OR_PASSWORD, a long identifier); anything mixed is a random string.
-const LONG_RUN = /[A-Za-z0-9_+/=-]{20,}/g;
-// Better Auth's backup codes: five characters, a hyphen, five characters — with a digit, which
-// is what separates one from two hyphenated words.
-const BACKUP_CODE = /\b(?=[A-Za-z0-9-]*\d)[A-Za-z0-9]{5}-[A-Za-z0-9]{5}\b/g;
-const ONE_TIME_CODE = /(?<![\w.-])\d{6,8}(?![\w-])/g;
-const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
-const IPV6 = /(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])/gi;
-
-const QUERY_PARAMS = /\bparams:[\s\S]*$/i;
-// A path, then `?` and at least one `key=`: its query and fragment, up to the next space or quote.
-const RELATIVE_QUERY = /((?:^|[\s"'(=])\/[^\s"'<>?#]*)\?[^\s"'<>=]*=[^\s"'<>]*/g;
-
-const isWordLike = (run: string) => /^[A-Z_]+$/.test(run) || /^[a-z_-]+$/.test(run);
-
-/** A long run: a word or a constant is kept; a path is judged segment by segment; the rest goes. */
-function scrubRun(run: string): string {
-  if (isWordLike(run)) return run;
-  // `/` is a base64 character and a path separator. A run that starts with one is a path
-  // (/api/auth/admin/set-user-password): its segments are words, or they are replaced.
-  if (run.startsWith("/")) {
-    return run
-      .split("/")
-      .map((segment) => (segment.length < 20 || isWordLike(segment) ? segment : "[token]"))
-      .join("/");
-  }
-  return "[token]";
-}
-
-/** Free text, safe to keep: scanned, and capped in length. */
+/**
+ * Free text, safe to keep: scanned, and capped in length. The rules themselves are the shared
+ * scan (src/shared/sentry-redact.ts `scanText`) — the same function the final Sentry walk uses,
+ * so a string redacted here and again on its way out reads the same.
+ */
 export function scrubText(text: string): string {
-  // A query's parameters are the row itself — names, hashes, tokens, in no recognisable shape.
-  // Drizzle puts them in the MESSAGE of the error it wraps a failed query in ("Failed query: …
-  // params: a,b,c"), so everything after that word goes, unread.
-  // The query (and fragment) of a relative URL goes whole too: the shared rules know three
-  // parameters by name, and a short `state` or a name in a redirect has no shape to scan for.
-  const withoutParams = text
-    .slice(0, 4 * MAX_TEXT)
-    .replace(QUERY_PARAMS, "params: [dropped]")
-    .replace(RELATIVE_QUERY, "$1?[query]");
-  // Whole URLs first: the shared rules rewrite parts of a URL, and what they leave would no
-  // longer read as one.
-  const scanned = redactText(withoutParams.replace(ABSOLUTE_URL, "[url]"))
-    .replace(JWT, "[token]")
-    .replace(LONG_RUN, scrubRun)
-    .replace(BACKUP_CODE, "[code]")
-    .replace(IPV4, "[ip]")
-    .replace(IPV6, (run) => (run.replace(/:/g, "").length >= 2 ? "[ip]" : run))
-    .replace(ONE_TIME_CODE, "[code]");
-  return scanned.length > MAX_TEXT ? `${scanned.slice(0, MAX_TEXT)}…` : scanned;
+  return scanText(text);
 }
 
 /** An event name, a user id, a request id: one short token of identifier characters. */
