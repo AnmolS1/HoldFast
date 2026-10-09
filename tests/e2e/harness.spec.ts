@@ -1,15 +1,19 @@
 // Proves the e2e harness itself: Playwright's own dev server answers on this checkout's port, the
 // Worker's host dispatch agrees with .dev.vars, and the fixtures later specs build on work.
-import { expect, expectNoA11yViolations, test } from "./fixtures";
+import { expect, expectNoA11yViolations, stubTurnstile, test } from "./fixtures";
 
 test.describe("dev server", () => {
   test("serves the SPA at / with 200, not 421", async ({ page }) => {
     // 421 here means the server's port and .dev.vars' APP_ORIGIN disagree.
+    await stubTurnstile(page);
     const response = await page.goto("/");
     expect(response?.status()).toBe(200);
     expect(response?.headers()["content-type"]).toMatch(/^text\/html/);
-    // The shell alone is not proof: wait for React to render.
-    await expect(page.getByRole("heading", { level: 1, name: "Holdfast" })).toBeVisible();
+    // The shell alone is not proof: wait for React to render. Nobody is signed in, so the app's
+    // first screen is the sign-in form — by its exact name, which the app's "couldn't start"
+    // screen does not share.
+    await expect(page).toHaveURL(/\/login\?next=%2F$/);
+    await expect(page.getByRole("heading", { level: 1, name: "Sign in", exact: true })).toBeVisible();
   });
 
   test("answers /__meta from the Worker", async ({ request }) => {
@@ -82,8 +86,9 @@ test.describe("fixtures", () => {
   });
 
   test("axe finds no violations on the shell", async ({ page }) => {
+    await stubTurnstile(page);
     await page.goto("/");
-    await expect(page.getByRole("heading", { level: 1, name: "Holdfast" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Sign in", exact: true })).toBeVisible();
     await expectNoA11yViolations(page);
   });
 

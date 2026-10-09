@@ -12,7 +12,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Page, Route } from "@playwright/test";
-import { expect, expectNoA11yViolations, test } from "./fixtures";
+import { expect, expectNoA11yViolations, stubTurnstile, test } from "./fixtures";
 
 const DESKTOP_MIN = 1024;
 
@@ -118,16 +118,6 @@ const notFound = (page: Page) => page.getByRole("heading", { name: "Page not fou
 async function gotoFrame(page: Page, path: string): Promise<void> {
   await page.goto(path);
   await expect(page.locator("[data-frame]")).toBeVisible();
-}
-
-/** The vendor's Turnstile script, replaced by a stand-in that passes at once (keeps the run offline). */
-async function stubTurnstile(page: Page): Promise<void> {
-  await page.route("https://challenges.cloudflare.com/**", (route) =>
-    route.fulfill({
-      contentType: "text/javascript",
-      body: "window.turnstile={render:function(el,o){setTimeout(function(){o.callback('XXXX.DUMMY.TOKEN.XXXX')},10);return 'w'},reset:function(){},remove:function(){}};",
-    }),
-  );
 }
 
 test.describe("the real Worker (nothing under /api is mocked)", () => {
@@ -256,13 +246,18 @@ test.describe("shell routes", () => {
     await expect(page.locator("[data-frame]")).toHaveCount(0);
   });
 
-  test("without a config the app says it could not start (this checkout's plain `npm run dev`)", async ({
-    page,
-    origins,
-  }) => {
+  test("when the public config cannot be read the app says it could not start", async ({ page, origins }) => {
     await serveBuild(page, origins.port);
+    // What the Worker answers for an unexpected failure: the 500 envelope outside the code table.
+    await page.route("**/api/public/config", (route) =>
+      route.fulfill({
+        status: 500,
+        json: { error: "internal", message: "Something went wrong.", requestId: "req-e2e" },
+      }),
+    );
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Holdfast couldn't start" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Sign in" })).toHaveCount(0);
   });
 });
 

@@ -33,4 +33,5 @@ export const test = base.extend<HarnessFixtures>({
 export { expect } from "@playwright/test";
 export { expectNoA11yViolations } from "./axe";
 export { clearOutbox, latestMailTo, linksIn } from "./outbox";
+export { stubTurnstile } from "./turnstile";
 export { addVirtualAuthenticator } from "./webauthn";
