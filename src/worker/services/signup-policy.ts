@@ -47,7 +47,7 @@ import {
 } from "../db/queries/auth-lifecycle";
 import { todayTotals, utcDay } from "../db/queries/ledger";
 import { record } from "../auth/observe";
-import { now } from "./clock";
+import { isTestMode, now } from "./clock";
 import { ipHashDaily, ipPrefix } from "./ip-hash";
 
 // ── refusals ────────────────────────────────────────────────────────────────────────────────
@@ -141,12 +141,50 @@ function listOf(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/** RFC 2606 / 6761: names under these can never be anyone's real mailbox. */
+const RESERVED_TEST_DOMAIN = /@[a-z0-9.-]+\.(?:example|test)$/;
+
+type AdminListEnv = Pick<Env, "ADMIN_EMAILS"> & {
+  E2E_ADMIN_EMAILS?: string;
+  EMAIL_TRANSPORT?: string;
+  SENTRY_ENVIRONMENT?: string;
+  APP_ORIGIN?: string;
+};
+
+/**
+ * The addresses that are given the admin role: `ADMIN_EMAILS`.
+ *
+ * TEST SEAM (never on a deploy — `isTestMode`: the memory mail transport, a non-production
+ * environment AND a plain-http origin): when the e2e run passes `E2E_ADMIN_EMAILS`
+ * (playwright.config.ts → vite.config.ts), that list is used INSTEAD, and only its addresses at
+ * a reserved test domain (`.example`, `.test`) count; `*@domain` there names every address at
+ * that domain. So an end-to-end run has admins without ever creating an account for the
+ * operator's real address — no test reads `ADMIN_EMAILS`. In `ADMIN_EMAILS` itself a `*` is an
+ * ordinary character: no real list can name a domain.
+ */
+function adminList(env: AdminListEnv): { addresses: string[]; domains: string[] } {
+  if (isTestMode(env) && typeof env.E2E_ADMIN_EMAILS === "string" && env.E2E_ADMIN_EMAILS.trim() !== "") {
+    const entries = listOf(env.E2E_ADMIN_EMAILS).filter((entry) => RESERVED_TEST_DOMAIN.test(entry));
+    return {
+      addresses: entries.filter((entry) => !entry.startsWith("*@")),
+      // `*@domain`: every address at exactly that (reserved) domain — the e2e seam only.
+      domains: entries.filter((entry) => entry.startsWith("*@")).map((entry) => entry.slice(1)),
+    };
+  }
+  return { addresses: listOf(env.ADMIN_EMAILS), domains: [] };
+}
+
 /**
  * Is the address one of `ADMIN_EMAILS`? Used for ONE thing: granting the admin role when a
- * verified account starts a session. It must never change what a sign-up is answered.
+ * verified account signs in. It must never change what a sign-up is answered.
  */
-export function isAdminEmail(env: Pick<Env, "ADMIN_EMAILS">, email: string): boolean {
-  return listOf(env.ADMIN_EMAILS).includes(email.trim().toLowerCase());
+export function isAdminEmail(env: AdminListEnv, email: string): boolean {
+  const address = email.trim().toLowerCase();
+  if (address === "") return false;
+  const list = adminList(env);
+  if (list.addresses.includes(address)) return true;
+  const at = address.lastIndexOf("@");
+  return at > 0 && list.domains.includes(address.slice(at));
 }
 
 export const MX_LOOKUP_TIMEOUT_MS = 2_000;
@@ -387,13 +425,18 @@ export async function takeAddressChange(
 /**
  * May this account start a session now? Throws `SessionRefusal`. Reads the DATABASE (never a
  * cached session). Also the admin bootstrap: a verified `ADMIN_EMAILS` address gets the `admin`
- * role here, before its session exists — never an unverified one, and never through an
- * impersonated session.
+ * role here, before its session exists — never an unverified one, never through an
+ * impersonated session, and never for a session that a mailed link creates (`mayGrantAdmin`).
  */
 export async function checkSessionStart(
   scope: AuthScope,
   userId: string,
   impersonated: boolean,
+  /**
+   * False for a session that a mailed LINK creates (the verification click): a click proves a
+   * mailbox, not a credential, and the admin role is granted only by a sign-in.
+   */
+  mayGrantAdmin = true,
 ): Promise<void> {
   const account = await getAccount(scope.db, userId);
   // No such user: Better Auth's own insert fails on the foreign key.
@@ -407,6 +450,7 @@ export async function checkSessionStart(
   if (account.suspendedAt) throw new SessionRefusal("suspended");
 
   if (
+    mayGrantAdmin &&
     !impersonated &&
     account.emailVerified &&
     isAdminEmail(scope.env, account.email) &&

@@ -34,3 +34,12 @@ export const testVars = {
 } as const satisfies Record<string, string>;
 
 export type TestVarName = keyof typeof testVars;
+
+// ── the end-to-end run (vite dev) ────────────────────────────────────────────────────────────
+// The e2e server reads the checkout's `.dev.vars`, whose ADMIN_EMAILS may be an operator's real
+// address. No test uses that: Playwright hands the server this list instead (E2E_ADMIN_EMAILS,
+// honoured in test mode only and only for reserved test domains). `*@domain` is every address
+// at that domain, so each test makes an admin of its own — its own password, its own
+// authenticator secret — and no two tests share an account.
+export const E2E_ADMIN_DOMAIN = "admins.holdfast-e2e.example";
+export const E2E_ADMIN_EMAILS = `*@${E2E_ADMIN_DOMAIN}`;

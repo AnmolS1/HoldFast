@@ -21,6 +21,7 @@ import {
   localDbName,
   localDbUrl,
 } from "./tests/setup/local-env";
+import { E2E_ADMIN_EMAILS } from "./tests/setup/test-vars";
 
 forbidDotEnvFallback();
 
@@ -69,6 +70,8 @@ export default defineConfig({
       // Read from the process environment, never from .dev.vars.
       [HYPERDRIVE_OVERRIDE]: localDbUrl(db),
       CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
+      // The run's admin addresses (a reserved test domain): see tests/setup/test-vars.ts.
+      HOLDFAST_E2E_ADMIN_EMAILS: E2E_ADMIN_EMAILS,
     },
   },
 });

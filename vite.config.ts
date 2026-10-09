@@ -49,7 +49,20 @@ export default defineConfig({
   // through a symlink: two checkouts with different imports would rewrite each other's cache and
   // break each other's running dev server. Keep it inside the checkout (.wrangler/ is ignored).
   cacheDir: ".wrangler/vite",
-  plugins: [react(), cloudflare({ inspectorPort })],
+  plugins: [
+    react(),
+    cloudflare({
+      inspectorPort,
+      // E2E only (playwright.config.ts sets the variable for the server it starts): the admin
+      // addresses of the run, as a var of its own. The plugin can set a var per process only
+      // when `.dev.vars` does not define it, which is why this is not ADMIN_EMAILS — and the
+      // Worker honours it in test mode only (src/worker/services/signup-policy.ts).
+      config: (config) => {
+        const admins = process.env.HOLDFAST_E2E_ADMIN_EMAILS;
+        if (admins) config.vars = { ...config.vars, E2E_ADMIN_EMAILS: admins };
+      },
+    }),
+  ],
   server: {
     host,
     port,

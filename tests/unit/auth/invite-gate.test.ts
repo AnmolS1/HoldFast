@@ -259,7 +259,7 @@ describe("without a valid invite: an ADMIN_EMAILS address and any other address"
 describe("the admin bootstrap: an invite like anyone's, the role at the first verified session", () => {
   beforeAll(forgetAdmin);
 
-  it("an ADMIN_EMAILS address signs up with an invite, is a plain user until verified, then an admin — once", async () => {
+  it("an ADMIN_EMAILS address signs up with an invite, is a plain user until it has verified AND signed in, then an admin — once", async () => {
     await forgetAdmin();
     const code = await createInvite({ note: "first admin" });
     const client = newClient();
@@ -272,11 +272,18 @@ describe("the admin bootstrap: an invite like anyone's, the role at the first ve
     expect((await signIn(newClient(), ADMIN_EMAIL)).status).toBe(403);
     expect((await userById(unverified!.id))!.role).toBe("user");
 
+    // The verification click signs the browser that signed up in — and grants nothing: a click
+    // proves a mailbox, not a credential (auth/mailbox-proof.ts).
     expect((await send(client, linkIn(await waitForMail(ADMIN_EMAIL, "verification")))).status).toBe(302);
     const row = await userByEmail(ADMIN_EMAIL);
-    expect(row).toMatchObject({ emailVerified: true, role: "admin" });
-    expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
+    expect(row).toMatchObject({ emailVerified: true, role: "user" });
+    expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(0);
 
+    // The role comes with the first SIGN-IN of the verified address — once.
+    await send(client, "/api/auth/sign-out", { json: {} });
+    expect((await signIn(client, ADMIN_EMAIL)).status).toBe(200);
+    expect((await userByEmail(ADMIN_EMAIL))!.role).toBe("admin");
+    expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
     await send(client, "/api/auth/sign-out", { json: {} });
     expect((await signIn(client, ADMIN_EMAIL)).status).toBe(200);
     expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
@@ -352,6 +359,77 @@ describe("ADMIN_EMAILS grants the role, and only that", () => {
       expect(isAdminEmail(list, address), address).toBe(false);
     }
     expect(isAdminEmail({ ADMIN_EMAILS: "" }, "")).toBe(false);
+  });
+
+  it("E2E_ADMIN_EMAILS replaces the list in TEST MODE only, and only with reserved test domains", () => {
+    const real = "owner@real-company.com";
+    const testMode = {
+      ADMIN_EMAILS: real,
+      EMAIL_TRANSPORT: "memory",
+      SENTRY_ENVIRONMENT: "test",
+      APP_ORIGIN: "http://localhost:5173",
+    };
+    const e2e = "admin@holdfast-e2e.example";
+    // Test mode + the var: the e2e address is the admin, the real one is NOT (a test run never
+    // makes an account for an operator's real address).
+    expect(isAdminEmail({ ...testMode, E2E_ADMIN_EMAILS: `${e2e}, second@run.test` }, e2e)).toBe(true);
+    expect(
+      isAdminEmail({ ...testMode, E2E_ADMIN_EMAILS: `${e2e}, second@run.test` }, "second@run.test"),
+    ).toBe(true);
+    expect(isAdminEmail({ ...testMode, E2E_ADMIN_EMAILS: e2e }, real)).toBe(false);
+    // Without the var (ordinary local development): ADMIN_EMAILS as ever.
+    expect(isAdminEmail(testMode, real)).toBe(true);
+    expect(isAdminEmail({ ...testMode, E2E_ADMIN_EMAILS: "" }, real)).toBe(true);
+    // Not test mode — each of its three conditions alone: the var is ignored.
+    for (const off of [
+      { APP_ORIGIN: "https://holdfast.example" },
+      { EMAIL_TRANSPORT: "resend" },
+      { SENTRY_ENVIRONMENT: "production" },
+    ]) {
+      const env = { ...testMode, ...off, E2E_ADMIN_EMAILS: e2e };
+      expect(isAdminEmail(env, e2e), JSON.stringify(off)).toBe(false);
+      expect(isAdminEmail(env, real), JSON.stringify(off)).toBe(true);
+    }
+    // An address outside the reserved test domains (.example, .test) is never taken from it.
+    const hostile = { ...testMode, E2E_ADMIN_EMAILS: `attacker@gmail.com, x@evil.example.com, ${e2e}` };
+    expect(isAdminEmail(hostile, "attacker@gmail.com")).toBe(false);
+    expect(isAdminEmail(hostile, "x@evil.example.com")).toBe(false);
+    expect(isAdminEmail(hostile, e2e)).toBe(true);
+    // `*@domain` names every address at exactly that reserved domain — in the e2e var only.
+    const wild = { ...testMode, E2E_ADMIN_EMAILS: "*@admins.run.example, *@gmail.com" };
+    expect(isAdminEmail(wild, "anyone@admins.run.example")).toBe(true);
+    expect(isAdminEmail(wild, "anyone@sub.admins.run.example")).toBe(false);
+    expect(isAdminEmail(wild, "anyone@xadmins.run.example")).toBe(false);
+    expect(isAdminEmail(wild, "anyone@gmail.com")).toBe(false);
+    expect(isAdminEmail(wild, "@admins.run.example")).toBe(false);
+    expect(isAdminEmail({ ...testMode, ADMIN_EMAILS: "*@real-company.com" }, "ceo@real-company.com")).toBe(
+      false,
+    );
+    expect(
+      isAdminEmail({ ...wild, APP_ORIGIN: "https://holdfast.example" }, "anyone@admins.run.example"),
+    ).toBe(false);
+  });
+
+  it("no test reads ADMIN_EMAILS out of .dev.vars (the e2e admin is a test-domain address from test vars)", async () => {
+    const sources = {
+      ...import.meta.glob("../../setup/**/*.ts", { query: "?raw", import: "default", eager: true }),
+      ...import.meta.glob("../../e2e/**/*.ts", { query: "?raw", import: "default", eager: true }),
+    };
+    expect(Object.keys(sources).length).toBeGreaterThan(5);
+    // Code only: a comment may say what is not done.
+    const code = (text: string) =>
+      text
+        .split("\n")
+        .filter((line) => !/^\s*(?:\/\/|\*|\/\*)/.test(line))
+        .join("\n");
+    const offenders = Object.entries(sources)
+      .filter(([, text]) =>
+        /ADMIN_EMAILS/.test(code(text).replace(/E2E_ADMIN_EMAILS?|HOLDFAST_E2E_ADMIN_EMAILS/g, "")),
+      )
+      // The Workers project's own explicit value (a test-domain address) is the one definition.
+      .filter(([file]) => !file.endsWith("/setup/test-vars.ts"))
+      .map(([file]) => file);
+    expect(offenders).toEqual([]);
   });
 });
 

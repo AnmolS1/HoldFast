@@ -15,14 +15,11 @@
 // (tests/setup/local-env.ts), and the mail comes from the Worker's in-memory outbox. A spec
 // against a deploy uses scripts/create-session.ts instead.
 import { createHmac, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
 import type { APIRequestContext, APIResponse, Page } from "@playwright/test";
 import pg from "pg";
 import { latestMailTo, linksIn } from "../e2e/fixtures/outbox";
-import { readVars } from "./e2e-preflight";
 import { appOrigin, e2ePort, localDbName, localDbUrl } from "./local-env";
+import { E2E_ADMIN_DOMAIN } from "./test-vars";
 
 /** What the stand-in Turnstile widget yields, and what Cloudflare's test secret accepts. */
 export const TURNSTILE_TEST_TOKEN = "XXXX.DUMMY.TOKEN.XXXX";
@@ -167,61 +164,34 @@ export async function signedInUser(
 }
 
 // ── the admin ───────────────────────────────────────────────────────────────────────────────
-// ADMIN_EMAILS names one address, and every test of a run (two browser projects, several
-// workers) may ask for the admin at once. So: the first caller creates it and enrols TOTP, the
-// rest sign in to it — serialised by a Postgres advisory lock, with the authenticator secret
-// kept in a file in the OS temp directory (it belongs to a throw-away local account).
+// Every call makes an admin of ITS OWN: a fresh address at the run's admin domain (the e2e
+// server is told `*@<that domain>` through E2E_ADMIN_EMAILS — tests/setup/test-vars.ts — and
+// honours it in test mode only), its own password and its own authenticator secret. No account
+// and no one-time code is shared between tests, so nothing here depends on a code being
+// accepted twice. Never this checkout's real ADMIN_EMAILS: no test reads that var.
 
-type AdminState = { userId: string; totpURI: string; backupCodes: string[]; password: string };
+/** A fresh address at the run's admin domain. */
+export const freshAdminEmail = () => `e2e-${hex(6)}@${E2E_ADMIN_DOMAIN}`;
 
-const stateFile = () => join(tmpdir(), `holdfast-e2e-admin-${localDbName()}.json`);
-
-function readState(): AdminState | null {
-  try {
-    return existsSync(stateFile()) ? (JSON.parse(readFileSync(stateFile(), "utf8")) as AdminState) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** The first address of this checkout's ADMIN_EMAILS (.dev.vars). Read here, never logged. */
-function adminEmail(): string {
-  const vars = readVars(resolve(process.cwd(), ".dev.vars"), ["ADMIN_EMAILS"]);
-  const first = (vars.ADMIN_EMAILS ?? "")
-    .split(",")
-    .map((entry) => entry.trim().toLowerCase())
-    .find(Boolean);
-  if (!first)
-    throw new Error(
-      "auth fixture: ADMIN_EMAILS is empty in this checkout's .dev.vars — signedInAdmin2fa needs one address",
-    );
-  return first;
-}
-
-async function withAdminLock<T>(run: () => Promise<T>): Promise<T> {
-  return localDb(async (db) => {
-    await db.query("SELECT pg_advisory_lock(hashtext('holdfast:e2e:admin'))");
-    try {
-      return await run();
-    } finally {
-      await db.query("SELECT pg_advisory_unlock(hashtext('holdfast:e2e:admin'))");
-    }
-  });
-}
-
-async function createAdmin(
-  request: APIRequestContext,
+/**
+ * An admin signed in the way an admin must be: role `admin`, two-factor enrolled, and a session
+ * that PASSED the second factor — what `requireAdmin` and the admin-plugin gate ask for.
+ *
+ * The bootstrap as an operator does it: an invite made out of band (scripts/create-invite.ts), a
+ * sign-up with an admin address, the verification link, TOTP enrolment — and then a real
+ * sign-in, password and code: the role is granted by a sign-in, never by the verification click.
+ */
+export async function signedInAdmin2fa(
+  target: APIRequestContext | Page,
   options: FixtureOptions,
-  email: string,
 ): Promise<SignedInAdmin> {
-  // The bootstrap as an operator does it: an invite made out of band (scripts/create-invite.ts),
-  // a sign-up with an ADMIN_EMAILS address, and the role at its first verified session — here the
-  // verification link. The address itself gets no other treatment.
+  const request = requestOf(target);
+  const email = options.email ?? freshAdminEmail();
   const user = await signUpAndVerify(request, {
     ...options,
     email,
     inviteCode: await createInvite(),
-    name: "E2E Admin",
+    name: options.name ?? "E2E Admin",
   });
   const enabled = await request.post("/api/auth/two-factor/enable", {
     headers: headersFor(options.clientIp),
@@ -229,60 +199,24 @@ async function createAdmin(
   });
   await expectOk(enabled, "two-factor/enable");
   const { totpURI, backupCodes } = (await enabled.json()) as { totpURI: string; backupCodes: string[] };
-  const verified = await request.post("/api/auth/two-factor/verify-totp", {
+  const enrolled = await request.post("/api/auth/two-factor/verify-totp", {
     headers: headersFor(options.clientIp),
     data: { code: totpCode(totpURI) },
   });
-  await expectOk(verified, "two-factor/verify-totp");
-  const state: AdminState = { userId: user.id, totpURI, backupCodes, password: user.password };
-  writeFileSync(stateFile(), JSON.stringify(state), { mode: 0o600 });
-  return { ...user, totpURI, backupCodes };
-}
-
-async function signInAdmin(
-  request: APIRequestContext,
-  options: FixtureOptions,
-  email: string,
-  state: AdminState,
-): Promise<SignedInAdmin> {
+  await expectOk(enrolled, "two-factor/verify-totp (enrolment)");
+  await expectOk(
+    await request.post("/api/auth/sign-out", { headers: headersFor(options.clientIp), data: {} }),
+    "sign-out",
+  );
   const password = await request.post("/api/auth/sign-in/email", {
     headers: headersFor(options.clientIp, { "x-captcha-response": TURNSTILE_TEST_TOKEN }),
-    data: { email, password: state.password },
+    data: { email, password: user.password },
   });
   await expectOk(password, "the admin's password sign-in");
   const code = await request.post("/api/auth/two-factor/verify-totp", {
     headers: headersFor(options.clientIp),
-    data: { code: totpCode(state.totpURI) },
+    data: { code: totpCode(totpURI) },
   });
   await expectOk(code, "the admin's TOTP code");
-  return {
-    id: state.userId,
-    email,
-    password: state.password,
-    name: "E2E Admin",
-    totpURI: state.totpURI,
-    backupCodes: state.backupCodes,
-  };
-}
-
-/**
- * The run's admin, signed in with two-factor: role `admin` AND `twoFactorEnabled`, on a session
- * that is not an impersonated one — what `requireAdmin` and the admin-plugin gate ask for.
- */
-export async function signedInAdmin2fa(
-  target: APIRequestContext | Page,
-  options: FixtureOptions,
-): Promise<SignedInAdmin> {
-  const request = requestOf(target);
-  const email = adminEmail();
-  return withAdminLock(async () => {
-    const existing = await userIdOf(email);
-    const state = readState();
-    if (existing && state && state.userId === existing) return signInAdmin(request, options, email, state);
-    if (existing) {
-      // An admin left by an earlier run whose authenticator we no longer have: start again.
-      await localDb((db) => db.query('DELETE FROM "user" WHERE id = $1', [existing]));
-    }
-    return createAdmin(request, options, email);
-  });
+  return { ...user, totpURI, backupCodes };
 }
