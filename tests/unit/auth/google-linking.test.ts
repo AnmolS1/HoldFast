@@ -17,7 +17,7 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode, type TestGoogleProfile } from "../../../src/worker/auth/test-outbound";
-import { passkey, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
+import { account, passkey, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
 import {
   accountsOf,
   auditRows,
@@ -218,6 +218,41 @@ describe("pre-hijacking: a stranger's unverified account at the victim's address
     expect(await planted(row.id)).toEqual(before);
   });
 
+  it("the same in OPEN sign-up mode, where no invite stands in the way: no intent → nothing emptied, nothing linked (T5)", async () => {
+    // In invite mode a sign-up without an intent is also stopped by the invite gate. Here that
+    // gate is off, so the ONLY thing between a stranger's unverified account and a link is the
+    // intent requirement itself.
+    const open = { signupMode: "open" } as const;
+    const email = freshEmail();
+    const { row } = await plantedAccount(email);
+    const before = await planted(row.id);
+    const victim = newClient({ settings: open });
+    const landed = await google(victim, profileFor(email));
+    expect(landed.error).toBe("SIGNUP_INTENT_REQUIRED");
+    expect(await getSession(victim)).toBeNull();
+    expect(await planted(row.id)).toEqual(before);
+    expect((await userById(row.id))!).toMatchObject({
+      emailVerified: false,
+      name: "Mallory",
+      twoFactorEnabled: true,
+    });
+    expect((await signIn(newClient({ settings: open }), email, PASSWORD)).status).toBe(403);
+    expect(await auditRows({ action: "auth.prehijack_cleanup", targetId: row.id })).toEqual([]);
+    expect(await auditRows({ action: "auth.provider_linked", targetId: row.id })).toEqual([]);
+    // Control, same mode: WITH the intent step (no invite needed here) the account is emptied and linked.
+    const proper = newClient({ settings: open });
+    expect((await intent(proper, null)).status).toBe(200);
+    const linked = await google(proper, profileFor(email));
+    expect(linked.error, linked.callback.text).toBeNull();
+    expect(await planted(row.id)).toEqual({
+      accounts: ["google"],
+      sessions: 1,
+      passkeys: 0,
+      twoFactor: 0,
+      tokens: 0,
+    });
+  });
+
   it("an address Google has NOT verified links to nothing — unverified or verified local account, with or without the intent", async () => {
     const email = freshEmail();
     const { row } = await plantedAccount(email);
@@ -242,6 +277,51 @@ describe("pre-hijacking: a stranger's unverified account at the victim's address
 });
 
 describe("linking to an account whose address IS proven", () => {
+  it("the SAME Google identity arriving three times at once is linked once: one row, no 500, no stray session (the unique index)", async () => {
+    const owner = await verifiedUser();
+    const profile = profileFor(owner.email);
+    const browsers = [newClient(), newClient(), newClient()];
+    const results = await Promise.all(browsers.map((browser) => google(browser, profile)));
+    for (const result of results) expect(result.callback.status).toBe(302);
+    // Exactly one `account` row for the identity, whoever won.
+    expect((await accountsOf(owner.user.id)).map((a) => a.providerId).sort()).toEqual([
+      "credential",
+      "google",
+    ]);
+    // Whoever lost the insert was told so (and may simply try again); nobody got a session
+    // without the link existing, and nobody got an error page from the Worker.
+    for (const [index, result] of results.entries()) {
+      const signedIn = await getSession(browsers[index]!);
+      if (result.error === null) expect(signedIn?.user.id).toBe(owner.user.id);
+      else {
+        expect(result.error).toBe("unable_to_link_account");
+        expect(signedIn).toBeNull();
+      }
+    }
+    expect(results.filter((result) => result.error === null).length).toBeGreaterThanOrEqual(1);
+    // A second attempt by a loser signs in on the existing link — still one row.
+    const retry = newClient();
+    expect((await google(retry, profile)).error).toBeNull();
+    expect((await accountsOf(owner.user.id)).filter((a) => a.providerId === "google")).toHaveLength(1);
+  });
+
+  it("the database refuses a second row for one provider identity, whatever inserts it", async () => {
+    const owner = await verifiedUser();
+    const other = await verifiedUser();
+    const values = (userId: string) => ({
+      id: crypto.randomUUID().replace(/-/g, ""),
+      providerId: "google",
+      accountId: "g-fixed-subject-" + owner.user.id,
+      userId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await testDb().insert(account).values(values(owner.user.id));
+    await expect(testDb().insert(account).values(values(owner.user.id))).rejects.toThrow();
+    await expect(testDb().insert(account).values(values(other.user.id))).rejects.toThrow();
+    expect((await accountsOf(other.user.id)).map((a) => a.providerId)).toEqual(["credential"]);
+  });
+
   it("links, keeps the existing credentials, tells the owner, and is audited", async () => {
     const owner = await verifiedUser();
     const before = mailTo(owner.email, "signInMethodAdded").length;
@@ -480,7 +560,8 @@ describe("races around the cleanup and the link", () => {
     try {
       const arrived = await victimArrives(email);
       victim = arrived.victim;
-      expect(arrived.landed.error ?? String(arrived.landed.callback.status)).not.toBeNull();
+      // Better Auth catches the failed insert and answers with its own error — not a sign-in.
+      expect(arrived.landed.error).toBe("unable_to_link_account");
       expect(await getSession(victim)).toBeNull();
     } finally {
       await remove();
