@@ -99,6 +99,10 @@ export function buildAuthOptions(scope: AuthScope) {
       window: 60,
       max: 30,
       customRules: {
+        // The shell reads the session in every route guard and on every window focus. Better
+        // Auth's default (30 a minute per address and path) would make people behind one
+        // address fail each other's page loads; the read is limited by RL_API instead.
+        "/get-session": false as const,
         "/sign-in/email": { window: 60, max: 5 },
         "/sign-up/email": { window: 3600, max: 5 },
         "/request-password-reset": { window: 3600, max: 3 },

@@ -298,7 +298,7 @@ describe("rate limits", () => {
     expect((await signIn(newClient(), email)).status).toBe(200);
   });
 
-  it("RL_AUTH: from one address the 21st auth write in a minute is 429 with our envelope — and 30 session reads still pass", async () => {
+  it("RL_AUTH: from one address the 21st auth write in a minute is 429 with our envelope — and 60 session reads still pass", async () => {
     const ip = newClient().ip;
     const a = newClient({ ip });
     const b = newClient({ ip });
@@ -316,7 +316,9 @@ describe("rate limits", () => {
     expect(signInAttempt.status).toBe(429);
     expect(signInAttempt.body).toMatchObject({ error: "rate_limited" });
     // …while the shell's session read, from two clients behind that one address, is not counted.
-    for (let i = 1; i <= 30; i++) {
+    // (60, not 30: Better Auth's own default limit of 30 a minute per address must not apply
+    // to this endpoint either.)
+    for (let i = 1; i <= 60; i++) {
       const read = await send(i % 2 ? a : b, "/api/auth/get-session");
       expect(read.status, `read ${i}`).toBe(200);
     }
@@ -485,6 +487,7 @@ describe("the options object", () => {
         window: 60,
         max: 30,
         customRules: {
+          "/get-session": false,
           "/sign-in/email": { window: 60, max: 5 },
           "/sign-up/email": { window: 3600, max: 5 },
           "/request-password-reset": { window: 3600, max: 3 },
