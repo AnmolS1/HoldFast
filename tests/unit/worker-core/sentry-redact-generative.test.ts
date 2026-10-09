@@ -96,6 +96,16 @@ const SECRETS: Array<(r: Rng) => Secret> = [
   () => ({ text: `ACCESS_TOKEN=${MARK}`, url: false }),
   (r) => ({ text: `x-api-key: ${MARK}${r.chars(2)}`, url: false }),
   (r) => ({ text: `code=${MARK.toLowerCase()}${r.chars(3)}`, url: false }),
+  // A named secret whose VALUE holds an encoded delimiter (review S2): decoded before the name
+  // rule ran, the value ended at the new delimiter and its tail was left behind.
+  (r) => ({ text: `token=${r.chars(4)}%20${MARK}${r.chars(4)}`, url: false }),
+  (r) => ({ text: `"password":"pre&#10;${MARK}${r.chars(3)}"`, url: false }),
+  (r) => ({ text: `password=pre%0a${MARK}${r.chars(2)}`, url: false }),
+  (r) => ({ text: `secret=pre&#x20;${MARK}${r.chars(2)}`, url: false }),
+  (r) => ({ text: `Cookie: a=1%0A${MARK}${r.chars(3)}`, url: false }),
+  (r) => ({ text: `{"password":"ab\\" ${MARK} ${r.chars(3)}"}`, url: false }),
+  (r) => ({ text: `Bearer ab12%20${MARK}${r.chars(3)}`, url: false }),
+  (r) => ({ text: `api_key=%61bc%26x%3D${MARK}${r.chars(2)}`, url: false }),
 ];
 
 // ── encodings ───────────────────────────────────────────────────────────────────────────────
@@ -682,5 +692,50 @@ describe("regressions: one case per finding", () => {
     const failed = redactEvent({ extra: { proxy, note: MARK } }, (kind) => counted.push(kind));
     expect(failed).toEqual({ message: REDACTION_FAILED, level: "error" });
     expect(counted).toEqual(["event"]);
+  });
+});
+
+// ── numbers (review S3) ─────────────────────────────────────────────────────────────────────
+// A one-time code can arrive as a JSON number. No whole number of six to eight digits survives,
+// wherever it sits — except a stack frame's line and column, at the SDK's own path.
+describe("generated events with one-time codes as NUMBERS (seed 20261010)", () => {
+  it("2,000 events: no planted number survives, small numbers and frame positions do", () => {
+    const r = prng(20261010);
+    const KEYS = ["code", "otp", "value", "n", "attempt", "data", "x-code", "pin", "id", "count"];
+    for (let index = 0; index < 2000; index++) {
+      const planted: number[] = [];
+      const code = () => {
+        const digits = 6 + r.int(3);
+        const value = 10 ** (digits - 1) + r.int(9 * 10 ** (digits - 1));
+        planted.push(value);
+        return r.chance(0.2) ? -value : value;
+      };
+      const node = (depth: number): unknown => {
+        if (depth > 3 || r.chance(0.35)) return r.chance(0.7) ? code() : r.int(1000);
+        if (r.chance(0.4)) return Array.from({ length: 1 + r.int(4) }, () => node(depth + 1));
+        return Object.fromEntries(
+          Array.from({ length: 1 + r.int(4) }, () => [`${r.pick(KEYS)}${r.int(3)}`, node(depth + 1)]),
+        );
+      };
+      const event = {
+        extra: node(0),
+        tags: { a: code() },
+        contexts: { app: node(1) },
+        request: { other: node(1) },
+        breadcrumbs: [{ data: node(2) }],
+        exception: { values: [{ stacktrace: { frames: [{ lineno: 123456, colno: 7654321 }] } }] },
+        timestamp: 1_760_000_000,
+      };
+      const out = redactEvent(event) as typeof event;
+      const text = JSON.stringify(out);
+      for (const value of planted) {
+        // (The frame's own two numbers are not planted values unless the generator drew them.)
+        if (value === 123456 || value === 7654321) continue;
+        expect(text.includes(String(value)), `event ${index}: ${value} in ${text.slice(0, 300)}`).toBe(false);
+      }
+      expect(out.exception.values[0]!.stacktrace.frames[0]).toEqual({ lineno: 123456, colno: 7654321 });
+      expect(out.timestamp).toBe(1_760_000_000);
+      expect(redactEvent(out), `event ${index}: idempotent`).toEqual(out);
+    }
   });
 });
