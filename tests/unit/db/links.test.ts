@@ -119,12 +119,10 @@ describe("logAccess", () => {
       country: null,
       uaHash: null,
     });
-    const rows = await db
-      .select()
-      .from(linkAccessLog)
-      .where(eq(linkAccessLog.linkId, link.id))
-      .orderBy(linkAccessLog.id);
+    const rows = await db.select().from(linkAccessLog).where(eq(linkAccessLog.linkId, link.id));
     expect(rows).toHaveLength(2);
+    // Ids made in the same millisecond do not order: pick the rows by outcome.
+    rows.sort((x, y) => (x.outcome === "ok" ? -1 : 1) - (y.outcome === "ok" ? -1 : 1));
     expect(rows[0]).toMatchObject({
       linkId: link.id,
       nodeId: file.id,
