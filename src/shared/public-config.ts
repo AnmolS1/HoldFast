@@ -1,4 +1,4 @@
-// CONTRACT (contracts-0). Owner: T07 (worker core), then T10, which takes the file over unchanged.
+// Owner: T07 (worker core), then T10, which takes the file over unchanged.
 // This is the single definition of `PublicConfig`: the body of GET /api/public/config. Nothing
 // secret is ever added to it. Compiled for both the browser and the Worker.
 

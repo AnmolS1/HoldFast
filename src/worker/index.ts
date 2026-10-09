@@ -1,14 +1,28 @@
 // Worker entry: host dispatch plus the queue, cron and container exports.
-// This is the skeleton. It is self-contained on purpose: it imports nothing but the build stamp.
+//
+// SEAM. This is the only file that imports the concrete database and auth modules; everything
+// else receives them as `CoreDeps`. Its import paths are final — later work replaces the files
+// behind them (./auth/create-auth, ./scan/consumer, ./scheduled, ./scan/container), never this.
+// `./auth/create-auth` stays the FIRST import: the auth task's module must be evaluated before
+// anything else in the graph.
 
-import { Container } from "@cloudflare/containers";
-import { metaResponse } from "./meta";
+import { createAuth } from "./auth/create-auth";
+import { createApp } from "./app";
+import { createDb } from "./db/client";
+import { insertAudit } from "./db/queries/audit";
+import { getSettings } from "./db/queries/settings";
+import { termsVersionOf } from "./db/queries/users";
+import { createFilesHost } from "./files-host";
+import * as consumer from "./scan/consumer";
+import * as scheduledImpl from "./scheduled";
+import { withSentry } from "./sentry";
+import { runBackground, type CoreDeps } from "./services/request-context";
 
-/** Scanner container. A placeholder image (containers/clamav) until the real scanner lands. */
-export class ScannerContainer extends Container<Env> {
-  defaultPort = 8080;
-  sleepAfter = "10m";
-}
+export { ScannerContainer } from "./scan/container";
+
+const core: CoreDeps = { createDb, createAuth, getSettings, termsVersionOf, insertAudit };
+const app = createApp(core);
+const filesHost = createFilesHost(core);
 
 /** `host` of an origin string, including a non-default port. Null when the value is not a URL. */
 function hostOf(origin: string | undefined): string | null {
@@ -20,9 +34,9 @@ function hostOf(origin: string | undefined): string | null {
   }
 }
 
-function plain(status: number, body: string): Response {
-  return new Response(body, {
-    status,
+function misdirected(): Response {
+  return new Response("Misdirected request\n", {
+    status: 421,
     headers: {
       "content-type": "text/plain; charset=utf-8",
       "cache-control": "no-store",
@@ -31,29 +45,21 @@ function plain(status: number, body: string): Response {
   });
 }
 
-export default {
-  async fetch(request, env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.host === hostOf(env.APP_ORIGIN)) {
-      if (url.pathname === "/api/health") {
-        return Response.json({ ok: true }, { headers: { "cache-control": "no-store" } });
-      }
-      if (url.pathname === "/__meta") return metaResponse();
-      return env.ASSETS.fetch(request);
-    }
-
-    // The files host serves user content only: no cookies, no HTML, and never the SPA shell.
-    if (url.host === hostOf(env.FILES_ORIGIN)) return plain(404, "Not found\n");
-
-    return plain(421, "Misdirected request\n");
+export default withSentry({
+  // Strict host separation. The full host is compared, port included, so localhost:<port> and
+  // files.localhost:<port> separate locally exactly as the two domains do when deployed.
+  async fetch(request, env, ctx): Promise<Response> {
+    const host = new URL(request.url).host;
+    if (host === hostOf(env.APP_ORIGIN)) return app.fetch(request, env, ctx);
+    if (host === hostOf(env.FILES_ORIGIN)) return filesHost.fetch(request, env, ctx);
+    return misdirected();
   },
 
-  // No scan consumer yet: acknowledge everything so nothing is retried or dead-lettered.
-  async queue(batch): Promise<void> {
-    batch.ackAll();
+  async queue(batch, env, ctx): Promise<void> {
+    await runBackground(env, ctx, (bg) => consumer.queue(batch, env, ctx, bg), core);
   },
 
-  // No scheduled jobs yet.
-  async scheduled(): Promise<void> {},
-} satisfies ExportedHandler<Env>;
+  async scheduled(event, env, ctx): Promise<void> {
+    await runBackground(env, ctx, (bg) => scheduledImpl.scheduled(event, env, ctx, bg), core);
+  },
+} satisfies ExportedHandler<Env>);

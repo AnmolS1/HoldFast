@@ -12,7 +12,8 @@ test.describe("dev server", () => {
     await expect(page.getByRole("heading", { level: 1, name: "Holdfast" })).toBeVisible();
   });
 
-  test("answers /__meta and /api/health from the Worker", async ({ request }) => {
+  test("answers /__meta from the Worker", async ({ request }) => {
+    // /__meta, not /api/health: health depends on the database and has its own tests.
     const meta = await request.get("/__meta");
     expect(meta.status()).toBe(200);
     expect(meta.headers()["content-type"]).toMatch(/^application\/json/);
@@ -23,10 +24,6 @@ test.describe("dev server", () => {
       builtAt: expect.any(String),
       version: expect.any(String),
     });
-
-    const health = await request.get("/api/health");
-    expect(health.status()).toBe(200);
-    expect(await health.json()).toEqual({ ok: true });
   });
 
   test("answers the files host with 404 text/plain and no cookie", async ({ page, origins }) => {
