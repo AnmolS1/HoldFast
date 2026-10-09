@@ -8,7 +8,7 @@
 import { and, asc, desc, eq, getTableColumns, inArray, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import { extOf, nameKeyOf, sanitizeName } from "../../services/filename";
 import type { Executor } from "../client";
-import { decodeCursor, encodeCursor } from "../cursor";
+import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { isUniqueViolation, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import {
@@ -90,6 +90,27 @@ function isKeysetCursor(value: unknown): value is KeysetCursor {
   );
 }
 
+/** Text a cursor may carry into a `::text` comparison: Postgres refuses a NUL byte in text. */
+const isCursorText = (value: unknown): value is string => typeof value === "string" && !value.includes("\0");
+
+/**
+ * Does a cursor's key have the types its sort compares? A cursor is unsigned base64 JSON, so
+ * anyone can write one: a key that is not what the cast in `keysetPage` expects must be refused
+ * here as `validation`, not reach Postgres and come back as a failed cast (a 500).
+ */
+function keyFitsSort(sort: NodeSort, key: readonly (string | number)[]): boolean {
+  switch (sort) {
+    case "name":
+      return key.length === 1 && isCursorText(key[0]);
+    case "size":
+      return key.length === 1 && typeof key[0] === "number" && Number.isSafeInteger(key[0]) && key[0] >= 0;
+    case "updated":
+      return key.length === 1 && isCursorTimestamp(key[0]);
+    case "kind":
+      return key.length === 2 && isCursorText(key[0]) && isCursorText(key[1]);
+  }
+}
+
 /** Per sort: the ordered columns (id comes last in every order) and the row → key mapping. */
 function sortSpec(sort: NodeSort): {
   columns: SQL[];
@@ -140,7 +161,7 @@ async function keysetPage(
       after.scope !== scope ||
       after.sort !== sort ||
       after.dir !== dir ||
-      after.key.length !== spec.columns.length ||
+      !keyFitsSort(sort, after.key) ||
       !segments.includes(after.kind)
     ) {
       throw new QueryError("validation", "cursor does not match this listing");
@@ -354,7 +375,7 @@ export async function rename(db: Executor, nodeId: string, rawName: string): Pro
  * moves of one owner are serialised with a transaction-scoped advisory lock (two concurrent
  * moves could otherwise each pass the cycle check and together build a cycle), then the node and
  * the target are locked `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found`
- * for a missing, trashed, system or foreign node or target.
+ * for a missing, trashed (itself or under a trashed folder), system or foreign node or target.
  */
 export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
   if (!isUuid(nodeId) || (newParentId !== null && !isUuid(newParentId))) throw new QueryError("not_found");
@@ -373,6 +394,9 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
     if (!node || node.system !== null || node.deletedAt !== null || node.ownerId !== peek.ownerId) {
       throw new QueryError("not_found");
     }
+    // Trashed by ancestry too: moving a node out of a trashed folder would be a restore that
+    // skips `restore` (and takes content out of a folder whose purge may already be requested).
+    if (await effectiveTrashed(tx, nodeId)) throw new QueryError("not_found");
     if (newParentId !== null) {
       const target = locked.find((row) => row.id === newParentId);
       if (!target || target.kind !== "folder" || target.system !== null || target.ownerId !== node.ownerId) {
@@ -499,15 +523,26 @@ export type ScanResult = {
 };
 
 /**
- * The one writer of a verdict. It never weakens a blocking state:
+ * The one writer of a verdict. The verdict belongs to ONE object — `r2Key`, the key that was
+ * scanned — and is written only while that key is still the node's current version. A node that
+ * was replaced in the meantime has a new key and a new, unscanned version: a late verdict for the
+ * old object must not mark it (null is returned and the caller acknowledges the message).
+ *
+ * It never weakens a blocking state:
  * - a `suspected_csam` node keeps its status and reason;
  * - an `under_review` node keeps `under_review` and stores the verdict in `scanStatusPrev` (what a
  *   dismissal restores) — unless the verdict is `suspected_csam`, which replaces it;
  * - any other node takes the verdict.
  * The detail, sniffed type, hash and scan time are written in every case.
- * Returns the row as written, or null when there is no such node.
+ * Returns the row as written, or null when there is no such node or `r2Key` is not (or no
+ * longer) its current version.
  */
-export async function setScanResult(tx: Executor, nodeId: string, result: ScanResult): Promise<Node | null> {
+export async function setScanResult(
+  tx: Executor,
+  nodeId: string,
+  r2Key: string,
+  result: ScanResult,
+): Promise<Node | null> {
   if (!isUuid(nodeId)) return null;
   const next = sql`${result.scanStatus}::scan_status`;
   const reason = result.scanReason ?? null;
@@ -526,7 +561,7 @@ export async function setScanResult(tx: Executor, nodeId: string, result: ScanRe
       ...(result.mimeSniffed !== undefined ? { mimeSniffed: result.mimeSniffed } : {}),
       ...(result.sha256 !== undefined ? { sha256: result.sha256 } : {}),
     })
-    .where(eq(nodes.id, nodeId))
+    .where(and(eq(nodes.id, nodeId), eq(nodes.r2Key, r2Key)))
     .returning();
   return row ?? null;
 }

@@ -297,6 +297,57 @@ describe("listChildren: the four keysets", () => {
     await expectCode(listStarred(db, owner, { cursor, limit: 2, visibleStatuses: OWNER }), "validation");
     await expectCode(listChildren(db, { ...args, limit: 0 }), "validation");
   });
+
+  // A cursor is unsigned base64 JSON: the client can write any key into one. A key of the wrong
+  // type used to reach the `::bigint` / `::timestamptz` cast and fail in Postgres — a 500 and an
+  // error report per request — instead of being refused as a bad cursor.
+  it("rejects a forged cursor whose key has the wrong type for the sort, as validation", async () => {
+    const { owner, parent } = await seeded();
+    const base = {
+      scope: { ownerId: owner },
+      parentId: parent.id,
+      visibleStatuses: OWNER,
+      limit: 2,
+    } as const;
+    const forge = (real: string, key: unknown[]) => {
+      const decoded = JSON.parse(Buffer.from(real, "base64url").toString("utf8")) as { t: string; v: object };
+      return Buffer.from(JSON.stringify({ t: decoded.t, v: { ...decoded.v, key } })).toString("base64url");
+    };
+    const cases: Array<[NodeSort, unknown[][]]> = [
+      ["size", [["x"], ["12"], [-1], [1.5], [1e30], [null], [], [1, 2]]],
+      [
+        "updated",
+        [
+          ["x"],
+          [12],
+          ["2026-13-45T00:00:00.000000Z"],
+          ["2026-02-30T00:00:00.000000Z"],
+          ["2026-01-01T25:00:00.000000Z"],
+          ["2026-01-01 00:00:00"],
+          ["2026-01-01T00:00:00.000000Z'; SELECT 1 --"],
+          ["infinity"],
+          [],
+        ],
+      ],
+      ["name", [[12], ["a\u0000b"], [], ["a", "b"]]],
+      ["kind", [["txt"], ["txt", 5], ["a\u0000", "b"], ["txt", "a", "b"]]],
+    ];
+    for (const [sort, keys] of cases) {
+      const args = { ...base, sort, dir: "asc" } as const;
+      const first = await listChildren(db, args);
+      const real = first.nextCursor!;
+      expect(real, sort).toEqual(expect.any(String));
+      // The control: the listing's own cursor still pages.
+      const second = await listChildren(db, { ...args, cursor: real });
+      expect(second.items.length, sort).toBeGreaterThan(0);
+      expect(second.items.map((n) => n.id)).not.toContain(first.items[0]!.id);
+      for (const key of keys) {
+        const error = await rejection(listChildren(db, { ...args, cursor: forge(real, key) }));
+        expect(error, `${sort} ${JSON.stringify(key)}`).toBeInstanceOf(QueryError);
+        expect((error as QueryError).code, `${sort} ${JSON.stringify(key)}`).toBe("validation");
+      }
+    }
+  });
 });
 
 describe("listRecent and listStarred", () => {
@@ -460,6 +511,29 @@ describe("createFolder, rename, move", () => {
     await expectCode(rename(db, file.id, ".."), "validation");
     await expectCode(rename(db, uuidv7(), "x"), "not_found");
     expect((await getNode(db, file.id))!.name).toBe("Final Report.PDF");
+  });
+
+  // Trash marks only the trashed root. A node inside a trashed folder has no `deletedAt` of its
+  // own; moving it out would bring it back without `restore` ever running.
+  it("move refuses a node that is in the trash by ancestry", async () => {
+    const owner = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const binned = await makeFolder(db, owner, null, `binned-${rand()}`, {
+      deletedAt: new Date(),
+      trashedRoot: true,
+      purgeRequestedAt: new Date(),
+    });
+    const sub = await makeFolder(db, owner, binned.id, "sub");
+    const inside = await makeFile(db, owner, binned.id, "inside.txt");
+    const deep = await makeFile(db, owner, sub.id, "deep.txt");
+    for (const node of [inside, deep, sub]) {
+      await expectCode(move(db, node.id, live.id), "not_found");
+      await expectCode(move(db, node.id, null), "not_found");
+    }
+    await expectCode(move(db, deep.id, binned.id), "not_found");
+    expect((await getNode(db, inside.id))!.parentId).toBe(binned.id);
+    expect((await getNode(db, deep.id))!.parentId).toBe(sub.id);
+    expect((await getNode(db, sub.id))!.parentId).toBe(binned.id);
   });
 
   it("move rejects a cycle, a collision and a foreign or missing target; moves to a folder and to the root", async () => {
@@ -656,7 +730,7 @@ describe("scan results", () => {
       sha256: "client-hash",
       mimeSniffed: null,
     });
-    const written = await setScanResult(db, file.id, {
+    const written = await setScanResult(db, file.id, file.r2Key!, {
       scanStatus: "infected",
       scanDetail: { signatures: ["Eicar-Test"], engine: "clamav", dbVersion: "27000", durationMs: 12 },
       mimeSniffed: "application/x-dosexec",
@@ -673,7 +747,7 @@ describe("scan results", () => {
     expect(written!.scannedAt!.getTime()).toBe(scannedAt.getTime());
 
     // A later verdict without a reason clears the reason; absent mime and hash are kept.
-    await setScanResult(db, file.id, { scanStatus: "skipped", scanReason: "size", scannedAt });
+    await setScanResult(db, file.id, file.r2Key!, { scanStatus: "skipped", scanReason: "size", scannedAt });
     expect(await getNode(db, file.id)).toMatchObject({
       scanStatus: "skipped",
       scanReason: "size",
@@ -681,7 +755,7 @@ describe("scan results", () => {
       mimeSniffed: "application/x-dosexec",
       sha256: "server-hash",
     });
-    await setScanResult(db, file.id, { scanStatus: "clean", scannedAt });
+    await setScanResult(db, file.id, file.r2Key!, { scanStatus: "clean", scannedAt });
     expect(await getNode(db, file.id)).toMatchObject({ scanStatus: "clean", scanReason: null });
 
     expect(await resetToPending(db, file.id)).toBe(true);
@@ -691,14 +765,59 @@ describe("scan results", () => {
       scanDetail: null,
       scannedAt: null,
     });
-    expect(await setScanResult(db, uuidv7(), { scanStatus: "clean", scannedAt })).toBeNull();
+    expect(await setScanResult(db, uuidv7(), file.r2Key!, { scanStatus: "clean", scannedAt })).toBeNull();
     expect(await resetToPending(db, uuidv7())).toBe(false);
+  });
+
+  // v1 is being scanned (a rescan, a redelivery, a stale-claim takeover) when the owner replaces
+  // the file. The late verdict is for v1's object; written to the node it would mark v2 —
+  // never scanned — `clean`, and store v1's hash on it.
+  it("a verdict for a replaced version is not written to the new version", async () => {
+    const owner = await makeUser(db);
+    const file = await makeFile(db, owner, null, `rv-${rand()}.bin`, {
+      scanStatus: "error",
+      sha256: "v1-hash",
+    });
+    const v1Key = file.r2Key!;
+    const v2 = {
+      r2Key: `u/${owner}/${file.id}/v2-${rand()}`,
+      versionId: `v2-${rand()}`,
+      size: 7,
+      sha256: null,
+    };
+    await replaceVersion(db, file.id, { ...v2, createdBy: owner });
+
+    const late = await setScanResult(db, file.id, v1Key, {
+      scanStatus: "clean",
+      mimeSniffed: "text/plain",
+      sha256: "v1-server-hash",
+      scannedAt,
+    });
+    expect(late).toBeNull();
+    expect(await getNode(db, file.id)).toMatchObject({
+      r2Key: v2.r2Key,
+      scanStatus: "pending",
+      sha256: null,
+      mimeSniffed: null,
+      scannedAt: null,
+    });
+    // A key that never belonged to the node is refused the same way.
+    expect(await setScanResult(db, file.id, "u/other/key", { scanStatus: "clean", scannedAt })).toBeNull();
+    expect((await getNode(db, file.id))!.scanStatus).toBe("pending");
+
+    // v2's own verdict lands.
+    const own = await setScanResult(db, file.id, v2.r2Key, {
+      scanStatus: "infected",
+      sha256: "v2-hash",
+      scannedAt,
+    });
+    expect(own).toMatchObject({ scanStatus: "infected", sha256: "v2-hash", r2Key: v2.r2Key });
   });
 
   it("a verdict never weakens suspected_csam, and goes to scanStatusPrev while under review", async () => {
     const owner = await makeUser(db);
     const csam = await makeFile(db, owner, null, `c-${rand()}.bin`, { scanStatus: "suspected_csam" });
-    await setScanResult(db, csam.id, { scanStatus: "clean", scannedAt });
+    await setScanResult(db, csam.id, csam.r2Key!, { scanStatus: "clean", scannedAt });
     expect(await getNode(db, csam.id)).toMatchObject({ scanStatus: "suspected_csam", scanStatusPrev: null });
     expect(await resetToPending(db, csam.id)).toBe(false);
 
@@ -706,14 +825,18 @@ describe("scan results", () => {
       scanStatus: "under_review",
       scanStatusPrev: "pending",
     });
-    await setScanResult(db, reviewed.id, { scanStatus: "skipped", scanReason: "encrypted", scannedAt });
+    await setScanResult(db, reviewed.id, reviewed.r2Key!, {
+      scanStatus: "skipped",
+      scanReason: "encrypted",
+      scannedAt,
+    });
     expect(await getNode(db, reviewed.id)).toMatchObject({
       scanStatus: "under_review",
       scanStatusPrev: "skipped",
       scanReason: "encrypted",
     });
     expect(await resetToPending(db, reviewed.id)).toBe(false);
-    await setScanResult(db, reviewed.id, { scanStatus: "suspected_csam", scannedAt });
+    await setScanResult(db, reviewed.id, reviewed.r2Key!, { scanStatus: "suspected_csam", scannedAt });
     expect(await getNode(db, reviewed.id)).toMatchObject({
       scanStatus: "suspected_csam",
       scanStatusPrev: null,
