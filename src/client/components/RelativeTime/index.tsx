@@ -20,6 +20,7 @@ export function RelativeTime({ value, variant = "relative", timeZone }: Relative
     <Box
       component="time"
       className="mono"
+      sx={{ whiteSpace: "nowrap", flex: "none" }}
       dateTime={iso}
       title={formatDate(value, { timeZone: zone, style: "dateTime" })}
     >
