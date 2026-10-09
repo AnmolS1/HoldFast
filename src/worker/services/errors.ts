@@ -6,6 +6,11 @@
 // The status comes from the table in src/shared/errors.ts — never pass one. `401 unauthorized`
 // has a single meaning (no session) and is produced only by `requireUser`.
 // A response never carries a stack trace, SQL text or an upstream error message.
+//
+// The query helpers (src/worker/db/**) cannot import this file — they also run under plain Node —
+// so they throw `QueryError`, which carries the same shared code. The handlers below answer it
+// exactly as they answer an `AppError`. `LegalHoldError` is deliberately NOT mapped: a hold must
+// never be disclosed, so one that escapes a route is an unexpected failure (500, reported).
 
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -14,10 +19,12 @@ import { ZodError } from "zod";
 import {
   ERROR_STATUS,
   INTERNAL_ERROR,
+  isErrorCode,
   type ErrorCode,
   type ErrorEnvelope,
   type InternalErrorEnvelope,
 } from "../../shared/errors";
+import { QueryError } from "../db/errors";
 import { captureError } from "../sentry";
 import { writeMetric } from "./metrics";
 import type { AppEnv } from "./request-context";
@@ -98,8 +105,19 @@ function fromHttpException(error: HTTPException): AppError | null {
   }
 }
 
+/** A query helper's failure as the route-level error: same code, same details. */
+function fromQueryError(error: QueryError): AppError | null {
+  // The code is typed, but the class is also built by code this module does not own: a value
+  // outside the table is an unexpected failure, not a status picked from thin air.
+  if (!isErrorCode(error.code)) return null;
+  // A helper that gave no message has its code as the message; the caller gets the default text.
+  const message = error.message === error.code ? undefined : error.message;
+  return new AppError(error.code, message, error.details);
+}
+
 function asAppError(error: unknown): AppError | null {
   if (error instanceof AppError) return error;
+  if (error instanceof QueryError) return fromQueryError(error);
   if (error instanceof ZodError) {
     return new AppError("validation", undefined, {
       issues: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),

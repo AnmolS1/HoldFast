@@ -1,5 +1,8 @@
-// CONTRACT STUB (contracts-0). Owner: T07 (worker core), which checks every field below against
-// the generated auth schema and the installed Better Auth types, and tightens what it can.
+// What the worker core knows about a session. Owner: the worker core (T07).
+//
+// The row types of the generated auth schema (src/worker/db/auth-schema.ts) are assignable to
+// these — a type-level test holds them to it (tests/unit/worker-core/integration.test.ts) — so a
+// regenerated schema that renames or retypes a field stops the typecheck here, not at run time.
 //
 // Structural types on purpose: no Better Auth import. Field names come from Better Auth 1.7.7
 // (core user and session, the admin plugin, the two-factor plugin) and from the additional fields

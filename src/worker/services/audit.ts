@@ -15,22 +15,14 @@
 // Not for thumbnail or inline serves (those are aggregated elsewhere).
 
 import type { Context } from "hono";
+import type { AuditRow } from "../db/queries/audit";
 import { captureError } from "../sentry";
 import { now } from "./clock";
 import { dayUTC, ipHashDaily } from "./ip-hash";
 import { writeMetric } from "./metrics";
-import {
-  coreFor,
-  coreOf,
-  db,
-  defer,
-  keys,
-  type AppEnv,
-  type CoreDeps,
-  type ServiceDeps,
-} from "./request-context";
+import { coreFor, coreOf, db, defer, keys, type AppEnv, type ServiceDeps } from "./request-context";
 
-export type AuditRow = Parameters<CoreDeps["insertAudit"]>[1];
+export type { AuditRow };
 export type AuditTarget = { type: string; id?: string | null } | null;
 export type AuditOptions = { actorUserId?: string | null; actorType?: AuditRow["actorType"] };
 
