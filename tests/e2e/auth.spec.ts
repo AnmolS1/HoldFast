@@ -155,6 +155,12 @@ test.describe("sign-up", () => {
     origins,
     virtualAuthenticator,
   }) => {
+    // The longest chain in the suite: three password hashes, three mails, two WebAuthn ceremonies
+    // and two TOTP codes against ONE single-threaded dev Worker, and it runs in both projects at
+    // the same moment. Measured: 4 s on an idle machine, 21 s when something else has the CPUs
+    // (the dev server already warm — tests/setup/e2e-global-setup.ts). Thirty seconds is not a
+    // statement about this test; three times that is. This ONE test — no other budget is raised.
+    test.slow();
     await stubTurnstile(page);
     const invite = await createInvite();
     const email = freshEmail();

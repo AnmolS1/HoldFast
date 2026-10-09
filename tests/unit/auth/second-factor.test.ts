@@ -12,7 +12,7 @@
 // Passkeys (with and without user verification) need a browser: tests/e2e/auth.spec.ts.
 import { env } from "cloudflare:workers";
 import { and, eq, like } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAuth } from "../../../src/worker/auth/create-auth";
 import { createScope } from "../../../src/worker/auth/scope";
 import {
@@ -47,6 +47,11 @@ import {
   waitForMail,
   type Client,
 } from "./helpers";
+
+// These tests use REAL one-time codes: a code belongs to a 30-second step, a step is accepted
+// once, and `nextTotp` never hands out a code that is about to go stale — so a test that needs a
+// third code for one authenticator may have to wait for the next step to begin (up to 30 s).
+vi.setConfig({ testTimeout: 75_000 });
 
 const ADMIN_PATH = "/api/auth/admin/set-role";
 

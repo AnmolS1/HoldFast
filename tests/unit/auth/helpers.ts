@@ -529,12 +529,19 @@ export async function totp(uriOrSecret: string, at: number = Date.now()): Promis
 // in ascending order: the previous step, the current one, the next. `nextTotp` hands out, per
 // authenticator, the oldest step still valid that is newer than the last one it handed out.
 const lastStep = new Map<string, number>();
+/** How long a handed-out code must stay valid at the least. */
+const TOTP_MARGIN_MS = 4_000; // (in-isolate requests: milliseconds away)
 
 /** A currently valid code for the authenticator, newer than any this file has handed out for it. */
 export async function nextTotp(uriOrSecret: string): Promise<string> {
   for (;;) {
-    const current = Math.floor(Date.now() / 30_000);
-    const step = Math.max(current - 1, (lastStep.get(uriOrSecret) ?? -1) + 1);
+    const at = Date.now();
+    const current = Math.floor(at / 30_000);
+    // The previous step's code is accepted only until the CURRENT step ends. It is handed out
+    // only while at least TOTP_MARGIN_MS of that remain: a request that is slow to arrive (a
+    // loaded machine) must not find its code two steps old — "Invalid code", once in a while.
+    const oldest = 30_000 - (at % 30_000) >= TOTP_MARGIN_MS ? current - 1 : current;
+    const step = Math.max(oldest, (lastStep.get(uriOrSecret) ?? -1) + 1);
     if (step <= current + 1) {
       lastStep.set(uriOrSecret, step);
       return totp(uriOrSecret, step * 30_000);
