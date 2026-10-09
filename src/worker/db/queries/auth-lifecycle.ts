@@ -395,6 +395,86 @@ export async function replaceUnverifiedEmail(
   }
 }
 
+// ── an account whose address was never proven ───────────────────────────────────────────────
+
+export type UnprovenReset = {
+  /** What the person who now PROVES the address stated at the intent step. */
+  termsAcceptedAt: Date;
+  termsVersion: string;
+  ageVerifiedAt: Date;
+  invitedBy: string | null;
+  quotaBytes: number;
+  name: string;
+};
+
+/**
+ * Empties an UNVERIFIED account of everything whoever created it could have planted, in one
+ * transaction: its password (every `account` row), its sessions, passkeys, two-factor secret and
+ * backup codes, the tokens that name it, and the profile it was given — and writes the policy
+ * fields of the person who is about to prove the address. The row itself (its id, its address)
+ * stays. Returns what was removed, or null when the account is not there or IS verified (then
+ * nothing is touched: a proven owner's credentials are never removed this way).
+ *
+ * The row is locked first, so a verification racing this either lands before (→ null) or waits.
+ */
+export async function clearUnprovenAccount(
+  db: Executor,
+  userId: string,
+  reset: UnprovenReset,
+): Promise<{
+  accounts: number;
+  sessions: number;
+  passkeys: number;
+  twoFactor: number;
+  tokens: number;
+} | null> {
+  return db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ id: user.id })
+      .from(user)
+      .where(and(eq(user.id, userId), eq(user.emailVerified, false)))
+      .for("update");
+    if (locked.length === 0) return null;
+    const sessions = await tx.delete(session).where(eq(session.userId, userId)).returning({ id: session.id });
+    const accounts = await tx.delete(account).where(eq(account.userId, userId)).returning({ id: account.id });
+    const passkeys = await tx.delete(passkey).where(eq(passkey.userId, userId)).returning({ id: passkey.id });
+    const factors = await tx
+      .delete(twoFactor)
+      .where(eq(twoFactor.userId, userId))
+      .returning({ id: twoFactor.id });
+    // Reset, delete-account, two-factor and trusted-device tokens carry the user id as value.
+    const tokens = await tx
+      .delete(verification)
+      .where(eq(verification.value, userId))
+      .returning({ id: verification.id });
+    await tx
+      .update(user)
+      .set({
+        name: reset.name,
+        image: null,
+        timezone: null,
+        locale: "en",
+        displayNameKey: null,
+        avatarNodeId: null,
+        twoFactorEnabled: false,
+        role: "user",
+        termsAcceptedAt: reset.termsAcceptedAt,
+        termsVersion: reset.termsVersion,
+        ageVerifiedAt: reset.ageVerifiedAt,
+        invitedBy: reset.invitedBy,
+        quotaBytes: reset.quotaBytes,
+      })
+      .where(eq(user.id, userId));
+    return {
+      accounts: accounts.length,
+      sessions: sessions.length,
+      passkeys: passkeys.length,
+      twoFactor: factors.length,
+      tokens: tokens.length,
+    };
+  });
+}
+
 // ── the end of an account ───────────────────────────────────────────────────────────────────
 
 /**

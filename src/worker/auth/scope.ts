@@ -43,6 +43,10 @@ export type AuthFacts = {
   emailChangedUserId: string | null;
   /** The admin gate refused the request (it has written its own audit row). */
   adminDenied: boolean;
+  /** The address of the user row this request is creating (set before the row exists), or null. */
+  signingUpEmail: string | null;
+  /** A provider identity is being linked to an account that already existed (hooks.ts). */
+  linking: { userId: string; providerId: string; cleaned: boolean } | null;
 };
 
 export type AuthScope = {
@@ -71,6 +75,8 @@ export function emptyFacts(): AuthFacts {
     passwordResetUserId: null,
     emailChangedUserId: null,
     adminDenied: false,
+    signingUpEmail: null,
+    linking: null,
   };
 }
 

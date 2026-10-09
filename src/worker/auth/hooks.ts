@@ -25,11 +25,17 @@
 import { generateId } from "@better-auth/core/utils/id";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
-import { ensureUserPrefs, getAccountByEmail, releaseSignup } from "../db/queries/auth-lifecycle";
+import {
+  clearUnprovenAccount,
+  ensureUserPrefs,
+  getAccount,
+  getAccountByEmail,
+  releaseSignup,
+} from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
-import { sendSignupAttempt } from "../services/email";
+import { sendSignInMethodAdded, sendSignupAttempt } from "../services/email";
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
   checkSessionStart,
@@ -41,7 +47,7 @@ import {
   type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
-import { countFor, reportError } from "./observe";
+import { countFor, record, reportError } from "./observe";
 import type { AuthScope, ClientFacts } from "./scope";
 import {
   cookieAttributes,
@@ -154,6 +160,9 @@ export function buildHooks(scope: AuthScope) {
             const path = ctx?.path;
             const email = user.email.toLowerCase();
             const client = clientOf(scope, ctx);
+            // For the `account.create` hook below: the account row that follows belongs to a NEW
+            // user. (Set here, not in `after`: after-hooks run when the endpoint's work is done.)
+            scope.facts.signingUpEmail = email;
             if (path === "/sign-up/email") {
               const grant = await takeSignup(scope, email, parseStatement(ctx?.body), client, null);
               return { data: grant };
@@ -224,6 +233,111 @@ export function buildHooks(scope: AuthScope) {
               });
             }
           }
+        },
+      },
+    },
+    // LINKING A PROVIDER IDENTITY TO AN ACCOUNT THAT ALREADY EXISTS.
+    //
+    // Better Auth links a Google sign-in to the local account with the same address. It does so
+    // only when Google says the address is verified (it is not a "trusted provider" here) and the
+    // addresses are equal (`allowDifferentEmails` is off). What it cannot know is whether the
+    // LOCAL account's address was ever proven. An unverified local account may be somebody
+    // else's: anyone can sign up with a victim's address and a password of their own, and wait.
+    // Linking the victim's Google identity to that row as it is would verify the address and
+    // leave the stranger's password opening the account ("pre-hijacking").
+    //
+    //   the local account is VERIFIED    link; its credentials stay; the owner is told.
+    //   the local account is UNVERIFIED  the Google user is the first to PROVE the address, and
+    //                                    is treated as the new sign-up they are: the intent
+    //                                    cookie (invite, age, terms) is required and taken, and
+    //                                    the row is emptied of everything its creator could
+    //                                    have planted — password, sessions, passkeys, two-factor
+    //                                    — before the link. Without the intent: refused, and
+    //                                    nothing is linked or removed.
+    //
+    // Atomicity, as it is: the emptying is ONE transaction, committed here, before Better Auth
+    // inserts the provider's account row and marks the address verified (its own statements, no
+    // transaction — auth/create-auth.ts). If that insert then fails, the account is left
+    // unverified with no credential at all: nobody can enter it, and nothing of the stranger's
+    // survives. The order cannot leave the stranger's password next to a verified address.
+    account: {
+      create: {
+        before: async (account: { userId: string; providerId: string }, ctx: HookContext) => {
+          // The password row of an email sign-up, and the first account row of a user this
+          // request has just created (a new OAuth sign-up): not a link.
+          if (account.providerId === "credential") return;
+          try {
+            const owner = await getAccount(scope.db, account.userId);
+            if (!owner) return;
+            if (scope.facts.signingUpEmail === owner.email.toLowerCase()) return;
+            if (owner.emailVerified) {
+              scope.facts.linking = { userId: owner.id, providerId: account.providerId, cleaned: false };
+              return;
+            }
+            const cookies = ctx?.headers?.get("cookie") ?? ctx?.request?.headers.get("cookie");
+            const intent = await readIntent(env, scope.keys, cookies, now());
+            if (!intent) throw new SignupRefusal("SIGNUP_INTENT_REQUIRED");
+            const statement = {
+              inviteCode: intent.inviteCode,
+              birthYear: 0,
+              birthMonth: 0,
+              acceptTerms: true as const,
+            };
+            // Invite, velocity and the intent's single use: taken as for any new sign-up.
+            const grant = await takeSignup(scope, owner.email, statement, clientOf(scope, ctx), intent.nonce);
+            const removed = await clearUnprovenAccount(scope.db, owner.id, {
+              ...grant,
+              // The name the row's creator typed is theirs, not the owner's.
+              name: owner.email.split("@")[0] ?? "",
+            });
+            // Verified in the meantime (the owner followed a mailed link a moment ago): a proven
+            // account after all — link it as one, and give back what was just taken.
+            if (removed === null) {
+              await releaseUnusedReservation(scope);
+              scope.facts.linking = { userId: owner.id, providerId: account.providerId, cleaned: false };
+              return;
+            }
+            scope.reservation = null;
+            scope.facts.linking = { userId: owner.id, providerId: account.providerId, cleaned: true };
+            record(
+              scope.deps,
+              "auth.prehijack_cleanup",
+              { type: "user", id: owner.id },
+              { ...removed },
+              {
+                actorUserId: owner.id,
+                actorType: "user",
+              },
+            );
+          } catch (error) {
+            return refused(error);
+          }
+        },
+        after: async (account: { userId: string; providerId: string }) => {
+          const linking = scope.facts.linking;
+          if (!linking || linking.userId !== account.userId || linking.providerId !== account.providerId)
+            return;
+          await quietly(env, "account_linked", async () => {
+            const owner = await getAccount(scope.db, account.userId);
+            if (!owner) return;
+            record(
+              scope.deps,
+              "auth.provider_linked",
+              { type: "user", id: owner.id },
+              {
+                provider: account.providerId === "google" ? "google" : "other",
+                cleaned: linking.cleaned,
+              },
+              { actorUserId: owner.id, actorType: "user" },
+            );
+            // A proven owner is told that a new way in exists. (After a cleanup the address has
+            // only just been proven, by this very sign-in: there is no earlier owner to tell.)
+            if (!linking.cleaned) {
+              scope.deps.defer(
+                sendSignInMethodAdded(scope.deps, { to: owner.email, name: owner.name, method: "google" }),
+              );
+            }
+          });
         },
       },
     },

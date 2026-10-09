@@ -400,12 +400,15 @@ describe("a Google sign-in of an existing account", () => {
       "google",
     ]);
 
-    // An address someone signed up with but never proved: Google must not sign in to it (the
-    // account could be an attacker's, waiting for the real owner to arrive).
+    // An address someone signed up with but never proved: Google must not sign in to it as it is
+    // (the account could be an attacker's, waiting for the real owner to arrive). From the
+    // sign-in screen — no intent step — it is refused like any Google sign-up without one, and
+    // nothing is linked or removed. With the intent step the account is emptied first:
+    // tests/unit/auth/google-linking.test.ts.
     const unverified = await signUp(newClient());
     const victim = newClient();
     const { location } = await googleRoundTrip(victim, profileFor(unverified.email), "/login");
-    expect(new URL(location, "http://x").searchParams.get("error")).toBe("account_not_linked");
+    expect(new URL(location, "http://x").searchParams.get("error")).toBe("SIGNUP_INTENT_REQUIRED");
     expect(await getSession(victim)).toBeNull();
     const row = await userByEmail(unverified.email);
     expect((await accountsOf(row!.id)).map((a) => a.providerId)).toEqual(["credential"]);

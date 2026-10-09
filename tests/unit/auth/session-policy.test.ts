@@ -539,7 +539,9 @@ describe("the options object", () => {
   it("has no delete hook that could be mistaken for a veto: no databaseHooks.user.delete, no afterDelete", () => {
     const options = buildAuthOptions(scope());
     expect(Object.keys(options.databaseHooks.user).sort()).toEqual(["create", "update"]);
-    expect(Object.keys(options.databaseHooks).sort()).toEqual(["session", "user"]);
+    // `account` is the provider-linking policy (create only); what must never exist is a DELETE hook.
+    expect(Object.keys(options.databaseHooks).sort()).toEqual(["account", "session", "user"]);
+    expect(Object.keys(options.databaseHooks.account)).toEqual(["create"]);
     expect(Object.keys(options.user.deleteUser).sort()).toEqual([
       "beforeDelete",
       "enabled",

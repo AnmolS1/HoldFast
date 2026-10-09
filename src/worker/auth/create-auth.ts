@@ -161,6 +161,21 @@ export function buildAuthOptions(scope: AuthScope) {
     account: {
       // Google's tokens are not used after sign-in; what is stored of them is stored encrypted.
       encryptOAuthTokens: true,
+      // Linking a provider identity to an existing account (see the `account.create` hook in
+      // auth/hooks.ts, which is where the policy for an UNVERIFIED local account lives):
+      //  - no trusted providers: a link needs the provider to say the address is verified;
+      //  - never to a different address;
+      //  - `requireLocalEmailVerified: false` hands the unverified-local case to our hook, which
+      //    either empties the account first or refuses. Better Auth's default (true) refuses it
+      //    outright — safe, but then whoever signed up first with someone's address locks that
+      //    person out of signing in with Google for good.
+      accountLinking: {
+        enabled: true,
+        trustedProviders: [],
+        allowDifferentEmails: false,
+        requireLocalEmailVerified: false,
+        updateUserInfoOnLink: false,
+      },
     },
     onAPIError: {
       // An OAuth error with no page of its own lands on the sign-in screen, not on a page

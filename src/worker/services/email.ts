@@ -303,6 +303,19 @@ export const templates = {
       { text: NOT_YOU },
     ],
   }),
+  signInMethodAdded: (d: { name?: unknown; method?: unknown }): Draft => ({
+    subject: "A new way to sign in was added to your account",
+    heading: "A new way to sign in was added",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: `${d.method === "google" ? "Google sign-in" : "A new sign-in method"} was connected to your Holdfast account. It can now be used to sign in.`,
+      },
+      {
+        text: `If this wasn't you, change your password and contact ${SUPPORT_EMAIL}.`,
+      },
+    ],
+  }),
   passkeyAdded: (d: { name?: unknown }): Draft => ({
     subject: "A passkey was added to your account",
     heading: "A passkey was added",
@@ -484,6 +497,7 @@ const CLASS_OF: Record<TemplateName, EmailClass> = {
   twoFactorEnabled: "security",
   twoFactorDisabled: "security",
   passkeyAdded: "security",
+  signInMethodAdded: "security",
   passkeyRemoved: "security",
   newDeviceSignIn: "security",
   accountSuspended: "security",
@@ -617,6 +631,8 @@ export const sendTwoFactorEnabled = (deps: ServiceDeps, d: To) =>
   deliver(deps, "twoFactorEnabled", d.to, () => templates.twoFactorEnabled(d));
 export const sendTwoFactorDisabled = (deps: ServiceDeps, d: To) =>
   deliver(deps, "twoFactorDisabled", d.to, () => templates.twoFactorDisabled(d));
+export const sendSignInMethodAdded = (deps: ServiceDeps, d: To & { method: "google" }) =>
+  deliver(deps, "signInMethodAdded", d.to, () => templates.signInMethodAdded(d));
 export const sendPasskeyAdded = (deps: ServiceDeps, d: To) =>
   deliver(deps, "passkeyAdded", d.to, () => templates.passkeyAdded(d));
 export const sendPasskeyRemoved = (deps: ServiceDeps, d: To) =>
