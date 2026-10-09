@@ -278,7 +278,9 @@ describe("the gates, one at a time", () => {
     await expectRefused("INVITE_INVALID", { inviteCode: "NO-SUCH-CODE-EVER" });
     await expectRefused("INVITE_INVALID", { inviteCode: await createInvite({ revokedAt: new Date() }) });
     await expectRefused("INVITE_INVALID", {
-      inviteCode: await createInvite({ expiresAt: new Date(Date.now() - 60_000) }),
+      // An hour, not a minute: the expiry is compared with the DATABASE's clock, and a local
+      // Postgres in a VM can lag the host by minutes after the machine has slept.
+      inviteCode: await createInvite({ expiresAt: new Date(Date.now() - 3_600_000) }),
     });
     const spent = await createInvite({ maxUses: 2, uses: 2 });
     const refused = await signUp(newClient(), { inviteCode: spent });
