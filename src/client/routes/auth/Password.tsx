@@ -12,7 +12,7 @@ import { authErrorMessage, captchaOptions } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
 import { isEmail, PASSWORD_MAX, PASSWORD_MIN } from "./validation";
 
-const backSx = { color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24 } as const;
+const backSx = { color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } } as const;
 
 /** Ask for a reset link. The answer is the same whether or not the address has an account. */
 export function ForgotPasswordPage() {

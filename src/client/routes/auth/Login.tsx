@@ -18,7 +18,7 @@ const REASONS: Record<string, { key: MessageKey; tone: "neutral" | "danger" }> =
   reset: { key: "login.reset", tone: "neutral" },
 };
 
-const linkSx = { color: hf.text, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24 } as const;
+const linkSx = { color: hf.text, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } } as const;
 
 /** Sign in: passkey first (and offered in the email field), password second, Google third. */
 export function LoginPage() {

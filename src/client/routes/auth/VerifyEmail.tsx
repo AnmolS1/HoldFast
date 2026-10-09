@@ -134,7 +134,7 @@ export function VerifyEmailPage() {
           )}
         </Box>
       ) : null}
-      <Box component={RouterLink} to="/login" sx={{ color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24 }}>
+      <Box component={RouterLink} to="/login" sx={{ color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } }}>
         {t("forgot.back")}
       </Box>
     </AuthCard>

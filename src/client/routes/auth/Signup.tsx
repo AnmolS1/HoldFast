@@ -152,7 +152,7 @@ export function SignupPage() {
           {errors.birth ? <FormError>{t(errors.birth)}</FormError> : null}
         </Box>
         <Box>
-          <Box component="label" sx={{ display: "flex", alignItems: "flex-start", gap: 2, fontSize: 12, lineHeight: "16px", color: hf.textSecondary, minHeight: 24, cursor: "pointer" }}>
+          <Box component="label" sx={{ display: "flex", alignItems: "flex-start", gap: 2, fontSize: 12, lineHeight: "16px", color: hf.textSecondary, minHeight: 24, cursor: "pointer", "@media (max-width:1023.95px)": { minHeight: 44, alignItems: "center" } }}>
             <Box component="input" type="checkbox" name="acceptTerms" checked={values.acceptTerms} onChange={(e) => set("acceptTerms", e.target.checked)} sx={{ width: 16, height: 16, margin: "0 0 0 0", flex: "none" }} />
             <span className="prose">
               {t("signup.assent.before")}
@@ -178,7 +178,7 @@ export function SignupPage() {
           {t("auth.google")}
         </Button>
       </Box>
-      <Box component={RouterLink} to="/login" sx={{ ...linkSx, fontSize: 12, display: "inline-flex", alignItems: "center", minHeight: 24 }}>
+      <Box component={RouterLink} to="/login" sx={{ ...linkSx, fontSize: 12, display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } }}>
         {t("signup.have")}
       </Box>
     </AuthCard>

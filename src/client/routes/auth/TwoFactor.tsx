@@ -63,7 +63,7 @@ export function TwoFactorPage() {
           errorText={error ?? undefined}
           slotProps={{ htmlInput: totp ? { inputMode: "numeric", maxLength: 7, style: { fontSize: 20, letterSpacing: "0.3em", textAlign: "center", height: 48 } } : { spellCheck: false, autoCapitalize: "off" } }}
         />
-        <Box component="label" sx={{ display: "flex", alignItems: "center", gap: 2, fontSize: 12, color: hf.textSecondary, minHeight: 24, cursor: "pointer" }}>
+        <Box component="label" sx={{ display: "flex", alignItems: "center", gap: 2, fontSize: 12, color: hf.textSecondary, minHeight: 24, cursor: "pointer", "@media (max-width:1023.95px)": { minHeight: 44 } }}>
           <Box component="input" type="checkbox" name="trustDevice" checked={trust} onChange={(e) => setTrust(e.target.checked)} sx={{ width: 16, height: 16, margin: 0 }} />
           {t("twoFactor.trust")}
         </Box>

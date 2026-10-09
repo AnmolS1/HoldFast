@@ -100,6 +100,24 @@ describe("sign-up screen", () => {
     expect(signUp).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["terms not accepted", {}, false],
+    ["an 11-character password", { password: "elevenchars" }, true],
+    ["a malformed email", { email: "ada@" }, true],
+    ["no invite code", { inviteCode: "" }, true],
+    ["under thirteen", { birthYear: "2020" }, true],
+  ] as const)("a form that is complete except for %s is not submitted", async (_name, patch, accept) => {
+    const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
+    const { router } = await openSignup();
+    fill({ inviteCode: "HF-7K2Q", name: "Ada", email: "ada@example.com", password: "correct horse battery", birthMonth: "5", birthYear: "1990", ...patch });
+    if (accept) fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    expect((await screen.findAllByRole("alert")).length).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(signUp).not.toHaveBeenCalled();
+    expect(router.state.location.pathname).toBe("/signup");
+  });
+
   it("a valid form calls signUp.email with the policy fields and goes to /verify-email", async () => {
     const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
     const { router } = await openSignup();

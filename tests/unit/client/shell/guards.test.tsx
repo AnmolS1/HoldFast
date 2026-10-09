@@ -46,6 +46,15 @@ describe("safeNext", () => {
     expect(safeNext(raw, ORIGIN)).toBe("/");
   });
 
+  it("the origin comparison is a second line behind the prefix rules: it alone still stops a host change", () => {
+    // If a future edit loosened the prefix rules, a value that resolves elsewhere must still fail.
+    // `new URL` is the arbiter; this asserts the property the comparison protects.
+    for (const raw of ["//evil.example", "https://evil.example", "/\\evil.example"]) {
+      expect(new URL(raw, ORIGIN).origin).not.toBe(ORIGIN);
+      expect(safeNext(raw, ORIGIN)).toBe("/");
+    }
+  });
+
   it("null and undefined → /", () => {
     expect(safeNext(null, ORIGIN)).toBe("/");
     expect(safeNext(undefined, ORIGIN)).toBe("/");
