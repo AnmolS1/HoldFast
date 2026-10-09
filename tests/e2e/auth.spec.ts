@@ -13,15 +13,17 @@
 // 3 sign-ups a day per client address. Tests wait for SCREENS (a heading, a control), never for
 // the router.
 import { execFile } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { APIRequestContext, Page } from "@playwright/test";
+import type { APIRequestContext, Browser, Page } from "@playwright/test";
 import { hasAdminRole } from "../../src/shared/roles";
 import {
   createInvite,
   FIXTURE_PASSWORD,
+  freshAdminEmail,
   freshEmail,
   localDb,
   signedInAdmin2fa,
@@ -50,6 +52,19 @@ async function sessionOf(request: APIRequestContext, fresh = false): Promise<Ses
   const response = await request.get(`/api/auth/get-session${fresh ? "?disableCookieCache=true" : ""}`);
   expect(response.status()).toBe(200);
   return (await response.json()) as Session;
+}
+
+/**
+ * A verification token for `email` that expired an hour ago, signed as the dev server signs its
+ * own (HS256 under this checkout's BETTER_AUTH_SECRET — read for the signature, never printed).
+ */
+function expiredVerificationToken(email: string): string {
+  const secret = readVars(join(process.cwd(), ".dev.vars"), ["BETTER_AUTH_SECRET"]).BETTER_AUTH_SECRET ?? "";
+  if (!secret) throw new Error("BETTER_AUTH_SECRET is not set in .dev.vars");
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const at = Math.floor(Date.now() / 1000);
+  const body = `${part({ alg: "HS256" })}.${part({ email: email.toLowerCase(), iat: at - 7200, exp: at - 3600 })}`;
+  return `${body}.${createHmac("sha256", secret).update(body).digest("base64url")}`;
 }
 
 /** The app frame is on screen: only a signed-in, verified user with current terms gets it. */
@@ -310,6 +325,175 @@ test.describe("sign-up", () => {
     await page.goto(await linkFromMail(right, "Confirm your email address", "/api/auth/verify-email"));
     await expectSignedIn(page);
     expect((await sessionOf(page.request))?.user).toMatchObject({ email: right, emailVerified: true });
+  });
+});
+
+// A1 — a verification link proves a MAILBOX, not the browser that chose the password
+// (src/worker/auth/mailbox-proof.ts). The same-browser path is the first test of this file.
+test.describe("the verification link, opened in a browser that did not sign up", () => {
+  /** A second browser (its own cookie jar and its own client address), as another person's would be. */
+  async function otherBrowser(browser: Browser, appOrigin: string, ip: string): Promise<Page> {
+    const context = await browser.newContext();
+    await context.route(`${appOrigin}/**`, (route) =>
+      route.continue({ headers: { ...route.request().headers(), "cf-connecting-ip": ip } }),
+    );
+    const page = await context.newPage();
+    const seen: string[] = [];
+    pageErrors.set(page, seen);
+    page.on("pageerror", (error) => seen.push(error.message));
+    await stubTurnstile(page);
+    return page;
+  }
+
+  /** A sign-in attempt from a client that is nobody's browser: the status only. */
+  async function passwordOpens(
+    request: APIRequestContext,
+    origin: string,
+    ip: string,
+    email: string,
+    password: string,
+  ): Promise<number> {
+    const response = await request.post("/api/auth/sign-in/email", {
+      headers: api(origin, ip, { "x-captcha-response": TURNSTILE_TEST_TOKEN }),
+      data: { email, password },
+    });
+    return response.status();
+  }
+
+  const NEW_PASSWORD = "the owner chose this one 7!";
+
+  test("a stranger signs up with someone's address; the owner's click kills the stranger's password and leads to 'set your password'", async ({
+    page,
+    browser,
+    clientIp,
+    origins,
+    playwright,
+  }) => {
+    await stubTurnstile(page);
+    const email = freshEmail();
+    // The stranger, through the real form, with a password of their own.
+    await page.goto(`/signup?invite=${await createInvite()}`);
+    await fillSignUp(page, { email, name: "Not The Owner" });
+    await page.getByRole("button", { name: "Create account" }).click();
+    await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
+    const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
+
+    // The owner opens the mailed link in THEIR browser.
+    const owner = await otherBrowser(browser, origins.app, "10.99.1.1");
+    await owner.goto(link);
+    await expect(owner.getByRole("heading", { name: "Set your password" })).toBeVisible();
+    await expect(owner.getByText("Your email is confirmed.", { exact: false })).toBeVisible();
+    // Nobody is signed in, the token is not left in the address bar, and the address is proven.
+    expect(await sessionOf(owner.request)).toBeNull();
+    await expect.poll(() => owner.url()).toBe(`${origins.app}/set-password`);
+    expect((await userRow(email))?.email_verified).toBe(true);
+    // The stranger's password opens nothing — from the stranger's own browser or anywhere.
+    const outsider = await playwright.request.newContext({ baseURL: origins.app });
+    expect(await passwordOpens(outsider, origins.app, "10.99.1.2", email, FIXTURE_PASSWORD)).toBe(401);
+    expect(await passwordOpens(page.request, origins.app, clientIp, email, FIXTURE_PASSWORD)).toBe(401);
+
+    // The owner chooses the password and signs in with it.
+    await owner.getByLabel("New password").fill(NEW_PASSWORD);
+    await owner.getByRole("button", { name: "Set password" }).click();
+    await expectSignInScreen(owner);
+    await expect(owner.getByText("Password set. Sign in to continue.")).toBeVisible();
+    await fillSignIn(owner, email, NEW_PASSWORD);
+    await expectSignedIn(owner);
+    expect((await sessionOf(owner.request))?.user).toMatchObject({ email, emailVerified: true });
+
+    // The link again, from a third browser: "confirmed, sign in" — and no session.
+    const third = await otherBrowser(browser, origins.app, "10.99.1.3");
+    await third.goto(link);
+    await expectSignInScreen(third);
+    await expect(third.getByText("Email confirmed. Sign in to continue.")).toBeVisible();
+    expect(await sessionOf(third.request)).toBeNull();
+    expect(await passwordOpens(outsider, origins.app, "10.99.1.4", email, FIXTURE_PASSWORD)).toBe(401);
+    await outsider.dispose();
+    await owner.context().close();
+    await third.context().close();
+  });
+
+  test("an expired link and a tampered one say so, sign nobody in and leave the account as it was", async ({
+    page,
+    browser,
+    clientIp,
+    origins,
+  }) => {
+    expect(clientIp).toBeTruthy();
+    await stubTurnstile(page);
+    const email = freshEmail();
+    await page.goto(`/signup?invite=${await createInvite()}`);
+    await fillSignUp(page, { email });
+    await page.getByRole("button", { name: "Create account" }).click();
+    await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
+    const link = new URL(await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email"));
+    const good = link.searchParams.get("token")!;
+
+    const other = await otherBrowser(browser, origins.app, "10.99.2.1");
+    // Tampered: the same token with its signature changed.
+    link.searchParams.set("token", `${good.slice(0, -4)}${good.endsWith("AAAA") ? "BBBB" : "AAAA"}`);
+    await other.goto(link.toString());
+    await expectSignInScreen(other);
+    await expect(other.getByRole("alert")).toContainText("That confirmation link isn't valid any more.");
+    await expect(other.getByText("Email confirmed.", { exact: false })).toHaveCount(0);
+    // Expired: a token for the same address, signed by this server's own key, an hour too old.
+    link.searchParams.set("token", expiredVerificationToken(email));
+    await other.goto(link.toString());
+    await expectSignInScreen(other);
+    await expect(other.getByRole("alert")).toContainText("That confirmation link has expired.");
+    expect(await sessionOf(other.request)).toBeNull();
+    // Nothing was verified and nothing removed: the sign-up's own password is still the account's.
+    expect((await userRow(email))?.email_verified).toBe(false);
+    const credentials = await localDb((db) =>
+      db.query(
+        `SELECT 1 FROM account a JOIN "user" u ON u.id = a.user_id WHERE u.email = $1 AND a.provider_id = 'credential'`,
+        [email],
+      ),
+    );
+    expect(credentials.rowCount).toBe(1);
+    await other.context().close();
+  });
+
+  test("an admin address: no admin role from the click, nor from setting the password — only from the sign-in after it", async ({
+    page,
+    browser,
+    clientIp,
+    origins,
+  }) => {
+    const email = freshAdminEmail();
+    // The stranger signs up with the admin's address (they have an invite).
+    const signUp = await page.request.post("/api/auth/sign-up/email", {
+      headers: api(origins.app, clientIp, { "x-captcha-response": TURNSTILE_TEST_TOKEN }),
+      data: {
+        email,
+        password: FIXTURE_PASSWORD,
+        name: "Not The Admin",
+        inviteCode: await createInvite(),
+        birthYear: 1990,
+        birthMonth: 5,
+        acceptTerms: true,
+        callbackURL: "/login?reason=verified",
+      },
+    });
+    expect(signUp.status()).toBe(200);
+    const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
+
+    const admin = await otherBrowser(browser, origins.app, "10.99.3.1");
+    await admin.goto(link);
+    await expect(admin.getByRole("heading", { name: "Set your password" })).toBeVisible();
+    expect(await userRow(email)).toMatchObject({ email_verified: true, role: "user" });
+    // The stranger's password: dead, and it granted nothing on the way.
+    expect(await passwordOpens(page.request, origins.app, clientIp, email, FIXTURE_PASSWORD)).toBe(401);
+    expect((await userRow(email))?.role).toBe("user");
+
+    await admin.getByLabel("New password").fill(NEW_PASSWORD);
+    await admin.getByRole("button", { name: "Set password" }).click();
+    await expectSignInScreen(admin);
+    expect((await userRow(email))?.role).toBe("user");
+    await fillSignIn(admin, email, NEW_PASSWORD);
+    await expectSignedIn(admin);
+    expect(hasAdminRole(String((await userRow(email))?.role))).toBe(true);
+    await admin.context().close();
   });
 });
 

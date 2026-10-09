@@ -1,10 +1,10 @@
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
-import { useState, type FormEvent } from "react";
-import { Link as RouterLink, useNavigate, useSearchParams } from "react-router";
+import { useEffect, useState, type FormEvent } from "react";
+import { Link as RouterLink, useLocation, useNavigate, useSearchParams } from "react-router";
 import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
-import { t } from "../../lib/i18n";
+import { t, type MessageKey } from "../../lib/i18n";
 import { usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
@@ -94,11 +94,73 @@ export function ForgotPasswordPage() {
   );
 }
 
-/** Choose a new password with the token from the emailed link. */
-export function ResetPasswordPage() {
+/**
+ * The token of a mailed link, taken out of the address bar. It is read ONCE, when the screen
+ * mounts — from `?token=` (Better Auth's reset link) or from `#token=` (the set-password step
+ * after a verification link) — and the URL is then replaced by one without it, so the token is
+ * not left in the history, in a copied link or in a bookmark.
+ */
+function useLinkToken(): string | null {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [token] = useState<string | null>(() => {
+    const fromQuery = new URLSearchParams(location.search).get("token");
+    const fromHash = new URLSearchParams(location.hash.replace(/^#/, "")).get("token");
+    return fromQuery || fromHash || null;
+  });
+  useEffect(() => {
+    const query = new URLSearchParams(location.search);
+    const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
+    if (!query.has("token") && !hash.has("token")) return;
+    query.delete("token");
+    hash.delete("token");
+    const search = query.toString();
+    const fragment = hash.toString();
+    navigate(
+      {
+        pathname: location.pathname,
+        search: search ? `?${search}` : "",
+        hash: fragment ? `#${fragment}` : "",
+      },
+      { replace: true, state: location.state },
+    );
+  }, [location, navigate]);
+  return token;
+}
+
+type PasswordLinkCopy = {
+  title: MessageKey;
+  lead?: MessageKey;
+  submit: MessageKey;
+  missing: MessageKey;
+  failed: MessageKey;
+  /** `reason` on the sign-in screen afterwards. */
+  done: string;
+};
+
+const RESET_COPY: PasswordLinkCopy = {
+  title: "reset.title",
+  submit: "reset.submit",
+  missing: "reset.missing",
+  failed: "reset.failed",
+  done: "reset",
+};
+
+// The verification link was opened in a browser other than the one that signed up: the address
+// is confirmed, the account has no password yet, and this screen is where its owner chooses one.
+const SET_COPY: PasswordLinkCopy = {
+  title: "setPassword.title",
+  lead: "setPassword.body",
+  submit: "setPassword.submit",
+  missing: "setPassword.missing",
+  failed: "setPassword.missing",
+  done: "password_set",
+};
+
+function PasswordLinkPage({ copy }: { copy: PasswordLinkCopy }) {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const token = params.get("token");
+  const token = useLinkToken();
   const linkError = params.get("error");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -121,18 +183,18 @@ export function ResetPasswordPage() {
     setBusy(false);
     if (result.error) {
       if (result.error.code === "PASSWORD_COMPROMISED") setError(t("signup.password.breached"));
-      else if (result.error.code === "INVALID_TOKEN") setError(t("reset.failed"));
-      else setError(authErrorMessage(result.error, "reset.failed"));
+      else if (result.error.code === "INVALID_TOKEN") setError(t(copy.failed));
+      else setError(authErrorMessage(result.error, copy.failed));
       return;
     }
-    navigate("/login?reason=reset", { replace: true });
+    navigate(`/login?reason=${copy.done}`, { replace: true });
   };
 
   const unusable = !token || Boolean(linkError);
   return (
-    <AuthCard title={t("reset.title")}>
+    <AuthCard title={t(copy.title)} lead={!unusable && copy.lead ? t(copy.lead) : undefined}>
       {unusable ? (
-        <FormNotice tone="danger">{t(linkError ? "reset.failed" : "reset.missing")}</FormNotice>
+        <FormNotice tone="danger">{t(linkError ? copy.failed : copy.missing)}</FormNotice>
       ) : (
         <Box
           component="form"
@@ -151,7 +213,7 @@ export function ResetPasswordPage() {
             errorText={error ?? undefined}
           />
           <Button type="submit" variant="contained" size="large" disabled={busy}>
-            {t("reset.submit")}
+            {t(copy.submit)}
           </Button>
         </Box>
       )}
@@ -160,4 +222,14 @@ export function ResetPasswordPage() {
       </Box>
     </AuthCard>
   );
+}
+
+/** Choose a new password with the token from the emailed reset link. */
+export function ResetPasswordPage() {
+  return <PasswordLinkPage copy={RESET_COPY} />;
+}
+
+/** Choose the account's first password, after its address was confirmed from another browser. */
+export function SetPasswordPage() {
+  return <PasswordLinkPage copy={SET_COPY} />;
 }

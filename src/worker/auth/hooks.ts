@@ -48,6 +48,7 @@ import {
   type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
+import { beforeVerifyEmail } from "./mailbox-proof";
 import { countFor, record, reportError } from "./observe";
 import type { AuthScope, ClientFacts } from "./scope";
 import {
@@ -67,6 +68,9 @@ export const INVALID_CREDENTIALS = {
 
 /** The endpoints through which an OAuth profile can create an account. */
 const OAUTH_SIGNUP_PATHS = new Set(["/callback/:id", "/sign-in/social"]);
+
+/** The endpoints whose session is created by following a mailed link, not by a credential. */
+const LINK_SESSION_PATHS = new Set(["/verify-email"]);
 
 /** The part of Better Auth's endpoint context the database hooks read. Null outside a request. */
 type HookContext = {
@@ -377,7 +381,14 @@ export function buildHooks(scope: AuthScope) {
             }
           }
           try {
-            await checkSessionStart(scope, session.userId, Boolean(session.impersonatedBy));
+            await checkSessionStart(
+              scope,
+              session.userId,
+              Boolean(session.impersonatedBy),
+              // A session the verification click creates carries no admin grant: the role comes
+              // with a sign-in (auth/mailbox-proof.ts).
+              !LINK_SESSION_PATHS.has(scope.facts.endpointPath ?? ""),
+            );
           } catch (error) {
             return refused(error);
           }
@@ -410,6 +421,7 @@ export function buildHooks(scope: AuthScope) {
     if (ctx.request) scope.facts.endpointPath = path ?? null;
     if (typeof path !== "string") return;
     if (path.startsWith("/admin/")) await adminGate(scope, ctx);
+    if (path === "/verify-email" && ctx.request) await beforeVerifyEmail(scope, ctx);
     if (path === "/sign-up/email" && ctx.request) {
       // The cheap refusals first — before the password is hashed and looked up in the breach
       // corpus. They depend only on what was submitted, never on whether the address has an

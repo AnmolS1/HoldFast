@@ -510,6 +510,64 @@ describe("password reset", () => {
     expect(reset).toHaveBeenCalledWith({ newPassword: "a much longer password", token: "tok123" });
   });
 
+  it("reset: the token leaves the address bar as soon as it has been read (S11)", async () => {
+    const reset = vi.spyOn(authClient, "resetPassword").mockResolvedValue({ data: {}, error: null });
+    shellFetch({ session: null });
+    const { router } = renderRoutes(buildRoutes(), ["/reset-password?token=tok123"]);
+    await screen.findByRole("heading", { name: "Choose a new password" });
+    await waitFor(() => expect(router.state.location.search).toBe(""));
+    // …and it still works: the form holds it.
+    expect(field("password")).not.toBeNull();
+    fill({ password: "a much longer password" });
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await waitFor(() =>
+      expect(reset).toHaveBeenCalledWith({ newPassword: "a much longer password", token: "tok123" }),
+    );
+  });
+
+  it("set password (after a verification link opened in another browser): token from the fragment, gone from the address bar, sent with the password", async () => {
+    const reset = vi.spyOn(authClient, "resetPassword").mockResolvedValue({ data: {}, error: null });
+    shellFetch({ session: null });
+    const { router } = renderRoutes(buildRoutes(), ["/set-password#token=tok456"]);
+    await screen.findByRole("heading", { name: "Set your password" });
+    expect(document.body.textContent).toContain("Your email is confirmed.");
+    await waitFor(() => expect(router.state.location.hash).toBe(""));
+    fill({ password: "short" });
+    fireEvent.click(screen.getByRole("button", { name: "Set password" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Use 12 characters or more.");
+    expect(reset).not.toHaveBeenCalled();
+    fill({ password: "a much longer password" });
+    fireEvent.click(screen.getByRole("button", { name: "Set password" }));
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(reset).toHaveBeenCalledWith({ newPassword: "a much longer password", token: "tok456" });
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
+      "Password set. Sign in to continue.",
+    );
+    expect(router.state.location.search).toBe("?reason=password_set");
+  });
+
+  it("set password without a token offers the reset-by-mail path instead of a form", async () => {
+    shellFetch({ session: null });
+    renderRoutes(buildRoutes(), ["/set-password"]);
+    await screen.findByRole("heading", { name: "Set your password" });
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
+      "This link is incomplete or was already used. Ask for a reset link to choose a password.",
+    );
+    expect(field("password")).toBeNull();
+    expect(screen.getByRole("link", { name: "Send reset link" }).getAttribute("href")).toBe(
+      "/forgot-password",
+    );
+  });
+
+  it("the sign-in screen says why an address-change link sent the browser there", async () => {
+    shellFetch({ session: null });
+    renderRoutes(buildRoutes(), ["/login?reason=change_email"]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
+      "Sign in first, then open the link in that email again to confirm your new address.",
+    );
+  });
+
   it("reset without a token offers a new link instead of a form", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/reset-password"]);

@@ -9,7 +9,9 @@
 //   hf_pending   set when POST /api/auth/sign-up/email answers: this browser just signed up with
 //                that address. It is what lets the "check your email" screen change a mistyped
 //                address (PATCH /api/account/pending-email) — an unverified account has no
-//                session. 1 hour, and it works only while the account is unverified.
+//                session — and what lets the verification link keep the password and sign this
+//                browser in (auth/mailbox-proof.ts): opened anywhere else, the link proves the
+//                mailbox only. 1 hour, and it works only while the account is unverified.
 //
 // Both are `HttpOnly; SameSite=Lax`, `Secure` with the `__Secure-` name prefix on an https
 // origin, scoped by Path to the one place that reads them, and are a base64url JSON payload
@@ -34,7 +36,10 @@ export const INTENT_COOKIE: CookieSpec = {
 };
 export const PENDING_COOKIE: CookieSpec = {
   base: "hf_pending",
-  path: "/api/account/pending-email",
+  // Read in two places: PATCH /api/account/pending-email, and the verification link
+  // (GET /api/auth/verify-email — auth/mailbox-proof.ts), where it is what tells the browser
+  // that signed up from any other browser that opens the mailed link.
+  path: "/",
   maxAge: 3600,
   purpose: "account-action",
 };

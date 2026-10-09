@@ -74,6 +74,8 @@ export function testDb(): Db {
 export type Client = {
   ip: string;
   cookies: Map<string, string>;
+  /** The `Path` each cookie was set with (absent = "/"). A cookie is sent only under its path, as a browser does. */
+  cookiePaths: Map<string, string>;
   /** Extra headers on every request (`user-agent`, …). */
   headers: Record<string, string>;
   /** Vars this client's requests see instead of the test environment's. */
@@ -135,6 +137,7 @@ export function newClient(overrides: Partial<Client> = {}): Client {
   return {
     ip: freshIp(),
     cookies: new Map(),
+    cookiePaths: new Map(),
     headers: {},
     env: {},
     origin: ORIGIN,
@@ -170,8 +173,19 @@ export async function send(client: Client, path: string, options: SendOptions = 
     headers.set("origin", client.origin);
     headers.set("sec-fetch-site", "same-origin");
   }
-  if (client.cookies.size > 0) {
-    headers.set("cookie", [...client.cookies].map(([name, value]) => `${name}=${value}`).join("; "));
+  // A cookie goes only to a path under the `Path` it was set with (RFC 6265 §5.1.4): a wrong
+  // `Path` on one of our own cookies must fail a test here, not only in a browser.
+  const requestPath = path.split(/[?#]/)[0]!;
+  const sendable = [...client.cookies].filter(([name]) => {
+    const cookiePath = client.cookiePaths.get(name) ?? "/";
+    return (
+      cookiePath === "/" ||
+      requestPath === cookiePath ||
+      requestPath.startsWith(cookiePath.endsWith("/") ? cookiePath : `${cookiePath}/`)
+    );
+  });
+  if (sendable.length > 0) {
+    headers.set("cookie", sendable.map(([name, value]) => `${name}=${value}`).join("; "));
   }
   let body: string | undefined;
   if (options.json !== undefined) {
@@ -203,8 +217,13 @@ export async function send(client: Client, path: string, options: SendOptions = 
     const eqAt = pair.indexOf("=");
     const name = pair.slice(0, eqAt).trim();
     const value = pair.slice(eqAt + 1).trim();
-    if (value === "" || /;\s*max-age=0\b/i.test(cookie)) client.cookies.delete(name);
-    else client.cookies.set(name, value);
+    if (value === "" || /;\s*max-age=0\b/i.test(cookie)) {
+      client.cookies.delete(name);
+      client.cookiePaths.delete(name);
+    } else {
+      client.cookies.set(name, value);
+      client.cookiePaths.set(name, /;\s*path=([^;]*)/i.exec(cookie)?.[1]?.trim() || "/");
+    }
   }
   const text = await response.text();
   let parsed: unknown = null;

@@ -25,6 +25,8 @@ const REASONS: Record<string, { key: MessageKey; tone: "neutral" | "danger" }> =
   suspended: { key: "login.suspended", tone: "danger" },
   verified: { key: "login.verified", tone: "neutral" },
   reset: { key: "login.reset", tone: "neutral" },
+  password_set: { key: "login.passwordSet", tone: "neutral" },
+  change_email: { key: "login.changeEmail", tone: "neutral" },
 };
 
 const linkSx = {

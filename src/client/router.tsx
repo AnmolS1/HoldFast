@@ -1,6 +1,6 @@
 // The route tree (seam: orchestrator-only after the shell task). React Router 7 data mode.
 //
-//   auth screens        /login /signup /verify-email /forgot-password /reset-password /two-factor /invite/:code
+//   auth screens        /login /signup /verify-email /forgot-password /reset-password /set-password /two-factor /invite/:code
 //   legal gate          /accept-terms                (signed in; outside the frame)
 //   app frame           / + featureRoutes + /help    (session → verified → terms; admin role for /admin/*)
 //   public routes       /s/:token /dmca …            (outside the frame and outside every guard)
@@ -28,6 +28,7 @@ import {
   InvitePage,
   LoginPage,
   ResetPasswordPage,
+  SetPasswordPage,
   safeNext,
   SignupPage,
   TwoFactorPage,
@@ -155,6 +156,9 @@ export function buildRoutes(): RouteObject[] {
               element: <ResetPasswordPage />,
               handle: auth,
             },
+            // Where a verification link opened in ANOTHER browser lands: the address is
+            // confirmed, and its owner chooses the account's password here.
+            { path: "set-password", loader: redirectSignedIn, element: <SetPasswordPage />, handle: auth },
             { path: "two-factor", loader: redirectSignedIn, element: <TwoFactorPage />, handle: auth },
           ],
         },

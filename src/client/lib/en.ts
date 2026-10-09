@@ -250,6 +250,8 @@ export const en = {
   "login.suspended": "This account is suspended. Contact support.",
   "login.verified": "Email confirmed. Sign in to continue.",
   "login.reset": "Password changed. Sign in with the new one.",
+  "login.passwordSet": "Password set. Sign in to continue.",
+  "login.changeEmail": "Sign in first, then open the link in that email again to confirm your new address.",
 
   "signup.title": "Create your account",
   "signup.invite.note": "Holdfast is in a private beta — you'll need an invite code.",
@@ -312,6 +314,13 @@ export const en = {
   "reset.submit": "Change password",
   "reset.missing": "This reset link is incomplete. Request a new one.",
   "reset.failed": "This reset link has expired or was already used. Request a new one.",
+
+  "setPassword.title": "Set your password",
+  "setPassword.body":
+    "Your email is confirmed. This link was opened in a different browser from the one used to sign up, so choose the password for your account here.",
+  "setPassword.submit": "Set password",
+  "setPassword.missing":
+    "This link is incomplete or was already used. Ask for a reset link to choose a password.",
 
   "twoFactor.title": "Enter your code",
   "twoFactor.body": "From your authenticator app.",

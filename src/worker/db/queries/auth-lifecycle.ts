@@ -486,6 +486,67 @@ export async function clearUnprovenAccount(
 }
 
 /**
+ * The same emptying for a MAILBOX proof (auth/mailbox-proof.ts): a verification link opened in a
+ * browser that did not create the account. Under the row lock and only while the account is
+ * still unverified AND still at `email` (the address the link proves): every credential and
+ * session, every passkey, two-factor secret and token is deleted, the profile its creator typed
+ * is reset, and the address is marked verified — one transaction. The policy fields (terms, age,
+ * invite, quota) stay as the sign-up wrote them. Null when the row is not in that state: nothing
+ * is touched.
+ */
+export async function clearForMailboxProof(
+  db: Executor,
+  userId: string,
+  email: string,
+): Promise<{
+  accounts: number;
+  sessions: number;
+  passkeys: number;
+  twoFactor: number;
+  tokens: number;
+} | null> {
+  return db.transaction(async (tx) => {
+    const locked = await tx
+      .select({ id: user.id })
+      .from(user)
+      .where(and(eq(user.id, userId), eq(user.emailVerified, false), eq(user.email, email)))
+      .for("update");
+    if (locked.length === 0) return null;
+    const sessions = await tx.delete(session).where(eq(session.userId, userId)).returning({ id: session.id });
+    const accounts = await tx.delete(account).where(eq(account.userId, userId)).returning({ id: account.id });
+    const passkeys = await tx.delete(passkey).where(eq(passkey.userId, userId)).returning({ id: passkey.id });
+    const factors = await tx
+      .delete(twoFactor)
+      .where(eq(twoFactor.userId, userId))
+      .returning({ id: twoFactor.id });
+    const tokens = await tx
+      .delete(verification)
+      .where(eq(verification.value, userId))
+      .returning({ id: verification.id });
+    await tx
+      .update(user)
+      .set({
+        emailVerified: true,
+        // The name the row's creator typed is theirs, not the owner's.
+        name: email.split("@")[0] ?? "",
+        image: null,
+        displayNameKey: null,
+        avatarNodeId: null,
+        twoFactorEnabled: false,
+        role: "user",
+      })
+      .where(eq(user.id, userId));
+    return {
+      accounts: accounts.length,
+      sessions: sessions.length,
+      passkeys: passkeys.length,
+      twoFactor: factors.length,
+      tokens: tokens.length,
+    };
+  });
+}
+
+/**
  * The second half of the cleanup, run AFTER the provider's account row exists and BEFORE the
  * owner's session does (delete, link, delete again): under the same row lock, everything that
  * could have been attached to the account in the window between `clearUnprovenAccount` and the
