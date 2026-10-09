@@ -392,6 +392,8 @@ export async function beforeSecondFactor(
     method,
     lockedNow: admitted.lockedNow,
     grantsNewSession: false,
+    proved: false,
+    backupCodesBefore: method === "backup_code" ? state.backupCodes : null,
     email: state.email,
     name: state.name,
   } as const;
@@ -420,7 +422,9 @@ export async function beforeSecondFactor(
   if (mode === "enrolment" && who.sessionId !== null) {
     grantsNewSession = await hasAuthMarker(scope.db, enrolProof(who.sessionId), who.userId);
   }
-  scope.facts.secondFactor = { ...attempt, grantsNewSession };
+  // A TOTP code that got here was verified above, against the account's own secret, and its step
+  // was accepted for the first time: that is the proof. A backup code is proved afterwards.
+  scope.facts.secondFactor = { ...attempt, grantsNewSession, proved: method === "totp" };
 
   // "Remember this device" is not offered to an admin.
   if (body.trustDevice && hasAdminRole(state.role)) return { ...body, trustDevice: false };
@@ -463,6 +467,21 @@ export async function afterSecondFactor(scope: AuthScope, ctx: CodeContext): Pro
   if (ctx.context.returned instanceof Error) {
     await afterSecondFactorFailure(scope, "wrong_code");
     return;
+  }
+  // FAIL-CLOSED: the count starts again only on positive proof that THIS request presented a valid
+  // factor of THIS account — never because the endpoint "did not fail". TOTP: our own check, in
+  // `beforeSecondFactor`. A backup code: the plugin has USED one — the stored codes are no longer
+  // what they were (plugins/two-factor/backup-codes/index.mjs:220–227 rewrites them on a valid
+  // code, and only then).
+  let proved = attempt.proved;
+  if (!proved && attempt.method === "backup_code" && attempt.backupCodesBefore !== null) {
+    const after = await secondFactorState(scope.db, attempt.userId);
+    proved = after !== null && after.backupCodes !== attempt.backupCodesBefore;
+  }
+  if (!proved) {
+    // An answer nobody proved: the attempt stays counted, is audited, and is not honoured.
+    await afterSecondFactorFailure(scope, "unproven");
+    throw new APIError("UNAUTHORIZED", { ...INVALID_CODE });
   }
   scope.facts.secondFactor = null;
   // A correct code: the count starts again (and a lock this very attempt set is lifted).

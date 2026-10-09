@@ -6,10 +6,14 @@ import { like, sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { STATEMENT_BUDGET } from "../../../src/worker/auth/parity";
 import * as passwordWork from "../../../src/worker/auth/password";
+import { APIError } from "better-auth/api";
+import { createScope } from "../../../src/worker/auth/scope";
 import {
   ACCOUNT_PRESSURE,
+  afterSignIn,
   FREE_ATTEMPTS,
   MAX_DELAY_S,
+  provingVerify,
   THROTTLE_WINDOW_S,
   throttleKeys,
 } from "../../../src/worker/auth/signin-throttle";
@@ -23,6 +27,7 @@ import {
   measured,
   newClient,
   PASSWORD,
+  send,
   signIn,
   signUp,
   testDb,
@@ -296,5 +301,171 @@ describe("the count is atomic (real concurrent statements against Postgres)", ()
     );
     const second = await Promise.all(Array.from({ length: 60 }, () => admitSignIn(testDb(), keys, RULE)));
     expect(second.filter((result) => result.ok)).toHaveLength(1);
+  });
+});
+
+describe("fail-closed: the count is given back only on proof of the right password", () => {
+  const countOf = async (email: string, client: Client) => (await rowOf(email, client))?.count ?? 0;
+
+  it("requests that end in a 400 — refused before the throttle, or by the handler after it — never reset the count", async () => {
+    const owner = await verifiedUser();
+    const guesser = quiet();
+    for (let n = 0; n < 3; n++) expect((await attempt(guesser, owner.email)).sent.status).toBe(401);
+    expect(await countOf(owner.email, guesser)).toBe(3);
+    const before = await rowOf(owner.email, guesser);
+
+    // Refused at stage (a): the row is not touched at all.
+    const malformed: Array<[string, Record<string, unknown>]> = [
+      ["a password that is a number", { email: owner.email, password: 123456789012 }],
+      ["a password that is an array", { email: owner.email, password: [PASSWORD] }],
+      ["no password", { email: owner.email }],
+      ["an empty password", { email: owner.email, password: "" }],
+      ["a password of 129 characters", { email: owner.email, password: "p".repeat(129) }],
+      ["rememberMe that is not a boolean", { email: owner.email, password: WRONG, rememberMe: "yes" }],
+      ["a callbackURL that is an object", { email: owner.email, password: WRONG, callbackURL: {} }],
+      ["the address with a space in front", { email: ` ${owner.email}`, password: WRONG }],
+      ["the address with a trailing newline", { email: `${owner.email}\n`, password: WRONG }],
+      ["the address in a list", { email: [owner.email], password: WRONG }],
+    ];
+    for (const [what, body] of malformed) {
+      await forgetAddressRule(guesser);
+      const sent = await send(guesser, "/api/auth/sign-in/email", { json: body, headers: CAPTCHA });
+      expect(sent.status, what).toBe(400);
+      expect(await rowOf(owner.email, guesser), what).toEqual(before);
+    }
+
+    // Refused by the handler AFTER the attempt was admitted — an answer that is neither a 401 nor
+    // a success (here: the password check itself answering 400, then failing outright, then a
+    // 403 nobody has listed). Each stays counted; none gives anything back.
+    for (const [what, failure, status] of [
+      [
+        "a 400 from inside the handler",
+        new APIError("BAD_REQUEST", { code: "SOMETHING_ELSE", message: "x" }),
+        400,
+      ],
+      ["a 403 from inside the handler", new APIError("FORBIDDEN", { code: "UNLISTED", message: "x" }), 403],
+      ["a 404 from inside the handler", new APIError("NOT_FOUND", { code: "UNLISTED", message: "x" }), 404],
+      ["a thrown error", new Error("boom"), 500],
+    ] as const) {
+      const counted = await countOf(owner.email, guesser);
+      await ago(owner.email, guesser, MAX_DELAY_S);
+      vi.mocked(passwordWork.verifyPassword).mockRejectedValueOnce(failure);
+      const sent = (await attempt(guesser, owner.email)).sent;
+      expect(sent.status, what).toBe(status);
+      expect(await countOf(owner.email, guesser), what).toBe(counted + 1);
+    }
+    expect(await countOf(owner.email, guesser)).toBe(7);
+    // … so the next guess waits, as after seven wrong passwords.
+    const next = await attempt(guesser, owner.email);
+    expect(next.sent.status).toBe(429);
+    expect(next.hashed).toBe(0);
+  });
+
+  it("the two-factor step answers only a RIGHT password — a wrong one on such an account stays counted", async () => {
+    const owner = await verifiedUser();
+    await enableTotp(owner.client);
+    const client = quiet();
+    for (let n = 1; n <= 3; n++) {
+      const wrong = await attempt(client, owner.email);
+      expect(wrong.sent.status).toBe(401);
+      expect(wrong.sent.body).not.toMatchObject({ twoFactorRedirect: true });
+      expect(await countOf(owner.email, client)).toBe(n);
+    }
+    const right = await attempt(client, owner.email, PASSWORD);
+    expect(right.sent.body).toMatchObject({ twoFactorRedirect: true });
+    expect(await rowOf(owner.email, client)).toBeNull();
+  });
+
+  it("a success clears exactly one row: this client's, on this account", async () => {
+    const a = await verifiedUser();
+    const b = await verifiedUser();
+    const client = quiet();
+    const other = quiet();
+    await attempt(client, a.email);
+    await attempt(client, b.email);
+    await attempt(other, a.email);
+    expect((await attempt(client, a.email, PASSWORD)).sent.status).toBe(200);
+    expect(await rowOf(a.email, client)).toBeNull();
+    expect(await countOf(b.email, client)).toBe(1);
+    expect(await countOf(a.email, other)).toBe(1);
+  });
+
+  it("asked directly: without the proof nothing is given back, whatever the endpoint returned", async () => {
+    const email = freshEmail();
+    const ip = freshIp();
+    const keys = await keysOf(email, ip);
+    expect((await admitSignIn(testDb(), keys, RULE)).ok).toBe(true);
+    const scope = createScope(env, testDb(), { waitUntil() {}, passThroughOnException() {} });
+    scope.facts.signInAttempt = keys.pair;
+    await afterSignIn(scope);
+    const [kept] = await testDb().select().from(rateLimit).where(like(rateLimit.key, keys.pair));
+    expect(kept?.count).toBe(1);
+    // A right password proved OUTSIDE an admitted sign-in attempt (another endpoint's check) is no proof.
+    const verify = provingVerify(scope, async () => true);
+    expect(await verify({ hash: "h", password: "p" })).toBe(true);
+    expect(scope.facts.signInProved).toBe(false);
+    // The control: inside an attempt, a verified password is the proof, and the row goes.
+    scope.facts.signInAttempt = keys.pair;
+    expect(await provingVerify(scope, async () => false)({ hash: "h", password: "p" })).toBe(false);
+    expect(scope.facts.signInProved).toBe(false);
+    expect(await verify({ hash: "h", password: "p" })).toBe(true);
+    expect(scope.facts.signInProved).toBe(true);
+    await afterSignIn(scope);
+    expect(await testDb().select().from(rateLimit).where(like(rateLimit.key, keys.pair))).toEqual([]);
+  });
+});
+
+describe("the throttle's key and Better Auth's look-up normalise an address the same way", () => {
+  // Better Auth looks the account up by `email.toLowerCase()` (api/routes/sign-in.mjs:319,
+  // db/internal-adapter.mjs:572) after `z.email()` (:317). The key is made from exactly that —
+  // and stage (a) refuses whatever `z.email()` would. So for every spelling: it is refused before
+  // the throttle (no row), OR it is the owner's account under the owner's key, OR it is another
+  // address — another key AND no way into the owner's account.
+  it.each([
+    ["upper case", (e: string) => e.toUpperCase(), "same"],
+    ["mixed case", (e: string) => e.replace(/^./, (c) => c.toUpperCase()), "same"],
+    ["a leading space", (e: string) => ` ${e}`, "refused"],
+    ["a trailing space", (e: string) => `${e} `, "refused"],
+    ["a trailing tab", (e: string) => `${e}\t`, "refused"],
+    ["a space inside", (e: string) => e.replace("@", " @"), "refused"],
+    ["a no-break space in front", (e: string) => `\u00a0${e}`, "refused"],
+    ["a zero-width space inside", (e: string) => e.replace("@", "\u200b@"), "refused"],
+    ["the Kelvin sign for a k (lower-cases to k)", (e: string) => `\u212a${e}`, "refused"],
+    ["a full-width letter", (e: string) => e.replace(/^./, "\uff55"), "refused"],
+    ["a dotless-i look-alike", (e: string) => e.replace("@", "\u0131@"), "refused"],
+    ["a trailing dot on the domain", (e: string) => `${e}.`, "refused"],
+    ["a quoted local part", (e: string) => `"${e.split("@")[0]}"@${e.split("@")[1]}`, "refused"],
+    ["plus-addressing", (e: string) => e.replace("@", "+x@"), "other"],
+    ["a dot in the local part", (e: string) => e.replace(/^(.)/, "$1."), "other"],
+    ["another sub-domain", (e: string) => e.replace("@", "@mail."), "other"],
+  ] as const)("%s", async (_what, spell, expected) => {
+    const owner = await verifiedUser();
+    const client = quiet();
+    const variant = spell(owner.email);
+    const ownersKey = (await keysOf(owner.email, client.ip)).pair;
+    const variantsKey = (await keysOf(variant, client.ip)).pair;
+    const wrong = (await attempt(client, variant)).sent;
+    const right = (await attempt(quiet(), variant, PASSWORD)).sent;
+    if (expected === "refused") {
+      expect(wrong.status).toBe(400);
+      expect(right.status).toBe(400);
+      expect(await testDb().select().from(rateLimit).where(like(rateLimit.key, variantsKey))).toEqual([]);
+      expect(await rowOf(owner.email, client)).toBeNull();
+    } else if (expected === "same") {
+      // One account, one key: the wrong guess is on the owner's row, and the right password opens it.
+      expect(variantsKey).toBe(ownersKey);
+      expect(wrong.status).toBe(401);
+      expect((await rowOf(owner.email, client))?.count).toBe(1);
+      expect(right.status).toBe(200);
+    } else {
+      // Another address: its own key — and the owner's password does not open anything through it.
+      expect(variantsKey).not.toBe(ownersKey);
+      expect(wrong.status).toBe(401);
+      expect(right.status).toBe(401);
+      expect(await rowOf(owner.email, client)).toBeNull();
+      expect(
+        (await testDb().select().from(rateLimit).where(like(rateLimit.key, variantsKey)))[0]?.count,
+      ).toBe(1);
+    }
   });
 });

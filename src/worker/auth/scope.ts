@@ -57,6 +57,10 @@ export type AuthFacts = {
     method: "totp" | "backup_code";
     lockedNow: boolean;
     grantsNewSession: boolean;
+    /** Positive proof that THIS request presented a valid factor (auth/second-factor.ts). */
+    proved: boolean;
+    /** The stored backup codes before the endpoint ran (a used code changes them). */
+    backupCodesBefore: string | null;
     email: string;
     name: string;
   } | null;
@@ -66,6 +70,8 @@ export type AuthFacts = {
   throttled: boolean;
   /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
   signInAttempt: string | null;
+  /** This request verified the right password for the account of `signInAttempt`. */
+  signInProved: boolean;
 };
 
 export type AuthScope = {
@@ -117,6 +123,7 @@ export function emptyFacts(): AuthFacts {
     impersonatorId: null,
     throttled: false,
     signInAttempt: null,
+    signInProved: false,
   };
 }
 

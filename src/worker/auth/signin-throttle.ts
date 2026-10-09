@@ -36,9 +36,16 @@
 // solved Turnstile challenge. Passwords are at least 12 characters and checked against the
 // breach corpus, and an account with two-factor on needs the second factor too.
 //
-// ATOMIC. Admission is one statement that COUNTS the attempt as a failure before the password is
-// looked at (db/queries/auth-lifecycle.ts `admitSignIn`): fifty simultaneous attempts are admitted
-// exactly as fifty in a row would be. The count is given back when the password turns out right.
+// ATOMIC, AND FAIL-CLOSED. Admission is one statement that COUNTS the attempt as a failure before
+// the password is looked at (db/queries/auth-lifecycle.ts `admitSignIn`): fifty simultaneous
+// attempts are admitted exactly as fifty in a row would be, and a request that is aborted or
+// crashes stays counted. The count is given back ONLY on positive proof that this very request
+// verified the right password of this very account (`provingVerify`) — never because the answer
+// "was not a 401".
+//
+// WHAT IS ADMITTED. Only a request that passed stage (a) (auth/preflight.ts): a password that is
+// a string of 1–128 characters and an address Better Auth's own validator accepts — the same
+// `z.email()` it runs (sign-in.mjs:317). Anything else is a 400 there, and no row is touched.
 //
 // The rows are pruned by Better Auth's own limiter (api/rate-limiter/index.mjs:174 — rows older
 // than its longest window, one hour), which is longer than this window.
@@ -61,7 +68,7 @@ export const SIGN_IN_THROTTLED = {
   message: "Too many attempts. Wait a moment and try again.",
 } as const;
 
-type Ctx = { body?: unknown; context: { returned?: unknown } };
+type Ctx = { body?: unknown };
 
 /** `signin:<account>:` — every client's row for one address signed in to starts with this. */
 export async function throttleKeys(
@@ -70,7 +77,10 @@ export async function throttleKeys(
   ip: string,
 ): Promise<{ account: string; pair: string }> {
   const [who, where] = await Promise.all([
-    hmacHex(scope.keys, "email-ledger", `signin|${email.trim().toLowerCase()}`),
+    // Exactly Better Auth's own normaliser for the look-up (`email.toLowerCase()`,
+    // api/routes/sign-in.mjs:319 and db/internal-adapter.mjs:572) — no more (two addresses it
+    // tells apart must not share a key) and no less (two spellings of one account must).
+    hmacHex(scope.keys, "email-ledger", `signin|${email.toLowerCase()}`),
     ipHashStable(scope.keys, ip),
   ]);
   const account = `signin:${who.slice(0, 32)}:`;
@@ -98,16 +108,38 @@ export async function beforeSignIn(scope: AuthScope, ctx: Ctx): Promise<void> {
   throw new APIError("TOO_MANY_REQUESTS", { ...SIGN_IN_THROTTLED }, { "Retry-After": String(wait) });
 }
 
-/** `hooks.after`: a password that was right is not a failure — the client's row goes. */
-export async function afterSignIn(scope: AuthScope, ctx: Ctx): Promise<void> {
+/**
+ * `emailAndPassword.password.verify`, wrapped (auth/create-auth.ts): the ONE place this request
+ * can learn that the password is right. Better Auth's sign-in calls it exactly once, with the
+ * stored hash of the account that has the submitted address (api/routes/sign-in.mjs:334) — for an
+ * address with no account it hashes instead (:321, :328) and never calls this.
+ */
+export function provingVerify(
+  scope: AuthScope,
+  verify: (data: { hash: string; password: string }) => Promise<boolean>,
+): (data: { hash: string; password: string }) => Promise<boolean> {
+  return async (data) => {
+    const right = await verify(data);
+    // Only inside a sign-in attempt the throttle admitted — no other endpoint's check counts.
+    if (right === true && scope.facts.signInAttempt !== null) scope.facts.signInProved = true;
+    return right;
+  };
+}
+
+/**
+ * `hooks.after`: the client's row is removed ONLY on proof that THIS request verified the right
+ * password of THIS account (`provingVerify`). Not "anything that is not a 401": every other
+ * outcome — a 400, a 404, a 429, a 5xx, a thrown error, an answer nobody has thought of yet —
+ * leaves the attempt counted. (What follows a verified password in the installed handler: the
+ * session (sign-in.mjs:355), "verify your address first" (:339–351), the two-factor step
+ * (plugins/two-factor/index.mjs:246–326), and our own refusals at session creation — a suspended
+ * or banned account. Each of them is reached only after `verify` returned true.)
+ */
+export async function afterSignIn(scope: AuthScope): Promise<void> {
   const pair = scope.facts.signInAttempt;
-  if (!pair) return;
+  const proved = scope.facts.signInProved;
   scope.facts.signInAttempt = null;
-  const returned = ctx.context.returned;
-  // 401 is the one answer to a wrong password or an unknown address (api/routes/sign-in.mjs:323–337).
-  // Everything else Better Auth answers after the password has been verified: a session, the
-  // two-factor step, "verify your address first" (:339), a ban.
-  const wrong = returned instanceof APIError && returned.statusCode === 401;
-  const failedOtherwise = returned instanceof Error && !(returned instanceof APIError);
-  if (!wrong && !failedOtherwise) await forgetSignInFailures(scope.db, pair);
+  scope.facts.signInProved = false;
+  // By the exact pair this request was admitted under: never another client's or account's row.
+  if (pair !== null && proved === true) await forgetSignInFailures(scope.db, pair);
 }

@@ -39,6 +39,7 @@ import { VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
+import { provingVerify } from "./signin-throttle";
 import { afterAnswer, createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
@@ -142,7 +143,8 @@ export function buildAuthOptions(scope: AuthScope) {
       maxPasswordLength: 128,
       revokeSessionsOnPasswordReset: true,
       // Better Auth's own scrypt, through a module a test can count calls on (./password.ts).
-      password: { hash: hashPassword, verify: verifyPassword },
+      // `verify` also tells the sign-in throttle when a password was proved right (signin-throttle.ts).
+      password: { hash: hashPassword, verify: provingVerify(scope, verifyPassword) },
       sendResetPassword: async ({ user, url }: { user: { email: string; name: string }; url: string }) => {
         // Handed to the request's deferred work and started only once the request is answered —
         // never awaited here: an answer that waited for a mail, or shared its round trips with

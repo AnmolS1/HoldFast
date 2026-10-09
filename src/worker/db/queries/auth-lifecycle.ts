@@ -649,6 +649,8 @@ export async function secondFactorState(
   userId: string,
 ): Promise<{
   secret: string;
+  /** The stored (encrypted) backup codes — compared, never read: it changes when one is used. */
+  backupCodes: string;
   verified: boolean;
   role: string | null;
   email: string;
@@ -658,6 +660,7 @@ export async function secondFactorState(
   const [row] = await db
     .select({
       secret: twoFactor.secret,
+      backupCodes: twoFactor.backupCodes,
       verified: twoFactor.verified,
       role: user.role,
       email: user.email,
@@ -673,6 +676,7 @@ export async function secondFactorState(
   if (!row) return null;
   return {
     secret: row.secret,
+    backupCodes: row.backupCodes,
     // Null on a row made before the column existed: Better Auth reads that as enrolled.
     verified: row.verified !== false,
     role: row.role,

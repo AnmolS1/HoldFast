@@ -523,7 +523,7 @@ export function buildHooks(scope: AuthScope) {
       return;
     }
     if (path === SIGN_IN_PATH && ctx.request) {
-      await afterSignIn(scope, ctx);
+      await afterSignIn(scope);
       return;
     }
     if (path === "/change-email" && ctx.request) {

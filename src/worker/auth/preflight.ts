@@ -33,6 +33,8 @@
 // request does at most ONE hash. (A counter shared by all clients was here and was withdrawn:
 // whoever filled it locked everyone out of sign-in.)
 
+import { z } from "zod";
+
 export const MAX_BODY_BYTES = 8 * 1024;
 export const PASSWORD_MIN = 12;
 export const PASSWORD_MAX = 128;
@@ -48,8 +50,16 @@ const optional =
   (value) =>
     value === undefined || value === null || rule(value);
 
-// A shape check only (the sign-up policy judges the domain): something@something, no spaces.
-const email = text(3, EMAIL_MAX, /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
+// An address: what Better Auth's own validator accepts — the very `z.email()` its endpoints run
+// (api/routes/sign-in.mjs:317, sign-up.mjs) — so that nothing reaches the handler, or the sign-in
+// throttle, that the handler would then refuse as "not an address". No spaces, no control
+// characters, ASCII only. (The sign-up policy judges the domain.)
+const EMAIL = z.email();
+const email: Rule = (value) =>
+  typeof value === "string" &&
+  value.length >= 3 &&
+  value.length <= EMAIL_MAX &&
+  EMAIL.safeParse(value).success;
 const link = optional(text(1, 2048));
 
 type Spec = {
@@ -76,7 +86,15 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   "/sign-in/email": {
     captcha: true,
     // A password being TRIED: any length a password could have had.
-    fields: { email, password: text(1, PASSWORD_MAX), callbackURL: link },
+    // Every field the endpoint's own schema would judge is judged HERE (api/routes/sign-in.mjs
+    // body schema): nothing is admitted to the sign-in throttle that the handler would then
+    // refuse as malformed.
+    fields: {
+      email,
+      password: text(1, PASSWORD_MAX),
+      callbackURL: link,
+      rememberMe: optional((value) => typeof value === "boolean"),
+    },
   },
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },

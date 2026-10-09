@@ -14,7 +14,9 @@ import { env } from "cloudflare:workers";
 import { and, eq, like } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { createAuth } from "../../../src/worker/auth/create-auth";
+import { createScope } from "../../../src/worker/auth/scope";
 import {
+  afterSecondFactor,
   ENROL_PROOF_S,
   SECOND_FACTOR_LOCK_S,
   SECOND_FACTOR_MAX_AGE_MS,
@@ -878,5 +880,79 @@ describe("the only writers of secondFactorAt (source scan)", () => {
     expect(mentions(/second_factor_at/)).toEqual([
       'src/worker/db/auth-schema.ts: secondFactorAt: timestamp("second_factor_at"),',
     ]);
+  });
+});
+
+describe("fail-closed: the attempt count starts again only on proof of a valid factor", () => {
+  const ctxFor = (path: string, returned: unknown) =>
+    ({ path, context: { returned } }) as unknown as Parameters<typeof afterSecondFactor>[1];
+  const attemptOf = (
+    account: { id: string; email: string },
+    method: "totp" | "backup_code",
+    backupCodesBefore: string | null,
+    proved: boolean,
+  ) => ({
+    userId: account.id,
+    sessionId: null,
+    mode: "sign_in" as const,
+    method,
+    lockedNow: false,
+    grantsNewSession: false,
+    proved,
+    backupCodesBefore,
+    email: account.email,
+    name: "x",
+  });
+  const counted = async (userId: string) =>
+    (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, userId)))[0]!;
+
+  it("an answer that is not an error but proves nothing — an unused backup code, an unverified TOTP — is refused, audited, and stays counted", async () => {
+    const admin = await adminWithTotp();
+    await testDb()
+      .update(twoFactor)
+      .set({ failedVerificationCount: 3 })
+      .where(eq(twoFactor.userId, admin.id));
+    const stored = (await counted(admin.id)).backupCodes;
+    for (const [method, path] of [
+      ["backup_code", VERIFY_BACKUP_CODE_PATH],
+      ["totp", VERIFY_TOTP_PATH],
+    ] as const) {
+      const pending: Promise<unknown>[] = [];
+      const scope = createScope(env, testDb(), {
+        waitUntil: (promise) => void pending.push(promise),
+        passThroughOnException() {},
+      });
+      scope.facts.secondFactor = attemptOf(admin, method, method === "backup_code" ? stored : null, false);
+      // The endpoint "succeeded" — and no code of this account was used, no TOTP step was proved.
+      const thrown = await afterSecondFactor(scope, ctxFor(path, { token: "t", user: {} })).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      await Promise.allSettled(pending);
+      expect(thrown, method).toMatchObject({ statusCode: 401 });
+      expect((await counted(admin.id)).failedVerificationCount, method).toBe(3);
+    }
+    expect(
+      (await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).filter(
+        (row) => (row.meta as { reason?: string }).reason === "unproven",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("the control: with the proof — a TOTP step we verified, or backup codes that changed — the count starts again", async () => {
+    const admin = await adminWithTotp();
+    for (const [method, path, before, proved] of [
+      ["totp", VERIFY_TOTP_PATH, null, true],
+      ["backup_code", VERIFY_BACKUP_CODE_PATH, "what was stored before a code was used", false],
+    ] as const) {
+      await testDb()
+        .update(twoFactor)
+        .set({ failedVerificationCount: 3 })
+        .where(eq(twoFactor.userId, admin.id));
+      const scope = createScope(env, testDb(), { waitUntil() {}, passThroughOnException() {} });
+      scope.facts.secondFactor = attemptOf(admin, method, before, proved);
+      await afterSecondFactor(scope, ctxFor(path, { token: "t", user: {} }));
+      expect((await counted(admin.id)).failedVerificationCount, method).toBe(0);
+    }
   });
 });
