@@ -1,4 +1,5 @@
 // Registers the shell's own palette commands and binds the global shortcuts. Renders nothing.
+import { hasAdminRole } from "../../../shared/roles";
 import { Moon, Sun } from "lucide-react";
 import { useEffect } from "react";
 import { useNavigate } from "react-router";
@@ -43,7 +44,7 @@ export function ShellCommands() {
       { id: "go.uploads", section: "goto", label: t("nav.uploads"), run: go("/uploads") },
       { id: "go.help", section: "goto", label: t("nav.help"), run: go("/help") },
     );
-    if (role === "admin")
+    if (hasAdminRole(role))
       commands.push({ id: "go.admin", section: "goto", label: t("nav.admin"), run: go("/admin") });
     const dark = prefs.theme === "dark" || (prefs.theme === "system" && isDarkNow());
     commands.push(

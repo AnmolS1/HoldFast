@@ -14,6 +14,7 @@ import {
   type LoaderFunctionArgs,
   type RouteObject,
 } from "react-router";
+import { hasAdminRole } from "../shared/roles";
 import type { RouteHandle } from "./components/slots";
 import { featureRoutes, publicRoutes, routeHandle } from "./features";
 import { configureApi } from "./lib/api";
@@ -70,7 +71,7 @@ export async function requireUser({ request }: LoaderFunctionArgs): Promise<null
 /** `/admin/*`: anyone who is not an admin gets the same page as an address that does not exist. */
 export async function requireAdmin(): Promise<null> {
   const session = await loadSession();
-  if (session?.user.role !== "admin") throw new Response(null, { status: 404 });
+  if (!hasAdminRole(session?.user.role)) throw new Response(null, { status: 404 });
   return null;
 }
 

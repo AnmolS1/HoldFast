@@ -6,6 +6,7 @@
 //                                      + 403 admin_requires_2fa (an admin without two-factor)
 
 import type { Context } from "hono";
+import { hasAdminRole } from "../../shared/roles";
 import type { SessionUser } from "../auth/types";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
@@ -24,18 +25,13 @@ export function requireVerified(c: Context<AppEnv>): SessionUser {
   return user;
 }
 
-/** Better Auth's admin plugin stores one role or a comma-separated list. */
-export function hasAdminRole(user: Pick<SessionUser, "role">): boolean {
-  return (user.role ?? "").split(",").some((role) => role.trim() === "admin");
-}
-
 export function requireAdmin(c: Context<AppEnv>): SessionUser {
   const user = requireUser(c);
   // An impersonated session belongs to the target user; it is never an admin session.
   if (c.get("impersonating")) {
     throw new AppError("forbidden", undefined, { reason: "impersonation_read_only" });
   }
-  if (!hasAdminRole(user)) throw new AppError("forbidden");
+  if (!hasAdminRole(user.role)) throw new AppError("forbidden");
   if (user.twoFactorEnabled !== true) throw new AppError("admin_requires_2fa");
   return user;
 }

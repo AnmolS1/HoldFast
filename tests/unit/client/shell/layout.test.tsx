@@ -166,8 +166,8 @@ describe("desktop frame", () => {
     expect(within(menu).getByRole("menuitem", { name: "DMCA" }).getAttribute("href")).toBe("/dmca");
   });
 
-  it("an admin sees Admin in the user menu", async () => {
-    await openAt(1280, "/", "admin");
+  it.each(["admin", "user,admin"])("an admin (role %j) sees Admin in the user menu", async (role) => {
+    await openAt(1280, "/", role);
     fireEvent.click(screen.getByRole("button", { name: "Account menu" }));
     expect((await screen.findByRole("menu", { name: "Account menu" })).textContent).toContain("Admin");
   });

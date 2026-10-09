@@ -119,6 +119,26 @@ describe("route guards", () => {
     await waitFor(() => expect(document.querySelector('[data-placeholder-page="Admin"]')).not.toBeNull());
   });
 
+  // Better Auth's admin plugin stores one role or a comma-separated list; the server's guard
+  // accepts "user,admin". The shell must read the same value the same way.
+  it.each(["user,admin", "admin,user", " admin ", "user, admin"])(
+    "/admin/* with the role list %j renders the admin page",
+    async (role) => {
+      shellFetch({ session: sessionOf({ role }) });
+      renderRoutes(buildRoutes(), ["/admin/users"]);
+      await waitFor(() => expect(document.querySelector('[data-placeholder-page="Admin"]')).not.toBeNull());
+    },
+  );
+
+  it.each(["administrator", "superadmin", "user,administrator", "", "Admin"])(
+    "/admin/* with the role %j renders not-found",
+    async (role) => {
+      shellFetch({ session: sessionOf({ role }) });
+      renderRoutes(buildRoutes(), ["/admin/users"]);
+      expect(await screen.findByRole("heading", { name: "Page not found" })).toBeTruthy();
+    },
+  );
+
   it("a signed-in user opening /login is sent to a SAFE next", async () => {
     shellFetch({ session: sessionOf() });
     const { router } = renderRoutes(buildRoutes(), ["/login?next=/recent"]);

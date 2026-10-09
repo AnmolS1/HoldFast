@@ -1,4 +1,5 @@
 // What the user menu (desktop) and the Account sheet (mobile) both offer.
+import { hasAdminRole } from "../../../shared/roles";
 import { CircleHelp, HardDrive, Keyboard, LogOut, Mail, Scale, Settings, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import { useNavigate } from "react-router";
@@ -53,7 +54,7 @@ export function useAccountActions(): AccountAction[] {
     { id: "settings", label: t("user.settings"), icon: <Settings size={16} />, to: "/account" },
     { id: "storage", label: t("user.storage"), icon: <HardDrive size={16} />, to: "/storage" },
   ];
-  if (session?.user.role === "admin")
+  if (hasAdminRole(session?.user.role))
     actions.push({ id: "admin", label: t("nav.admin"), icon: <ShieldCheck size={16} />, to: "/admin" });
   actions.push(
     {
