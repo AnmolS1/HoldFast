@@ -95,7 +95,7 @@ describe("GET /api/health against real Postgres and R2", () => {
 
     const health = await call(app, "/api/health");
     expect(health.response.status).toBe(200);
-    expect(await health.response.json()).toEqual({ ok: true, db: true, r2: true });
+    expect(await health.response.json()).toEqual({ ok: true, db: true, r2: true, config: true });
     await health.ctx.settle();
 
     // The database it reached is this checkout's own.
@@ -110,7 +110,7 @@ describe("GET /api/health against real Postgres and R2", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toMatch(/^application\/json/);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(await response.json()).toEqual({ ok: true, db: true, r2: true });
+    expect(await response.json()).toEqual({ ok: true, db: true, r2: true, config: true });
   });
 
   it("is 503 { ok: false, db: false, r2: true } when the database URL is dead, with no error text", async () => {
@@ -120,7 +120,7 @@ describe("GET /api/health against real Postgres and R2", () => {
     });
     expect(response.status).toBe(503);
     const text = await response.text();
-    expect(JSON.parse(text)).toEqual({ ok: false, db: false, r2: true });
+    expect(JSON.parse(text)).toEqual({ ok: false, db: false, r2: true, config: true });
     expect(text).not.toMatch(/holdfast_no_such_database|does not exist|postgres/i);
     // The failed pool is still closed, and closing it does not throw.
     await ctx.settle();
@@ -327,7 +327,7 @@ describe("deferred work on a real pool", () => {
   const healthy = async () => {
     const { response, ctx } = await call(createApp(realCore), "/api/health");
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, db: true, r2: true });
+    expect(await response.json()).toEqual({ ok: true, db: true, r2: true, config: true });
     await ctx.settle();
   };
 

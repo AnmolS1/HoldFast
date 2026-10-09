@@ -19,7 +19,7 @@ import type { APIRequestContext, APIResponse, Page } from "@playwright/test";
 import pg from "pg";
 import { latestMailTo, linksIn } from "../e2e/fixtures/outbox";
 import { appOrigin, e2ePort, localDbName, localDbUrl } from "./local-env";
-import { E2E_ADMIN_DOMAIN } from "./test-vars";
+import { E2E_ADMIN_POOL } from "./test-vars";
 
 /** What the stand-in Turnstile widget yields, and what Cloudflare's test secret accepts. */
 export const TURNSTILE_TEST_TOKEN = "XXXX.DUMMY.TOKEN.XXXX";
@@ -183,14 +183,40 @@ export async function signedInUser(
 }
 
 // ── the admin ───────────────────────────────────────────────────────────────────────────────
-// Every call makes an admin of ITS OWN: a fresh address at the run's admin domain (the e2e
-// server is told `*@<that domain>` through E2E_ADMIN_EMAILS — tests/setup/test-vars.ts — and
-// honours it in test mode only), its own password and its own authenticator secret. No account
-// and no one-time code is shared between tests, so nothing here depends on a code being
-// accepted twice. Never this checkout's real ADMIN_EMAILS: no test reads that var.
+// Every call makes an admin of ITS OWN: an address claimed from the run's pool of exact admin
+// addresses (the e2e server is given that pool through E2E_ADMIN_EMAILS — tests/setup/
+// test-vars.ts — and honours it in test mode only), its own password and its own authenticator
+// secret. No account and no one-time code is shared between tests, so nothing here depends on a
+// code being accepted twice. Never this checkout's real ADMIN_EMAILS: no test reads that var.
 
-/** A fresh address at the run's admin domain. */
-export const freshAdminEmail = () => `e2e-${hex(6)}@${E2E_ADMIN_DOMAIN}`;
+const ADMIN_CLAIM_LOCK = 81_500_106;
+
+/**
+ * An address of the pool that no test of this run has taken. Claimed under an advisory lock (the
+ * suite runs in several workers at once), by a marker row that `scripts/db-reset.sh` removes
+ * with everything else before the next run.
+ */
+export async function claimAdminEmail(): Promise<string> {
+  return localDb(async (db) => {
+    await db.query("SELECT pg_advisory_lock($1)", [ADMIN_CLAIM_LOCK]);
+    try {
+      const taken = await db.query<{ identifier: string }>(
+        "SELECT identifier FROM verification WHERE identifier LIKE 'e2e-admin-claim:%'",
+      );
+      const used = new Set(taken.rows.map((row) => row.identifier.slice("e2e-admin-claim:".length)));
+      const email = E2E_ADMIN_POOL.find((address) => !used.has(address));
+      if (!email) throw new Error(`auth fixture: all ${E2E_ADMIN_POOL.length} e2e admin addresses are taken`);
+      await db.query(
+        `INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at)
+         VALUES ($1, $2, '1', now() + interval '1 day', now(), now())`,
+        [hex(16), `e2e-admin-claim:${email}`],
+      );
+      return email;
+    } finally {
+      await db.query("SELECT pg_advisory_unlock($1)", [ADMIN_CLAIM_LOCK]);
+    }
+  });
+}
 
 /**
  * An admin signed in the way an admin must be: role `admin`, two-factor enrolled, and a session
@@ -205,7 +231,7 @@ export async function signedInAdmin2fa(
   options: FixtureOptions,
 ): Promise<SignedInAdmin> {
   const request = requestOf(target);
-  const email = options.email ?? freshAdminEmail();
+  const email = options.email ?? (await claimAdminEmail());
   const user = await signUpAndVerify(request, {
     ...options,
     email,

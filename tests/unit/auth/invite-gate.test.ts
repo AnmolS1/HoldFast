@@ -396,19 +396,14 @@ describe("ADMIN_EMAILS grants the role, and only that", () => {
     expect(isAdminEmail(hostile, "attacker@gmail.com")).toBe(false);
     expect(isAdminEmail(hostile, "x@evil.example.com")).toBe(false);
     expect(isAdminEmail(hostile, e2e)).toBe(true);
-    // `*@domain` names every address at exactly that reserved domain — in the e2e var only.
+    // No wildcard, in any mode — not even in the e2e var at a reserved domain: `*@domain` is not an
+    // address, so it is ignored and grants nothing (tests/unit/auth/admin-emails.test.ts).
     const wild = { ...testMode, E2E_ADMIN_EMAILS: "*@admins.run.example, *@gmail.com" };
-    expect(isAdminEmail(wild, "anyone@admins.run.example")).toBe(true);
-    expect(isAdminEmail(wild, "anyone@sub.admins.run.example")).toBe(false);
-    expect(isAdminEmail(wild, "anyone@xadmins.run.example")).toBe(false);
-    expect(isAdminEmail(wild, "anyone@gmail.com")).toBe(false);
-    expect(isAdminEmail(wild, "@admins.run.example")).toBe(false);
+    expect(isAdminEmail(wild, "anyone@admins.run.example")).toBe(false);
+    expect(isAdminEmail(wild, "*@admins.run.example")).toBe(false);
     expect(isAdminEmail({ ...testMode, ADMIN_EMAILS: "*@real-company.com" }, "ceo@real-company.com")).toBe(
       false,
     );
-    expect(
-      isAdminEmail({ ...wild, APP_ORIGIN: "https://holdfast.example" }, "anyone@admins.run.example"),
-    ).toBe(false);
   });
 
   it("no test reads ADMIN_EMAILS out of .dev.vars (the e2e admin is a test-domain address from test vars)", async () => {

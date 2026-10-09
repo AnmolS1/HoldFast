@@ -38,6 +38,8 @@ ALLOWED_STORAGE_KEYS="hf.prefs.v1"
 REVIEWED_NONLITERAL_STORAGE_SITES=0
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
+ADMIN_MATCHER="src/shared/admin-emails.ts"
+ADMIN_CONSUMERS="src/worker/services/signup-policy.ts src/worker/auth/test-outbound.ts"
 EXPECTED_CHECKS=14
 
 json_tail() { awk 'found || /^[[:space:]]*[\[{]/ { found = 1; print }'; }
@@ -53,6 +55,39 @@ eval_todo() { # <wrangler config>
     return 1
   fi
   echo "TODO_ sentinel: none in $(basename "$file")"
+}
+
+eval_admin_exact() { # <tree root> — ADMIN_EMAILS is exact addresses only: one shared matcher, no wildcard
+  local tree="$1" bad=0 file
+  if [ -f "$tree/$ADMIN_MATCHER" ]; then echo "admin list: the shared matcher is present ($ADMIN_MATCHER)"; else
+    echo "admin list: the shared matcher is missing: $ADMIN_MATCHER"
+    bad=1
+  fi
+  for file in $ADMIN_CONSUMERS; do
+    if [ ! -f "$tree/$file" ]; then
+      echo "admin list: $file does not exist"
+      bad=1
+    elif ! grep -q 'shared/admin-emails' "$tree/$file"; then
+      echo "admin list: $file does not use the shared matcher"
+      bad=1
+    elif grep -v '^[[:space:]]*\(//\|\*\|/\*\)' "$tree/$file" | grep -q '"\*@\|startsWith("\*'; then
+      echo "admin list: $file handles a wildcard entry"
+      bad=1
+    else
+      echo "admin list: $file matches exact addresses through the shared matcher"
+    fi
+  done
+  return "$bad"
+}
+
+eval_health_config() { # <file with the body of GET /api/health> — `config` must be exactly true
+  local file="$1" config
+  config="$(jq -r 'if has("config") then (.config | tostring) else "absent" end' "$file" 2>/dev/null)" || config="unreadable"
+  if [ "$config" != "true" ]; then
+    echo "health: config is '$config', expected true (an ADMIN_EMAILS entry that is not one plain address grants nothing — fix the secret)"
+    return 1
+  fi
+  echo "health: config is true (every ADMIN_EMAILS entry is one plain address)"
 }
 
 eval_c2_files() { # <tree root> — reports both, so one run names everything that is missing
@@ -216,6 +251,31 @@ self_test() {
   expect fail "config with a planted TODO_" eval_todo "$tmp/todo.jsonc"
   expect fail "config missing" eval_todo "$tmp/absent.jsonc"
 
+  echo "admin list (exact addresses only):"
+  local consumer
+  mkdir -p "$tmp/adm-ok" "$tmp/adm-wild" "$tmp/adm-own" "$tmp/adm-none"
+  for consumer in $ADMIN_CONSUMERS; do
+    mkdir -p "$tmp/adm-ok/$(dirname "$consumer")" "$tmp/adm-wild/$(dirname "$consumer")" "$tmp/adm-own/$(dirname "$consumer")"
+    printf '// a comment may say "*@domain"\nimport { isListedAdmin } from "../../shared/admin-emails";\n' >"$tmp/adm-ok/$consumer"
+    printf 'import { isListedAdmin } from "../../shared/admin-emails";\nconst d = e.filter((x) => x.startsWith("*@"));\n' >"$tmp/adm-wild/$consumer"
+    printf 'const list = env.ADMIN_EMAILS.split(",");\n' >"$tmp/adm-own/$consumer"
+  done
+  mkdir -p "$tmp/adm-ok/$(dirname "$ADMIN_MATCHER")" "$tmp/adm-wild/$(dirname "$ADMIN_MATCHER")" "$tmp/adm-own/$(dirname "$ADMIN_MATCHER")"
+  : >"$tmp/adm-ok/$ADMIN_MATCHER" && : >"$tmp/adm-wild/$ADMIN_MATCHER" && : >"$tmp/adm-own/$ADMIN_MATCHER"
+  expect pass "consumers use the shared matcher" eval_admin_exact "$tmp/adm-ok"
+  expect fail "a consumer handles a wildcard" eval_admin_exact "$tmp/adm-wild"
+  expect fail "a consumer parses the list itself" eval_admin_exact "$tmp/adm-own"
+  expect fail "no matcher, no consumers" eval_admin_exact "$tmp/adm-none"
+  echo '{"ok":true,"db":true,"r2":true,"config":true}' >"$tmp/health-ok.json"
+  echo '{"ok":true,"db":true,"r2":true,"config":false}' >"$tmp/health-bad.json"
+  echo '{"ok":true,"db":true,"r2":true}' >"$tmp/health-old.json"
+  echo 'Bad gateway' >"$tmp/health-junk.json"
+  expect pass "health says the configuration is valid" eval_health_config "$tmp/health-ok.json"
+  expect fail "health says an entry is malformed" eval_health_config "$tmp/health-bad.json"
+  expect fail "health has no config field (nothing compared)" eval_health_config "$tmp/health-old.json"
+  expect fail "health is not JSON" eval_health_config "$tmp/health-junk.json"
+  expect fail "health body missing" eval_health_config "$tmp/health-absent.json"
+
   echo "C2 files:"
   mkdir -p "$tmp/both/$(dirname "$C2_TEST")" "$tmp/both/$(dirname "$C2_SCRIPT")" "$tmp/only-script/$(dirname "$C2_SCRIPT")" "$tmp/only-test/$(dirname "$C2_TEST")" "$tmp/neither"
   : >"$tmp/both/$C2_TEST" && : >"$tmp/both/$C2_SCRIPT" && : >"$tmp/only-script/$C2_SCRIPT" && : >"$tmp/only-test/$C2_TEST"
@@ -300,6 +360,7 @@ static_checks() { # <tree root> — runs all of them and reports every failure
   local tree="$1" bad=0
   eval_todo "$tree/wrangler.jsonc" || bad=1
   eval_c2_files "$tree" || bad=1
+  eval_admin_exact "$tree" || bad=1
   return "$bad"
 }
 
@@ -397,6 +458,9 @@ check_deploy() {
   bash "$lib" health "$APP_URL" || return 1
   bash "$lib" stamp "$APP_URL" "$dev_sha" 3 5 || return 1
   bash "$lib" files-host "$FILES_URL/" || return 1
+  # The deploy's ADMIN_EMAILS secret: every entry one plain address (a boolean — never the value).
+  curl -sS --max-time 15 "$APP_URL/api/health" >"$tmpdir/health.json" 2>/dev/null || : >"$tmpdir/health.json"
+  eval_health_config "$tmpdir/health.json" || return 1
 }
 
 # The dev branch's DIRECT connection string, fetched once. Held in a variable, handed over in the

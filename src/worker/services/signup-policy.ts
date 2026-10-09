@@ -46,7 +46,13 @@ import {
   type VelocitySubject,
 } from "../db/queries/auth-lifecycle";
 import { todayTotals, utcDay } from "../db/queries/ledger";
-import { record } from "../auth/observe";
+import {
+  isListedAdmin,
+  parseAdminList,
+  RESERVED_TEST_DOMAIN,
+  type AdminList,
+} from "../../shared/admin-emails";
+import { countFor, record, reportError } from "../auth/observe";
 import { isTestMode, now } from "./clock";
 import { ipHashDaily, ipPrefix } from "./ip-hash";
 
@@ -141,9 +147,6 @@ function listOf(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-/** RFC 2606 / 6761: names under these can never be anyone's real mailbox. */
-const RESERVED_TEST_DOMAIN = /@[a-z0-9.-]+\.(?:example|test)$/;
-
 type AdminListEnv = Pick<Env, "ADMIN_EMAILS"> & {
   E2E_ADMIN_EMAILS?: string;
   EMAIL_TRANSPORT?: string;
@@ -152,26 +155,50 @@ type AdminListEnv = Pick<Env, "ADMIN_EMAILS"> & {
 };
 
 /**
- * The addresses that are given the admin role: `ADMIN_EMAILS`.
+ * The addresses that are given the admin role: `ADMIN_EMAILS` — exact addresses only, parsed and
+ * matched by the ONE matcher (shared/admin-emails.ts).
  *
  * TEST SEAM (never on a deploy — `isTestMode`: the memory mail transport, a non-production
  * environment AND a plain-http origin): when the e2e run passes `E2E_ADMIN_EMAILS`
  * (playwright.config.ts → vite.config.ts), that list is used INSTEAD, and only its addresses at
- * a reserved test domain (`.example`, `.test`) count; `*@domain` there names every address at
- * that domain. So an end-to-end run has admins without ever creating an account for the
- * operator's real address — no test reads `ADMIN_EMAILS`. In `ADMIN_EMAILS` itself a `*` is an
- * ordinary character: no real list can name a domain.
+ * a reserved test domain (`.example`, `.test`) count. So an end-to-end run has admins without
+ * ever creating an account for the operator's real address — no test reads `ADMIN_EMAILS`. The
+ * seam's list is exact addresses too: there is no wildcard, in any mode.
  */
-function adminList(env: AdminListEnv): { addresses: string[]; domains: string[] } {
+export function adminListOf(env: AdminListEnv): AdminList {
   if (isTestMode(env) && typeof env.E2E_ADMIN_EMAILS === "string" && env.E2E_ADMIN_EMAILS.trim() !== "") {
-    const entries = listOf(env.E2E_ADMIN_EMAILS).filter((entry) => RESERVED_TEST_DOMAIN.test(entry));
+    const parsed = parseAdminList(env.E2E_ADMIN_EMAILS);
     return {
-      addresses: entries.filter((entry) => !entry.startsWith("*@")),
-      // `*@domain`: every address at exactly that (reserved) domain — the e2e seam only.
-      domains: entries.filter((entry) => entry.startsWith("*@")).map((entry) => entry.slice(1)),
+      addresses: new Set([...parsed.addresses].filter((entry) => RESERVED_TEST_DOMAIN.test(entry))),
+      invalid: parsed.invalid,
     };
   }
-  return { addresses: listOf(env.ADMIN_EMAILS), domains: [] };
+  const parsed = parseAdminList(env.ADMIN_EMAILS);
+  reportInvalidOnce(env, parsed.invalid);
+  return parsed;
+}
+
+let invalidReported = false;
+/** An entry that is not an address grants nothing — and is reported, once per isolate, by COUNT. */
+function reportInvalidOnce(env: AdminListEnv, invalid: number): void {
+  if (invalid === 0 || invalidReported) return;
+  invalidReported = true;
+  countFor(env as Parameters<typeof countFor>[0], "error", {
+    kind: "config",
+    reason: "admin_emails_invalid",
+  });
+  reportError(
+    new Error(
+      `ADMIN_EMAILS: ${invalid} entr${invalid === 1 ? "y is" : "ies are"} not a plain address and grant nothing`,
+    ),
+    {
+      kind: "config",
+    },
+  );
+}
+/** For tests: the once-per-isolate report can be made again. */
+export function resetAdminListReportForTests(): void {
+  invalidReported = false;
 }
 
 /**
@@ -179,12 +206,7 @@ function adminList(env: AdminListEnv): { addresses: string[]; domains: string[] 
  * verified account signs in. It must never change what a sign-up is answered.
  */
 export function isAdminEmail(env: AdminListEnv, email: string): boolean {
-  const address = email.trim().toLowerCase();
-  if (address === "") return false;
-  const list = adminList(env);
-  if (list.addresses.includes(address)) return true;
-  const at = address.lastIndexOf("@");
-  return at > 0 && list.domains.includes(address.slice(at));
+  return isListedAdmin(adminListOf(env), email);
 }
 
 export const MX_LOOKUP_TIMEOUT_MS = 2_000;

@@ -38,8 +38,13 @@ export type TestVarName = keyof typeof testVars;
 // ── the end-to-end run (vite dev) ────────────────────────────────────────────────────────────
 // The e2e server reads the checkout's `.dev.vars`, whose ADMIN_EMAILS may be an operator's real
 // address. No test uses that: Playwright hands the server this list instead (E2E_ADMIN_EMAILS,
-// honoured in test mode only and only for reserved test domains). `*@domain` is every address
-// at that domain, so each test makes an admin of its own — its own password, its own
-// authenticator secret — and no two tests share an account.
+// honoured in test mode only and only for reserved test domains). The list is EXACT addresses,
+// like `ADMIN_EMAILS` itself — there is no wildcard anywhere (src/shared/admin-emails.ts): a pool
+// of them, from which each test claims one of its own (tests/setup/auth-fixtures.ts
+// `claimAdminEmail`) — its own password, its own authenticator secret; no two tests share one.
 export const E2E_ADMIN_DOMAIN = "admins.holdfast-e2e.example";
-export const E2E_ADMIN_EMAILS = `*@${E2E_ADMIN_DOMAIN}`;
+export const E2E_ADMIN_POOL: readonly string[] = Array.from(
+  { length: 48 },
+  (_, index) => `e2e-admin-${String(index).padStart(2, "0")}@${E2E_ADMIN_DOMAIN}`,
+);
+export const E2E_ADMIN_EMAILS = E2E_ADMIN_POOL.join(",");

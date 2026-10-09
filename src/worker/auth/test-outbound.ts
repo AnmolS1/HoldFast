@@ -33,6 +33,12 @@
 //
 // Outside test mode `installTestOutbound` does nothing at all: `fetch` is not touched.
 
+import {
+  isListedAdmin,
+  parseAdminList,
+  RESERVED_TEST_DOMAIN,
+  type AdminList,
+} from "../../shared/admin-emails";
 import { isTestMode } from "../services/clock";
 
 /** Passwords the stand-in breach API reports as breached. Long enough to pass the length rule. */
@@ -49,7 +55,7 @@ type State = {
   original: typeof fetch;
   strict: boolean;
   /** Addresses the stand-in Google must never vouch for (see `googleToken`). */
-  realAdmins: ReadonlySet<string>;
+  realAdmins: AdminList;
   calls: TestOutboundCall[];
   /** Extra hosts a test answers itself (the Resend API, a failing DoH …). Checked first. */
   overrides: Map<string, Handler>;
@@ -102,16 +108,16 @@ export function testGoogleCode(profile: TestGoogleProfile): string {
   return `test.${base64Url(JSON.stringify(profile))}`;
 }
 
-const RESERVED_DOMAIN = /\.(?:example|test)$/;
-
-/** The ADMIN_EMAILS entries that are real mailboxes — everything not at a reserved test domain. */
-export function realAdminAddresses(list: string | undefined): Set<string> {
-  return new Set(
-    (list ?? "")
-      .split(",")
-      .map((entry) => entry.trim().toLowerCase())
-      .filter((entry) => entry !== "" && !RESERVED_DOMAIN.test(entry)),
-  );
+/**
+ * The ADMIN_EMAILS entries that are real mailboxes — everything not at a reserved test domain —
+ * by the ONE parser of that list (shared/admin-emails.ts).
+ */
+export function realAdminAddresses(list: string | undefined): AdminList {
+  const parsed = parseAdminList(list);
+  return {
+    addresses: new Set([...parsed.addresses].filter((entry) => !RESERVED_TEST_DOMAIN.test(entry))),
+    invalid: parsed.invalid,
+  };
 }
 
 /**
@@ -133,7 +139,8 @@ async function googleToken(request: Request, state: Pick<State, "realAdmins">): 
   } catch {
     return json({ error: "invalid_grant" }, 400);
   }
-  if (typeof profile?.email !== "string" || state.realAdmins.has(profile.email.trim().toLowerCase())) {
+  // The same matcher that grants the role decides here whom the stand-in may not be.
+  if (typeof profile?.email !== "string" || isListedAdmin(state.realAdmins, profile.email)) {
     return json({ error: "invalid_grant" }, 400);
   }
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -180,7 +187,12 @@ export async function routeTestOutbound(
   request: Request,
   state: Pick<State, "original" | "strict"> & Partial<Pick<State, "calls" | "overrides" | "realAdmins">>,
 ): Promise<Response> {
-  return route(request, { calls: [], overrides: new Map(), realAdmins: new Set(), ...state });
+  return route(request, {
+    calls: [],
+    overrides: new Map(),
+    realAdmins: { addresses: new Set(), invalid: 0 },
+    ...state,
+  });
 }
 
 async function route(request: Request, state: State): Promise<Response> {

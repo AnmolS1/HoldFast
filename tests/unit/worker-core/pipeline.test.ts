@@ -875,6 +875,23 @@ describe("GET /api/health", () => {
     const r2 = { head: async () => Promise.reject(new Error("r2 secret detail")) };
     const answer = await send("/api/health", { env: { FILES: r2 } });
     expect(answer.status).toBe(503);
-    expect(answer.body).toEqual({ ok: false, db: true, r2: false });
+    expect(answer.body).toEqual({ ok: false, db: true, r2: false, config: true });
+  });
+
+  it("`config` is false when an ADMIN_EMAILS entry is not one plain address — a boolean, never the entry or a count", async () => {
+    const { send } = setup();
+    for (const [list, valid] of [
+      ["admin@example.test", true],
+      ["admin@example.test, second@example.test", true],
+      ["", true],
+      ["admin@example.test, *@example.test", false],
+      ["Ana <admin@example.test>", false],
+      ["admin@example.test;second@example.test", false],
+      ["not-an-address", false],
+    ] as const) {
+      const answer = await send("/api/health", { env: { ADMIN_EMAILS: list } });
+      expect((answer.body as unknown as { config: boolean }).config, list).toBe(valid);
+      expect(JSON.stringify(answer.body), list).not.toMatch(/example\.test|invalid|\d{2,}/);
+    }
   });
 });

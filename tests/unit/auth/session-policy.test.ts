@@ -343,10 +343,13 @@ describe("third parties under `vite dev` (test mode, not the unit-test environme
 
   it("T19 — the stand-in Google never vouches for a REAL admin mailbox: only test admins at reserved domains", async () => {
     // What a developer's `.dev.vars` may hold: their own address, beside the test admins.
+    // What a developer's `.dev.vars` may hold: their own address, beside the test admins — and
+    // entries that are no address at all, which name nobody.
     const realAdmins = realAdminAddresses(
-      " Operator@Gmail.com , admin@example.test,*@e2e-admin.example, ops@holdfast.ponderance.dev ",
+      " Operator@Gmail.com , admin@example.test, *@gmail.com, e2e-admin-01@admins.holdfast-e2e.example, ops@holdfast.ponderance.dev ",
     );
-    expect([...realAdmins].sort()).toEqual(["operator@gmail.com", "ops@holdfast.ponderance.dev"]);
+    expect([...realAdmins.addresses].sort()).toEqual(["operator@gmail.com", "ops@holdfast.ponderance.dev"]);
+    expect(realAdmins.invalid).toBe(1);
     const exchange = (email: unknown) =>
       routeTestOutbound(
         new Request("https://oauth2.googleapis.com/token", {

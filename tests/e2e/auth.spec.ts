@@ -23,7 +23,7 @@ import { hasAdminRole } from "../../src/shared/roles";
 import {
   createInvite,
   FIXTURE_PASSWORD,
-  freshAdminEmail,
+  claimAdminEmail,
   freshEmail,
   localDb,
   signedInAdmin2fa,
@@ -467,7 +467,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     clientIp,
     origins,
   }) => {
-    const email = freshAdminEmail();
+    const email = await claimAdminEmail();
     // The stranger signs up with the admin's address (they have an invite).
     const signUp = await page.request.post("/api/auth/sign-up/email", {
       headers: api(origins.app, clientIp, { "x-captcha-response": TURNSTILE_TEST_TOKEN }),
