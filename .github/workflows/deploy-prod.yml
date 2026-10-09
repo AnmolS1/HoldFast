@@ -1,0 +1,188 @@
+# Deploys PRODUCTION (Worker "holdfast") on a push to `prod`, after CI is green for that commit.
+# Order: preconditions → build → migrate → deploy → build stamp → files host → Sentry release.
+#
+# This workflow can only REDEPLOY production. It refuses to run unless the production Worker
+# already exists, has a deployment, has its nine secrets, and answers on its custom domain — all of
+# which are done by hand at the beta gate (the CI token cannot attach a custom domain, and the
+# secrets must be set before the first deploy). A push to `prod` before that fails here, before the
+# database is touched.
+name: deploy-prod
+
+on:
+  push:
+    branches: [prod]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  deploy:
+    needs: ci
+    if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The repository's existing "Production" environment. It has no protection rule today; adding
+    # a required reviewer to it in the repository settings makes every production deploy wait for
+    # approval, with no change to this file.
+    environment: Production
+    # One deploy to production at a time, shared with scanner-image.yml. Never cancelled mid-flight.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+      APP_URL: https://holdfast.ponderance.dev
+      FILES_URL: https://holdfastusercontent.com
+      # "true" = always build and push the scanner image, even when containers/ did not change.
+      SCANNER_ALWAYS_BUILD: "false"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: This commit is still the head of prod
+        run: bash .github/workflows/lib/deploy-lib.sh branch-head prod "$GITHUB_SHA"
+
+      - name: Postgres client
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+
+      # The three preconditions. Nothing below runs — no migration, no deploy — unless they hold.
+      - name: The production Worker exists and has its secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh worker-ready holdfast
+
+      - name: Production already answers on its custom domains
+        run: |
+          bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
+          bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
+
+      - name: Containers plan
+        id: plan
+        run: bash .github/workflows/lib/deploy-lib.sh containers-plan "$APP_URL" "$GITHUB_SHA"
+
+      # The same rule CI checked against the previous push, now against the commit that is LIVE:
+      # after a failed deploy the previous push is not what production is running.
+      - name: Migration rule, against the live commit
+        env:
+          DEPLOYED: ${{ steps.plan.outputs.deployed }}
+        run: |
+          if [[ "$DEPLOYED" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$DEPLOYED^{commit}" 2>/dev/null; then
+            node scripts/check-migrations.mjs --base "$DEPLOYED" --head HEAD
+          else
+            echo "::notice::The live commit could not be read or is not in this checkout; the migration rule was checked against the previous push only (job ci)."
+          fi
+
+      # The environment is chosen at BUILD time; `--env` at deploy time does not select it.
+      - name: Build (production)
+        env:
+          CLOUDFLARE_ENV: production
+        run: npm run build
+
+      - name: The build is a production build
+        run: bash .github/workflows/lib/deploy-lib.sh built-env production
+
+      - name: Migrate the production database
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_PROD }}
+        run: bash .github/workflows/lib/deploy-lib.sh migrate apply remote
+
+      # = the deploy half of `npm run deploy` (the build half ran above so that the name check sits
+      # between them). wrangler refuses `--env production` against a build made for another env.
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ROLLOUT: ${{ steps.plan.outputs.rollout }}
+        run: |
+          case "$ROLLOUT" in
+            build) npx wrangler deploy --env production ;;
+            none) npx wrangler deploy --env production --containers-rollout none ;;
+            *)
+              echo "::error::no containers plan (got '$ROLLOUT'); refusing to guess"
+              exit 1
+              ;;
+          esac
+
+      - name: Build stamp is this commit
+        run: bash .github/workflows/lib/deploy-lib.sh stamp "$APP_URL" "$GITHUB_SHA" 6 10
+
+      - name: App answers
+        run: bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
+
+      - name: Files host answers 404 and nothing else
+        run: bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
+
+  # Tells Sentry which commit is live. The Worker and the browser bundle both report
+  # release = the commit sha. A separate job, so the Sentry token is never in the deploy job.
+  sentry-release:
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # "true" once the build emits source maps (a vite.config.ts change that is not made yet).
+      SOURCE_MAPS: "false"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create and finalize the release
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then
+            echo "::error::SENTRY_AUTH_TOKEN is not set"
+            exit 1
+          fi
+          npx sentry-cli releases new -p holdfast-worker -p holdfast-web "$GITHUB_SHA"
+          npx sentry-cli releases finalize "$GITHUB_SHA"
+          npx sentry-cli deploys new -p holdfast-worker -p holdfast-web --release "$GITHUB_SHA" --env production
+          # Read it back: a release nobody can find was not created.
+          npx sentry-cli releases info "$GITHUB_SHA"
+
+      # Never green on an upload of nothing: while the build emits no source maps this step says
+      # so in the run summary instead of pretending.
+      - name: Source maps
+        run: |
+          if [ "$SOURCE_MAPS" != "true" ]; then
+            echo "::warning::Source maps are NOT uploaded to Sentry: the build does not emit them yet. Stack traces for release $GITHUB_SHA are minified."
+            exit 0
+          fi
+          echo "::error::SOURCE_MAPS is true but this workflow has no upload step yet"
+          exit 1
