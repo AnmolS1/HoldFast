@@ -302,9 +302,9 @@ describe("middleware order", () => {
   });
 
   it("a rate-limited auth request has still been through getSession", async () => {
-    const { fake, send } = setup();
+    const { fake, post } = setup();
     const denied = { limit: async () => ({ success: false }) };
-    const answer = await send("/api/auth/list-sessions", { env: { RL_AUTH: denied } });
+    const answer = await post("/api/auth/sign-in/email", { env: { RL_AUTH: denied } });
     expect(answer.status).toBe(429);
     expect(fake.calls).toContain("getSession");
   });
@@ -327,7 +327,7 @@ describe("rate limit", () => {
   });
 
   it("keys RL_API by user when signed in, by IP otherwise; RL_AUTH by IP on the auth paths only", async () => {
-    const { fake, send } = setup();
+    const { fake, send, post } = setup();
     const api: string[] = [];
     const auth: string[] = [];
     const env = { RL_API: limiter(api), RL_AUTH: limiter(auth) };
@@ -337,9 +337,73 @@ describe("rate limit", () => {
     await send("/api/nodes", { env, headers });
     expect(api).toEqual(["ip:203.0.113.9", `u:${"u".repeat(32)}`]);
     expect(auth).toEqual([]);
-    for (const path of ["/api/auth/list-sessions", "/api/auth-intent", "/api/invites/abc"])
-      await send(path, { env, headers });
+    await post("/api/auth/sign-in/email", { env, headers });
+    await post("/api/auth-intent", { env, headers });
+    await send("/api/invites/abc", { env, headers });
     expect(auth).toEqual(["ip:203.0.113.9", "ip:203.0.113.9", "ip:203.0.113.9"]);
+  });
+
+  // The shell reads the session in every route guard and on every window focus. Counted against
+  // the 20-a-minute sign-in bucket, three people behind one address lock each other out of /login.
+  it("RL_AUTH is for state-changing auth requests: a session read spends RL_API only", async () => {
+    const { send, post } = setup();
+    const api: string[] = [];
+    const auth: string[] = [];
+    const exhausted = { RL_API: limiter(api), RL_AUTH: limiter(auth, false) };
+    const headers = { "cf-connecting-ip": "203.0.113.9" };
+
+    // 30 session reads from one address while its auth bucket is empty: every one answers.
+    for (let n = 0; n < 30; n++) {
+      const read = await send("/api/auth/get-session", { env: exhausted, headers });
+      expect(read.status, `read ${n + 1}`).toBe(200);
+      expect(read.body).toBeNull();
+    }
+    expect((await send("/api/auth/list-sessions", { env: exhausted, headers })).status).toBe(200);
+    expect(
+      (await send("/api/auth/get-session", { method: "HEAD", env: exhausted, headers })).status,
+    ).not.toBe(429);
+    expect(auth).toEqual([]);
+    expect(api).toHaveLength(32);
+    expect(new Set(api)).toEqual(new Set(["ip:203.0.113.9"]));
+
+    // The same address, the same empty bucket: every write under /api/auth/ is refused …
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      const write = await post("/api/auth/sign-in/email", { method, env: exhausted, headers });
+      expect(write.status, method).toBe(429);
+      expect(write.body.error).toBe("rate_limited");
+    }
+    expect(auth).toHaveLength(4);
+    // … and so are the two unauthenticated lookups that are not under /api/auth/, GET included:
+    // an invite code is guessable, so reading one is throttled like a sign-in.
+    expect((await send("/api/invites/abc", { env: exhausted, headers })).status).toBe(429);
+    expect((await post("/api/auth-intent", { env: exhausted, headers })).status).toBe(429);
+  });
+
+  // A home IPv6 connection is a /64: 2^64 source addresses. Keyed by the raw address, each one is
+  // a fresh bucket and no limit ever applies.
+  it("keys by the normalised address: IPv4 whole, IPv6 by its /64", async () => {
+    const { post } = setup();
+    const api: string[] = [];
+    const auth: string[] = [];
+    const env = { RL_API: limiter(api), RL_AUTH: limiter(auth) };
+    const from = (ip: string) => ({ env, headers: { "cf-connecting-ip": ip } });
+
+    await post("/api/auth/sign-in/email", from("203.0.113.9"));
+    await post("/api/auth/sign-in/email", from("203.0.113.10"));
+    await post("/api/auth/sign-in/email", from("2001:db8:0:1::1"));
+    await post("/api/auth/sign-in/email", from("2001:DB8:0:1:ffff:ffff:ffff:ffff"));
+    await post("/api/auth/sign-in/email", from("2001:db8:0:2::1"));
+    await post("/api/auth/sign-in/email", from("::ffff:203.0.113.9"));
+    const expected = [
+      "ip:203.0.113.9",
+      "ip:203.0.113.10",
+      "ip:2001:db8:0:1::/64",
+      "ip:2001:db8:0:1::/64",
+      "ip:2001:db8:0:2::/64",
+      "ip:203.0.113.9",
+    ];
+    expect(auth).toEqual(expected);
+    expect(api).toEqual(expected);
   });
 
   it("takes the client address from cf-connecting-ip only", async () => {

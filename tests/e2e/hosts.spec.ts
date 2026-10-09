@@ -78,7 +78,38 @@ test.describe("app origin", () => {
       data: {},
     });
     expect(crossSite.status()).toBe(403);
-    expect(await crossSite.json()).toMatchObject({ error: "forbidden" });
+    // The reason, not only the status: any other 403 on this path would otherwise pass for CSRF.
+    expect(await crossSite.json()).toMatchObject({ error: "forbidden", details: { reason: "csrf" } });
+  });
+
+  // The real limiters (20 a minute for auth attempts, 600 for the API), one client address.
+  test("session reads do not spend the sign-in limit: 25 from one address all answer", async ({
+    request,
+  }) => {
+    // An address of this run only, so neither another test nor the previous run shares its buckets.
+    const octet = () => 1 + Math.floor(Math.random() * 254);
+    const headers = { "cf-connecting-ip": `10.${octet()}.${octet()}.${octet()}` };
+
+    // Empty the address's auth bucket with sign-in attempts. 20 are let through (to the 404 of a
+    // route that does not exist yet); allow for the limiter's minute rolling over part-way.
+    let refusedAfter = 0;
+    for (let attempt = 1; attempt <= 41 && refusedAfter === 0; attempt++) {
+      const answer = await request.post("/api/auth/sign-in/email", { headers, data: {} });
+      if (answer.status() === 429) {
+        expect(await answer.json()).toMatchObject({ error: "rate_limited" });
+        refusedAfter = attempt;
+      } else {
+        expect(answer.status(), `attempt ${attempt}`).toBe(404);
+      }
+    }
+    expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);
+
+    // With that bucket empty, the shell's own session read still answers, 25 times over.
+    for (let read = 1; read <= 25; read++) {
+      const answer = await request.get("/api/auth/get-session", { headers });
+      expect(answer.status(), `session read ${read}`).toBe(200);
+      expect(await answer.json()).toBeNull();
+    }
   });
 });
 

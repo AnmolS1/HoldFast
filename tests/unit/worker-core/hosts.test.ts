@@ -197,6 +197,34 @@ describe("files host", () => {
     expect(seen).toEqual(["ip:203.0.113.9"]);
     expect(await response.text()).not.toContain("{");
   });
+
+  it("keys RL_FILES by the normalised address: IPv6 by its /64", async () => {
+    const seen: string[] = [];
+    const RL_FILES = {
+      limit: async ({ key }: { key: string }) => {
+        seen.push(key);
+        return { success: true };
+      },
+    };
+    for (const ip of [
+      "2001:db8:0:1::1",
+      "2001:db8:0:1:aaaa:bbbb:cccc:dddd",
+      "2001:db8:0:2::1",
+      "198.51.100.7",
+    ]) {
+      const { response } = await filesCall("/d/abc/def", {
+        env: { RL_FILES },
+        headers: { "cf-connecting-ip": ip },
+      });
+      await response.text();
+    }
+    expect(seen).toEqual([
+      "ip:2001:db8:0:1::/64",
+      "ip:2001:db8:0:1::/64",
+      "ip:2001:db8:0:2::/64",
+      "ip:198.51.100.7",
+    ]);
+  });
 });
 
 describe("app host headers", () => {
