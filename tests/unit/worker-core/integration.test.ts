@@ -42,7 +42,11 @@ import {
   type CoreDeps,
 } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
+import { WARM_UP_TIMEOUT_MS, warmWorker } from "../harness/workers/warm-up";
 import { call, fakeCtx, POOL_ENDED, sameOrigin, sleep, testEnv } from "./helpers";
+
+// This file calls the Worker's own entry: load it first, under its own limit (see warm-up.ts).
+beforeAll(warmWorker, WARM_UP_TIMEOUT_MS);
 
 /** Exactly what src/worker/index.ts injects. */
 const realCore: CoreDeps = { createDb, createAuth, getSettings, termsVersionOf, insertAudit };

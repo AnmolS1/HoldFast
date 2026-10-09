@@ -1,9 +1,13 @@
 // Proves the Workers test project boots against the full wrangler.jsonc and that each local
 // simulation the later tasks rely on is really there.
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, inject, it } from "vitest";
+import { beforeAll, describe, expect, inject, it } from "vitest";
 import { pngBytes } from "../../../setup/fixture-bytes";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN, testVars, type TestVarName } from "../../../setup/test-vars";
+import { WARM_UP_TIMEOUT_MS, warmWorker } from "./warm-up";
+
+// The Worker entry is loaded here, under its own limit; the tests below are timed on requests.
+beforeAll(warmWorker, WARM_UP_TIMEOUT_MS);
 
 describe("workers project", () => {
   it("runs inside workerd", () => {

@@ -2,13 +2,17 @@
 // or an asset, and never answer with a JSON envelope; the app host must send the full policy.
 import { exports } from "cloudflare:workers";
 import { Hono } from "hono";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
 import { createFilesHost } from "../../../src/worker/files-host";
 import { filesHostHeaders, htmlCsp } from "../../../src/worker/middleware/security-headers";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
+import { WARM_UP_TIMEOUT_MS, warmWorker } from "../harness/workers/warm-up";
 import { appWith, call, fakeCore, type CallOptions } from "./helpers";
+
+// This file calls the Worker's own entry: load it first, under its own limit (see warm-up.ts).
+beforeAll(warmWorker, WARM_UP_TIMEOUT_MS);
 
 // The real auth router (routes/auth.ts) hands every /api/auth/* request to Better Auth. These
 // tests are about the pipeline IN FRONT of it, so the registry gets the stand-in the pipeline was
