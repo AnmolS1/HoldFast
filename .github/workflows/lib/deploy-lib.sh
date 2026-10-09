@@ -316,7 +316,11 @@ cmd_containers_plan() {
   plan="$(plan_from_shas "$deployed" "$head")"
   rollout="${plan%% *}"
   echo "containers-plan: $rollout (${plan#* })"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then echo "rollout=$rollout" >>"$GITHUB_OUTPUT"; fi
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "rollout=$rollout" >>"$GITHUB_OUTPUT"
+    # The live commit, for the migration rule ("" when it could not be read).
+    if is_sha "$deployed"; then echo "deployed=$deployed" >>"$GITHUB_OUTPUT"; else echo "deployed=" >>"$GITHUB_OUTPUT"; fi
+  fi
 }
 
 # ── worker-ready / secrets ───────────────────────────────────────────────────────────────────────

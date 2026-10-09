@@ -2,8 +2,9 @@
 # are never more than about a week old even when containers/ is untouched.
 #
 # `schedule` and `workflow_dispatch` only fire from the default branch (`prod`), so this does
-# nothing until the file is on `prod`. It is also a no-op while containers/clamav/Dockerfile is
-# still the placeholder (no scanner in it): the job says so and stops.
+# nothing until the file is on `prod`. While containers/clamav/Dockerfile is still the placeholder
+# (no scanner in it) the weekly run is a no-op that says so, and a manual run fails: a green run of
+# this workflow always means the step "Deploy with a freshly built image" ran.
 #
 # It redeploys the code that is ALREADY LIVE, with a fresh image, and nothing else: for each
 # environment it checks out that environment's branch and refuses to continue unless the live build
@@ -97,9 +98,13 @@ jobs:
           fi
           if grep -qiE 'freshclam|clamd' "$dockerfile" && ! grep -qi 'placeholder scanner image' "$dockerfile"; then
             echo "real=true" >>"$GITHUB_OUTPUT"
-          else
+          elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             echo "real=false" >>"$GITHUB_OUTPUT"
             echo "::notice::scanner-image: $dockerfile is still the placeholder — nothing was rebuilt for $TARGET_ENV"
+          else
+            # A person asked for a rebuild. Answering green without rebuilding anything would be a lie.
+            echo "::error::scanner-image: $dockerfile is still the placeholder — there is no scanner image to rebuild"
+            exit 1
           fi
 
       - name: Set up Node
