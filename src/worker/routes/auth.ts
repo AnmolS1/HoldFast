@@ -25,6 +25,7 @@ import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath, recordAdminDenial } from "../a
 import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
+import { safeError } from "../auth/redact";
 import { captureError } from "../sentry";
 import { AppError } from "../services/errors";
 import { metric } from "../services/metrics";
@@ -149,6 +150,14 @@ router.all("/auth/*", async (c) => {
       );
     }
     response = outcome;
+  } catch (error) {
+    // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
+    // What goes on — to the error handler, and from there to Sentry — is a sanitised copy:
+    // the class, the code and the scanned message. A database error carries the row it was
+    // about (the address, in `detail`), and none of that may leave with it.
+    if (error instanceof AppError) throw error;
+    metric("auth", { outcome: "error" });
+    throw safeError(error);
   } finally {
     clearTimeout(timer);
   }

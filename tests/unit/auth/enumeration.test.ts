@@ -9,7 +9,7 @@
 // caller, on their next request, which it was.
 import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { user } from "../../../src/worker/db/schema";
+import { account, user } from "../../../src/worker/db/schema";
 import { scheduleDeletion, suspendUser, SYSTEM_ACTOR } from "../../../src/worker/services/account-state";
 import * as passwordWork from "../../../src/worker/auth/password";
 import {
@@ -215,7 +215,7 @@ describe("sign-up: an address that has an account, and one that has none", () =>
 });
 
 describe("sign-in with a wrong password", () => {
-  it("is one answer whatever the address is: unknown, unverified, verified, suspended, banned, deletion pending or past", async () => {
+  it("is one answer whatever the address is: unknown, without a password, unverified, verified, suspended, banned, deletion pending or past", async () => {
     const verified = await verifiedUser();
     const unverified = await signUp(newClient());
     const suspended = await verifiedUser();
@@ -234,8 +234,26 @@ describe("sign-in with a wrong password", () => {
       .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
       .where(eq(user.id, gone.user.id));
 
+    // An account that has no password at all (it signs in with Google).
+    const googleOnly = freshEmail();
+    const googleOnlyId = `g${crypto.randomUUID().replace(/-/g, "").slice(0, 31)}`;
+    await testDb()
+      .insert(user)
+      .values({ id: googleOnlyId, name: "G", email: googleOnly, emailVerified: true });
+    await testDb()
+      .insert(account)
+      .values({
+        id: `a${crypto.randomUUID().replace(/-/g, "").slice(0, 31)}`,
+        accountId: "google-subject-1",
+        providerId: "google",
+        userId: googleOnlyId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
     const addresses = {
       unknown: freshEmail(),
+      "no password (Google only)": googleOnly,
       unverified: unverified.email,
       verified: verified.email,
       suspended: suspended.email,

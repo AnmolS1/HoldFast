@@ -162,9 +162,17 @@ export function buildAuthOptions(scope: AuthScope) {
       // Google's tokens are not used after sign-in; what is stored of them is stored encrypted.
       encryptOAuthTokens: true,
     },
-    // An OAuth error with no page of its own lands on the sign-in screen, not on a page served
-    // from /api/auth.
-    onAPIError: { errorURL: `${env.APP_ORIGIN}/login` },
+    onAPIError: {
+      // An OAuth error with no page of its own lands on the sign-in screen, not on a page
+      // served from /api/auth.
+      errorURL: `${env.APP_ORIGIN}/login`,
+      // An error that is not Better Auth's own (a database failure, say) is THROWN out of the
+      // handler instead of being printed by the router underneath: better-call's fallback is
+      // `console.error("# SERVER_ERROR: ", error)` (better-call/dist/router.mjs:93) — the whole
+      // error object, unredacted, straight to the Worker's log. routes/auth.ts catches it and
+      // reports a sanitised copy. An APIError is answered exactly as before (router.mjs:88).
+      throw: true,
+    },
     user: {
       additionalFields: userAdditionalFields,
       changeEmail: {

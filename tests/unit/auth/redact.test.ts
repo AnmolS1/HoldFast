@@ -207,6 +207,12 @@ describe("the redaction function", () => {
       "INVALID_EMAIL_OR_PASSWORD (SQLSTATE 23505) in user_email_unique",
     );
     expect(scrubText("x".repeat(5000)).length).toBeLessThanOrEqual(501);
+    // A failed query's parameter list is the row: cut off whole, name and all.
+    expect(
+      scrubText(
+        `Failed query: insert into "user" (name) values ($1)\nparams: ${SECRETS.name},${SECRETS.password}`,
+      ),
+    ).toBe('Failed query: insert into "user" (name) values ($1)\nparams: [dropped]');
   });
 
   it("an error: its class, its code and its scanned message — none of its fields", () => {

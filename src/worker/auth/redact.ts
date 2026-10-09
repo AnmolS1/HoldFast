@@ -15,7 +15,9 @@
 //    one-time codes and IP addresses.
 //
 // A scan cannot recognise a person's NAME or any other free-form value inside a sentence. Nothing
-// here relies on it to: such values only ever arrive inside objects, which the first rule drops.
+// here relies on it to: such values arrive inside objects, which the first rule drops — and in
+// the one place a library puts a row into a sentence (the parameter list of a failed query, in
+// the error's message), the whole list is cut off.
 
 import { redactText } from "../../shared/sentry-redact";
 
@@ -35,6 +37,8 @@ const ONE_TIME_CODE = /(?<![\w.-])\d{6,8}(?![\w-])/g;
 const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 const IPV6 = /(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])/gi;
 
+const QUERY_PARAMS = /\bparams:[\s\S]*$/i;
+
 const isWordLike = (run: string) => /^[A-Z_]+$/.test(run) || /^[a-z_-]+$/.test(run);
 
 /** A long run: a word or a constant is kept; a path is judged segment by segment; the rest goes. */
@@ -53,9 +57,13 @@ function scrubRun(run: string): string {
 
 /** Free text, safe to keep: scanned, and capped in length. */
 export function scrubText(text: string): string {
+  // A query's parameters are the row itself — names, hashes, tokens, in no recognisable shape.
+  // Drizzle puts them in the MESSAGE of the error it wraps a failed query in ("Failed query: …
+  // params: a,b,c"), so everything after that word goes, unread.
+  const withoutParams = text.slice(0, 4 * MAX_TEXT).replace(QUERY_PARAMS, "params: [dropped]");
   // Whole URLs first: the shared rules rewrite parts of a URL, and what they leave would no
   // longer read as one.
-  const scanned = redactText(text.slice(0, 4 * MAX_TEXT).replace(ABSOLUTE_URL, "[url]"))
+  const scanned = redactText(withoutParams.replace(ABSOLUTE_URL, "[url]"))
     .replace(JWT, "[token]")
     .replace(LONG_RUN, scrubRun)
     .replace(BACKUP_CODE, "[code]")

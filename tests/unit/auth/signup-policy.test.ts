@@ -467,28 +467,37 @@ describe("concurrency", () => {
     expect(invites.reduce((sum, invite) => sum + invite!.uses, 0)).toBe(3);
   });
 
-  it("the same new address four times at once: one account, one invite used, one count taken", async () => {
+  it("the same new address four times at once: one account; each request that was answered 200 spent one invite and one count, the others none", async () => {
     const email = freshEmail();
     const clients = Array.from({ length: 4 }, () => newClient());
     const results = await Promise.all(clients.map((client) => signUp(client, { email })));
-    // The losers either hit the unique index (422) or arrive late and get the look-alike 200.
+    // One request creates the account. Each of the others either hits the unique index (422,
+    // and gives back what it took) or arrives after the account exists and gets the look-alike
+    // 200 — which spends exactly what a new sign-up spends, so that a duplicate cannot be told
+    // from a new one by what is left afterwards (tests/unit/auth/enumeration.test.ts).
     for (const result of results) expect([200, 422]).toContain(result.sent.status);
+    const answered = results.filter((result) => result.sent.status === 200).length;
+    expect(answered).toBeGreaterThanOrEqual(1);
     const row = await userByEmail(email);
     expect(row).not.toBeNull();
+    const all = await testDb().select({ id: user.id }).from(user).where(eq(user.email, email));
+    expect(all, "exactly one account").toHaveLength(1);
     const invites = await Promise.all(results.map((r) => inviteRow(r.inviteCode!)));
-    expect(
-      invites.reduce((sum, invite) => sum + invite!.uses, 0),
-      "exactly one invite was used",
-    ).toBe(1);
+    for (const [index, invite] of invites.entries()) {
+      expect(invite!.uses, `request ${index}: ${results[index]!.sent.status}`).toBe(
+        results[index]!.sent.status === 200 ? 1 : 0,
+      );
+    }
     const counts = await Promise.all(
       clients.map(async (client) =>
         ledgerCount("signup_ip", await ipHashDaily(keys, client.ip, dayUTC(new Date()))),
       ),
     );
-    expect(
-      counts.reduce((sum, count) => sum + count, 0),
-      "exactly one sign-up was counted",
-    ).toBe(1);
+    for (const [index, count] of counts.entries()) {
+      expect(count, `request ${index}: ${results[index]!.sent.status}`).toBe(
+        results[index]!.sent.status === 200 ? 1 : 0,
+      );
+    }
   });
 });
 
