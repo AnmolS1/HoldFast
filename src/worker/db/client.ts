@@ -29,7 +29,7 @@
 import type { ExtractTablesWithRelations } from "drizzle-orm";
 import { drizzle, type NodePgDatabase, type NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
-import { Pool, types, type PoolClient } from "pg";
+import { Client, Pool, types, type PoolClient } from "pg";
 import * as schema from "./schema";
 
 /** OID of `timestamp` WITHOUT time zone. */
@@ -62,10 +62,27 @@ export type Executor = PgDatabase<NodePgQueryResultHKT, Schema, ExtractTablesWit
 /**
  * Takes no ExecutionContext and schedules nothing. `close()` is idempotent.
  *
- * `close()` waits for every checked-out connection to be returned (pg's `pool.end()`), so it
- * never resolves while some task still holds one. `close({ force: true })` is for the caller
- * that has given up on such tasks: it first destroys the connections that are still checked out
- * — their owners' next query fails — and then ends the pool.
+ * `close()` is pg's `pool.end()`: it resolves only once EVERY connection has come back
+ * (pg-pool 3.14 index.js `_pulseQueue`: an ending pool removes its idle clients and calls the end
+ * callback only when `_clients` is empty). A task that sits on a connection — a query in flight,
+ * a transaction it never commits — therefore blocks it for ever.
+ *
+ * `close({ force: true })` is for the caller that has given up on such tasks. It may be called
+ * first, or after a plain `close()` that did not return. For every connection still lent out:
+ *   1. `client.release(true)` — pg-pool `_release` with a truthy argument goes to `_remove`,
+ *      which drops the client from `_clients` at once and calls `client.end()` (pg 8.23
+ *      lib/client.js `end`: with a query in flight it destroys the socket, otherwise it sends
+ *      Terminate);
+ *   2. `client.release` is then replaced with a no-op: pg-pool's own `pool.query` wrapper, and a
+ *      task that wakes up later, will call it again, and the original throws "Release called on
+ *      client which has already been released" from inside an event callback;
+ *   3. the socket is destroyed (`client.connection.stream.destroy()`, the call pg-pool itself
+ *      uses for a timed-out client), so the server-side session ends now, not when the server
+ *      next reads from it. `client.end()` has already marked the client as ending, so this
+ *      raises no "terminated unexpectedly" error; an error listener is attached regardless.
+ * Before that, a query the connection is running is cancelled on the server (see
+ * `cancelRunningQuery`). The abandoned owners' next use of their connection fails; nothing waits
+ * for them.
  */
 export function createDb(env: Env): { db: Db; close: (opts?: { force?: boolean }) => Promise<void> } {
   const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
@@ -74,24 +91,56 @@ export function createDb(env: Env): { db: Db; close: (opts?: { force?: boolean }
   const lent = new Set<PoolClient>();
   pool.on("acquire", (client) => lent.add(client));
   pool.on("release", (_error, client) => lent.delete(client));
-  let closed = false;
+  let ending: Promise<void> | null = null;
+
+  /**
+   * Best effort, before the socket goes: ask the server to cancel the query this connection is
+   * running, with Postgres' own CancelRequest (pg `Client#cancel`: a second, throw-away
+   * connection that sends the target's process id and secret key — it can only ever hit that one
+   * session). Without it the server does not notice a vanished client until the query ends: a
+   * destroyed socket alone leaves a minute-long query running its minute.
+   */
+  const cancelRunningQuery = (client: PoolClient): void => {
+    try {
+      const target = client as unknown as { activeQuery?: unknown; _getActiveQuery?: () => unknown };
+      const running = target._getActiveQuery ? target._getActiveQuery() : target.activeQuery;
+      if (!running) return;
+      const canceller = new Client({ connectionString: env.HYPERDRIVE.connectionString });
+      canceller.on("error", () => {});
+      (canceller as unknown as { connection: { on(event: string, fn: () => void): void } }).connection.on(
+        "error",
+        () => {},
+      );
+      (canceller as unknown as { cancel(client: PoolClient, query: unknown): void }).cancel(client, running);
+    } catch {
+      // The connection could not be made or the driver changed shape: the socket is destroyed anyway.
+    }
+  };
+
+  const takeBack = (client: PoolClient): void => {
+    lent.delete(client);
+    client.on("error", () => {});
+    cancelRunningQuery(client);
+    try {
+      client.release(true);
+    } catch {
+      // Released by its owner in the meantime.
+    }
+    client.release = () => {};
+    try {
+      (client as unknown as { connection?: { stream?: { destroy(): void } } }).connection?.stream?.destroy();
+    } catch {
+      // Already gone.
+    }
+  };
+
   return {
     db,
     close: async (opts = {}) => {
-      if (closed) return;
-      closed = true;
-      if (opts.force) {
-        for (const client of [...lent]) {
-          lent.delete(client);
-          try {
-            // `true` destroys the connection instead of returning it to the pool.
-            client.release(true);
-          } catch {
-            // Already released by its owner in the meantime.
-          }
-        }
-      }
-      await pool.end();
+      // Before pool.end() on a first forced call, so that the pool finds itself empty at once.
+      if (opts.force) for (const client of [...lent]) takeBack(client);
+      ending ??= pool.end();
+      await ending;
     },
   };
 }

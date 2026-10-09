@@ -28,6 +28,11 @@
 //                         context/#waituntil). At the deadline the pool is closed regardless —
 //                         forcibly, connections still lent out included — and the number of
 //                         abandoned tasks is logged and counted. The 10 s left are for the close.
+//   CLOSE_DEADLINE_MS     3 s for the close itself. A plain close waits for every connection to
+//                         come back, so it can hang on a connection something still holds: when
+//                         it has not returned in 3 s it is forced, and the forced close gets 3 s
+//                         more. If even that does not return, the fact is logged and counted and
+//                         the invocation ends anyway. 20 + 3 + 3 s stays inside the 30.
 //   MAX_DEFERRED_TASKS    100 `defer` calls per invocation.
 //   MAX_DEFER_ROUNDS      8 drain passes: work deferred by deferred work, eight levels deep.
 // Past either cap `defer()` throws `DEFER_LIMIT` and does not register the promise — a task that
@@ -139,7 +144,15 @@ export const MAX_DEFERRED_TASKS = 100;
 /** Drain passes per invocation: how deep deferred work may defer more work. */
 export const MAX_DEFER_ROUNDS = 8;
 
-export type DeferLimits = { drainDeadlineMs: number; maxDeferredTasks: number; maxDeferRounds: number };
+/** One close attempt (plain, then forced). */
+export const CLOSE_DEADLINE_MS = 3_000;
+
+export type DeferLimits = {
+  drainDeadlineMs: number;
+  closeDeadlineMs: number;
+  maxDeferredTasks: number;
+  maxDeferRounds: number;
+};
 
 /** Env defaults under the settings table. An unknown `SIGNUP_MODE` is the closed one. */
 export function resolveSettings(
@@ -182,6 +195,7 @@ type Lifetime = {
 function newLifetime(core: CoreDeps, env: Env, ctx: WaitUntil): Lifetime {
   const limits: DeferLimits = {
     drainDeadlineMs: DRAIN_DEADLINE_MS,
+    closeDeadlineMs: CLOSE_DEADLINE_MS,
     maxDeferredTasks: MAX_DEFERRED_TASKS,
     maxDeferRounds: MAX_DEFER_ROUNDS,
     ...core.limits,
@@ -280,9 +294,44 @@ async function drainAndClose(life: Lifetime): Promise<void> {
     writeMetric(life.env, "error", { kind: "deferred_abandoned" }, abandoned);
     console.warn(`deferred work abandoned at the drain deadline: ${abandoned} task(s) had not settled`);
   }
-  // Forced when tasks were abandoned: one of them may hold a connection, and an ordinary close
-  // waits for every connection to come back.
-  if (life.handle) await life.handle.close({ force: abandoned > 0 });
+  await closeWithin(life, abandoned > 0);
+}
+
+/** True when `work` settled (either way) within `ms`. Never rejects, never leaves a rejection unhandled. */
+async function settledWithin(work: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  const done = work.then(
+    () => true as const,
+    () => true as const,
+  );
+  try {
+    return await Promise.race([done, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Closes the pool, in bounded time whatever state its connections are in. Forced straight away
+ * when deferred tasks were abandoned (one of them may hold a connection); otherwise a plain close
+ * first, forced only if that does not return. Never throws: this runs inside `waitUntil` and in
+ * a `finally`, where a rejection would be unhandled or would mask the handler's own error.
+ */
+async function closeWithin(life: Lifetime, force: boolean): Promise<void> {
+  const handle = life.handle;
+  if (!handle) return;
+  const ms = life.limits.closeDeadlineMs;
+  if (!force && (await settledWithin(handle.close(), ms))) return;
+  if (!force) {
+    writeMetric(life.env, "error", { kind: "pool_close", reason: "forced" });
+    console.warn("the database pool did not close in time: forcing it");
+  }
+  if (await settledWithin(handle.close({ force: true }), ms)) return;
+  writeMetric(life.env, "error", { kind: "pool_close", reason: "abandoned" });
+  console.warn("the database pool did not close even when forced: abandoning it");
 }
 
 // ── Request path ──────────────────────────────────────────────────────────────────────────────

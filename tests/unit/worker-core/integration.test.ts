@@ -26,6 +26,7 @@ import { audit } from "../../../src/worker/services/audit";
 import {
   db,
   defer,
+  CLOSE_DEADLINE_MS,
   DEFER_LIMIT,
   DRAIN_DEADLINE_MS,
   MAX_DEFER_ROUNDS,
@@ -312,51 +313,195 @@ describe("deferred work on a real pool", () => {
     await ctx.settle();
   };
 
-  it("fetch: a deferred task that never settles — holding a connection — is abandoned at the deadline and the pool is closed", async () => {
-    const seen: { db?: Db } = {};
+  /** Is that backend still connected to the server? Asked over a separate connection. */
+  const backendAlive = (pid: number) =>
+    withDb(workerEnv, async (handle) => {
+      const found = await handle.execute(sql`select 1 from pg_stat_activity where pid = ${pid}`);
+      return found.rows.length > 0;
+    });
+  /** Waits (bounded) for the server to drop the backend. */
+  const backendGone = async (pid: number) => {
+    for (let waited = 0; waited < 3_000; waited += 50) {
+      if (!(await backendAlive(pid))) return true;
+      await sleep(50);
+    }
+    return false;
+  };
+  const pidOf = async (handle: { execute: Db["execute"] }) =>
+    Number(((await handle.execute(sql`select pg_backend_pid() as pid`)).rows[0] as { pid: number }).pid);
+
+  type Stuck = { pid?: number; release(): void; task(handle: Db): Promise<unknown> };
+  /** A task that checks a connection out inside a transaction and never commits. */
+  const openTransaction = (): Stuck => {
     let release!: () => void;
     const never = new Promise<void>((resolve) => (release = resolve));
-    let holding = false;
-    const sink = metricsSink();
-    const router = new Hono<AppEnv>();
-    router.get("/_it/hung", (c) => {
-      seen.db = db(c);
-      // Checks a connection out of the pool and keeps it: an ordinary pool.end() waits for it.
-      defer(
-        c,
-        db(c).transaction(async (tx) => {
-          await tx.execute(sql`select 1`);
-          holding = true;
+    const stuck: Stuck = {
+      release,
+      task: (handle) =>
+        handle.transaction(async (tx) => {
+          stuck.pid = await pidOf(tx);
           await never;
         }),
+    };
+    return stuck;
+  };
+  /** A task with a query in flight for a minute. */
+  const longQuery = (): Stuck => {
+    const stuck: Stuck = {
+      release: () => {},
+      task: (handle) =>
+        handle.transaction(async (tx) => {
+          stuck.pid = await pidOf(tx);
+          await tx.execute(sql`select pg_sleep(60)`);
+        }),
+    };
+    return stuck;
+  };
+  /** The same minute-long query through the pool's own `query` (no transaction, no explicit client). */
+  const longPoolQuery = (): Stuck => ({
+    release: () => {},
+    task: (handle) => handle.execute(sql`select pg_sleep(60), 'hf-drain-test' as marker`),
+  });
+  const poolQueryRunning = () =>
+    withDb(workerEnv, async (handle) => {
+      const found = await handle.execute(
+        sql`select pid from pg_stat_activity where state = 'active' and query like '%pg_sleep(60), ''hf-drain-test''%' and pid <> pg_backend_pid()`,
       );
-      defer(c, sleep(5));
+      return found.rows.map((row) => Number((row as { pid: number }).pid));
+    });
+
+  for (const [label, make] of [
+    ["holds a connection in a transaction it never commits", openTransaction],
+    ["has a minute-long query in flight inside a transaction", longQuery],
+  ] as const) {
+    it(`fetch: a deferred task that ${label} is abandoned at the deadline; the pool closes and the server-side connection is gone`, async () => {
+      const seen: { db?: Db } = {};
+      const stuck = make();
+      const sink = metricsSink();
+      const router = new Hono<AppEnv>();
+      router.get("/_it/hung", (c) => {
+        seen.db = db(c);
+        defer(c, stuck.task(db(c)));
+        defer(c, sleep(5));
+        return c.json({ ok: true });
+      });
+      const started = Date.now();
+      const { response, ctx } = await call(
+        createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }), { extraRouters: [router] }),
+        "/api/_it/hung",
+        { env: { METRICS: sink.METRICS } },
+      );
+      expect(response.status).toBe(200);
+      await response.text();
+      // Before the deadline the task really is sitting on a live server connection.
+      await sleep(100);
+      expect(stuck.pid).toEqual(expect.any(Number));
+      expect(await backendAlive(stuck.pid!)).toBe(true);
+
+      await drainOf(ctx);
+      const took = Date.now() - started;
+      expect(took).toBeGreaterThanOrEqual(290);
+      // Deadline + one close attempt at most; not the minute the query would take.
+      expect(took).toBeLessThan(300 + 1_000 + 1_500);
+      await expectPoolEnded(seen.db);
+      expect(await backendGone(stuck.pid!), "the server no longer has the connection").toBe(true);
+      // Counted and logged: how many, never what. The forced close worked first time.
+      const abandoned = sink.points.filter((point) => point.blobs[2] === "deferred_abandoned");
+      expect(abandoned).toHaveLength(1);
+      expect(abandoned[0]!.doubles[0]).toBe(1);
+      expect(JSON.stringify(abandoned)).not.toContain("_it/hung");
+      expect(sink.points.filter((point) => point.blobs[2] === "pool_close")).toEqual([]);
+      // The next invocation has its own pool and is unaffected.
+      await healthy();
+      stuck.release();
+      await sleep(20);
+    });
+  }
+
+  it("fetch: a minute-long query through pool.query is abandoned too, with no stray error", async () => {
+    const seen: { db?: Db } = {};
+    const stuck = longPoolQuery();
+    const router = new Hono<AppEnv>();
+    router.get("/_it/hung-query", (c) => {
+      seen.db = db(c);
+      defer(c, stuck.task(db(c)));
+      return c.json({ ok: true });
+    });
+    const { response, ctx } = await call(
+      createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }), { extraRouters: [router] }),
+      "/api/_it/hung-query",
+    );
+    await response.text();
+    await sleep(100);
+    const before = await poolQueryRunning();
+    expect(before.length).toBeGreaterThanOrEqual(1);
+    await drainOf(ctx);
+    await expectPoolEnded(seen.db);
+    for (const pid of before) expect(await backendGone(pid)).toBe(true);
+    // pg-pool's own query wrapper releases the client again when the query errors: that second
+    // release must not throw (it would be an uncaught exception, failing this whole file).
+    await sleep(50);
+    await healthy();
+  });
+
+  it("fetch: deferred work that finishes before the deadline is waited for and the close is a plain one", async () => {
+    const seen: { db?: Db } = {};
+    const rows: unknown[] = [];
+    const sink = metricsSink();
+    const router = new Hono<AppEnv>();
+    router.get("/_it/slow-but-fine", (c) => {
+      seen.db = db(c);
+      defer(
+        c,
+        db(c)
+          .execute(sql`select pg_sleep(0.4), 42 as answer`)
+          .then((result) => rows.push((result.rows[0] as { answer: number }).answer)),
+      );
       return c.json({ ok: true });
     });
     const started = Date.now();
     const { response, ctx } = await call(
-      createApp(quick({ drainDeadlineMs: 300 }), { extraRouters: [router] }),
-      "/api/_it/hung",
+      createApp(quick({ drainDeadlineMs: 3_000, closeDeadlineMs: 1_000 }), { extraRouters: [router] }),
+      "/api/_it/slow-but-fine",
       { env: { METRICS: sink.METRICS } },
     );
-    expect(response.status).toBe(200);
+    await response.text();
+    await ctx.settle();
+    expect(rows).toEqual([42]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(390);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(sink.points.filter((p) => ["deferred_abandoned", "pool_close"].includes(p.blobs[2]!))).toEqual([]);
+    await expectPoolEnded(seen.db);
+  });
+
+  it("fetch: a connection leaked by the handler itself (nothing deferred) cannot hang the close either", async () => {
+    const seen: { db?: Db } = {};
+    const stuck = openTransaction();
+    const sink = metricsSink();
+    const router = new Hono<AppEnv>();
+    router.get("/_it/leak", async (c) => {
+      seen.db = db(c);
+      // Not deferred: the drain knows nothing about it, so the close starts as a plain one.
+      void stuck.task(db(c)).catch(() => {});
+      await sleep(50);
+      return c.json({ ok: true });
+    });
+    const started = Date.now();
+    const { response, ctx } = await call(
+      createApp(quick({ closeDeadlineMs: 300 }), { extraRouters: [router] }),
+      "/api/_it/leak",
+      { env: { METRICS: sink.METRICS } },
+    );
     await response.text();
     await drainOf(ctx);
-    const took = Date.now() - started;
-
-    expect(holding).toBe(true);
-    expect(took).toBeGreaterThanOrEqual(290);
-    expect(took).toBeLessThan(5_000);
+    expect(Date.now() - started).toBeLessThan(300 + 300 + 1_500);
+    expect(sink.points.filter((point) => point.blobs[2] === "pool_close").map((p) => p.blobs[3])).toEqual([
+      "forced",
+    ]);
     await expectPoolEnded(seen.db);
-    // Counted and logged: how many, never what.
-    const abandoned = sink.points.filter((point) => point.blobs[2] === "deferred_abandoned");
-    expect(abandoned).toHaveLength(1);
-    expect(abandoned[0]!.doubles[0]).toBe(1);
-    expect(JSON.stringify(abandoned)).not.toContain("_it/hung");
-    // The connection it held was taken back: the server no longer has it in a transaction.
-    // And the next invocation is unaffected.
-    await healthy();
-    release();
+    expect(await backendGone(stuck.pid!)).toBe(true);
+    stuck.release();
+    await sleep(20);
   });
 
   it("fetch: a task that re-defers itself forever stops at the round limit, and the pool is closed", async () => {
@@ -435,41 +580,67 @@ describe("deferred work on a real pool", () => {
   it("the defaults are under the platform's 30 s waitUntil window", () => {
     expect(DRAIN_DEADLINE_MS).toBe(20_000);
     expect(DRAIN_DEADLINE_MS).toBeLessThanOrEqual(30_000 - 10_000);
+    expect(CLOSE_DEADLINE_MS).toBe(3_000);
+    // The drain, a plain close and a forced close, all inside the platform's window.
+    expect(DRAIN_DEADLINE_MS + 2 * CLOSE_DEADLINE_MS).toBeLessThan(30_000);
     expect(MAX_DEFERRED_TASKS).toBe(100);
     expect(MAX_DEFER_ROUNDS).toBe(8);
   });
 
-  it("runBackground: a deferred task that never settles is abandoned at the deadline; the next run works", async () => {
-    const seen: { db?: Db } = {};
-    let release!: () => void;
-    const never = new Promise<void>((resolve) => (release = resolve));
-    const sink = metricsSink();
-    const started = Date.now();
-    await runBackground(
-      testEnv({ METRICS: sink.METRICS }),
-      fakeCtx(),
-      async (bg) => {
-        seen.db = bg.db;
-        bg.defer(
-          bg.db.transaction(async (tx) => {
-            await tx.execute(sql`select 1`);
-            await never;
-          }),
-        );
-      },
-      quick({ drainDeadlineMs: 300 }),
-    );
-    expect(Date.now() - started).toBeLessThan(5_000);
-    await expectPoolEnded(seen.db);
-    expect(sink.points.filter((point) => point.blobs[2] === "deferred_abandoned")).toHaveLength(1);
-    const again = await runBackground(
-      testEnv(),
-      fakeCtx(),
-      async (bg) => bg.db.execute(sql`select 7 as n`),
-      realCore,
-    );
-    expect(again.rows).toEqual([{ n: 7 }]);
-    release();
+  // queue() and scheduled() both run through runBackground (src/worker/index.ts).
+  for (const [label, make] of [
+    ["holds a connection in a transaction it never commits", openTransaction],
+    ["has a minute-long query in flight", longQuery],
+  ] as const) {
+    it(`runBackground (queue and cron): a deferred task that ${label} is abandoned at the deadline; the next run works`, async () => {
+      const seen: { db?: Db } = {};
+      const stuck = make();
+      const sink = metricsSink();
+      const started = Date.now();
+      await runBackground(
+        testEnv({ METRICS: sink.METRICS }),
+        fakeCtx(),
+        async (bg) => {
+          seen.db = bg.db;
+          bg.defer(stuck.task(bg.db));
+          await sleep(100);
+          expect(await backendAlive(stuck.pid!)).toBe(true);
+        },
+        quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }),
+      );
+      expect(Date.now() - started).toBeLessThan(100 + 300 + 1_000 + 1_500);
+      await expectPoolEnded(seen.db);
+      expect(await backendGone(stuck.pid!)).toBe(true);
+      expect(sink.points.filter((point) => point.blobs[2] === "deferred_abandoned")).toHaveLength(1);
+      const again = await runBackground(
+        testEnv(),
+        fakeCtx(),
+        async (bg) => bg.db.execute(sql`select 7 as n`),
+        realCore,
+      );
+      expect(again.rows).toEqual([{ n: 7 }]);
+      stuck.release();
+      await sleep(20);
+    });
+  }
+
+  it("runBackground: a failing job whose pool will not close still rethrows the job's own error", async () => {
+    const stuck = openTransaction();
+    await expect(
+      runBackground(
+        testEnv(),
+        fakeCtx(),
+        async (bg) => {
+          void stuck.task(bg.db).catch(() => {});
+          await sleep(50);
+          throw new Error("job failed");
+        },
+        quick({ closeDeadlineMs: 300 }),
+      ),
+    ).rejects.toThrow("job failed");
+    expect(await backendGone(stuck.pid!)).toBe(true);
+    stuck.release();
+    await sleep(20);
   });
 
   it("runBackground: a task that re-defers forever stops at the round limit", async () => {
