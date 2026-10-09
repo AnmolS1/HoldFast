@@ -380,12 +380,22 @@ describe("rate limits", () => {
     const a = newClient({ ip });
     const b = newClient({ ip });
     // Sign-out is limited by Better Auth at its default 30 a minute, so RL_AUTH (20) trips first.
-    for (let i = 1; i <= 20; i++) {
+    // The limiter counts in fixed one-minute windows. Twenty writes pass in any window, so the
+    // first refusal is the 21st write — or, when the minute rolls over part-way (a loaded
+    // machine), the 21st of the new window: never earlier than the 21st, never later than the 41st.
+    let refused: Awaited<ReturnType<typeof send>> | null = null;
+    let refusedAt = 0;
+    for (let i = 1; i <= 41 && refused === null; i++) {
       const sent = await send(i % 2 ? a : b, "/api/auth/sign-out", { json: {} });
-      expect(sent.status, `write ${i}`).toBe(200);
+      if (sent.status === 429) {
+        refused = sent;
+        refusedAt = i;
+      } else {
+        expect(sent.status, `write ${i}`).toBe(200);
+      }
     }
-    const refused = await send(a, "/api/auth/sign-out", { json: {} });
-    expect(refused.status).toBe(429);
+    expect(refusedAt, "the first refused write").toBeGreaterThanOrEqual(21);
+    if (refused === null) throw new Error("41 writes in at most two windows were all let through");
     expect(refused.body).toMatchObject({ error: "rate_limited" });
     expect(refused.headers.get("retry-after")).toBe("60");
     // The ruling's own words: the 21st SIGN-IN attempt from that address is a 429 too.
