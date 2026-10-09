@@ -15,9 +15,23 @@ export function DetailsPanel() {
       component="aside"
       aria-label={t("details.label")}
       data-details-panel
-      sx={{ width: layout.details, flex: "none", boxSizing: "border-box", borderLeft: `1px solid ${hf.hairline}`, backgroundColor: hf.bg, padding: 5, display: "flex", flexDirection: "column", gap: 4, overflowY: "auto", minHeight: 0 }}
+      sx={{
+        width: layout.details,
+        flex: "none",
+        boxSizing: "border-box",
+        borderLeft: `1px solid ${hf.hairline}`,
+        backgroundColor: hf.bg,
+        padding: 5,
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        overflowY: "auto",
+        minHeight: 0,
+      }}
     >
-      {current.content ?? <EmptyState type="cleared" title={t("details.empty.title")} body={t("details.empty.body")} />}
+      {current.content ?? (
+        <EmptyState type="cleared" title={t("details.empty.title")} body={t("details.empty.body")} />
+      )}
     </Box>
   );
 }
@@ -26,8 +40,15 @@ export function DetailsPanel() {
 export function DetailsSheet() {
   const current = useSyncExternalStore(subscribeDetails, getDetails, getDetails);
   return (
-    <BottomSheet open={current.open && current.content !== null} onClose={detailsApi.close} title={current.title ?? t("details.label")} hideTitle={current.title === null}>
-      <Box sx={{ padding: "0 12px 12px", display: "flex", flexDirection: "column", gap: 4 }}>{current.content}</Box>
+    <BottomSheet
+      open={current.open && current.content !== null}
+      onClose={detailsApi.close}
+      title={current.title ?? t("details.label")}
+      hideTitle={current.title === null}
+    >
+      <Box sx={{ padding: "0 12px 12px", display: "flex", flexDirection: "column", gap: 4 }}>
+        {current.content}
+      </Box>
     </BottomSheet>
   );
 }

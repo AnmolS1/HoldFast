@@ -1,14 +1,28 @@
 // Properties of the source tree that a reviewer would otherwise check by grep.
 import { describe, expect, it } from "vitest";
 
-const sources = import.meta.glob<string>("/src/client/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
-const initScript = import.meta.glob<string>("/public/color-scheme-init.js", { query: "?raw", import: "default", eager: true })["/public/color-scheme-init.js"]!;
-const indexHtml = import.meta.glob<string>("/index.html", { query: "?raw", import: "default", eager: true })["/index.html"]!;
+const sources = import.meta.glob<string>("/src/client/**/*.{ts,tsx}", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+const initScript = import.meta.glob<string>("/public/color-scheme-init.js", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+})["/public/color-scheme-init.js"]!;
+const indexHtml = import.meta.glob<string>("/index.html", { query: "?raw", import: "default", eager: true })[
+  "/index.html"
+]!;
 
 describe("Web Storage", () => {
   it("is touched by exactly one module, and only for UI preferences", () => {
     const users = Object.entries(sources)
-      .filter(([, code]) => /\b(localStorage|sessionStorage|indexedDB)\b/.test(code.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")))
+      .filter(([, code]) =>
+        /\b(localStorage|sessionStorage|indexedDB)\b/.test(
+          code.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, ""),
+        ),
+      )
       .map(([path]) => path);
     expect(users).toEqual(["/src/client/lib/prefs.ts"]);
   });
@@ -41,13 +55,19 @@ describe("index.html", () => {
       expect(attributes).toMatch(/\bsrc=/);
       expect(body!.trim()).toBe("");
     }
-    expect(indexHtml.indexOf("/color-scheme-init.js")).toBeLessThan(indexHtml.indexOf("/src/client/main.tsx"));
+    expect(indexHtml.indexOf("/color-scheme-init.js")).toBeLessThan(
+      indexHtml.indexOf("/src/client/main.tsx"),
+    );
     expect(scripts[0]![1]).not.toMatch(/\b(async|defer|type="module")/);
   });
 
   it("carries one theme-color per scheme and the manifest link", () => {
-    expect(indexHtml).toMatch(/<meta name="theme-color" media="\(prefers-color-scheme: light\)" content="#F7F8FA"/);
-    expect(indexHtml).toMatch(/<meta name="theme-color" media="\(prefers-color-scheme: dark\)" content="#0F1115"/);
+    expect(indexHtml).toMatch(
+      /<meta name="theme-color" media="\(prefers-color-scheme: light\)" content="#F7F8FA"/,
+    );
+    expect(indexHtml).toMatch(
+      /<meta name="theme-color" media="\(prefers-color-scheme: dark\)" content="#0F1115"/,
+    );
     expect(indexHtml).toContain('<link rel="manifest" href="/manifest.webmanifest"');
   });
 });
@@ -72,7 +92,9 @@ describe("tokens with restricted use", () => {
 
 describe("placeholder modules", () => {
   it("every placeholder module says who takes it over", () => {
-    const placeholders = Object.entries(sources).filter(([path]) => path.startsWith("/src/client/features/") && path !== "/src/client/features/index.ts");
+    const placeholders = Object.entries(sources).filter(
+      ([path]) => path.startsWith("/src/client/features/") && path !== "/src/client/features/index.ts",
+    );
     expect(placeholders.length).toBe(27);
     for (const [path, code] of placeholders) expect(code, path).toMatch(/PLACEHOLDER — taken over by/);
     expect(sources["/src/client/lib/auth-client.ts"]).toMatch(/PLACEHOLDER — taken over by/);

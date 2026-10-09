@@ -9,7 +9,13 @@ import { completeReauth, isReauthPending, subscribeGates } from "../../lib/api";
 import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
 import { t } from "../../lib/i18n";
-import { confirmReauthIdentity, getCachedSession, getKnownUserId, purgeUserState, usePublicConfig } from "../../lib/query";
+import {
+  confirmReauthIdentity,
+  getCachedSession,
+  getKnownUserId,
+  purgeUserState,
+  usePublicConfig,
+} from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
@@ -57,7 +63,9 @@ function ReauthForm() {
     setError(null);
     if (step === "code") {
       setBusy(true);
-      const result = await callAuth(() => authClient.twoFactor.verifyTotp({ code: code.replace(/\s+/g, "") }));
+      const result = await callAuth(() =>
+        authClient.twoFactor.verifyTotp({ code: code.replace(/\s+/g, "") }),
+      );
       setBusy(false);
       if (result.error) {
         setError(t("twoFactor.failed"));
@@ -75,11 +83,15 @@ function ReauthForm() {
       return;
     }
     setBusy(true);
-    const result = await callAuth(() => authClient.signIn.email({ email, password, fetchOptions: captchaOptions(turnstile.token) }));
+    const result = await callAuth(() =>
+      authClient.signIn.email({ email, password, fetchOptions: captchaOptions(turnstile.token) }),
+    );
     turnstile.reset();
     setBusy(false);
     if (result.error) {
-      setError(result.error.status === 401 ? t("reauth.failed") : authErrorMessage(result.error, "reauth.failed"));
+      setError(
+        result.error.status === 401 ? t("reauth.failed") : authErrorMessage(result.error, "reauth.failed"),
+      );
       return;
     }
     if (result.data && "twoFactorRedirect" in result.data && result.data.twoFactorRedirect) {
@@ -99,19 +111,48 @@ function ReauthForm() {
   };
 
   return (
-    <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
+    <Box
+      component="form"
+      noValidate
+      onSubmit={onSubmit}
+      sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+    >
       {step === "password" ? (
         <>
           <Button size="large" onClick={onPasskey} disabled={busy} startIcon={<PasskeyIcon />}>
             {t("reauth.passkey")}
           </Button>
           {/* The address is fixed: this dialog re-opens the same account, it does not switch accounts. */}
-          <Field label={t("auth.email")} type="email" name="email" autoComplete="username" value={email} slotProps={{ htmlInput: { readOnly: true } }} />
-          <Field label={t("reauth.password")} type="password" name="password" autoComplete="current-password" autoFocus value={password} onChange={(e) => setPassword(e.target.value)} />
+          <Field
+            label={t("auth.email")}
+            type="email"
+            name="email"
+            autoComplete="username"
+            value={email}
+            slotProps={{ htmlInput: { readOnly: true } }}
+          />
+          <Field
+            label={t("reauth.password")}
+            type="password"
+            name="password"
+            autoComplete="current-password"
+            autoFocus
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
           {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
         </>
       ) : (
-        <Field label={t("twoFactor.code")} name="code" mono autoFocus autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} slotProps={{ htmlInput: { inputMode: "numeric", maxLength: 7 } }} />
+        <Field
+          label={t("twoFactor.code")}
+          name="code"
+          mono
+          autoFocus
+          autoComplete="one-time-code"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          slotProps={{ htmlInput: { inputMode: "numeric", maxLength: 7 } }}
+        />
       )}
       <FormError>{error}</FormError>
       <Button type="submit" variant="contained" size="large" disabled={busy}>

@@ -27,7 +27,9 @@ function ListPage() {
         folder={id} count={count}
       </span>
       <button onClick={() => setCount((c) => c + 1)}>increment</button>
-      <button onClick={() => navigate("/preview/node-9", { state: { from: `/folder/${id}` } })}>open preview</button>
+      <button onClick={() => navigate("/preview/node-9", { state: { from: `/folder/${id}` } })}>
+        open preview
+      </button>
     </div>
   );
 }
@@ -38,7 +40,9 @@ function PreviewPage() {
   return (
     <div data-testid="preview">
       preview of {nodeId}
-      <button onClick={() => navigate("/preview/node-10", { replace: true, state: { from: "/folder/7" } })}>next</button>
+      <button onClick={() => navigate("/preview/node-10", { replace: true, state: { from: "/folder/7" } })}>
+        next
+      </button>
       <button onClick={() => navigate(-1)}>close</button>
     </div>
   );
@@ -127,7 +131,15 @@ describe("overlay routes", () => {
   it("control: a route WITHOUT handle.overlay replaces the list (it unmounts)", async () => {
     arrange();
     const plain: RouteObject[] = [
-      { path: "/", element: <Frame backgroundRoutes={background} />, children: [children[0]!, children[1]!, { path: "preview/:nodeId", element: <PreviewPage />, handle: { title: "Preview" } }] },
+      {
+        path: "/",
+        element: <Frame backgroundRoutes={background} />,
+        children: [
+          children[0]!,
+          children[1]!,
+          { path: "preview/:nodeId", element: <PreviewPage />, handle: { title: "Preview" } },
+        ],
+      },
     ];
     renderRoutes(plain, ["/folder/7"]);
     await screen.findByTestId("list");

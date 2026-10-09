@@ -3,15 +3,29 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { authClient } from "../../../../src/client/lib/auth-client";
 import { buildRoutes } from "../../../../src/client/router";
-import { isThirteenOrOlder, passwordStrength, validateSignup, type SignupValues } from "../../../../src/client/routes/auth/validation";
+import {
+  isThirteenOrOlder,
+  passwordStrength,
+  validateSignup,
+  type SignupValues,
+} from "../../../../src/client/routes/auth/validation";
 import { RESEND_COOLDOWN_S } from "../../../../src/client/routes/auth/VerifyEmail";
 import { envelope, json, renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
 
 setupShell();
 
 const NOW = new Date("2026-10-08T12:00:00Z");
-const valid: SignupValues = { name: "Ada", email: "ada@example.com", password: "correct horse battery", inviteCode: "HF-7K2Q", birthMonth: "5", birthYear: "1990", acceptTerms: true };
-const check = (patch: Partial<SignupValues>, inviteRequired = true) => validateSignup({ ...valid, ...patch }, { inviteRequired, now: NOW });
+const valid: SignupValues = {
+  name: "Ada",
+  email: "ada@example.com",
+  password: "correct horse battery",
+  inviteCode: "HF-7K2Q",
+  birthMonth: "5",
+  birthYear: "1990",
+  acceptTerms: true,
+};
+const check = (patch: Partial<SignupValues>, inviteRequired = true) =>
+  validateSignup({ ...valid, ...patch }, { inviteRequired, now: NOW });
 
 describe("sign-up validation (pure)", () => {
   it("a complete form has no errors", () => {
@@ -71,14 +85,17 @@ async function openSignup(config = {}) {
   return view;
 }
 
-function fill(values: Partial<Record<"inviteCode" | "name" | "email" | "password" | "birthMonth" | "birthYear", string>>) {
+function fill(
+  values: Partial<Record<"inviteCode" | "name" | "email" | "password" | "birthMonth" | "birthYear", string>>,
+) {
   for (const [name, value] of Object.entries(values)) fireEvent.change(field(name), { target: { value } });
 }
 
 describe("sign-up screen", () => {
   it("has every field the policy needs, with the age note and the terms links", async () => {
     await openSignup();
-    for (const name of ["inviteCode", "name", "email", "password", "birthMonth", "birthYear", "acceptTerms"]) expect(field(name), name).not.toBeNull();
+    for (const name of ["inviteCode", "name", "email", "password", "birthMonth", "birthYear", "acceptTerms"])
+      expect(field(name), name).not.toBeNull();
     expect(screen.getByText("Used once to check you're 13 or older; we don't keep it.")).toBeTruthy();
     const assent = field("acceptTerms").closest("label")!;
     expect(Array.from(assent.querySelectorAll("a"), (a) => [a.textContent, a.getAttribute("href")])).toEqual([
@@ -95,7 +112,14 @@ describe("sign-up screen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     const alerts = (await screen.findAllByRole("alert")).map((node) => node.textContent);
     expect(alerts).toEqual(
-      expect.arrayContaining(["Enter your invite code.", "Enter your name.", "Enter a valid email address.", "Use 12 characters or more.", "Enter the month (1–12) and a four-digit year.", "You need to accept the Terms and Privacy Policy."]),
+      expect.arrayContaining([
+        "Enter your invite code.",
+        "Enter your name.",
+        "Enter a valid email address.",
+        "Use 12 characters or more.",
+        "Enter the month (1–12) and a four-digit year.",
+        "You need to accept the Terms and Privacy Policy.",
+      ]),
     );
     expect(signUp).not.toHaveBeenCalled();
   });
@@ -109,7 +133,15 @@ describe("sign-up screen", () => {
   ] as const)("a form that is complete except for %s is not submitted", async (_name, patch, accept) => {
     const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
     const { router } = await openSignup();
-    fill({ inviteCode: "HF-7K2Q", name: "Ada", email: "ada@example.com", password: "correct horse battery", birthMonth: "5", birthYear: "1990", ...patch });
+    fill({
+      inviteCode: "HF-7K2Q",
+      name: "Ada",
+      email: "ada@example.com",
+      password: "correct horse battery",
+      birthMonth: "5",
+      birthYear: "1990",
+      ...patch,
+    });
     if (accept) fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     expect((await screen.findAllByRole("alert")).length).toBeGreaterThan(0);
@@ -121,11 +153,28 @@ describe("sign-up screen", () => {
   it("a valid form calls signUp.email with the policy fields and goes to /verify-email", async () => {
     const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
     const { router } = await openSignup();
-    fill({ inviteCode: "HF-7K2Q", name: "Ada", email: "ada@example.com", password: "correct horse battery", birthMonth: "5", birthYear: "1990" });
+    fill({
+      inviteCode: "HF-7K2Q",
+      name: "Ada",
+      email: "ada@example.com",
+      password: "correct horse battery",
+      birthMonth: "5",
+      birthYear: "1990",
+    });
     fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/verify-email"));
-    expect(signUp).toHaveBeenCalledWith(expect.objectContaining({ name: "Ada", email: "ada@example.com", password: "correct horse battery", inviteCode: "HF-7K2Q", birthYear: 1990, birthMonth: 5, acceptTerms: true }));
+    expect(signUp).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "Ada",
+        email: "ada@example.com",
+        password: "correct horse battery",
+        inviteCode: "HF-7K2Q",
+        birthYear: 1990,
+        birthMonth: 5,
+        acceptTerms: true,
+      }),
+    );
     expect((await screen.findByText("ada@example.com")).getAttribute("data-verify-email")).not.toBeNull();
     // The address travels in router state, not in the URL.
     expect(router.state.location.search).toBe("");
@@ -135,7 +184,13 @@ describe("sign-up screen", () => {
     const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
     await openSignup({ signupMode: "open" });
     expect(field("inviteCode")).toBeNull();
-    fill({ name: "Ada", email: "ada@example.com", password: "correct horse battery", birthMonth: "5", birthYear: "1990" });
+    fill({
+      name: "Ada",
+      email: "ada@example.com",
+      password: "correct horse battery",
+      birthMonth: "5",
+      birthYear: "1990",
+    });
     fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     await waitFor(() => expect(signUp).toHaveBeenCalled());
@@ -143,18 +198,38 @@ describe("sign-up screen", () => {
   });
 
   it("a breached password is reported under the password field", async () => {
-    vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: null, error: { status: 400, statusText: "", code: "PASSWORD_COMPROMISED", message: "x" } });
+    vi.spyOn(authClient.signUp, "email").mockResolvedValue({
+      data: null,
+      error: { status: 400, statusText: "", code: "PASSWORD_COMPROMISED", message: "x" },
+    });
     await openSignup();
-    fill({ inviteCode: "HF", name: "Ada", email: "ada@example.com", password: "password123456", birthMonth: "5", birthYear: "1990" });
+    fill({
+      inviteCode: "HF",
+      name: "Ada",
+      email: "ada@example.com",
+      password: "password123456",
+      birthMonth: "5",
+      birthYear: "1990",
+    });
     fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     expect(await screen.findByText("This password appears in a known breach. Choose another.")).toBeTruthy();
   });
 
   it("the server's refusal sentence is shown as it is", async () => {
-    vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: null, error: { status: 403, statusText: "", message: "This invite can't be used." } });
+    vi.spyOn(authClient.signUp, "email").mockResolvedValue({
+      data: null,
+      error: { status: 403, statusText: "", message: "This invite can't be used." },
+    });
     await openSignup();
-    fill({ inviteCode: "HF", name: "Ada", email: "ada@example.com", password: "correct horse battery", birthMonth: "5", birthYear: "1990" });
+    fill({
+      inviteCode: "HF",
+      name: "Ada",
+      email: "ada@example.com",
+      password: "correct horse battery",
+      birthMonth: "5",
+      birthYear: "1990",
+    });
     fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Create account" }));
     expect(await screen.findByText("This invite can't be used.")).toBeTruthy();
@@ -185,13 +260,21 @@ describe("sign-up screen", () => {
     fireEvent.click(field("acceptTerms"));
     fireEvent.click(screen.getByRole("button", { name: "Continue with Google" }));
     await waitFor(() => expect(order).toEqual(["intent", "social"]));
-    expect(calls.find((call) => call.path === "/api/auth-intent")?.body).toEqual({ inviteCode: "HF-7K2Q", birthYear: 1990, birthMonth: 5, acceptTerms: true });
+    expect(calls.find((call) => call.path === "/api/auth-intent")?.body).toEqual({
+      inviteCode: "HF-7K2Q",
+      birthYear: 1990,
+      birthMonth: 5,
+      acceptTerms: true,
+    });
     expect(social).toHaveBeenCalledWith(expect.objectContaining({ provider: "google" }));
   });
 
   it("a refused intent does not start OAuth", async () => {
     const social = vi.spyOn(authClient.signIn, "social");
-    shellFetch({ session: null, extra: (call) => (call.path === "/api/auth-intent" ? envelope("forbidden", 403) : undefined) });
+    shellFetch({
+      session: null,
+      extra: (call) => (call.path === "/api/auth-intent" ? envelope("forbidden", 403) : undefined),
+    });
     renderRoutes(buildRoutes(), ["/signup"]);
     await screen.findByRole("heading", { name: "Create your account" });
     fill({ inviteCode: "HF", birthMonth: "5", birthYear: "1990" });
@@ -202,7 +285,10 @@ describe("sign-up screen", () => {
   });
 
   it("/invite/:code checks the code and prefills it", async () => {
-    shellFetch({ session: null, extra: (call) => (call.path === "/api/invites/HF-GOOD" ? json({ valid: true }) : undefined) });
+    shellFetch({
+      session: null,
+      extra: (call) => (call.path === "/api/invites/HF-GOOD" ? json({ valid: true }) : undefined),
+    });
     const { router } = renderRoutes(buildRoutes(), ["/invite/HF-GOOD"]);
     await waitFor(() => expect(router.state.location.pathname).toBe("/signup"));
     await waitFor(() => expect(field("inviteCode")?.value).toBe("HF-GOOD"));
@@ -210,9 +296,14 @@ describe("sign-up screen", () => {
   });
 
   it("an invalid invite says so, without a reason", async () => {
-    shellFetch({ session: null, extra: (call) => (call.path.startsWith("/api/invites/") ? json({ valid: false }) : undefined) });
+    shellFetch({
+      session: null,
+      extra: (call) => (call.path.startsWith("/api/invites/") ? json({ valid: false }) : undefined),
+    });
     renderRoutes(buildRoutes(), ["/invite/HF-BAD"]);
-    expect(await screen.findByText("This invite can't be used. Check the code or ask for a new one.")).toBeTruthy();
+    expect(
+      await screen.findByText("This invite can't be used. Check the code or ask for a new one."),
+    ).toBeTruthy();
   });
 });
 
@@ -227,7 +318,10 @@ describe("sign-in screen", () => {
   });
 
   it("a wrong password shows an error on the form and never opens the re-auth modal", async () => {
-    vi.spyOn(authClient.signIn, "email").mockResolvedValue({ data: null, error: { status: 401, statusText: "Unauthorized" } });
+    vi.spyOn(authClient.signIn, "email").mockResolvedValue({
+      data: null,
+      error: { status: 401, statusText: "Unauthorized" },
+    });
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/login"]);
     await screen.findByRole("heading", { name: "Sign in" });
@@ -247,7 +341,10 @@ describe("sign-in screen", () => {
   });
 
   it("a second factor sends the user to /two-factor with next kept", async () => {
-    vi.spyOn(authClient.signIn, "email").mockResolvedValue({ data: { twoFactorRedirect: true }, error: null });
+    vi.spyOn(authClient.signIn, "email").mockResolvedValue({
+      data: { twoFactorRedirect: true },
+      error: null,
+    });
     shellFetch({ session: null });
     const { router } = renderRoutes(buildRoutes(), ["/login?next=/recent"]);
     await screen.findByRole("heading", { name: "Sign in" });
@@ -266,7 +363,9 @@ describe("sign-in screen", () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/login?reason=suspended"]);
     await screen.findByRole("heading", { name: "Sign in" });
-    expect(document.querySelector("[data-form-notice]")?.textContent).toBe("This account is suspended. Contact support.");
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
+      "This account is suspended. Contact support.",
+    );
   });
 
   it("there is no /confirm-deletion screen", async () => {
@@ -278,7 +377,10 @@ describe("sign-in screen", () => {
 
 describe("verify-email screen", () => {
   async function open() {
-    const calls = shellFetch({ session: sessionOf({ emailVerified: false, email: "ada@example.com" }), extra: (call) => (call.path === "/api/account/pending-email" ? json({ ok: true }) : undefined) });
+    const calls = shellFetch({
+      session: sessionOf({ emailVerified: false, email: "ada@example.com" }),
+      extra: (call) => (call.path === "/api/account/pending-email" ? json({ ok: true }) : undefined),
+    });
     renderRoutes(buildRoutes(), ["/verify-email"]);
     await screen.findByRole("heading", { name: "Check your email" });
     // Under fake timers React's passive effects wait for the scheduler: flush them.
@@ -324,7 +426,9 @@ describe("verify-email screen", () => {
 
     fireEvent.change(field("newEmail"), { target: { value: "ada.l@example.com" } });
     fireEvent.click(screen.getByRole("button", { name: "Update and resend" }));
-    await waitFor(() => expect(document.querySelector("[data-verify-email]")?.textContent).toBe("ada.l@example.com"));
+    await waitFor(() =>
+      expect(document.querySelector("[data-verify-email]")?.textContent).toBe("ada.l@example.com"),
+    );
     const patch = calls.find((call) => call.path === "/api/account/pending-email");
     expect(patch?.method).toBe("PATCH");
     expect(patch?.body).toEqual({ email: "ada.l@example.com" });
@@ -333,15 +437,26 @@ describe("verify-email screen", () => {
 
 describe("password reset", () => {
   it("forgot: the answer is the same whether or not the address exists", async () => {
-    const request = vi.spyOn(authClient, "requestPasswordReset").mockResolvedValue({ data: null, error: { status: 404, statusText: "", message: "User not found" } });
+    const request = vi
+      .spyOn(authClient, "requestPasswordReset")
+      .mockResolvedValue({ data: null, error: { status: 404, statusText: "", message: "User not found" } });
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/forgot-password"]);
     await screen.findByRole("heading", { name: "Reset your password" });
     fill({ email: "nobody@example.com" });
     fireEvent.click(screen.getByRole("button", { name: "Send reset link" }));
-    await waitFor(() => expect(document.querySelector("[data-form-notice]")?.textContent).toContain("If that address has an account"));
+    await waitFor(() =>
+      expect(document.querySelector("[data-form-notice]")?.textContent).toContain(
+        "If that address has an account",
+      ),
+    );
     expect(document.body.textContent).not.toContain("User not found");
-    expect(request).toHaveBeenCalledWith(expect.objectContaining({ email: "nobody@example.com", redirectTo: expect.stringMatching(/\/reset-password$/) }));
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        email: "nobody@example.com",
+        redirectTo: expect.stringMatching(/\/reset-password$/),
+      }),
+    );
   });
 
   it("reset: sends the token and the new password, then returns to sign-in", async () => {
@@ -363,7 +478,9 @@ describe("password reset", () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/reset-password"]);
     await screen.findByRole("heading", { name: "Choose a new password" });
-    expect(document.querySelector("[data-form-notice]")?.textContent).toBe("This reset link is incomplete. Request a new one.");
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
+      "This reset link is incomplete. Request a new one.",
+    );
     expect(field("password")).toBeNull();
   });
 });

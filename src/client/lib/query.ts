@@ -167,7 +167,9 @@ function connectApi(): void {
     hadSession: () => Boolean(getCachedSession()),
     clearSession,
     patchConfig: (patch) => {
-      queryClient.setQueryData(publicConfigQuery.queryKey, (current) => (current ? { ...current, ...patch } : current));
+      queryClient.setQueryData(publicConfigQuery.queryKey, (current) =>
+        current ? { ...current, ...patch } : current,
+      );
     },
   });
 }

@@ -48,7 +48,15 @@ export function StatusDot({ status, reason, variant = "glyph" }: StatusDotProps)
       component="span"
       data-status={status}
       data-token={presentation.token}
-      sx={{ display: "inline-flex", alignItems: "center", gap: "6px", color, fontSize: 12, lineHeight: "16px", minWidth: 0 }}
+      sx={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "6px",
+        color,
+        fontSize: 12,
+        lineHeight: "16px",
+        minWidth: 0,
+      }}
     >
       {Icon ? <Icon size={14} strokeWidth={2} aria-hidden="true" style={{ flex: "none" }} /> : null}
       <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>

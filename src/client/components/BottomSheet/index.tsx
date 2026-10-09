@@ -20,7 +20,14 @@ export interface BottomSheetProps {
 }
 
 /** The mobile container for details and actions: a modal sheet from the bottom edge. */
-export function BottomSheet({ open, onClose, title, subtitle, children, hideTitle = false }: BottomSheetProps) {
+export function BottomSheet({
+  open,
+  onClose,
+  title,
+  subtitle,
+  children,
+  hideTitle = false,
+}: BottomSheetProps) {
   const titleId = useId();
   return (
     <Drawer
@@ -42,15 +49,39 @@ export function BottomSheet({ open, onClose, title, subtitle, children, hideTitl
         },
       }}
     >
-      <Box aria-hidden="true" sx={{ width: 36, height: 4, borderRadius: "2px", backgroundColor: hf.illustration, margin: "8px auto 4px" }} />
-      <Box sx={{ display: "flex", alignItems: "center", gap: 3, padding: "4px 8px 4px 20px", minHeight: layout.touchTarget }}>
+      <Box
+        aria-hidden="true"
+        sx={{
+          width: 36,
+          height: 4,
+          borderRadius: "2px",
+          backgroundColor: hf.illustration,
+          margin: "8px auto 4px",
+        }}
+      />
+      <Box
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 3,
+          padding: "4px 8px 4px 20px",
+          minHeight: layout.touchTarget,
+        }}
+      >
         <Box sx={{ flex: "1 1 auto", minWidth: 0 }}>
           <Typography
             id={titleId}
             component="h2"
             sx={
               hideTitle
-                ? { position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap" }
+                ? {
+                    position: "absolute",
+                    width: 1,
+                    height: 1,
+                    overflow: "hidden",
+                    clip: "rect(0 0 0 0)",
+                    whiteSpace: "nowrap",
+                  }
                 : { margin: 0, fontSize: 16, lineHeight: "22px", fontWeight: 600, overflowWrap: "anywhere" }
             }
           >
@@ -58,7 +89,11 @@ export function BottomSheet({ open, onClose, title, subtitle, children, hideTitl
           </Typography>
           {subtitle ? <Box sx={{ color: hf.textSecondary, fontSize: 12 }}>{subtitle}</Box> : null}
         </Box>
-        <IconButton aria-label={t("app.close")} onClick={onClose} sx={{ width: layout.touchTarget, height: layout.touchTarget, flex: "none" }}>
+        <IconButton
+          aria-label={t("app.close")}
+          onClick={onClose}
+          sx={{ width: layout.touchTarget, height: layout.touchTarget, flex: "none" }}
+        >
           <X size={20} aria-hidden="true" />
         </IconButton>
       </Box>

@@ -57,7 +57,8 @@ export function Frame({ backgroundRoutes }: FrameProps) {
   // last non-overlay outlet element is kept and rendered in the same tree position, so React
   // preserves its state, scroll position and route params.
   const [background, setBackground] = useState<Background | null>(null);
-  if (!overlay && background?.key !== location.key) setBackground({ key: location.key, element: outlet, handle });
+  if (!overlay && background?.key !== location.key)
+    setBackground({ key: location.key, element: outlet, handle });
   const from = (location.state as { from?: unknown } | null)?.from;
   const coldFrom = typeof from === "string" && from.startsWith("/") && !from.startsWith("//") ? from : "/";
   const shown = overlay ? background : { element: outlet, handle };
@@ -76,36 +77,87 @@ export function Frame({ backgroundRoutes }: FrameProps) {
   }, [desktop]);
 
   const page = (
-    <Box sx={{ position: "relative", flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}>
-    <Box component="main" id="main" tabIndex={-1} data-main sx={{ position: "relative", flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column", overflowY: "auto", outline: "none" }}>
-      <ErrorBoundary resetKey={location.key}>
-        <Box data-background={overlay ? "kept" : undefined} inert={overlay} sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 0 }}>
-          {shown ? shown.element : <ColdBackground routes={backgroundRoutes} from={coldFrom} />}
-        </Box>
-        {overlay ? (
-          <Box data-overlay sx={{ position: "absolute", inset: 0, zIndex: 2, display: "flex", flexDirection: "column", backgroundColor: hf.surface }}>
-            {outlet}
+    <Box
+      sx={{ position: "relative", flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}
+    >
+      <Box
+        component="main"
+        id="main"
+        tabIndex={-1}
+        data-main
+        sx={{
+          position: "relative",
+          flex: "1 1 auto",
+          minHeight: 0,
+          display: "flex",
+          flexDirection: "column",
+          overflowY: "auto",
+          outline: "none",
+        }}
+      >
+        <ErrorBoundary resetKey={location.key}>
+          <Box
+            data-background={overlay ? "kept" : undefined}
+            inert={overlay}
+            sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 0 }}
+          >
+            {shown ? shown.element : <ColdBackground routes={backgroundRoutes} from={coldFrom} />}
           </Box>
-        ) : null}
-      </ErrorBoundary>
-    </Box>
-    {!desktop && !overlay && groupFor(backgroundPath) === "files" ? <NewFab /> : null}
+          {overlay ? (
+            <Box
+              data-overlay
+              sx={{
+                position: "absolute",
+                inset: 0,
+                zIndex: 2,
+                display: "flex",
+                flexDirection: "column",
+                backgroundColor: hf.surface,
+              }}
+            >
+              {outlet}
+            </Box>
+          ) : null}
+        </ErrorBoundary>
+      </Box>
+      {!desktop && !overlay && groupFor(backgroundPath) === "files" ? <NewFab /> : null}
     </Box>
   );
 
   return (
-    <Box data-frame={desktop ? "desktop" : "mobile"} sx={{ display: "flex", height: "100dvh", overflow: "hidden", backgroundColor: hf.bg, color: hf.text }}>
+    <Box
+      data-frame={desktop ? "desktop" : "mobile"}
+      sx={{ display: "flex", height: "100dvh", overflow: "hidden", backgroundColor: hf.bg, color: hf.text }}
+    >
       <Box
         component="a"
         href="#main"
-        sx={{ position: "absolute", left: 8, top: -100, zIndex: 2000, padding: "8px 12px", backgroundColor: hf.primaryButton, color: hf.primaryButtonText, borderRadius: "6px", "&:focus": { top: 8 } }}
+        sx={{
+          position: "absolute",
+          left: 8,
+          top: -100,
+          zIndex: 2000,
+          padding: "8px 12px",
+          backgroundColor: hf.primaryButton,
+          color: hf.primaryButtonText,
+          borderRadius: "6px",
+          "&:focus": { top: 8 },
+        }}
       >
         {t("app.skip")}
       </Box>
       <ShellCommands />
       <UploadDropOverlay />
       {desktop ? <Sidebar /> : null}
-      <Box sx={{ flex: "1 1 auto", minWidth: 0, display: "flex", flexDirection: "column", backgroundColor: hf.surface }}>
+      <Box
+        sx={{
+          flex: "1 1 auto",
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+          backgroundColor: hf.surface,
+        }}
+      >
         {desktop ? <TransferRibbon /> : null}
         {desktop ? <Header title={title} /> : <MobileHeader onAccount={() => setAccountOpen(true)} />}
         <FrameBanners />

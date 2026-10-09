@@ -45,8 +45,14 @@ export interface SignUpEmailInput {
 export interface AuthClientContract {
   signIn: {
     /** `data.twoFactorRedirect` is true when a second factor is required. */
-    email(input: SignInEmailInput): Promise<AuthResult<{ twoFactorRedirect?: boolean } | Record<string, unknown>>>;
-    social(input: { provider: "google"; callbackURL?: string; errorCallbackURL?: string }): Promise<AuthResult>;
+    email(
+      input: SignInEmailInput,
+    ): Promise<AuthResult<{ twoFactorRedirect?: boolean } | Record<string, unknown>>>;
+    social(input: {
+      provider: "google";
+      callbackURL?: string;
+      errorCallbackURL?: string;
+    }): Promise<AuthResult>;
     /** `autoFill: true` starts conditional UI (the browser offers passkeys in the email field). */
     passkey(input?: { autoFill?: boolean }): Promise<AuthResult>;
   };
@@ -83,6 +89,14 @@ export async function callAuth<T>(call: () => Promise<AuthResult<T>>): Promise<A
     return await call();
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
-    return { data: null, error: { status: 0, statusText: "", message, code: message === AUTH_NOT_WIRED ? "NOT_WIRED" : "NETWORK" } };
+    return {
+      data: null,
+      error: {
+        status: 0,
+        statusText: "",
+        message,
+        code: message === AUTH_NOT_WIRED ? "NOT_WIRED" : "NETWORK",
+      },
+    };
   }
 }

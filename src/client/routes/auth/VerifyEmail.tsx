@@ -35,7 +35,9 @@ export function VerifyEmailPage() {
   const config = usePublicConfig().data;
   const turnstile = useTurnstile(config?.turnstileSiteKey);
   const fromState = (location.state as { email?: unknown } | null)?.email;
-  const [email, setEmail] = useState<string | null>(session?.user.email ?? (typeof fromState === "string" ? fromState : null));
+  const [email, setEmail] = useState<string | null>(
+    session?.user.email ?? (typeof fromState === "string" ? fromState : null),
+  );
   const [cooldownUntil, setCooldownUntil] = useState(() => Date.now() + RESEND_COOLDOWN_S * 1000);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,11 +56,19 @@ export function VerifyEmailPage() {
       return;
     }
     setBusy(true);
-    const result = await callAuth(() => authClient.sendVerificationEmail({ email, callbackURL: "/login?reason=verified", fetchOptions: captchaOptions(turnstile.token) }));
+    const result = await callAuth(() =>
+      authClient.sendVerificationEmail({
+        email,
+        callbackURL: "/login?reason=verified",
+        fetchOptions: captchaOptions(turnstile.token),
+      }),
+    );
     turnstile.reset();
     setBusy(false);
     if (result.error) {
-      setError(result.error.code === "NOT_WIRED" ? authErrorMessage(result.error) : t("verify.resend.failed"));
+      setError(
+        result.error.code === "NOT_WIRED" ? authErrorMessage(result.error) : t("verify.resend.failed"),
+      );
       return;
     }
     setCooldownUntil(Date.now() + RESEND_COOLDOWN_S * 1000);
@@ -79,7 +89,9 @@ export function VerifyEmailPage() {
       await api("/api/account/pending-email", { method: "PATCH", body: { email: next } });
     } catch (cause) {
       setBusy(false);
-      setDraftError(cause instanceof ApiError && cause.code === "validation" ? cause.message : t("verify.change.failed"));
+      setDraftError(
+        cause instanceof ApiError && cause.code === "validation" ? cause.message : t("verify.change.failed"),
+      );
       return;
     }
     setBusy(false);
@@ -97,7 +109,11 @@ export function VerifyEmailPage() {
         email ? (
           <>
             {t("verify.body.before")}
-            <Box component="strong" data-verify-email sx={{ color: hf.text, fontWeight: 500, overflowWrap: "anywhere" }}>
+            <Box
+              component="strong"
+              data-verify-email
+              sx={{ color: hf.text, fontWeight: 500, overflowWrap: "anywhere" }}
+            >
               {email}
             </Box>
             {t("verify.body.after")}
@@ -121,8 +137,22 @@ export function VerifyEmailPage() {
           </Button>
           <FormError>{error}</FormError>
           {changing ? (
-            <Box component="form" noValidate onSubmit={onChange} sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <Field label={t("verify.change.label")} type="email" name="newEmail" autoComplete="email" autoFocus value={draft} onChange={(e) => setDraft(e.target.value)} errorText={draftError ?? undefined} />
+            <Box
+              component="form"
+              noValidate
+              onSubmit={onChange}
+              sx={{ display: "flex", flexDirection: "column", gap: 2 }}
+            >
+              <Field
+                label={t("verify.change.label")}
+                type="email"
+                name="newEmail"
+                autoComplete="email"
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                errorText={draftError ?? undefined}
+              />
               <Button type="submit" variant="contained" size="large" disabled={busy}>
                 {t("verify.change.submit")}
               </Button>
@@ -134,7 +164,20 @@ export function VerifyEmailPage() {
           )}
         </Box>
       ) : null}
-      <Box component={RouterLink} to="/login" sx={{ color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } }}>
+      <Box
+        component={RouterLink}
+        to="/login"
+        sx={{
+          color: hf.text,
+          fontSize: 12,
+          textDecoration: "underline",
+          textUnderlineOffset: "2px",
+          display: "inline-flex",
+          alignItems: "center",
+          minHeight: 24,
+          "@media (max-width:1023.95px)": { minHeight: 44 },
+        }}
+      >
         {t("forgot.back")}
       </Box>
     </AuthCard>

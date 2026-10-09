@@ -20,7 +20,15 @@ export interface EmptyStateProps {
 
 // Drawn from the UI's own shapes — rows, a folder, the search lens — in one colour.
 function Drawing({ type }: { type: EmptyStateType }) {
-  const common = { width: 160, height: 96, viewBox: "0 0 160 96", fill: "none", stroke: "currentColor", strokeWidth: 1.25, "aria-hidden": true } as const;
+  const common = {
+    width: 160,
+    height: 96,
+    viewBox: "0 0 160 96",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.25,
+    "aria-hidden": true,
+  } as const;
   if (type === "first-use") {
     return (
       <svg {...common}>
@@ -35,7 +43,10 @@ function Drawing({ type }: { type: EmptyStateType }) {
   if (type === "cleared") {
     return (
       <svg {...common}>
-        <path d="M20 30h32l8 8h80a6 6 0 0 1 6 6v36a6 6 0 0 1-6 6H20a6 6 0 0 1-6-6V36a6 6 0 0 1 6-6Z" strokeDasharray="4 3" />
+        <path
+          d="M20 30h32l8 8h80a6 6 0 0 1 6 6v36a6 6 0 0 1-6 6H20a6 6 0 0 1-6-6V36a6 6 0 0 1 6-6Z"
+          strokeDasharray="4 3"
+        />
       </svg>
     );
   }
@@ -62,12 +73,25 @@ export function EmptyState({ type, title, body, actions, requestId, headingLevel
   return (
     <Box
       data-empty-state={type}
-      sx={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, padding: 8, textAlign: "center", minHeight: 320, flex: "1 1 auto" }}
+      sx={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 4,
+        padding: 8,
+        textAlign: "center",
+        minHeight: 320,
+        flex: "1 1 auto",
+      }}
     >
       <Box sx={{ color: hf.illustration, display: "inline-flex" }}>
         <Drawing type={type} />
       </Box>
-      <Typography component={headingLevel} sx={{ margin: 0, fontSize: 16, lineHeight: "22px", fontWeight: 600 }}>
+      <Typography
+        component={headingLevel}
+        sx={{ margin: 0, fontSize: 16, lineHeight: "22px", fontWeight: 600 }}
+      >
         {title}
       </Typography>
       {body || requestId ? (
@@ -83,7 +107,9 @@ export function EmptyState({ type, title, body, actions, requestId, headingLevel
           ) : null}
         </Typography>
       ) : null}
-      {actions ? <Box sx={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 2 }}>{actions}</Box> : null}
+      {actions ? (
+        <Box sx={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 2 }}>{actions}</Box>
+      ) : null}
     </Box>
   );
 }

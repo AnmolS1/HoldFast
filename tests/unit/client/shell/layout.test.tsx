@@ -56,9 +56,25 @@ describe("desktop frame", () => {
     await openAt(1280, "/recent");
     const nav = document.querySelector<HTMLElement>("[data-sidebar]")!;
     const links = Array.from(nav.querySelectorAll("[data-nav]"));
-    expect(links.map((link) => link.textContent)).toEqual(["Files", "Shared with me", "Shared by me", "Recent", "Starred", "Trash"]);
-    expect(links.map((link) => link.getAttribute("href"))).toEqual(["/", "/shared", "/shared-by-me", "/recent", "/starred", "/trash"]);
-    expect(links.filter((link) => link.getAttribute("aria-current") === "page").map((link) => link.textContent)).toEqual(["Recent"]);
+    expect(links.map((link) => link.textContent)).toEqual([
+      "Files",
+      "Shared with me",
+      "Shared by me",
+      "Recent",
+      "Starred",
+      "Trash",
+    ]);
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "/",
+      "/shared",
+      "/shared-by-me",
+      "/recent",
+      "/starred",
+      "/trash",
+    ]);
+    expect(
+      links.filter((link) => link.getAttribute("aria-current") === "page").map((link) => link.textContent),
+    ).toEqual(["Recent"]);
   });
 
   it("has a skip link, one main landmark, one h1, and the header controls", async () => {
@@ -76,7 +92,9 @@ describe("desktop frame", () => {
 
   it("the storage bar shows its skeleton while usage is unknown", async () => {
     await openAt(1280);
-    expect(within(document.querySelector<HTMLElement>("[data-sidebar]")!).getByLabelText("Loading storage use")).toBeTruthy();
+    expect(
+      within(document.querySelector<HTMLElement>("[data-sidebar]")!).getByLabelText("Loading storage use"),
+    ).toBeTruthy();
   });
 
   it("the details panel shows its empty state, then what a feature sets", async () => {
@@ -126,9 +144,25 @@ describe("desktop frame", () => {
     fireEvent.click(screen.getByRole("button", { name: "Account menu" }));
     const menu = await screen.findByRole("menu", { name: "Account menu" });
     const text = menu.textContent!;
-    for (const label of ["Account settings", "Manage storage", "Theme: Match system", "Theme: Light", "Theme: Dark", "Help", "Keyboard shortcuts", "Contact support", "Terms", "Privacy", "DMCA", "Sign out"]) expect(text).toContain(label);
+    for (const label of [
+      "Account settings",
+      "Manage storage",
+      "Theme: Match system",
+      "Theme: Light",
+      "Theme: Dark",
+      "Help",
+      "Keyboard shortcuts",
+      "Contact support",
+      "Terms",
+      "Privacy",
+      "DMCA",
+      "Sign out",
+    ])
+      expect(text).toContain(label);
     expect(text).not.toContain("Admin");
-    expect(within(menu).getByRole("menuitem", { name: /Help/ }).getAttribute("href")).toBe("https://ponderance.dev/support/holdfast");
+    expect(within(menu).getByRole("menuitem", { name: /Help/ }).getAttribute("href")).toBe(
+      "https://ponderance.dev/support/holdfast",
+    );
     expect(within(menu).getByRole("menuitem", { name: "DMCA" }).getAttribute("href")).toBe("/dmca");
   });
 
@@ -146,19 +180,33 @@ describe("mobile frame", () => {
     const items = Array.from(nav.querySelectorAll("[data-bottom-nav-item]"));
     expect(items.map((item) => item.textContent)).toEqual(["Files", "Shared", "Account"]);
     expect(nav.querySelectorAll("a, button").length).toBe(3);
-    expect(items.filter((item) => item.getAttribute("aria-current") === "page").map((item) => item.textContent)).toEqual(["Files"]);
+    expect(
+      items.filter((item) => item.getAttribute("aria-current") === "page").map((item) => item.textContent),
+    ).toEqual(["Files"]);
   });
 
   it("Recent, Starred and Trash are reached through the Files switcher; the nav item stays Files", async () => {
     const { router } = await openAt(390);
-    for (const [label, path, title] of [["Recent", "/recent", "Recent"], ["Starred", "/starred", "Starred"], ["Trash", "/trash", "Trash"], ["My files", "/", "Files"]] as const) {
+    for (const [label, path, title] of [
+      ["Recent", "/recent", "Recent"],
+      ["Starred", "/starred", "Starred"],
+      ["Trash", "/trash", "Trash"],
+      ["My files", "/", "Files"],
+    ] as const) {
       fireEvent.click(screen.getByRole("button", { name: "Switch files view" }));
       const sheet = await screen.findByRole("dialog", { name: "Files" });
-      expect(within(sheet).getAllByRole("button").filter((b) => b.hasAttribute("data-nav")).map((b) => b.textContent)).toEqual(["My files", "Recent", "Starred", "Trash"]);
+      expect(
+        within(sheet)
+          .getAllByRole("button")
+          .filter((b) => b.hasAttribute("data-nav"))
+          .map((b) => b.textContent),
+      ).toEqual(["My files", "Recent", "Starred", "Trash"]);
       fireEvent.click(within(sheet).getByRole("button", { name: label }));
       await waitFor(() => expect(router.state.location.pathname).toBe(path));
       await waitFor(() => expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(title));
-      expect(document.querySelector('[data-bottom-nav-item="files"]')!.getAttribute("aria-current")).toBe("page");
+      expect(document.querySelector('[data-bottom-nav-item="files"]')!.getAttribute("aria-current")).toBe(
+        "page",
+      );
       await waitFor(() => expect(screen.queryByRole("dialog", { name: "Files" })).toBeNull());
     }
   });
@@ -166,11 +214,19 @@ describe("mobile frame", () => {
   it("Shared has a two-segment control: With me · By me", async () => {
     const { router } = await openAt(390, "/shared");
     const control = screen.getByRole("group", { name: "Shared files view" });
-    expect(within(control).getAllByRole("link").map((link) => link.textContent)).toEqual(["With me", "By me"]);
-    expect(document.querySelector('[data-bottom-nav-item="shared"]')!.getAttribute("aria-current")).toBe("page");
+    expect(
+      within(control)
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["With me", "By me"]);
+    expect(document.querySelector('[data-bottom-nav-item="shared"]')!.getAttribute("aria-current")).toBe(
+      "page",
+    );
     fireEvent.click(within(control).getByRole("link", { name: "By me" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/shared-by-me"));
-    expect(document.querySelector('[data-bottom-nav-item="shared"]')!.getAttribute("aria-current")).toBe("page");
+    expect(document.querySelector('[data-bottom-nav-item="shared"]')!.getAttribute("aria-current")).toBe(
+      "page",
+    );
   });
 
   it("Account opens a sheet with settings, storage, help and sign-out", async () => {
@@ -178,19 +234,32 @@ describe("mobile frame", () => {
     fireEvent.click(document.querySelector<HTMLElement>('[data-bottom-nav-item="account"]')!);
     const sheet = await screen.findByRole("dialog", { name: "Ada Lovelace" });
     const labels = Array.from(sheet.querySelectorAll("[data-account-action]"), (node) => node.textContent);
-    expect(labels).toEqual(["Account settings", "Manage storage", "Help", "Contact support", "Terms", "Privacy", "DMCA", "Sign out"]);
+    expect(labels).toEqual([
+      "Account settings",
+      "Manage storage",
+      "Help",
+      "Contact support",
+      "Terms",
+      "Privacy",
+      "DMCA",
+      "Sign out",
+    ]);
     expect(within(sheet).getByLabelText("Loading storage use")).toBeTruthy();
     expect(within(sheet).getByRole("radiogroup", { name: "Theme" })).toBeTruthy();
     fireEvent.click(within(sheet).getByText("Account settings"));
     await waitFor(() => expect(router.state.location.pathname).toBe("/account"));
-    expect(document.querySelector('[data-bottom-nav-item="account"]')!.getAttribute("aria-current")).toBe("page");
+    expect(document.querySelector('[data-bottom-nav-item="account"]')!.getAttribute("aria-current")).toBe(
+      "page",
+    );
   });
 
   it("the FAB offers New folder and Upload in a sheet", async () => {
     await openAt(390);
     fireEvent.click(screen.getByRole("button", { name: "New" }));
     const sheet = await screen.findByRole("dialog", { name: "New" });
-    expect(Array.from(sheet.querySelectorAll("[data-new-action]"), (n) => n.getAttribute("data-new-action"))).toEqual(["new-folder", "upload"]);
+    expect(
+      Array.from(sheet.querySelectorAll("[data-new-action]"), (n) => n.getAttribute("data-new-action")),
+    ).toEqual(["new-folder", "upload"]);
   });
 
   it("read-only disables New and says why", async () => {

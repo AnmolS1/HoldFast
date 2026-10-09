@@ -21,32 +21,43 @@ describe("StatusDot", () => {
     expect(Object.keys(TABLE).sort()).toEqual(Object.keys(STATUS_PRESENTATION).sort());
   });
 
-  it.each(Object.entries(TABLE) as Array<[ScanStatus, [string | null, string | null]]>)("%s → token and sentence", (status, [token, sentence]) => {
-    expect(STATUS_PRESENTATION[status].token).toBe(token);
-    expect(statusSentence(status)).toBe(sentence);
-    const { container } = renderShell(<StatusDot status={status} variant="sentence" />);
-    const node = container.querySelector("[data-status]");
-    if (sentence === null) {
-      expect(node).toBeNull();
-    } else {
-      expect(node?.getAttribute("data-token")).toBe(token);
-      expect(node?.textContent).toBe(sentence);
-    }
-  });
+  it.each(Object.entries(TABLE) as Array<[ScanStatus, [string | null, string | null]]>)(
+    "%s → token and sentence",
+    (status, [token, sentence]) => {
+      expect(STATUS_PRESENTATION[status].token).toBe(token);
+      expect(statusSentence(status)).toBe(sentence);
+      const { container } = renderShell(<StatusDot status={status} variant="sentence" />);
+      const node = container.querySelector("[data-status]");
+      if (sentence === null) {
+        expect(node).toBeNull();
+      } else {
+        expect(node?.getAttribute("data-token")).toBe(token);
+        expect(node?.textContent).toBe(sentence);
+      }
+    },
+  );
 
   it("clean renders nothing in either variant", () => {
     expect(renderShell(<StatusDot status="clean" />).container.querySelector("[data-status]")).toBeNull();
-    expect(renderShell(<StatusDot status="clean" variant="sentence" />).container.querySelector("[data-status]")).toBeNull();
+    expect(
+      renderShell(<StatusDot status="clean" variant="sentence" />).container.querySelector("[data-status]"),
+    ).toBeNull();
   });
 
   it("pending renders no glyph (the row's underline shows it) but a sentence", () => {
     expect(renderShell(<StatusDot status="pending" />).container.querySelector("[data-status]")).toBeNull();
-    expect(renderShell(<StatusDot status="pending" variant="sentence" />).container.textContent).toBe("Scanning");
+    expect(renderShell(<StatusDot status="pending" variant="sentence" />).container.textContent).toBe(
+      "Scanning",
+    );
   });
 
   it("suspected_csam is presented exactly as under review — never a category", () => {
-    const a = renderShell(<StatusDot status="suspected_csam" variant="sentence" />).container.querySelector("[data-status]");
-    const b = renderShell(<StatusDot status="under_review" variant="sentence" />).container.querySelector("[data-status]");
+    const a = renderShell(<StatusDot status="suspected_csam" variant="sentence" />).container.querySelector(
+      "[data-status]",
+    );
+    const b = renderShell(<StatusDot status="under_review" variant="sentence" />).container.querySelector(
+      "[data-status]",
+    );
     expect(a?.textContent).toBe("Under review");
     expect(a?.textContent).toBe(b?.textContent);
     expect(a?.getAttribute("data-token")).toBe(b?.getAttribute("data-token"));
@@ -69,7 +80,14 @@ describe("StatusDot", () => {
 
   it("flagged is the danger colour, never the activity colour", () => {
     expect(STATUS_PRESENTATION.infected.token).toBe("danger");
-    for (const status of ["infected", "under_review", "suspected_csam", "skipped", "error", "clean"] as const) {
+    for (const status of [
+      "infected",
+      "under_review",
+      "suspected_csam",
+      "skipped",
+      "error",
+      "clean",
+    ] as const) {
       expect(STATUS_PRESENTATION[status].token).not.toBe("accentText");
     }
   });

@@ -1,15 +1,34 @@
 // Small pure helpers: sizes, dates, the i18n catalogue, the shortcut map, Sentry wiring.
 import { describe, expect, it, vi } from "vitest";
 import { en } from "../../../../src/client/lib/en";
-import { formatBytes, formatCountdown, formatDate, formatRelative, resolveTimeZone } from "../../../../src/client/lib/format";
+import {
+  formatBytes,
+  formatCountdown,
+  formatDate,
+  formatRelative,
+  resolveTimeZone,
+} from "../../../../src/client/lib/format";
 import { t } from "../../../../src/client/lib/i18n";
-import { initSentry, redactOrDrop, reportError, resetSentryForTests } from "../../../../src/client/lib/sentry";
-import { isEditableTarget, matchShortcut, shortcutLabel, SHORTCUTS } from "../../../../src/client/lib/shortcuts";
+import {
+  initSentry,
+  redactOrDrop,
+  reportError,
+  resetSentryForTests,
+} from "../../../../src/client/lib/sentry";
+import {
+  isEditableTarget,
+  matchShortcut,
+  shortcutLabel,
+  SHORTCUTS,
+} from "../../../../src/client/lib/shortcuts";
 
 // The shared redaction is a stub that throws until the worker-core task fills it in.
 vi.mock("../../../../src/shared/sentry-redact", () => ({
   redactUrl: (url: string) => url.replace(/\/(s|d|i|t)\/[^/?#]+/g, "/$1/[redacted]"),
-  redactEvent: vi.fn(<T,>(event: T): T => JSON.parse(JSON.stringify(event).replace(/\/(s|d|i|t)\/[^/?#"]+/g, "/$1/[redacted]")) as T),
+  redactEvent: vi.fn(
+    <T>(event: T): T =>
+      JSON.parse(JSON.stringify(event).replace(/\/(s|d|i|t)\/[^/?#"]+/g, "/$1/[redacted]")) as T,
+  ),
 }));
 
 describe("formatBytes", () => {
@@ -98,12 +117,17 @@ describe("i18n", () => {
     expect(en["placeholder.shared.note"]).toBe("Shared files appear here once sharing is switched on.");
     expect(en["app.preparing"]).toBe("This page is being prepared.");
     expect(en["terms.title"]).toBe("We've updated the Terms and Privacy Policy.");
-    expect(`${en["reauth.title"]} — ${en["reauth.body"].toLowerCase()}`).toBe("Your session ended — sign in to continue.");
+    expect(`${en["reauth.title"]} — ${en["reauth.body"].toLowerCase()}`).toBe(
+      "Your session ended — sign in to continue.",
+    );
   });
 });
 
 describe("shortcuts", () => {
-  const key = (k: string, mods: Partial<Record<"metaKey" | "ctrlKey" | "shiftKey" | "altKey", boolean>> = {}) => ({ key: k, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods });
+  const key = (
+    k: string,
+    mods: Partial<Record<"metaKey" | "ctrlKey" | "shiftKey" | "altKey", boolean>> = {},
+  ) => ({ key: k, metaKey: false, ctrlKey: false, shiftKey: false, altKey: false, ...mods });
 
   it.each([
     ["/", {}, "search"],
@@ -144,7 +168,22 @@ describe("shortcuts", () => {
   });
 
   it("covers the whole keyboard map of the specification", () => {
-    expect(SHORTCUTS.map((s) => s.id).sort()).toEqual(["escape", "help", "newFolder", "next", "open", "palette", "previous", "quickLook", "rename", "search", "selectAll", "theme", "trash", "upload"]);
+    expect(SHORTCUTS.map((s) => s.id).sort()).toEqual([
+      "escape",
+      "help",
+      "newFolder",
+      "next",
+      "open",
+      "palette",
+      "previous",
+      "quickLook",
+      "rename",
+      "search",
+      "selectAll",
+      "theme",
+      "trash",
+      "upload",
+    ]);
   });
 
   it("text fields are editable targets; checkboxes and buttons are not", () => {
@@ -163,7 +202,11 @@ describe("shortcuts", () => {
 });
 
 describe("sentry", () => {
-  const config = { sentryDsnWeb: "https://public@o0.ingest.example/1", sentryEnvironment: "test", release: "abc" };
+  const config = {
+    sentryDsnWeb: "https://public@o0.ingest.example/1",
+    sentryEnvironment: "test",
+    release: "abc",
+  };
 
   it("is not initialised (and the SDK is not even loaded) without a DSN", async () => {
     resetSentryForTests();
@@ -180,10 +223,20 @@ describe("sentry", () => {
     await expect(initSentry(config, load)).resolves.toBe(true);
     await initSentry(config, load);
     expect(load).toHaveBeenCalledTimes(1);
-    const options = init.mock.calls[0]![0] as { dsn: string; environment: string; release: string; beforeSend(e: unknown): unknown; beforeBreadcrumb(b: unknown): unknown };
+    const options = init.mock.calls[0]![0] as {
+      dsn: string;
+      environment: string;
+      release: string;
+      beforeSend(e: unknown): unknown;
+      beforeBreadcrumb(b: unknown): unknown;
+    };
     expect(options).toMatchObject({ dsn: config.sentryDsnWeb, environment: "test", release: "abc" });
-    expect(options.beforeSend({ request: { url: "https://app.test/s/SECRETTOKEN" } })).toEqual({ request: { url: "https://app.test/s/[redacted]" } });
-    expect(options.beforeBreadcrumb({ data: { url: "https://files.test/t/n1/320/BEARER" } })).toEqual({ data: { url: "https://files.test/t/[redacted]/320/BEARER" } });
+    expect(options.beforeSend({ request: { url: "https://app.test/s/SECRETTOKEN" } })).toEqual({
+      request: { url: "https://app.test/s/[redacted]" },
+    });
+    expect(options.beforeBreadcrumb({ data: { url: "https://files.test/t/n1/320/BEARER" } })).toEqual({
+      data: { url: "https://files.test/t/[redacted]/320/BEARER" },
+    });
     reportError(new Error("x"), { where: "test" });
     expect(captureException).toHaveBeenCalledTimes(1);
   });

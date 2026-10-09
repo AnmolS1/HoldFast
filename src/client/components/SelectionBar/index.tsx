@@ -35,9 +35,19 @@ const actionSx = {
   "@media (max-width:1023.95px)": { minHeight: layout.touchTarget },
 } as const;
 
-export function SelectionBarAction({ label, onClick, shortcut, disabled, destructive }: SelectionBarActionProps) {
+export function SelectionBarAction({
+  label,
+  onClick,
+  shortcut,
+  disabled,
+  destructive,
+}: SelectionBarActionProps) {
   return (
-    <ButtonBase onClick={onClick} disabled={disabled} sx={{ ...actionSx, color: destructive ? hf.danger : "inherit" }}>
+    <ButtonBase
+      onClick={onClick}
+      disabled={disabled}
+      sx={{ ...actionSx, color: destructive ? hf.danger : "inherit" }}
+    >
       {label}
       {shortcut ? <Kbd bare>{shortcutLabel(shortcut)}</Kbd> : null}
     </ButtonBase>
@@ -56,7 +66,14 @@ export function SelectionBar({ count, actions, onClear }: SelectionBarProps) {
         aria-live="polite"
         role="status"
         data-selection-live
-        sx={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap" }}
+        sx={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+          whiteSpace: "nowrap",
+        }}
       >
         {count > 0 ? t("selection.announce", { count }) : ""}
       </Box>
@@ -73,12 +90,22 @@ export function SelectionBar({ count, actions, onClear }: SelectionBarProps) {
             padding: "6px 20px",
             borderBottom: `1px solid ${hf.hairline}`,
             backgroundColor: hfAccent.wash,
-            "@keyframes hf-selection-in": { from: { transform: "translateY(-6px)", opacity: 0 }, to: { transform: "none", opacity: 1 } },
+            "@keyframes hf-selection-in": {
+              from: { transform: "translateY(-6px)", opacity: 0 },
+              to: { transform: "none", opacity: 1 },
+            },
             animation: `hf-selection-in ${motion.fast}ms ease-out`,
           }}
         >
-          <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 2, fontWeight: 500 }}>
-            <Box component="span" aria-hidden="true" sx={{ width: 8, height: 8, borderRadius: "4px", backgroundColor: hfAccent.main }} />
+          <Box
+            component="span"
+            sx={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 2, fontWeight: 500 }}
+          >
+            <Box
+              component="span"
+              aria-hidden="true"
+              sx={{ width: 8, height: 8, borderRadius: "4px", backgroundColor: hfAccent.main }}
+            />
             <span className="num">{label}</span>
           </Box>
           {actions}

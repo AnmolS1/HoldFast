@@ -28,7 +28,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, State> {
   }
 
   static getDerivedStateFromProps(props: ErrorBoundaryProps, state: State): Partial<State> | null {
-    if (props.resetKey !== state.resetKey) return { error: undefined, failed: false, resetKey: props.resetKey };
+    if (props.resetKey !== state.resetKey)
+      return { error: undefined, failed: false, resetKey: props.resetKey };
     return null;
   }
 

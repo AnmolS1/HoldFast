@@ -63,7 +63,10 @@ export interface SignupValues {
 export type SignupField = keyof SignupValues | "birth";
 export type SignupErrors = Partial<Record<SignupField, MessageKey>>;
 
-export function parseBirth(values: Pick<SignupValues, "birthMonth" | "birthYear">, now: Date = new Date()): { month: number; year: number } | null {
+export function parseBirth(
+  values: Pick<SignupValues, "birthMonth" | "birthYear">,
+  now: Date = new Date(),
+): { month: number; year: number } | null {
   if (!/^\d{1,2}$/.test(values.birthMonth.trim()) || !/^\d{4}$/.test(values.birthYear.trim())) return null;
   const month = Number(values.birthMonth);
   const year = Number(values.birthYear);
@@ -72,7 +75,10 @@ export function parseBirth(values: Pick<SignupValues, "birthMonth" | "birthYear"
 }
 
 /** The checks shared by email sign-up and the pre-OAuth intent step. */
-export function validateIntent(values: SignupValues, options: { inviteRequired: boolean; now?: Date }): SignupErrors {
+export function validateIntent(
+  values: SignupValues,
+  options: { inviteRequired: boolean; now?: Date },
+): SignupErrors {
   const errors: SignupErrors = {};
   if (options.inviteRequired && values.inviteCode.trim() === "") errors.inviteCode = "signup.error.invite";
   const birth = parseBirth(values, options.now);
@@ -82,7 +88,10 @@ export function validateIntent(values: SignupValues, options: { inviteRequired: 
   return errors;
 }
 
-export function validateSignup(values: SignupValues, options: { inviteRequired: boolean; now?: Date }): SignupErrors {
+export function validateSignup(
+  values: SignupValues,
+  options: { inviteRequired: boolean; now?: Date },
+): SignupErrors {
   const errors: SignupErrors = {};
   if (values.name.trim() === "") errors.name = "signup.error.name";
   if (!isEmail(values.email)) errors.email = "signup.error.email";

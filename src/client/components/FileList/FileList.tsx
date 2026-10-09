@@ -70,9 +70,15 @@ const LONG_PRESS_MS = 500;
 const ALL_COLUMNS: FileListColumn[] = ["share", "modified", "size"];
 const COLUMN_WIDTH: Record<FileListColumn, string> = { share: "72px", modified: "140px", size: "96px" };
 
-type Row<T> = { kind: "group"; key: string; label: string } | { kind: "items"; key: string; items: Array<{ item: T; index: number }> };
+type Row<T> =
+  | { kind: "group"; key: string; label: string }
+  | { kind: "items"; key: string; items: Array<{ item: T; index: number }> };
 
-function buildRows<T extends FileListItem>(items: T[], perRow: number, groupLabel: FileListProps<T>["groupLabel"]): Row<T>[] {
+function buildRows<T extends FileListItem>(
+  items: T[],
+  perRow: number,
+  groupLabel: FileListProps<T>["groupLabel"],
+): Row<T>[] {
   const rows: Row<T>[] = [];
   let current: Array<{ item: T; index: number }> = [];
   let lastLabel: string | null = null;
@@ -99,9 +105,17 @@ function ShareCell({ item }: { item: FileListItem }) {
   if (!sharing) return null;
   const parts: ReactNode[] = [];
   if (sharing.people > 0) {
-    const label = sharing.people === 1 ? t("list.shared.person") : t("list.shared.people", { count: sharing.people });
+    const label =
+      sharing.people === 1 ? t("list.shared.person") : t("list.shared.people", { count: sharing.people });
     parts.push(
-      <Box key="people" component="span" role="img" aria-label={label} title={label} sx={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+      <Box
+        key="people"
+        component="span"
+        role="img"
+        aria-label={label}
+        title={label}
+        sx={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
+      >
         <Users size={14} aria-hidden="true" />
         <span className="num" aria-hidden="true">
           {sharing.people}
@@ -110,9 +124,22 @@ function ShareCell({ item }: { item: FileListItem }) {
     );
   }
   if (sharing.link !== "none") {
-    const label = t(sharing.link === "active" ? "list.link.active" : sharing.link === "paused" ? "list.link.paused" : "list.link.expired");
+    const label = t(
+      sharing.link === "active"
+        ? "list.link.active"
+        : sharing.link === "paused"
+          ? "list.link.paused"
+          : "list.link.expired",
+    );
     parts.push(
-      <Box key="link" component="span" role="img" aria-label={label} title={label} sx={{ display: "inline-flex", opacity: sharing.link === "active" ? 1 : 0.6 }}>
+      <Box
+        key="link"
+        component="span"
+        role="img"
+        aria-label={label}
+        title={label}
+        sx={{ display: "inline-flex", opacity: sharing.link === "active" ? 1 : 0.6 }}
+      >
         <Link2 size={14} aria-hidden="true" />
       </Box>,
     );
@@ -131,7 +158,26 @@ function progressOf(item: FileListItem): number | null | undefined {
 }
 
 export function FileList<T extends FileListItem>(props: FileListProps<T>) {
-  const { items, view, selectionMode, selection, onSelectionChange, onOpen, onQuickLook, rowMenu, onContextMenu, rowProps, renderThumb, groupLabel, renderStatus, hasMore, onLoadMore, loading, emptyState, ariaLabel } = props;
+  const {
+    items,
+    view,
+    selectionMode,
+    selection,
+    onSelectionChange,
+    onOpen,
+    onQuickLook,
+    rowMenu,
+    onContextMenu,
+    rowProps,
+    renderThumb,
+    groupLabel,
+    renderStatus,
+    hasMore,
+    onLoadMore,
+    loading,
+    emptyState,
+    ariaLabel,
+  } = props;
   const columns = props.columns ?? ALL_COLUMNS;
   const desktop = useIsDesktop();
   const touchRows = useMediaQuery(TOUCH_QUERY, { noSsr: true });
@@ -147,7 +193,10 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
   const grid = view === "grid";
   const rowHeight = touchRows ? layout.touchRowHeight : layout.rowHeight;
   const order = useMemo(() => items.map((item) => item.id), [items]);
-  const rows = useMemo(() => buildRows(items, grid ? perRow : 1, groupLabel), [items, grid, perRow, groupLabel]);
+  const rows = useMemo(
+    () => buildRows(items, grid ? perRow : 1, groupLabel),
+    [items, grid, perRow, groupLabel],
+  );
   const virtual = items.length > VIRTUALIZE_ABOVE;
   const activeIndex = Math.min(active, Math.max(0, items.length - 1));
 
@@ -219,7 +268,9 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
       focusPending.current = true;
       setActive(next);
       if (virtual) {
-        const rowIndex = rows.findIndex((row) => row.kind === "items" && row.items.some((entry) => entry.index === next));
+        const rowIndex = rows.findIndex(
+          (row) => row.kind === "items" && row.items.some((entry) => entry.index === next),
+        );
         if (rowIndex >= 0) virtualizer.scrollToIndex(rowIndex);
       }
       const id = items[next]?.id;
@@ -324,12 +375,18 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
       longPress.current = null;
     }
   };
-  useEffect(() => () => {
-    if (longPress.current) clearTimeout(longPress.current.timer);
-  }, []);
+  useEffect(
+    () => () => {
+      if (longPress.current) clearTimeout(longPress.current.timer);
+    },
+    [],
+  );
 
   const template = desktop
-    ? `32px minmax(0, 1fr) ${columns.map((column) => COLUMN_WIDTH[column]).join(" ")} 36px`.replace(/\s+/g, " ")
+    ? `32px minmax(0, 1fr) ${columns.map((column) => COLUMN_WIDTH[column]).join(" ")} 36px`.replace(
+        /\s+/g,
+        " ",
+      )
     : `minmax(0, 1fr) ${layout.touchTarget}px`;
 
   const itemHandlers = (item: T, index: number) => {
@@ -375,38 +432,86 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
 
   const nameOf = (item: T) => {
     const name = (
-      <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: item.kind === "folder" ? 500 : 400 }}>
+      <Box
+        component="span"
+        sx={{
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          fontWeight: item.kind === "folder" ? 500 : 400,
+        }}
+      >
         {item.name}
       </Box>
     );
     // Folder names are the shared element of the folder-enter transition (name → breadcrumb).
-    return item.kind === "folder" ? <ViewTransition name={`hf-node-${item.id}`}>{name}</ViewTransition> : name;
+    return item.kind === "folder" ? (
+      <ViewTransition name={`hf-node-${item.id}`}>{name}</ViewTransition>
+    ) : (
+      name
+    );
   };
 
   const underline = (item: T) => {
     const progress = progressOf(item);
     if (progress === undefined) return null;
-    return <ProgressUnderline value={progress} label={`${statusSentence("pending") ?? ""} ${item.name}`.trim()} />;
+    return (
+      <ProgressUnderline value={progress} label={`${statusSentence("pending") ?? ""} ${item.name}`.trim()} />
+    );
   };
 
   const listRow = (item: T, index: number) => {
     const status = renderStatus ? renderStatus(item) : <DefaultStatus item={item} />;
-    const glyph = item.kind === "folder" ? <FolderGlyph size={desktop ? 16 : 20} /> : <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={desktop ? 16 : 20} />;
+    const glyph =
+      item.kind === "folder" ? (
+        <FolderGlyph size={desktop ? 16 : 20} />
+      ) : (
+        <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={desktop ? 16 : 20} />
+      );
     if (!desktop) {
       return (
         <Box
           key={item.id}
           role="row"
           {...itemHandlers(item, index)}
-          sx={{ position: "relative", display: "grid", gridTemplateColumns: template, alignItems: "center", minHeight: rowHeight, padding: "0 0 0 8px", borderRadius: "8px", outlineOffset: -2, cursor: "default", userSelect: "none", WebkitTouchCallout: "none" }}
+          sx={{
+            position: "relative",
+            display: "grid",
+            gridTemplateColumns: template,
+            alignItems: "center",
+            minHeight: rowHeight,
+            padding: "0 0 0 8px",
+            borderRadius: "8px",
+            outlineOffset: -2,
+            cursor: "default",
+            userSelect: "none",
+            WebkitTouchCallout: "none",
+          }}
         >
           <Box role="gridcell" sx={{ display: "flex", alignItems: "center", gap: 3, minWidth: 0 }}>
             {glyph}
             <Box sx={{ display: "flex", flexDirection: "column", minWidth: 0, lineHeight: "18px" }}>
               {nameOf(item)}
-              <Box component="span" sx={{ display: "flex", alignItems: "center", gap: "6px", color: hf.textSecondary, fontSize: 12, minWidth: 0 }}>
+              <Box
+                component="span"
+                sx={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  color: hf.textSecondary,
+                  fontSize: 12,
+                  minWidth: 0,
+                }}
+              >
                 {status}
-                {item.secondary ? <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.secondary}</Box> : null}
+                {item.secondary ? (
+                  <Box
+                    component="span"
+                    sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  >
+                    {item.secondary}
+                  </Box>
+                ) : null}
                 {item.kind === "file" && columns.includes("size") ? <Bytes value={item.size} /> : null}
                 {columns.includes("modified") ? <RelativeTime value={item.updatedAt} variant="date" /> : null}
                 {columns.includes("share") ? <ShareCell item={item} /> : null}
@@ -425,7 +530,19 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
         key={item.id}
         role="row"
         {...itemHandlers(item, index)}
-        sx={{ position: "relative", display: "grid", gridTemplateColumns: template, alignItems: "center", height: rowHeight, padding: "0 12px", borderRadius: `${layout.radius.control}px`, outlineOffset: -2, cursor: "default", userSelect: "none", "&:hover": { backgroundColor: hf.surface2 } }}
+        sx={{
+          position: "relative",
+          display: "grid",
+          gridTemplateColumns: template,
+          alignItems: "center",
+          height: rowHeight,
+          padding: "0 12px",
+          borderRadius: `${layout.radius.control}px`,
+          outlineOffset: -2,
+          cursor: "default",
+          userSelect: "none",
+          "&:hover": { backgroundColor: hf.surface2 },
+        }}
       >
         <Box role="gridcell" sx={{ display: "flex", alignItems: "center" }}>
           {checkbox(item)}
@@ -434,14 +551,33 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
           {glyph}
           {nameOf(item)}
           {item.secondary ? (
-            <Box component="span" sx={{ color: hf.textSecondary, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: "0 1 auto" }}>
+            <Box
+              component="span"
+              sx={{
+                color: hf.textSecondary,
+                fontSize: 12,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                flex: "0 1 auto",
+              }}
+            >
               {item.secondary}
             </Box>
           ) : null}
           {status}
         </Box>
         {columns.includes("share") ? (
-          <Box role="gridcell" sx={{ display: "inline-flex", alignItems: "center", gap: 2, color: hf.textSecondary, fontSize: 12 }}>
+          <Box
+            role="gridcell"
+            sx={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 2,
+              color: hf.textSecondary,
+              fontSize: 12,
+            }}
+          >
             <ShareCell item={item} />
           </Box>
         ) : null}
@@ -488,16 +624,53 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
           "&:hover": { backgroundColor: hf.surface2 },
         }}
       >
-        <Box sx={{ position: "relative", flex: "1 1 auto", minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: `${layout.radius.control}px`, overflow: "hidden" }}>
-          {renderThumb ? renderThumb(item) : item.kind === "folder" ? <FolderGlyph size={40} /> : <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={48} />}
-          {multi ? <Box sx={{ position: "absolute", top: 4, left: 4, display: "flex" }}>{checkbox(item)}</Box> : null}
+        <Box
+          sx={{
+            position: "relative",
+            flex: "1 1 auto",
+            minHeight: 0,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            borderRadius: `${layout.radius.control}px`,
+            overflow: "hidden",
+          }}
+        >
+          {renderThumb ? (
+            renderThumb(item)
+          ) : item.kind === "folder" ? (
+            <FolderGlyph size={40} />
+          ) : (
+            <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={48} />
+          )}
+          {multi ? (
+            <Box sx={{ position: "absolute", top: 4, left: 4, display: "flex" }}>{checkbox(item)}</Box>
+          ) : null}
           {rowMenu ? <Box sx={{ position: "absolute", top: 0, right: 0 }}>{rowMenu(item)}</Box> : null}
         </Box>
         <Box sx={{ display: "flex", flexDirection: "column", minWidth: 0, lineHeight: "18px" }}>
           {nameOf(item)}
-          <Box component="span" sx={{ display: "flex", alignItems: "center", gap: "6px", color: hf.textSecondary, fontSize: 12, minWidth: 0, minHeight: 16 }}>
+          <Box
+            component="span"
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              color: hf.textSecondary,
+              fontSize: 12,
+              minWidth: 0,
+              minHeight: 16,
+            }}
+          >
             {renderStatus ? renderStatus(item) : <DefaultStatus item={item} />}
-            {item.secondary ? <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.secondary}</Box> : null}
+            {item.secondary ? (
+              <Box
+                component="span"
+                sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+              >
+                {item.secondary}
+              </Box>
+            ) : null}
             {item.kind === "file" ? <Bytes value={item.size} /> : null}
           </Box>
         </Box>
@@ -509,7 +682,19 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
   const renderRow = (row: Row<T>) => {
     if (row.kind === "group") {
       return (
-        <Box key={row.key} role="row" sx={{ display: "flex", alignItems: "flex-end", height: GROUP_HEIGHT, padding: "0 12px 6px", color: hf.textSecondary, fontSize: 12, fontWeight: 500 }}>
+        <Box
+          key={row.key}
+          role="row"
+          sx={{
+            display: "flex",
+            alignItems: "flex-end",
+            height: GROUP_HEIGHT,
+            padding: "0 12px 6px",
+            color: hf.textSecondary,
+            fontSize: 12,
+            fontWeight: 500,
+          }}
+        >
           <Box role="columnheader" data-group-label>
             {row.label}
           </Box>
@@ -521,7 +706,18 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
       return listRow(entry.item, entry.index);
     }
     return (
-      <Box key={row.key} role="row" sx={{ display: "grid", gridTemplateColumns: `repeat(${perRow}, minmax(0, 1fr))`, gap: 2, height: TILE_HEIGHT, paddingBottom: 2, boxSizing: "border-box" }}>
+      <Box
+        key={row.key}
+        role="row"
+        sx={{
+          display: "grid",
+          gridTemplateColumns: `repeat(${perRow}, minmax(0, 1fr))`,
+          gap: 2,
+          height: TILE_HEIGHT,
+          paddingBottom: 2,
+          boxSizing: "border-box",
+        }}
+      >
         {row.items.map((entry) => tile(entry.item, entry.index))}
       </Box>
     );
@@ -531,7 +727,10 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
   const skeletons = loading ? (
     <Box aria-hidden="true" data-skeleton-rows>
       {Array.from({ length: skeletonCount }, (_, i) => (
-        <Box key={i} sx={{ display: "flex", alignItems: "center", gap: 3, height: rowHeight, padding: "0 12px" }}>
+        <Box
+          key={i}
+          sx={{ display: "flex", alignItems: "center", gap: 3, height: rowHeight, padding: "0 12px" }}
+        >
           <Skeleton variant="rounded" width={16} height={16} />
           <Skeleton variant="text" width={`${40 + ((i * 17) % 35)}%`} />
         </Box>
@@ -547,14 +746,42 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
       ref={scrollRef}
       data-hf-list
       data-view={view}
-      sx={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: desktop ? "0 8px 24px" : "0 8px 96px", position: "relative" }}
+      sx={{
+        flex: "1 1 auto",
+        minHeight: 0,
+        overflowY: "auto",
+        padding: desktop ? "0 8px 24px" : "0 8px 96px",
+        position: "relative",
+      }}
     >
       {showEmpty ? (
         emptyState
       ) : (
-        <Box role="grid" aria-label={ariaLabel} aria-multiselectable={multi || undefined} aria-rowcount={items.length} aria-busy={loading || undefined}>
+        <Box
+          role="grid"
+          aria-label={ariaLabel}
+          aria-multiselectable={multi || undefined}
+          aria-rowcount={items.length}
+          aria-busy={loading || undefined}
+        >
           {desktop && !grid ? (
-            <Box role="row" sx={{ display: "grid", gridTemplateColumns: template, alignItems: "center", height: HEADER_HEIGHT, padding: "0 12px", color: hf.textSecondary, fontSize: 12, borderBottom: `1px solid ${hf.hairline}`, position: "sticky", top: 0, backgroundColor: hf.surface, zIndex: 1 }}>
+            <Box
+              role="row"
+              sx={{
+                display: "grid",
+                gridTemplateColumns: template,
+                alignItems: "center",
+                height: HEADER_HEIGHT,
+                padding: "0 12px",
+                color: hf.textSecondary,
+                fontSize: 12,
+                borderBottom: `1px solid ${hf.hairline}`,
+                position: "sticky",
+                top: 0,
+                backgroundColor: hf.surface,
+                zIndex: 1,
+              }}
+            >
               <Box role="presentation" />
               <Box role="columnheader">{t("list.name")}</Box>
               {columns.includes("share") ? <Box role="columnheader" aria-label={t("list.sharing")} /> : null}
@@ -573,7 +800,17 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
                 const row = rows[virtualRow.index];
                 if (!row) return null;
                 return (
-                  <Box key={row.key} role="presentation" sx={{ position: "absolute", top: 0, left: 0, right: 0, transform: `translateY(${virtualRow.start}px)` }}>
+                  <Box
+                    key={row.key}
+                    role="presentation"
+                    sx={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      right: 0,
+                      transform: `translateY(${virtualRow.start}px)`,
+                    }}
+                  >
                     {renderRow(row)}
                   </Box>
                 );
@@ -587,7 +824,9 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
         </Box>
       )}
       {skeletons}
-      {hasMore ? <Box ref={sentinelRef} data-load-more-sentinel aria-hidden="true" sx={{ height: 1 }} /> : null}
+      {hasMore ? (
+        <Box ref={sentinelRef} data-load-more-sentinel aria-hidden="true" sx={{ height: 1 }} />
+      ) : null}
     </Box>
   );
 }

@@ -4,5 +4,9 @@ import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
 
 export const routes: RouteObject[] = [
-  { path: "account/*", element: <PlaceholderPage name={t("nav.account")} />, handle: { title: t("nav.account"), details: false } },
+  {
+    path: "account/*",
+    element: <PlaceholderPage name={t("nav.account")} />,
+    handle: { title: t("nav.account"), details: false },
+  },
 ];

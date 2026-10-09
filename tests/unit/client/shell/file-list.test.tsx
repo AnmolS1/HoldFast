@@ -52,15 +52,21 @@ function Harness({ items, onCause, ...rest }: HarnessProps) {
 
 const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-item-index]"));
 const row = (index: number) => document.querySelector<HTMLElement>(`[data-item-index="${index}"]`)!;
-const selectedIds = () => rows().filter((r) => r.getAttribute("aria-selected") === "true").map((r) => r.getAttribute("data-item-id"));
-const key = (element: HTMLElement, k: string, init: KeyboardEventInit = {}) => fireEvent.keyDown(element, { key: k, ...init });
+const selectedIds = () =>
+  rows()
+    .filter((r) => r.getAttribute("aria-selected") === "true")
+    .map((r) => r.getAttribute("data-item-id"));
+const key = (element: HTMLElement, k: string, init: KeyboardEventInit = {}) =>
+  fireEvent.keyDown(element, { key: k, ...init });
 
 describe("FileList: structure", () => {
   it("is a labelled grid with the D01 columns by default", () => {
     renderShell(<Harness items={makeItems(3)} />);
     const grid = screen.getByRole("grid", { name: "Test files" });
     expect(grid.getAttribute("aria-multiselectable")).toBe("true");
-    expect(screen.getAllByRole("columnheader").map((h) => h.textContent || h.getAttribute("aria-label") || "")).toEqual(["Name", "Sharing", "Modified", "Size"]);
+    expect(
+      screen.getAllByRole("columnheader").map((h) => h.textContent || h.getAttribute("aria-label") || ""),
+    ).toEqual(["Name", "Sharing", "Modified", "Size"]);
     expect(getComputedStyle(row(0)).gridTemplateColumns).toBe("32px minmax(0, 1fr) 72px 140px 96px 36px");
     // No owner column and no scan column.
     expect(document.body.textContent).not.toMatch(/Owner|Scan status/);
@@ -92,8 +98,13 @@ describe("FileList: structure", () => {
 
   it("consecutive items sharing a group label get one header", () => {
     const items = makeItems(5);
-    renderShell(<Harness items={items} groupLabel={(item) => (Number(item.id.slice(1)) < 2 ? "Today" : "Earlier")} />);
-    expect(Array.from(document.querySelectorAll("[data-group-label]")).map((n) => n.textContent)).toEqual(["Today", "Earlier"]);
+    renderShell(
+      <Harness items={items} groupLabel={(item) => (Number(item.id.slice(1)) < 2 ? "Today" : "Earlier")} />,
+    );
+    expect(Array.from(document.querySelectorAll("[data-group-label]")).map((n) => n.textContent)).toEqual([
+      "Today",
+      "Earlier",
+    ]);
   });
 
   it("shows `secondary`, the default status sentence and the progress underline from the item", () => {
@@ -108,7 +119,13 @@ describe("FileList: structure", () => {
   });
 
   it("renderStatus and rowMenu are slots", () => {
-    renderShell(<Harness items={makeItems(3)} renderStatus={(item) => <i>status-{item.id}</i>} rowMenu={(item) => <button aria-label={`More actions for ${item.name}`}>⋮</button>} />);
+    renderShell(
+      <Harness
+        items={makeItems(3)}
+        renderStatus={(item) => <i>status-{item.id}</i>}
+        rowMenu={(item) => <button aria-label={`More actions for ${item.name}`}>⋮</button>}
+      />,
+    );
     expect(screen.getByText("status-n2")).toBeTruthy();
     expect(screen.getByRole("button", { name: "More actions for file-2.pdf" })).toBeTruthy();
   });
@@ -281,7 +298,9 @@ describe("FileList: grid view and mobile", () => {
   it("grid view renders tiles that carry aria-selected", () => {
     const restore = stubLayout(800, 600);
     try {
-      renderShell(<Harness items={makeItems(5)} view="grid" renderThumb={(item) => <i>thumb-{item.id}</i>} />);
+      renderShell(
+        <Harness items={makeItems(5)} view="grid" renderThumb={(item) => <i>thumb-{item.id}</i>} />,
+      );
       expect(document.querySelector("[data-view]")?.getAttribute("data-view")).toBe("grid");
       expect(rows().every((r) => r.getAttribute("role") === "gridcell")).toBe(true);
       expect(screen.getByText("thumb-n3")).toBeTruthy();
@@ -305,11 +324,20 @@ describe("FileList: grid view and mobile", () => {
 });
 
 describe("FileList: selection styling is theme-owned", () => {
-  const source = import.meta.glob<string>("/src/client/components/FileList/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
+  const source = import.meta.glob<string>("/src/client/components/FileList/*.{ts,tsx}", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
 
   it("the component's source names no activity-colour token", () => {
-    expect(Object.keys(source).sort()).toEqual(["/src/client/components/FileList/FileList.tsx", "/src/client/components/FileList/index.ts", "/src/client/components/FileList/selection.ts"]);
-    for (const [path, code] of Object.entries(source)) expect(/accent|palette\.primary/i.test(code), path).toBe(false);
+    expect(Object.keys(source).sort()).toEqual([
+      "/src/client/components/FileList/FileList.tsx",
+      "/src/client/components/FileList/index.ts",
+      "/src/client/components/FileList/selection.ts",
+    ]);
+    for (const [path, code] of Object.entries(source))
+      expect(/accent|palette\.primary/i.test(code), path).toBe(false);
   });
 
   it("a selected row still computes to the tint and the 2 px inset, through the theme's global rule", () => {

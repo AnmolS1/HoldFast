@@ -24,7 +24,9 @@ export const SEARCH_INPUT_ID = "hf-search";
 export function SearchBox({ compact = false }: { compact?: boolean }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [query, setQuery] = useState(() => (location.pathname === "/search" ? (new URLSearchParams(location.search).get("q") ?? "") : ""));
+  const [query, setQuery] = useState(() =>
+    location.pathname === "/search" ? (new URLSearchParams(location.search).get("q") ?? "") : "",
+  );
   const [focused, setFocused] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const onSubmit = (event: FormEvent) => {
@@ -49,7 +51,17 @@ export function SearchBox({ compact = false }: { compact?: boolean }) {
     >
       <Box
         component="label"
-        sx={{ display: "flex", alignItems: "center", gap: 2, height: compact ? 44 : 32, padding: compact ? "0 12px" : "0 10px", border: `1px solid ${hf.hairline}`, borderRadius: `${compact ? layout.radius.card : layout.radius.control}px`, backgroundColor: hf.bg, "&:focus-within": { borderColor: hf.text } }}
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 2,
+          height: compact ? 44 : 32,
+          padding: compact ? "0 12px" : "0 10px",
+          border: `1px solid ${hf.hairline}`,
+          borderRadius: `${compact ? layout.radius.card : layout.radius.control}px`,
+          backgroundColor: hf.bg,
+          "&:focus-within": { borderColor: hf.text },
+        }}
       >
         <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
           <Search size={16} />
@@ -64,13 +76,31 @@ export function SearchBox({ compact = false }: { compact?: boolean }) {
           placeholder={t(compact ? "header.searchPlaceholderShort" : "header.searchPlaceholder")}
           aria-label={t("header.search")}
           autoComplete="off"
-          sx={{ flex: "1 1 auto", minWidth: 0, border: 0, outline: "none", background: "transparent", color: hf.text, font: "inherit", fontSize: compact ? 16 : 13, "&::placeholder": { color: hf.textSecondary }, "&::-webkit-search-cancel-button": { display: "none" } }}
+          sx={{
+            flex: "1 1 auto",
+            minWidth: 0,
+            border: 0,
+            outline: "none",
+            background: "transparent",
+            color: hf.text,
+            font: "inherit",
+            fontSize: compact ? 16 : 13,
+            "&::placeholder": { color: hf.textSecondary },
+            "&::-webkit-search-cancel-button": { display: "none" },
+          }}
         />
         {compact ? null : <Kbd>{shortcutLabel("search")}</Kbd>}
       </Box>
       {focused && query.trim() !== "" ? (
         <Box data-search-suggestions sx={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 3 }}>
-          <SearchSuggestions query={query.trim()} onPick={(nodeId) => navigate(`/preview/${encodeURIComponent(nodeId)}`, { state: { from: location.pathname + location.search } })} />
+          <SearchSuggestions
+            query={query.trim()}
+            onPick={(nodeId) =>
+              navigate(`/preview/${encodeURIComponent(nodeId)}`, {
+                state: { from: location.pathname + location.search },
+              })
+            }
+          />
         </Box>
       ) : null}
     </Box>
@@ -90,15 +120,36 @@ export function ViewToggle() {
           aria-pressed={active}
           onClick={() => prefs.setViewMode(mode)}
           data-view-toggle={mode}
-          sx={{ width: 32, height: 32, color: active ? hf.text : hf.textSecondary, backgroundColor: active ? hf.navActive : hf.surface, "&.Mui-focusVisible": { outlineOffset: -2 }, "@media (max-width:1023.95px)": { width: 44, height: 44 } }}
+          sx={{
+            width: 32,
+            height: 32,
+            color: active ? hf.text : hf.textSecondary,
+            backgroundColor: active ? hf.navActive : hf.surface,
+            "&.Mui-focusVisible": { outlineOffset: -2 },
+            "@media (max-width:1023.95px)": { width: 44, height: 44 },
+          }}
         >
-          {mode === "list" ? <ListIcon size={16} aria-hidden="true" /> : <LayoutGrid size={16} aria-hidden="true" />}
+          {mode === "list" ? (
+            <ListIcon size={16} aria-hidden="true" />
+          ) : (
+            <LayoutGrid size={16} aria-hidden="true" />
+          )}
         </ButtonBase>
       </Tooltip>
     );
   };
   return (
-    <Box role="group" aria-label={t("header.view")} sx={{ display: "inline-flex", border: `1px solid ${hf.hairline}`, borderRadius: `${layout.radius.control}px`, overflow: "hidden", flex: "none" }}>
+    <Box
+      role="group"
+      aria-label={t("header.view")}
+      sx={{
+        display: "inline-flex",
+        border: `1px solid ${hf.hairline}`,
+        borderRadius: `${layout.radius.control}px`,
+        overflow: "hidden",
+        flex: "none",
+      }}
+    >
       {button("list")}
       {button("grid")}
     </Box>
@@ -123,7 +174,14 @@ export function NewMenu() {
       >
         {t("header.new")}
       </Button>
-      <Menu id={menuId} anchorEl={anchor} open={Boolean(anchor)} onClose={() => setAnchor(null)} anchorOrigin={{ vertical: "bottom", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "right" }}>
+      <Menu
+        id={menuId}
+        anchorEl={anchor}
+        open={Boolean(anchor)}
+        onClose={() => setAnchor(null)}
+        anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+        transformOrigin={{ vertical: "top", horizontal: "right" }}
+      >
         {actions.map((action) => (
           <MenuItem
             key={action.id}
@@ -152,7 +210,20 @@ export function NewMenu() {
 /** Desktop header, 56 px: title and breadcrumbs, search, palette, view toggle, New. */
 export function Header({ title }: { title: string }) {
   return (
-    <Box component="header" data-header sx={{ display: "flex", alignItems: "center", gap: 3, minHeight: layout.header, boxSizing: "border-box", padding: "0 20px", borderBottom: `1px solid ${hf.hairline}`, flex: "none" }}>
+    <Box
+      component="header"
+      data-header
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        gap: 3,
+        minHeight: layout.header,
+        boxSizing: "border-box",
+        padding: "0 20px",
+        borderBottom: `1px solid ${hf.hairline}`,
+        flex: "none",
+      }}
+    >
       <Box sx={{ flex: "1 1 auto", minWidth: 0 }}>
         <Breadcrumbs fallbackTitle={title} />
       </Box>

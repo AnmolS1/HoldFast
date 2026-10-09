@@ -9,7 +9,15 @@ import type { UseTurnstile } from "../../lib/turnstile";
 import { hf, layout } from "../../theme/tokens";
 
 /** The card every auth screen sits in. */
-export function AuthCard({ title, lead, children }: { title: string; lead?: ReactNode; children: ReactNode }) {
+export function AuthCard({
+  title,
+  lead,
+  children,
+}: {
+  title: string;
+  lead?: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <Box
       sx={{
@@ -48,7 +56,17 @@ export type FieldProps = Omit<TextFieldProps, "variant" | "error" | "helperText"
 };
 
 /** A labelled input: the label sits above the box, the error below it and is announced. */
-export function Field({ label, errorKey, errorText, help, mono, hideLabel, slotProps, sx, ...rest }: FieldProps) {
+export function Field({
+  label,
+  errorKey,
+  errorText,
+  help,
+  mono,
+  hideLabel,
+  slotProps,
+  sx,
+  ...rest
+}: FieldProps) {
   const error = errorKey ? t(errorKey) : errorText;
   return (
     <TextField
@@ -66,11 +84,26 @@ export function Field({ label, errorKey, errorText, help, mono, hideLabel, slotP
       sx={{
         // The label is static above the field, not floating inside the outline.
         "& .MuiInputLabel-root": hideLabel
-          ? { position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap", transform: "none" }
+          ? {
+              position: "absolute",
+              width: 1,
+              height: 1,
+              overflow: "hidden",
+              clip: "rect(0 0 0 0)",
+              whiteSpace: "nowrap",
+              transform: "none",
+            }
           : { position: "static", transform: "none", marginBottom: "6px", maxWidth: "100%" },
         "& .MuiOutlinedInput-notchedOutline": { top: 0 },
         "& .MuiOutlinedInput-notchedOutline legend": { display: "none" },
-        ...(mono ? { "& input": { fontFamily: "'Commit Mono', ui-monospace, monospace", fontVariantNumeric: "tabular-nums" } } : {}),
+        ...(mono
+          ? {
+              "& input": {
+                fontFamily: "'Commit Mono', ui-monospace, monospace",
+                fontVariantNumeric: "tabular-nums",
+              },
+            }
+          : {}),
         ...sx,
       }}
     />
@@ -88,12 +121,26 @@ export function FormError({ children }: { children: ReactNode }) {
 }
 
 /** A neutral notice above a form ("Email confirmed. Sign in to continue."). */
-export function FormNotice({ children, tone = "neutral" }: { children: ReactNode; tone?: "neutral" | "danger" }) {
+export function FormNotice({
+  children,
+  tone = "neutral",
+}: {
+  children: ReactNode;
+  tone?: "neutral" | "danger";
+}) {
   return (
     <Box
       role="status"
       data-form-notice
-      sx={{ padding: "8px 12px", borderRadius: `${layout.radius.control}px`, backgroundColor: hf.surface2, boxShadow: `inset 2px 0 0 ${tone === "danger" ? hf.danger : hf.textSecondary}`, color: hf.text, fontSize: 12, lineHeight: "16px" }}
+      sx={{
+        padding: "8px 12px",
+        borderRadius: `${layout.radius.control}px`,
+        backgroundColor: hf.surface2,
+        boxShadow: `inset 2px 0 0 ${tone === "danger" ? hf.danger : hf.textSecondary}`,
+        color: hf.text,
+        fontSize: 12,
+        lineHeight: "16px",
+      }}
     >
       {children}
     </Box>
@@ -117,7 +164,18 @@ export function TurnstileBox({ turnstile }: { turnstile: UseTurnstile }) {
   return (
     <Box data-turnstile={status}>
       <Box ref={attach} aria-describedby={statusId} />
-      <Box id={statusId} role="status" sx={{ display: "flex", alignItems: "center", gap: 2, color: status === "error" ? hf.danger : hf.textSecondary, fontSize: 12, minHeight: 16 }}>
+      <Box
+        id={statusId}
+        role="status"
+        sx={{
+          display: "flex",
+          alignItems: "center",
+          gap: 2,
+          color: status === "error" ? hf.danger : hf.textSecondary,
+          fontSize: 12,
+          minHeight: 16,
+        }}
+      >
         {status === "loading" ? (
           <>
             <CircularProgress size={12} aria-hidden="true" />
@@ -133,7 +191,17 @@ export function TurnstileBox({ turnstile }: { turnstile: UseTurnstile }) {
 
 export function PasskeyIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
       <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" />
       <circle cx="16.5" cy="7.5" r=".5" />
     </svg>
@@ -144,10 +212,19 @@ export function PasskeyIcon() {
 export function GoogleIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
-      <path fill="#4285F4" d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.5Z" />
-      <path fill="#34A853" d="M12 24c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3A12 12 0 0 0 12 24Z" />
+      <path
+        fill="#4285F4"
+        d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.4h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.5Z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3A12 12 0 0 0 12 24Z"
+      />
       <path fill="#FBBC05" d="M5.6 14.7a7.2 7.2 0 0 1 0-4.6V7.2H1.8a12 12 0 0 0 0 10.8l3.8-3.3Z" />
-      <path fill="#EA4335" d="M12 4.7c1.7 0 3.2.6 4.4 1.7l3.3-3.3A12 12 0 0 0 1.8 7.2l3.8 3C6.5 7.5 9 4.7 12 4.7Z" />
+      <path
+        fill="#EA4335"
+        d="M12 4.7c1.7 0 3.2.6 4.4 1.7l3.3-3.3A12 12 0 0 0 1.8 7.2l3.8 3C6.5 7.5 9 4.7 12 4.7Z"
+      />
     </svg>
   );
 }

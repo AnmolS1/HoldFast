@@ -35,11 +35,19 @@ export function TwoFactorPage() {
     }
     setBusy(true);
     const result = await callAuth(() =>
-      mode === "totp" ? authClient.twoFactor.verifyTotp({ code: value, trustDevice: trust }) : authClient.twoFactor.verifyBackupCode({ code: value, trustDevice: trust }),
+      mode === "totp"
+        ? authClient.twoFactor.verifyTotp({ code: value, trustDevice: trust })
+        : authClient.twoFactor.verifyBackupCode({ code: value, trustDevice: trust }),
     );
     setBusy(false);
     if (result.error) {
-      setError(result.error.code === "NOT_WIRED" ? t("auth.notWired") : result.error.status === 429 ? t("auth.error.rate") : t("twoFactor.failed"));
+      setError(
+        result.error.code === "NOT_WIRED"
+          ? t("auth.notWired")
+          : result.error.status === 429
+            ? t("auth.error.rate")
+            : t("twoFactor.failed"),
+      );
       return;
     }
     await refreshSession();
@@ -48,8 +56,16 @@ export function TwoFactorPage() {
 
   const totp = mode === "totp";
   return (
-    <AuthCard title={t(totp ? "twoFactor.title" : "twoFactor.backup.title")} lead={t(totp ? "twoFactor.body" : "twoFactor.backup.body")}>
-      <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
+    <AuthCard
+      title={t(totp ? "twoFactor.title" : "twoFactor.backup.title")}
+      lead={t(totp ? "twoFactor.body" : "twoFactor.backup.body")}
+    >
+      <Box
+        component="form"
+        noValidate
+        onSubmit={onSubmit}
+        sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+      >
         <Field
           key={mode}
           label={t(totp ? "twoFactor.code" : "twoFactor.backup.code")}
@@ -61,10 +77,37 @@ export function TwoFactorPage() {
           value={code}
           onChange={(e) => setCode(e.target.value)}
           errorText={error ?? undefined}
-          slotProps={{ htmlInput: totp ? { inputMode: "numeric", maxLength: 7, style: { fontSize: 20, letterSpacing: "0.3em", textAlign: "center", height: 48 } } : { spellCheck: false, autoCapitalize: "off" } }}
+          slotProps={{
+            htmlInput: totp
+              ? {
+                  inputMode: "numeric",
+                  maxLength: 7,
+                  style: { fontSize: 20, letterSpacing: "0.3em", textAlign: "center", height: 48 },
+                }
+              : { spellCheck: false, autoCapitalize: "off" },
+          }}
         />
-        <Box component="label" sx={{ display: "flex", alignItems: "center", gap: 2, fontSize: 12, color: hf.textSecondary, minHeight: 24, cursor: "pointer", "@media (max-width:1023.95px)": { minHeight: 44 } }}>
-          <Box component="input" type="checkbox" name="trustDevice" checked={trust} onChange={(e) => setTrust(e.target.checked)} sx={{ width: 16, height: 16, margin: 0 }} />
+        <Box
+          component="label"
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 2,
+            fontSize: 12,
+            color: hf.textSecondary,
+            minHeight: 24,
+            cursor: "pointer",
+            "@media (max-width:1023.95px)": { minHeight: 44 },
+          }}
+        >
+          <Box
+            component="input"
+            type="checkbox"
+            name="trustDevice"
+            checked={trust}
+            onChange={(e) => setTrust(e.target.checked)}
+            sx={{ width: 16, height: 16, margin: 0 }}
+          />
           {t("twoFactor.trust")}
         </Box>
         <Button type="submit" variant="contained" size="large" disabled={busy}>

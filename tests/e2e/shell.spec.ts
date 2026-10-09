@@ -65,7 +65,10 @@ async function serveBuild(page: Page, port: number): Promise<void> {
     const path = decodeURIComponent(new URL(route.request().url()).pathname);
     let file = join(DIST, path);
     if (!existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "index.html");
-    return route.fulfill({ body: readFileSync(file), contentType: CONTENT_TYPES[extname(file)] ?? "application/octet-stream" });
+    return route.fulfill({
+      body: readFileSync(file),
+      contentType: CONTENT_TYPES[extname(file)] ?? "application/octet-stream",
+    });
   });
 }
 
@@ -143,7 +146,9 @@ test.describe("shell routes", () => {
     await mockShell(page, origins.port, { user: { termsVersion: "2025-01" } });
     await page.goto("/recent");
     await expect(page).toHaveURL(/\/accept-terms\?next=%2Frecent$/);
-    await expect(page.getByRole("heading", { name: "We've updated the Terms and Privacy Policy." })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "We've updated the Terms and Privacy Policy." }),
+    ).toBeVisible();
     await expect(page.locator("[data-frame]")).toHaveCount(0);
   });
 
@@ -172,7 +177,10 @@ test.describe("shell routes", () => {
     await expect(page.locator("[data-frame]")).toHaveCount(0);
   });
 
-  test("without a config the app says it could not start (this checkout's plain `npm run dev`)", async ({ page, origins }) => {
+  test("without a config the app says it could not start (this checkout's plain `npm run dev`)", async ({
+    page,
+    origins,
+  }) => {
     await serveBuild(page, origins.port);
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Holdfast couldn't start" })).toBeVisible();
@@ -189,7 +197,10 @@ test.describe("navigation", () => {
     ["trash", "/trash", "Trash"],
   ];
 
-  test("desktop: every sidebar destination shows its placeholder, none shows not-found", async ({ page, origins }) => {
+  test("desktop: every sidebar destination shows its placeholder, none shows not-found", async ({
+    page,
+    origins,
+  }) => {
     test.skip(isMobile(page), "desktop layout");
     await mockShell(page, origins.port);
     await gotoFrame(page, "/");
@@ -203,20 +214,34 @@ test.describe("navigation", () => {
       await expect(page.locator(`[data-sidebar] [data-nav="${id}"]`)).toHaveAttribute("aria-current", "page");
     }
     await page.locator('[data-sidebar] [data-nav="shared"]').click();
-    await expect(placeholder(page, "Shared with me")).toContainText("Shared files appear here once sharing is switched on.");
+    await expect(placeholder(page, "Shared with me")).toContainText(
+      "Shared files appear here once sharing is switched on.",
+    );
   });
 
-  test("mobile: three nav items; Recent, Starred and Trash through the Files switcher", async ({ page, origins }) => {
+  test("mobile: three nav items; Recent, Starred and Trash through the Files switcher", async ({
+    page,
+    origins,
+  }) => {
     test.skip(!isMobile(page), "mobile layout");
     await mockShell(page, origins.port);
     await gotoFrame(page, "/");
     await expect(page.locator("[data-frame]")).toHaveAttribute("data-frame", "mobile");
-    await expect(page.locator("[data-bottom-nav] [data-bottom-nav-item]")).toHaveText(["Files", "Shared", "Account"]);
+    await expect(page.locator("[data-bottom-nav] [data-bottom-nav-item]")).toHaveText([
+      "Files",
+      "Shared",
+      "Account",
+    ]);
     await expect(page.locator("[data-bottom-nav]").locator("a, button")).toHaveCount(3);
     await expect(page.locator("[data-sidebar]")).toHaveCount(0);
     await expect(placeholder(page, "Files")).toBeVisible();
 
-    for (const [label, title] of [["Recent", "Recent"], ["Starred", "Starred"], ["Trash", "Trash"], ["My files", "Files"]] as const) {
+    for (const [label, title] of [
+      ["Recent", "Recent"],
+      ["Starred", "Starred"],
+      ["Trash", "Trash"],
+      ["My files", "Files"],
+    ] as const) {
       await page.getByRole("button", { name: "Switch files view" }).click();
       await page.getByRole("dialog", { name: "Files" }).getByRole("button", { name: label }).click();
       await expect(placeholder(page, title)).toBeVisible();
@@ -225,19 +250,33 @@ test.describe("navigation", () => {
     }
 
     await page.locator('[data-bottom-nav-item="shared"]').click();
-    await expect(placeholder(page, "Shared with me")).toContainText("Shared files appear here once sharing is switched on.");
+    await expect(placeholder(page, "Shared with me")).toContainText(
+      "Shared files appear here once sharing is switched on.",
+    );
     await page.getByRole("group", { name: "Shared files view" }).getByRole("link", { name: "By me" }).click();
     await expect(placeholder(page, "Shared by me")).toBeVisible();
 
     await page.locator('[data-bottom-nav-item="account"]').click();
     const sheet = page.getByRole("dialog", { name: "Ada Lovelace" });
-    await expect(sheet.locator("[data-account-action]")).toHaveText(["Account settings", "Manage storage", "Help", "Contact support", "Terms", "Privacy", "DMCA", "Sign out"]);
+    await expect(sheet.locator("[data-account-action]")).toHaveText([
+      "Account settings",
+      "Manage storage",
+      "Help",
+      "Contact support",
+      "Terms",
+      "Privacy",
+      "DMCA",
+      "Sign out",
+    ]);
     await sheet.getByText("Account settings").click();
     await expect(placeholder(page, "Account")).toBeVisible();
     await expect(page.locator('[data-bottom-nav-item="account"]')).toHaveAttribute("aria-current", "page");
   });
 
-  test("every other in-frame placeholder route renders (deep links, both layouts)", async ({ page, origins }) => {
+  test("every other in-frame placeholder route renders (deep links, both layouts)", async ({
+    page,
+    origins,
+  }) => {
     await mockShell(page, origins.port, { user: { role: "admin" } });
     for (const [path, title] of [
       ["/folder/abc", "Files"],
@@ -301,7 +340,10 @@ test.describe("theme", () => {
     }
   }
 
-  test("the toggle persists across a reload, and the scheme is set before the app runs", async ({ page, origins }) => {
+  test("the toggle persists across a reload, and the scheme is set before the app runs", async ({
+    page,
+    origins,
+  }) => {
     await page.emulateMedia({ colorScheme: "light" });
     await mockShell(page, origins.port);
     await gotoFrame(page, "/");
@@ -319,10 +361,17 @@ test.describe("theme", () => {
       const read = () => {
         const root = document.documentElement;
         if (!root) return;
-        const value = [root.hasAttribute("data-light") ? "light" : "", root.hasAttribute("data-dark") ? "dark" : ""].join("");
+        const value = [
+          root.hasAttribute("data-light") ? "light" : "",
+          root.hasAttribute("data-dark") ? "dark" : "",
+        ].join("");
         if (seen[seen.length - 1] !== value) seen.push(value);
       };
-      new MutationObserver(read).observe(document, { attributes: true, subtree: true, attributeFilter: ["data-light", "data-dark"] });
+      new MutationObserver(read).observe(document, {
+        attributes: true,
+        subtree: true,
+        attributeFilter: ["data-light", "data-dark"],
+      });
       document.addEventListener("DOMContentLoaded", read);
     });
 
@@ -344,11 +393,16 @@ test.describe("theme", () => {
     expect(schemes.filter((value) => value !== "")).toEqual(["dark"]);
   });
 
-  test("control: without the first-paint script the stored scheme is NOT on <html> before the app runs", async ({ page, origins }) => {
+  test("control: without the first-paint script the stored scheme is NOT on <html> before the app runs", async ({
+    page,
+    origins,
+  }) => {
     await page.emulateMedia({ colorScheme: "light" });
     await mockShell(page, origins.port);
     await page.addInitScript(() => localStorage.setItem("mui-mode", "dark"));
-    await page.route("**/color-scheme-init.js", (route) => route.fulfill({ contentType: "text/javascript", body: "" }));
+    await page.route("**/color-scheme-init.js", (route) =>
+      route.fulfill({ contentType: "text/javascript", body: "" }),
+    );
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
     await page.route(APP_ENTRY, async (route) => {
@@ -365,7 +419,10 @@ test.describe("theme", () => {
     await expect(page.locator("html")).toHaveAttribute("data-dark", "");
   });
 
-  test("the first-paint script follows the system scheme when nothing is stored", async ({ page, origins }) => {
+  test("the first-paint script follows the system scheme when nothing is stored", async ({
+    page,
+    origins,
+  }) => {
     await page.emulateMedia({ colorScheme: "dark" });
     await mockShell(page, origins.port, { user: null });
     await page.goto("/login");
@@ -405,7 +462,10 @@ test.describe("accessibility (light)", () => {
     await expectNoA11yViolations(page);
   });
 
-  test("keyboard: the skip link is the first stop and moves focus to main; the palette traps and returns focus", async ({ page, origins }) => {
+  test("keyboard: the skip link is the first stop and moves focus to main; the palette traps and returns focus", async ({
+    page,
+    origins,
+  }) => {
     test.skip(isMobile(page), "keyboard path on the desktop layout");
     await mockShell(page, origins.port);
     await gotoFrame(page, "/");
@@ -430,12 +490,17 @@ test.describe("accessibility (light)", () => {
 });
 
 test.describe("session expiry", () => {
-  test.skip(Boolean(DIST), "needs the dev server: the trigger imports the app's API client module, which a build does not expose (the same matrix runs in jsdom: api-401.test.ts)");
+  test.skip(
+    Boolean(DIST),
+    "needs the dev server: the trigger imports the app's API client module, which a build does not expose (the same matrix runs in jsdom: api-401.test.ts)",
+  );
 
   // The same trigger in both tests: the app's own API client asks for an app route and gets 401.
   async function trigger401(page: Page): Promise<void> {
     await page.evaluate(async () => {
-      const module = (await import("/src/client/lib/api.ts" as string)) as { api: (path: string) => Promise<unknown> };
+      const module = (await import("/src/client/lib/api.ts" as string)) as {
+        api: (path: string) => Promise<unknown>;
+      };
       void module.api("/api/nodes").catch(() => {});
     });
   }
@@ -459,7 +524,10 @@ test.describe("session expiry", () => {
     await expect(modal).toBeVisible();
   });
 
-  test("on a public page the same 401 shows no modal — even with a signed-in session", async ({ page, origins }) => {
+  test("on a public page the same 401 shows no modal — even with a signed-in session", async ({
+    page,
+    origins,
+  }) => {
     await mockShell(page, origins.port, { api: unauthorized });
     // A session is known to the client (it visited the app first), then a public link is opened.
     await gotoFrame(page, "/");
@@ -475,9 +543,22 @@ test.describe("session expiry", () => {
 });
 
 test.describe("storage and layout", () => {
-  test("Web Storage holds UI preferences only, after visiting the shell and changing them", async ({ page, origins }) => {
+  test("Web Storage holds UI preferences only, after visiting the shell and changing them", async ({
+    page,
+    origins,
+  }) => {
     await mockShell(page, origins.port, { user: { role: "admin" } });
-    for (const path of ["/", "/shared", "/recent", "/account", "/admin", "/help", "/preview/n1", "/search?q=secret"]) await gotoFrame(page, path);
+    for (const path of [
+      "/",
+      "/shared",
+      "/recent",
+      "/account",
+      "/admin",
+      "/help",
+      "/preview/n1",
+      "/search?q=secret",
+    ])
+      await gotoFrame(page, path);
     await page.goto("/login?next=/recent");
     await gotoFrame(page, "/");
     // Change every preference through the UI: theme (menu or sheet) and view mode (toggle).
@@ -493,7 +574,11 @@ test.describe("storage and layout", () => {
     }
     await page.getByRole("button", { name: "Grid view" }).click();
     await expect(page.locator("html")).toHaveAttribute("data-dark", "");
-    const stored = await page.evaluate(() => ({ local: Object.keys(localStorage).sort(), session: Object.keys(sessionStorage), prefs: localStorage.getItem("hf.prefs.v1") }));
+    const stored = await page.evaluate(() => ({
+      local: Object.keys(localStorage).sort(),
+      session: Object.keys(sessionStorage),
+      prefs: localStorage.getItem("hf.prefs.v1"),
+    }));
     const allowed = ["hf.prefs.v1", "mui-color-scheme-dark", "mui-color-scheme-light", "mui-mode"];
     expect(stored.local.filter((key) => !allowed.includes(key))).toEqual([]);
     expect(stored.local).toContain("hf.prefs.v1");
@@ -510,21 +595,35 @@ test.describe("storage and layout", () => {
       page.evaluate(() => {
         const small: string[] = [];
         const inputs: string[] = [];
-        for (const element of Array.from(document.querySelectorAll<HTMLElement>('a[href], button, [role="button"], [role="radio"], input, select, textarea'))) {
+        for (const element of Array.from(
+          document.querySelectorAll<HTMLElement>(
+            'a[href], button, [role="button"], [role="radio"], input, select, textarea',
+          ),
+        )) {
           if (element.closest("[inert], [aria-hidden='true']")) continue;
           const style = getComputedStyle(element);
           if (style.visibility === "hidden" || style.display === "none") continue;
           // A checkbox's target is its label; so is a bare input drawn inside a labelled box (search).
-          const target = element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "search") ? (element.closest("label") ?? element) : element;
+          const target =
+            element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "search")
+              ? (element.closest("label") ?? element)
+              : element;
           const rect = target.getBoundingClientRect();
           if (rect.width === 0 && rect.height === 0) continue;
           // The skip link is off-screen until focused.
           if (rect.bottom < 0) continue;
           // Links inside a sentence are exempt (inline targets).
           if (element.tagName === "A" && element.closest(".prose")) continue;
-          const name = element.getAttribute("aria-label") ?? element.textContent?.trim().slice(0, 30) ?? element.tagName;
-          if (rect.height < 43.5 || rect.width < 43.5) small.push(`${name} ${Math.round(rect.width)}x${Math.round(rect.height)}`);
-          if (element instanceof HTMLInputElement && !["checkbox", "radio", "hidden"].includes(element.type) && parseFloat(style.fontSize) < 16) inputs.push(`${element.name} ${style.fontSize}`);
+          const name =
+            element.getAttribute("aria-label") ?? element.textContent?.trim().slice(0, 30) ?? element.tagName;
+          if (rect.height < 43.5 || rect.width < 43.5)
+            small.push(`${name} ${Math.round(rect.width)}x${Math.round(rect.height)}`);
+          if (
+            element instanceof HTMLInputElement &&
+            !["checkbox", "radio", "hidden"].includes(element.type) &&
+            parseFloat(style.fontSize) < 16
+          )
+            inputs.push(`${element.name} ${style.fontSize}`);
         }
         return { small, inputs };
       });
@@ -548,11 +647,22 @@ test.describe("storage and layout", () => {
         const inputs: string[] = [];
         for (const element of Array.from(document.querySelectorAll<HTMLElement>("a[href], button, input"))) {
           if (element.tagName === "A" && element.closest(".prose")) continue;
-          const target = element instanceof HTMLInputElement && element.type === "checkbox" ? (element.closest("label") ?? element) : element;
+          const target =
+            element instanceof HTMLInputElement && element.type === "checkbox"
+              ? (element.closest("label") ?? element)
+              : element;
           const rect = target.getBoundingClientRect();
           if (rect.width === 0 && rect.height === 0) continue;
-          if (rect.height < 43.5) small.push(`${element.getAttribute("name") ?? element.textContent?.trim().slice(0, 30)} ${Math.round(rect.width)}x${Math.round(rect.height)}`);
-          if (element instanceof HTMLInputElement && element.type !== "checkbox" && parseFloat(getComputedStyle(element).fontSize) < 16) inputs.push(`${element.name} ${getComputedStyle(element).fontSize}`);
+          if (rect.height < 43.5)
+            small.push(
+              `${element.getAttribute("name") ?? element.textContent?.trim().slice(0, 30)} ${Math.round(rect.width)}x${Math.round(rect.height)}`,
+            );
+          if (
+            element instanceof HTMLInputElement &&
+            element.type !== "checkbox" &&
+            parseFloat(getComputedStyle(element).fontSize) < 16
+          )
+            inputs.push(`${element.name} ${getComputedStyle(element).fontSize}`);
         }
         return { small, inputs };
       });
@@ -562,7 +672,11 @@ test.describe("storage and layout", () => {
 
   test("no horizontal overflow at 360 px", async ({ page, origins }) => {
     await page.setViewportSize({ width: 360, height: 740 });
-    const overflow = () => page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+    const overflow = () =>
+      page.evaluate(() => ({
+        scroll: document.documentElement.scrollWidth,
+        client: document.documentElement.clientWidth,
+      }));
     await mockShell(page, origins.port);
     for (const path of ["/", "/shared", "/account", "/help", "/storage"]) {
       await gotoFrame(page, path);

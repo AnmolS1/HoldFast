@@ -60,17 +60,40 @@ export function AcceptTermsPage() {
   };
 
   return (
-    <Box sx={{ minHeight: "100dvh", display: "flex", flexDirection: "column", alignItems: "center", backgroundColor: hf.bg, padding: { xs: "24px 16px", md: "64px 16px 24px" } }}>
+    <Box
+      sx={{
+        minHeight: "100dvh",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        backgroundColor: hf.bg,
+        padding: { xs: "24px 16px", md: "64px 16px 24px" },
+      }}
+    >
       <Box component="header" sx={{ width: "100%", maxWidth: 480, marginBottom: 4, color: hf.text }}>
         <Wordmark />
       </Box>
       <Box component="main" id="main" sx={{ width: "100%", maxWidth: 480 }}>
-        <Box sx={{ backgroundColor: hf.surface, border: `1px solid ${hf.hairline}`, borderRadius: `${layout.radius.card}px`, padding: { xs: 5, md: 7 }, display: "flex", flexDirection: "column", gap: 4 }}>
+        <Box
+          sx={{
+            backgroundColor: hf.surface,
+            border: `1px solid ${hf.hairline}`,
+            borderRadius: `${layout.radius.card}px`,
+            padding: { xs: 5, md: 7 },
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
           <Typography component="h1" sx={{ margin: 0, fontSize: 18, lineHeight: "24px", fontWeight: 600 }}>
             {t("terms.title")}
           </Typography>
           <Typography sx={{ color: hf.textSecondary }}>{t("terms.body")}</Typography>
-          <Box component="ul" className="prose" sx={{ margin: 0, paddingLeft: 5, display: "flex", flexDirection: "column", gap: 1 }}>
+          <Box
+            component="ul"
+            className="prose"
+            sx={{ margin: 0, paddingLeft: 5, display: "flex", flexDirection: "column", gap: 1 }}
+          >
             <li>
               <a href={EXTERNAL_LINKS.terms} target="_blank" rel="noopener">
                 {t("terms.readTerms")}
@@ -82,9 +105,24 @@ export function AcceptTermsPage() {
               </a>
             </li>
           </Box>
-          <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            <Box component="label" sx={{ display: "flex", alignItems: "center", gap: 2, minHeight: 44, cursor: "pointer" }}>
-              <Box component="input" type="checkbox" name="accept" checked={checked} onChange={(e) => setChecked(e.target.checked)} sx={{ width: 16, height: 16, margin: 0, flex: "none" }} />
+          <Box
+            component="form"
+            noValidate
+            onSubmit={onSubmit}
+            sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+          >
+            <Box
+              component="label"
+              sx={{ display: "flex", alignItems: "center", gap: 2, minHeight: 44, cursor: "pointer" }}
+            >
+              <Box
+                component="input"
+                type="checkbox"
+                name="accept"
+                checked={checked}
+                onChange={(e) => setChecked(e.target.checked)}
+                sx={{ width: 16, height: 16, margin: 0, flex: "none" }}
+              />
               {t("terms.checkbox")}
             </Box>
             {error ? (

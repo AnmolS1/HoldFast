@@ -1,15 +1,33 @@
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { COMMAND_IDS, CommandPalette, openPalette, paletteFilter, registerCommands, runCommand, usePaletteOpen, type Command } from "../../../../src/client/components/CommandPalette";
+import {
+  COMMAND_IDS,
+  CommandPalette,
+  openPalette,
+  paletteFilter,
+  registerCommands,
+  runCommand,
+  usePaletteOpen,
+  type Command,
+} from "../../../../src/client/components/CommandPalette";
 import { buildRoutes } from "../../../../src/client/router";
 import { renderRoutes, renderShell, sessionOf, setupShell, shellFetch } from "./helpers";
 
 setupShell();
 
-const items = () => Array.from(document.querySelectorAll<HTMLElement>("[cmdk-item]")).map((node) => node.getAttribute("data-command-id"));
-const headings = () => Array.from(document.querySelectorAll("[cmdk-group-heading]")).map((node) => node.textContent);
+const items = () =>
+  Array.from(document.querySelectorAll<HTMLElement>("[cmdk-item]")).map((node) =>
+    node.getAttribute("data-command-id"),
+  );
+const headings = () =>
+  Array.from(document.querySelectorAll("[cmdk-group-heading]")).map((node) => node.textContent);
 
-function command(id: string, label: string, section: Command["section"], extra: Partial<Command> = {}): Command {
+function command(
+  id: string,
+  label: string,
+  section: Command["section"],
+  extra: Partial<Command> = {},
+): Command {
   return { id, label, section, run: vi.fn(), ...extra };
 }
 
@@ -68,7 +86,8 @@ describe("CommandPalette", () => {
     expect(headings()).toEqual(["Selection", "Go to", "Actions"]);
     expect(items()).toEqual(["sel.move", "sel.trash", "go.trash", "go.recent", "act.folder", "act.theme"]);
     const dialog = screen.getByRole("dialog");
-    for (const word of ["move", "run", "toggle", "Keyboard shortcuts"]) expect(dialog.textContent).toContain(word);
+    for (const word of ["move", "run", "toggle", "Keyboard shortcuts"])
+      expect(dialog.textContent).toContain(word);
     // Every command with a shortcut shows it.
     expect(document.querySelector('[data-command-id="act.folder"] kbd')?.textContent).toMatch(/N/);
   });
@@ -123,7 +142,8 @@ describe("the shell's own commands", () => {
     await waitFor(() => expect(document.querySelector("[data-frame]")).not.toBeNull());
     fireEvent.keyDown(document.body, { key: "k", ctrlKey: true });
     await screen.findByRole("dialog", { name: "Command palette" });
-    for (const id of ["go.files", "go.shared", "go.shared-by-me", "go.recent", "go.starred", "go.trash"]) expect(items()).toContain(id);
+    for (const id of ["go.files", "go.shared", "go.shared-by-me", "go.recent", "go.starred", "go.trash"])
+      expect(items()).toContain(id);
     expect(items()).toEqual(expect.arrayContaining(["upload.request", "shell.theme", "shell.shortcuts"]));
     expect(items()).not.toContain("go.admin");
     const input = screen.getByPlaceholderText("Type a command or search");
@@ -139,7 +159,16 @@ describe("the shell's own commands", () => {
     await waitFor(() => expect(document.querySelector("[data-frame]")).not.toBeNull());
     fireEvent.keyDown(document.body, { key: "?", shiftKey: true });
     const dialog = await screen.findByRole("dialog", { name: "Keyboard shortcuts" });
-    for (const text of ["Search", "Command palette", "Quick look", "Select all", "Move to trash", "New folder", "Rename"]) expect(dialog.textContent).toContain(text);
+    for (const text of [
+      "Search",
+      "Command palette",
+      "Quick look",
+      "Select all",
+      "Move to trash",
+      "New folder",
+      "Rename",
+    ])
+      expect(dialog.textContent).toContain(text);
   });
 
   it("a shortcut typed into a text field is ignored (except the global ones)", async () => {

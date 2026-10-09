@@ -19,11 +19,42 @@ export interface Destination {
 const at = (prefix: string) => (pathname: string) => pathname === prefix || pathname.startsWith(`${prefix}/`);
 
 export const DESTINATIONS: readonly Destination[] = [
-  { id: "files", path: "/", label: "nav.files", shortLabel: "nav.myFiles", icon: Folder, group: "files", matches: (p) => p === "/" || p.startsWith("/folder/") },
-  { id: "shared", path: "/shared", label: "nav.sharedWithMe", shortLabel: "nav.shared.withMe", icon: Users, group: "shared", matches: at("/shared") },
-  { id: "shared-by-me", path: "/shared-by-me", label: "nav.sharedByMe", shortLabel: "nav.shared.byMe", icon: Share2, group: "shared", matches: at("/shared-by-me") },
+  {
+    id: "files",
+    path: "/",
+    label: "nav.files",
+    shortLabel: "nav.myFiles",
+    icon: Folder,
+    group: "files",
+    matches: (p) => p === "/" || p.startsWith("/folder/"),
+  },
+  {
+    id: "shared",
+    path: "/shared",
+    label: "nav.sharedWithMe",
+    shortLabel: "nav.shared.withMe",
+    icon: Users,
+    group: "shared",
+    matches: at("/shared"),
+  },
+  {
+    id: "shared-by-me",
+    path: "/shared-by-me",
+    label: "nav.sharedByMe",
+    shortLabel: "nav.shared.byMe",
+    icon: Share2,
+    group: "shared",
+    matches: at("/shared-by-me"),
+  },
   { id: "recent", path: "/recent", label: "nav.recent", icon: Clock, group: "files", matches: at("/recent") },
-  { id: "starred", path: "/starred", label: "nav.starred", icon: Star, group: "files", matches: at("/starred") },
+  {
+    id: "starred",
+    path: "/starred",
+    label: "nav.starred",
+    icon: Star,
+    group: "files",
+    matches: at("/starred"),
+  },
   { id: "trash", path: "/trash", label: "nav.trash", icon: Trash2, group: "files", matches: at("/trash") },
 ];
 

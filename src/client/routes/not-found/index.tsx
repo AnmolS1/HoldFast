@@ -19,7 +19,19 @@ function Page({ children }: { children: React.ReactNode }) {
 /** The first paint, while the session and the public config load. */
 export function StartingPage() {
   return (
-    <Box role="status" aria-busy="true" aria-label={t("app.loading")} sx={{ minHeight: "100dvh", display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: hf.bg, color: hf.textSecondary }}>
+    <Box
+      role="status"
+      aria-busy="true"
+      aria-label={t("app.loading")}
+      sx={{
+        minHeight: "100dvh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: hf.bg,
+        color: hf.textSecondary,
+      }}
+    >
       <Mark size={28} />
     </Box>
   );

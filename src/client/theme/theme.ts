@@ -90,7 +90,13 @@ export function createHoldfastTheme(): Theme {
       h4: { fontSize: 13, lineHeight: "20px", fontWeight: 600 },
       h5: { fontSize: 13, lineHeight: "20px", fontWeight: 600 },
       h6: { fontSize: 13, lineHeight: "20px", fontWeight: 600 },
-      body1: { fontSize: 13, lineHeight: "20px", fontWeight: 400, letterSpacing: 0, [mobile]: { fontSize: 14 } },
+      body1: {
+        fontSize: 13,
+        lineHeight: "20px",
+        fontWeight: 400,
+        letterSpacing: 0,
+        [mobile]: { fontSize: 14 },
+      },
       body2: { fontSize: 12, lineHeight: "16px", fontWeight: 400, letterSpacing: 0 },
       subtitle1: { fontSize: 13, lineHeight: "20px", fontWeight: 500 },
       subtitle2: { fontSize: 12, lineHeight: "16px", fontWeight: 500 },
@@ -160,7 +166,10 @@ export function createHoldfastTheme(): Theme {
             gap: 8,
             [mobile]: { minHeight: layout.touchTarget, fontSize: 14 },
             variants: [
-              { props: { size: "large" }, style: { minHeight: 40, [mobile]: { minHeight: layout.touchTarget } } },
+              {
+                props: { size: "large" },
+                style: { minHeight: 40, [mobile]: { minHeight: layout.touchTarget } },
+              },
               {
                 props: { variant: "contained" },
                 style: {
@@ -285,9 +294,13 @@ export function createHoldfastTheme(): Theme {
           list: { padding: "4px 0" },
         },
       },
-      MuiPopover: { styleOverrides: { paper: { border: `1px solid ${hf.hairline}`, borderRadius: layout.radius.card } } },
+      MuiPopover: {
+        styleOverrides: { paper: { border: `1px solid ${hf.hairline}`, borderRadius: layout.radius.card } },
+      },
       MuiBackdrop: {
-        styleOverrides: { root: { backgroundColor: hf.scrim, "&.MuiBackdrop-invisible": { backgroundColor: "transparent" } } },
+        styleOverrides: {
+          root: { backgroundColor: hf.scrim, "&.MuiBackdrop-invisible": { backgroundColor: "transparent" } },
+        },
       },
       MuiDialog: {
         styleOverrides: {
@@ -299,7 +312,11 @@ export function createHoldfastTheme(): Theme {
           },
         },
       },
-      MuiDialogTitle: { styleOverrides: { root: { fontSize: 15, lineHeight: "22px", fontWeight: 600, padding: "20px 20px 8px" } } },
+      MuiDialogTitle: {
+        styleOverrides: {
+          root: { fontSize: 15, lineHeight: "22px", fontWeight: 600, padding: "20px 20px 8px" },
+        },
+      },
       MuiDialogContent: { styleOverrides: { root: { padding: "0 20px 16px" } } },
       MuiDialogActions: { styleOverrides: { root: { padding: "0 20px 20px", gap: 8 } } },
       MuiSnackbarContent: {
@@ -332,11 +349,35 @@ export function createHoldfastTheme(): Theme {
             "&.Mui-focused": focusRing,
             "&.Mui-error .MuiOutlinedInput-notchedOutline": { borderColor: hf.danger },
           },
-          input: { height: 40, boxSizing: "border-box", padding: "0 12px", [mobile]: { height: layout.touchTarget } },
+          input: {
+            height: 40,
+            boxSizing: "border-box",
+            padding: "0 12px",
+            [mobile]: { height: layout.touchTarget },
+          },
         },
       },
-      MuiFormLabel: { styleOverrides: { root: { fontSize: 12, lineHeight: "16px", color: hf.textSecondary, "&.Mui-focused": { color: hf.textSecondary } } } },
-      MuiFormHelperText: { styleOverrides: { root: { margin: "6px 0 0", fontSize: 12, lineHeight: "16px", color: hf.textSecondary, "&.Mui-error": { color: hf.danger } } } },
+      MuiFormLabel: {
+        styleOverrides: {
+          root: {
+            fontSize: 12,
+            lineHeight: "16px",
+            color: hf.textSecondary,
+            "&.Mui-focused": { color: hf.textSecondary },
+          },
+        },
+      },
+      MuiFormHelperText: {
+        styleOverrides: {
+          root: {
+            margin: "6px 0 0",
+            fontSize: 12,
+            lineHeight: "16px",
+            color: hf.textSecondary,
+            "&.Mui-error": { color: hf.danger },
+          },
+        },
+      },
       MuiLink: { defaultProps: { underline: "always", color: "inherit" } },
       MuiSkeleton: { styleOverrides: { root: { backgroundColor: hf.surface2 } } },
       MuiCircularProgress: { defaultProps: { color: "inherit", size: 16, thickness: 5 } },

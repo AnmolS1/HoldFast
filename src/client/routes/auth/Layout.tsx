@@ -8,9 +8,29 @@ import { hf } from "../../theme/tokens";
 /** The frame of every signed-out screen: wordmark, one card, the legal links. */
 export function AuthLayout() {
   return (
-    <Box sx={{ minHeight: "100dvh", display: "flex", flexDirection: "column", alignItems: "center", backgroundColor: hf.bg, padding: { xs: "24px 16px", md: "64px 16px 24px" } }}>
+    <Box
+      sx={{
+        minHeight: "100dvh",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        backgroundColor: hf.bg,
+        padding: { xs: "24px 16px", md: "64px 16px 24px" },
+      }}
+    >
       <Box component="header" sx={{ width: "100%", maxWidth: 400, marginBottom: 4 }}>
-        <Box component={RouterLink} to="/login" aria-label={t("nav.home")} sx={{ display: "inline-flex", alignItems: "center", minHeight: 44, color: hf.text, textDecoration: "none" }}>
+        <Box
+          component={RouterLink}
+          to="/login"
+          aria-label={t("nav.home")}
+          sx={{
+            display: "inline-flex",
+            alignItems: "center",
+            minHeight: 44,
+            color: hf.text,
+            textDecoration: "none",
+          }}
+        >
           <Wordmark />
         </Box>
       </Box>

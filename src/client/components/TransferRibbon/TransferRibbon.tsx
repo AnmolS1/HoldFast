@@ -42,12 +42,25 @@ export function TransferRibbon() {
   const expanded = wantsExpanded && openCount > 0;
 
   const percent = current ? Math.round(current.progress * 100) : 0;
-  const tone = current?.status === "error" ? hf.danger : current?.status === "paused" ? hf.textSecondary : hfAccent.main;
+  const tone =
+    current?.status === "error" ? hf.danger : current?.status === "paused" ? hf.textSecondary : hfAccent.main;
   const hasPanel = panels.length > 0;
 
   return (
     <Box data-transfer-ribbon={idle ? "idle" : current.status}>
-      <Box aria-live="polite" role="status" data-ribbon-live sx={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0 0 0 0)", whiteSpace: "nowrap" }}>
+      <Box
+        aria-live="polite"
+        role="status"
+        data-ribbon-live
+        sx={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          overflow: "hidden",
+          clip: "rect(0 0 0 0)",
+          whiteSpace: "nowrap",
+        }}
+      >
         {announcement}
       </Box>
       {idle ? (
@@ -62,7 +75,15 @@ export function TransferRibbon() {
             aria-valuenow={percent}
             sx={{ height: "2px", backgroundColor: hfAccent.track }}
           >
-            <Box data-ribbon-fill sx={{ width: `${current.progress * 100}%`, height: "100%", backgroundColor: tone, transition: `width ${motion.fast}ms ease-out` }} />
+            <Box
+              data-ribbon-fill
+              sx={{
+                width: `${current.progress * 100}%`,
+                height: "100%",
+                backgroundColor: tone,
+                transition: `width ${motion.fast}ms ease-out`,
+              }}
+            />
           </Box>
           <ButtonBase
             aria-expanded={hasPanel ? expanded : undefined}
@@ -85,8 +106,23 @@ export function TransferRibbon() {
               "&.Mui-disabled": { color: hf.text },
             }}
           >
-            <Box component="span" aria-hidden="true" sx={{ width: 8, height: 8, borderRadius: "4px", backgroundColor: tone, flex: "none" }} />
-            <Box component="span" data-ribbon-sentence sx={{ fontWeight: 500, flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <Box
+              component="span"
+              aria-hidden="true"
+              sx={{ width: 8, height: 8, borderRadius: "4px", backgroundColor: tone, flex: "none" }}
+            />
+            <Box
+              component="span"
+              data-ribbon-sentence
+              sx={{
+                fontWeight: 500,
+                flex: "1 1 auto",
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
               {current.sentence}
             </Box>
             {hasPanel ? (
@@ -96,7 +132,18 @@ export function TransferRibbon() {
             ) : null}
           </ButtonBase>
           {hasPanel && expanded ? (
-            <Box id={panelId} role="region" aria-label={t("ribbon.label")} data-ribbon-panel sx={{ maxHeight: "40dvh", overflowY: "auto", borderBottom: `1px solid ${hf.hairline}`, backgroundColor: hf.surface }}>
+            <Box
+              id={panelId}
+              role="region"
+              aria-label={t("ribbon.label")}
+              data-ribbon-panel
+              sx={{
+                maxHeight: "40dvh",
+                overflowY: "auto",
+                borderBottom: `1px solid ${hf.hairline}`,
+                backgroundColor: hf.surface,
+              }}
+            >
               {panels.map((panel) => (
                 <Box key={panel.sourceId} data-ribbon-source={panel.sourceId}>
                   {panel.node}

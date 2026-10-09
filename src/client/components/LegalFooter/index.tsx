@@ -20,7 +20,19 @@ const linkSx = {
 /** Terms · Privacy · DMCA · Support. Public pages render it as their footer. */
 export function LegalFooter() {
   return (
-    <Box component="nav" aria-label={t("legal.footer")} sx={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: "0 12px", padding: 4, fontSize: 12, color: hf.textSecondary }}>
+    <Box
+      component="nav"
+      aria-label={t("legal.footer")}
+      sx={{
+        display: "flex",
+        flexWrap: "wrap",
+        justifyContent: "center",
+        gap: "0 12px",
+        padding: 4,
+        fontSize: 12,
+        color: hf.textSecondary,
+      }}
+    >
       <Box component="a" href={EXTERNAL_LINKS.terms} rel="noopener" sx={linkSx}>
         {t("legal.terms")}
       </Box>

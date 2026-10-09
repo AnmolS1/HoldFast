@@ -73,7 +73,8 @@ describe("safeNext", () => {
   });
 });
 
-const path = (router: { state: { location: { pathname: string; search: string } } }) => router.state.location.pathname + router.state.location.search;
+const path = (router: { state: { location: { pathname: string; search: string } } }) =>
+  router.state.location.pathname + router.state.location.search;
 
 describe("route guards", () => {
   it("unauthenticated → /login?next=<where they were going>", async () => {
@@ -124,12 +125,15 @@ describe("route guards", () => {
     await waitFor(() => expect(path(router)).toBe("/recent"));
   });
 
-  it.each(["//evil.example", "https://evil.example/x", "/\\evil.example"])("a signed-in user opening /login?next=%s lands on / — never off-site", async (next) => {
-    shellFetch({ session: sessionOf() });
-    const { router } = renderRoutes(buildRoutes(), [`/login?next=${encodeURIComponent(next)}`]);
-    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
-    expect(path(router)).toBe("/");
-  });
+  it.each(["//evil.example", "https://evil.example/x", "/\\evil.example"])(
+    "a signed-in user opening /login?next=%s lands on / — never off-site",
+    async (next) => {
+      shellFetch({ session: sessionOf() });
+      const { router } = renderRoutes(buildRoutes(), [`/login?next=${encodeURIComponent(next)}`]);
+      await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+      expect(path(router)).toBe("/");
+    },
+  );
 
   it("public routes render with no session, outside the frame, and read no session", async () => {
     const calls = shellFetch({ session: null });
@@ -142,7 +146,9 @@ describe("route guards", () => {
   it("/s/:token renders outside the frame with no session", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/s/abc123"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Shared file"]')).not.toBeNull());
+    await waitFor(() =>
+      expect(document.querySelector('[data-placeholder-page="Shared file"]')).not.toBeNull(),
+    );
     expect(document.querySelector("[data-frame]")).toBeNull();
   });
 
@@ -153,7 +159,13 @@ describe("route guards", () => {
   });
 
   it("when the config cannot be loaded the app says so instead of rendering half a shell", async () => {
-    shellFetch({ session: sessionOf(), extra: (call) => (call.path === "/api/public/config" ? new Response("<!doctype html>", { headers: { "content-type": "text/html" } }) : undefined) });
+    shellFetch({
+      session: sessionOf(),
+      extra: (call) =>
+        call.path === "/api/public/config"
+          ? new Response("<!doctype html>", { headers: { "content-type": "text/html" } })
+          : undefined,
+    });
     renderRoutes(buildRoutes(), ["/"]);
     expect(await screen.findByRole("heading", { name: "Holdfast couldn't start" })).toBeTruthy();
     expect(document.querySelector("[data-frame]")).toBeNull();

@@ -41,7 +41,12 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "search", combos: [{ key: "/" }], description: "shortcuts.search" },
   { id: "palette", combos: [{ key: "k", mod: true }], description: "shortcuts.palette", global: true },
   { id: "next", combos: [{ key: "ArrowDown" }, { key: "j" }], description: "shortcuts.move", listOnly: true },
-  { id: "previous", combos: [{ key: "ArrowUp" }, { key: "k" }], description: "shortcuts.move", listOnly: true },
+  {
+    id: "previous",
+    combos: [{ key: "ArrowUp" }, { key: "k" }],
+    description: "shortcuts.move",
+    listOnly: true,
+  },
   { id: "open", combos: [{ key: "Enter" }], description: "shortcuts.open", listOnly: true },
   { id: "quickLook", combos: [{ key: " " }], description: "shortcuts.quickLook", listOnly: true },
   { id: "selectAll", combos: [{ key: "a", mod: true }], description: "shortcuts.selectAll", listOnly: true },
@@ -51,7 +56,12 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "newFolder", combos: [{ key: "N", shift: true }], description: "shortcuts.newFolder" },
   { id: "rename", combos: [{ key: "F2" }], description: "shortcuts.rename" },
   { id: "upload", combos: [{ key: "u", mod: true }], description: "shortcuts.upload", global: true },
-  { id: "theme", combos: [{ key: "l", mod: true, shift: true }], description: "shortcuts.theme", global: true },
+  {
+    id: "theme",
+    combos: [{ key: "l", mod: true, shift: true }],
+    description: "shortcuts.theme",
+    global: true,
+  },
 ];
 
 export function isApplePlatform(): boolean {

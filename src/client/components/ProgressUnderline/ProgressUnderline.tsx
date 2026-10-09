@@ -31,7 +31,16 @@ export function ProgressUnderline({ value, label }: ProgressUnderlineProps) {
       aria-valuemax={100}
       aria-valuenow={percent}
       data-progress={shown === null ? "indeterminate" : shown}
-      sx={{ position: "absolute", left: 0, right: 0, bottom: 0, height: "1px", backgroundColor: hfAccent.track, overflow: "hidden", pointerEvents: "none" }}
+      sx={{
+        position: "absolute",
+        left: 0,
+        right: 0,
+        bottom: 0,
+        height: "1px",
+        backgroundColor: hfAccent.track,
+        overflow: "hidden",
+        pointerEvents: "none",
+      }}
     >
       <Box
         sx={{

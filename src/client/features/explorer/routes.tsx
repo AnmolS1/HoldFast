@@ -5,5 +5,9 @@ import { t } from "../../lib/i18n";
 
 export const routes: RouteObject[] = [
   { index: true, element: <PlaceholderPage name={t("nav.files")} />, handle: { title: t("nav.files") } },
-  { path: "folder/:id", element: <PlaceholderPage name={t("nav.files")} />, handle: { title: t("nav.files") } },
+  {
+    path: "folder/:id",
+    element: <PlaceholderPage name={t("nav.files")} />,
+    handle: { title: t("nav.files") },
+  },
 ];

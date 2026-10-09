@@ -80,10 +80,27 @@ function Thumb(props: ThumbImageProps) {
     <Box
       ref={boxRef}
       data-thumb={showImage ? "image" : eligible && !failed ? "pending" : "fallback"}
-      sx={{ position: "relative", width: "100%", aspectRatio: String(aspectRatio), backgroundColor: hf.thumbPlaceholder, overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center" }}
+      sx={{
+        position: "relative",
+        width: "100%",
+        aspectRatio: String(aspectRatio),
+        backgroundColor: hf.thumbPlaceholder,
+        overflow: "hidden",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}
     >
       {showImage ? (
-        <Box component="img" src={url} alt={alt} draggable={false} decoding="async" onError={onError} sx={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }} />
+        <Box
+          component="img"
+          src={url}
+          alt={alt}
+          draggable={false}
+          decoding="async"
+          onError={onError}
+          sx={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+        />
       ) : !eligible || failed ? (
         fallback
       ) : null}

@@ -7,7 +7,13 @@
 //   not found           *
 //
 // A feature never edits this file: it exports `routes` from `features/<name>/routes.tsx`.
-import { createBrowserRouter, Outlet, redirect, type LoaderFunctionArgs, type RouteObject } from "react-router";
+import {
+  createBrowserRouter,
+  Outlet,
+  redirect,
+  type LoaderFunctionArgs,
+  type RouteObject,
+} from "react-router";
 import type { RouteHandle } from "./components/slots";
 import { featureRoutes, publicRoutes, routeHandle } from "./features";
 import { configureApi } from "./lib/api";
@@ -15,7 +21,17 @@ import type { PublicConfig, SessionShape } from "./lib/contracts";
 import { t } from "./lib/i18n";
 import { publicConfigQuery, queryClient, sessionQuery } from "./lib/query";
 import { initSentry } from "./lib/sentry";
-import { AuthLayout, ForgotPasswordPage, InvitePage, LoginPage, ResetPasswordPage, safeNext, SignupPage, TwoFactorPage, VerifyEmailPage } from "./routes/auth";
+import {
+  AuthLayout,
+  ForgotPasswordPage,
+  InvitePage,
+  LoginPage,
+  ResetPasswordPage,
+  safeNext,
+  SignupPage,
+  TwoFactorPage,
+  VerifyEmailPage,
+} from "./routes/auth";
 import { Frame } from "./routes/frame/Frame";
 import { HelpPage } from "./routes/help";
 import { AcceptTermsPage } from "./routes/legal-gate";
@@ -85,7 +101,8 @@ export async function termsGuard({ request }: LoaderFunctionArgs): Promise<null>
   return null;
 }
 
-const isAdminRoute = (route: RouteObject) => route.path === "admin" || Boolean(route.path?.startsWith("admin/"));
+const isAdminRoute = (route: RouteObject) =>
+  route.path === "admin" || Boolean(route.path?.startsWith("admin/"));
 const isOverlay = (route: RouteObject) => routeHandle(route).overlay === true;
 
 const auth: RouteHandle = { auth: true };
@@ -94,11 +111,17 @@ const auth: RouteHandle = { auth: true };
 export function buildRoutes(): RouteObject[] {
   const adminRoutes = featureRoutes.filter(isAdminRoute);
   const plainRoutes = featureRoutes.filter((route) => !isAdminRoute(route));
-  const helpRoute: RouteObject = { path: "help", element: <HelpPage />, handle: { title: t("nav.help"), details: false } };
+  const helpRoute: RouteObject = {
+    path: "help",
+    element: <HelpPage />,
+    handle: { title: t("nav.help"), details: false },
+  };
   const frameChildren: RouteObject[] = [
     ...plainRoutes,
     helpRoute,
-    ...(adminRoutes.length > 0 ? [{ id: "admin-guard", loader: requireAdmin, element: <Outlet />, children: adminRoutes }] : []),
+    ...(adminRoutes.length > 0
+      ? [{ id: "admin-guard", loader: requireAdmin, element: <Outlet />, children: adminRoutes }]
+      : []),
   ];
   // What a cold overlay link shows underneath: every in-frame page that is not itself an overlay
   // and has no role guard of its own.
@@ -119,13 +142,29 @@ export function buildRoutes(): RouteObject[] {
             { path: "signup", loader: redirectSignedIn, element: <SignupPage />, handle: auth },
             { path: "invite/:code", loader: redirectSignedIn, element: <InvitePage />, handle: auth },
             { path: "verify-email", loader: verifyEmailGuard, element: <VerifyEmailPage />, handle: auth },
-            { path: "forgot-password", loader: redirectSignedIn, element: <ForgotPasswordPage />, handle: auth },
-            { path: "reset-password", loader: redirectSignedIn, element: <ResetPasswordPage />, handle: auth },
+            {
+              path: "forgot-password",
+              loader: redirectSignedIn,
+              element: <ForgotPasswordPage />,
+              handle: auth,
+            },
+            {
+              path: "reset-password",
+              loader: redirectSignedIn,
+              element: <ResetPasswordPage />,
+              handle: auth,
+            },
             { path: "two-factor", loader: redirectSignedIn, element: <TwoFactorPage />, handle: auth },
           ],
         },
         { path: "accept-terms", loader: termsGuard, element: <AcceptTermsPage />, handle: auth },
-        { id: "frame", path: "/", loader: requireUser, element: <Frame backgroundRoutes={backgroundRoutes} />, children: frameChildren },
+        {
+          id: "frame",
+          path: "/",
+          loader: requireUser,
+          element: <Frame backgroundRoutes={backgroundRoutes} />,
+          children: frameChildren,
+        },
         // Public pages: no loader, no session read, no frame.
         ...publicRoutes,
         { path: "*", element: <NotFoundPage /> },
@@ -141,7 +180,10 @@ export function connectRouter(router: Pick<AppRouter, "state" | "navigate">): vo
   configureApi({
     routeInfo: () => {
       const handles = router.state.matches.map((match) => (match.route.handle ?? {}) as RouteHandle);
-      return { public: handles.some((handle) => handle.public === true), auth: handles.some((handle) => handle.auth === true) };
+      return {
+        public: handles.some((handle) => handle.public === true),
+        auth: handles.some((handle) => handle.auth === true),
+      };
     },
     navigate: (to, options) => void router.navigate(to, { replace: options?.replace }),
     currentPath: () => {

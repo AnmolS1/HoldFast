@@ -16,7 +16,8 @@
 //   import accentGuard from "./src/client/theme/eslint-accent-guard.mjs";
 //   { files: ["src/client/**/*.{ts,tsx}"], plugins: { holdfast: accentGuard }, rules: { "holdfast/accent-guard": "error" } }
 
-export const ALLOWED = /(^|\/)src\/client\/(theme|components\/(TransferRibbon|SelectionBar|StatusDot|ProgressUnderline))\//;
+export const ALLOWED =
+  /(^|\/)src\/client\/(theme|components\/(TransferRibbon|SelectionBar|StatusDot|ProgressUnderline))\//;
 const SCOPE = /(^|\/)src\/client\//;
 
 const WORD = /accent/i;
@@ -30,10 +31,14 @@ function isScoped(filename) {
 const rule = {
   meta: {
     type: "problem",
-    docs: { description: "the activity colour and palette.primary are referenced only by the allow-listed components and the theme" },
+    docs: {
+      description:
+        "the activity colour and palette.primary are referenced only by the allow-listed components and the theme",
+    },
     schema: [],
     messages: {
-      accent: "The activity colour may be referenced only in theme/ and in TransferRibbon, SelectionBar, StatusDot and ProgressUnderline. Use `aria-selected` inside a `data-hf-list` container, `<Button variant=\"cta\">`, or one of the four components.",
+      accent:
+        'The activity colour may be referenced only in theme/ and in TransferRibbon, SelectionBar, StatusDot and ProgressUnderline. Use `aria-selected` inside a `data-hf-list` container, `<Button variant="cta">`, or one of the four components.',
       primary: "`palette.primary` may be referenced only in theme/ and the four allow-listed components.",
     },
   },
@@ -46,13 +51,17 @@ const rule = {
     };
     const isPalette = (node) =>
       (node.type === "Identifier" && node.name === "palette") ||
-      (node.type === "MemberExpression" && !node.computed && node.property.type === "Identifier" && node.property.name === "palette");
+      (node.type === "MemberExpression" &&
+        !node.computed &&
+        node.property.type === "Identifier" &&
+        node.property.name === "palette");
     return {
       Program(node) {
         const source = context.sourceCode ?? context.getSourceCode();
         for (const comment of source.getAllComments()) {
           if (WORD.test(comment.value)) context.report({ loc: comment.loc, messageId: "accent" });
-          else if (PRIMARY_TEXT.test(comment.value)) context.report({ loc: comment.loc, messageId: "primary" });
+          else if (PRIMARY_TEXT.test(comment.value))
+            context.report({ loc: comment.loc, messageId: "primary" });
         }
         void node;
       },
@@ -73,7 +82,11 @@ const rule = {
       },
       MemberExpression(node) {
         if (!isPalette(node.object)) return;
-        const name = node.computed ? (node.property.type === "Literal" ? node.property.value : null) : node.property.name;
+        const name = node.computed
+          ? node.property.type === "Literal"
+            ? node.property.value
+            : null
+          : node.property.name;
         if (name === "primary") context.report({ node, messageId: "primary" });
       },
     };

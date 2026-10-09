@@ -31,7 +31,10 @@ export function Wordmark({ size = 16 }: { size?: number }) {
   return (
     <Box component="span" sx={{ display: "inline-flex", alignItems: "center", gap: "10px" }}>
       <Mark size={Math.round(size * 1.25)} />
-      <Box component="span" sx={{ fontWeight: 600, fontSize: size, letterSpacing: "-0.02em", lineHeight: 1.25 }}>
+      <Box
+        component="span"
+        sx={{ fontWeight: 600, fontSize: size, letterSpacing: "-0.02em", lineHeight: 1.25 }}
+      >
         {t("app.name")}
       </Box>
     </Box>

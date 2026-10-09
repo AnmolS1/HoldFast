@@ -12,7 +12,16 @@ import { authErrorMessage, captchaOptions } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
 import { isEmail, PASSWORD_MAX, PASSWORD_MIN } from "./validation";
 
-const backSx = { color: hf.text, fontSize: 12, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } } as const;
+const backSx = {
+  color: hf.text,
+  fontSize: 12,
+  textDecoration: "underline",
+  textUnderlineOffset: "2px",
+  display: "inline-flex",
+  alignItems: "center",
+  minHeight: 24,
+  "@media (max-width:1023.95px)": { minHeight: 44 },
+} as const;
 
 /** Ask for a reset link. The answer is the same whether or not the address has an account. */
 export function ForgotPasswordPage() {
@@ -36,7 +45,11 @@ export function ForgotPasswordPage() {
     }
     setBusy(true);
     const result = await callAuth(() =>
-      authClient.requestPasswordReset({ email: email.trim(), redirectTo: `${window.location.origin}/reset-password`, fetchOptions: captchaOptions(turnstile.token) }),
+      authClient.requestPasswordReset({
+        email: email.trim(),
+        redirectTo: `${window.location.origin}/reset-password`,
+        fetchOptions: captchaOptions(turnstile.token),
+      }),
     );
     turnstile.reset();
     setBusy(false);
@@ -53,8 +66,20 @@ export function ForgotPasswordPage() {
       {sent ? (
         <FormNotice>{t("forgot.sent")}</FormNotice>
       ) : (
-        <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-          <Field label={t("auth.email")} type="email" name="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+        <Box
+          component="form"
+          noValidate
+          onSubmit={onSubmit}
+          sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+        >
+          <Field
+            label={t("auth.email")}
+            type="email"
+            name="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
           {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
           <FormError>{error}</FormError>
           <Button type="submit" variant="contained" size="large" disabled={busy}>
@@ -109,8 +134,22 @@ export function ResetPasswordPage() {
       {unusable ? (
         <FormNotice tone="danger">{t(linkError ? "reset.failed" : "reset.missing")}</FormNotice>
       ) : (
-        <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-          <Field label={t("reset.new")} type="password" name="password" autoComplete="new-password" value={password} onChange={(e) => setPassword(e.target.value)} help={t("signup.password.help")} errorText={error ?? undefined} />
+        <Box
+          component="form"
+          noValidate
+          onSubmit={onSubmit}
+          sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+        >
+          <Field
+            label={t("reset.new")}
+            type="password"
+            name="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            help={t("signup.password.help")}
+            errorText={error ?? undefined}
+          />
           <Button type="submit" variant="contained" size="large" disabled={busy}>
             {t("reset.submit")}
           </Button>

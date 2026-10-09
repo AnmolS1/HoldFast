@@ -43,7 +43,10 @@ const PAIRS: Pair[] = [
 describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
   it.each(PAIRS)("$fg on $bg ≥ $min ($why)", ({ fg, bg, min }) => {
     const ratio = contrast(tokens[fg], tokens[bg], tokens.bg);
-    expect(ratio, `${scheme}: ${fg} ${tokens[fg]} on ${bg} ${tokens[bg]} = ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(min);
+    expect(
+      ratio,
+      `${scheme}: ${fg} ${tokens[fg]} on ${bg} ${tokens[bg]} = ${ratio.toFixed(2)}:1`,
+    ).toBeGreaterThanOrEqual(min);
   });
 
   it("dark accent is text-capable; light accent is UI-only by design", () => {
@@ -60,7 +63,9 @@ describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
   });
 
   it("the scrim is the only translucent token and composites to a darker page", () => {
-    const translucent = (Object.keys(tokens) as Array<keyof TokenSet>).filter((key) => parseColor(tokens[key]).a < 1);
+    const translucent = (Object.keys(tokens) as Array<keyof TokenSet>).filter(
+      (key) => parseColor(tokens[key]).a < 1,
+    );
     expect(translucent).toEqual(["scrim"]);
     const dimmed = composite(parseColor(tokens.scrim), parseColor(tokens.surface));
     const surface = parseColor(tokens.surface);

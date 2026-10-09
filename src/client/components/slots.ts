@@ -37,7 +37,11 @@ export interface PreviewItem {
 /** A public page supplies metadata and URLs itself; `"owner"` means the authenticated API. */
 export interface PublicPreviewSource {
   getItem(nodeId: string): Promise<PreviewItem>;
-  getUrl(nodeId: string, kind: "inline" | "thumb", size?: number): Promise<{ url: string; expiresAt: string }>;
+  getUrl(
+    nodeId: string,
+    kind: "inline" | "thumb",
+    size?: number,
+  ): Promise<{ url: string; expiresAt: string }>;
 }
 
 export interface PreviewDialogProps {

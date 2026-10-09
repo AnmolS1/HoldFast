@@ -19,25 +19,43 @@ import { renderShell, resolveVar, setupShell } from "./helpers";
 setupShell();
 
 describe("EmptyState and PlaceholderPage", () => {
-  it.each(["first-use", "cleared", "no-results", "unavailable"] as const)("%s: a monochrome inline drawing, a title, a body", (type) => {
-    const { container } = renderShell(<EmptyState type={type} title="Title" body="Body text" />);
-    const svg = container.querySelector("svg")!;
-    expect(svg.getAttribute("aria-hidden")).toBe("true");
-    expect(svg.getAttribute("stroke")).toBe("currentColor");
-    // One colour only: no element of the drawing sets its own.
-    expect(Array.from(svg.querySelectorAll("*")).some((node) => node.hasAttribute("stroke") || (node.hasAttribute("fill") && node.getAttribute("fill") !== "none"))).toBe(false);
-    expect(container.querySelector("img, image")).toBeNull();
-    expect(screen.getByRole("heading", { name: "Title" })).toBeTruthy();
-    expect(container.textContent).toContain("Body text");
-  });
+  it.each(["first-use", "cleared", "no-results", "unavailable"] as const)(
+    "%s: a monochrome inline drawing, a title, a body",
+    (type) => {
+      const { container } = renderShell(<EmptyState type={type} title="Title" body="Body text" />);
+      const svg = container.querySelector("svg")!;
+      expect(svg.getAttribute("aria-hidden")).toBe("true");
+      expect(svg.getAttribute("stroke")).toBe("currentColor");
+      // One colour only: no element of the drawing sets its own.
+      expect(
+        Array.from(svg.querySelectorAll("*")).some(
+          (node) =>
+            node.hasAttribute("stroke") ||
+            (node.hasAttribute("fill") && node.getAttribute("fill") !== "none"),
+        ),
+      ).toBe(false);
+      expect(container.querySelector("img, image")).toBeNull();
+      expect(screen.getByRole("heading", { name: "Title" })).toBeTruthy();
+      expect(container.textContent).toContain("Body text");
+    },
+  );
 
   it("unavailable shows the request id", () => {
-    const { container } = renderShell(<EmptyState type="unavailable" title="Couldn't load this folder" body="The connection dropped." requestId="7f3a-19c2" />);
+    const { container } = renderShell(
+      <EmptyState
+        type="unavailable"
+        title="Couldn't load this folder"
+        body="The connection dropped."
+        requestId="7f3a-19c2"
+      />,
+    );
     expect(container.textContent).toContain("req 7f3a-19c2");
   });
 
   it("PlaceholderPage: the destination's title, 'Coming soon', and the optional note", () => {
-    const { container } = renderShell(<PlaceholderPage name="Shared with me" note="Shared files appear here once sharing is switched on." />);
+    const { container } = renderShell(
+      <PlaceholderPage name="Shared with me" note="Shared files appear here once sharing is switched on." />,
+    );
     expect(container.querySelector('[data-placeholder-page="Shared with me"]')).not.toBeNull();
     expect(screen.getByRole("heading", { name: "Shared with me" })).toBeTruthy();
     expect(container.textContent).toContain("Coming soon");
@@ -69,10 +87,15 @@ describe("FileBadge", () => {
 
 describe("StorageBar", () => {
   it("shows used of quota in user units, as text and as a named image", () => {
-    const { container } = renderShell(<StorageBar usage={{ usedBytes: 1_503_238_553, quotaBytes: 5_368_709_120 }} />);
+    const { container } = renderShell(
+      <StorageBar usage={{ usedBytes: 1_503_238_553, quotaBytes: 5_368_709_120 }} />,
+    );
     expect(container.textContent).toContain("1.4 GB of 5 GB");
     expect(screen.getByRole("img", { name: "1.4 GB of 5 GB used" })).toBeTruthy();
-    expect(parseFloat(getComputedStyle(container.querySelector("[data-storage-fill]")!).width)).toBeCloseTo(28, 3);
+    expect(parseFloat(getComputedStyle(container.querySelector("[data-storage-fill]")!).width)).toBeCloseTo(
+      28,
+      3,
+    );
     expect(container.textContent).not.toContain("Almost full");
   });
 
@@ -80,7 +103,9 @@ describe("StorageBar", () => {
     const { container } = renderShell(<StorageBar usage={{ usedBytes: 95, quotaBytes: 100 }} />);
     const warning = screen.getByText("Almost full");
     expect(resolveVar(getComputedStyle(warning).color)).toBe(lightTokens.attention);
-    expect(resolveVar(getComputedStyle(container.querySelector("[data-storage-fill]")!).backgroundColor)).toBe(lightTokens.textSecondary);
+    expect(
+      resolveVar(getComputedStyle(container.querySelector("[data-storage-fill]")!).backgroundColor),
+    ).toBe(lightTokens.textSecondary);
   });
 
   it("null usage is a skeleton", () => {
@@ -94,11 +119,19 @@ describe("SelectionBar", () => {
     const onClear = vi.fn();
     const view = renderShell(<SelectionBar count={0} onClear={onClear} />);
     expect(screen.queryByRole("toolbar")).toBeNull();
-    view.rerender(<SelectionBar count={3} onClear={onClear} actions={<SelectionBarAction label="Trash" shortcut="trash" destructive onClick={() => {}} />} />);
+    view.rerender(
+      <SelectionBar
+        count={3}
+        onClear={onClear}
+        actions={<SelectionBarAction label="Trash" shortcut="trash" destructive onClick={() => {}} />}
+      />,
+    );
     expect(screen.getByRole("toolbar", { name: "3 selected" })).toBeTruthy();
     expect(document.querySelector("[data-selection-live]")!.textContent).toBe("3 selected");
     expect(document.querySelector("[data-selection-live]")!.getAttribute("aria-live")).toBe("polite");
-    expect(resolveVar(getComputedStyle(screen.getByRole("toolbar")).backgroundColor)).toBe(lightTokens.accentWash);
+    expect(resolveVar(getComputedStyle(screen.getByRole("toolbar")).backgroundColor)).toBe(
+      lightTokens.accentWash,
+    );
     const trash = screen.getByRole("button", { name: /Trash/ });
     expect(trash.querySelector("kbd")).not.toBeNull();
     expect(resolveVar(getComputedStyle(trash).color)).toBe(lightTokens.danger);
@@ -109,13 +142,24 @@ describe("SelectionBar", () => {
 
 describe("ConfirmDialog", () => {
   function Host(props: { typeToConfirm?: string; onConfirm(): void; onCancel(): void }) {
-    return <ConfirmDialog open title="Delete 3 items forever?" consequence="3 people lose access. This can't be undone." confirmLabel="Delete forever" destructive {...props} />;
+    return (
+      <ConfirmDialog
+        open
+        title="Delete 3 items forever?"
+        consequence="3 people lose access. This can't be undone."
+        confirmLabel="Delete forever"
+        destructive
+        {...props}
+      />
+    );
   }
 
   it("states the blast radius and is labelled and described by it", async () => {
     renderShell(<Host onConfirm={() => {}} onCancel={() => {}} />);
     const dialog = await screen.findByRole("dialog", { name: "Delete 3 items forever?" });
-    expect(document.getElementById(dialog.getAttribute("aria-describedby")!)!.textContent).toBe("3 people lose access. This can't be undone.");
+    expect(document.getElementById(dialog.getAttribute("aria-describedby")!)!.textContent).toBe(
+      "3 people lose access. This can't be undone.",
+    );
   });
 
   it("focus starts on Cancel, so Enter never destroys by reflex; Escape cancels", async () => {
@@ -187,7 +231,12 @@ describe("BottomSheet", () => {
       return (
         <>
           <button onClick={() => setOpen(true)}>open sheet</button>
-          <BottomSheet open={open} onClose={() => setOpen(false)} title="Lease agreement.pdf" subtitle="PDF · 2.4 MB">
+          <BottomSheet
+            open={open}
+            onClose={() => setOpen(false)}
+            title="Lease agreement.pdf"
+            subtitle="PDF · 2.4 MB"
+          >
             <button>Download</button>
           </BottomSheet>
         </>
@@ -213,7 +262,11 @@ describe("BottomSheet", () => {
 
 describe("FrameBanner and ErrorBoundary", () => {
   it("a banner is a status region that never uses the activity colour", () => {
-    const { container } = renderShell(<FrameBanner name="x" tone="danger" action={<button>Act</button>}>Something</FrameBanner>);
+    const { container } = renderShell(
+      <FrameBanner name="x" tone="danger" action={<button>Act</button>}>
+        Something
+      </FrameBanner>,
+    );
     const banner = container.querySelector('[data-banner="x"]')!;
     expect(banner.getAttribute("role")).toBe("status");
     const style = getComputedStyle(banner);

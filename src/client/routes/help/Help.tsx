@@ -17,7 +17,17 @@ import { closeShortcuts, useShortcutsOpen } from "./shortcuts-store";
 
 function ShortcutTable() {
   return (
-    <Box component="dl" sx={{ margin: 0, display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", rowGap: 2, columnGap: 6, alignItems: "center" }}>
+    <Box
+      component="dl"
+      sx={{
+        margin: 0,
+        display: "grid",
+        gridTemplateColumns: "minmax(0, 1fr) auto",
+        rowGap: 2,
+        columnGap: 6,
+        alignItems: "center",
+      }}
+    >
       {SHORTCUTS.map((shortcut) => (
         <Box key={shortcut.id} sx={{ display: "contents" }}>
           <Box component="dt">{t(shortcut.description)}</Box>
@@ -38,7 +48,10 @@ export function ShortcutsDialog() {
   const titleId = useId();
   return (
     <Dialog open={open} onClose={closeShortcuts} aria-labelledby={titleId} maxWidth="xs" fullWidth>
-      <DialogTitle id={titleId} sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <DialogTitle
+        id={titleId}
+        sx={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
+      >
         {t("shortcuts.title")}
         <IconButton aria-label={t("app.close")} onClick={closeShortcuts}>
           <X size={16} aria-hidden="true" />
@@ -55,13 +68,19 @@ export function ShortcutsDialog() {
 export function HelpPage() {
   return (
     <Box sx={{ maxWidth: 640, padding: 5, display: "flex", flexDirection: "column", gap: 6 }}>
-      <Box component="section" sx={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}>
+      <Box
+        component="section"
+        sx={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}
+      >
         <Typography sx={{ color: hf.textSecondary }}>{t("help.body")}</Typography>
         <Button component="a" href={EXTERNAL_LINKS.help} target="_blank" rel="noopener">
           {t("help.open")}
         </Button>
       </Box>
-      <Box component="section" sx={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}>
+      <Box
+        component="section"
+        sx={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}
+      >
         <Typography variant="h2">{t("help.contact")}</Typography>
         <Typography sx={{ color: hf.textSecondary }}>{t("help.contact.body")}</Typography>
         <Button component="a" href={EXTERNAL_LINKS.support} target="_blank" rel="noopener">

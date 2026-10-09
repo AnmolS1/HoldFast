@@ -19,7 +19,12 @@ export const ALMOST_FULL = 0.9;
 export function StorageBar({ usage, footer }: StorageBarProps) {
   if (!usage) {
     return (
-      <Box role="status" aria-busy="true" aria-label={t("storage.loading")} sx={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <Box
+        role="status"
+        aria-busy="true"
+        aria-label={t("storage.loading")}
+        sx={{ display: "flex", flexDirection: "column", gap: "6px" }}
+      >
         <Skeleton variant="text" width="70%" height={16} />
         <Skeleton variant="rectangular" height={3} sx={{ borderRadius: "2px" }} />
       </Box>
@@ -44,7 +49,10 @@ export function StorageBar({ usage, footer }: StorageBarProps) {
         aria-label={t("storage.aria", { used, quota })}
         sx={{ height: "3px", backgroundColor: hf.hairline, borderRadius: "2px", overflow: "hidden" }}
       >
-        <Box data-storage-fill sx={{ width: `${ratio * 100}%`, height: "100%", backgroundColor: hf.textSecondary }} />
+        <Box
+          data-storage-fill
+          sx={{ width: `${ratio * 100}%`, height: "100%", backgroundColor: hf.textSecondary }}
+        />
       </Box>
       {warning ? (
         <Box component="span" sx={{ color: ratio >= 1 ? hf.danger : hf.attention, fontSize: 12 }}>

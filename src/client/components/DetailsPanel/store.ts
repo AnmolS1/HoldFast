@@ -35,7 +35,11 @@ export interface DetailsPanelApi {
 
 export const detailsApi = {
   setContent(node: ReactNode | null, options?: { title?: string }) {
-    set(node === null ? { content: null, open: false, title: null } : { content: node, title: options?.title ?? state.title });
+    set(
+      node === null
+        ? { content: null, open: false, title: null }
+        : { content: node, title: options?.title ?? state.title },
+    );
   },
   open() {
     if (state.content !== null) set({ open: true });
@@ -47,7 +51,10 @@ export const detailsApi = {
 
 export function useDetailsPanel(): DetailsPanelApi {
   const current = useSyncExternalStore(subscribeDetails, getDetails, getDetails);
-  return useMemo(() => ({ ...detailsApi, isOpen: current.open, hasContent: current.content !== null }), [current.open, current.content]);
+  return useMemo(
+    () => ({ ...detailsApi, isOpen: current.open, hasContent: current.content !== null }),
+    [current.open, current.content],
+  );
 }
 
 /** Back to empty: run by `purgeUserState()` and by tests. */

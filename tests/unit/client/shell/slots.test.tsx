@@ -41,18 +41,50 @@ exact<Slots.DangerousFileInterstitialProps, { fileName: string; onContinue(): vo
 exact<Slots.ShareDialogProps, { open: boolean; nodeId: string | null; onClose(): void }>(true);
 exact<Slots.SearchSuggestionsProps, { query: string; onPick(nodeId: string): void }>(true);
 exact<Slots.UsageSummary, { usedBytes: number; quotaBytes: number }>(true);
-exact<Slots.PreviewItem, { id: string; name: string; size: number; mimeCategory: MimeCategory; ext: string; mimeSniffed?: string | null }>(true);
+exact<
+  Slots.PreviewItem,
+  {
+    id: string;
+    name: string;
+    size: number;
+    mimeCategory: MimeCategory;
+    ext: string;
+    mimeSniffed?: string | null;
+  }
+>(true);
 exact<Slots.PreviewDialogProps["source"], "owner" | Slots.PublicPreviewSource>(true);
 exact<Parameters<Slots.RequestUpload>, [opts?: { files?: File[]; parentId?: string }]>(true);
-exact<ScanStatus, "pending" | "clean" | "infected" | "suspected_csam" | "under_review" | "skipped" | "error">(true);
+exact<ScanStatus, "pending" | "clean" | "infected" | "suspected_csam" | "under_review" | "skipped" | "error">(
+  true,
+);
 
 // A node DTO shaped like the contracts task's is assignable to the list item without an import.
-const dto = { id: "n", kind: "file" as const, name: "a.pdf", size: 1, mimeCategory: "pdf" as const, scanStatus: "clean" as const, scanReason: null, updatedAt: "2026-10-02T00:00:00Z", parentId: null, etag: "e", starred: false };
+const dto = {
+  id: "n",
+  kind: "file" as const,
+  name: "a.pdf",
+  size: 1,
+  mimeCategory: "pdf" as const,
+  scanStatus: "clean" as const,
+  scanReason: null,
+  updatedAt: "2026-10-02T00:00:00Z",
+  parentId: null,
+  etag: "e",
+  starred: false,
+};
 const asItem: FileListItem = dto;
 void asItem;
 
 // Consumers can use each stub as a component of the contract's props.
-const consumers: Array<ComponentType<never>> = [ReportLink, ReportDialog, DangerousFileInterstitial, PreviewDialog, ShareDialog, SearchSuggestions, UploadDropOverlay];
+const consumers: Array<ComponentType<never>> = [
+  ReportLink,
+  ReportDialog,
+  DangerousFileInterstitial,
+  PreviewDialog,
+  ShareDialog,
+  SearchSuggestions,
+  UploadDropOverlay,
+];
 
 // The real Better Auth React client (with the three plugins the auth task installs) satisfies the
 // shell's contract. If this line stops compiling after an upgrade, the contract is the thing to fix.
@@ -80,9 +112,13 @@ describe("slot stubs", () => {
   it("the interstitial stub passes straight through: onContinue once, on mount", () => {
     const onContinue = vi.fn();
     const onCancel = vi.fn();
-    const view = render(<DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />);
+    const view = render(
+      <DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />,
+    );
     expect(onContinue).toHaveBeenCalledTimes(1);
-    view.rerender(<DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />);
+    view.rerender(
+      <DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />,
+    );
     expect(onContinue).toHaveBeenCalledTimes(1);
     expect(onCancel).not.toHaveBeenCalled();
     expect(view.container.innerHTML).toBe("");
@@ -106,7 +142,15 @@ describe("the auth-client placeholder", () => {
       () => authClient.signIn.email({ email: "a@b.c", password: "x" }),
       () => authClient.signIn.social({ provider: "google" }),
       () => authClient.signIn.passkey(),
-      () => authClient.signUp.email({ name: "a", email: "a@b.c", password: "x", birthYear: 1990, birthMonth: 1, acceptTerms: true }),
+      () =>
+        authClient.signUp.email({
+          name: "a",
+          email: "a@b.c",
+          password: "x",
+          birthYear: 1990,
+          birthMonth: 1,
+          acceptTerms: true,
+        }),
       () => authClient.signOut(),
       () => authClient.sendVerificationEmail({ email: "a@b.c" }),
       () => authClient.requestPasswordReset({ email: "a@b.c" }),
@@ -120,16 +164,34 @@ describe("the auth-client placeholder", () => {
 });
 
 describe("the route registry", () => {
-  const paths = (routes: typeof featureRoutes) => routes.map((route) => (route.index ? "(index)" : route.path)).sort();
+  const paths = (routes: typeof featureRoutes) =>
+    routes.map((route) => (route.index ? "(index)" : route.path)).sort();
 
   it("every destination has a real route — none is an empty array that would fall to not-found", () => {
-    expect(paths(featureRoutes)).toEqual(["(index)", "account/*", "admin/*", "folder/:id", "preview/:nodeId", "recent", "search", "shared", "shared-by-me", "starred", "storage", "trash", "uploads"].sort());
+    expect(paths(featureRoutes)).toEqual(
+      [
+        "(index)",
+        "account/*",
+        "admin/*",
+        "folder/:id",
+        "preview/:nodeId",
+        "recent",
+        "search",
+        "shared",
+        "shared-by-me",
+        "starred",
+        "storage",
+        "trash",
+        "uploads",
+      ].sort(),
+    );
   });
 
   it("public routes are split out by handle.public", () => {
     expect(paths(publicRoutes)).toEqual(["dmca", "s/:token"]);
     for (const route of publicRoutes) expect((route.handle as Slots.RouteHandle).public).toBe(true);
-    for (const route of featureRoutes) expect((route.handle as Slots.RouteHandle | undefined)?.public).not.toBe(true);
+    for (const route of featureRoutes)
+      expect((route.handle as Slots.RouteHandle | undefined)?.public).not.toBe(true);
   });
 
   it("the preview is an overlay route", () => {

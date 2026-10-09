@@ -46,6 +46,8 @@ export function selectionReducer(state: SelectionState, action: SelectionAction)
     case "all":
       return { selected: new Set(action.order), anchor: state.anchor ?? action.order[0] ?? null };
     case "clear":
-      return state.selected.size === 0 && state.anchor === null ? state : { selected: new Set<string>(), anchor: null };
+      return state.selected.size === 0 && state.anchor === null
+        ? state
+        : { selected: new Set<string>(), anchor: null };
   }
 }

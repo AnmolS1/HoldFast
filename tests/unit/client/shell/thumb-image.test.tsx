@@ -1,6 +1,10 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { EXPIRY_MARGIN_MS, ThumbImage, type ThumbImageProps } from "../../../../src/client/components/ThumbImage";
+import {
+  EXPIRY_MARGIN_MS,
+  ThumbImage,
+  type ThumbImageProps,
+} from "../../../../src/client/components/ThumbImage";
 import { intersect, observedCount, renderShell, setupShell } from "./helpers";
 
 setupShell();
@@ -73,7 +77,10 @@ describe("ThumbImage", () => {
   });
 
   it("re-requests once the cached URL is within the expiry margin", async () => {
-    const getUrl = vi.fn(async () => ({ url: `https://files.test/t/${getUrl.mock.calls.length}`, expiresAt: inFuture(EXPIRY_MARGIN_MS - 1000) }));
+    const getUrl = vi.fn(async () => ({
+      url: `https://files.test/t/${getUrl.mock.calls.length}`,
+      expiresAt: inFuture(EXPIRY_MARGIN_MS - 1000),
+    }));
     const p = props({ getUrl });
     const first = renderShell(<ThumbImage {...p} />);
     act(() => intersect());

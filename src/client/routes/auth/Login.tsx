@@ -9,7 +9,16 @@ import { refreshSession, usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
-import { AuthCard, Field, FormError, FormNotice, GoogleIcon, OrDivider, PasskeyIcon, TurnstileBox } from "./parts";
+import {
+  AuthCard,
+  Field,
+  FormError,
+  FormNotice,
+  GoogleIcon,
+  OrDivider,
+  PasskeyIcon,
+  TurnstileBox,
+} from "./parts";
 import { isEmail, safeNext } from "./validation";
 
 const REASONS: Record<string, { key: MessageKey; tone: "neutral" | "danger" }> = {
@@ -18,7 +27,15 @@ const REASONS: Record<string, { key: MessageKey; tone: "neutral" | "danger" }> =
   reset: { key: "login.reset", tone: "neutral" },
 };
 
-const linkSx = { color: hf.text, textDecoration: "underline", textUnderlineOffset: "2px", display: "inline-flex", alignItems: "center", minHeight: 24, "@media (max-width:1023.95px)": { minHeight: 44 } } as const;
+const linkSx = {
+  color: hf.text,
+  textDecoration: "underline",
+  textUnderlineOffset: "2px",
+  display: "inline-flex",
+  alignItems: "center",
+  minHeight: 24,
+  "@media (max-width:1023.95px)": { minHeight: 44 },
+} as const;
 
 /** Sign in: passkey first (and offered in the email field), password second, Google third. */
 export function LoginPage() {
@@ -43,8 +60,11 @@ export function LoginPage() {
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    const available = (window.PublicKeyCredential as (typeof PublicKeyCredential & { isConditionalMediationAvailable?: () => Promise<boolean> }) | undefined)
-      ?.isConditionalMediationAvailable;
+    const available = (
+      window.PublicKeyCredential as
+        | (typeof PublicKeyCredential & { isConditionalMediationAvailable?: () => Promise<boolean> })
+        | undefined
+    )?.isConditionalMediationAvailable;
     if (!available) return;
     let cancelled = false;
     void available
@@ -78,7 +98,9 @@ export function LoginPage() {
   const onGoogle = async () => {
     setError(null);
     setBusy("google");
-    const result = await callAuth(() => authClient.signIn.social({ provider: "google", callbackURL: next, errorCallbackURL: "/login" }));
+    const result = await callAuth(() =>
+      authClient.signIn.social({ provider: "google", callbackURL: next, errorCallbackURL: "/login" }),
+    );
     setBusy(null);
     if (result.error) setError(authErrorMessage(result.error));
   };
@@ -95,7 +117,13 @@ export function LoginPage() {
       return;
     }
     setBusy("password");
-    const result = await callAuth(() => authClient.signIn.email({ email: email.trim(), password, fetchOptions: captchaOptions(turnstile.token) }));
+    const result = await callAuth(() =>
+      authClient.signIn.email({
+        email: email.trim(),
+        password,
+        fetchOptions: captchaOptions(turnstile.token),
+      }),
+    );
     turnstile.reset();
     setBusy(null);
     if (result.error) {
@@ -116,13 +144,32 @@ export function LoginPage() {
   return (
     <AuthCard title={t("login.title")}>
       {reason ? <FormNotice tone={reason.tone}>{t(reason.key)}</FormNotice> : null}
-      <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        <Field label={t("auth.email")} type="email" name="email" autoComplete="username webauthn" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <Box
+        component="form"
+        noValidate
+        onSubmit={onSubmit}
+        sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+      >
+        <Field
+          label={t("auth.email")}
+          type="email"
+          name="email"
+          autoComplete="username webauthn"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
         <Button size="large" onClick={onPasskey} disabled={busy !== null} startIcon={<PasskeyIcon />}>
           {t("auth.passkey")}
         </Button>
         <OrDivider />
-        <Field label={t("auth.password")} type="password" name="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        <Field
+          label={t("auth.password")}
+          type="password"
+          name="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
         {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
         <FormError>{error}</FormError>
         <Button type="submit" variant="contained" size="large" disabled={busy !== null}>

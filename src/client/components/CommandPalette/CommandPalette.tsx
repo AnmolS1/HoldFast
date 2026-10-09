@@ -7,7 +7,14 @@ import { t, type MessageKey } from "../../lib/i18n";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { Kbd } from "../Kbd";
-import { closePalette, paletteFilter, useCommands, usePaletteOpen, type Command, type CommandSection } from "./registry";
+import {
+  closePalette,
+  paletteFilter,
+  useCommands,
+  usePaletteOpen,
+  type Command,
+  type CommandSection,
+} from "./registry";
 
 // Selection-aware commands come first, then navigation, then actions.
 const SECTIONS: Array<{ id: CommandSection; heading: MessageKey }> = [
@@ -20,7 +27,12 @@ const listSx = {
   padding: 2,
   maxHeight: 420,
   overflowY: "auto",
-  "& [cmdk-group-heading]": { padding: "8px 10px 4px", fontSize: 12, lineHeight: "16px", color: hf.textSecondary },
+  "& [cmdk-group-heading]": {
+    padding: "8px 10px 4px",
+    fontSize: 12,
+    lineHeight: "16px",
+    color: hf.textSecondary,
+  },
   "& [cmdk-item]": {
     display: "flex",
     alignItems: "center",
@@ -47,11 +59,24 @@ function Row({ command }: { command: Command }) {
       }}
     >
       {command.icon ? (
-        <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary, flex: "none" }}>
+        <Box
+          component="span"
+          aria-hidden="true"
+          sx={{ display: "inline-flex", color: hf.textSecondary, flex: "none" }}
+        >
           {command.icon}
         </Box>
       ) : null}
-      <Box component="span" sx={{ flex: "1 1 auto", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <Box
+        component="span"
+        sx={{
+          flex: "1 1 auto",
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
         {command.label}
       </Box>
       {command.hint ? (
@@ -80,12 +105,23 @@ export function CommandPalette() {
       maxWidth={false}
       slotProps={{
         // The name belongs on the element with role="dialog" (the paper), not on the modal root.
-        paper: { "aria-label": t("palette.label"), sx: { maxWidth: 640, overflow: "hidden", alignSelf: "flex-start", marginTop: { xs: 4, md: 24 } } },
+        paper: {
+          "aria-label": t("palette.label"),
+          sx: { maxWidth: 640, overflow: "hidden", alignSelf: "flex-start", marginTop: { xs: 4, md: 24 } },
+        },
         transition: { onExited: () => setQuery("") },
       }}
     >
       <Cmdk label={t("palette.label")} loop filter={paletteFilter}>
-        <Box sx={{ display: "flex", alignItems: "center", gap: "10px", padding: "10px 16px", borderBottom: `1px solid ${hf.hairline}` }}>
+        <Box
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            padding: "10px 16px",
+            borderBottom: `1px solid ${hf.hairline}`,
+          }}
+        >
           <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
             <Search size={16} />
           </Box>
@@ -95,7 +131,18 @@ export function CommandPalette() {
             value={query}
             onValueChange={setQuery}
             placeholder={t("palette.placeholder")}
-            sx={{ flex: "1 1 auto", minWidth: 0, height: 32, border: 0, outline: "none", background: "transparent", color: hf.text, font: "inherit", fontSize: { xs: 16, md: 15 }, "&::placeholder": { color: hf.textSecondary } }}
+            sx={{
+              flex: "1 1 auto",
+              minWidth: 0,
+              height: 32,
+              border: 0,
+              outline: "none",
+              background: "transparent",
+              color: hf.text,
+              font: "inherit",
+              fontSize: { xs: 16, md: 15 },
+              "&::placeholder": { color: hf.textSecondary },
+            }}
           />
           <Kbd>{shortcutLabel("escape")}</Kbd>
         </Box>
@@ -114,7 +161,19 @@ export function CommandPalette() {
           })}
         </Box>
       </Cmdk>
-      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "6px 14px", padding: "8px 16px", borderTop: `1px solid ${hf.hairline}`, backgroundColor: hf.bg, color: hf.textSecondary, fontSize: 12 }}>
+      <Box
+        sx={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: "6px 14px",
+          padding: "8px 16px",
+          borderTop: `1px solid ${hf.hairline}`,
+          backgroundColor: hf.bg,
+          color: hf.textSecondary,
+          fontSize: 12,
+        }}
+      >
         <span>
           <Kbd>↑↓</Kbd> {t("palette.footer.move")}
         </span>

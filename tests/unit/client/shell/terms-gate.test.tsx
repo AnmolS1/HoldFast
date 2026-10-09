@@ -21,19 +21,30 @@ describe("terms re-acceptance", () => {
       },
     });
     const { router } = renderRoutes(buildRoutes(), ["/recent"]);
-    expect(await screen.findByRole("heading", { name: "We've updated the Terms and Privacy Policy." })).toBeTruthy();
+    expect(
+      await screen.findByRole("heading", { name: "We've updated the Terms and Privacy Policy." }),
+    ).toBeTruthy();
     // The screen replaces the app: no frame, no page content.
     expect(document.querySelector("[data-frame]")).toBeNull();
     expect(document.querySelector("[data-placeholder-page]")).toBeNull();
-    expect(screen.getByRole("link", { name: "Read the Terms" }).getAttribute("href")).toBe("https://ponderance.dev/terms");
-    expect(screen.getByRole("link", { name: "Read the Privacy Policy" }).getAttribute("href")).toBe("https://ponderance.dev/privacy");
+    expect(screen.getByRole("link", { name: "Read the Terms" }).getAttribute("href")).toBe(
+      "https://ponderance.dev/terms",
+    );
+    expect(screen.getByRole("link", { name: "Read the Privacy Policy" }).getAttribute("href")).toBe(
+      "https://ponderance.dev/privacy",
+    );
 
     const accept = screen.getByRole("button", { name: "Accept and continue" });
-    const checkbox = screen.getByRole("checkbox", { name: "I agree to the Terms and Privacy Policy." }) as HTMLInputElement;
+    const checkbox = screen.getByRole("checkbox", {
+      name: "I agree to the Terms and Privacy Policy.",
+    }) as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
     expect((accept as HTMLButtonElement).disabled).toBe(true);
     // Exactly two actions exist: accept, and sign out.
-    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Accept and continue", "Sign out"]);
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Accept and continue",
+      "Sign out",
+    ]);
 
     fireEvent.click(checkbox);
     fireEvent.click(accept);
@@ -44,7 +55,10 @@ describe("terms re-acceptance", () => {
   });
 
   it("a failed accept stays on the screen and shows the request id", async () => {
-    shellFetch({ session: sessionOf({ termsVersion: "2025-01" }), extra: (call) => (call.path === "/api/account/accept-terms" ? envelope("validation", 400) : undefined) });
+    shellFetch({
+      session: sessionOf({ termsVersion: "2025-01" }),
+      extra: (call) => (call.path === "/api/account/accept-terms" ? envelope("validation", 400) : undefined),
+    });
     const { router } = renderRoutes(buildRoutes(), ["/accept-terms"]);
     fireEvent.click(await screen.findByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Accept and continue" }));
@@ -60,7 +74,8 @@ describe("terms re-acceptance", () => {
       session: () => session,
       config: () => ({ ...CONFIG, termsVersion: configTerms }),
       extra: (call) => {
-        if (call.path === "/api/nodes/folder") return accepted ? json({ id: "new" }) : envelope("terms_required", 403);
+        if (call.path === "/api/nodes/folder")
+          return accepted ? json({ id: "new" }) : envelope("terms_required", 403);
         if (call.path === "/api/account/accept-terms") {
           accepted = true;
           session = sessionOf({ termsVersion: "2026-11" });
@@ -87,6 +102,9 @@ describe("terms re-acceptance", () => {
     await expect(pending).resolves.toEqual({ id: "new" });
     expect(isTermsPending()).toBe(false);
     await waitFor(() => expect(router.state.location.pathname).toBe("/trash"));
-    expect(calls.filter((call) => call.path === "/api/nodes/folder").map((call) => call.body)).toEqual([{ name: "Taxes" }, { name: "Taxes" }]);
+    expect(calls.filter((call) => call.path === "/api/nodes/folder").map((call) => call.body)).toEqual([
+      { name: "Taxes" },
+      { name: "Taxes" },
+    ]);
   });
 });

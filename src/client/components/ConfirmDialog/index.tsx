@@ -32,7 +32,19 @@ export interface ConfirmDialogProps {
  * states the blast radius. Focus starts on Cancel, so Enter never destroys anything by reflex.
  */
 export function ConfirmDialog(props: ConfirmDialogProps) {
-  const { open, title, consequence, confirmLabel, cancelLabel, destructive = false, typeToConfirm, typeToConfirmLabel, busy = false, onConfirm, onCancel } = props;
+  const {
+    open,
+    title,
+    consequence,
+    confirmLabel,
+    cancelLabel,
+    destructive = false,
+    typeToConfirm,
+    typeToConfirmLabel,
+    busy = false,
+    onConfirm,
+    onCancel,
+  } = props;
   const titleId = useId();
   const bodyId = useId();
   const [typed, setTyped] = useState("");
@@ -68,7 +80,12 @@ export function ConfirmDialog(props: ConfirmDialogProps) {
         <Button autoFocus onClick={onCancel} disabled={busy}>
           {cancelLabel ?? t("app.cancel")}
         </Button>
-        <Button variant="contained" color={destructive ? "error" : "primary"} onClick={onConfirm} disabled={busy || blocked}>
+        <Button
+          variant="contained"
+          color={destructive ? "error" : "primary"}
+          onClick={onConfirm}
+          disabled={busy || blocked}
+        >
           {confirmLabel}
         </Button>
       </DialogActions>

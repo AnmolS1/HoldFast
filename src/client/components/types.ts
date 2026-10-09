@@ -2,7 +2,8 @@
 // of the contracts task is assignable without an import.
 
 /** Identical to the database enum. */
-export type ScanStatus = "pending" | "clean" | "infected" | "suspected_csam" | "under_review" | "skipped" | "error";
+export type ScanStatus =
+  "pending" | "clean" | "infected" | "suspected_csam" | "under_review" | "skipped" | "error";
 
 export type MimeCategory = "image" | "video" | "audio" | "pdf" | "document" | "archive" | "code" | "other";
 

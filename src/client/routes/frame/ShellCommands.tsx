@@ -2,7 +2,13 @@
 import { Moon, Sun } from "lucide-react";
 import { useEffect } from "react";
 import { useNavigate } from "react-router";
-import { COMMAND_IDS, registerCommands, runCommand, togglePalette, type Command } from "../../components/CommandPalette";
+import {
+  COMMAND_IDS,
+  registerCommands,
+  runCommand,
+  togglePalette,
+  type Command,
+} from "../../components/CommandPalette";
 import { requestUpload } from "../../features/upload";
 import { t } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
@@ -23,7 +29,13 @@ export function ShellCommands() {
     const go = (path: string) => () => navigate(path);
     const commands: Command[] = DESTINATIONS.map((destination) => {
       const Icon = destination.icon;
-      return { id: `go.${destination.id}`, section: "goto", label: t(destination.label), icon: <Icon size={16} />, run: go(destination.path) };
+      return {
+        id: `go.${destination.id}`,
+        section: "goto",
+        label: t(destination.label),
+        icon: <Icon size={16} />,
+        run: go(destination.path),
+      };
     });
     commands.push(
       { id: "go.account", section: "goto", label: t("nav.account"), run: go("/account") },
@@ -31,7 +43,8 @@ export function ShellCommands() {
       { id: "go.uploads", section: "goto", label: t("nav.uploads"), run: go("/uploads") },
       { id: "go.help", section: "goto", label: t("nav.help"), run: go("/help") },
     );
-    if (role === "admin") commands.push({ id: "go.admin", section: "goto", label: t("nav.admin"), run: go("/admin") });
+    if (role === "admin")
+      commands.push({ id: "go.admin", section: "goto", label: t("nav.admin"), run: go("/admin") });
     const dark = prefs.theme === "dark" || (prefs.theme === "system" && isDarkNow());
     commands.push(
       {
@@ -51,7 +64,13 @@ export function ShellCommands() {
         keywords: ["theme", "dark", "light", "mode"],
         run: toggleTheme,
       },
-      { id: "shell.shortcuts", section: "actions", label: t("user.shortcuts"), shortcut: "help", run: openShortcuts },
+      {
+        id: "shell.shortcuts",
+        section: "actions",
+        label: t("user.shortcuts"),
+        shortcut: "help",
+        run: openShortcuts,
+      },
     );
     return registerCommands("shell", commands);
   }, [navigate, prefs.theme, config?.readOnly, config?.uploadsEnabled, role, config]);

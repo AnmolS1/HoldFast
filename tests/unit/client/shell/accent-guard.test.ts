@@ -10,7 +10,10 @@ const linter = new Linter({ configType: "flat" });
 const config: Linter.Config[] = [
   {
     files: ["**/*.ts", "**/*.tsx"],
-    languageOptions: { parser: tseslint.parser as Linter.Parser, parserOptions: { ecmaFeatures: { jsx: true } } },
+    languageOptions: {
+      parser: tseslint.parser as Linter.Parser,
+      parserOptions: { ecmaFeatures: { jsx: true } },
+    },
     plugins: { holdfast: accentGuard },
     rules: { "holdfast/accent-guard": "error" },
   },
@@ -20,7 +23,9 @@ function lint(code: string, filename: string): string[] {
   const messages = linter.verify(code, config, { filename });
   const fatal = messages.filter((message) => message.fatal);
   if (fatal.length) throw new Error(`${filename}: ${fatal[0]!.message}`);
-  return messages.filter((message) => message.ruleId === "holdfast/accent-guard").map((message) => message.messageId ?? "");
+  return messages
+    .filter((message) => message.ruleId === "holdfast/accent-guard")
+    .map((message) => message.messageId ?? "");
 }
 
 const OUTSIDE = "src/client/components/FileList/FileList.tsx";
@@ -28,7 +33,10 @@ const FEATURE = "src/client/features/explorer/routes.tsx";
 
 describe("accent guard: fixture violations", () => {
   const violations: Array<[string, string]> = [
-    ["an imported token object", `import { hfAccent } from "../../theme/tokens"; export const c = hfAccent.main;`],
+    [
+      "an imported token object",
+      `import { hfAccent } from "../../theme/tokens"; export const c = hfAccent.main;`,
+    ],
     ["a token property", `export const c = tokens.accentTint;`],
     ["the CSS variable in a string", `export const c = "var(--hf-accent)";`],
     ["the variable in a template string", "export const c = `1px solid var(--hf-accent-track)`;"],
@@ -69,15 +77,34 @@ describe("accent guard: fixture violations", () => {
   });
 
   it("the allow-list is exactly the specification's", () => {
-    const allowed = ["theme/x.ts", "components/TransferRibbon/a.ts", "components/SelectionBar/a.tsx", "components/StatusDot/a.tsx", "components/ProgressUnderline/a.tsx"];
-    const denied = ["components/FileList/a.tsx", "components/CommandPalette/a.tsx", "components/EmptyState/a.tsx", "routes/frame/a.tsx", "lib/a.ts", "features/explorer/a.tsx", "components/StatusDotExtra/a.tsx", "themes/a.ts"];
+    const allowed = [
+      "theme/x.ts",
+      "components/TransferRibbon/a.ts",
+      "components/SelectionBar/a.tsx",
+      "components/StatusDot/a.tsx",
+      "components/ProgressUnderline/a.tsx",
+    ];
+    const denied = [
+      "components/FileList/a.tsx",
+      "components/CommandPalette/a.tsx",
+      "components/EmptyState/a.tsx",
+      "routes/frame/a.tsx",
+      "lib/a.ts",
+      "features/explorer/a.tsx",
+      "components/StatusDotExtra/a.tsx",
+      "themes/a.ts",
+    ];
     for (const path of allowed) expect(ALLOWED.test(`src/client/${path}`), path).toBe(true);
     for (const path of denied) expect(ALLOWED.test(`src/client/${path}`), path).toBe(false);
   });
 });
 
 describe("accent guard: the tree", () => {
-  const sources = import.meta.glob<string>("/src/client/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
+  const sources = import.meta.glob<string>("/src/client/**/*.{ts,tsx}", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  });
 
   it("covers the client source", () => {
     expect(Object.keys(sources).length).toBeGreaterThan(80);

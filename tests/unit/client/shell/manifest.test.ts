@@ -1,9 +1,21 @@
 // The web app manifest parses, and every icon it names exists with the size it claims.
 import { describe, expect, it } from "vitest";
 
-const manifestText = import.meta.glob<string>("/public/manifest.webmanifest", { query: "?raw", import: "default", eager: true })["/public/manifest.webmanifest"]!;
-const icons = import.meta.glob<string>("/public/icons/*.png", { query: "?inline", import: "default", eager: true });
-const svgs = import.meta.glob<string>("/public/icons/*.svg", { query: "?raw", import: "default", eager: true });
+const manifestText = import.meta.glob<string>("/public/manifest.webmanifest", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+})["/public/manifest.webmanifest"]!;
+const icons = import.meta.glob<string>("/public/icons/*.png", {
+  query: "?inline",
+  import: "default",
+  eager: true,
+});
+const svgs = import.meta.glob<string>("/public/icons/*.svg", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
 
 interface ManifestIcon {
   src: string;
@@ -21,7 +33,13 @@ function pngSize(dataUri: string): { width: number; height: number } {
 }
 
 describe("manifest.webmanifest", () => {
-  const manifest = JSON.parse(manifestText) as { name: string; short_name: string; display: string; start_url: string; icons: ManifestIcon[] };
+  const manifest = JSON.parse(manifestText) as {
+    name: string;
+    short_name: string;
+    display: string;
+    start_url: string;
+    icons: ManifestIcon[];
+  };
 
   it("names the app and is standalone", () => {
     expect(manifest.name).toBe("Holdfast");

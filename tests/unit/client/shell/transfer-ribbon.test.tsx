@@ -1,6 +1,12 @@
 import { act, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { ANNOUNCE_INTERVAL_MS, getRibbonSnapshot, publish, setPanel, TransferRibbon } from "../../../../src/client/components/TransferRibbon";
+import {
+  ANNOUNCE_INTERVAL_MS,
+  getRibbonSnapshot,
+  publish,
+  setPanel,
+  TransferRibbon,
+} from "../../../../src/client/components/TransferRibbon";
 import { renderShell, setupShell } from "./helpers";
 
 setupShell();
@@ -64,7 +70,9 @@ describe("ribbon store", () => {
 describe("TransferRibbon", () => {
   it("idle: a hairline, no progressbar", () => {
     const { container } = renderShell(<TransferRibbon />);
-    expect(container.querySelector("[data-transfer-ribbon]")?.getAttribute("data-transfer-ribbon")).toBe("idle");
+    expect(container.querySelector("[data-transfer-ribbon]")?.getAttribute("data-transfer-ribbon")).toBe(
+      "idle",
+    );
     expect(screen.queryByRole("progressbar")).toBeNull();
   });
 
@@ -99,7 +107,9 @@ describe("TransferRibbon", () => {
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.queryByText("panel rows")).toBeNull();
     act(() => publish("upload", active(0.1, "Uploading again")));
-    expect(screen.getByRole("button", { name: /Uploading again/ }).getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByRole("button", { name: /Uploading again/ }).getAttribute("aria-expanded")).toBe(
+      "false",
+    );
   });
 
   it("announces sentence changes in a live region, throttled: the latest wins", () => {

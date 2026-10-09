@@ -57,7 +57,12 @@ function readLocal(): Prefs {
   } catch {
     // Storage blocked or corrupt: defaults.
   }
-  return { ...DEFAULTS, density: stored.density ?? DEFAULTS.density, viewMode: stored.viewMode ?? DEFAULTS.viewMode, theme };
+  return {
+    ...DEFAULTS,
+    density: stored.density ?? DEFAULTS.density,
+    viewMode: stored.viewMode ?? DEFAULTS.viewMode,
+    theme,
+  };
 }
 
 function writeLocal(prefs: Prefs): void {
@@ -102,7 +107,8 @@ export function getPrefs(): Prefs {
 export function setPrefs(patch: Partial<Prefs>, options: { fromServer?: boolean } = {}): void {
   const clean = sanitizePrefs(patch);
   const next = { ...state, ...clean };
-  if (next.theme === state.theme && next.density === state.density && next.viewMode === state.viewMode) return;
+  if (next.theme === state.theme && next.density === state.density && next.viewMode === state.viewMode)
+    return;
   state = next;
   writeLocal(state);
   applyDensity();

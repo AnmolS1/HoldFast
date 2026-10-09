@@ -13,7 +13,12 @@ import { resetRibbonForTests } from "../../../../src/client/components/TransferR
 import { resetApiForTests } from "../../../../src/client/lib/api";
 import type { PublicConfig, SessionShape, SessionUserShape } from "../../../../src/client/lib/contracts";
 import { resetPrefsForTests } from "../../../../src/client/lib/prefs";
-import { publicConfigQuery, queryClient, resetIdentityForTests, sessionQuery } from "../../../../src/client/lib/query";
+import {
+  publicConfigQuery,
+  queryClient,
+  resetIdentityForTests,
+  sessionQuery,
+} from "../../../../src/client/lib/query";
 import { connectRouter } from "../../../../src/client/router";
 import { closeShortcuts } from "../../../../src/client/routes/help";
 import { HoldfastThemeProvider } from "../../../../src/client/theme";
@@ -46,7 +51,10 @@ export const USER: SessionUserShape = {
   deleteScheduledAt: null,
 };
 
-export function sessionOf(patch: Partial<SessionUserShape> = {}, session: { impersonatedBy?: string | null } = {}): NonNullable<SessionShape> {
+export function sessionOf(
+  patch: Partial<SessionUserShape> = {},
+  session: { impersonatedBy?: string | null } = {},
+): NonNullable<SessionShape> {
   return { user: { ...USER, ...patch }, session };
 }
 
@@ -95,7 +103,8 @@ function installMatchMedia(): void {
         const wrapped = handlers.get(handler);
         if (wrapped) mediaListeners.delete(wrapped);
       },
-      addListener: (handler: (event: { matches: boolean }) => void) => list.addEventListener("change", handler),
+      addListener: (handler: (event: { matches: boolean }) => void) =>
+        list.addEventListener("change", handler),
       removeListener: (handler: unknown) => list.removeEventListener("change", handler),
       dispatchEvent: () => false,
     };
@@ -148,8 +157,14 @@ function installObservers(): void {
     unobserve() {}
     disconnect() {}
   }
-  Object.assign(window, { IntersectionObserver: FakeIntersectionObserver, ResizeObserver: FakeResizeObserver });
-  Object.assign(globalThis, { IntersectionObserver: FakeIntersectionObserver, ResizeObserver: FakeResizeObserver });
+  Object.assign(window, {
+    IntersectionObserver: FakeIntersectionObserver,
+    ResizeObserver: FakeResizeObserver,
+  });
+  Object.assign(globalThis, {
+    IntersectionObserver: FakeIntersectionObserver,
+    ResizeObserver: FakeResizeObserver,
+  });
   Element.prototype.scrollIntoView = () => {};
   Element.prototype.scrollTo = (() => {}) as Element["scrollTo"];
 }
@@ -161,7 +176,17 @@ export function stubLayout(width = 1000, height = 600): () => void {
     vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(width),
     vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(width),
     vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(height),
-    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ width, height, top: 0, left: 0, right: width, bottom: height, x: 0, y: 0, toJSON: () => ({}) }),
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      width,
+      height,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: height,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }),
   ];
   return () => spies.forEach((spy) => spy.mockRestore());
 }
@@ -178,10 +203,18 @@ export interface MockCall {
 export type MockHandler = (call: MockCall) => Response | Promise<Response> | undefined;
 
 export function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
-  return new Response(body === undefined ? null : JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+  return new Response(body === undefined ? null : JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
 }
 
-export function envelope(error: string, status: number, details?: Record<string, unknown>, headers: Record<string, string> = {}): Response {
+export function envelope(
+  error: string,
+  status: number,
+  details?: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Response {
   return json({ error, message: `${error} message`, requestId: "req-1234", details }, status, headers);
 }
 
@@ -189,7 +222,10 @@ export function envelope(error: string, status: number, details?: Record<string,
 export function mockFetch(handler: MockHandler): MockCall[] {
   const calls: MockCall[] = [];
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init: RequestInit = {}) => {
-    const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url, "http://localhost:3000");
+    const url = new URL(
+      typeof input === "string" || input instanceof URL ? String(input) : input.url,
+      "http://localhost:3000",
+    );
     let body: unknown = init.body;
     if (typeof body === "string") {
       try {
@@ -198,7 +234,12 @@ export function mockFetch(handler: MockHandler): MockCall[] {
         // not JSON
       }
     }
-    const call: MockCall = { method: (init.method ?? "GET").toUpperCase(), path: url.pathname + url.search, body, headers: (init.headers ?? {}) as Record<string, string> };
+    const call: MockCall = {
+      method: (init.method ?? "GET").toUpperCase(),
+      path: url.pathname + url.search,
+      body,
+      headers: (init.headers ?? {}) as Record<string, string>,
+    };
     calls.push(call);
     return (await handler(call)) ?? envelope("not_found", 404);
   });
@@ -206,12 +247,20 @@ export function mockFetch(handler: MockHandler): MockCall[] {
 }
 
 /** The two requests every guarded route makes, plus whatever `extra` answers. */
-export function shellFetch(options: { session?: SessionShape | (() => SessionShape); config?: Partial<PublicConfig> | (() => PublicConfig); extra?: MockHandler } = {}): MockCall[] {
+export function shellFetch(
+  options: {
+    session?: SessionShape | (() => SessionShape);
+    config?: Partial<PublicConfig> | (() => PublicConfig);
+    extra?: MockHandler;
+  } = {},
+): MockCall[] {
   return mockFetch((call) => {
     const extra = options.extra?.(call);
     if (extra) return extra;
-    if (call.path === "/api/auth/get-session") return json(typeof options.session === "function" ? options.session() : (options.session ?? null));
-    if (call.path === "/api/public/config") return json(typeof options.config === "function" ? options.config() : { ...CONFIG, ...options.config });
+    if (call.path === "/api/auth/get-session")
+      return json(typeof options.session === "function" ? options.session() : (options.session ?? null));
+    if (call.path === "/api/public/config")
+      return json(typeof options.config === "function" ? options.config() : { ...CONFIG, ...options.config });
     if (call.path === "/api/account/deletion-status") return json({ scheduledFor: null });
     return undefined;
   });
@@ -232,7 +281,11 @@ export function renderShell(ui: ReactElement): RenderResult {
 }
 
 /** Render a route tree in a memory router wired to the API client like the real one. */
-export function renderRoutes(routes: RouteObject[], initialEntries: Array<string | { pathname: string; search?: string; state?: unknown }>, extra?: ReactNode) {
+export function renderRoutes(
+  routes: RouteObject[],
+  initialEntries: Array<string | { pathname: string; search?: string; state?: unknown }>,
+  extra?: ReactNode,
+) {
   const router = createMemoryRouter(routes, { initialEntries });
   connectRouter(router);
   const view = render(

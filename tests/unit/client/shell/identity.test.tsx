@@ -9,11 +9,27 @@ import { toast, getToasts } from "../../../../src/client/components/Toaster";
 import { api, configureApi, isReauthPending, isTermsPending } from "../../../../src/client/lib/api";
 import { authClient } from "../../../../src/client/lib/auth-client";
 import { registerUserStatePurger, type SessionShape } from "../../../../src/client/lib/contracts";
-import { getKnownUserId, purgeUserState, queryClient, refreshSession } from "../../../../src/client/lib/query";
+import {
+  getKnownUserId,
+  purgeUserState,
+  queryClient,
+  refreshSession,
+} from "../../../../src/client/lib/query";
 import { buildRoutes } from "../../../../src/client/router";
 import { ReauthDialog } from "../../../../src/client/routes/auth";
 import { lightTokens } from "../../../../src/client/theme/tokens";
-import { envelope, flush, json, renderRoutes, renderShell, resolveVar, seedConfig, sessionOf, setupShell, shellFetch } from "./helpers";
+import {
+  envelope,
+  flush,
+  json,
+  renderRoutes,
+  renderShell,
+  resolveVar,
+  seedConfig,
+  sessionOf,
+  setupShell,
+  shellFetch,
+} from "./helpers";
 
 setupShell();
 
@@ -24,7 +40,14 @@ let assigned: string[];
 beforeEach(() => {
   assigned = [];
   // jsdom cannot navigate: record hard navigations instead.
-  Object.defineProperty(window, "location", { configurable: true, value: { ...window.location, origin: "http://localhost:3000", assign: (url: string) => void assigned.push(url) } });
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    value: {
+      ...window.location,
+      origin: "http://localhost:3000",
+      assign: (url: string) => void assigned.push(url),
+    },
+  });
   configureApi({ routeInfo: () => ({ public: false, auth: false }) });
 });
 
@@ -35,7 +58,8 @@ async function aliceWithHeldRequest(next: () => SessionShape) {
   const calls = shellFetch({
     session: () => current,
     extra: (call) => {
-      if (call.path === "/api/nodes/delete") return expired ? envelope("unauthorized", 401) : json({ deleted: true, as: current?.user.id });
+      if (call.path === "/api/nodes/delete")
+        return expired ? envelope("unauthorized", 401) : json({ deleted: true, as: current?.user.id });
       return undefined;
     },
   });

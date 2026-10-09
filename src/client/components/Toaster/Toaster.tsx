@@ -50,12 +50,21 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
             entry.action?.onClick();
             dismissToast(entry.id);
           }}
-          sx={{ color: "inherit", fontWeight: 600, textDecoration: "underline", "&:hover": { backgroundColor: "transparent", color: "inherit", opacity: 0.85 } }}
+          sx={{
+            color: "inherit",
+            fontWeight: 600,
+            textDecoration: "underline",
+            "&:hover": { backgroundColor: "transparent", color: "inherit", opacity: 0.85 },
+          }}
         >
           {entry.action.label}
         </Button>
       ) : null}
-      <IconButton aria-label={t("toast.dismiss")} onClick={() => dismissToast(entry.id)} sx={{ color: "inherit", "&:hover": { backgroundColor: "transparent", opacity: 0.8 } }}>
+      <IconButton
+        aria-label={t("toast.dismiss")}
+        onClick={() => dismissToast(entry.id)}
+        sx={{ color: "inherit", "&:hover": { backgroundColor: "transparent", opacity: 0.8 } }}
+      >
         <X size={16} aria-hidden="true" />
       </IconButton>
     </Box>

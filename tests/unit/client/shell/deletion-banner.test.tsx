@@ -12,10 +12,16 @@ const banner = () => document.querySelector('[data-banner="deletion"]');
 
 describe("deletion banner", () => {
   it("is shown when the account is scheduled for deletion, with the date and the paused-links sentence", async () => {
-    shellFetch({ session: sessionOf({ deleteScheduledAt: WHEN }), extra: (call) => (call.path === "/api/account/deletion-status" ? json({ scheduledFor: WHEN }) : undefined) });
+    shellFetch({
+      session: sessionOf({ deleteScheduledAt: WHEN }),
+      extra: (call) =>
+        call.path === "/api/account/deletion-status" ? json({ scheduledFor: WHEN }) : undefined,
+    });
     renderRoutes(buildRoutes(), ["/"]);
     await waitFor(() => expect(banner()).not.toBeNull());
-    expect(banner()!.textContent).toContain("This account is scheduled for deletion on October 15, 2026. Your links are paused until then.");
+    expect(banner()!.textContent).toContain(
+      "This account is scheduled for deletion on October 15, 2026. Your links are paused until then.",
+    );
     expect(screen.getByRole("button", { name: "Cancel deletion" })).toBeTruthy();
   });
 
@@ -63,29 +69,44 @@ describe("deletion banner", () => {
     });
     renderRoutes(buildRoutes(), ["/"]);
     fireEvent.click(await screen.findByRole("button", { name: "Cancel deletion" }));
-    await waitFor(() => expect(banner()!.textContent).toContain("Deletion has already started — contact support."));
+    await waitFor(() =>
+      expect(banner()!.textContent).toContain("Deletion has already started — contact support."),
+    );
     expect(screen.queryByRole("button", { name: "Cancel deletion" })).toBeNull();
     expect(getToasts()).toEqual([]);
   });
 
   it("?deletion=scheduled re-reads the status and the session, shows the banner, and drops the parameter", async () => {
     // The session cookie is cached: it does not carry the date yet. The status route does.
-    const calls = shellFetch({ session: sessionOf(), extra: (call) => (call.path === "/api/account/deletion-status" ? json({ scheduledFor: WHEN }) : undefined) });
+    const calls = shellFetch({
+      session: sessionOf(),
+      extra: (call) =>
+        call.path === "/api/account/deletion-status" ? json({ scheduledFor: WHEN }) : undefined,
+    });
     const { router } = renderRoutes(buildRoutes(), ["/account?deletion=scheduled&tab=x"]);
     await waitFor(() => expect(banner()).not.toBeNull());
     await waitFor(() => expect(router.state.location.search).toBe("?tab=x"));
     expect(router.state.location.pathname).toBe("/account");
     expect(document.querySelector('[data-placeholder-page="Account"]')).not.toBeNull();
-    expect(calls.filter((call) => call.path === "/api/account/deletion-status").length).toBeGreaterThanOrEqual(1);
+    expect(
+      calls.filter((call) => call.path === "/api/account/deletion-status").length,
+    ).toBeGreaterThanOrEqual(1);
     expect(calls.filter((call) => call.path === "/api/auth/get-session").length).toBeGreaterThanOrEqual(2);
   });
 
   it("impersonation and read-only banners", async () => {
-    shellFetch({ session: sessionOf({ name: "Grace Hopper" }, { impersonatedBy: "b".repeat(32) }), config: { readOnly: true } });
+    shellFetch({
+      session: sessionOf({ name: "Grace Hopper" }, { impersonatedBy: "b".repeat(32) }),
+      config: { readOnly: true },
+    });
     renderRoutes(buildRoutes(), ["/"]);
     await waitFor(() => expect(document.querySelector('[data-banner="impersonation"]')).not.toBeNull());
-    expect(document.querySelector('[data-banner="impersonation"]')!.textContent).toContain("Viewing as Grace Hopper — read-only");
+    expect(document.querySelector('[data-banner="impersonation"]')!.textContent).toContain(
+      "Viewing as Grace Hopper — read-only",
+    );
     expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy();
-    expect(document.querySelector('[data-banner="read-only"]')!.textContent).toContain("Holdfast is read-only for maintenance.");
+    expect(document.querySelector('[data-banner="read-only"]')!.textContent).toContain(
+      "Holdfast is read-only for maintenance.",
+    );
   });
 });

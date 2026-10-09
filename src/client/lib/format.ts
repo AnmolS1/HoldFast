@@ -53,7 +53,12 @@ export function formatDate(
   const style = options.style ?? "short";
   const locale = getLocale();
   if (style === "long") {
-    return new Intl.DateTimeFormat(locale, { timeZone, year: "numeric", month: "long", day: "numeric" }).format(date);
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    }).format(date);
   }
   if (style === "dateTime") {
     return new Intl.DateTimeFormat(locale, {

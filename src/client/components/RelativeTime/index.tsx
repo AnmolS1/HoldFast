@@ -17,7 +17,12 @@ export function RelativeTime({ value, variant = "relative", timeZone }: Relative
   const date = value instanceof Date ? value : new Date(value);
   const iso = Number.isNaN(date.getTime()) ? undefined : date.toISOString();
   return (
-    <Box component="time" className="mono" dateTime={iso} title={formatDate(value, { timeZone: zone, style: "dateTime" })}>
+    <Box
+      component="time"
+      className="mono"
+      dateTime={iso}
+      title={formatDate(value, { timeZone: zone, style: "dateTime" })}
+    >
       {variant === "date" ? formatDate(value, { timeZone: zone }) : formatRelative(value, { timeZone: zone })}
     </Box>
   );

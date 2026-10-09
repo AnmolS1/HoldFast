@@ -34,7 +34,11 @@ export function FrameBanner({ children, action, tone = "neutral", icon, name }: 
       }}
     >
       {icon ? (
-        <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: TONE[tone], flex: "none" }}>
+        <Box
+          component="span"
+          aria-hidden="true"
+          sx={{ display: "inline-flex", color: TONE[tone], flex: "none" }}
+        >
           {icon}
         </Box>
       ) : null}

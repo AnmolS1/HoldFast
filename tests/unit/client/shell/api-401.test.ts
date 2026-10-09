@@ -20,14 +20,24 @@ import { envelope, flush, json, mockFetch, seedConfig, seedSession, sessionOf, s
 setupShell();
 
 const APP: RouteInfo = { public: false, auth: false };
-const base: ReauthInput = { status: 401, code: "unauthorized", path: "/api/nodes", hadSession: true, route: APP };
+const base: ReauthInput = {
+  status: 401,
+  code: "unauthorized",
+  path: "/api/nodes",
+  hadSession: true,
+  route: APP,
+};
 
 describe("shouldReauth (pure)", () => {
   const table: Array<[string, Partial<ReauthInput>, boolean]> = [
     ["signed-in app route, 401 unauthorized on /api/nodes", {}, true],
     ["an absolute URL to the same kind of path", { path: "http://localhost:3000/api/nodes/1?x=1" }, true],
     ["/api/public/* never", { path: "/api/public/links/tok/info" }, false],
-    ["/api/auth/* never (a wrong password, any Better Auth answer)", { path: "/api/auth/sign-in/email" }, false],
+    [
+      "/api/auth/* never (a wrong password, any Better Auth answer)",
+      { path: "/api/auth/sign-in/email" },
+      false,
+    ],
     ["/api/auth-intent is not under /api/auth/ and does qualify", { path: "/api/auth-intent" }, true],
     ["a path outside /api/", { path: "/s/token" }, false],
     ["no session when the request was made", { hadSession: false }, false],
@@ -56,7 +66,13 @@ describe("401 through api()", () => {
     const onExpired = () => (expired += 1);
     window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
     let signedIn = false;
-    const calls = mockFetch((call) => (call.path === "/api/nodes" ? (signedIn ? json({ ok: true }) : envelope("unauthorized", 401)) : undefined));
+    const calls = mockFetch((call) =>
+      call.path === "/api/nodes"
+        ? signedIn
+          ? json({ ok: true })
+          : envelope("unauthorized", 401)
+        : undefined,
+    );
 
     const pending = api<{ ok: boolean }>("/api/nodes", { method: "POST", body: { name: "x" } });
     await flush();
@@ -117,13 +133,54 @@ describe("401 through api()", () => {
   });
 
   const noModal: Array<[string, () => void, string, Response]> = [
-    ["/api/public/* 401", () => seedSession(sessionOf()), "/api/public/links/t/info", envelope("unauthorized", 401)],
-    ["/api/auth/* 401", () => seedSession(sessionOf()), "/api/auth/sign-in/email", envelope("unauthorized", 401)],
-    ["any 401 on a handle.public route", () => { seedSession(sessionOf()); route = { public: true, auth: false }; }, "/api/nodes", envelope("unauthorized", 401)],
-    ["any 401 on an auth screen", () => { seedSession(sessionOf()); route = { public: false, auth: true }; }, "/api/nodes", envelope("unauthorized", 401)],
-    ["a 401 with no session at request time", () => seedSession(null), "/api/nodes", envelope("unauthorized", 401)],
-    ["403 password_required", () => seedSession(sessionOf()), "/api/public/links/t/download-url", envelope("password_required", 403)],
-    ["403 password_required even on an app path", () => seedSession(sessionOf()), "/api/nodes", envelope("password_required", 403)],
+    [
+      "/api/public/* 401",
+      () => seedSession(sessionOf()),
+      "/api/public/links/t/info",
+      envelope("unauthorized", 401),
+    ],
+    [
+      "/api/auth/* 401",
+      () => seedSession(sessionOf()),
+      "/api/auth/sign-in/email",
+      envelope("unauthorized", 401),
+    ],
+    [
+      "any 401 on a handle.public route",
+      () => {
+        seedSession(sessionOf());
+        route = { public: true, auth: false };
+      },
+      "/api/nodes",
+      envelope("unauthorized", 401),
+    ],
+    [
+      "any 401 on an auth screen",
+      () => {
+        seedSession(sessionOf());
+        route = { public: false, auth: true };
+      },
+      "/api/nodes",
+      envelope("unauthorized", 401),
+    ],
+    [
+      "a 401 with no session at request time",
+      () => seedSession(null),
+      "/api/nodes",
+      envelope("unauthorized", 401),
+    ],
+    [
+      "403 password_required",
+      () => seedSession(sessionOf()),
+      "/api/public/links/t/download-url",
+      envelope("password_required", 403),
+    ],
+    [
+      "403 password_required even on an app path",
+      () => seedSession(sessionOf()),
+      "/api/nodes",
+      envelope("password_required", 403),
+    ],
   ];
   it.each(noModal)("%s → no modal", async (_name, arrange, path, response) => {
     arrange();
@@ -165,7 +222,13 @@ describe("other statuses", () => {
     mockFetch(() => envelope("conflict", 409, { name: "taken" }));
     const error = await api("/api/nodes").catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
-    expect(error).toMatchObject({ status: 409, code: "conflict", message: "conflict message", requestId: "req-1234", details: { name: "taken" } });
+    expect(error).toMatchObject({
+      status: 409,
+      code: "conflict",
+      message: "conflict message",
+      requestId: "req-1234",
+      details: { name: "taken" },
+    });
   });
 
   it("403 account_suspended → signed out locally and sent to /login?reason=suspended", async () => {
@@ -185,7 +248,10 @@ describe("other statuses", () => {
   it("429 → a toast with Retry-After", async () => {
     mockFetch(() => envelope("rate_limited", 429, undefined, { "retry-after": "42" }));
     await expect(api("/api/nodes")).rejects.toMatchObject({ status: 429, retryAfter: 42 });
-    expect(getToasts()[0]).toMatchObject({ message: "Too many requests. Try again in 42 s.", requestId: "req-1234" });
+    expect(getToasts()[0]).toMatchObject({
+      message: "Too many requests. Try again in 42 s.",
+      requestId: "req-1234",
+    });
   });
 
   it("503 read_only → the config flips to read-only (the banner), plus a toast", async () => {
@@ -198,16 +264,23 @@ describe("other statuses", () => {
   it.each([
     ["uploads_disabled", "Uploads are paused right now.", "uploadsEnabled"],
     ["links_disabled", "Link sharing is paused right now.", "linksEnabled"],
-  ] as const)("503 feature_disabled %s → the toast names the feature and the control's flag flips", async (reason, message, flag) => {
-    mockFetch(() => envelope("feature_disabled", 503, { reason }));
-    await expect(api("/api/uploads", { method: "POST" })).rejects.toMatchObject({ status: 503 });
-    expect(getToasts()[0]?.message).toBe(message);
-    expect(queryClient.getQueryData(publicConfigQuery.queryKey)?.[flag]).toBe(false);
-  });
+  ] as const)(
+    "503 feature_disabled %s → the toast names the feature and the control's flag flips",
+    async (reason, message, flag) => {
+      mockFetch(() => envelope("feature_disabled", 503, { reason }));
+      await expect(api("/api/uploads", { method: "POST" })).rejects.toMatchObject({ status: 503 });
+      expect(getToasts()[0]?.message).toBe(message);
+      expect(queryClient.getQueryData(publicConfigQuery.queryKey)?.[flag]).toBe(false);
+    },
+  );
 
   it("an HTML answer where JSON was expected is an invalid_response error, not a crash", async () => {
-    mockFetch(() => new Response("<!doctype html>", { status: 200, headers: { "content-type": "text/html" } }));
-    await expect(api("/api/public/config", { schema: PublicConfig })).rejects.toMatchObject({ code: "invalid_response" });
+    mockFetch(
+      () => new Response("<!doctype html>", { status: 200, headers: { "content-type": "text/html" } }),
+    );
+    await expect(api("/api/public/config", { schema: PublicConfig })).rejects.toMatchObject({
+      code: "invalid_response",
+    });
   });
 
   it("sends same-origin credentials and JSON", async () => {

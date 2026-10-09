@@ -1,5 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { getPrefs, MODE_KEY, PREFS_KEY, registerPrefsSync, resetPrefsForTests, sanitizePrefs, setPrefs, SYNC_DEBOUNCE_MS, type Prefs } from "../../../../src/client/lib/prefs";
+import {
+  getPrefs,
+  MODE_KEY,
+  PREFS_KEY,
+  registerPrefsSync,
+  resetPrefsForTests,
+  sanitizePrefs,
+  setPrefs,
+  SYNC_DEBOUNCE_MS,
+  type Prefs,
+} from "../../../../src/client/lib/prefs";
 import { purgeUserState } from "../../../../src/client/lib/query";
 import { flush, mockFetch, setupShell } from "./helpers";
 
@@ -14,7 +24,10 @@ describe("prefs: local only", () => {
     const calls = mockFetch(() => undefined);
     setPrefs({ viewMode: "grid", density: "comfortable" });
     expect(getPrefs()).toMatchObject({ viewMode: "grid", density: "comfortable" });
-    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toEqual({ density: "comfortable", viewMode: "grid" });
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toEqual({
+      density: "comfortable",
+      viewMode: "grid",
+    });
     expect(document.documentElement.getAttribute("data-density")).toBe("comfortable");
     expect(calls).toEqual([]);
   });
@@ -64,9 +77,15 @@ describe("prefs: with a registered sync", () => {
   it("on registration the server copy wins and overwrites local", async () => {
     setPrefs({ viewMode: "grid", theme: "dark" });
     const save = vi.fn(async () => {});
-    await registerPrefsSync({ load: async () => ({ viewMode: "list", theme: "light", density: "comfortable" }), save });
+    await registerPrefsSync({
+      load: async () => ({ viewMode: "list", theme: "light", density: "comfortable" }),
+      save,
+    });
     expect(getPrefs()).toEqual({ viewMode: "list", theme: "light", density: "comfortable" });
-    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toEqual({ density: "comfortable", viewMode: "list" });
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toEqual({
+      density: "comfortable",
+      viewMode: "list",
+    });
     expect(localStorage.getItem(MODE_KEY)).toBe("light");
     // Adopting the server copy is not a change to push back.
     await flush(SYNC_DEBOUNCE_MS + 50);
@@ -87,7 +106,10 @@ describe("prefs: with a registered sync", () => {
 
   it("a failing load keeps the local copy; a failing save does not throw", async () => {
     setPrefs({ viewMode: "grid" });
-    await registerPrefsSync({ load: async () => Promise.reject(new Error("offline")), save: async () => Promise.reject(new Error("offline")) });
+    await registerPrefsSync({
+      load: async () => Promise.reject(new Error("offline")),
+      save: async () => Promise.reject(new Error("offline")),
+    });
     expect(getPrefs().viewMode).toBe("grid");
     setPrefs({ viewMode: "list" });
     await flush(SYNC_DEBOUNCE_MS + 50);

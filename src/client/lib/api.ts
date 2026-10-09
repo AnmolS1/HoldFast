@@ -61,7 +61,8 @@ const defaultEnvironment: ApiEnvironment = {
   hadSession: () => false,
   routeInfo: () => ({ public: false, auth: false }),
   navigate: () => {},
-  currentPath: () => (typeof location === "undefined" ? "/" : location.pathname + location.search + location.hash),
+  currentPath: () =>
+    typeof location === "undefined" ? "/" : location.pathname + location.search + location.hash,
   clearSession: () => {},
   patchConfig: () => {},
 };
@@ -276,7 +277,12 @@ async function toApiError(response: Response): Promise<ApiError> {
       retryAfter,
     });
   }
-  return new ApiError({ status: response.status, code: "http_error", message: t("toast.generic"), retryAfter });
+  return new ApiError({
+    status: response.status,
+    code: "http_error",
+    message: t("toast.generic"),
+    retryAfter,
+  });
 }
 
 async function send(path: string, options: ApiOptions<unknown>): Promise<Response> {
@@ -375,7 +381,13 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
     const error = await toApiError(response);
     if (!replayed) {
       if (
-        shouldReauth({ status: error.status, code: error.code, path, hadSession, route: environment.routeInfo() })
+        shouldReauth({
+          status: error.status,
+          code: error.code,
+          path,
+          hadSession,
+          route: environment.routeInfo(),
+        })
       ) {
         await waitForReauth();
         replayed = true;

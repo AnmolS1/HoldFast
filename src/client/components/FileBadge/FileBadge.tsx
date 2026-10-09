@@ -19,9 +19,24 @@ export function FileBadge({ name, mimeCategory, size = 16 }: FileBadgeProps) {
       component="span"
       aria-hidden="true"
       data-badge={text || undefined}
-      sx={{ position: "relative", display: "inline-flex", width: size, height: size, flex: "none", color: hf.textSecondary }}
+      sx={{
+        position: "relative",
+        display: "inline-flex",
+        width: size,
+        height: size,
+        flex: "none",
+        color: hf.textSecondary,
+      }}
     >
-      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={size >= 28 ? 1.25 : 2} strokeLinejoin="round">
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={size >= 28 ? 1.25 : 2}
+        strokeLinejoin="round"
+      >
         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
         <path d="M14 2v6h6" />
       </svg>
@@ -51,8 +66,20 @@ export function FileBadge({ name, mimeCategory, size = 16 }: FileBadgeProps) {
 /** The folder glyph: the only filled glyph, always graphite. Selection is shown by the row. */
 export function FolderGlyph({ size = 16 }: { size?: number }) {
   return (
-    <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", width: size, height: size, flex: "none", color: hf.text }}>
-      <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth={1.5} strokeLinejoin="round">
+    <Box
+      component="span"
+      aria-hidden="true"
+      sx={{ display: "inline-flex", width: size, height: size, flex: "none", color: hf.text }}
+    >
+      <svg
+        width={size}
+        height={size}
+        viewBox="0 0 24 24"
+        fill="currentColor"
+        stroke="currentColor"
+        strokeWidth={1.5}
+        strokeLinejoin="round"
+      >
         <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
       </svg>
     </Box>

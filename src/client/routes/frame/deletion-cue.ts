@@ -19,6 +19,9 @@ export function useDeletionCue(): void {
     void refreshSession().catch(() => {});
     params.delete("deletion");
     const search = params.toString();
-    navigate({ pathname: location.pathname, search: search ? `?${search}` : "", hash: location.hash }, { replace: true, state: location.state });
+    navigate(
+      { pathname: location.pathname, search: search ? `?${search}` : "", hash: location.hash },
+      { replace: true, state: location.state },
+    );
   }, [location, navigate, queryClient]);
 }

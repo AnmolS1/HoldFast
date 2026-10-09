@@ -39,7 +39,11 @@ export function DeletionBanner() {
     } catch (cause) {
       setBusy(false);
       if (cause instanceof ApiError && cause.status === 409) setStarted(true);
-      else toast({ message: t("banner.deletion.failed"), requestId: cause instanceof ApiError ? cause.requestId : undefined });
+      else
+        toast({
+          message: t("banner.deletion.failed"),
+          requestId: cause instanceof ApiError ? cause.requestId : undefined,
+        });
       return;
     }
     setBusy(false);
@@ -62,7 +66,11 @@ export function DeletionBanner() {
         )
       }
     >
-      {started ? t("banner.deletion.started") : t("banner.deletion", { date: formatDate(scheduledFor, { timeZone: session.user.timezone, style: "long" }) })}
+      {started
+        ? t("banner.deletion.started")
+        : t("banner.deletion", {
+            date: formatDate(scheduledFor, { timeZone: session.user.timezone, style: "long" }),
+          })}
     </FrameBanner>
   );
 }

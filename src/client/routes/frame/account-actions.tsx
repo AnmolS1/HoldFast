@@ -27,7 +27,10 @@ export interface AccountAction {
   desktopOnly?: boolean;
 }
 
-export const THEME_OPTIONS: Array<{ value: ThemePref; label: "user.theme.system" | "user.theme.light" | "user.theme.dark" }> = [
+export const THEME_OPTIONS: Array<{
+  value: ThemePref;
+  label: "user.theme.system" | "user.theme.light" | "user.theme.dark";
+}> = [
   { value: "system", label: "user.theme.system" },
   { value: "light", label: "user.theme.light" },
   { value: "dark", label: "user.theme.dark" },
@@ -50,15 +53,41 @@ export function useAccountActions(): AccountAction[] {
     { id: "settings", label: t("user.settings"), icon: <Settings size={16} />, to: "/account" },
     { id: "storage", label: t("user.storage"), icon: <HardDrive size={16} />, to: "/storage" },
   ];
-  if (session?.user.role === "admin") actions.push({ id: "admin", label: t("nav.admin"), icon: <ShieldCheck size={16} />, to: "/admin" });
+  if (session?.user.role === "admin")
+    actions.push({ id: "admin", label: t("nav.admin"), icon: <ShieldCheck size={16} />, to: "/admin" });
   actions.push(
-    { id: "help", label: t("user.help"), icon: <CircleHelp size={16} />, href: EXTERNAL_LINKS.help, divider: true },
-    { id: "shortcuts", label: t("user.shortcuts"), icon: <Keyboard size={16} />, onSelect: openShortcuts, shortcut: shortcutLabel("help"), desktopOnly: true },
+    {
+      id: "help",
+      label: t("user.help"),
+      icon: <CircleHelp size={16} />,
+      href: EXTERNAL_LINKS.help,
+      divider: true,
+    },
+    {
+      id: "shortcuts",
+      label: t("user.shortcuts"),
+      icon: <Keyboard size={16} />,
+      onSelect: openShortcuts,
+      shortcut: shortcutLabel("help"),
+      desktopOnly: true,
+    },
     { id: "support", label: t("user.support"), icon: <Mail size={16} />, href: EXTERNAL_LINKS.support },
-    { id: "terms", label: t("user.terms"), icon: <Scale size={16} />, href: EXTERNAL_LINKS.terms, divider: true },
+    {
+      id: "terms",
+      label: t("user.terms"),
+      icon: <Scale size={16} />,
+      href: EXTERNAL_LINKS.terms,
+      divider: true,
+    },
     { id: "privacy", label: t("user.privacy"), icon: <Scale size={16} />, href: EXTERNAL_LINKS.privacy },
     { id: "dmca", label: t("user.dmca"), icon: <Scale size={16} />, to: "/dmca" },
-    { id: "sign-out", label: t("user.signOut"), icon: <LogOut size={16} />, onSelect: () => void signOut(), divider: true },
+    {
+      id: "sign-out",
+      label: t("user.signOut"),
+      icon: <LogOut size={16} />,
+      onSelect: () => void signOut(),
+      divider: true,
+    },
   );
   return actions;
 }
