@@ -13,6 +13,7 @@
 
 import { generateId } from "@better-auth/core/utils/id";
 import { Hono } from "hono";
+import { guard } from "../auth/observe";
 import { scopeOf } from "../auth/create-auth";
 import { INTENT_COOKIE, mintIntent, setCookieHeader } from "../auth/signed-cookie";
 import { insertIntent } from "../db/queries/auth-lifecycle";
@@ -24,31 +25,34 @@ import { parseStatement, precheckSignup, SignupRefusal } from "../services/signu
 
 export const router = new Hono<AppEnv>();
 
-router.post("/auth-intent", async (c) => {
-  const scope = scopeOf(auth(c));
-  if (!scope) throw new Error("no auth scope");
-  const at = now(c);
-  try {
-    const statement = parseStatement(await jsonBody(c), at);
-    const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
-    await precheckSignup(scope, null, statement, {
-      ip: c.get("ip"),
-      asn: typeof cf?.asn === "number" ? cf.asn : null,
-      country: typeof cf?.country === "string" ? cf.country : null,
-      userAgent: c.req.header("user-agent") ?? null,
-    });
-    const intent = await mintIntent(scope.keys, statement.inviteCode, at);
-    await insertIntent(scope.db, {
-      id: generateId(),
-      nonce: intent.nonce,
-      expiresAt: intent.expiresAt,
-      now: at,
-    });
-    c.header("Set-Cookie", setCookieHeader(c.env, INTENT_COOKIE, intent.value));
-    return c.json({ ok: true });
-  } catch (error) {
-    if (error instanceof SignupRefusal)
-      throw new AppError("validation", error.message, { reason: error.code });
-    throw error;
-  }
-});
+router.post(
+  "/auth-intent",
+  guard("auth_intent", async (c) => {
+    const scope = scopeOf(auth(c));
+    if (!scope) throw new Error("no auth scope");
+    const at = now(c);
+    try {
+      const statement = parseStatement(await jsonBody(c), at);
+      const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
+      await precheckSignup(scope, null, statement, {
+        ip: c.get("ip"),
+        asn: typeof cf?.asn === "number" ? cf.asn : null,
+        country: typeof cf?.country === "string" ? cf.country : null,
+        userAgent: c.req.header("user-agent") ?? null,
+      });
+      const intent = await mintIntent(scope.keys, statement.inviteCode, at);
+      await insertIntent(scope.db, {
+        id: generateId(),
+        nonce: intent.nonce,
+        expiresAt: intent.expiresAt,
+        now: at,
+      });
+      c.header("Set-Cookie", setCookieHeader(c.env, INTENT_COOKIE, intent.value));
+      return c.json({ ok: true });
+    } catch (error) {
+      if (error instanceof SignupRefusal)
+        throw new AppError("validation", error.message, { reason: error.code });
+      throw error;
+    }
+  }),
+);

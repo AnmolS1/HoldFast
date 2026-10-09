@@ -25,10 +25,8 @@ import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath, recordAdminDenial } from "../a
 import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
-import { safeError } from "../auth/redact";
-import { captureError } from "../sentry";
+import { count, guard, isAnswer, reportError } from "../auth/observe";
 import { AppError } from "../services/errors";
-import { metric } from "../services/metrics";
 import { auth, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
@@ -97,72 +95,80 @@ async function smallJsonBody(request: Request): Promise<unknown> {
   }
 }
 
-router.all("/auth/*", async (c) => {
-  const instance = auth(c);
-  const scope = scopeOf(instance);
-  // The path exactly as it was sent (Hono's `c.req.path` is percent-decoded).
-  const relativePath = new URL(c.req.url).pathname.slice(AUTH_PREFIX.length);
-  const method = c.req.method;
+router.all(
+  "/auth/*",
+  guard("auth", async (c) => {
+    const instance = auth(c);
+    const scope = scopeOf(instance);
+    // The path exactly as it was sent (Hono's `c.req.path` is percent-decoded).
+    const relativePath = new URL(c.req.url).pathname.slice(AUTH_PREFIX.length);
+    const method = c.req.method;
 
-  // 1. The admin plugin: by raw path, before Better Auth routes anything.
-  if (isAdminPluginPath(relativePath) && !ALLOWED_ADMIN.includes(relativePath)) {
-    if (scope) await recordAdminDenial(scope, c.get("user")?.id ?? null, relativePath, method);
-    throw new AppError("forbidden", "This admin action is not available.", {
-      reason: "admin_endpoint_denied",
-    });
-  }
-
-  // 2. What the hooks need from the request.
-  const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
-  if (scope) {
-    scope.client = {
-      ip: c.get("ip"),
-      asn: typeof cf?.asn === "number" ? cf.asn : null,
-      country: typeof cf?.country === "string" ? cf.country : null,
-      userAgent: c.req.header("user-agent") ?? null,
-    };
-  }
-  const request = withClientAddress(c.req.raw, c.get("ip"));
-  const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
-
-  // 3. The watchdog.
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<typeof HANG>((resolve) => {
-    timer = setTimeout(() => resolve(HANG), handlerTimeoutMs);
-  });
-  let response: Response;
-  try {
-    const handled = instance.handler(request);
-    // The loser of the race must not become an unhandled rejection.
-    handled.catch(() => {});
-    const outcome = await Promise.race([handled, timeout]);
-    if (outcome === HANG) {
-      metric("auth", { outcome: "hang" });
-      captureError(new Error("the auth handler did not answer within 10 s"), { kind: "auth_hang" });
-      return c.json(
-        {
-          error: INTERNAL_ERROR,
-          message: "Sign-in is not available right now.",
-          requestId: c.get("requestId"),
-        },
-        503,
-        { "Retry-After": "30" },
-      );
+    // 1. The admin plugin: by raw path, before Better Auth routes anything.
+    if (isAdminPluginPath(relativePath) && !ALLOWED_ADMIN.includes(relativePath)) {
+      if (scope) await recordAdminDenial(scope, c.get("user")?.id ?? null, relativePath, method);
+      throw new AppError("forbidden", "This admin action is not available.", {
+        reason: "admin_endpoint_denied",
+      });
     }
-    response = outcome;
-  } catch (error) {
-    // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
-    // What goes on — to the error handler, and from there to Sentry — is a sanitised copy:
-    // the class, the code and the scanned message. A database error carries the row it was
-    // about (the address, in `detail`), and none of that may leave with it.
-    if (error instanceof AppError) throw error;
-    metric("auth", { outcome: "error" });
-    throw safeError(error);
-  } finally {
-    clearTimeout(timer);
-  }
 
-  // 4. What happened, for the audit log.
-  if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
-  return response;
-});
+    // 2. What the hooks need from the request.
+    const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
+    if (scope) {
+      scope.client = {
+        ip: c.get("ip"),
+        asn: typeof cf?.asn === "number" ? cf.asn : null,
+        country: typeof cf?.country === "string" ? cf.country : null,
+        userAgent: c.req.header("user-agent") ?? null,
+      };
+    }
+    const request = withClientAddress(c.req.raw, c.get("ip"));
+    const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
+
+    // 3. The watchdog.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof HANG>((resolve) => {
+      timer = setTimeout(() => resolve(HANG), handlerTimeoutMs);
+    });
+    let response: Response;
+    try {
+      const handled = instance.handler(request);
+      // The loser of the race must not become an unhandled rejection.
+      handled.catch(() => {});
+      const outcome = await Promise.race([handled, timeout]);
+      if (outcome === HANG) {
+        count("auth", { outcome: "hang" });
+        reportError(new Error("the auth handler did not answer within 10 s"), { kind: "auth_hang" });
+        return c.json(
+          {
+            error: INTERNAL_ERROR,
+            message: "Sign-in is not available right now.",
+            requestId: c.get("requestId"),
+          },
+          503,
+          { "Retry-After": "30" },
+        );
+      }
+      response = outcome;
+    } catch (error) {
+      // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
+      // It is reported from here as a sanitised copy — the class, the code and the scanned
+      // message; a database error carries the row it was about, and none of that may leave with
+      // it — and answered here. The caught object goes nowhere: not to a sink, and not to the
+      // app's error handler.
+      if (isAnswer(error)) throw error;
+      count("auth", { outcome: "error" });
+      reportError(error, { kind: "auth_handler" });
+      return c.json(
+        { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
+        500,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // 4. What happened, for the audit log.
+    if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
+    return response;
+  }),
+);

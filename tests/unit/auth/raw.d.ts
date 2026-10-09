@@ -4,3 +4,8 @@ declare module "*?raw" {
   const text: string;
   export default text;
 }
+
+// Vite's `import.meta.glob`, as the source scan in observability.test.ts uses it (eager, raw).
+interface ImportMeta {
+  glob(pattern: string, options: { query: "?raw"; import: "default"; eager: true }): Record<string, string>;
+}

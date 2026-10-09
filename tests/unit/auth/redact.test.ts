@@ -13,10 +13,6 @@ import {
   scrubText,
 } from "../../../src/worker/auth/redact";
 import { createScope } from "../../../src/worker/auth/scope";
-import loggerSource from "../../../src/worker/auth/logger.ts?raw";
-import hooksSource from "../../../src/worker/auth/hooks.ts?raw";
-import emailSource from "../../../src/worker/services/email.ts?raw";
-import routeSource from "../../../src/worker/routes/auth.ts?raw";
 import {
   auditRows,
   CAPTCHA,
@@ -278,19 +274,6 @@ describe("Better Auth's logger", () => {
       createScope(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} }),
     );
     expect(options.logger).toMatchObject({ level: "warn", log: authLog, disabled: false });
-  });
-
-  it("the layer has no other way to the log: no console call outside the logger, and every Sentry capture is of a safeError", () => {
-    const sources = { hooksSource, emailSource, routeSource };
-    for (const [name, source] of Object.entries(sources)) {
-      expect(source, name).not.toMatch(/console\.(log|info|warn|error|debug)\(/);
-      const captures = source.match(/captureError\(([^,)]*)/g) ?? [];
-      expect(captures.length, name).toBeGreaterThan(0);
-      // A capture is of a sanitised error, or of a constant message written here.
-      for (const capture of captures)
-        expect(capture, name).toMatch(/captureError\((safeError\(|new Error\(")/);
-    }
-    expect(loggerSource).toMatch(/describeValue/);
   });
 });
 

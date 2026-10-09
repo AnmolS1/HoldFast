@@ -33,10 +33,8 @@
 import { APIError, getSessionFromCtx } from "better-auth/api";
 import { hasAdminRole } from "../../shared/roles";
 import { getAccount } from "../db/queries/auth-lifecycle";
-import { audit } from "../services/audit";
-import { metric } from "../services/metrics";
 import type { ServiceDeps } from "../services/request-context";
-import { scrubText } from "./redact";
+import { count, record, sinkPath } from "./observe";
 import type { AuthScope } from "./scope";
 
 /** Relative to Better Auth's `basePath` (/api/auth). The five plugin calls the admin console makes. */
@@ -92,7 +90,7 @@ async function auditNow(
 ): Promise<void> {
   const local: Promise<unknown>[] = [];
   const deps: ServiceDeps = { db: scope.db, env: scope.env, defer: (promise) => void local.push(promise) };
-  audit(deps, "auth.admin_endpoint_denied", { type: "auth_endpoint" }, meta, {
+  record(deps, "auth.admin_endpoint_denied", { type: "auth_endpoint" }, meta, {
     actorUserId,
     actorType: actorUserId ? "user" : "system",
   });
@@ -107,11 +105,11 @@ export async function recordAdminDenial(
   method: string,
 ): Promise<void> {
   scope.facts.adminDenied = true;
-  metric("auth", { outcome: "denied", kind: "admin_endpoint" });
+  count("auth", { outcome: "denied", kind: "admin_endpoint" });
   // The path is attacker-controlled text: recorded capped, and scanned like any free text (an
   // address or a token typed into it does not belong in the audit log).
   await auditNow(scope, actorUserId, {
-    path: scrubText(path).slice(0, 200),
+    path: sinkPath(path),
     method: /^[A-Z]{1,16}$/.test(method) ? method : "OTHER",
   });
 }

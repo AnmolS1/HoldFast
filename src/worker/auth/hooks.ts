@@ -27,11 +27,9 @@ import { APIError, createAuthMiddleware } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
 import { ensureUserPrefs, getAccountByEmail, releaseSignup } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
-import { captureError } from "../sentry";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
 import { sendSignupAttempt } from "../services/email";
-import { writeMetric } from "../services/metrics";
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
   checkSessionStart,
@@ -43,7 +41,7 @@ import {
   type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
-import { safeError } from "./redact";
+import { countFor, reportError } from "./observe";
 import type { AuthScope, ClientFacts } from "./scope";
 import {
   cookieAttributes,
@@ -90,8 +88,8 @@ async function quietly(env: Env, kind: string, work: () => Promise<void>): Promi
   try {
     await work();
   } catch (error) {
-    captureError(safeError(error), { kind: `auth_hook_${kind}` });
-    writeMetric(env, "error", { kind: "auth_hook", reason: kind });
+    reportError(error, { kind: `auth_hook_${kind}` });
+    countFor(env, "error", { kind: "auth_hook", reason: kind });
   }
 }
 

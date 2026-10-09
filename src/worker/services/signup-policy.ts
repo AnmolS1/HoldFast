@@ -40,7 +40,7 @@ import {
   type VelocitySubject,
 } from "../db/queries/auth-lifecycle";
 import { todayTotals, utcDay } from "../db/queries/ledger";
-import { audit } from "./audit";
+import { record } from "../auth/observe";
 import { now } from "./clock";
 import { ipHashDaily, ipPrefix } from "./ip-hash";
 
@@ -383,7 +383,7 @@ export async function checkSessionStart(
     !hasAdminRole(account.role)
   ) {
     if (await grantAdminRole(scope.db, userId)) {
-      audit(scope.deps, "auth.admin_granted", { type: "user", id: userId }, { source: "ADMIN_EMAILS" });
+      record(scope.deps, "auth.admin_granted", { type: "user", id: userId }, { source: "ADMIN_EMAILS" });
     }
   }
 }

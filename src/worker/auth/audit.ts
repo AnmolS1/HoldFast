@@ -26,7 +26,6 @@
 
 import type { Context } from "hono";
 import { getAccount, getAccountByEmail, knownDevices } from "../db/queries/auth-lifecycle";
-import { audit } from "../services/audit";
 import { now } from "../services/clock";
 import {
   sendNewDeviceSignIn,
@@ -36,8 +35,8 @@ import {
   sendTwoFactorDisabled,
   sendTwoFactorEnabled,
 } from "../services/email";
-import { metric } from "../services/metrics";
 import { db, defer, deps, type AppEnv } from "../services/request-context";
+import { count, record as auditRow } from "./observe";
 import { responseCode } from "./redact";
 import type { AuthScope } from "./scope";
 
@@ -122,7 +121,7 @@ export async function afterAuthRequest(
   try {
     await record(c, scope, info);
   } catch {
-    metric("error", { kind: "auth_audit" });
+    count("error", { kind: "auth_audit" });
   }
 }
 
@@ -137,12 +136,12 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
 
   if (facts.adminDenied) return; // counted and audited by the gate
   if (status === 429) {
-    metric("auth", { outcome: "limited", kind: "better_auth" });
+    count("auth", { outcome: "limited", kind: "better_auth" });
     return;
   }
   // The request never reached an endpoint (captcha refused it, the origin check, a 404 …).
   if (!path) {
-    if (status >= 400) metric("auth", { outcome: "refused", kind: String(status) });
+    if (status >= 400) count("auth", { outcome: "refused", kind: String(status) });
     return;
   }
 
@@ -156,7 +155,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     const method = SIGN_IN_METHOD[path] ?? "other";
     const since = new Date(now(c).getTime() - NEW_DEVICE_WINDOW_DAYS * 86_400_000);
     const known = await knownDevices(db(c), started.userId, since, started.id);
-    audit(
+    auditRow(
       c,
       "auth.sign_in",
       userTarget(started.userId),
@@ -166,7 +165,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         actorType: "user",
       },
     );
-    metric("auth", { outcome: "ok", kind: method });
+    count("auth", { outcome: "ok", kind: method });
     // Never on the very first sign-in (nothing to compare with), only when this browser family
     // or country matches nothing the account has signed in from in the last 30 days.
     const seen = known.some((d) => d.country === started.country && d.uaFamily === started.uaFamily);
@@ -191,13 +190,13 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
   // ── impersonation ────────────────────────────────────────────────────────────────────────
   if (path === "/admin/impersonate-user" && ok) {
     const target = facts.newSessions.find((s) => s.impersonatedBy)?.userId ?? null;
-    audit(c, "auth.impersonation_started", target ? userTarget(target) : null);
-    metric("auth", { outcome: "ok", kind: "impersonate" });
+    auditRow(c, "auth.impersonation_started", target ? userTarget(target) : null);
+    count("auth", { outcome: "ok", kind: "impersonate" });
     return;
   }
   if (path === "/admin/stop-impersonating" && ok) {
     // requestActor() names the admin behind an impersonated session.
-    audit(c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
+    auditRow(c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
     return;
   }
 
@@ -205,18 +204,18 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     const account = before ? { to: before.email, name: before.name } : null;
     switch (path) {
       case "/sign-out":
-        if (before) audit(c, "auth.sign_out", userTarget(before.id));
+        if (before) auditRow(c, "auth.sign_out", userTarget(before.id));
         break;
       case "/change-password":
         if (before && account) {
-          audit(c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
+          auditRow(c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
           defer(c, sendPasswordChanged(deps(c), account));
         }
         break;
       case "/reset-password":
         if (facts.passwordResetUserId) {
           const id = facts.passwordResetUserId;
-          audit(
+          auditRow(
             c,
             "auth.password_changed",
             userTarget(id),
@@ -230,32 +229,32 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       case "/two-factor/verify-totp":
         // With a session and two-factor not yet on, a correct code is what switches it on.
         if (before && account && before.twoFactorEnabled !== true) {
-          audit(c, "auth.2fa_enabled", userTarget(before.id), null, self);
+          auditRow(c, "auth.2fa_enabled", userTarget(before.id), null, self);
           defer(c, sendTwoFactorEnabled(deps(c), account));
         }
         break;
       case "/two-factor/disable":
         if (before && account) {
-          audit(c, "auth.2fa_disabled", userTarget(before.id), null, self);
+          auditRow(c, "auth.2fa_disabled", userTarget(before.id), null, self);
           defer(c, sendTwoFactorDisabled(deps(c), account));
         }
         break;
       case "/passkey/verify-registration":
         if (before && account) {
-          audit(c, "auth.passkey_added", userTarget(before.id), null, self);
+          auditRow(c, "auth.passkey_added", userTarget(before.id), null, self);
           defer(c, sendPasskeyAdded(deps(c), account));
         }
         break;
       case "/passkey/delete-passkey":
         if (before && account) {
-          audit(c, "auth.passkey_removed", userTarget(before.id), null, self);
+          auditRow(c, "auth.passkey_removed", userTarget(before.id), null, self);
           defer(c, sendPasskeyRemoved(deps(c), account));
         }
         break;
     }
     if (facts.emailChangedUserId) {
       const id = facts.emailChangedUserId;
-      audit(c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
+      auditRow(c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
     }
     return;
   }
@@ -271,14 +270,14 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         if (tried) target = userTarget(tried.id);
       }
     }
-    audit(
+    auditRow(
       c,
       "auth.failed",
       target,
       { path, status, code },
       before ? self : { actorUserId: null, actorType: "system" },
     );
-    metric("auth", {
+    count("auth", {
       outcome: "failed",
       kind: SIGN_IN_METHOD[path] ?? "credential",
       reason: code ?? String(status),

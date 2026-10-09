@@ -31,7 +31,7 @@ import type { Executor } from "../db/client";
 import { pauseLinks, unpauseLinks } from "../db/queries/links";
 import { cancel, schedule } from "../db/queries/user-purge";
 import { userState } from "../db/queries/users";
-import { audit } from "./audit";
+import { record } from "../auth/observe";
 import { now } from "./clock";
 import { sendAccountSuspended, sendDeletionCancelled, sendDeletionScheduled } from "./email";
 import { AppError } from "./errors";
@@ -76,7 +76,7 @@ export async function suspendUser(
     return { sessions, links: paused.length, account: await getAccount(tx, userId) };
   });
   if (!suspended) return false;
-  audit(
+  record(
     deps,
     "account.suspended",
     target(userId),
@@ -101,7 +101,7 @@ export async function unsuspendUser(deps: ServiceDeps, userId: string, actor: Ac
     return { links: restored.length, stillBanned: state?.banned === true };
   });
   if (!lifted) return false;
-  audit(deps, "account.unsuspended", target(userId), lifted, by(actor));
+  record(deps, "account.unsuspended", target(userId), lifted, by(actor));
   return true;
 }
 
@@ -130,7 +130,7 @@ export async function applyBanChange(
     const restored = await unpauseLinks(tx, { ownerId: userId }, "owner_suspended");
     return { sessions: 0, links: restored.length };
   });
-  audit(deps, banned ? "account.banned" : "account.unbanned", target(userId), outcome, by(actor));
+  record(deps, banned ? "account.banned" : "account.unbanned", target(userId), outcome, by(actor));
 }
 
 export type ScheduleOutcome = {
@@ -168,7 +168,7 @@ export async function scheduleDeletion(
     const current = await getAccount(deps.db, userId);
     return { scheduledFor: current?.deleteScheduledAt ?? null, changed: false };
   }
-  audit(
+  record(
     deps,
     "account.deletion_scheduled",
     target(userId),
@@ -196,7 +196,7 @@ export async function cancelDeletion(
     throw new AppError("conflict", "The deletion has already started and can no longer be cancelled.");
   }
   if (!account.deleteScheduledAt) return false;
-  audit(deps, "account.deletion_cancelled", target(userId), null, by(actor));
+  record(deps, "account.deletion_cancelled", target(userId), null, by(actor));
   deps.defer(sendDeletionCancelled(deps, { to: account.email, name: account.name }));
   return true;
 }
@@ -215,7 +215,7 @@ export async function acceptTerms(deps: ServiceDeps, userId: string, version: st
     });
   }
   if (!(await setTermsAccepted(deps.db, userId, version, now()))) throw new AppError("not_found");
-  audit(
+  record(
     deps,
     "account.terms_accepted",
     target(userId),

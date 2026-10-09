@@ -16,6 +16,7 @@
 
 import { Hono, type Context } from "hono";
 import { z } from "zod";
+import { guard } from "../auth/observe";
 import { getAccount } from "../db/queries/auth-lifecycle";
 import { requireUser } from "../middleware/guards";
 import { acceptTerms, cancelDeletion } from "../services/account-state";
@@ -51,24 +52,33 @@ async function refreshSessionCookie(c: Context<AppEnv>): Promise<void> {
 
 const AcceptTermsBody = z.object({ version: z.string().min(1).max(64) });
 
-router.post("/account/accept-terms", async (c) => {
-  const user = requireUser(c);
-  const { version } = AcceptTermsBody.parse(await jsonBody(c));
-  await acceptTerms(deps(c), user.id, version);
-  await refreshSessionCookie(c);
-  return c.json({ ok: true, termsVersion: version });
-});
+router.post(
+  "/account/accept-terms",
+  guard("accept_terms", async (c) => {
+    const user = requireUser(c);
+    const { version } = AcceptTermsBody.parse(await jsonBody(c));
+    await acceptTerms(deps(c), user.id, version);
+    await refreshSessionCookie(c);
+    return c.json({ ok: true, termsVersion: version });
+  }),
+);
 
-router.post("/account/deletion/cancel", async (c) => {
-  const user = requireUser(c);
-  await cancelDeletion(deps(c), user.id);
-  await refreshSessionCookie(c);
-  return c.json({ scheduledFor: null });
-});
+router.post(
+  "/account/deletion/cancel",
+  guard("deletion_cancel", async (c) => {
+    const user = requireUser(c);
+    await cancelDeletion(deps(c), user.id);
+    await refreshSessionCookie(c);
+    return c.json({ scheduledFor: null });
+  }),
+);
 
-router.get("/account/deletion-status", async (c) => {
-  const user = requireUser(c);
-  // From the database, not the cookie-cached session: a cancel shows at once.
-  const account = await getAccount(db(c), user.id);
-  return c.json({ scheduledFor: account?.deleteScheduledAt?.toISOString() ?? null });
-});
+router.get(
+  "/account/deletion-status",
+  guard("deletion_status", async (c) => {
+    const user = requireUser(c);
+    // From the database, not the cookie-cached session: a cancel shows at once.
+    const account = await getAccount(db(c), user.id);
+    return c.json({ scheduledFor: account?.deleteScheduledAt?.toISOString() ?? null });
+  }),
+);

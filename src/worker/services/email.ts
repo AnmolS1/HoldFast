@@ -30,10 +30,8 @@
 
 import { Resend } from "resend";
 import { tryConsume } from "../db/queries/email-ledger";
-import { safeError } from "../auth/redact";
-import { captureError } from "../sentry";
+import { countFor, reportError } from "../auth/observe";
 import { createKeys, hmacHex } from "./keys";
-import { writeMetric } from "./metrics";
 import * as outbox from "./outbox";
 import type { ServiceDeps } from "./request-context";
 
@@ -542,7 +540,7 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
       failure = error;
     }
     // Reported once per failed attempt; the address and the content are never part of it.
-    captureError(safeError(failure), { kind: "email", attempt: String(attempt + 1) });
+    reportError(failure, { kind: "email", attempt: String(attempt + 1) });
   }
   throw failure;
 }
@@ -563,7 +561,7 @@ async function deliver(
     if (CLASS_OF[name] !== "security") {
       const allowed = await tryConsume(deps.db, await recipientHash(env, address), EMAIL_CAPS);
       if (!allowed) {
-        writeMetric(env, "email", { outcome: "capped", kind });
+        countFor(env, "email", { outcome: "capped", kind });
         return "capped";
       }
     }
@@ -573,11 +571,11 @@ async function deliver(
     } else {
       await viaResend(env, { to: address, ...rendered });
     }
-    writeMetric(env, "email", { outcome: "sent", kind });
+    countFor(env, "email", { outcome: "sent", kind });
     return "sent";
   } catch (error) {
-    captureError(safeError(error), { kind: "email", template: name });
-    writeMetric(env, "email", { outcome: "failed", kind });
+    reportError(error, { kind: "email", template: name });
+    countFor(env, "email", { outcome: "failed", kind });
     return "failed";
   }
 }
