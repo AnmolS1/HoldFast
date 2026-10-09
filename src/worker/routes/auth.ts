@@ -35,6 +35,15 @@ export const router = new Hono<AppEnv>();
 /** How long the auth handler may take before the request is answered 503. */
 export const AUTH_HANDLER_TIMEOUT_MS = 10_000;
 
+let handlerTimeoutMs = AUTH_HANDLER_TIMEOUT_MS;
+/** Tests only: a 10-second wait cannot be part of a unit test. Returns the function that restores it. */
+export function setAuthHandlerTimeoutForTests(ms: number): () => void {
+  handlerTimeoutMs = ms;
+  return () => {
+    handlerTimeoutMs = AUTH_HANDLER_TIMEOUT_MS;
+  };
+}
+
 const HANG = Symbol("auth handler timed out");
 const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
 
@@ -118,7 +127,7 @@ router.all("/auth/*", async (c) => {
   // 3. The watchdog.
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<typeof HANG>((resolve) => {
-    timer = setTimeout(() => resolve(HANG), AUTH_HANDLER_TIMEOUT_MS);
+    timer = setTimeout(() => resolve(HANG), handlerTimeoutMs);
   });
   let response: Response;
   try {

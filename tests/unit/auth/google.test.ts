@@ -220,8 +220,18 @@ describe("a Google sign-up", () => {
       const [body, mac] = genuine.split(".");
       return `${b64({ ...decode(body!), e: decode(body!).e + 86_400 })}.${mac}`;
     });
-    // One character of the signature changed.
-    await forge((genuine) => genuine.slice(0, -1) + (genuine.endsWith("A") ? "B" : "A"));
+    // One character of the signature changed (the first: every bit of it counts).
+    await forge((genuine) => {
+      const [body, mac] = genuine.split(".");
+      return `${body}.${mac!.startsWith("A") ? "B" : "A"}${mac!.slice(1)}`;
+    });
+    // The same signature bytes under another spelling: the last base64 character has two spare
+    // bits, so one of its three siblings decodes to the same MAC. Refused all the same.
+    await forge((genuine) => {
+      const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+      const last = alphabet.indexOf(genuine.at(-1)!);
+      return genuine.slice(0, -1) + alphabet[(last & ~3) | ((last & 3) === 0 ? 1 : 0)];
+    });
     // No signature; an empty signature.
     await forge((genuine) => genuine.split(".")[0]!);
     await forge((genuine) => `${genuine.split(".")[0]!}.`);
@@ -237,23 +247,34 @@ describe("a Google sign-up", () => {
     });
   });
 
-  it("an expired intent is refused", async () => {
-    const client = newClient();
-    const code = await createInvite();
-    const past = new Date(Date.now() - 11 * 60_000);
-    const minted = await mintIntent(keys, code, past);
-    await insertIntent(testDb(), {
-      id: generateId(),
-      nonce: minted.nonce,
-      expiresAt: minted.expiresAt,
-      now: past,
-    });
-    client.cookies.set("hf_intent", minted.value);
-    const email = freshEmail();
-    const { location } = await googleRoundTrip(client, profileFor(email));
-    expectRefusedAt(location, "SIGNUP_INTENT_REQUIRED");
-    expect(await userByEmail(email)).toBeNull();
-    expect((await inviteRow(code))!.uses).toBe(0);
+  it("an expired intent is refused — by the cookie's own expiry, and by the recorded marker's", async () => {
+    const tenMinutes = 600_000;
+    const cases = [
+      // The cookie says it expired a minute ago; its marker in the database is still live.
+      {
+        mintedAt: new Date(Date.now() - tenMinutes - 60_000),
+        markerExpiresAt: new Date(Date.now() + tenMinutes),
+      },
+      // The cookie is fresh; its marker expired a minute ago.
+      { mintedAt: new Date(), markerExpiresAt: new Date(Date.now() - 60_000) },
+    ];
+    for (const { mintedAt, markerExpiresAt } of cases) {
+      const client = newClient();
+      const code = await createInvite();
+      const minted = await mintIntent(keys, code, mintedAt);
+      await insertIntent(testDb(), {
+        id: generateId(),
+        nonce: minted.nonce,
+        expiresAt: markerExpiresAt,
+        now: mintedAt,
+      });
+      client.cookies.set("hf_intent", minted.value);
+      const email = freshEmail();
+      const { location } = await googleRoundTrip(client, profileFor(email));
+      expectRefusedAt(location, "SIGNUP_INTENT_REQUIRED");
+      expect(await userByEmail(email)).toBeNull();
+      expect((await inviteRow(code))!.uses).toBe(0);
+    }
   });
 
   it("a genuine cookie whose nonce was never recorded is refused (the signature alone is not enough)", async () => {

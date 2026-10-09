@@ -270,7 +270,7 @@ export function buildHooks(scope: AuthScope) {
       try {
         const body = (ctx.body ?? {}) as { email?: unknown };
         const email = typeof body.email === "string" ? body.email.toLowerCase() : null;
-        await precheckSignup(scope, email, parseStatement(ctx.body));
+        await precheckSignup(scope, email, parseStatement(ctx.body), clientOf(scope, ctx));
       } catch (error) {
         refused(error);
       }

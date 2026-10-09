@@ -1,17 +1,20 @@
 // The sign-up policy, through the real handler: every gate refuses (never a fake success, never
 // a user row, never a spent invite), the counters hold under concurrency, and nothing a person
 // states about their age is stored.
+import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { DISPOSABLE_DOMAINS, isDisposableDomain } from "../../../src/worker/auth/data/disposable-domains";
 import { PUBLIC_MAIL_PROVIDERS } from "../../../src/worker/auth/data/public-mail-providers";
+import { createScope } from "../../../src/worker/auth/scope";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
 import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
 import { addUsage, utcDay } from "../../../src/worker/db/queries/ledger";
-import { downloadLedger, userPrefs } from "../../../src/worker/db/schema";
+import { downloadLedger, user, userPrefs } from "../../../src/worker/db/schema";
 import { dayUTC, ipHashDaily, ipPrefix } from "../../../src/worker/services/ip-hash";
 import { createKeys } from "../../../src/worker/services/keys";
 import {
+  checkSessionStart,
   domainAcceptsMail,
   emailDomain,
   isThirteenOrOlder,
@@ -344,6 +347,30 @@ describe("velocity: a day's sign-ups per subject", () => {
     expect((await signUp(newClient())).sent.status).toBe(200);
   });
 
+  it("no oracle: over the limit, a sign-up with an address that HAS an account is refused exactly like a new one", async () => {
+    const existing = (await signUp(newClient())).email;
+    const ip = freshIp();
+    for (let i = 0; i < SIGNUP_VELOCITY_DEFAULTS.signupIpDay; i++) await signUp(newClient({ ip }));
+    const fresh = await signUp(newClient({ ip }));
+    const known = await signUp(newClient({ ip }), { email: existing });
+    expect(fresh.sent.status).toBe(400);
+    expect(known.sent.status).toBe(fresh.sent.status);
+    expect(known.sent.body).toEqual(fresh.sent.body);
+    // Under the limit both are a 200 (the look-alike answer for the existing one).
+    expect((await signUp(newClient(), { email: existing })).sent.status).toBe(200);
+  });
+
+  it("the intent step is refused over the limit too, before anything is minted", async () => {
+    const ip = freshIp();
+    for (let i = 0; i < SIGNUP_VELOCITY_DEFAULTS.signupIpDay; i++) await signUp(newClient({ ip }));
+    const sent = await send(newClient({ ip }), "/api/auth-intent", {
+      json: { birthYear: 1990, birthMonth: 5, acceptTerms: true, inviteCode: await createInvite() },
+    });
+    expect(sent.status).toBe(400);
+    expect(sent.body).toMatchObject({ error: "validation", details: { reason: "SIGNUP_LIMIT" } });
+    expect(sent.setCookies).toEqual([]);
+  });
+
   it("50 file downloads from the same address do not touch signup_ip", async () => {
     const ip = freshIp();
     const hash = await ipHashDaily(keys, ip, dayUTC(new Date()));
@@ -490,6 +517,35 @@ describe("ADMIN_EMAILS", () => {
     });
     expect(again.status).toBe(200);
     expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
+    await purgeAuthRows(testDb(), row!.id);
+  });
+
+  it("the role is granted only to a VERIFIED admin address, and never through an impersonated session", async () => {
+    const existing = await userByEmail(ADMIN_EMAIL);
+    if (existing) await purgeAuthRows(testDb(), existing.id);
+    const scope = createScope(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} });
+    const roleOf = async (id: string) =>
+      (await testDb().select({ role: user.role }).from(user).where(eq(user.id, id)))[0]!.role;
+    const { sent } = await signUp(newClient(), { email: ADMIN_EMAIL, inviteCode: null });
+    expect(sent.status).toBe(200);
+    const row = await userByEmail(ADMIN_EMAIL);
+
+    // Unverified: a session start (were one possible) grants nothing.
+    await checkSessionStart(scope, row!.id, false);
+    expect(await roleOf(row!.id)).toBe("user");
+    // Verified, but the session being started is an admin impersonating this account: nothing.
+    await testDb().update(user).set({ emailVerified: true }).where(eq(user.id, row!.id));
+    await checkSessionStart(scope, row!.id, true);
+    expect(await roleOf(row!.id)).toBe("user");
+    // Verified, its own session: granted.
+    await checkSessionStart(scope, row!.id, false);
+    expect(await roleOf(row!.id)).toBe("admin");
+    // Any other verified account: never.
+    const other = await signUp(newClient());
+    const otherRow = await userByEmail(other.email);
+    await testDb().update(user).set({ emailVerified: true }).where(eq(user.id, otherRow!.id));
+    await checkSessionStart(scope, otherRow!.id, false);
+    expect(await roleOf(otherRow!.id)).toBe("user");
     await purgeAuthRows(testDb(), row!.id);
   });
 

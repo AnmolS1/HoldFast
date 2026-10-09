@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath } from "../../../src/worker/auth/admin-gate";
 import { createAuth } from "../../../src/worker/auth/create-auth";
 import { IMPERSONATION_EXEMPT_PATHS } from "../../../src/worker/middleware/impersonation";
-import { account, user } from "../../../src/worker/db/schema";
+import { account, session, user } from "../../../src/worker/db/schema";
 import {
   accountsOf,
   auditRows,
@@ -310,6 +310,50 @@ describe("the four allowed paths an admin calls", () => {
       expect(await snapshot(), "the target is untouched by all four").toEqual(before);
     },
   );
+
+  it("the hook itself refuses an impersonated session, and a revoked one — not only the pipeline in front of it", async () => {
+    const auth = createAuth(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} });
+    const api = auth.api as unknown as Record<string, (input: unknown) => Promise<unknown>>;
+    const cookieHeader = (client: Client) =>
+      new Headers({ cookie: [...client.cookies].map(([name, value]) => `${name}=${value}`).join("; ") });
+    const target = await verifiedUser();
+
+    // An admin looking through another admin's session: the role and two-factor are the
+    // puppet's own, and it is still not an admin session.
+    const admin = await admin2fa();
+    const puppet = await verifiedUser();
+    expect(
+      (await send(admin.client, "/api/auth/admin/impersonate-user", { json: { userId: puppet.user.id } }))
+        .status,
+    ).toBe(200);
+    await promoteToAdmin(puppet.user.id);
+    const impersonated: unknown = await api.banUser!({
+      body: { userId: target.user.id },
+      headers: cookieHeader(admin.client),
+    }).then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    expect(impersonated).toMatchObject({ status: "FORBIDDEN" });
+    expect((await userById(target.user.id))!.banned).not.toBe(true);
+
+    // An admin whose session rows were just deleted, but whose browser still holds the cookie
+    // and its 60-second cache: refused, because the gate reads the database.
+    const revoked = await admin2fa();
+    expect((await getSession(revoked.client))?.user.id).toBe(revoked.user.id);
+    await testDb().delete(session).where(eq(session.userId, revoked.user.id));
+    expect(revoked.client.cookies.has("hf.session_data")).toBe(true);
+    const afterRevoke: unknown = await api.banUser!({
+      body: { userId: target.user.id },
+      headers: cookieHeader(revoked.client),
+    }).then(
+      () => "resolved",
+      (error: unknown) => error,
+    );
+    expect(afterRevoke).toMatchObject({ status: "FORBIDDEN" });
+    expect((await userById(target.user.id))!.banned).not.toBe(true);
+    expect(await sessionsOf(target.user.id)).toHaveLength(1);
+  });
 
   it("a demoted admin stops at once, not when the cookie cache expires", async () => {
     const admin = await admin2fa();

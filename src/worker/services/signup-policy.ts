@@ -39,7 +39,7 @@ import {
   reserveSignup,
   type VelocitySubject,
 } from "../db/queries/auth-lifecycle";
-import { utcDay } from "../db/queries/ledger";
+import { todayTotals, utcDay } from "../db/queries/ledger";
 import { audit } from "./audit";
 import { now } from "./clock";
 import { ipHashDaily, ipPrefix } from "./ip-hash";
@@ -260,7 +260,7 @@ export async function inviteRequired(scope: AuthScope, email: string): Promise<b
 }
 
 /**
- * Checks 1, 4, 5 and — read-only — 7, for an address (`email` null: the address is not known
+ * Checks 1, 4, 5 and — read-only — 6 and 7, for an address (`email` null: the address is not known
  * yet, as in the pre-OAuth intent step). Nothing is taken. Used before the expensive part of a
  * sign-up (password hashing, the breach lookup) and by the intent route; the binding checks are
  * `takeSignup`'s. Checks 2 and 3 are `parseStatement`'s.
@@ -269,12 +269,26 @@ export async function precheckSignup(
   scope: AuthScope,
   email: string | null,
   statement: SignupStatement,
+  client: ClientFacts | null = null,
 ): Promise<void> {
   const settings = await scope.settings();
   if (settings.readOnly) throw new SignupRefusal("SIGNUP_PAUSED");
   if (email !== null) {
     const problem = await emailProblem(scope, email);
     if (problem) throw new SignupRefusal(problem);
+  }
+  // Velocity, read-only. The binding check is the reservation in `takeSignup` — but that runs
+  // only for an address with no account, so without this an address over its limit would be
+  // told "limit" for a new address and "200" for one that exists: an existence oracle.
+  if (client !== null) {
+    const day = utcDay(now());
+    const subjects = await velocitySubjects(scope, email ?? "", client, day);
+    const counts = await Promise.all(
+      subjects.map((subject) => todayTotals(scope.db, subject.type, subject.id)),
+    );
+    if (subjects.some((subject, index) => counts[index]!.count >= subject.limit)) {
+      throw new SignupRefusal("SIGNUP_LIMIT");
+    }
   }
   const needsInvite = settings.signupMode === "invite" && !(email !== null && isAdminEmail(scope.env, email));
   if (needsInvite && !(statement.inviteCode && (await inviteUsable(scope.db, statement.inviteCode)))) {

@@ -17,6 +17,7 @@ import {
   PASSWORD_COMPROMISED_MESSAGE,
 } from "../../../src/worker/auth/create-auth";
 import { sessionAdditionalFields, userAdditionalFields } from "../../../src/worker/auth/fields";
+import { authLog, authLogLine } from "../../../src/worker/auth/logger";
 import { createScope } from "../../../src/worker/auth/scope";
 import {
   BREACHED_TEST_PASSWORDS,
@@ -548,6 +549,39 @@ describe("the options object", () => {
     await expect(fetch("https://api.resend.com/emails", { method: "POST", body: "{}" })).rejects.toThrow(
       /unexpected outbound/,
     );
+  });
+});
+
+describe("what Better Auth logs", () => {
+  it("is redacted before it reaches the Worker's log: no address, no token, no field of a database error", () => {
+    const pgError = Object.assign(
+      new Error('duplicate key value violates unique constraint "user_email_unique"'),
+      {
+        detail: "Key (email)=(victim@example.com) already exists.",
+        code: "23505",
+      },
+    );
+    const wrapped = new Error("Failed query: insert into user … params: victim@example.com", {
+      cause: pgError,
+    });
+    const line = authLogLine("Sign-up attempt for existing email: victim@example.com", [
+      wrapped,
+      {
+        endpoint: "http://localhost/api/auth/verify-email?token=eyJhbGciOi.abc.def&callbackURL=%2F",
+        who: "other@example.org",
+      },
+      "http://localhost/api/auth/reset-password/sEcReTtOkEn123?callbackURL=x",
+    ]);
+    expect(line).not.toMatch(/victim@example\.com|other@example\.org|eyJhbGciOi|sEcReTtOkEn123/);
+    expect(line).toContain("[email]");
+    expect(line).toContain("user_email_unique");
+    expect(line).not.toContain("Key (email)");
+    expect(authLogLine("x".repeat(5000), []).length).toBeLessThanOrEqual(2001);
+    // And it is what the instance is configured with.
+    const options = buildAuthOptions(
+      createScope(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} }),
+    );
+    expect(options.logger).toMatchObject({ level: "warn", log: authLog });
   });
 });
 

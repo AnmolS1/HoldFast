@@ -30,7 +30,13 @@ router.post("/auth-intent", async (c) => {
   const at = now(c);
   try {
     const statement = parseStatement(await jsonBody(c), at);
-    await precheckSignup(scope, null, statement);
+    const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
+    await precheckSignup(scope, null, statement, {
+      ip: c.get("ip"),
+      asn: typeof cf?.asn === "number" ? cf.asn : null,
+      country: typeof cf?.country === "string" ? cf.country : null,
+      userAgent: c.req.header("user-agent") ?? null,
+    });
     const intent = await mintIntent(scope.keys, statement.inviteCode, at);
     await insertIntent(scope.db, {
       id: generateId(),

@@ -116,9 +116,13 @@ export async function verify(
   const dot = value.indexOf(".");
   if (dot < 1 || dot !== value.lastIndexOf(".")) return null;
   const body = value.slice(0, dot);
-  const mac = fromBase64Url(value.slice(dot + 1));
+  const signature = value.slice(dot + 1);
+  const mac = fromBase64Url(signature);
   const raw = fromBase64Url(body);
   if (!mac || !raw || mac.length !== 32) return null;
+  // One spelling per signature: base64 has spare bits in its last character, and a value that
+  // differs only there would decode to the same bytes.
+  if (toBase64Url(mac) !== signature) return null;
   // `verify` compares in constant time.
   const valid = await crypto.subtle.verify("HMAC", await keys.get(spec.purpose), mac, encoder.encode(body));
   if (!valid) return null;

@@ -33,6 +33,7 @@ import {
 import type { AuthContext, ServiceDeps } from "../services/request-context";
 import { sessionAdditionalFields, userAdditionalFields } from "./fields";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
+import { authLog } from "./logger";
 import { createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
@@ -79,6 +80,8 @@ export function buildAuthOptions(scope: AuthScope) {
     trustedOrigins: [env.APP_ORIGIN],
     database: drizzleAdapter(db, { provider: "pg", schema }),
     telemetry: { enabled: false },
+    // Warnings and errors only, and every line redacted before it reaches the Worker's log.
+    logger: { level: "warn" as const, log: authLog },
     advanced: {
       useSecureCookies: secure,
       cookiePrefix: "hf",
