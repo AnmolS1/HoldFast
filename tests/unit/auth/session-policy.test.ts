@@ -22,8 +22,11 @@ import { createScope } from "../../../src/worker/auth/scope";
 import {
   BREACHED_TEST_PASSWORDS,
   installTestOutbound,
+  routeTestOutbound,
+  testGoogleCode,
   testOutbound,
   TURNSTILE_TEST_SECRET_FAIL,
+  TURNSTILE_TEST_SECRET_PASS,
 } from "../../../src/worker/auth/test-outbound";
 import { user } from "../../../src/worker/db/schema";
 import createAuthSource from "../../../src/worker/auth/create-auth.ts?raw";
@@ -219,6 +222,79 @@ describe("Turnstile", () => {
     expect(refused.sent.status).toBe(403);
     expect(refused.sent.body).toMatchObject({ code: "VERIFICATION_FAILED" });
     expect(await userByEmail(refused.email)).toBeNull();
+  });
+});
+
+describe("third parties under `vite dev` (test mode, not the unit-test environment)", () => {
+  // The end-to-end run: `strict` is off there, so an unknown host goes to the network — but none
+  // of the four third parties the auth layer calls may, with the test values an e2e run uses.
+  const network: string[] = [];
+  const state = {
+    strict: false,
+    original: (async (input: RequestInfo | URL) => {
+      network.push(new Request(input as RequestInfo).url);
+      return new Response("from the network", { status: 599 });
+    }) as typeof fetch,
+  };
+  const verify = (secret: string) =>
+    routeTestOutbound(
+      new Request("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ secret, response: "XXXX.DUMMY.TOKEN.XXXX" }),
+      }),
+      state,
+    );
+
+  it("Turnstile's published test secrets are answered here: no request leaves for Cloudflare", async () => {
+    network.length = 0;
+    const pass = await verify(TURNSTILE_TEST_SECRET_PASS);
+    expect(pass.status).toBe(200);
+    expect(await pass.json()).toMatchObject({ success: true });
+    expect(await (await verify(TURNSTILE_TEST_SECRET_FAIL)).json()).toMatchObject({ success: false });
+    expect(network).toEqual([]);
+  });
+
+  it("the breach API, the MX lookup and a test Google code are answered here too", async () => {
+    network.length = 0;
+    const range = await routeTestOutbound(new Request("https://api.pwnedpasswords.com/range/ABCDE"), state);
+    expect(range.status).toBe(200);
+    const mx = await routeTestOutbound(
+      new Request("https://cloudflare-dns.com/dns-query?name=example.test&type=MX"),
+      state,
+    );
+    expect(await mx.json()).toMatchObject({ Status: 0 });
+    const token = await routeTestOutbound(
+      new Request("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        body: new URLSearchParams({
+          code: testGoogleCode({ sub: "1", email: "g@example.test" }),
+          client_id: "c",
+        }),
+      }),
+      state,
+    );
+    expect(await token.json()).toMatchObject({ token_type: "Bearer" });
+    expect(network).toEqual([]);
+  });
+
+  it("control — anything that is not a test value still goes out: a real secret, a real code, another host", async () => {
+    network.length = 0;
+    expect((await verify("0x4AAAAAAA-a-developers-real-secret")).status).toBe(599);
+    const real = await routeTestOutbound(
+      new Request("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        body: new URLSearchParams({ code: "4/0AbC-real-code" }),
+      }),
+      state,
+    );
+    expect(real.status).toBe(599);
+    expect((await routeTestOutbound(new Request("https://api.resend.com/emails"), state)).status).toBe(599);
+    expect(network).toEqual([
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      "https://oauth2.googleapis.com/token",
+      "https://api.resend.com/emails",
+    ]);
   });
 });
 

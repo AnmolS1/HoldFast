@@ -20,11 +20,12 @@
 //                                          received from the token endpoint). A real code — a
 //                                          developer signing in with Google locally — goes to
 //                                          Google as usual.
-//   challenges.cloudflare.com/…/siteverify ONLY under the unit-test environment, and only for
-//                                          Cloudflare's published test secrets: the always-pass
-//                                          secret passes, the always-fail one fails. Under
-//                                          `vite dev` the real endpoint is called (with the
-//                                          published test pair), so the plugin's wiring is real.
+//   challenges.cloudflare.com/…/siteverify ONLY for Cloudflare's published test secrets: the
+//                                          always-pass secret passes, the always-fail one fails.
+//                                          That holds under `vite dev` too — an end-to-end run
+//                                          makes no call to Cloudflare. A request carrying any
+//                                          other secret (a developer's real one) is not ours to
+//                                          answer and goes to the real endpoint.
 //
 // Every other request goes to the network as usual — except under the unit-test environment
 // (`SENTRY_ENVIRONMENT === "test"`), where an unexpected outbound request THROWS: no unit test
@@ -147,6 +148,17 @@ async function turnstile(request: Request, state: State): Promise<Response | nul
   return state.strict ? null : state.original(request);
 }
 
+/**
+ * What one outbound request gets in test mode. Exported for its tests, which pass a state of
+ * their own (the isolate's installed state is fixed at the first `installTestOutbound`).
+ */
+export async function routeTestOutbound(
+  request: Request,
+  state: Pick<State, "original" | "strict"> & Partial<Pick<State, "calls" | "overrides">>,
+): Promise<Response> {
+  return route(request, { calls: [], overrides: new Map(), ...state });
+}
+
 async function route(request: Request, state: State): Promise<Response> {
   const url = new URL(request.url);
   const host = url.hostname;
@@ -163,7 +175,6 @@ async function route(request: Request, state: State): Promise<Response> {
     if (answered) return answered;
   }
   if (host === "challenges.cloudflare.com" && url.pathname.endsWith("/siteverify")) {
-    if (!state.strict) return state.original(request);
     const answered = await turnstile(request, state);
     if (answered) return answered;
   }
