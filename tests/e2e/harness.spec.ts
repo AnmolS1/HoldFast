@@ -59,6 +59,34 @@ test.describe("dev server", () => {
   });
 });
 
+test.describe("the Turnstile stand-in", () => {
+  test("issues a token on render and a NEW one after every reset, like the real widget", async ({
+    page,
+    clientIp,
+  }) => {
+    // Its own address: three sign-in attempts must not spend the shared address's allowance.
+    expect(clientIp).toBeTruthy();
+    await stubTurnstile(page);
+    await page.goto("/login");
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    type Stub = { issued: number; resets: number };
+    const stub = () => page.evaluate(() => (window as unknown as { __turnstileStub?: Stub }).__turnstileStub);
+    await expect.poll(async () => (await stub())?.issued).toBe(1);
+    // A submit spends the token: the form resets the widget and must get another, or the second
+    // attempt on the same page waits for ever ("Wait for the human check to finish.").
+    for (const attempt of [1, 2, 3]) {
+      await page.getByLabel("Email").fill("nobody@holdfast-e2e.example");
+      await page.getByLabel("Password").fill(`wrong password number ${attempt}`);
+      await page.getByRole("button", { name: "Sign in", exact: true }).click();
+      await expect.poll(async () => (await stub())?.resets, `reset after attempt ${attempt}`).toBe(attempt);
+      await expect
+        .poll(async () => (await stub())?.issued, `token after attempt ${attempt}`)
+        .toBe(attempt + 1);
+    }
+    await expect(page.getByText("Wait for the human check to finish.")).toHaveCount(0);
+  });
+});
+
 test.describe("fixtures", () => {
   test("virtual authenticator creates a passkey without a prompt", async ({ page, virtualAuthenticator }) => {
     await page.goto("/");

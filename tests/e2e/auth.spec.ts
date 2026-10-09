@@ -31,25 +31,10 @@ import {
 } from "../setup/auth-fixtures";
 import { readVars } from "../setup/e2e-preflight";
 import { localDbName, localDbUrl } from "../setup/local-env";
-import { expect, latestMailTo, linksIn, test } from "./fixtures";
+import { expect, latestMailTo, linksIn, stubTurnstile, test } from "./fixtures";
 
 const run = promisify(execFile);
 
-/**
- * The Turnstile widget script, replaced by a stand-in that passes at once — and passes AGAIN
- * after `reset()`, as the real widget does. (A form resets the widget after every submit: a
- * stand-in whose reset yields no new token leaves a second attempt waiting for ever.)
- */
-async function stubTurnstile(page: Page): Promise<void> {
-  await page.route("https://challenges.cloudflare.com/**", (route) =>
-    route.fulfill({
-      contentType: "text/javascript",
-      body:
-        "window.turnstile=(function(){var cb=null;function pass(){setTimeout(function(){if(cb)cb('XXXX.DUMMY.TOKEN.XXXX')},10)}" +
-        "return{render:function(el,o){cb=o.callback;pass();return 'w'},reset:function(){pass()},remove:function(){cb=null}}})();",
-    }),
-  );
-}
 const DESKTOP_MIN = 1024;
 const isMobile = (page: Page) => (page.viewportSize()?.width ?? 0) < DESKTOP_MIN;
 
@@ -113,6 +98,13 @@ async function linkFromMail(address: string, subject: string | RegExp, contains:
   const link = linksIn(mail).find((url) => url.includes(contains));
   if (!link) throw new Error(`no ${contains} link in the mail to ${address}`);
   return link;
+}
+
+/** How many mails to `address` the memory outbox holds. */
+async function mailCount(request: APIRequestContext, address: string): Promise<number> {
+  const response = await request.get("/api/_test/outbox", { params: { to: address } });
+  expect(response.status()).toBe(200);
+  return ((await response.json()) as { messages: unknown[] }).messages.length;
 }
 
 /** Fills the sign-up form (everything but the Google / submit choice). */
@@ -247,7 +239,11 @@ test.describe("sign-up", () => {
     await page.goto("/signup");
     await fillSignUp(page, { email, invite: spent });
     await page.getByRole("button", { name: "Create account" }).click();
-    await expect(page.getByText("This invite code isn't valid.")).toBeVisible();
+    // A used-up code and an unknown one are one answer from the server; the form says what most
+    // likely happened — the code was used, perhaps by this very person a minute ago.
+    await expect(
+      page.getByText(/This invite code isn't valid, or it has already been used\..*check your email/),
+    ).toBeVisible();
     await expect(page.getByRole("heading", { name: "Create your account" })).toBeVisible();
     expect(await userRow(email)).toBeNull();
   });
@@ -397,8 +393,22 @@ test.describe("sign-in", () => {
     await fillSignIn(page, email, "not the password at all!");
     await expect(page.getByText("Wrong email or password.")).toBeVisible();
     await fillSignIn(page, email, FIXTURE_PASSWORD);
-    await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
+    // The right password for an address that was never confirmed: a screen that says so and can
+    // send the link again AT ONCE (nothing was sent by this attempt, so there is nothing to wait for).
+    await expect(page.getByRole("heading", { name: "Confirm your email" })).toBeVisible();
+    await expect(page.getByText(/hasn't been confirmed yet/)).toBeVisible();
     expect(await sessionOf(page.request)).toBeNull();
+    const before = await mailCount(page.request, email);
+    const resend = page.locator("[data-resend]");
+    await expect(resend).toBeEnabled();
+    await resend.click();
+    await expect(page.getByText("Sent. Check your inbox.")).toBeVisible();
+    await expect.poll(() => mailCount(page.request, email)).toBe(before + 1);
+    await expect(resend).toBeDisabled();
+    // The new link confirms the address and signs in.
+    await page.goto(await linkFromMail(email, /Confirm your email address/, "/api/auth/verify-email"));
+    await expectSignedIn(page);
+    expect((await userRow(email))?.email_verified).toBe(true);
   });
 
   test("password reset: the mailed link leads to a new password, which signs in; the old one does not", async ({
@@ -469,13 +479,16 @@ test.describe("Google", () => {
     await page.goto("/login");
     await expectSignInScreen(page);
     await page.getByRole("button", { name: "Continue with Google" }).click();
-    // Back on the sign-in screen, with the refusal in the address — and no account, no session.
-    await expect(page).toHaveURL(/\/login\?error=SIGNUP_INTENT_REQUIRED/);
+    // The refusal comes back as /login?error=SIGNUP_INTENT_REQUIRED&error_description=…: the
+    // screen shows OUR sentence for that code and takes both parameters out of the address.
     await expectSignInScreen(page);
+    await expect(page.getByRole("alert")).toHaveText("To sign up with Google, start from the sign-up page.");
+    await expect(page).toHaveURL(/\/login$/);
     expect(google.visits()).toBe(1);
-    expect(new URL(page.url()).searchParams.get("error_description")).toBe(
-      "Start sign-up from the Holdfast sign-up page.",
-    );
+    // A reload does not bring the message back: it was in the address, and the address is clean.
+    await page.reload();
+    await expectSignInScreen(page);
+    await expect(page.getByRole("alert")).toHaveCount(0);
     expect(await userRow(email)).toBeNull();
     expect(await sessionOf(page.request)).toBeNull();
   });

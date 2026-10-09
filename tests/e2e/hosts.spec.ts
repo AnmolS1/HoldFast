@@ -83,8 +83,9 @@ test.describe("app origin", () => {
   });
 
   // The real limiters (20 a minute for auth attempts, 600 for the API), one client address.
-  test("session reads do not spend the sign-in limit: 25 from one address all answer", async ({
+  test("RL_AUTH: the 21st credential POST in a minute is refused with our envelope; 30 session reads from that address still answer", async ({
     request,
+    origins,
   }) => {
     // An address of this run only, so neither another test nor the previous run shares its buckets.
     const octet = () => 1 + Math.floor(Math.random() * 254);
@@ -106,8 +107,22 @@ test.describe("app origin", () => {
     }
     expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);
 
-    // With that bucket empty, the shell's own session read still answers, 25 times over.
-    for (let read = 1; read <= 25; read++) {
+    // The ruling's own words — a SIGN-IN attempt from that address is refused too, and by the
+    // pipeline's limiter, not Better Auth's: ours answers with the app's envelope
+    // (`error: "rate_limited"`, a request id, Retry-After: 60); Better Auth's own 5-a-minute rule
+    // on this path answers `{ message }` with no `error` and an X-Retry-After header.
+    const signIn = await request.post("/api/auth/sign-in/email", {
+      headers: { ...headers, origin: origins.app, "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" },
+      data: { email: "nobody@holdfast-e2e.example", password: "correct horse battery staple 9!" },
+    });
+    expect(signIn.status()).toBe(429);
+    const refusal = (await signIn.json()) as { error?: string; requestId?: string };
+    expect(refusal.error).toBe("rate_limited");
+    expect(refusal.requestId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(signIn.headers()["retry-after"]).toBe("60");
+
+    // With that bucket empty, the shell's own session read still answers, 30 times over.
+    for (let read = 1; read <= 30; read++) {
       const answer = await request.get("/api/auth/get-session", { headers });
       expect(answer.status(), `session read ${read}`).toBe(200);
       expect(await answer.json()).toBeNull();
