@@ -387,10 +387,15 @@ describe("velocity: a day's sign-ups per subject", () => {
 
   it("signup_ip24 counts the /24, across addresses", async () => {
     const [a, b] = crypto.getRandomValues(new Uint8Array(2));
-    const net = `100.${64 + (a! % 64)}.${b}`;
+    // A /24 outside the range `freshIp` draws from: the day's counts stay in the database, and
+    // every other sign-up of the day (thousands, on a day of many runs) has counted against the
+    // /24 of ITS address — with a limit of 2 this test would meet one of them.
+    const net = `10.${a}.${b}`;
     const settings = { ceilings: { signupIp24Day: 2 } };
-    expect((await signUp(newClient({ ip: `${net}.10`, settings }))).sent.status).toBe(200);
-    expect((await signUp(newClient({ ip: `${net}.11`, settings }))).sent.status).toBe(200);
+    const first = await signUp(newClient({ ip: `${net}.10`, settings }));
+    expect(first.sent.status, first.sent.text).toBe(200);
+    const second = await signUp(newClient({ ip: `${net}.11`, settings }));
+    expect(second.sent.status, second.sent.text).toBe(200);
     await expectRefused("SIGNUP_LIMIT", {}, newClient({ ip: `${net}.12`, settings }));
     const subject = await ipHashDaily(keys, ipPrefix(`${net}.99`), dayUTC(new Date()));
     expect(await ledgerCount("signup_ip24", subject)).toBe(2);
