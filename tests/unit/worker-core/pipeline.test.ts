@@ -17,6 +17,8 @@ import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 import { appWith, call, fakeCore, sameOrigin, signIn, type CallOptions, type FakeCore } from "./helpers";
 import { parsePath } from "./registry-check";
 
+// Probes under /api/auth/ use paths the auth router does not declare (it answers only
+// GET /auth/get-session until the auth task replaces it), so they fall through to the probe.
 type Probe = { reached: string; user: string | null; impersonating: boolean; termsStale: boolean };
 type Envelope = { error: string; message: string; requestId: string; details?: Record<string, unknown> };
 
@@ -182,7 +184,7 @@ describe("session", () => {
       const app = await send("/api/nodes");
       expect(app.status).toBe(403);
       expect(app.body).toMatchObject({ error: "forbidden", details: { reason: "account_suspended" } });
-      for (const path of ["/api/auth/get-session", "/api/auth/sign-out"]) {
+      for (const path of ["/api/auth/list-sessions", "/api/auth/sign-out"]) {
         const auth = await send(path, {
           method: path.endsWith("sign-out") ? "POST" : "GET",
           headers: sameOrigin,
@@ -220,7 +222,7 @@ describe("session", () => {
       const { fake, send } = setup();
       signIn(fake, { deleteScheduledAt: value });
       expect((await send("/api/nodes")).body.user).toBeNull();
-      expect((await send("/api/auth/get-session")).body.user).toBeNull();
+      expect((await send("/api/auth/list-sessions")).body.user).toBeNull();
       expect((await send("/api/_guard/user")).status).toBe(401);
     });
   }
@@ -302,7 +304,7 @@ describe("middleware order", () => {
   it("a rate-limited auth request has still been through getSession", async () => {
     const { fake, send } = setup();
     const denied = { limit: async () => ({ success: false }) };
-    const answer = await send("/api/auth/get-session", { env: { RL_AUTH: denied } });
+    const answer = await send("/api/auth/list-sessions", { env: { RL_AUTH: denied } });
     expect(answer.status).toBe(429);
     expect(fake.calls).toContain("getSession");
   });
@@ -335,7 +337,7 @@ describe("rate limit", () => {
     await send("/api/nodes", { env, headers });
     expect(api).toEqual(["ip:203.0.113.9", `u:${"u".repeat(32)}`]);
     expect(auth).toEqual([]);
-    for (const path of ["/api/auth/get-session", "/api/auth-intent", "/api/invites/abc"])
+    for (const path of ["/api/auth/list-sessions", "/api/auth-intent", "/api/invites/abc"])
       await send(path, { env, headers });
     expect(auth).toEqual(["ip:203.0.113.9", "ip:203.0.113.9", "ip:203.0.113.9"]);
   });
@@ -466,7 +468,7 @@ describe("impersonation is read-only", () => {
       signIn(fake, flags, { impersonatedBy: "a".repeat(32) });
       const label = JSON.stringify(Object.keys(flags));
       // Not put on c.var as a user — and still an impersonated session.
-      expect((await send("/api/auth/get-session")).body, label).toMatchObject({
+      expect((await send("/api/auth/list-sessions")).body, label).toMatchObject({
         user: null,
         impersonating: true,
       });

@@ -112,6 +112,27 @@ describe("GET /api/health against real Postgres and R2", () => {
   });
 });
 
+describe("the placeholder auth router", () => {
+  it("answers the session read as signed out (JSON null), and nothing else under /api/auth", async () => {
+    const app = createApp(realCore);
+    const session = await call(app, "/api/auth/get-session");
+    expect(session.response.status).toBe(200);
+    expect(session.response.headers.get("content-type")).toMatch(/^application\/json/);
+    expect(session.response.headers.get("cache-control")).toBe("no-store");
+    expect(await session.response.text()).toBe("null");
+    await session.ctx.settle();
+
+    const signIn = await call(app, "/api/auth/sign-in/email", {
+      method: "POST",
+      headers: sameOrigin,
+      body: "{}",
+    });
+    expect(signIn.response.status).toBe(404);
+    expect(((await signIn.response.json()) as Envelope).error).toBe("not_found");
+    await signIn.ctx.settle();
+  });
+});
+
 describe("GET /api/public/config against the real settings table", () => {
   const KEYS = ["signupMode", "termsVersion", "uploadsEnabled", "linksEnabled", "readOnly"];
   let saved: Array<typeof settingsTable.$inferSelect> = [];
