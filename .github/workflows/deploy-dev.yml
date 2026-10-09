@@ -36,7 +36,7 @@ jobs:
     # (Cloudflare cannot scope a Workers token to one script, so the two deploy tokens are equal
     # in what they could do; what the split protects is the production database URL.)
     environment: dev
-    # One deploy to dev at a time, shared with scanner-image.yml. Never cancelled mid-flight: a
+    # One deploy to dev at a time. Never cancelled mid-flight: a
     # cancelled run could stop between the migration and the deploy.
     concurrency:
       group: deploy-dev

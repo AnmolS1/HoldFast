@@ -1,27 +1,36 @@
-# Rebuilds the scanner (ClamAV) image and redeploys, so the virus signatures baked into the image
-# are never more than about a week old even when containers/ is untouched.
+# Rebuilds the PRODUCTION scanner (ClamAV) image and redeploys, so the virus signatures baked into
+# the image are never more than about a week old even when containers/ is untouched.
 #
 # `schedule` and `workflow_dispatch` only fire from the default branch (`prod`), so this does
-# nothing until the file is on `prod`. While containers/clamav/Dockerfile is still the placeholder
-# (no scanner in it) the weekly run is a no-op that says so, and a manual run fails: a green run of
-# this workflow always means the step "Deploy with a freshly built image" ran.
+# nothing until the file is on `prod` (after the beta gate) — until then NOTHING scheduled rebuilds
+# any image. While containers/clamav/Dockerfile is still the placeholder (no scanner in it) the
+# weekly run is a no-op that says so, and a manual run fails: a green run of this workflow always
+# means the step "Deploy with a freshly built image" ran.
 #
-# It redeploys the code that is ALREADY LIVE, with a fresh image, and nothing else: for each
-# environment it checks out that environment's branch and refuses to continue unless the live build
-# stamp is exactly that commit. It never migrates a database and can never ship undeployed code.
+# It redeploys the code that is ALREADY LIVE, with a fresh image, and nothing else: it refuses to
+# continue unless the live build stamp is exactly the commit it runs on. It never migrates a
+# database and can never ship undeployed code.
+#
+# PRODUCTION ONLY, on purpose. The deploy token is a secret of the `Production` environment, and
+# an environment's secrets may be read only by code from the branch that environment admits
+# (`Production` ↔ `prod`, `dev` ↔ `dev`). So this workflow
+#   - runs only on `refs/heads/prod` (the job's `if:`; a dispatch from any other ref is skipped,
+#     not merely refused by the environment),
+#   - checks out, builds and runs ONLY the commit that triggered it — there is no `ref:`, and no
+#     input reaches a script or a checkout,
+#   - never touches the dev Worker: code from `dev` must not run with production's token, and the
+#     `dev` environment does not admit a run from `prod`.
+# The dev image is rebuilt by deploy-dev.yml whenever containers/ or the container settings change
+# on `dev`. A scheduled refresh for dev cannot live here (a schedule runs the default branch's
+# file); whether dev needs one is the scanner task's decision.
 name: scanner-image
 
 on:
   schedule:
     # Mondays 05:23 UTC.
     - cron: "23 5 * * 1"
+  # No inputs: there is nothing to choose.
   workflow_dispatch:
-    inputs:
-      target:
-        description: Which environment to rebuild
-        type: choice
-        options: [both, dev, production]
-        default: both
 
 permissions:
   contents: read
@@ -35,69 +44,27 @@ jobs:
     if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    # `Production` for BOTH legs, the dev one included. The deploy token is an environment secret
-    # (there is none at repository level), so the job must name an environment — and an
-    # environment's branch rule is matched against the ref of the RUN, which here is always `prod`
-    # (`schedule` and `workflow_dispatch` fire from the default branch; the `if:` above insists).
-    # The `dev` environment admits only runs from `dev`, so naming it would refuse the dev leg.
-    # `Production` admits `prod`, and its Cloudflare token can deploy either Worker (a Workers
-    # token cannot be scoped to one script). This workflow never reads a database URL.
-    # Consequence: a required reviewer added to `Production` also gates this weekly run.
+    # Holds the production deploy token; admits only runs from `prod`. A required reviewer added
+    # to this environment also gates the weekly run.
     environment: Production
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - env: dev
-            branch: dev
-            worker: holdfast-dev
-            app_url: https://holdfast-dev.ponderance.dev
-            files_url: https://dev.holdfastusercontent.com
-          - env: production
-            branch: prod
-            worker: holdfast
-            app_url: https://holdfast.ponderance.dev
-            files_url: https://holdfastusercontent.com
-    # The same groups as deploy-dev.yml / deploy-prod.yml: never two deploys to one environment.
+    # The same group as deploy-prod.yml: never two deploys to production at once.
     concurrency:
-      group: deploy-${{ matrix.env }}
+      group: deploy-production
       cancel-in-progress: false
     env:
       CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
-      TARGET_ENV: ${{ matrix.env }}
-      TARGET_BRANCH: ${{ matrix.branch }}
-      WORKER: ${{ matrix.worker }}
-      APP_URL: ${{ matrix.app_url }}
-      FILES_URL: ${{ matrix.files_url }}
+      WORKER: holdfast
+      APP_URL: https://holdfast.ponderance.dev
+      FILES_URL: https://holdfastusercontent.com
     steps:
-      - name: Is this environment selected?
-        id: select
-        env:
-          REQUESTED: ${{ inputs.target || 'both' }}
-        run: |
-          case "$REQUESTED" in
-            both | "$TARGET_ENV") echo "run=true" >>"$GITHUB_OUTPUT" ;;
-            dev | production)
-              echo "run=false" >>"$GITHUB_OUTPUT"
-              echo "::notice::scanner-image: $TARGET_ENV not selected (target=$REQUESTED)"
-              ;;
-            *)
-              echo "::error::unknown target"
-              exit 1
-              ;;
-          esac
-
-      - name: Check out the environment's branch
-        if: steps.select.outputs.run == 'true'
+      # The commit that triggered the run, and nothing else: no `ref:`.
+      - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ matrix.branch }}
           persist-credentials: false
 
       # The placeholder image has no scanner and no signatures: there is nothing to refresh.
       - name: Is there a real scanner image to rebuild?
-        if: steps.select.outputs.run == 'true'
         id: guard
         run: |
           dockerfile=containers/clamav/Dockerfile
@@ -109,7 +76,7 @@ jobs:
             echo "real=true" >>"$GITHUB_OUTPUT"
           elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             echo "real=false" >>"$GITHUB_OUTPUT"
-            echo "::notice::scanner-image: $dockerfile is still the placeholder — nothing was rebuilt for $TARGET_ENV"
+            echo "::notice::scanner-image: $dockerfile is still the placeholder — nothing was rebuilt"
           else
             # A person asked for a rebuild. Answering green without rebuilding anything would be a lie.
             echo "::error::scanner-image: $dockerfile is still the placeholder — there is no scanner image to rebuild"
@@ -152,19 +119,18 @@ jobs:
       # bucket) into containers/clamav/cvd/, refreshing it when it is older than 24 h. The
       # signature CDN rate-limits CI runners.
 
-      # The stamp must keep naming the redeployed commit and branch, not this workflow's ref.
-      - name: Build
+      # The environment is chosen at BUILD time. The stamp keeps naming this commit and branch.
+      - name: Build (production)
         if: steps.guard.outputs.real == 'true'
         env:
+          CLOUDFLARE_ENV: production
           HOLDFAST_GIT_SHA: ${{ steps.commit.outputs.sha }}
-          HOLDFAST_GIT_BRANCH: ${{ matrix.branch }}
-        run: |
-          if [ "$TARGET_ENV" = "production" ]; then export CLOUDFLARE_ENV=production; fi
-          npm run build
+          HOLDFAST_GIT_BRANCH: prod
+        run: npm run build
 
-      - name: The build is for this environment
+      - name: The build is a production build
         if: steps.guard.outputs.real == 'true'
-        run: bash .github/workflows/lib/deploy-lib.sh built-env "$TARGET_ENV"
+        run: bash .github/workflows/lib/deploy-lib.sh built-env production
 
       # A Dockerfile path always builds and pushes: that is the point of this workflow.
       - name: Deploy with a freshly built image
@@ -172,12 +138,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          if [ "$TARGET_ENV" = "production" ]; then
-            npx wrangler deploy --env production
-          else
-            npx wrangler deploy
-          fi
+        run: npx wrangler deploy --env production
 
       - name: Build stamp is unchanged
         if: steps.guard.outputs.real == 'true'
