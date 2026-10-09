@@ -1,5 +1,7 @@
-// The SPA shell, against `vite dev`, with the public config and the session mocked at the network
-// layer (in this checkout the Worker has no /api/public/config and no auth backend).
+// The SPA shell, against `vite dev`. Most tests mock the public config and the session at the
+// network layer: they need a signed-in user, stale terms or a particular config, and no auth
+// backend can produce a session yet. The first block ("the real Worker") mocks nothing under
+// /api: the shell there runs on the Worker's own /api/public/config and session read.
 //
 //   npm run e2e -- tests/e2e/shell.spec.ts
 //
@@ -106,13 +108,7 @@ async function mockShell(page: Page, port: number, options: MockOptions = {}): P
     if (path === "/api/account/deletion-status") return route.fulfill({ json: { scheduledFor: null } });
     return route.fulfill({ status: 404, json: envelope("not_found", "Not found.") });
   });
-  // The Turnstile script is the vendor's: a local stand-in that passes at once keeps the run offline.
-  await page.route("https://challenges.cloudflare.com/**", (route) =>
-    route.fulfill({
-      contentType: "text/javascript",
-      body: "window.turnstile={render:function(el,o){setTimeout(function(){o.callback('XXXX.DUMMY.TOKEN.XXXX')},10);return 'w'},reset:function(){},remove:function(){}};",
-    }),
-  );
+  await stubTurnstile(page);
 }
 
 const isMobile = (page: Page) => (page.viewportSize()?.width ?? 0) < DESKTOP_MIN;
@@ -123,6 +119,89 @@ async function gotoFrame(page: Page, path: string): Promise<void> {
   await page.goto(path);
   await expect(page.locator("[data-frame]")).toBeVisible();
 }
+
+/** The vendor's Turnstile script, replaced by a stand-in that passes at once (keeps the run offline). */
+async function stubTurnstile(page: Page): Promise<void> {
+  await page.route("https://challenges.cloudflare.com/**", (route) =>
+    route.fulfill({
+      contentType: "text/javascript",
+      body: "window.turnstile={render:function(el,o){setTimeout(function(){o.callback('XXXX.DUMMY.TOKEN.XXXX')},10);return 'w'},reset:function(){},remove:function(){}};",
+    }),
+  );
+}
+
+test.describe("the real Worker (nothing under /api is mocked)", () => {
+  test.skip(Boolean(DIST), "offline mode serves the build by interception: there is no Worker to ask");
+
+  test("/login renders the sign-in form from the Worker's own public config, with no CSP violation", async ({
+    page,
+    origins,
+  }) => {
+    const violations: string[] = [];
+    page.on("console", (message) => {
+      if (
+        /content security policy|refused to (load|execute|apply|connect|frame|create)/i.test(message.text())
+      ) {
+        violations.push(message.text());
+      }
+    });
+    page.on("pageerror", (error) => violations.push(`pageerror: ${error.message}`));
+    await page.addInitScript(() => {
+      document.addEventListener("securitypolicyviolation", (event) => {
+        console.error(`Content Security Policy violation: ${event.violatedDirective} ${event.blockedURI}`);
+      });
+    });
+    await stubTurnstile(page);
+
+    const configAnswer = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/public/config");
+    const sessionAnswer = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/auth/get-session");
+    await page.goto("/login");
+
+    // Both answers come from the Worker, not from a mock.
+    const configResponse = await configAnswer;
+    expect(configResponse.status()).toBe(200);
+    expect(configResponse.fromServiceWorker()).toBe(false);
+    const config = (await configResponse.json()) as Record<string, unknown>;
+    expect(config).toMatchObject({
+      appOrigin: origins.app,
+      filesOrigin: origins.files,
+      maxFileBytes: 2_000_000_000,
+      uploadsEnabled: true,
+      linksEnabled: true,
+      readOnly: false,
+    });
+    expect(["invite", "open"]).toContain(config.signupMode);
+    expect(String(config.turnstileSiteKey)).not.toBe("");
+    expect(String(config.termsVersion)).not.toBe("");
+    expect(String(config.release)).toMatch(/^[0-9a-f]{40}$/);
+    const sessionResponse = await sessionAnswer;
+    expect(sessionResponse.status()).toBe(200);
+    expect(await sessionResponse.json()).toBeNull();
+
+    // The form, not the "couldn't start" screen.
+    await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible();
+    await expect(page.getByText("Holdfast couldn't start")).toHaveCount(0);
+    await expect(page.getByLabel("Email")).toBeVisible();
+    await expect(page.getByLabel("Password", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Forgot password?" })).toBeVisible();
+    await expect(page.locator("[data-frame]")).toHaveCount(0);
+
+    await page.waitForTimeout(500);
+    expect(violations).toEqual([]);
+  });
+
+  test("signed out, / goes to /login with next; /signup and an unknown address render", async ({ page }) => {
+    await stubTurnstile(page);
+    await page.goto("/");
+    await expect(page).toHaveURL(/\/login\?next=%2F$/);
+    await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible();
+    await page.goto("/signup");
+    await expect(page.getByRole("heading", { level: 1, name: "Create your account" })).toBeVisible();
+    await page.goto("/no/such/page");
+    await expect(notFound(page)).toBeVisible();
+  });
+});
 
 test.describe("shell routes", () => {
   const signedOut: Array<[string, string]> = [
