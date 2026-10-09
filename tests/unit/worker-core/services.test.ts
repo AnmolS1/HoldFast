@@ -484,6 +484,38 @@ describe("test outbox", () => {
   });
 });
 
+describe("audit: the User-Agent (S10)", () => {
+  it("keeps the browser family only — never the header a client sent", async () => {
+    const SECRET = "zz-device-fingerprint-zz";
+    for (const [header, family] of [
+      [
+        `Mozilla/5.0 (X11; Linux x86_64; ${SECRET}) AppleWebKit/537.36 Chrome/141.0.0.0 Safari/537.36`,
+        "Chrome",
+      ],
+      [`Mozilla/5.0 (Macintosh; ${SECRET}) Gecko/20100101 Firefox/143.0`, "Firefox"],
+      [`${SECRET} token=abc123 ${"x".repeat(400)}`, "other"],
+      [undefined, null],
+    ] as const) {
+      const fake = fakeCore();
+      fake.state.settings = { termsVersion: "2026-10-01" };
+      const router = new Hono<AppEnv>();
+      router.post("/_audit", (c) => {
+        audit(c, "node.trashed", { type: "node", id: "n1" }, null);
+        return c.json({ ok: true });
+      });
+      const { response, ctx } = await call(appWith(fake, { extraRouters: [router] }), "/api/_audit", {
+        method: "POST",
+        headers: { ...sameOrigin, ...(header === undefined ? {} : { "user-agent": header }) },
+      });
+      expect(response.status).toBe(200);
+      await ctx.settle();
+      expect(fake.audits).toHaveLength(1);
+      expect(fake.audits[0]!.ua).toBe(family);
+      expect(JSON.stringify(fake.audits)).not.toContain(SECRET);
+    }
+  });
+});
+
 describe("audit", () => {
   it("from a request: deferred past the handler, with the ip hash, request id and actor", async () => {
     const fake = fakeCore();
@@ -513,7 +545,7 @@ describe("audit", () => {
         actorUserId: "u".repeat(32),
         actorType: "user",
         ipHashDaily: expectedHash,
-        ua: "vitest",
+        ua: "other",
         country: null,
         requestId,
       },

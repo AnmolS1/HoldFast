@@ -96,10 +96,19 @@ export function escapeHtml(text: string): string {
     .replace(/'/g, "&#39;");
 }
 
-const greeting = (name: unknown) => {
-  const who = clean(name, 80);
-  return who ? `Hello ${who},` : "Hello,";
+// A name is something a person TYPED — at sign-up, before any address was proved theirs — and
+// the greeting is the first line of a mail from our own sender. So a name is used only when it
+// reads as one: letters, spaces, apostrophes and hyphens, at most NAME_MAX characters. No dot,
+// slash, colon, at-sign or digit: nothing a mail client turns into a link, and no room for a
+// sentence ("your account is locked, visit evil.example/x"). Anything else: "Hello,".
+const NAME_MAX = 40;
+const READS_AS_A_NAME = /^[\p{L}\p{M}][\p{L}\p{M} '’-]*$/u;
+export const greeting = (name: unknown) => {
+  const who = clean(name, 200);
+  return who.length <= NAME_MAX && READS_AS_A_NAME.test(who) ? `Hello ${who},` : "Hello,";
 };
+/** For mail to an address that nobody has proved theirs yet: no name at all. */
+const GREETING_UNPROVEN = "Hello,";
 
 /** A link a message may carry: under APP_ORIGIN, or one of the fixed estate pages. */
 function assertLink(env: Pick<Env, "APP_ORIGIN">, url: string): string {
@@ -174,11 +183,13 @@ const NOT_YOU = `If this wasn't you, change your password now and contact ${SUPP
 
 /** Every template, as a function from its data to a draft. Exported for the render tests. */
 export const templates = {
+  // `name` is accepted and NOT used: whoever signed up chose it, and this mail goes to an address
+  // that may be somebody else's.
   verification: (d: { name?: unknown; url: string; resend?: boolean }): Draft => ({
     subject: "Confirm your email address",
     heading: "Confirm your email address",
     blocks: [
-      { text: greeting(d.name) },
+      { text: GREETING_UNPROVEN },
       {
         text: d.resend
           ? "Here is a new link to confirm your email address for Holdfast. Earlier links still work until they expire."
@@ -207,7 +218,8 @@ export const templates = {
     subject: "Confirm your new email address",
     heading: "Confirm your new email address",
     blocks: [
-      { text: greeting(d.name) },
+      // To the NEW address — not yet proved to belong to the account's owner: no name.
+      { text: GREETING_UNPROVEN },
       { text: "Confirm this address to make it the email address of your Holdfast account." },
       { link: { label: "Confirm new address", url: d.url } },
       { text: `The link works for one hour. ${IGNORE}` },
@@ -540,6 +552,38 @@ export function normaliseRecipient(to: unknown): Recipient | null {
   return address;
 }
 
+/**
+ * Which cap a template counts against. Mail a STRANGER can cause to be sent to an address
+ * (a sign-up, a resend, a sign-up attempt — and all product mail) shares the recipient's ordinary
+ * cap. If the owner's own mail counted there too, five such mails an hour would silently stop
+ * their password reset, their address change and their deletion confirmation. So:
+ *   reset     the reset link, alone: only other reset links — which are what the owner asked
+ *             for — can use it up;
+ *   session   mail only a signed-in session of the account can cause.
+ * Each bucket has the same caps (EMAIL_CAPS), so one recipient gets at most three times the cap.
+ */
+const BUCKET_OF: Partial<Record<TemplateName, "reset" | "session">> = {
+  passwordReset: "reset",
+  changeEmailConfirmation: "session",
+  deleteAccountVerification: "session",
+  newAddressVerification: "session",
+};
+export const EMAIL_BUCKETS = ["reset", "session"] as const;
+
+/** The ledger key a template's mail to `address` is counted under. */
+export async function ledgerKey(
+  env: Pick<Env, "FILES_TOKEN_SECRET">,
+  address: string,
+  bucket?: (typeof EMAIL_BUCKETS)[number],
+): Promise<string> {
+  if (!bucket) return recipientHash(env, address);
+  return hmacHex(
+    createKeys(env.FILES_TOKEN_SECRET),
+    "email-ledger",
+    `${bucket}|${address.trim().toLowerCase()}`,
+  );
+}
+
 /** The ledger key of a recipient: HMAC(email-ledger key, lower-cased address). */
 export async function recipientHash(env: Pick<Env, "FILES_TOKEN_SECRET">, address: string): Promise<string> {
   return hmacHex(createKeys(env.FILES_TOKEN_SECRET), "email-ledger", address.trim().toLowerCase());
@@ -585,7 +629,7 @@ async function deliver(
     const rendered = render(env, draft());
 
     if (CLASS_OF[name] !== "security") {
-      const allowed = await tryConsume(deps.db, await recipientHash(env, address), EMAIL_CAPS);
+      const allowed = await tryConsume(deps.db, await ledgerKey(env, address, BUCKET_OF[name]), EMAIL_CAPS);
       if (!allowed) {
         countFor(env, "email", { outcome: "capped", kind });
         return "capped";

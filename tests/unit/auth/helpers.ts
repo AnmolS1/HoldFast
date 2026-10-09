@@ -11,7 +11,7 @@
 // Postgres is shared by every test file and every run: rows are found by random markers (a
 // fresh address, a fresh client address), never by table-wide counts.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { createApp } from "../../../src/worker/app";
 import { createAuth, scopeOf } from "../../../src/worker/auth/create-auth";
 import { installTestOutbound } from "../../../src/worker/auth/test-outbound";
@@ -36,7 +36,7 @@ import {
   shares,
   user,
 } from "../../../src/worker/db/schema";
-import { recipientHash } from "../../../src/worker/services/email";
+import { EMAIL_BUCKETS, ledgerKey, recipientHash } from "../../../src/worker/services/email";
 import * as outbox from "../../../src/worker/services/outbox";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 
@@ -387,7 +387,14 @@ export async function waitForMail(address: string, template: string, count = 1):
 export async function forgetMailCountOf(address: string): Promise<void> {
   await testDb()
     .delete(emailLedger)
-    .where(eq(emailLedger.recipientHash, await recipientHash(env as unknown as Env, address)));
+    .where(
+      inArray(emailLedger.recipientHash, [
+        await recipientHash(env as unknown as Env, address),
+        ...(await Promise.all(
+          EMAIL_BUCKETS.map((bucket) => ledgerKey(env as unknown as Env, address, bucket)),
+        )),
+      ]),
+    );
 }
 
 /** The first link in a message, as a path (its origin is asserted where a test is about origins). */

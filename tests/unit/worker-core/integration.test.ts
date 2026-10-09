@@ -796,7 +796,7 @@ describe("deferred work on a real pool", () => {
         actorUserId: null,
         targetType: "test",
         requestId,
-        ua: "w1b-integration",
+        ua: "other",
         meta: { n: 1 },
       });
       expect(found[0]!.ipHashDaily).toMatch(/^[0-9a-f]{64}$/);

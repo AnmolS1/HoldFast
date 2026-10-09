@@ -14,6 +14,7 @@
 //
 // Not for thumbnail or inline serves (those are aggregated elsewhere).
 
+import { userAgentFamily } from "../../shared/sentry-redact";
 import type { Context } from "hono";
 import type { AuditRow } from "../db/queries/audit";
 import { captureError } from "../sentry";
@@ -68,7 +69,10 @@ export function audit(
     const actor = { ...requestActor(c), ...options };
     const ip = c.get("ip");
     const requestId = c.get("requestId");
-    const ua = c.req.header("user-agent")?.slice(0, 256) ?? null;
+    // The browser FAMILY only ("Chrome", "Safari", "other") — what the session row keeps too. The
+    // raw header is 256 characters of anything the client cares to send, and identifies a device.
+    const header = c.req.header("user-agent");
+    const ua = header === undefined ? null : userAgentFamily(header);
     const cf = c.req.raw.cf as { country?: unknown } | undefined;
     const country = typeof cf?.country === "string" ? cf.country : null;
     const day = dayUTC(now(c));

@@ -13,14 +13,19 @@ import {
   ESTATE_LINKS,
   normaliseRecipient,
   recipientHash,
+  greeting,
   render,
   sendAccountSuspended,
   sendAdminAlert,
+  sendChangeEmailConfirmation,
+  sendDeleteAccountVerification,
+  sendNewAddressVerification,
   sendPasswordChanged,
   sendPasswordReset,
   SENDER,
   sendQuarantineNotice,
   sendShareInvitation,
+  sendSignupAttempt,
   sendVerification,
   SUPPORT_EMAIL,
   templates,
@@ -322,17 +327,37 @@ describe("caps", () => {
       expect(await sendVerification(deps, { to, name: "Ana", url }), `mail ${i}`).toBe("sent");
     }
     expect(await sendVerification(deps, { to, name: "Ana", url })).toBe("capped");
-    // Another auth-class template shares the cap; so does a product-class one.
-    expect(await sendPasswordReset(deps, { to, name: "Ana", url: `${APP}/api/auth/reset-password/t` })).toBe(
-      "capped",
-    );
+    // What a stranger can cause shares that cap — another such template, and product mail.
+    expect(await sendSignupAttempt(deps, { to, name: "Ana" })).toBe("capped");
     expect(await sendQuarantineNotice(deps, { to, name: "Ana", fileName: "a.exe" })).toBe("capped");
     expect(mailTo(to)).toHaveLength(5);
+    // S8 — it does NOT stop the owner's own mail: the reset link has a cap of its own …
+    const resetUrl = `${APP}/api/auth/reset-password/t`;
+    for (let i = 1; i <= EMAIL_CAPS.perHour; i++) {
+      expect(await sendPasswordReset(deps, { to, name: "Ana", url: resetUrl }), `reset ${i}`).toBe("sent");
+    }
+    expect(await sendPasswordReset(deps, { to, name: "Ana", url: resetUrl })).toBe("capped");
+    // … and so has mail that only a signed-in session of the account can cause — five of those,
+    // of whichever kind, with both other caps already used up.
+    const confirmUrl = `${APP}/api/auth/verify-email?token=c`;
+    const deleteUrl = `${APP}/api/auth/delete-user/callback?token=d`;
+    expect(
+      await sendChangeEmailConfirmation(deps, { to, name: "Ana", newEmail: "n@x.example", url: confirmUrl }),
+    ).toBe("sent");
+    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
+    expect(await sendNewAddressVerification(deps, { to, name: "Ana", url: confirmUrl })).toBe("sent");
+    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
+    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
+    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("capped");
+    expect(
+      await sendChangeEmailConfirmation(deps, { to, name: "Ana", newEmail: "n@x.example", url: confirmUrl }),
+    ).toBe("capped");
+    expect(mailTo(to)).toHaveLength(15);
     // Security notices are never dropped — and do not count against the cap either.
     expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("sent");
     expect(await sendAccountSuspended(deps, { to, name: "Ana" })).toBe("sent");
     expect(await sendAdminAlert(deps, { to, kind: "report", reportId: "r1", category: "spam" })).toBe("sent");
-    expect(mailTo(to)).toHaveLength(8);
+    expect(mailTo(to)).toHaveLength(18);
     // Another recipient is not affected.
     expect(await sendVerification(deps, { to: freshEmail(), name: "Bo", url })).toBe("sent");
   });
@@ -386,14 +411,14 @@ describe("the Resend transport", () => {
     try {
       const { deps } = serviceDeps({ EMAIL_TRANSPORT: "resend", RESEND_API_KEY: "re_test_key" });
       const to = freshEmail();
-      expect(await sendPasswordChanged(deps, { to, name: "<b>Ana</b>" })).toBe("sent");
+      expect(await sendPasswordChanged(deps, { to, name: "Ana O'Neil" })).toBe("sent");
       expect(seen).toHaveLength(2);
       expect(seen[0]!.auth).toBe("Bearer re_test_key");
       expect(seen[0]!.key).toBeTruthy();
       expect(seen[1]!.key).toBe(seen[0]!.key);
       expect(seen[1]!.body).toMatchObject({ from: SENDER, to, subject: "[dev] Your password was changed" });
-      expect(String(seen[1]!.body.html)).toContain("&lt;b&gt;Ana&lt;/b&gt;");
-      expect(String(seen[1]!.body.text)).toContain("Hello <b>Ana</b>,");
+      expect(String(seen[1]!.body.html)).toContain("Hello Ana O&#39;Neil,");
+      expect(String(seen[1]!.body.text)).toContain("Hello Ana O'Neil,");
       // Nothing went to the memory outbox on this transport.
       expect(mailTo(to)).toEqual([]);
 
@@ -463,5 +488,61 @@ describe("changing the address of a verified account", () => {
     expect(mailTo(other.email)).toHaveLength(before);
     expect((await userById(row.id))!.email).toBe(email);
     expect((await userByEmail(other.email))!.id).toBe(other.user.id);
+  });
+});
+
+/** The greeting line of a message's text part, or null when it has none. */
+const helloLine = (text: string) => text.split("\n").find((line) => line.startsWith("Hello")) ?? null;
+
+describe("S7 — the greeting", () => {
+  const LURES = [
+    "your account is locked, visit evil.example/x",
+    "evil.example",
+    "Ana https://evil.example",
+    "Ana: call 0800 123 456",
+    "visit evil example slash x now to unlock your account",
+    "a@b.example",
+    "Ana/..",
+    "<b>Ana</b>",
+    "123456",
+    "Ana. Your account is locked",
+  ];
+
+  it("a name is used only when it reads as a name; a sentence, a link or digits become a plain greeting", () => {
+    for (const name of ["Ana", "Ana María", "O'Neil", "Jean-Luc Picard", "Åsa Öberg", "李小龍", "D’Arcy"]) {
+      expect(greeting(name), name).toBe(`Hello ${name},`);
+    }
+    for (const name of [...LURES, "", "   ", null, undefined, 42, "x".repeat(41)]) {
+      expect(greeting(name), String(name)).toBe("Hello,");
+    }
+  });
+
+  it("mail to an address nobody has proved theirs carries no name at all — not even a harmless one", () => {
+    const url = `${APP}/api/auth/verify-email?token=t`;
+    for (const name of ["Ana", ...LURES]) {
+      for (const draft of [
+        templates.verification({ name, url }),
+        templates.verification({ name, url, resend: true }),
+        templates.newAddressVerification({ name, url }),
+      ]) {
+        const message = render(renderEnv, draft);
+        expect(helloLine(message.text), name).toBe("Hello,");
+        expect(message.text, name).not.toContain(name);
+        expect(message.html, name).not.toContain("evil");
+      }
+    }
+  });
+
+  it("no template lets a lure through its greeting (the name of an UNVERIFIED account reaches reset and notice mail too)", () => {
+    let greeted = 0;
+    for (const lure of LURES) {
+      for (const [name, draft] of Object.entries(draftsWith(lure))) {
+        const hello = helloLine(render(renderEnv, draft).text);
+        greeted += hello === null ? 0 : 1;
+        if (hello !== null) expect(hello, `${name}: ${lure}`).toBe("Hello,");
+      }
+    }
+    // (the control: most templates do greet)
+    expect(greeted).toBeGreaterThan(LURES.length * 15);
   });
 });
