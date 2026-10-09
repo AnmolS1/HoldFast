@@ -13,6 +13,9 @@
 //   2. a migration added by the push is destructive AND an earlier migration is added by the same
 //      push (the expand step it follows has not been deployed yet);
 //   3. a single added migration both expands and contracts.
+//   4. the drizzle journal (drizzle/meta/_journal.json) changed an entry that existed at <base>:
+//      the journal is append-only — a changed tag, order or timestamp makes drizzle skip or
+//      re-run a migration on a database that already recorded the old entry.
 // One exemption: when <base> has no migrations at all, nothing has ever been deployed against this
 // schema, so there is no previous version to roll back to and rule 2 and 3 do not apply.
 //
@@ -21,7 +24,8 @@
 //
 // "Destructive" = a statement after which the previous Worker version can break:
 //   DROP <anything> except DROP INDEX / DROP CONSTRAINT / DROP NOT NULL (those only relax),
-//   RENAME, SET NOT NULL, a column type change, TRUNCATE.
+//   RENAME, SET NOT NULL, a column type change, TRUNCATE,
+//   ADD COLUMN … NOT NULL with no DEFAULT (the previous version's INSERTs do not supply it).
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,7 +69,75 @@ export function destructiveStatements(sql) {
   if (/\bSET\s+NOT\s+NULL\b/i.test(text)) found.push("SET NOT NULL");
   if (/\bALTER\s+COLUMN\s+\S+\s+(SET\s+DATA\s+)?TYPE\b/i.test(text)) found.push("ALTER COLUMN TYPE");
   if (/\bTRUNCATE\b/i.test(text)) found.push("TRUNCATE");
+  if (addsRequiredColumn(text)) found.push("ADD COLUMN NOT NULL without DEFAULT");
   return found;
+}
+
+/**
+ * True when an ALTER TABLE adds a column that is NOT NULL and has no DEFAULT (nor is generated or
+ * an identity/serial column): the previous Worker version's INSERTs, which do not name the
+ * column, fail from the moment the migration is applied. `text` is already stripped.
+ */
+function addsRequiredColumn(text) {
+  for (const statement of text.split(";")) {
+    if (!/\bALTER\s+TABLE\b/i.test(statement)) continue;
+    // Each ADD [COLUMN] clause, up to the next top-level action or the end of the statement.
+    const clauses = statement.split(/,\s*(?=(?:ADD|DROP|ALTER|RENAME)\b)/i);
+    for (const clause of clauses) {
+      const add =
+        /\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b|PRIMARY\b|UNIQUE\b|FOREIGN\b|CHECK\b|VALUE\b)(\S+)\s+([\s\S]*)$/i.exec(
+          clause,
+        );
+      if (!add) continue;
+      const definition = add[2];
+      if (!/\bNOT\s+NULL\b/i.test(definition)) continue;
+      if (/\b(DEFAULT|GENERATED|SERIAL|BIGSERIAL|SMALLSERIAL)\b/i.test(definition)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+const JOURNAL = "meta/_journal.json";
+
+/** The journal's entries at a commit, or null when there is no journal there. */
+function journalAt(cwd, commit, dir) {
+  let raw;
+  try {
+    raw = git(cwd, ["show", `${commit}:${dir}/${JOURNAL}`]);
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new CheckError(`${dir}/${JOURNAL} at ${commit} is not JSON`);
+  }
+  if (!parsed || !Array.isArray(parsed.entries))
+    throw new CheckError(`${dir}/${JOURNAL} at ${commit} has no entries`);
+  return parsed.entries;
+}
+
+/** Problems with how the journal changed: it may only grow at its end. */
+export function journalProblems(before, after, dir = "drizzle") {
+  if (before === null) return [];
+  const file = `${dir}/${JOURNAL}`;
+  if (after === null) return [`${file}: existed at the base and is gone — the journal is append-only`];
+  const problems = [];
+  if (after.length < before.length)
+    problems.push(
+      `${file}: ${before.length - after.length} entr(y/ies) removed — the journal is append-only`,
+    );
+  before.forEach((entry, index) => {
+    const now = after[index];
+    if (now === undefined) return;
+    if (JSON.stringify(entry) !== JSON.stringify(now))
+      problems.push(
+        `${file}: entry ${index} (${entry.tag}) changed after it was pushed — the journal is append-only; add a new migration instead`,
+      );
+  });
+  return problems;
 }
 
 /** True when the file adds schema that new code depends on (an expand step). */
@@ -132,6 +204,9 @@ export function checkMigrations({ cwd, base, head = "HEAD", dir = "drizzle" }) {
         `${file}: edited after it was pushed — an applied migration is immutable; add a new migration instead`,
       );
   }
+
+  // Rule 4: the journal only grows.
+  problems.push(...journalProblems(journalAt(cwd, baseCommit, dir), journalAt(cwd, headCommit, dir), dir));
 
   const added = atHead.filter((f) => !baseSet.has(f));
   const firstEver = atBase.length === 0;
@@ -291,6 +366,72 @@ function selfTest() {
       });
       expectResult("RENAME COLUMN in the same push as an expand step", "fail", () =>
         checkMigrations({ cwd, base: relax, head: rename }),
+      );
+    }
+    {
+      // A required column with no default breaks the previous version's INSERTs at once.
+      const cwd = repo();
+      const base = commit(cwd, { "drizzle/0000_init.sql": CREATE });
+      const required = commit(cwd, {
+        "drizzle/0001_required.sql": "ALTER TABLE notes ADD COLUMN owner text NOT NULL;\n",
+      });
+      expectResult("ADD COLUMN … NOT NULL with no DEFAULT", "fail", () =>
+        checkMigrations({ cwd, base, head: required }),
+      );
+      const cwd2 = repo();
+      const base2 = commit(cwd2, { "drizzle/0000_init.sql": CREATE });
+      const fine = commit(cwd2, {
+        "drizzle/0001_fine.sql":
+          'ALTER TABLE notes ADD COLUMN "owner" text DEFAULT \'x\' NOT NULL;\nALTER TABLE "notes" ADD COLUMN "seen_at" timestamp with time zone;\nALTER TABLE notes ADD CONSTRAINT notes_title_nn CHECK (title IS NOT NULL) NOT VALID;\n',
+      });
+      expectResult("ADD COLUMN … NOT NULL with a DEFAULT, a nullable column, a constraint", "pass", () =>
+        checkMigrations({ cwd: cwd2, base: base2, head: fine }),
+      );
+      const cwd3 = repo();
+      const base3 = commit(cwd3, { "drizzle/0000_init.sql": CREATE });
+      const second = commit(cwd3, {
+        "drizzle/0001_two.sql": "ALTER TABLE notes ADD COLUMN a text, ADD COLUMN b integer NOT NULL;\n",
+      });
+      expectResult("the second ADD of one ALTER is the required one", "fail", () =>
+        checkMigrations({ cwd: cwd3, base: base3, head: second }),
+      );
+    }
+    {
+      // The journal is append-only.
+      const entry = (idx, tag, when = 1000 + idx) => ({ idx, version: "7", when, tag, breakpoints: true });
+      const journal = (...entries) => JSON.stringify({ version: "7", dialect: "postgresql", entries }) + "\n";
+      const cwd = repo();
+      mkdirSync(join(cwd, "drizzle/meta"), { recursive: true });
+      const base = commit(cwd, {
+        "drizzle/0000_init.sql": CREATE,
+        "drizzle/meta/_journal.json": journal(entry(0, "0000_init")),
+      });
+      const appended = commit(cwd, {
+        "drizzle/0001_add_title.sql": ADD,
+        "drizzle/meta/_journal.json": journal(entry(0, "0000_init"), entry(1, "0001_add_title")),
+      });
+      expectResult("journal: an entry appended", "pass", () =>
+        checkMigrations({ cwd, base, head: appended }),
+      );
+      const retimed = commit(cwd, {
+        "drizzle/meta/_journal.json": journal(entry(0, "0000_init", 999999), entry(1, "0001_add_title")),
+      });
+      expectResult("journal: an existing entry's timestamp changed", "fail", () =>
+        checkMigrations({ cwd, base: appended, head: retimed }),
+      );
+      const retagged = commit(cwd, {
+        "drizzle/meta/_journal.json": journal(entry(0, "0000_first"), entry(1, "0001_add_title")),
+      });
+      expectResult("journal: an existing entry renamed", "fail", () =>
+        checkMigrations({ cwd, base: appended, head: retagged }),
+      );
+      const dropped = commit(cwd, { "drizzle/meta/_journal.json": journal(entry(0, "0000_init")) });
+      expectResult("journal: an entry removed", "fail", () =>
+        checkMigrations({ cwd, base: appended, head: dropped }),
+      );
+      const gone = commit(cwd, { "drizzle/meta/_journal.json": null });
+      expectResult("journal: the file deleted", "fail", () =>
+        checkMigrations({ cwd, base: appended, head: gone }),
       );
     }
     {

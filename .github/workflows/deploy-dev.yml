@@ -27,11 +27,14 @@ jobs:
     if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # The GitHub environment this job's secrets may be scoped to. A secret of the same name set on
-    # the environment wins over the repository-level one, so moving CLOUDFLARE_API_TOKEN and
-    # NEON_DIRECT_URL_DEV there needs no change to this file. (deploy-prod.yml uses `Production`,
-    # where the production database URL and tokens belong, restricted to the `prod` branch — so a
-    # run from `dev` cannot read them.)
+    # The GitHub environment `dev`: its deployment-branch rule admits only the `dev` branch, and
+    # it holds this job's CLOUDFLARE_API_TOKEN (the dev deploy token) and NEON_DIRECT_URL_DEV.
+    # Neither exists at repository level any more (only CLOUDFLARE_ACCOUNT_ID does), so a job
+    # that does not name this environment gets empty values. Production's secrets — its database
+    # URL, its deploy token, the Sentry token — live on the `Production` environment, whose rule
+    # admits only `prod`: a run from `dev` cannot read them, whatever the workflow file says.
+    # (Cloudflare cannot scope a Workers token to one script, so the two deploy tokens are equal
+    # in what they could do; what the split protects is the production database URL.)
     environment: dev
     # One deploy to dev at a time, shared with scanner-image.yml. Never cancelled mid-flight: a
     # cancelled run could stop between the migration and the deploy.
@@ -86,16 +89,12 @@ jobs:
         run: bash .github/workflows/lib/deploy-lib.sh containers-plan "$APP_URL" "$GITHUB_SHA"
 
       # The same rule CI checked against the previous push, now against the commit that is LIVE:
-      # after a failed deploy the previous push is not what production is running.
+      # after a failed deploy the previous push is not what is running. When the live commit
+      # cannot be read the rule cannot be checked, and the deploy stops here — before it migrates.
       - name: Migration rule, against the live commit
         env:
           DEPLOYED: ${{ steps.plan.outputs.deployed }}
-        run: |
-          if [[ "$DEPLOYED" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$DEPLOYED^{commit}" 2>/dev/null; then
-            node scripts/check-migrations.mjs --base "$DEPLOYED" --head HEAD
-          else
-            echo "::notice::The live commit could not be read or is not in this checkout; the migration rule was checked against the previous push only (job ci)."
-          fi
+        run: bash .github/workflows/lib/deploy-lib.sh live-migration-rule "$DEPLOYED"
 
       # The top level of wrangler.jsonc is dev; the environment is chosen here, at build time.
       # The build stamp (GET /__meta) takes GITHUB_SHA and GITHUB_REF_NAME from the runner.

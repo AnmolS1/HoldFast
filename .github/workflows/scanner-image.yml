@@ -35,6 +35,15 @@ jobs:
     if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # `Production` for BOTH legs, the dev one included. The deploy token is an environment secret
+    # (there is none at repository level), so the job must name an environment — and an
+    # environment's branch rule is matched against the ref of the RUN, which here is always `prod`
+    # (`schedule` and `workflow_dispatch` fire from the default branch; the `if:` above insists).
+    # The `dev` environment admits only runs from `dev`, so naming it would refuse the dev leg.
+    # `Production` admits `prod`, and its Cloudflare token can deploy either Worker (a Workers
+    # token cannot be scoped to one script). This workflow never reads a database URL.
+    # Consequence: a required reviewer added to `Production` also gates this weekly run.
+    environment: Production
     strategy:
       fail-fast: false
       max-parallel: 1

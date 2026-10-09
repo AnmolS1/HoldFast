@@ -30,9 +30,11 @@ jobs:
     if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # The repository's existing "Production" environment. It has no protection rule today; adding
-    # a required reviewer to it in the repository settings makes every production deploy wait for
-    # approval, with no change to this file.
+    # The GitHub environment `Production`: its deployment-branch rule admits only the `prod`
+    # branch, and it holds the production deploy token, NEON_DIRECT_URL_PROD and SENTRY_AUTH_TOKEN
+    # (none of them exists at repository level). It has no required reviewer today; adding one in
+    # the repository settings makes every production deploy wait for approval, with no change to
+    # this file.
     environment: Production
     # One deploy to production at a time, shared with scanner-image.yml. Never cancelled mid-flight.
     concurrency:
@@ -87,16 +89,12 @@ jobs:
         run: bash .github/workflows/lib/deploy-lib.sh containers-plan "$APP_URL" "$GITHUB_SHA"
 
       # The same rule CI checked against the previous push, now against the commit that is LIVE:
-      # after a failed deploy the previous push is not what production is running.
+      # after a failed deploy the previous push is not what is running. When the live commit
+      # cannot be read the rule cannot be checked, and the deploy stops here — before it migrates.
       - name: Migration rule, against the live commit
         env:
           DEPLOYED: ${{ steps.plan.outputs.deployed }}
-        run: |
-          if [[ "$DEPLOYED" =~ ^[0-9a-f]{40}$ ]] && git cat-file -e "$DEPLOYED^{commit}" 2>/dev/null; then
-            node scripts/check-migrations.mjs --base "$DEPLOYED" --head HEAD
-          else
-            echo "::notice::The live commit could not be read or is not in this checkout; the migration rule was checked against the previous push only (job ci)."
-          fi
+        run: bash .github/workflows/lib/deploy-lib.sh live-migration-rule "$DEPLOYED"
 
       # The environment is chosen at BUILD time; `--env` at deploy time does not select it.
       - name: Build (production)

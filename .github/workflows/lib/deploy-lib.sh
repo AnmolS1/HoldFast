@@ -323,6 +323,35 @@ cmd_containers_plan() {
   fi
 }
 
+# ── live-migration-rule ──────────────────────────────────────────────────────────────────────────
+# The migration rule against the commit that is LIVE (CI checked it against the previous push;
+# after a failed deploy that is not what is running). The live commit must be readable: when it is
+# not — /__meta did not answer with a commit, or the commit is not in this checkout — the rule
+# cannot be checked, and a rule that was not checked is a failure, never a pass with a notice.
+# Every Worker this deploys already exists and carries a build stamp, so there is no first-run
+# exemption.
+live_base() { # <deployed sha or ""> → 0 and prints the sha when it can be compared against
+  local deployed="$1"
+  if ! is_sha "$deployed"; then
+    echo "the live commit could not be read from the build stamp (/__meta)"
+    return 1
+  fi
+  if ! git -C "$repo_root" cat-file -e "$deployed^{commit}" 2>/dev/null; then
+    echo "the live commit $deployed is not in this checkout"
+    return 1
+  fi
+  echo "$deployed"
+}
+
+cmd_live_migration_rule() {
+  [ "$#" -ge 1 ] || fail "usage: deploy-lib.sh live-migration-rule <deployed-sha>"
+  need git node
+  local base
+  base="$(live_base "$1")" ||
+    fail "live-migration-rule: $base — the migration rule cannot be checked against what is running, so this deploy stops before it migrates. Fix the stamp (or redeploy the previous commit by hand) and run again."
+  (cd "$repo_root" && node scripts/check-migrations.mjs --base "$base" --head HEAD)
+}
+
 # ── worker-ready / secrets ───────────────────────────────────────────────────────────────────────
 eval_secret_names() { # <file with `wrangler secret list --format json` output>
   local file="$1" have missing="" name
@@ -565,6 +594,12 @@ cmd_self_test() {
   expect pass "deployed commit not in the checkout → build" plan_is build "$sha_a" "$c2"
   expect pass "deployed commit ahead of head → build" plan_is build "$c2" "$c1"
   SCANNER_ALWAYS_BUILD=true expect pass "SCANNER_ALWAYS_BUILD → build" plan_is build "$c1" "$c2"
+
+  echo "live-migration-rule (the base it may compare against):"
+  expect pass "a live commit that is in the checkout" live_base "$c1"
+  expect fail "no live commit (the stamp could not be read)" live_base ""
+  expect fail "a stamp that is not a commit sha" live_base "unknown"
+  expect fail "a live commit that is not in the checkout" live_base "$sha_a"
   repo_root="$saved_root"
 
   echo "redaction:"
@@ -585,6 +620,7 @@ case "$command" in
   files-host) cmd_files_host "$@" ;;
   branch-head) cmd_branch_head "$@" ;;
   containers-plan) cmd_containers_plan "$@" ;;
+  live-migration-rule) cmd_live_migration_rule "$@" ;;
   worker-ready) cmd_worker_ready "$@" ;;
   secrets) cmd_secrets "$@" ;;
   migrate) cmd_migrate "$@" ;;
