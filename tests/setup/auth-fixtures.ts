@@ -123,10 +123,10 @@ export function totpCode(uriOrSecret: string, at: number = Date.now()): string {
   return String((mac.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
-/** Sign up and follow the verification link. `inviteCode: null` sends none (an ADMIN_EMAILS address). */
+/** Sign up with an invite and follow the verification link. Every address needs an invite. */
 async function signUpAndVerify(
   request: APIRequestContext,
-  options: FixtureOptions & { inviteCode: string | null },
+  options: FixtureOptions & { inviteCode: string },
 ): Promise<SignedInUser> {
   const email = (options.email ?? freshEmail()).toLowerCase();
   const password = options.password ?? FIXTURE_PASSWORD;
@@ -137,7 +137,7 @@ async function signUpAndVerify(
       email,
       password,
       name,
-      ...(options.inviteCode ? { inviteCode: options.inviteCode } : {}),
+      inviteCode: options.inviteCode,
       birthYear: 1990,
       birthMonth: 5,
       acceptTerms: true,
@@ -214,8 +214,15 @@ async function createAdmin(
   options: FixtureOptions,
   email: string,
 ): Promise<SignedInAdmin> {
-  // An ADMIN_EMAILS address needs no invite; its first session (the verification link) grants the role.
-  const user = await signUpAndVerify(request, { ...options, email, inviteCode: null, name: "E2E Admin" });
+  // The bootstrap as an operator does it: an invite made out of band (scripts/create-invite.ts),
+  // a sign-up with an ADMIN_EMAILS address, and the role at its first verified session — here the
+  // verification link. The address itself gets no other treatment.
+  const user = await signUpAndVerify(request, {
+    ...options,
+    email,
+    inviteCode: await createInvite(),
+    name: "E2E Admin",
+  });
   const enabled = await request.post("/api/auth/two-factor/enable", {
     headers: headersFor(options.clientIp),
     data: { password: user.password },
