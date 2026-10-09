@@ -80,7 +80,23 @@ export type AuthScope = {
   userUpdates: Array<{ banned?: boolean; address?: boolean; emailChanged?: boolean }>;
   /** Memo of the per-domain sign-up check (the MX lookup is made once per request). */
   domainChecks: Map<string, Promise<string | null>>;
+  /**
+   * "The request has been answered." Mail that an auth request causes is sent only after this
+   * (`afterAnswer`): work that started earlier would run beside the request's own — more round
+   * trips before the answer exactly when there is somebody to mail (auth/parity.ts). The route
+   * holds it (`held`) until the answer is complete; a handler called without the route releases
+   * it when it returns.
+   */
+  answered: { promise: Promise<void>; release(): void; held: boolean };
 };
+
+/**
+ * `work`, started once the request has been answered — as a promise for the request's deferred
+ * work (`scope.deps.defer(afterAnswer(scope, () => send…()))`).
+ */
+export function afterAnswer<T>(scope: AuthScope, work: () => Promise<T>): Promise<T> {
+  return scope.answered.promise.then(() => new Promise<void>((resolve) => setTimeout(resolve, 0))).then(work);
+}
 
 export function emptyFacts(): AuthFacts {
   return {
@@ -96,6 +112,12 @@ export function emptyFacts(): AuthFacts {
     secondFactor: null,
     impersonatorId: null,
   };
+}
+
+function answerGate(): AuthScope["answered"] {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => (release = resolve));
+  return { promise, release, held: false };
 }
 
 export function createScope(env: Env, db: Db, ctx: AuthContext): AuthScope {
@@ -118,5 +140,6 @@ export function createScope(env: Env, db: Db, ctx: AuthContext): AuthScope {
     reservation: null,
     userUpdates: [],
     domainChecks: new Map(),
+    answered: answerGate(),
   };
 }

@@ -49,6 +49,7 @@ import {
   type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
+import { BREACH_PATHS, refuseBreachedPassword } from "./breach-check";
 import { afterChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
@@ -64,7 +65,7 @@ import {
   VERIFY_TOTP_PATH,
 } from "./second-factor";
 import { countFor, record, reportError } from "./observe";
-import type { AuthScope, ClientFacts } from "./scope";
+import { afterAnswer, type AuthScope, type ClientFacts } from "./scope";
 import {
   cookieAttributes,
   cookieName,
@@ -459,11 +460,6 @@ export function buildHooks(scope: AuthScope) {
       const body = await beforeSecondFactor(scope, ctx);
       if (body) return { context: { body } };
     }
-    if (path === "/change-password" && ctx.request) {
-      // A changed password ends every other session, whatever the client asked for
-      // (api/routes/update-user.mjs honours `revokeOtherSessions` only when the body says so).
-      return { context: { body: { ...((ctx.body ?? {}) as object), revokeOtherSessions: true } } };
-    }
     if (path === "/sign-up/email" && ctx.request) {
       // The cheap refusals first — before the password is hashed and looked up in the breach
       // corpus. They depend only on what was submitted, never on whether the address has an
@@ -476,6 +472,23 @@ export function buildHooks(scope: AuthScope) {
         refused(error);
       }
     }
+    if (BREACH_PATHS.has(path) && ctx.request) {
+      // Input first (auth/parity.ts, auth/breach-check.ts): a password of acceptable length is
+      // looked up in the breach corpus BEFORE anything is looked up about any account or token —
+      // so the answer to a breached password is the same whoever the request is about, and a
+      // reset token is not spent on a password that will be refused. (A length Better Auth
+      // refuses anyway is left to it.)
+      const body = (ctx.body ?? {}) as { password?: unknown; newPassword?: unknown };
+      const password = path === "/sign-up/email" ? body.password : body.newPassword;
+      if (typeof password === "string" && password.length >= 12 && password.length <= 128) {
+        await refuseBreachedPassword(env, password);
+      }
+    }
+    if (path === "/change-password" && ctx.request) {
+      // A changed password ends every other session, whatever the client asked for
+      // (api/routes/update-user.mjs honours `revokeOtherSessions` only when the body says so).
+      return { context: { body: { ...((ctx.body ?? {}) as object), revokeOtherSessions: true } } };
+    }
   });
 
   const after = createAuthMiddleware(async (ctx) => {
@@ -485,8 +498,12 @@ export function buildHooks(scope: AuthScope) {
       return;
     }
     if (path === "/change-email" && ctx.request) {
-      await quietly(env, "change_email", () =>
-        afterChangeEmail(scope, ctx, (mail) => sendChangeEmailConfirmation(scope.deps, mail)),
+      scope.deps.defer(
+        afterAnswer(scope, () =>
+          quietly(env, "change_email", () =>
+            afterChangeEmail(scope, ctx, (mail) => sendChangeEmailConfirmation(scope.deps, mail)),
+          ),
+        ),
       );
       return;
     }
@@ -566,10 +583,12 @@ export function buildHooks(scope: AuthScope) {
         // The owner hears about it — a notice, never a link: whoever sent the request must not
         // be able to make the owner's inbox hand them anything.
         scope.deps.defer(
-          quietly(env, "signup_attempt", async () => {
-            const owner = await getAccountByEmail(scope.db, address);
-            if (owner) await sendSignupAttempt(scope.deps, { to: owner.email, name: owner.name });
-          }),
+          afterAnswer(scope, () =>
+            quietly(env, "signup_attempt", async () => {
+              const owner = await getAccountByEmail(scope.db, address);
+              if (owner) await sendSignupAttempt(scope.deps, { to: owner.email, name: owner.name });
+            }),
+          ),
         );
       }
       // "This browser just signed up with that address" — what lets the next screen fix a

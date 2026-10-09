@@ -419,7 +419,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await third.context().close();
   });
 
-  test("an expired link and a tampered one say so, sign nobody in and leave the account as it was", async ({
+  test("an expired link and a tampered one get one answer, sign nobody in and leave the account as it was", async ({
     page,
     browser,
     clientIp,
@@ -446,7 +446,8 @@ test.describe("the verification link, opened in a browser that did not sign up",
     link.searchParams.set("token", expiredVerificationToken(email));
     await other.goto(link.toString());
     await expectSignInScreen(other);
-    await expect(other.getByRole("alert")).toContainText("That confirmation link has expired.");
+    // The SAME sentence as for a tampered one: a link that does not work does not say why.
+    await expect(other.getByRole("alert")).toContainText("That confirmation link isn't valid any more.");
     expect(await sessionOf(other.request)).toBeNull();
     // Nothing was verified and nothing removed: the sign-up's own password is still the account's.
     expect((await userRow(email))?.email_verified).toBe(false);

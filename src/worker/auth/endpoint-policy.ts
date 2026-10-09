@@ -23,7 +23,7 @@
 // it off; sign-up is refused by the sign-up policy).
 //
 // THE TABLE is the route table of better-auth 1.7.7 + @better-auth/passkey 1.7.7 with the plugins
-// of auth/config.ts (passkey, twoFactor, admin, captcha, haveIBeenPwned), read from the built
+// of auth/config.ts (passkey, twoFactor, admin, captcha), read from the built
 // instance: `Object.values(auth.api)` → `endpoint.path`, `endpoint.options.method`.
 // tests/unit/worker-core/auth-endpoints.test.ts rebuilds that list from the installed packages
 // and fails when it differs from this table — a new endpoint cannot appear without a decision.

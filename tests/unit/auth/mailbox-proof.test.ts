@@ -212,7 +212,7 @@ describe("a verification link opened in a browser that did not sign up", () => {
     url.searchParams.set("token", tampered);
     const answer = await send(newClient(), url.pathname + url.search);
     expect(answer.status).toBe(302);
-    expect(answer.headers.get("location")).toContain("error=INVALID_TOKEN");
+    expect(answer.headers.get("location")).toContain("error=LINK_INVALID");
     expect(await userById(id)).toMatchObject({ emailVerified: false, name: "Planted Name" });
     expect((await accountsOf(id)).map((row) => row.providerId)).toEqual(["credential"]);
     await purgeAuthRows(testDb(), id);

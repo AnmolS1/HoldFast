@@ -108,7 +108,7 @@ describe("verification comes first", () => {
     for (const forged of [`${header}.${other}.${signature}`, `${header}.${payload}.AAAA`, "not-a-token"]) {
       url.searchParams.set("token", forged);
       const answer = await send(newClient(), url.pathname + url.search);
-      expect(answer.headers.get("location") ?? "").toMatch(/error=(INVALID_TOKEN|invalid_token)/i);
+      expect(answer.headers.get("location") ?? "").toMatch(/error=LINK_INVALID/);
     }
     expect((await userByEmail(email))!.emailVerified).toBe(false);
   });
@@ -394,6 +394,13 @@ describe("the breach check", () => {
     // The old password still works: nothing was changed by the refused attempts.
     await send(client, "/api/auth/sign-out", { json: {} });
     expect((await signIn(newClient(), email)).status).toBe(200);
+    // And the refusal came BEFORE the token was looked at: the link is not spent — the same
+    // token then takes a password that is not in the corpus.
+    const accepted = await send(newClient(), "/api/auth/reset-password", {
+      json: { newPassword: "a password nobody breached 61!", token },
+    });
+    expect(accepted.status, accepted.text).toBe(200);
+    expect((await signIn(newClient(), email, "a password nobody breached 61!")).status).toBe(200);
   });
 
   it("an unreachable breach service fails the sign-up closed (no account without the check)", async () => {
@@ -401,7 +408,9 @@ describe("the breach check", () => {
     outbound.answer("api.pwnedpasswords.com", () => new Response("down", { status: 503 }));
     try {
       const { sent, email } = await signUp(newClient());
-      expect(sent.status).toBe(500);
+      // Refused, and said so — 503 with a code of its own, not an unexplained 500 (auth/breach-check.ts).
+      expect(sent.status).toBe(503);
+      expect(sent.body).toMatchObject({ code: "BREACH_CHECK_UNAVAILABLE" });
       expect(await userByEmail(email)).toBeNull();
     } finally {
       outbound.answer("api.pwnedpasswords.com", null);

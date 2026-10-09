@@ -11,7 +11,7 @@
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
-import { admin, captcha, haveIBeenPwned, twoFactor } from "better-auth/plugins";
+import { admin, captcha, twoFactor } from "better-auth/plugins";
 import { drizzle } from "drizzle-orm/node-postgres";
 
 // The two `additionalFields` objects live in ./fields (a module with no imports, which the
@@ -40,6 +40,5 @@ export const auth = betterAuth({
     twoFactor(),
     admin(),
     captcha({ provider: "cloudflare-turnstile", secretKey: "schema-generation-only" }),
-    haveIBeenPwned(),
   ],
 });

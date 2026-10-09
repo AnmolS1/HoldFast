@@ -32,6 +32,7 @@ const REDIRECT_ERRORS = new Map<string, MessageKey>([
   ["PROVIDER_EMAIL_UNVERIFIED", "auth.redirect.providerUnverified"],
   ["ACCOUNT_SUSPENDED", "login.suspended"],
   // A verification link (Better Auth's GET /verify-email).
+  ["LINK_INVALID", "auth.redirect.linkInvalid"],
   ["TOKEN_EXPIRED", "auth.redirect.linkExpired"],
   ["INVALID_TOKEN", "auth.redirect.linkInvalid"],
   ["USER_NOT_FOUND", "auth.redirect.linkInvalid"],

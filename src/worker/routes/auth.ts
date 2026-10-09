@@ -26,14 +26,17 @@ import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
 import { CHANGE_EMAIL_UNAVAILABLE } from "../auth/mailbox-proof";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
+import { LINK_ERROR_BUDGET, padStatements, spendHash, STATEMENT_BUDGET } from "../auth/parity";
 import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { isUniqueViolation } from "../db/errors";
 import { AppError } from "../services/errors";
-import { auth, type AppEnv } from "../services/request-context";
+import { auth, db, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
 
 const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
+/** The one error a verification link answers with (the client has one sentence for it). */
+export const LINK_INVALID = "LINK_INVALID";
 
 /** The only request body this route keeps a copy of: a sign-in's, to name the account a failed attempt tried. */
 const KEEP_BODY_PATH = "/sign-in/email";
@@ -84,6 +87,37 @@ async function smallJsonBody(request: Request): Promise<unknown> {
   }
 }
 
+/** A link's answer that is a redirect carrying `error=`. */
+function linkFailed(relativePath: string, response: Response): boolean {
+  if (relativePath !== "/verify-email" || response.status !== 302) return false;
+  return /[?&]error=/.test(response.headers.get("location") ?? "");
+}
+
+/**
+ * ONE answer for a verification link that did not work — unknown, expired, tampered, for an
+ * address no account has any more, or for another account: Better Auth names each
+ * (`TOKEN_EXPIRED`, `INVALID_TOKEN`, `USER_NOT_FOUND`, `INVALID_USER`), which tells whoever holds
+ * a link things about the account behind it. They all become `LINK_INVALID`.
+ */
+function genericLinkError(response: Response): Response {
+  if (response.status !== 302) return response;
+  const location = response.headers.get("location");
+  if (!location || !/[?&]error=/.test(location)) return response;
+  const headers = new Headers(response.headers);
+  headers.set("location", location.replace(/([?&]error=)[^&#]*/, `$1${LINK_INVALID}`));
+  return new Response(null, { status: 302, headers });
+}
+
+/** The `code` of a JSON error answer, read from a copy. */
+async function errorCode(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.clone().json()) as { code?: unknown } | null;
+    return typeof body?.code === "string" ? body.code : null;
+  } catch {
+    return null;
+  }
+}
+
 router.all(
   "/auth/*",
   guard("auth", async (c) => {
@@ -114,35 +148,56 @@ router.all(
     const request = withClientAddress(c.req.raw, c.get("ip"));
     const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
 
-    // 3. The watchdog (auth/watchdog.ts).
-    let response: Response;
+    // Mail this request causes waits until it has been answered (auth/scope.ts `afterAnswer`).
+    if (scope) scope.answered.held = true;
     try {
-      const outcome = await watched(instance.handler(request));
-      if (outcome === HANG) return hungAnswer(c, "handler");
-      response = outcome;
-    } catch (error) {
-      // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
-      // It is reported from here as a sanitised copy — the class, the code and the scanned
-      // message; a database error carries the row it was about, and none of that may leave with
-      // it — and answered here. The caught object goes nowhere: not to a sink, and not to the
-      // app's error handler.
-      if (isAnswer(error)) throw error;
-      if (relativePath === "/verify-email" && isUniqueViolation(error)) {
-        // The address a change-of-address link confirms was taken between the look-up and the
-        // write (two accounts confirming one address at the same moment): not an error page on a
-        // link somebody clicked — the same answer as "taken a while ago" (auth/mailbox-proof.ts).
-        return c.redirect(`${c.env.APP_ORIGIN}${CHANGE_EMAIL_UNAVAILABLE}`, 302);
-      }
-      count("auth", { outcome: "error" });
-      reportError(error, { kind: "auth_handler" });
-      return c.json(
-        { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
-        500,
-      );
+      return await answer();
+    } finally {
+      scope?.answered.release();
     }
 
-    // 4. What happened, for the audit log.
-    if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
-    return response;
+    async function answer(): Promise<Response> {
+      // 3. The watchdog (auth/watchdog.ts).
+      let response: Response;
+      try {
+        const outcome = await watched(instance.handler(request));
+        if (outcome === HANG) return hungAnswer(c, "handler");
+        response = outcome;
+      } catch (error) {
+        // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
+        // It is reported from here as a sanitised copy — the class, the code and the scanned
+        // message; a database error carries the row it was about, and none of that may leave with
+        // it — and answered here. The caught object goes nowhere: not to a sink, and not to the
+        // app's error handler.
+        if (isAnswer(error)) throw error;
+        if (relativePath === "/verify-email" && isUniqueViolation(error)) {
+          // The address a change-of-address link confirms was taken between the look-up and the
+          // write (two accounts confirming one address at the same moment): not an error page on a
+          // link somebody clicked — the same answer as "taken a while ago" (auth/mailbox-proof.ts).
+          return c.redirect(`${c.env.APP_ORIGIN}${CHANGE_EMAIL_UNAVAILABLE}`, 302);
+        }
+        count("auth", { outcome: "error" });
+        reportError(error, { kind: "auth_handler" });
+        return c.json(
+          { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
+          500,
+        );
+      }
+
+      // 3b. One answer, one amount of work (auth/parity.ts).
+      if (method === "GET" && relativePath === "/verify-email") response = genericLinkError(response);
+      const budget = linkFailed(relativePath, response) ? LINK_ERROR_BUDGET : STATEMENT_BUDGET[relativePath];
+      if (budget !== undefined) {
+        // A reset whose token did not check out has hashed nothing; one that did has hashed once.
+        if (relativePath === "/reset-password" && method === "POST" && response.status === 400) {
+          if ((await errorCode(response)) === "INVALID_TOKEN") await spendHash();
+        }
+        await padStatements(db(c), budget);
+      }
+
+      // 4. What happened, for the audit log.
+      if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
+      return response;
+    }
   }),
 );

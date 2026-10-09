@@ -127,7 +127,21 @@ export function createDb(
 
   // Connections currently lent out, so a forced close can take them back.
   const lent = new Set<PoolClient>();
-  pool.on("acquire", (client) => lent.add(client));
+  // …and every statement any of them sends is counted (`statementsSent`): the auth routes bring
+  // each of their answers to one fixed number of round trips, whatever the answer is.
+  const counter = { sent: 0 };
+  statementCounters.set(db, counter);
+  const counted = new WeakSet<PoolClient>();
+  pool.on("acquire", (client) => {
+    lent.add(client);
+    if (counted.has(client)) return;
+    counted.add(client);
+    const query = client.query.bind(client) as (...args: unknown[]) => unknown;
+    (client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args) => {
+      counter.sent += 1;
+      return query(...args);
+    };
+  });
   pool.on("release", (_error, client) => lent.delete(client));
   let ending: Promise<void> | null = null;
 
@@ -156,6 +170,13 @@ export function createDb(
       await ending;
     },
   };
+}
+
+const statementCounters = new WeakMap<object, { sent: number }>();
+
+/** How many statements this handle's connections have sent so far (0 for a handle not made here). */
+export function statementsSent(db: Db): number {
+  return statementCounters.get(db)?.sent ?? 0;
 }
 
 /** create → fn → close in `finally`. For scripts and tests. */

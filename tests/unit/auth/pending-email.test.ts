@@ -75,7 +75,7 @@ describe("PATCH /api/account/pending-email", () => {
 
     // The old link names an address no account has any more.
     const stale = await send(newClient(), oldLink);
-    expect(stale.headers.get("location")).toMatch(/error=USER_NOT_FOUND/);
+    expect(stale.headers.get("location")).toMatch(/error=LINK_INVALID/);
     expect((await userById(row!.id))!.emailVerified).toBe(false);
 
     // The new one verifies and signs in.

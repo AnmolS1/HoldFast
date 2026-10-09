@@ -106,6 +106,61 @@ export const BASE_SETTINGS: Settings = {
   ceilings: {},
 };
 
+// ── counting what a request does ────────────────────────────────────────────────────────────
+// For the enumeration tests: instead of comparing wall-clock time (which measures the machine),
+// two requests are compared by the WORK they did — SQL statements sent before the response was
+// produced and in total, promises handed to the request's deferred work, audit rows, mails.
+export const probe = { statements: 0, statementsAtResponse: 0, deferred: 0, audits: 0 };
+
+/** `createDb`, with every statement any of its connections sends counted in `probe`. */
+const countedDb: CoreDeps["createDb"] = (dbEnv, limits) => {
+  const made = createDb(dbEnv, limits);
+  const pool = (made.db as unknown as { $client: { on(event: string, fn: (client: unknown) => void): void } })
+    .$client;
+  const patched = new WeakSet<object>();
+  pool.on("acquire", (client) => {
+    const connection = client as { query: (...args: unknown[]) => unknown };
+    if (patched.has(connection)) return;
+    patched.add(connection);
+    const query = connection.query.bind(connection);
+    connection.query = (...args: unknown[]) => {
+      probe.statements += 1;
+      return query(...args);
+    };
+  });
+  return made;
+};
+
+export type Measured = {
+  sent: Sent;
+  /** SQL statements sent before the response existed — what the caller's stopwatch sees. */
+  statements: number;
+  /** …and in total, deferred work included. */
+  statementsTotal: number;
+  /** Promises handed to the request's deferred work (mails, audit rows, pool close). */
+  deferred: number;
+  audits: number;
+  mails: number;
+};
+
+/** `send`, with the work the request did. One at a time: the counters are the file's own. */
+export async function measured(client: Client, path: string, options: SendOptions = {}): Promise<Measured> {
+  probe.statements = 0;
+  probe.statementsAtResponse = 0;
+  probe.deferred = 0;
+  probe.audits = 0;
+  const mailsBefore = outbox.list({}).length;
+  const sent = await send(client, path, options);
+  return {
+    sent,
+    statements: probe.statementsAtResponse,
+    statementsTotal: probe.statements,
+    deferred: probe.deferred,
+    audits: probe.audits,
+    mails: outbox.list({}).length - mailsBefore,
+  };
+}
+
 const apps = new Map<string, ReturnType<typeof createApp>>();
 
 /** The real app, with the settings table overlaid by `overrides` (for the pipeline AND the auth hooks). */
@@ -120,6 +175,11 @@ function appFor(overrides: Settings): ReturnType<typeof createApp> {
     });
     app = createApp({
       ...realCore,
+      createDb: countedDb,
+      insertAudit: async (db, row) => {
+        probe.audits += 1;
+        return insertAudit(db, row);
+      },
       getSettings: overlaid,
       createAuth: (authEnv, db, ctx) => {
         const auth = createAuth(authEnv, db, ctx);
@@ -196,7 +256,10 @@ export async function send(client: Client, path: string, options: SendOptions = 
 
   const pending: Promise<unknown>[] = [];
   const ctx = {
-    waitUntil: (promise: Promise<unknown>) => void pending.push(promise),
+    waitUntil: (promise: Promise<unknown>) => {
+      probe.deferred += 1;
+      pending.push(promise);
+    },
     passThroughOnException() {},
     props: {},
   } as unknown as ExecutionContext;
@@ -208,6 +271,7 @@ export async function send(client: Client, path: string, options: SendOptions = 
     requestEnv,
     ctx,
   );
+  probe.statementsAtResponse = probe.statements;
   // Everything the request deferred — audit rows, mails, the pool's close — has happened when
   // this returns.
   while (pending.length) await Promise.allSettled(pending.splice(0));

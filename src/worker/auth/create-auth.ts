@@ -19,7 +19,7 @@ import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { passkey } from "@better-auth/passkey";
 import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
-import { admin, captcha, haveIBeenPwned, twoFactor } from "better-auth/plugins";
+import { admin, captcha, twoFactor } from "better-auth/plugins";
 import type { Db } from "../db/client";
 import { deleteTrustedDevices } from "../db/queries/auth-lifecycle";
 import * as schema from "../db/schema";
@@ -39,7 +39,7 @@ import { VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
-import { createScope, emptyFacts, type AuthScope } from "./scope";
+import { afterAnswer, createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
 
@@ -48,7 +48,7 @@ export const SESSION_UPDATE_AGE_S = 60 * 60 * 24;
 export const IMPERSONATION_SESSION_S = 60 * 15;
 export const VERIFICATION_EXPIRES_IN_S = VERIFY_LINK_EXPIRES_IN_S;
 
-export const PASSWORD_COMPROMISED_MESSAGE = "This password appears in a known breach. Choose another.";
+export { PASSWORD_COMPROMISED_MESSAGE } from "./breach-check";
 
 /** Endpoints that need a Turnstile token (`x-captcha-response`). */
 export const CAPTCHA_ENDPOINTS = [
@@ -138,7 +138,12 @@ export function buildAuthOptions(scope: AuthScope) {
       // Better Auth's own scrypt, through a module a test can count calls on (./password.ts).
       password: { hash: hashPassword, verify: verifyPassword },
       sendResetPassword: async ({ user, url }: { user: { email: string; name: string }; url: string }) => {
-        await sendPasswordReset(deps, { to: user.email, name: user.name, url });
+        // Handed to the request's deferred work and started only once the request is answered —
+        // never awaited here: an answer that waited for a mail, or shared its round trips with
+        // one, would be slower exactly when the address has an account (auth/parity.ts).
+        deps.defer(
+          afterAnswer(scope, () => sendPasswordReset(deps, { to: user.email, name: user.name, url })),
+        );
       },
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
         scope.facts.passwordResetUserId = user.id;
@@ -159,11 +164,20 @@ export function buildAuthOptions(scope: AuthScope) {
         url: string;
         token: string;
       }) => {
+        // Deferred, never awaited (see `sendResetPassword` above).
         if (isAddressChangeToken(token)) {
-          await sendNewAddressVerification(deps, { to: user.email, name: user.name, url });
+          deps.defer(
+            afterAnswer(scope, () =>
+              sendNewAddressVerification(deps, { to: user.email, name: user.name, url }),
+            ),
+          );
         } else {
           const resend = scope.facts.endpointPath === "/send-verification-email";
-          await sendVerification(deps, { to: user.email, name: user.name, url, resend });
+          deps.defer(
+            afterAnswer(scope, () =>
+              sendVerification(deps, { to: user.email, name: user.name, url, resend }),
+            ),
+          );
         }
       },
     },
@@ -218,7 +232,11 @@ export function buildAuthOptions(scope: AuthScope) {
           newEmail: string;
           url: string;
         }) => {
-          await sendChangeEmailConfirmation(deps, { to: user.email, name: user.name, newEmail, url });
+          deps.defer(
+            afterAnswer(scope, () =>
+              sendChangeEmailConfirmation(deps, { to: user.email, name: user.name, newEmail, url }),
+            ),
+          );
         },
       },
       deleteUser: {
@@ -284,7 +302,6 @@ export function buildAuthOptions(scope: AuthScope) {
         secretKey: env.TURNSTILE_SECRET,
         endpoints: CAPTCHA_ENDPOINTS,
       }),
-      haveIBeenPwned({ customPasswordCompromisedMessage: PASSWORD_COMPROMISED_MESSAGE }),
     ],
   };
 }
@@ -311,6 +328,8 @@ export function createAuth(env: Env, db: Db, ctx: AuthContext): Auth {
         // A sign-up that took an invite and velocity counts but did not create its account
         // (it failed, or threw) gives them back.
         await releaseUnusedReservation(scope);
+        // Called without the route (a test, a script): the handler's return IS the answer.
+        if (!scope.answered.held) scope.answered.release();
       }
     },
   };
