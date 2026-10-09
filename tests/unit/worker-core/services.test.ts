@@ -650,13 +650,15 @@ describe("Sentry redaction", () => {
     }
   });
 
-  it("drops token, code and password query values", () => {
+  it("drops token, code, state and password query values", () => {
     expect(redactUrl("/api/auth/delete-user/callback?token=SECRET&callbackURL=/x")).toBe(
       "/api/auth/delete-user/callback?token=[redacted]&callbackURL=/x",
     );
-    expect(redactUrl("/cb?state=1&code=4/0AbC&password=hunter2")).toBe(
-      "/cb?state=1&code=[redacted]&password=[redacted]",
+    // The OAuth `state` goes like the `code` does: it is what ties a callback to a browser.
+    expect(redactUrl("/cb?state=1&code=4/0AbC&password=hunter2&scope=email")).toBe(
+      "/cb?state=[redacted]&code=[redacted]&password=[redacted]&scope=email",
     );
+    expect(redactUrl("/x?estate=1&statement=2")).toBe("/x?estate=1&statement=2");
     expect(redactUrl("token=abc&x=1")).toBe("token=[redacted]&x=1");
     expect(redactUrl("/x?barcode=1")).toBe("/x?barcode=1");
   });
@@ -736,7 +738,10 @@ describe("Sentry redaction", () => {
           Cookie: "__Secure-hf.session_token=abc",
           authorization: "Bearer abc",
           "X-Captcha-Response": "turnstile-token",
-          "user-agent": "Mozilla",
+          "user-agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+          "CF-Connecting-IP": "203.0.113.77",
+          "x-forwarded-for": "203.0.113.77, 198.51.100.4",
+          accept: "application/json",
         },
         cookies: { "hf.session_token": "abc" },
         data: { email: "bob@example.test", password: "hunter2", newPassword: "hunter3", name: "Bob" },
@@ -758,7 +763,8 @@ describe("Sentry redaction", () => {
       request: {
         url: "https://files.example/d/[redacted]",
         query_string: "token=[redacted]&x=1",
-        headers: { "user-agent": "Mozilla" },
+        // Credentials and the client's address are gone; the User-Agent is its family only.
+        headers: { "user-agent": "Firefox", accept: "application/json" },
         cookies: "[redacted]",
         data: { email: "[email]", password: "[redacted]", newPassword: "[redacted]", name: "Bob" },
       },
@@ -778,6 +784,10 @@ describe("Sentry redaction", () => {
       "eve@",
       "CODE-1",
       "AbCdEf",
+      "203.0.113",
+      "198.51.100",
+      "Gecko",
+      "Linux",
     ]) {
       expect(text).not.toContain(leak);
     }
