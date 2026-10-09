@@ -45,6 +45,16 @@ async function suspend(userId: string): Promise<void> {
   expect(await sessionsOf(userId), "suspension ends every session").toEqual([]);
 }
 
+/** Makes browsers that hold exactly the cookies `client` holds NOW (same address too). */
+function sameCookies(client: Client): () => Client {
+  const held = new Map(client.cookies);
+  return () => {
+    const browser = newClient({ ip: client.ip });
+    for (const [name, value] of held) browser.cookies.set(name, value);
+    return browser;
+  };
+}
+
 const SUSPENDED = { code: "ACCOUNT_SUSPENDED", message: "This account is suspended. Contact support." };
 
 /** No session row, no session for the browser, whatever the answer was. */
@@ -188,11 +198,15 @@ describe("a suspended account cannot start a session", () => {
       [...client.cookies.keys()].some((name) => name.includes("session_data")),
       "the cache cookie is sent",
     ).toBe(true);
-    const sessionRead = await send(client, "/api/auth/get-session");
-    const appRead = await send(client, "/api/account/deletion-status");
-    const appWrite = await send(client, "/api/account/deletion/cancel", { json: {} });
-    const authWrite = await send(client, "/api/auth/update-user", { json: { name: "Still Here" } });
-    const authRead = await send(client, "/api/auth/list-sessions");
+    // One browser per request, each holding the same cookies as they were at the suspension: an
+    // answer that deletes the cookies (Better Auth does, once it finds nobody) must not be what
+    // makes the NEXT request fail.
+    const asThen = sameCookies(client);
+    const appRead = await send(asThen(), "/api/account/deletion-status");
+    const appWrite = await send(asThen(), "/api/account/deletion/cancel", { json: {} });
+    const authWrite = await send(asThen(), "/api/auth/update-user", { json: { name: "Still Here" } });
+    const authRead = await send(asThen(), "/api/auth/list-sessions");
+    const sessionRead = await send(asThen(), "/api/auth/get-session");
     expect({
       sessionRead: sessionRead.body,
       appRead: appRead.status,
@@ -234,11 +248,17 @@ describe("a suspended account cannot start a session", () => {
       ["laptop", laptop],
       ["phone", phone],
     ] as const) {
-      expect((await send(browser, "/api/auth/get-session")).body, device).toBeNull();
-      expect((await send(browser, "/api/account/deletion-status")).status, device).toBe(401);
-      expect((await send(browser, "/api/auth/update-user", { json: { name: "x" } })).status, device).toBe(
+      // Each request with the device's cookies as they were (see the suspension case above).
+      expect(
+        [...browser.cookies.keys()].some((name) => name.includes("session_data")),
+        device,
+      ).toBe(true);
+      const asThen = sameCookies(browser);
+      expect((await send(asThen(), "/api/account/deletion-status")).status, device).toBe(401);
+      expect((await send(asThen(), "/api/auth/update-user", { json: { name: "x" } })).status, device).toBe(
         401,
       );
+      expect((await send(asThen(), "/api/auth/get-session")).body, device).toBeNull();
     }
     // The old password no longer signs in; the new one does.
     expect((await signIn(newClient(), email)).status).toBe(401);
