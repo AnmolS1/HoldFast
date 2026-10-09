@@ -10,7 +10,7 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { tryConsume } from "../../../src/worker/db/queries/email-ledger";
-import { addUsage, todayTotals, utcDay } from "../../../src/worker/db/queries/ledger";
+import { addUsage, addUsageIfUnder, todayTotals, utcDay } from "../../../src/worker/db/queries/ledger";
 import { clearSettingsCache, getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import * as uploadIps from "../../../src/worker/db/queries/upload-ips";
 import { isActive, revokeAllSessions, termsVersionOf, userState } from "../../../src/worker/db/queries/users";
@@ -34,6 +34,52 @@ beforeAll(() => {
 afterAll(() => close());
 
 describe("ledger", () => {
+  // `todayTotals` → compare → `addUsage` lets every concurrent request through on the same stale
+  // total. The conditional add is one statement: the ceiling holds under any concurrency.
+  it("addUsageIfUnder never passes a ceiling, however many requests race", async () => {
+    const today = utcDay();
+    const byBytes = `ceil-b-${rand()}`;
+    const results = await Promise.all(
+      Array.from({ length: 40 }, () =>
+        addUsageIfUnder(db, today, "user", byBytes, { bytes: 10 }, { bytes: 100 }),
+      ),
+    );
+    expect(results.filter(Boolean)).toHaveLength(10);
+    expect(await todayTotals(db, "user", byBytes)).toEqual({ bytes: 100, count: 10 });
+
+    const byCount = `ceil-c-${rand()}`;
+    const counted = await Promise.all(
+      Array.from({ length: 30 }, () => addUsageIfUnder(db, today, "ip", byCount, { bytes: 7 }, { count: 5 })),
+    );
+    expect(counted.filter(Boolean)).toHaveLength(5);
+    expect(await todayTotals(db, "ip", byCount)).toEqual({ bytes: 35, count: 5 });
+  });
+
+  it("addUsageIfUnder: the exact ceiling fits, one more does not, and a refusal writes nothing", async () => {
+    const today = utcDay();
+    const subject = `ceil-x-${rand()}`;
+    // The very first add is checked too (there is no row yet to compare with).
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 101 }, { bytes: 100 })).toBe(false);
+    expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 0, count: 0 });
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 60 }, { bytes: 100 })).toBe(true);
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 41 }, { bytes: 100 })).toBe(false);
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 40 }, { bytes: 100 })).toBe(true);
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 0, count: 0 }, { bytes: 100 })).toBe(
+      true,
+    );
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 1 }, { bytes: 100 })).toBe(false);
+    expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 100, count: 2 });
+    // Both ceilings at once; no ceiling at all behaves like addUsage.
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 0 }, { bytes: 100, count: 2 })).toBe(
+      false,
+    );
+    expect(await addUsageIfUnder(db, today, "user", subject, { bytes: 5 }, {})).toBe(true);
+    expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 105, count: 3 });
+    await expect(addUsageIfUnder(db, today, "user", subject, { bytes: -1 }, {})).rejects.toMatchObject({
+      code: "validation",
+    });
+  });
+
   it("addUsage creates the row, then adds; todayTotals reads the UTC day", async () => {
     const subject = `user-${rand()}`;
     expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 0, count: 0 });
