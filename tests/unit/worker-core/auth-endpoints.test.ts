@@ -9,7 +9,7 @@
 // Better Auth itself is not mounted yet: "reaches the handler" is a probe router standing where
 // the auth handler will stand, so what is proven is the gate, not the handler behind it.
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { auth } from "../../../src/worker/auth/config";
 import {
   AUTH_ENDPOINTS,
@@ -21,6 +21,18 @@ import type { SessionInfo, SessionUser } from "../../../src/worker/auth/types";
 import { IMPERSONATION_EXEMPT_PATHS } from "../../../src/worker/middleware/impersonation";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { appWith, call, fakeCore, signIn } from "./helpers";
+
+// The real auth router (routes/auth.ts) hands every /api/auth/* request to Better Auth. These
+// tests are about the pipeline IN FRONT of it, so the registry gets the stand-in the pipeline was
+// built against: an auth router that answers only the session read (signed out) and lets every
+// other path fall through to this file's probes. The real handler has its own tests
+// (tests/unit/auth/**).
+vi.mock("../../../src/worker/routes/auth", async () => {
+  const { Hono } = await import("hono");
+  const router = new Hono();
+  router.get("/auth/get-session", (c) => c.json(null));
+  return { router };
+});
 
 type Endpoint = { path?: string; options?: { method?: string | string[] } };
 

@@ -384,6 +384,11 @@ describe("terms", () => {
     expect(blocked.body).toMatchObject({ error: "terms_required" });
     // Reading is not blocked.
     expect((await send(bumped, "/api/account/deletion-status")).status).toBe(200);
+    // Nor is cancelling a deletion (exempt from the terms gate): the route itself answers — here
+    // with nothing scheduled, its plain 200 — never 403 terms_required.
+    const cancelStale = await send(bumped, "/api/account/deletion/cancel", { json: {} });
+    expect(cancelStale.status, cancelStale.text).toBe(200);
+    expect(cancelStale.body).toEqual({ scheduledFor: null });
 
     const wrong = await send(bumped, "/api/account/accept-terms", { json: { version: "2026-10" } });
     expect(wrong.status).toBe(400);

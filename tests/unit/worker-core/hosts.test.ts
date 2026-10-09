@@ -2,13 +2,25 @@
 // or an asset, and never answer with a JSON envelope; the app host must send the full policy.
 import { exports } from "cloudflare:workers";
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
 import { createFilesHost } from "../../../src/worker/files-host";
 import { filesHostHeaders, htmlCsp } from "../../../src/worker/middleware/security-headers";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
 import { appWith, call, fakeCore, type CallOptions } from "./helpers";
+
+// The real auth router (routes/auth.ts) hands every /api/auth/* request to Better Auth. These
+// tests are about the pipeline IN FRONT of it, so the registry gets the stand-in the pipeline was
+// built against: an auth router that answers only the session read (signed out) and lets every
+// other path fall through to this file's probes. The real handler has its own tests
+// (tests/unit/auth/**).
+vi.mock("../../../src/worker/routes/auth", async () => {
+  const { Hono } = await import("hono");
+  const router = new Hono();
+  router.get("/auth/get-session", (c) => c.json(null));
+  return { router };
+});
 
 const HTTPS = {
   APP_ORIGIN: "https://app.example.test",

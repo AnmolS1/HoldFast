@@ -123,8 +123,8 @@ describe("GET /api/health against real Postgres and R2", () => {
   });
 });
 
-describe("the placeholder auth router", () => {
-  it("answers the session read as signed out (JSON null), and nothing else under /api/auth", async () => {
+describe("the auth router", () => {
+  it("answers the session read as signed out (JSON null), and hands every other path to Better Auth", async () => {
     const app = createApp(realCore);
     const session = await call(app, "/api/auth/get-session");
     expect(session.response.status).toBe(200);
@@ -138,8 +138,12 @@ describe("the placeholder auth router", () => {
       headers: sameOrigin,
       body: "{}",
     });
-    expect(signIn.response.status).toBe(404);
-    expect(((await signIn.response.json()) as Envelope).error).toBe("not_found");
+    // Better Auth's own answer (its captcha plugin refuses a sign-in without a token), not the
+    // registry's 404 envelope.
+    expect(signIn.response.status).toBe(400);
+    const refused = (await signIn.response.json()) as { code?: string; error?: string };
+    expect(refused.code).toBe("MISSING_RESPONSE");
+    expect(refused.error).toBeUndefined();
     await signIn.ctx.settle();
   });
 });

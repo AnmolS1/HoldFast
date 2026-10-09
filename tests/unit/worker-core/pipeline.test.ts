@@ -2,7 +2,7 @@
 // a catch-all probe router mounted after the (placeholder) registry. `reached` in a probe answer
 // means the request passed every middleware.
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildPipeline } from "../../../src/worker/app";
 import { requireSwitch } from "../../../src/worker/middleware/kill-switch";
 import {
@@ -27,6 +27,18 @@ import {
   type FakeCore,
 } from "./helpers";
 import { parsePath } from "./registry-check";
+
+// The real auth router (routes/auth.ts) hands every /api/auth/* request to Better Auth. These
+// tests are about the pipeline IN FRONT of it, so the registry gets the stand-in the pipeline was
+// built against: an auth router that answers only the session read (signed out) and lets every
+// other path fall through to this file's probes. The real handler has its own tests
+// (tests/unit/auth/**).
+vi.mock("../../../src/worker/routes/auth", async () => {
+  const { Hono } = await import("hono");
+  const router = new Hono();
+  router.get("/auth/get-session", (c) => c.json(null));
+  return { router };
+});
 
 // Probes under /api/auth/ use paths the auth router does not declare (it answers only
 // GET /auth/get-session until the auth task replaces it), so they fall through to the probe.
@@ -573,7 +585,10 @@ describe("impersonation is read-only", () => {
     const fake = fakeCore();
     fake.state.settings = { termsVersion: "2026-10-01" };
     const app = appWith(fake, { extraRouters: [router] });
-    const routes = app.routes.filter((route) => route.path.includes(":"));
+    // The two routes this test adds (the real routers have parameterised routes of their own).
+    const routes = app.routes.filter(
+      (route) => route.path.includes(":") && /^\/api\/(nodes|account\/sessions)\//.test(route.path),
+    );
     expect(routes.map((route) => `${route.method} ${concrete(route.path)}`)).toEqual([
       "POST /api/nodes/0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e/copy",
       "DELETE /api/account/sessions/aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL",
@@ -665,15 +680,26 @@ describe("terms gate", () => {
     const { fake, post } = setup();
     signIn(fake, { termsVersion: "2025-01-01" });
     fake.state.termsVersionInDb = "2025-01-01";
-    for (const path of [
-      "/api/auth/sign-out",
-      "/api/public/report",
-      "/api/account/accept-terms",
-      "/api/account/deletion",
-      "/api/account/deletion/cancel",
-    ]) {
-      expect((await post(path)).body.reached, path).toBe(path);
+    // Stand-in routes answer with their own path: the request passed every middleware.
+    for (const path of ["/api/auth/sign-out", "/api/public/report", "/api/account/deletion"]) {
+      const sent = await post(path);
+      expect(sent.status, path).toBe(200);
+      expect(sent.body.reached, path).toBe(path);
     }
+    // accept-terms and deletion/cancel are real routes now, so "reached" is the route's OWN
+    // answer — pinned exactly, because "anything but terms_required" would also pass on a 404 or
+    // on a route that crashed. accept-terms reads its body first (none was sent): its own 400.
+    const accept = await post("/api/account/accept-terms");
+    expect(accept.status).toBe(400);
+    expect(accept.body).toMatchObject({ error: "validation", details: { reason: "malformed_json" } });
+    // deletion/cancel goes straight to the database, which this file's fake core does not have:
+    // the route's guard answers 500. The same request against a real database, with stale terms,
+    // is in tests/unit/auth/account-state.test.ts ("terms").
+    const queriesBefore = fake.calls.filter((entry) => entry === "query").length;
+    const cancel = await post("/api/account/deletion/cancel");
+    expect(cancel.status).toBe(500);
+    expect(cancel.body.error).toBe("internal");
+    expect(fake.calls.filter((entry) => entry === "query").length).toBeGreaterThan(queriesBefore);
     expect((await post("/api/account/deletion-status")).status).toBe(403);
   });
 

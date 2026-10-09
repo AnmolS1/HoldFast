@@ -103,9 +103,10 @@ test.describe("fixtures", () => {
     // Refused at some point: after 20 attempts on a fresh bucket, sooner when the previous run
     // (same test, same address, within the limiter's minute) has already emptied it.
     expect(refusedAfter).toBeGreaterThanOrEqual(1);
-    // A client without the fixture is 127.0.0.1 — another bucket, so its attempt is not refused.
+    // A client without the fixture is 127.0.0.1 — another bucket, so its attempt is not refused
+    // by the limiter: it reaches the auth handler, which answers 400 (no Turnstile token).
     const other = await request.post("/api/auth/sign-in/email", { data: {} });
-    expect(other.status()).toBe(404);
+    expect(other.status()).toBe(400);
   });
 
   test("axe finds no violations on the shell", async ({ page }) => {

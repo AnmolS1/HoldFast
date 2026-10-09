@@ -97,6 +97,7 @@ describe("placeholder modules", () => {
     );
     expect(placeholders.length).toBe(27);
     for (const [path, code] of placeholders) expect(code, path).toMatch(/PLACEHOLDER — taken over by/);
-    expect(sources["/src/client/lib/auth-client.ts"]).toMatch(/PLACEHOLDER — taken over by/);
+    // The auth client is no longer one: it is the real Better Auth client.
+    expect(sources["/src/client/lib/auth-client.ts"]).not.toMatch(/PLACEHOLDER/);
   });
 });

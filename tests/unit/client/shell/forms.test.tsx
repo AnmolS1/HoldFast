@@ -331,13 +331,13 @@ describe("sign-in screen", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("with the placeholder auth client the screen says sign-in is not available yet", async () => {
+  it("when the auth endpoint cannot be reached the screen says so, generically", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/login"]);
     await screen.findByRole("heading", { name: "Sign in" });
     fill({ email: "ada@example.com", password: "anything" });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect((await screen.findByRole("alert")).textContent).toBe("Sign-in isn't available in this build yet.");
+    expect((await screen.findByRole("alert")).textContent).toBe("That didn't work. Try again.");
   });
 
   it("a second factor sends the user to /two-factor with next kept", async () => {

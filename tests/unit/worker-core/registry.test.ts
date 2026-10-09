@@ -154,7 +154,13 @@ describe("registry: controls (each rule is seen to fail)", () => {
       `nodes: DELETE /nodes/${id} — outside its row: claimed by trash`,
     ]);
     expect(withExtra({ file: "nodes", method: "POST", path: `/nodes/${id}/trash` })).toHaveLength(1);
-    expect(withExtra({ file: "account", method: "POST", path: "/account/accept-terms" })).toHaveLength(1);
+    // accept-terms is a real route of account-lifecycle now: declaring it in `account` is outside
+    // that file's row (and, separately, a duplicate).
+    expect(
+      withExtra({ file: "account", method: "POST", path: "/account/accept-terms" }).filter((problem) =>
+        problem.includes("outside its row"),
+      ),
+    ).toHaveLength(1);
     expect(withExtra({ file: "account", method: "GET", path: "/account/usage" })).toHaveLength(1);
     expect(withExtra({ file: "uploads", method: "GET", path: "/made-up" })).toHaveLength(1);
     // A router-wide middleware would also run for every router mounted after it.

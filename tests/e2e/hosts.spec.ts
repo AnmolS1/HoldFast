@@ -90,16 +90,18 @@ test.describe("app origin", () => {
     const octet = () => 1 + Math.floor(Math.random() * 254);
     const headers = { "cf-connecting-ip": `10.${octet()}.${octet()}.${octet()}` };
 
-    // Empty the address's auth bucket with sign-in attempts. 20 are let through (to the 404 of a
-    // route that does not exist yet); allow for the limiter's minute rolling over part-way.
+    // Empty the address's auth bucket with auth writes. 20 are let through to the auth handler;
+    // allow for the limiter's minute rolling over part-way. Sign-out, not sign-in: Better Auth
+    // has a limit of its own on the sign-in path (5 a minute, another envelope), which would
+    // answer first — sign-out is under its default of 30, so the pipeline's 20 is what trips.
     let refusedAfter = 0;
     for (let attempt = 1; attempt <= 41 && refusedAfter === 0; attempt++) {
-      const answer = await request.post("/api/auth/sign-in/email", { headers, data: {} });
+      const answer = await request.post("/api/auth/sign-out", { headers, data: {} });
       if (answer.status() === 429) {
         expect(await answer.json()).toMatchObject({ error: "rate_limited" });
         refusedAfter = attempt;
       } else {
-        expect(answer.status(), `attempt ${attempt}`).toBe(404);
+        expect(answer.status(), `attempt ${attempt}`).toBe(200);
       }
     }
     expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);

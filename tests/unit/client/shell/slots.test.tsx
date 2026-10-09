@@ -18,7 +18,7 @@ import { requestUpload, UploadDropOverlay } from "../../../../src/client/feature
 import * as uploadSlots from "../../../../src/client/features/upload/slots";
 import { useUsageSummary } from "../../../../src/client/features/usage";
 import { authClient } from "../../../../src/client/lib/auth-client";
-import { AUTH_NOT_WIRED, type AuthClientContract } from "../../../../src/client/lib/auth-contract";
+import type { AuthClientContract } from "../../../../src/client/lib/auth-contract";
 
 type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const exact = <A, B>(proof: Exact<A, B> extends true ? true : never) => void proof;
@@ -136,30 +136,37 @@ describe("slot stubs", () => {
   });
 });
 
-describe("the auth-client placeholder", () => {
-  it("every method rejects with 'auth not wired'", async () => {
-    const calls: Array<() => Promise<unknown>> = [
-      () => authClient.signIn.email({ email: "a@b.c", password: "x" }),
-      () => authClient.signIn.social({ provider: "google" }),
-      () => authClient.signIn.passkey(),
-      () =>
-        authClient.signUp.email({
-          name: "a",
-          email: "a@b.c",
-          password: "x",
-          birthYear: 1990,
-          birthMonth: 1,
-          acceptTerms: true,
-        }),
-      () => authClient.signOut(),
-      () => authClient.sendVerificationEmail({ email: "a@b.c" }),
-      () => authClient.requestPasswordReset({ email: "a@b.c" }),
-      () => authClient.resetPassword({ newPassword: "x", token: "t" }),
-      () => authClient.twoFactor.verifyTotp({ code: "1" }),
-      () => authClient.twoFactor.verifyBackupCode({ code: "1" }),
-      () => authClient.admin.stopImpersonating(),
+describe("the auth client", () => {
+  it("is a plain object with every method of the contract (so a test can spy on one)", () => {
+    const methods: Array<[string, unknown]> = [
+      ["signIn.email", authClient.signIn.email],
+      ["signIn.social", authClient.signIn.social],
+      ["signIn.passkey", authClient.signIn.passkey],
+      ["signUp.email", authClient.signUp.email],
+      ["signOut", authClient.signOut],
+      ["sendVerificationEmail", authClient.sendVerificationEmail],
+      ["requestPasswordReset", authClient.requestPasswordReset],
+      ["resetPassword", authClient.resetPassword],
+      ["twoFactor.verifyTotp", authClient.twoFactor.verifyTotp],
+      ["twoFactor.verifyBackupCode", authClient.twoFactor.verifyBackupCode],
+      ["admin.stopImpersonating", authClient.admin.stopImpersonating],
     ];
-    for (const call of calls) await expect(call()).rejects.toThrow(AUTH_NOT_WIRED);
+    for (const [name, method] of methods) expect(typeof method, name).toBe("function");
+    // Not the library's proxy: the same function on every access.
+    expect(authClient.signIn.email).toBe(authClient.signIn.email);
+    const contract: AuthClientContract = authClient;
+    expect(Object.keys(contract).sort()).toEqual(
+      [
+        "admin",
+        "requestPasswordReset",
+        "resetPassword",
+        "sendVerificationEmail",
+        "signIn",
+        "signOut",
+        "signUp",
+        "twoFactor",
+      ].sort(),
+    );
   });
 });
 
