@@ -39,3 +39,29 @@ export function decodeCursor<T>(tag: string, cursor: string, check: (value: unkn
   if (!check(v)) throw new QueryError("validation", "invalid cursor");
   return v;
 }
+
+/** `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`: the only form a listing writes a timestamp into a cursor in. */
+const CURSOR_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/;
+
+/**
+ * True for a cursor timestamp that Postgres will accept in a `::timestamptz` cast: the exact
+ * form above, naming a real calendar date and time. Anything else (a cursor is client-writable)
+ * must be refused as `validation` before it reaches a query.
+ */
+export function isCursorTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const m = CURSOR_TIMESTAMP.exec(value);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second] = m.slice(1).map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  if (year < 1 || hour > 23 || minute > 59 || second > 59) return false;
+  const date = new Date(Date.UTC(2000, month - 1, day));
+  date.setUTCFullYear(year);
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+}

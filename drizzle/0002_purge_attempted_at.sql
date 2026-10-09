@@ -1,0 +1,1 @@
+ALTER TABLE "nodes" ADD COLUMN "purge_attempted_at" timestamp with time zone;

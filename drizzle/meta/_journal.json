@@ -15,6 +15,13 @@
       "when": 1791506590804,
       "tag": "0001_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791519118827,
+      "tag": "0002_purge_attempted_at",
+      "breakpoints": true
     }
   ]
 }

@@ -9,10 +9,10 @@
 // objects, which the reconcile job removes; the reverse order would leave rows that point at
 // missing objects.
 
-import { and, desc, eq, inArray, isNotNull, isNull, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { extOf, nameKeyOf } from "../../services/filename";
 import type { Executor } from "../client";
-import { decodeCursor, encodeCursor } from "../cursor";
+import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { type HoldCause, isUniqueViolation, LegalHoldError, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import { type Node, nodes, nodeVersions, uploads, user } from "../schema";
@@ -118,7 +118,7 @@ export async function restore(
 
 type TrashCursor = { at: string; id: string };
 const isTrashCursor = (v: unknown): v is TrashCursor =>
-  !!v && typeof v === "object" && typeof (v as TrashCursor).at === "string" && isUuid((v as TrashCursor).id);
+  !!v && typeof v === "object" && isCursorTimestamp((v as TrashCursor).at) && isUuid((v as TrashCursor).id);
 
 /**
  * The owner's trashed roots, most recently trashed first. Never a root whose purge was
@@ -162,36 +162,78 @@ export async function listTrash(
   };
 }
 
+/** An open DMCA notice names the node aliased `n` (the same test as `assertPurgeable`). */
+const OPEN_NOTICE_ON_N = sql`EXISTS (
+  SELECT 1 FROM dmca_notice_nodes dn JOIN dmca_notices d ON d.id = dn.notice_id
+  WHERE dn.node_id = n.id AND d.status IN ('received', 'incomplete', 'actioned', 'counter_received'))`;
+
+/**
+ * What `assertPurgeable` would refuse because of the node aliased `n` ITSELF or its owner `u`.
+ * The gate stays the authority (it also looks inside the subtree, under locks); this only keeps
+ * rows that cannot be purged now out of the queues, so they cannot fill a batch.
+ */
+const HELD_AT_N = sql`(u.legal_hold OR n.legal_hold
+  OR n.scan_status IN ('under_review', 'suspected_csam') OR ${OPEN_NOTICE_ON_N})`;
+
 /**
  * Roots the purge job should try now: trashed roots past `purgeAfter`, and every root whose
- * purge was requested while it was held (retried on every tick until the hold lifts).
+ * purge was requested while it was held — as soon as the hold is gone.
+ *
+ * Two rules keep rows that cannot be purged from stopping the rows that can (each failing row
+ * would otherwise be returned first, on every run, forever):
+ *  - a root that is held ITSELF, or whose owner is, is not returned at all;
+ *  - a root that is held by something deeper in its subtree is returned, the gate refuses it, and
+ *    the job records that with `markPurgeAttempted` — the order is never-tried roots first, then
+ *    the ones tried longest ago, so a refused root goes to the back of the queue.
  */
 export async function purgeDue(db: Executor, limit: number): Promise<{ id: string; ownerId: string }[]> {
-  return db
-    .select({ id: nodes.id, ownerId: nodes.ownerId })
-    .from(nodes)
-    .where(
-      or(
-        and(eq(nodes.trashedRoot, true), isNotNull(nodes.deletedAt), lte(nodes.purgeAfter, sql`now()`)),
-        isNotNull(nodes.purgeRequestedAt),
-      ),
-    )
-    .orderBy(sql`${nodes.purgeAfter} ASC NULLS FIRST`, nodes.id)
-    .limit(limit);
+  const result = await db.execute<{ id: string; owner_id: string }>(sql`
+    SELECT n.id, n.owner_id
+    FROM nodes n JOIN "user" u ON u.id = n.owner_id
+    WHERE ((n.trashed_root AND n.deleted_at IS NOT NULL AND n.purge_after <= now())
+           OR n.purge_requested_at IS NOT NULL)
+      AND NOT ${HELD_AT_N}
+    ORDER BY n.purge_attempted_at ASC NULLS FIRST, n.purge_after ASC NULLS FIRST, n.id
+    LIMIT ${limit}`);
+  return result.rows.map((row) => ({ id: row.id, ownerId: row.owner_id }));
 }
 
-/** Old versions past their `purgeAfter`. */
+/**
+ * The purge job calls this for every root `deleteSubtreeRows` refused with `LegalHoldError`:
+ * it stamps the attempt, which moves the root behind every root not tried since (`purgeDue`).
+ * Returns how many rows were stamped.
+ */
+export async function markPurgeAttempted(db: Executor, rootIds: readonly string[]): Promise<number> {
+  const ids = [...new Set(rootIds.filter(isUuid))];
+  if (ids.length === 0) return 0;
+  const rows = await db
+    .update(nodes)
+    .set({ purgeAttemptedAt: sql`now()` })
+    .where(inArray(nodes.id, ids))
+    .returning({ id: nodes.id });
+  return rows.length;
+}
+
+/**
+ * Old versions past their `purgeAfter`, except those the gate would refuse: the gate for a
+ * version looks at its node alone (a file has no subtree), so every cause is known here and a
+ * held node's versions are simply not returned until the hold is gone.
+ */
 export async function versionsDue(
   db: Executor,
   limit: number,
 ): Promise<{ nodeId: string; versionId: string; ownerId: string }[]> {
-  return db
-    .select({ nodeId: nodeVersions.nodeId, versionId: nodeVersions.versionId, ownerId: nodes.ownerId })
-    .from(nodeVersions)
-    .innerJoin(nodes, eq(nodes.id, nodeVersions.nodeId))
-    .where(lte(nodeVersions.purgeAfter, sql`now()`))
-    .orderBy(nodeVersions.purgeAfter, nodeVersions.nodeId, nodeVersions.versionId)
-    .limit(limit);
+  const result = await db.execute<{ node_id: string; version_id: string; owner_id: string }>(sql`
+    SELECT v.node_id, v.version_id, n.owner_id
+    FROM node_versions v JOIN nodes n ON n.id = v.node_id JOIN "user" u ON u.id = n.owner_id
+    WHERE v.purge_after <= now() AND NOT ${HELD_AT_N}
+    ORDER BY v.purge_after, v.node_id, v.version_id
+    LIMIT ${limit}`);
+  return result.rows.map((row) => ({
+    nodeId: row.node_id,
+    versionId: row.version_id,
+    ownerId: row.owner_id,
+  }));
 }
 
 // ── the purge gate ──────────────────────────────────────────────────────────────────────────

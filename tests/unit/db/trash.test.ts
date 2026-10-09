@@ -11,6 +11,7 @@ import {
   deleteSubtreeRows,
   deleteVersionRows,
   listTrash,
+  markPurgeAttempted,
   purgeDue,
   restore,
   trash,
@@ -55,6 +56,9 @@ async function held(promise: Promise<unknown>): Promise<LegalHoldError> {
   expect(error).not.toBeInstanceOf(QueryError);
   return error as LegalHoldError;
 }
+
+/** The gate refuses this root. */
+const held_ = (rootId: string) => held(assertPurgeable(db, [rootId]));
 
 /** root/ { keep.txt (60), sub/ { deep.txt (40) } } */
 async function tree(ownerOverrides: Partial<typeof user.$inferInsert> = {}) {
@@ -208,6 +212,164 @@ describe("trash and restore", () => {
     ]);
     const versions = (await versionsDue(db, 100_000)).filter((v) => v.nodeId === live.id);
     expect(versions).toEqual([{ nodeId: live.id, versionId: "old", ownerId: owner }]);
+  });
+});
+
+// One account on legal hold with `limit` expired trashed items used to fill every batch: each
+// item throws LegalHoldError, sorts first again on the next run, and nobody else's trash is ever
+// purged. Fixture dates are in 1999 so these rows sort ahead of anything another test file made.
+describe("the purge queues are not wedged by rows that cannot be purged", () => {
+  const at = (month: number) => new Date(Date.UTC(1999, month, 1));
+  const trashedAt = (when: Date) => ({ deletedAt: when, trashedRoot: true, purgeAfter: when });
+
+  it("purgeDue leaves out a root that is held itself or whose owner is, whatever the cause", async () => {
+    const heldOwner = await makeUser(db, { legalHold: true });
+    const owner = await makeUser(db);
+    const held: string[] = [];
+    for (let n = 0; n < 4; n++) {
+      held.push((await makeFile(db, heldOwner, null, `owner-held-${n}.txt`, trashedAt(at(0)))).id);
+    }
+    held.push(
+      (await makeFile(db, owner, null, "node-held.txt", { ...trashedAt(at(0)), legalHold: true })).id,
+    );
+    held.push(
+      (await makeFile(db, owner, null, "review.txt", { ...trashedAt(at(0)), scanStatus: "under_review" })).id,
+    );
+    held.push(
+      (await makeFile(db, owner, null, "csam.txt", { ...trashedAt(at(0)), scanStatus: "suspected_csam" })).id,
+    );
+    // Purge requested while held: `purge_after` may be null, which sorted before everything.
+    held.push(
+      (
+        await makeFile(db, heldOwner, null, "requested-held.txt", {
+          purgeRequestedAt: at(0),
+          purgeAfter: null,
+        })
+      ).id,
+    );
+    const noticed = await makeFile(db, owner, null, "noticed.txt", trashedAt(at(0)));
+    const [notice] = await db
+      .insert(dmcaNotices)
+      .values({ receivedVia: "form", status: "actioned" })
+      .returning();
+    await db
+      .insert(dmcaNoticeNodes)
+      .values({ noticeId: notice!.id, nodeId: noticed.id, nodeName: "noticed.txt" });
+    held.push(noticed.id);
+    const purgeable = await makeFile(db, owner, null, "purgeable.txt", trashedAt(at(6)));
+    const requested = await makeFile(db, owner, null, "requested.txt", {
+      purgeRequestedAt: at(6),
+      purgeAfter: null,
+    });
+
+    const all = (await purgeDue(db, 100_000)).map((row) => row.id);
+    expect(all).toContain(purgeable.id);
+    expect(all).toContain(requested.id);
+    expect(all.filter((id) => held.includes(id))).toEqual([]);
+    // Every one of them really is refused by the gate — the query mirrors it, it does not replace it.
+    for (const id of held) await held_(id);
+    // The moment a hold is gone the row is back.
+    await db.update(user).set({ legalHold: false }).where(eq(user.id, heldOwner));
+    await db.update(dmcaNotices).set({ status: "closed" }).where(eq(dmcaNotices.id, notice!.id));
+    const after = (await purgeDue(db, 100_000)).map((row) => row.id);
+    expect(after.filter((id) => held.includes(id)).sort()).toEqual(
+      held.filter((id) => ![held[4], held[5], held[6]].includes(id)).sort(),
+    );
+    await db.delete(nodes).where(inArray(nodes.id, [...held, purgeable.id, requested.id]));
+  });
+
+  it("a root held by something inside it goes to the back once the job has tried it", async () => {
+    const owner = await makeUser(db);
+    const stuck: string[] = [];
+    for (let n = 0; n < 5; n++) {
+      const folder = await makeFolder(db, owner, null, `stuck-${n}-${rand()}`, trashedAt(at(0)));
+      await makeFile(db, owner, folder.id, "evidence.bin", { legalHold: true });
+      stuck.push(folder.id);
+    }
+    const purgeable = await makeFile(db, owner, null, `behind-${rand()}.txt`, trashedAt(at(6)));
+    const mine = async (limit: number) =>
+      (await purgeDue(db, limit)).map((row) => row.id).filter((id) => [...stuck, purgeable.id].includes(id));
+
+    // Never tried: oldest first, so the stuck roots lead — and the gate refuses each of them.
+    expect(await mine(100_000)).toEqual([...stuck.slice().sort(), purgeable.id]);
+    for (const id of stuck) await held(deleteSubtreeRows(db, id));
+    expect(await markPurgeAttempted(db, [...stuck, uuidv7(), "junk"])).toBe(5);
+
+    // Tried: behind every root that has not been tried since.
+    const order = (await purgeDue(db, 100_000)).map((row) => row.id);
+    const position = (id: string) => order.indexOf(id);
+    for (const id of stuck) {
+      expect(position(id), "still queued").toBeGreaterThanOrEqual(0);
+      expect(position(purgeable.id)).toBeLessThan(position(id));
+    }
+    const batch = (await purgeDue(db, position(purgeable.id) + 1)).map((row) => row.id);
+    expect(batch).toContain(purgeable.id);
+    expect(batch.filter((id) => stuck.includes(id))).toEqual([]);
+
+    // Round-robin among the stuck ones: the one tried longest ago is next.
+    await db
+      .update(nodes)
+      .set({ purgeAttemptedAt: at(1) })
+      .where(eq(nodes.id, stuck[3]!));
+    const again = await mine(100_000);
+    expect(again.indexOf(stuck[3]!)).toBeLessThan(again.indexOf(stuck[0]!));
+    await db.delete(nodes).where(inArray(nodes.parentId, stuck));
+    await db.delete(nodes).where(inArray(nodes.id, [...stuck, purgeable.id]));
+  });
+
+  it("versionsDue leaves out the old versions of a node the gate would refuse", async () => {
+    const heldOwner = await makeUser(db, { legalHold: true });
+    const owner = await makeUser(db);
+    const blocked = [
+      await makeFile(db, heldOwner, null, "owner-held.txt"),
+      await makeFile(db, owner, null, "node-held.txt", { legalHold: true }),
+      await makeFile(db, owner, null, "review.txt", { scanStatus: "under_review" }),
+      await makeFile(db, owner, null, "csam.txt", { scanStatus: "suspected_csam" }),
+    ];
+    const free = await makeFile(db, owner, null, "free.txt");
+    for (const node of blocked) {
+      for (let n = 0; n < 3; n++) {
+        await db.insert(nodeVersions).values({
+          nodeId: node.id,
+          versionId: `old-${n}`,
+          r2Key: `k/${rand()}`,
+          size: 1,
+          purgeAfter: at(0),
+        });
+      }
+    }
+    await db
+      .insert(nodeVersions)
+      .values({ nodeId: free.id, versionId: "old", r2Key: `k/${rand()}`, size: 1, purgeAfter: at(6) });
+    const ids = blocked.map((node) => node.id);
+    const all = await versionsDue(db, 100_000);
+    expect(all.filter((v) => ids.includes(v.nodeId))).toEqual([]);
+    expect(all.filter((v) => v.nodeId === free.id)).toEqual([
+      { nodeId: free.id, versionId: "old", ownerId: owner },
+    ]);
+    for (const node of blocked) await held(deleteVersionRows(db, node.id, ["old-0"]));
+    await db.update(user).set({ legalHold: false }).where(eq(user.id, heldOwner));
+    expect((await versionsDue(db, 100_000)).filter((v) => v.nodeId === blocked[0]!.id)).toHaveLength(3);
+    await db.delete(nodes).where(inArray(nodes.id, [...ids, free.id]));
+  });
+
+  it("listTrash refuses a forged cursor as validation", async () => {
+    const owner = await makeUser(db);
+    for (let n = 0; n < 3; n++) await trash(db, (await makeFile(db, owner, null, `t-${n}.txt`)).id, owner);
+    const first = await listTrash(db, owner, { limit: 1 });
+    expect((await listTrash(db, owner, { limit: 1, cursor: first.nextCursor })).items).toHaveLength(1);
+    const real = JSON.parse(Buffer.from(first.nextCursor!, "base64url").toString("utf8")) as {
+      t: string;
+      v: { at: string; id: string };
+    };
+    for (const at_ of ["x", "2026-13-45T00:00:00.000000Z", "2026-01-01", "", 5, null]) {
+      const forged = Buffer.from(JSON.stringify({ t: real.t, v: { ...real.v, at: at_ } })).toString(
+        "base64url",
+      );
+      const error = await rejection(listTrash(db, owner, { limit: 1, cursor: forged }));
+      expect(error, String(at_)).toBeInstanceOf(QueryError);
+      expect((error as QueryError).code).toBe("validation");
+    }
   });
 });
 

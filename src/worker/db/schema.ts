@@ -206,6 +206,11 @@ export const nodes = pgTable(
     purgeAfter: ts(),
     /** The owner asked for permanent deletion while the subtree was held. */
     purgeRequestedAt: ts(),
+    /**
+     * When the purge job last tried this root and the gate refused it (something inside the
+     * subtree is held). Orders the purge queue: never-tried roots first, then the longest-waiting.
+     */
+    purgeAttemptedAt: ts(),
 
     // Moderation.
     legalHold: boolean().notNull().default(false),
