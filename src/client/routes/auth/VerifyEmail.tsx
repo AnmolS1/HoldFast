@@ -34,11 +34,17 @@ export function VerifyEmailPage() {
   const session = useSession().data;
   const config = usePublicConfig().data;
   const turnstile = useTurnstile(config?.turnstileSiteKey);
-  const fromState = (location.state as { email?: unknown } | null)?.email;
+  const state = location.state as { email?: unknown; unconfirmed?: unknown } | null;
+  const fromState = state?.email;
+  // Arrived from a sign-in that was refused because the address is unconfirmed: nothing was sent
+  // just now, so there is nothing to wait for before sending.
+  const unconfirmed = state?.unconfirmed === true;
   const [email, setEmail] = useState<string | null>(
     session?.user.email ?? (typeof fromState === "string" ? fromState : null),
   );
-  const [cooldownUntil, setCooldownUntil] = useState(() => Date.now() + RESEND_COOLDOWN_S * 1000);
+  const [cooldownUntil, setCooldownUntil] = useState(() =>
+    unconfirmed ? 0 : Date.now() + RESEND_COOLDOWN_S * 1000,
+  );
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -104,11 +110,11 @@ export function VerifyEmailPage() {
 
   return (
     <AuthCard
-      title={t("verify.title")}
+      title={t(unconfirmed ? "verify.unconfirmed.title" : "verify.title")}
       lead={
         email ? (
           <>
-            {t("verify.body.before")}
+            {t(unconfirmed ? "verify.unconfirmed.before" : "verify.body.before")}
             <Box
               component="strong"
               data-verify-email
@@ -116,7 +122,7 @@ export function VerifyEmailPage() {
             >
               {email}
             </Box>
-            {t("verify.body.after")}
+            {t(unconfirmed ? "verify.unconfirmed.after" : "verify.body.after")}
           </>
         ) : (
           t("verify.body.unknown")

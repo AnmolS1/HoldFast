@@ -10,6 +10,9 @@ import {
   type SignupValues,
 } from "../../../../src/client/routes/auth/validation";
 import { RESEND_COOLDOWN_S } from "../../../../src/client/routes/auth/VerifyEmail";
+import { redirectErrorMessage, takeRedirectError } from "../../../../src/client/routes/auth/errors";
+import { en } from "../../../../src/client/lib/en";
+import { isThirteenOrOlder as sharedIsThirteenOrOlder } from "../../../../src/shared/age";
 import { envelope, json, renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
 
 setupShell();
@@ -60,10 +63,40 @@ describe("sign-up validation (pure)", () => {
     expect(check({ inviteCode: "" }, false)).toEqual({});
   });
 
-  it("thirteen this month is old enough", () => {
-    expect(isThirteenOrOlder(2013, 10, NOW)).toBe(true);
-    expect(isThirteenOrOlder(2013, 11, NOW)).toBe(false);
-    expect(isThirteenOrOlder(2012, 12, NOW)).toBe(true);
+  // The form's age rule IS the server's (src/shared/age.ts). It used to accept the birth month
+  // itself, which the server refuses: a person turning thirteen this month passed the form and
+  // was turned away after submitting it.
+  it("the age rule is the server's own function: whole months, strictly, in UTC", () => {
+    const table: Array<[string, number, number, string, boolean]> = [
+      ["13 years and 1 month", 2013, 9, "2026-10-08T12:00:00Z", true],
+      ["thirteen THIS month — the birthday may not have come yet", 2013, 10, "2026-10-08T12:00:00Z", false],
+      ["thirteen next month", 2013, 11, "2026-10-08T12:00:00Z", false],
+      ["12 years and 11 months, born in December", 2013, 12, "2026-11-30T23:59:59Z", false],
+      ["the December-to-January boundary: 13 years exactly", 2012, 12, "2025-12-01T00:00:00Z", false],
+      ["one month on, in January", 2012, 12, "2026-01-01T00:00:00Z", true],
+      ["born in January, asked in January of the 13th year", 2013, 1, "2026-01-31T12:00:00Z", false],
+      ["born in January, asked in February", 2013, 1, "2026-02-01T00:00:00Z", true],
+      // The month is read in UTC: 23:30 on the 31st in New York is already the next month.
+      ["the last second of the birth month, UTC", 2013, 9, "2026-09-30T23:59:59Z", false],
+      ["the first second of the next month, UTC", 2013, 9, "2026-10-01T00:00:00Z", true],
+      ["an adult", 1990, 5, "2026-10-08T12:00:00Z", true],
+      ["born this year", 2026, 10, "2026-10-08T12:00:00Z", false],
+      ["born in the future", 2027, 1, "2026-10-08T12:00:00Z", false],
+      ["before 1900", 1899, 12, "2026-10-08T12:00:00Z", false],
+      ["month 0", 2000, 0, "2026-10-08T12:00:00Z", false],
+      ["month 13", 2000, 13, "2026-10-08T12:00:00Z", false],
+      ["a fractional year", 2000.5, 5, "2026-10-08T12:00:00Z", false],
+    ];
+    for (const [name, year, month, at, expected] of table) {
+      const now = new Date(at);
+      expect(isThirteenOrOlder(year, month, now), name).toBe(expected);
+      // One function, not two that agree today. (That the SERVER uses this same function is
+      // tests/unit/auth/signup-policy.test.ts, with this same table.)
+      expect(isThirteenOrOlder(year, month, now), name).toBe(sharedIsThirteenOrOlder(year, month, now));
+    }
+    // Through the form's validation: the birth month itself is refused with the neutral sentence.
+    expect(check({ birthYear: "2013", birthMonth: "10" })).toEqual({ birth: "signup.error.age" });
+    expect(check({ birthYear: "2013", birthMonth: "9" })).toEqual({});
   });
 
   it("password strength: length carries most of the weight", () => {
@@ -485,5 +518,200 @@ describe("password reset", () => {
       "This reset link is incomplete. Request a new one.",
     );
     expect(field("password")).toBeNull();
+  });
+});
+
+// ── an error that arrives in the URL ─────────────────────────────────────────────────────────
+describe("?error= on the sign-in and sign-up screens", () => {
+  const HOSTILE = "<img src=x onerror=alert(1)> Call +1 555 0100 to unlock your account";
+
+  it("a known code picks OUR sentence; an unknown one the generic sentence; the description is never read", () => {
+    expect(redirectErrorMessage("SIGNUP_INTENT_REQUIRED")).toBe(
+      "To sign up with Google, start from the sign-up page.",
+    );
+    expect(redirectErrorMessage("INVITE_INVALID")).toBe("This invite code isn't valid.");
+    expect(redirectErrorMessage("TOKEN_EXPIRED")).toBe(en["auth.redirect.linkExpired"]);
+    expect(redirectErrorMessage("access_denied")).toBe("The Google sign-in was cancelled.");
+    for (const unknown of [
+      HOSTILE,
+      "",
+      "toString",
+      "constructor",
+      "__proto__",
+      "invite_invalid",
+      "x".repeat(5000),
+    ])
+      expect(redirectErrorMessage(unknown), unknown.slice(0, 20)).toBe("That didn't work. Try again.");
+    expect(
+      takeRedirectError(
+        `?error=${encodeURIComponent(HOSTILE)}&error_description=${encodeURIComponent(HOSTILE)}&next=%2Ffolder`,
+      ),
+    ).toEqual({
+      message: "That didn't work. Try again.",
+      search: "?next=%2Ffolder",
+    });
+    // A description alone is removed and says nothing.
+    expect(takeRedirectError(`?error_description=${encodeURIComponent(HOSTILE)}`)).toEqual({
+      message: null,
+      search: "",
+    });
+    expect(takeRedirectError("?next=%2Fx")).toEqual({ message: null, search: "?next=%2Fx" });
+    expect(takeRedirectError("")).toEqual({ message: null, search: "" });
+  });
+
+  it.each([
+    ["/login", "Sign in"],
+    ["/signup", "Create your account"],
+  ])(
+    "%s shows the mapped sentence, never the parameter, and takes both out of the address",
+    async (path, heading) => {
+      shellFetch({ session: null });
+      const { router } = renderRoutes(buildRoutes(), [
+        `${path}?error=SIGNUP_INTENT_REQUIRED&error_description=${encodeURIComponent(HOSTILE)}&next=%2Ffolder%2Fabc`,
+      ]);
+      await screen.findByRole("heading", { name: heading });
+      expect((await screen.findByRole("alert")).textContent).toBe(
+        "To sign up with Google, start from the sign-up page.",
+      );
+      expect(document.body.textContent).not.toContain("555 0100");
+      expect(document.body.innerHTML).not.toContain("onerror");
+      expect(document.querySelector("img[src='x']")).toBeNull();
+      await waitFor(() => expect(router.state.location.search).toBe("?next=%2Ffolder%2Fabc"));
+      expect(router.state.historyAction).toBe("REPLACE");
+      // The sentence stays after the address is cleaned (it was read once, into state).
+      expect(screen.getByRole("alert").textContent).toBe(
+        "To sign up with Google, start from the sign-up page.",
+      );
+    },
+  );
+
+  it("an unknown or hostile code shows only the generic sentence", async () => {
+    shellFetch({ session: null });
+    const { router } = renderRoutes(buildRoutes(), [`/login?error=${encodeURIComponent(HOSTILE)}`]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect((await screen.findByRole("alert")).textContent).toBe("That didn't work. Try again.");
+    expect(document.body.textContent).not.toContain("unlock your account");
+    await waitFor(() => expect(router.state.location.search).toBe(""));
+  });
+
+  it("a verification link that came back with an error does not say 'Email confirmed'", async () => {
+    shellFetch({ session: null });
+    renderRoutes(buildRoutes(), ["/login?reason=verified&error=TOKEN_EXPIRED"]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect((await screen.findByRole("alert")).textContent).toBe(en["auth.redirect.linkExpired"]);
+    expect(screen.queryByText("Email confirmed. Sign in to continue.")).toBeNull();
+  });
+
+  it("control: without an error the 'Email confirmed' notice is shown, and nothing is an alert", async () => {
+    shellFetch({ session: null });
+    renderRoutes(buildRoutes(), ["/login?reason=verified"]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(await screen.findByText("Email confirmed. Sign in to continue.")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+// ── after a sign-up; and an address that was never confirmed ─────────────────────────────────
+describe("what the screens say about a sign-up that was answered", () => {
+  const complete = {
+    inviteCode: "HF-7K2Q",
+    name: "Ada",
+    email: "ada@example.com",
+    password: "correct horse battery",
+    birthMonth: "5",
+    birthYear: "1990",
+  };
+
+  it("a sign-up that was answered REPLACES the form (Back cannot offer the same invite again) and tells the truth about the mail", async () => {
+    const signUp = vi.spyOn(authClient.signUp, "email").mockResolvedValue({ data: {}, error: null });
+    const { router } = await openSignup();
+    fill(complete);
+    fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await screen.findByRole("heading", { name: "Check your email" });
+    expect(signUp).toHaveBeenCalledTimes(1);
+    expect(router.state.location.pathname).toBe("/verify-email");
+    expect(router.state.historyAction).toBe("REPLACE");
+    // Not "we sent": the server answers the same when the address already has an account.
+    const lead = document.querySelector("[data-verify-email]")!.parentElement!.textContent;
+    expect(lead).toBe(
+      "If this address is new to Holdfast, we've sent a confirmation link to ada@example.com. It works for one hour. If you already have an account with it, sign in instead.",
+    );
+    // The link was just sent (if at all): sending again waits.
+    expect(document.querySelector<HTMLButtonElement>("[data-resend]")!.disabled).toBe(true);
+  });
+
+  it("a second attempt with a used invite is told what most likely happened", async () => {
+    vi.spyOn(authClient.signUp, "email").mockResolvedValue({
+      data: null,
+      error: {
+        status: 400,
+        statusText: "Bad Request",
+        code: "INVITE_INVALID",
+        message: "This invite code isn't valid.",
+      },
+    });
+    await openSignup();
+    fill(complete);
+    fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: "Create account" }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("alert").map((node) => node.textContent)).toContain(
+        en["signup.error.inviteUsed"],
+      ),
+    );
+    expect(en["signup.error.inviteUsed"]).toMatch(/already been used/);
+    expect(en["signup.error.inviteUsed"]).toMatch(/check your email/);
+  });
+
+  it("the right password for an unconfirmed address leads to a screen that can send the link again at once", async () => {
+    vi.spyOn(authClient.signIn, "email").mockResolvedValue({
+      data: null,
+      error: {
+        status: 403,
+        statusText: "Forbidden",
+        code: "EMAIL_NOT_VERIFIED",
+        message: "Email not verified",
+      },
+    });
+    const resend = vi
+      .spyOn(authClient, "sendVerificationEmail")
+      .mockResolvedValue({ data: { status: true }, error: null });
+    shellFetch({ session: null });
+    renderRoutes(buildRoutes(), ["/login"]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    fill({ email: "ada@example.com", password: "the right one" });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await screen.findByRole("heading", { name: "Confirm your email" });
+    expect(document.querySelector("[data-verify-email]")!.parentElement!.textContent).toBe(
+      "The address ada@example.com hasn't been confirmed yet. We can send the link again.",
+    );
+    const button = document.querySelector<HTMLButtonElement>("[data-resend]")!;
+    expect(button.disabled, "nothing was just sent: no wait").toBe(false);
+    fireEvent.click(button);
+    await waitFor(() => expect(resend).toHaveBeenCalledTimes(1));
+    expect(resend.mock.calls[0]![0]).toMatchObject({
+      email: "ada@example.com",
+      callbackURL: "/login?reason=verified",
+    });
+    expect(await screen.findByText("Sent. Check your inbox.")).toBeTruthy();
+    // And now it waits, like after any send.
+    await waitFor(() =>
+      expect(document.querySelector<HTMLButtonElement>("[data-resend]")!.disabled).toBe(true),
+    );
+  });
+
+  it("a wrong password for that same address says only 'wrong email or password' (no hint that it exists)", async () => {
+    vi.spyOn(authClient.signIn, "email").mockResolvedValue({
+      data: null,
+      error: { status: 401, statusText: "Unauthorized", code: "INVALID_EMAIL_OR_PASSWORD" },
+    });
+    shellFetch({ session: null });
+    const { router } = renderRoutes(buildRoutes(), ["/login"]);
+    await screen.findByRole("heading", { name: "Sign in" });
+    fill({ email: "ada@example.com", password: "nope" });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Wrong email or password.");
+    expect(router.state.location.pathname).toBe("/login");
   });
 });

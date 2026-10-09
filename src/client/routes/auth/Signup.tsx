@@ -10,7 +10,7 @@ import { t } from "../../lib/i18n";
 import { usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
-import { authErrorMessage, captchaOptions } from "./errors";
+import { authErrorMessage, captchaOptions, useRedirectError } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, GoogleIcon, OrDivider, TurnstileBox } from "./parts";
 import {
   parseBirth,
@@ -69,7 +69,8 @@ export function SignupPage() {
   });
   const [errors, setErrors] = useState<SignupErrors>({});
   const [passwordServerError, setPasswordServerError] = useState<string | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
+  const redirectError = useRedirectError();
+  const [formError, setFormError] = useState<string | null>(redirectError);
   const [busy, setBusy] = useState(false);
   const inviteState = params.get("valid");
 
@@ -107,10 +108,16 @@ export function SignupPage() {
     setBusy(false);
     if (result.error) {
       if (result.error.code === "PASSWORD_COMPROMISED") setPasswordServerError(t("signup.password.breached"));
+      // A code that is used up reads the same as one that never existed — and the commonest way
+      // to use one up is to have signed up with it already. Say so.
+      else if (result.error.code === "INVITE_INVALID") setFormError(t("signup.error.inviteUsed"));
       else setFormError(authErrorMessage(result.error));
       return;
     }
-    navigate("/verify-email", { state: { email: values.email.trim() } });
+    // REPLACES this screen: the submission used the invite (also when the address already had an
+    // account — the answer is the same on purpose), so Back must not return to a filled-in form
+    // that offers to send the same code again.
+    navigate("/verify-email", { state: { email: values.email.trim() }, replace: true });
   };
 
   // Google sign-ups carry invite, age and assent through a signed intent cookie set first.

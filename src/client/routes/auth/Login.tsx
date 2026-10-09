@@ -8,7 +8,7 @@ import { t, type MessageKey } from "../../lib/i18n";
 import { refreshSession, usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
-import { authErrorMessage, captchaOptions } from "./errors";
+import { authErrorMessage, captchaOptions, useRedirectError } from "./errors";
 import {
   AuthCard,
   Field,
@@ -42,12 +42,15 @@ export function LoginPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const next = safeNext(params.get("next"));
-  const reason = REASONS[params.get("reason") ?? ""];
+  const redirectError = useRedirectError();
+  // A link that came back with an error did not do what its `reason` says: no "Email confirmed"
+  // beside "that link has expired".
+  const reason = redirectError ? undefined : REASONS[params.get("reason") ?? ""];
   const config = usePublicConfig().data;
   const turnstile = useTurnstile(config?.turnstileSiteKey);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(redirectError);
   const [busy, setBusy] = useState<"password" | "passkey" | "google" | null>(null);
   const started = useRef(false);
 
@@ -128,7 +131,9 @@ export function LoginPage() {
     setBusy(null);
     if (result.error) {
       if (result.error.status === 403 && result.error.code === "EMAIL_NOT_VERIFIED") {
-        navigate("/verify-email", { state: { email: email.trim() } });
+        // The right password for an address that was never confirmed. Nothing has been sent by
+        // this attempt: the next screen offers to send the link again, at once.
+        navigate("/verify-email", { state: { email: email.trim(), unconfirmed: true } });
         return;
       }
       setError(authErrorMessage(result.error));
