@@ -53,11 +53,35 @@ function withClientAddress(request: Request, ip: string): Request {
   return new Request(request, { headers });
 }
 
+/**
+ * A copy of a small JSON request body, or null. Never more than `KEEP_BODY_MAX_BYTES` is read:
+ * a larger body (declared, or discovered while reading) is abandoned.
+ */
 async function smallJsonBody(request: Request): Promise<unknown> {
   const declared = request.headers.get("content-length");
-  if (!declared || !/^\d+$/.test(declared) || Number(declared) > KEEP_BODY_MAX_BYTES) return null;
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > KEEP_BODY_MAX_BYTES)) return null;
+  const reader = request.clone().body?.getReader();
+  if (!reader) return null;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
   try {
-    return JSON.parse(await request.clone().text()) as unknown;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > KEEP_BODY_MAX_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
     return null;
   }

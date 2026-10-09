@@ -14,11 +14,16 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { createApp } from "../../../src/worker/app";
 import { createAuth, scopeOf } from "../../../src/worker/auth/create-auth";
+import { installTestOutbound } from "../../../src/worker/auth/test-outbound";
 import { createDb, type Db } from "../../../src/worker/db/client";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { getSettings, type Settings } from "../../../src/worker/db/queries/settings";
 import { termsVersionOf } from "../../../src/worker/db/queries/users";
-import { resolveSettings, type CoreDeps } from "../../../src/worker/services/request-context";
+import {
+  resolveSettings,
+  type CoreDeps,
+  type ServiceDeps,
+} from "../../../src/worker/services/request-context";
 import {
   account,
   auditLog,
@@ -32,6 +37,10 @@ import {
 } from "../../../src/worker/db/schema";
 import * as outbox from "../../../src/worker/services/outbox";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
+
+// The stand-ins for third parties, before any test runs (createAuth installs them too, but a
+// test may call a service before any request has built an auth instance).
+installTestOutbound(env);
 
 export const ORIGIN = TEST_APP_ORIGIN;
 export const CAPTCHA = { "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" };
@@ -452,4 +461,27 @@ export async function makePendingShare(nodeId: string, grantedBy: string, email:
 export async function shareById(id: string) {
   const [row] = await testDb().select().from(shares).where(eq(shares.id, id));
   return row ?? null;
+}
+
+// ── services called directly ────────────────────────────────────────────────────────────────
+/** A `ServiceDeps` over the test database, and a way to wait for what was deferred on it. */
+export function serviceDeps(overrides: Record<string, unknown> = {}) {
+  const deferred: Promise<unknown>[] = [];
+  const deps: ServiceDeps = {
+    db: testDb(),
+    env: { ...env, ...overrides } as unknown as Env,
+    defer: (promise) => void deferred.push(promise),
+  };
+  return {
+    deps,
+    deferred,
+    async settle() {
+      while (deferred.length) await Promise.allSettled(deferred.splice(0));
+    },
+  };
+}
+
+/** Makes a signed-in user what `requireAdmin` and the admin gate ask for: the role and two-factor. */
+export async function promoteToAdmin(userId: string, twoFactor = true) {
+  await testDb().update(user).set({ role: "admin", twoFactorEnabled: twoFactor }).where(eq(user.id, userId));
 }
