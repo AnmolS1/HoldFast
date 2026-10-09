@@ -38,7 +38,7 @@ ALLOWED_STORAGE_KEYS="hf.prefs.v1"
 REVIEWED_NONLITERAL_STORAGE_SITES=0
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
-EXPECTED_CHECKS=13
+EXPECTED_CHECKS=14
 
 json_tail() { awk 'found || /^[[:space:]]*[\[{]/ { found = 1; print }'; }
 
@@ -399,13 +399,24 @@ check_deploy() {
   bash "$lib" files-host "$FILES_URL/" || return 1
 }
 
+# The dev branch's DIRECT connection string, fetched once. Held in a variable, handed over in the
+# environment, never printed.
+fetch_neon_url() {
+  [ -z "$neon_url" ] || return 0
+  neon_url="$(cd "$root" && npx --yes "neonctl@$NEONCTL_VERSION" connection-string "$NEON_BRANCH" --project-id "$NEON_PROJECT" 2>/dev/null)" || neon_url=""
+  [ -n "$neon_url" ] || { echo "could not fetch the Neon $NEON_BRANCH connection string (neonctl login?)" && return 1; }
+}
+
+# Live, against the Neon dev branch: zero UTC offset in January and July for a new session and
+# for every stored database/role setting (the auth tables' DEFAULT now() depends on it).
+check_utc_zone() {
+  fetch_neon_url || return 1
+  DATABASE_URL_DIRECT="$neon_url" bash "$lib" utc-zone
+}
+
 check_migrations() {
-  local url
-  # The dev branch's DIRECT connection string. Held in a variable, handed over in the
-  # environment, never printed.
-  url="$(cd "$root" && npx --yes "neonctl@$NEONCTL_VERSION" connection-string "$NEON_BRANCH" --project-id "$NEON_PROJECT" 2>/dev/null)" || url=""
-  [ -n "$url" ] || { echo "could not fetch the Neon $NEON_BRANCH connection string (neonctl login?)" && return 1; }
-  DATABASE_URL_DIRECT="$url" bash "$lib" migrate none-pending remote
+  fetch_neon_url || return 1
+  DATABASE_URL_DIRECT="$neon_url" bash "$lib" migrate none-pending remote
 }
 
 check_secrets() { bash "$lib" secrets "$DEV_WORKER"; }
@@ -459,7 +470,7 @@ gate() {
   tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-gate-a.XXXXXX")"
   # shellcheck disable=SC2064
   trap "restore_dev_build; rm -rf '$tmpdir'" EXIT
-  dev_sha="" hyperdrive_dev="" hyperdrive_prod=""
+  dev_sha="" hyperdrive_dev="" hyperdrive_prod="" neon_url=""
 
   # Offline first, all reported together: nothing below is worth running on a tree like that.
   echo "── static checks"
@@ -475,6 +486,7 @@ gate() {
   step "wrangler whoami" check_whoami
   step "both environments build and dry-run with the right names" check_builds
   step "dev deploy: health, build stamp, files host" check_deploy
+  step "the Neon dev branch keeps UTC time (January and July)" check_utc_zone
   step "migrations applied on the Neon dev branch (re-run applies 0)" check_migrations
   step "the nine secrets are on the dev Worker" check_secrets
   step "Hyperdrive caching disabled on both configs" check_hyperdrive
