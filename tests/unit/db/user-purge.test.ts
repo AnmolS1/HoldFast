@@ -102,9 +102,12 @@ describe("schedule and cancel", () => {
     expect((await userState(db, owner))!.deleteScheduledAt!.getTime()).toBe(when.getTime());
     expect(await pending(owner)).toBeDefined();
     expect((await getById(db, link.id))!.pauseReasons).toEqual(["owner_deletion"]);
-    // And schedule no longer moves the date of a started purge.
-    await schedule(db, owner, inDays(30));
+    // And schedule no longer moves the date of a started purge — on the pending row or on the
+    // user row (the session check and the banner read that one), and it says so.
+    expect(await schedule(db, owner, inDays(30))).toBe(false);
     expect((await pending(owner))!.scheduledFor.getTime()).toBe(when.getTime());
+    expect((await userState(db, owner))!.deleteScheduledAt!.getTime()).toBe(when.getTime());
+    expect(await schedule(db, baId(), inDays(30))).toBe(false);
   });
 
   it("schedule is one transaction", async () => {
@@ -140,6 +143,35 @@ describe("due", () => {
     expect(await pending(past.owner)).toMatchObject({ error: null });
     expect((await pending(past.owner))!.finishedAt).toBeInstanceOf(Date);
     expect((await due(db, 1)).length).toBeLessThanOrEqual(1);
+  });
+
+  // `limit` accounts whose purge fails every night used to sort first (oldest date) forever, and
+  // nobody else's account was ever deleted.
+  it("rows that keep failing go to the back: a fresh row is ahead of every much-retried one", async () => {
+    const longAgo = new Date(Date.UTC(1999, 0, 1));
+    const failing: string[] = [];
+    for (let n = 0; n < 5; n++) {
+      const { owner } = await account();
+      await schedule(db, owner, longAgo);
+      for (let attempt = 0; attempt < 3; attempt++) await markStarted(db, owner);
+      await markFailed(db, owner, "r2 delete failed");
+      failing.push(owner);
+    }
+    const fresh = await account();
+    await schedule(db, fresh.owner, inDays(-1));
+
+    const order = (await due(db, 100_000)).map((row) => row.userId);
+    const position = (id: string) => order.indexOf(id);
+    expect(position(fresh.owner)).toBeGreaterThanOrEqual(0);
+    for (const id of failing) {
+      expect(position(id), "a failing row is still due").toBeGreaterThanOrEqual(0);
+      expect(position(fresh.owner), "the fresh row comes first").toBeLessThan(position(id));
+    }
+    // With a batch no larger than the number of poison rows, the fresh row is still served.
+    const batch = (await due(db, position(fresh.owner) + 1)).map((row) => row.userId);
+    expect(batch).toContain(fresh.owner);
+    for (const id of failing) expect(batch).not.toContain(id);
+    for (const id of [...failing, fresh.owner]) await markFinished(db, id);
   });
 
   it("a user on legal hold is never due, and is due again when the hold is released", async () => {

@@ -17,24 +17,27 @@ import { pauseLinks, unpauseLinks } from "./links";
  * Schedules the account's deletion. One transaction: `user.deleteScheduledAt`, the pending row,
  * and the account's links paused with `owner_deletion` — paused, not revoked. Safe to repeat: a
  * second call moves the date, as long as the purge has not started.
- * False when there is no such user.
+ * False — and nothing changes — when there is no such user, or once the purge has started (the
+ * date on the `user` row must keep saying when the purge that is running was due).
+ *
+ * Lock order (shared with `cancel`): the `user` row first, then the pending row.
  */
 export async function schedule(db: Executor, userId: string, scheduledFor: Date): Promise<boolean> {
   return db.transaction(async (tx) => {
-    const updated = await tx
-      .update(user)
-      .set({ deleteScheduledAt: scheduledFor })
-      .where(eq(user.id, userId))
-      .returning({ id: user.id });
-    if (updated.length === 0) return false;
-    await tx
+    const [owner] = await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
+    if (!owner) return false;
+    const written = await tx
       .insert(pendingUserPurges)
       .values({ userId, scheduledFor })
       .onConflictDoUpdate({
         target: pendingUserPurges.userId,
         set: { scheduledFor, requestedAt: sql`now()` },
         setWhere: isNull(pendingUserPurges.startedAt),
-      });
+      })
+      .returning({ userId: pendingUserPurges.userId });
+    // No row written = a pending row exists and its purge has started: leave everything as it is.
+    if (written.length === 0) return false;
+    await tx.update(user).set({ deleteScheduledAt: scheduledFor }).where(eq(user.id, userId));
     await pauseLinks(tx, { ownerId: userId }, "owner_deletion");
     return true;
   });
@@ -44,9 +47,13 @@ export async function schedule(db: Executor, userId: string, scheduledFor: Date)
  * Cancels a scheduled deletion: clears `deleteScheduledAt`, deletes the pending row and removes
  * the `owner_deletion` pause (a link that carries another reason stays paused).
  * False — and nothing changes — once the purge has started.
+ *
+ * Lock order (shared with `schedule`): the `user` row first, then the pending row. Taken the
+ * other way round, a cancel beside a re-schedule deadlocks and one of them fails.
  */
 export async function cancel(db: Executor, userId: string): Promise<boolean> {
   return db.transaction(async (tx) => {
+    await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
     const [row] = await tx
       .select({ startedAt: pendingUserPurges.startedAt })
       .from(pendingUserPurges)
@@ -65,6 +72,10 @@ export async function cancel(db: Executor, userId: string): Promise<boolean> {
  * started and failed are included (the job resumes). A user on legal hold is silently left
  * out — the request stays "scheduled". A row whose user no longer exists is included, so the
  * job can finish it.
+ *
+ * Ordered by `attempts` first (`markStarted` counts them), then by date: a row that keeps failing
+ * goes to the back, so `limit` rows that can never finish do not stop every other account's
+ * deletion.
  */
 export async function due(db: Executor, limit: number): Promise<PendingUserPurge[]> {
   const rows = await db
@@ -78,7 +89,7 @@ export async function due(db: Executor, limit: number): Promise<PendingUserPurge
         or(isNull(user.id), eq(user.legalHold, false)),
       ),
     )
-    .orderBy(pendingUserPurges.scheduledFor, pendingUserPurges.userId)
+    .orderBy(pendingUserPurges.attempts, pendingUserPurges.scheduledFor, pendingUserPurges.userId)
     .limit(limit);
   return rows.map((r) => r.purge);
 }

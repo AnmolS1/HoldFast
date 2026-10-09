@@ -563,12 +563,20 @@ export async function replaceVersion(
 ): Promise<{ previousVersionId: string | null }> {
   if (!isUuid(nodeId)) throw new QueryError("not_found");
   return tx.transaction(async (sp) => {
-    const [node] = await sp.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
-    if (!node || node.kind !== "file" || node.system !== null) throw new QueryError("not_found");
+    // Lock order: the owner's `user` row FIRST, then the node (the order of the purge, the
+    // reconcile and the CSAM lock — see queries/quota.ts). Locked, not just read: a legal hold
+    // being placed on the account either is seen here or waits for this Replace to commit.
+    const [peek] = await sp.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
+    if (!peek) throw new QueryError("not_found");
     const [owner] = await sp
       .select({ legalHold: user.legalHold })
       .from(user)
-      .where(eq(user.id, node.ownerId));
+      .where(eq(user.id, peek.ownerId))
+      .for("update");
+    const [node] = await sp.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
+    if (!node || node.kind !== "file" || node.system !== null || node.ownerId !== peek.ownerId) {
+      throw new QueryError("not_found");
+    }
     if (
       node.scanStatus === "suspected_csam" ||
       node.legalHold ||

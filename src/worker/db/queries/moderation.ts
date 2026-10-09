@@ -121,7 +121,7 @@ export async function insertReport(tx: Executor, report: ReportInput): Promise<s
  * put on legal hold, the node's links are paused with `moderation`, the node's `upload_ips` rows
  * are held, its hash is blocklisted as `csam`, and a `reports` row is filed. The object is never
  * deleted. Safe to repeat: a second call files no second report.
- * Null when there is no such node.
+ * Null when there is no such node (also when a purge that started first deleted it meanwhile).
  */
 export async function lockSuspectedCsam(
   db: Executor,
@@ -130,18 +130,28 @@ export async function lockSuspectedCsam(
 ): Promise<{ reportId: string; ownerId: string } | null> {
   if (!isUuid(nodeId)) return null;
   return db.transaction(async (tx) => {
+    // LOCK ORDER: the owner's `user` row first, then the node — the order of the purge
+    // (`deleteSubtreeRows`), the reconcile and the quota writers. Taking the node first and the
+    // owner second is the opposite order: run beside a purge of the same owner the two deadlock,
+    // and when Postgres picks THIS transaction as the victim it rolls back whole (no
+    // `suspected_csam`, no hold) and the purge goes on to delete the evidence.
+    // The owner is read without a lock only to learn whose row to lock; `owner_id` never changes.
+    const [peek] = await tx.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
+    if (!peek) return null;
+    await tx.select({ id: user.id }).from(user).where(eq(user.id, peek.ownerId)).for("update");
     const [node] = await tx
       .select({ ownerId: nodes.ownerId, sha256: nodes.sha256 })
       .from(nodes)
       .where(eq(nodes.id, nodeId))
       .for("update");
+    // Gone while this waited for the owner's row: a purge that began first has deleted it.
     if (!node) return null;
 
+    await tx.update(user).set({ legalHold: true }).where(eq(user.id, node.ownerId));
     await tx
       .update(nodes)
       .set({ scanStatus: "suspected_csam", scanStatusPrev: null, legalHold: true })
       .where(eq(nodes.id, nodeId));
-    await tx.update(user).set({ legalHold: true }).where(eq(user.id, node.ownerId));
     await pauseLinks(tx, { nodeId }, "moderation");
     await tx.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
     if (node.sha256 !== null) {
