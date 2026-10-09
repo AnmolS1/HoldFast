@@ -55,9 +55,10 @@ export default defineConfig({
   ],
   webServer: {
     command: `npm run dev -- --port ${port} --strictPort`,
-    // `localhost`, not 127.0.0.1: the Worker answers any other host with 421. /api/health is
-    // answered by the Worker itself, so "ready" means the Worker is up, not just Vite.
-    url: `${baseURL}/api/health`,
+    // `localhost`, not 127.0.0.1: the Worker answers any other host with 421. /__meta is
+    // answered by the Worker itself, so "ready" means the Worker is up, not just Vite — and it
+    // does not depend on the database, which /api/health does (503 when the database is down).
+    url: `${baseURL}/__meta`,
     reuseExistingServer: false,
     timeout: 60_000,
     gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },

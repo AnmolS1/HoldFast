@@ -68,12 +68,11 @@ describe("workers project", () => {
   });
 
   it("dispatches on the host: app, files host, anything else", async () => {
-    const app = await exports.default.fetch(`${TEST_APP_ORIGIN}/api/health`);
-    expect(app.status).toBe(200);
-    expect(await app.json()).toEqual({ ok: true });
-
+    // The Worker boots and answers on the app host. /__meta, not /api/health: health depends on
+    // the database and has its own tests.
     const meta = await exports.default.fetch(`${TEST_APP_ORIGIN}/__meta`);
     expect(meta.status).toBe(200);
+    expect(meta.headers.get("content-type")).toMatch(/^application\/json/);
     expect(await meta.json()).toMatchObject({ project: "holdfast" });
 
     // The SPA shell: any unknown path on the app host falls back to index.html.
