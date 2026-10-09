@@ -173,6 +173,48 @@ describe("a Google sign-up", () => {
     ]);
   });
 
+  // What Google vouches for is taken only in the form it is stored in (auth/create-auth.ts
+  // `mapProfileToUser`): Better Auth would otherwise `toLowerCase()` the address — folding, say,
+  // a Kelvin sign onto `k` — and store or MATCH an address other than the one vouched for.
+  it("an address that is not printable ASCII is not taken from Google at all — no account, and no existing account matched", async () => {
+    const victim = await verifiedUser({
+      email: `mark-${crypto.randomUUID().slice(0, 8)}@holdfast-test.example`,
+    });
+    const before = await accountsOf(victim.user.id);
+    for (const [what, address] of [
+      [
+        "the Kelvin sign for a k (toLowerCase folds it onto the victim's address)",
+        victim.email.replace("mark", "mar\u212a"),
+      ],
+      ["full-width letters", victim.email.replace("mark", "ｍａｒｋ")],
+      ["a capital dotted I", `adm\u0130n-${crypto.randomUUID().slice(0, 6)}@holdfast-test.example`],
+      ["a zero-width space", victim.email.replace("@", "\u200b@")],
+      ["a leading space", ` ${victim.email}`],
+      ["a non-ASCII domain", `ana@bücher-${crypto.randomUUID().slice(0, 6)}.example`],
+    ] as const) {
+      const client = newClient();
+      await intent(client);
+      const { callback, location } = await googleRoundTrip(client, profileFor(address));
+      expect(callback.status, what).toBe(302);
+      expect(new URL(location, "http://localhost").searchParams.get("error"), what).toBeTruthy();
+      expect(await getSession(client), what).toBeNull();
+      // No row was made — under the address as given, or under what lower-casing makes of it.
+      expect(await userByEmail(address.toLowerCase()).then((row) => row?.id ?? null), what).toSatisfy(
+        (id: string | null) => id === null || id === victim.user.id,
+      );
+    }
+    // The victim's account was neither linked to a Google identity nor signed in to.
+    expect(await accountsOf(victim.user.id)).toEqual(before);
+    // The control: upper-case ASCII in Google's answer is the same mailbox — stored lower-case.
+    const client = newClient();
+    const plain = freshEmail();
+    await intent(client);
+    const { location } = await googleRoundTrip(client, profileFor(plain.toUpperCase()));
+    expect(location).toBe("/");
+    expect((await userByEmail(plain))?.emailVerified).toBe(true);
+    expect((await getSession(client))?.user.email).toBe(plain);
+  });
+
   it("without the intent: refused, no account, no session", async () => {
     const client = newClient();
     const email = freshEmail();

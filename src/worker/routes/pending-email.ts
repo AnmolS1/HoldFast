@@ -39,6 +39,7 @@ import { createEmailVerificationToken } from "better-auth/api";
 import { Hono } from "hono";
 import { z } from "zod";
 import { captchaToken, verifyCaptcha } from "../auth/captcha";
+import { isStoredFormAddress } from "../auth/preflight";
 import { scopeOf, VERIFICATION_EXPIRES_IN_S } from "../auth/create-auth";
 import { afterAnswer, type AuthScope } from "../auth/scope";
 import {
@@ -103,9 +104,15 @@ router.patch(
           reason: "no_pending_signup",
         });
       const token = captchaToken(c.req.raw);
-      const newEmail = Body.parse(await jsonBody(c))
-        .email.trim()
-        .toLowerCase();
+      // Only an address already in the form it is stored in (auth/preflight.ts): nothing typed is
+      // trimmed or folded into another address here.
+      const submitted = Body.parse(await jsonBody(c)).email;
+      if (!isStoredFormAddress(submitted)) {
+        throw new AppError("validation", "Enter the address in lower case, without spaces.", {
+          fields: ["email"],
+        });
+      }
+      const newEmail = submitted;
       // The caller's own budget, then the challenge — and only then the database.
       await enforceRateLimit(c.env, "RL_AUTH", ipKey(c.get("ip")));
       await verifyCaptcha(c.env, token, c.get("ip"));

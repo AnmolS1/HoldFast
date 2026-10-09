@@ -22,6 +22,7 @@
 //    password sign-in just made). Whether a sign-in really completed is therefore decided from
 //    the final response, by the route (auth/audit.ts), not here.
 
+import { hasAdminRole } from "../../shared/roles";
 import { generateId } from "@better-auth/core/utils/id";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
@@ -32,6 +33,7 @@ import {
   getAccount,
   getAccountByEmail,
   releaseSignup,
+  revokeBootstrapAdmin,
   sweepAfterLink,
 } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
@@ -46,6 +48,7 @@ import {
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
   checkSessionStart,
+  isAdminEmail,
   parseStatement,
   precheckSignup,
   SessionRefusal,
@@ -584,9 +587,36 @@ export function buildHooks(scope: AuthScope) {
       // An account past its deletion date behaves as deleted. The session middleware already
       // treats such a session as absent; this ends it, the first time it is seen.
       const found = ctx.context.returned as
-        { user?: { id?: string; deleteScheduledAt?: unknown } } | null | undefined;
+        | {
+            user?: {
+              id?: string;
+              deleteScheduledAt?: unknown;
+              role?: unknown;
+              email?: unknown;
+              emailVerified?: unknown;
+            };
+          }
+        | null
+        | undefined;
       const scheduled = found?.user?.deleteScheduledAt;
       const userId = found?.user?.id;
+      // THE BOOTSTRAP ROLE IS RE-EVALUATED on every session read: an admin whose STORED, verified
+      // address is not (or no longer) on ADMIN_EMAILS — the address was changed, or the entry was
+      // removed — loses a role that the list gave (db/queries/auth-lifecycle.ts
+      // `revokeBootstrapAdmin`: only a role carrying the list's mark; one given by another admin
+      // is not the list's to take). From this very request on.
+      const seen = found?.user;
+      if (
+        userId &&
+        seen &&
+        hasAdminRole(typeof seen.role === "string" ? seen.role : null) &&
+        !(seen.emailVerified === true && typeof seen.email === "string" && isAdminEmail(env, seen.email))
+      ) {
+        if (await revokeBootstrapAdmin(scope.db, userId)) {
+          seen.role = "user";
+          record(scope.deps, "auth.admin_revoked", { type: "user", id: userId }, { source: "ADMIN_EMAILS" });
+        }
+      }
       if (userId && scheduled) {
         const at = scheduled instanceof Date ? scheduled : new Date(scheduled as string);
         if (!Number.isNaN(at.getTime()) && at.getTime() <= now().getTime()) {

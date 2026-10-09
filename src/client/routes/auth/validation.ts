@@ -29,6 +29,16 @@ export function safeNext(raw: string | null | undefined, origin: string = window
   return url.pathname + url.search + url.hash;
 }
 
+/**
+ * An address as the server stores it and accepts it: trimmed, with its ASCII letters lower-cased.
+ * The server folds NOTHING (it refuses an address that is not already in this form), so that what
+ * is stored, mailed and compared is exactly what was sent. Only A–Z are touched: a non-ASCII
+ * character is left for the server to refuse, not folded into a look-alike.
+ */
+export function storedForm(value: string): string {
+  return value.trim().replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
 export function isEmail(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()) && value.trim().length <= 254;
 }

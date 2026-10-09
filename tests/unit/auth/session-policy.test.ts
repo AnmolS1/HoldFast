@@ -365,7 +365,7 @@ describe("third parties under `vite dev` (test mode, not the unit-test environme
     for (const email of [
       "operator@gmail.com",
       "OPERATOR@GMAIL.COM",
-      " ops@holdfast.ponderance.dev",
+      "ops@holdfast.ponderance.dev",
       undefined,
     ]) {
       const refused = await exchange(email);

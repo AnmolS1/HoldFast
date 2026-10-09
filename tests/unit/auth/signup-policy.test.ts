@@ -79,7 +79,12 @@ describe("a sign-up that passes every gate", () => {
     const code = await createInvite({ createdBy: inviterRow!.id });
     const client = newClient({ settings: { termsVersion: "2031-01-01" } });
     const before = Date.now();
-    const { sent, email } = await signUp(client, { inviteCode: code, email: freshEmail().toUpperCase() });
+    // Only the stored form of an address is accepted (auth/preflight.ts): another spelling is
+    // refused before an invite is looked at.
+    const shouted = await signUp(newClient(), { inviteCode: code, email: freshEmail().toUpperCase() });
+    expect(shouted.sent.status).toBe(400);
+    expect(shouted.sent.body).toMatchObject({ code: "INVALID_EMAIL" });
+    const { sent, email } = await signUp(client, { inviteCode: code, email: freshEmail() });
     expect(sent.status, sent.text).toBe(200);
     expect(sent.body).toMatchObject({ token: null });
 
@@ -240,7 +245,7 @@ describe("the gates, one at a time", () => {
     expect((await signUp(newClient(allowed), { email: freshEmail("allowed.example") })).sent.status).toBe(
       200,
     );
-    expect((await signUp(newClient(allowed), { email: freshEmail("SECOND.example") })).sent.status).toBe(200);
+    expect((await signUp(newClient(allowed), { email: freshEmail("second.example") })).sent.status).toBe(200);
     // A sub-domain of an allowed domain is not that domain.
     await expectRefused("EMAIL_NOT_ALLOWED", { email: freshEmail("x.allowed.example") }, newClient(allowed));
     // …and with the list set, check 5 is skipped: a listed domain may be a disposable one.
@@ -470,9 +475,7 @@ describe("velocity: a day's sign-ups per subject", () => {
     const domain = `${crypto.randomUUID().slice(0, 8)}.velocity.example`;
     const settings = { ceilings: { signupDomainDay: 2 } };
     expect((await signUp(newClient({ settings }), { email: freshEmail(domain) })).sent.status).toBe(200);
-    expect(
-      (await signUp(newClient({ settings }), { email: freshEmail(domain.toUpperCase()) })).sent.status,
-    ).toBe(200);
+    expect((await signUp(newClient({ settings }), { email: freshEmail(domain) })).sent.status).toBe(200);
     await expectRefused("SIGNUP_LIMIT", { email: freshEmail(domain) }, newClient({ settings }));
     expect(await ledgerCount("signup_domain", domain)).toBe(2);
 

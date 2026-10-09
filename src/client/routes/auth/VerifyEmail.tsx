@@ -12,7 +12,7 @@ import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
-import { isEmail } from "./validation";
+import { isEmail, storedForm } from "./validation";
 
 export const RESEND_COOLDOWN_S = 60;
 
@@ -85,7 +85,7 @@ export function VerifyEmailPage() {
     event.preventDefault();
     setDraftError(null);
     setNotice(null);
-    const next = draft.trim();
+    const next = storedForm(draft);
     if (!isEmail(next)) {
       setDraftError(t("signup.error.email"));
       return;

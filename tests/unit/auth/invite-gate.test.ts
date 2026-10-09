@@ -208,15 +208,15 @@ describe("without a valid invite: an ADMIN_EMAILS address and any other address"
 
     const other = await observe(freshEmail());
     const admin = await observe(ADMIN_EMAIL);
-    // Upper case and surrounding space: the same address as far as ADMIN_EMAILS is concerned.
+    // Another spelling is not "the same address" to anything here: only the stored form is
+    // accepted at all (auth/preflight.ts) — refused for free, like any malformed address.
     const adminSpelled = await observe(ADMIN_EMAIL.toUpperCase());
+    expect(adminSpelled.answer.status).toBe(400);
+    expect(adminSpelled.answer.body).toMatchObject({ code: "INVALID_EMAIL" });
 
     expect(other.answer.status).toBe(400);
     expect(other.answer.body).toMatchObject({ code: "INVITE_INVALID" });
-    for (const [label, seen] of [
-      ["the admin address", admin],
-      ["the admin address in another spelling", adminSpelled],
-    ] as const) {
+    for (const [label, seen] of [["the admin address", admin]] as const) {
       expect(seen.answer, label).toEqual(other.answer);
       expect(seen, label).toEqual(other);
     }
@@ -342,14 +342,11 @@ describe("ADMIN_EMAILS grants the role, and only that", () => {
 
   it("matches the whole address, case-insensitively, and nothing else", () => {
     const list = { ADMIN_EMAILS: ` ${ADMIN_EMAIL.toUpperCase()} , second@example.test,, ` };
-    for (const address of [
-      ADMIN_EMAIL,
-      ADMIN_EMAIL.toUpperCase(),
-      ` ${ADMIN_EMAIL} `,
-      "second@example.test",
-    ]) {
+    for (const address of [ADMIN_EMAIL, ADMIN_EMAIL.toUpperCase(), "second@example.test"]) {
       expect(isAdminEmail(list, address), address).toBe(true);
     }
+    // The stored address is compared as stored: surrounding space is another string.
+    expect(isAdminEmail(list, ` ${ADMIN_EMAIL} `)).toBe(false);
     for (const address of [
       `x${ADMIN_EMAIL}`,
       ADMIN_EMAIL.replace("@", "+tag@"),

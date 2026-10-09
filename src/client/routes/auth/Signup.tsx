@@ -16,10 +16,11 @@ import {
   parseBirth,
   passwordStrength,
   safeNext,
-  validateIntent,
-  validateSignup,
+  storedForm,
   type SignupErrors,
   type SignupValues,
+  validateIntent,
+  validateSignup,
 } from "./validation";
 
 const linkSx = { color: hf.text, textDecoration: "underline", textUnderlineOffset: "2px" } as const;
@@ -94,7 +95,7 @@ export function SignupPage() {
     const result = await callAuth(() =>
       authClient.signUp.email({
         name: values.name.trim(),
-        email: values.email.trim(),
+        email: storedForm(values.email),
         password: values.password,
         inviteCode: inviteRequired ? values.inviteCode.trim() : undefined,
         birthYear: birth.year,
@@ -117,7 +118,7 @@ export function SignupPage() {
     // REPLACES this screen: the submission used the invite (also when the address already had an
     // account — the answer is the same on purpose), so Back must not return to a filled-in form
     // that offers to send the same code again.
-    navigate("/verify-email", { state: { email: values.email.trim() }, replace: true });
+    navigate("/verify-email", { state: { email: storedForm(values.email) }, replace: true });
   };
 
   // Google sign-ups carry invite, age and assent through a signed intent cookie set first.

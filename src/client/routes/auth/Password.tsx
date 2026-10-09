@@ -10,7 +10,7 @@ import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
-import { isEmail, PASSWORD_MAX, PASSWORD_MIN } from "./validation";
+import { isEmail, PASSWORD_MAX, PASSWORD_MIN, storedForm } from "./validation";
 
 const backSx = {
   color: hf.text,
@@ -46,7 +46,7 @@ export function ForgotPasswordPage() {
     setBusy(true);
     const result = await callAuth(() =>
       authClient.requestPasswordReset({
-        email: email.trim(),
+        email: storedForm(email),
         redirectTo: `${window.location.origin}/reset-password`,
         fetchOptions: captchaOptions(turnstile.token),
       }),

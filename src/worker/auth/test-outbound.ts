@@ -139,8 +139,14 @@ async function googleToken(request: Request, state: Pick<State, "realAdmins">): 
   } catch {
     return json({ error: "invalid_grant" }, 400);
   }
-  // The same matcher that grants the role decides here whom the stand-in may not be.
-  if (typeof profile?.email !== "string" || isListedAdmin(state.realAdmins, profile.email)) {
+  // The same matcher that grants the role decides here whom the stand-in may not be — asked about
+  // the address as given AND as the handler would store it (it lower-cases a provider's address
+  // with `toLowerCase()`; auth/create-auth.ts refuses the non-ASCII ones, this is the belt).
+  if (
+    typeof profile?.email !== "string" ||
+    isListedAdmin(state.realAdmins, profile.email) ||
+    isListedAdmin(state.realAdmins, profile.email.toLowerCase())
+  ) {
     return json({ error: "invalid_grant" }, 400);
   }
   const nowSeconds = Math.floor(Date.now() / 1000);

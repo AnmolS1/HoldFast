@@ -54,12 +54,25 @@ const optional =
 // (api/routes/sign-in.mjs:317, sign-up.mjs) — so that nothing reaches the handler, or the sign-in
 // throttle, that the handler would then refuse as "not an address". No spaces, no control
 // characters, ASCII only. (The sign-up policy judges the domain.)
+//
+// AND ALREADY IN THE FORM IT IS STORED IN. Better Auth lower-cases an address before it stores or
+// looks it up (`email.toLowerCase()` — sign-up.mjs:158, sign-in.mjs:319, update-user.mjs:429,
+// oauth2/link-account.mjs:119) — with JavaScript's Unicode-aware `toLowerCase`, which also turns
+// the Kelvin sign into `k`. Nothing typed is ever folded into ANOTHER address here: an address
+// is accepted only as printable ASCII with no upper-case letter — exactly the bytes that will be
+// stored, mailed and (for an admin) compared. The forms lower-case what a person types.
 const EMAIL = z.email();
-const email: Rule = (value) =>
-  typeof value === "string" &&
-  value.length >= 3 &&
-  value.length <= EMAIL_MAX &&
-  EMAIL.safeParse(value).success;
+export function isStoredFormAddress(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 3 &&
+    value.length <= EMAIL_MAX &&
+    /^[\x21-\x7e]+$/.test(value) &&
+    !/[A-Z]/.test(value) &&
+    EMAIL.safeParse(value).success
+  );
+}
+const email: Rule = isStoredFormAddress;
 const link = optional(text(1, 2048));
 
 const personName: Rule = (value) =>
@@ -104,6 +117,7 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },
   "/update-user": { fields: { name: optional(personName) } },
+  "/change-email": { fields: { newEmail: email, callbackURL: link } },
   "/reset-password": {
     captcha: true,
     fields: { newPassword: text(PASSWORD_MIN, PASSWORD_MAX), token: text(1, 128, /^[A-Za-z0-9_-]+$/) },

@@ -1,9 +1,11 @@
 // `ADMIN_EMAILS` is EXACT ADDRESSES ONLY (src/shared/admin-emails.ts): one parser and one matcher
 // for every consumer — the role grant, the test-mode stand-ins, the health flag, the checker
 // script. A wildcard or a malformed entry grants nothing.
+import { eq } from "drizzle-orm";
+import { user } from "../../../src/worker/db/schema";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { canonicalAdminAddress, isListedAdmin, parseAdminList } from "../../../src/shared/admin-emails";
+import { adminListEntry, asciiLower, isListedAdmin, parseAdminList } from "../../../src/shared/admin-emails";
 import * as observe from "../../../src/worker/auth/observe";
 import {
   adminListOf,
@@ -14,15 +16,20 @@ import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
 import signupPolicySource from "../../../src/worker/services/signup-policy.ts?raw";
 import testOutboundSource from "../../../src/worker/auth/test-outbound.ts?raw";
 import {
+  auditRows,
   createInvite,
   enableTotp,
   freshEmail,
+  linkIn,
   newClient,
   nextTotp,
   send,
   signIn,
+  signUp,
+  testDb,
   userByEmail,
   verifiedUser,
+  waitForMail,
 } from "./helpers";
 
 vi.mock("../../../src/worker/auth/observe", async (original) => {
@@ -30,14 +37,14 @@ vi.mock("../../../src/worker/auth/observe", async (original) => {
   return { ...real, reportError: vi.fn(real.reportError), countFor: vi.fn(real.countFor) };
 });
 
-describe("the parser: one plain address per entry, or nothing", () => {
+describe("the parser: an entry is one plain ASCII address, or nothing", () => {
   it.each([
     ["ana@example.com", "ana@example.com"],
     ["  Ana@Example.COM ", "ana@example.com"],
-    ["a.b+tag_x-y@sub.example.co.uk", "a.b+tag_x-y@sub.example.co.uk"],
-    ["ＡＮＡ@example.com", "ana@example.com"],
-  ])("%s is the address %s", (entry, canonical) => {
-    expect(canonicalAdminAddress(entry)).toBe(canonical);
+    ["a.b+tag_x-y%z@sub.example.co.uk", "a.b+tag_x-y%z@sub.example.co.uk"],
+    ["ops@xn--bcher-kva.example", "ops@xn--bcher-kva.example"],
+  ])("%s is the address %s", (entry, address) => {
+    expect(adminListEntry(entry)).toBe(address);
   });
 
   it.each([
@@ -50,59 +57,106 @@ describe("the parser: one plain address per entry, or nothing", () => {
     ["a display name", "Ana <ana@example.com>"],
     ["angle brackets", "<ana@example.com>"],
     ["a quoted local part", '"ana"@example.com'],
+    ["a comment", "ana(work)@example.com"],
     ["two addresses, a semicolon", "ana@example.com;bo@example.com"],
     ["two addresses, a space", "ana@example.com bo@example.com"],
+    ["two at-signs", "ana@bo@example.com"],
     ["a domain only", "@example.com"],
     ["a domain only, no at", "example.com"],
-    ["no domain dot", "ana@localhost"],
+    ["no top-level label", "ana@localhost"],
     ["an IP literal", "ana@[127.0.0.1]"],
     ["a trailing dot", "ana@example.com."],
-    ["a leading dot", ".ana@example.com"],
-    ["a double dot", "a..b@example.com"],
+    ["an empty label", "ana@example..com"],
+    ["a label that starts with a hyphen", "ana@-example.com"],
+    ["full-width letters", "ａｎａ@example.com"],
+    ["mathematical letters", "𝐚𝐧𝐚@example.com"],
     ["a non-ASCII letter", "añá@example.com"],
     ["a Cyrillic look-alike", "аna@example.com"],
-    ["a non-ASCII domain", "ana@exámple.com"],
+    ["a dotless i", "adm\u0131n@example.com"],
+    ["a capital dotted I", "adm\u0130n@example.com"],
+    ["a sharp s", "stra\u00dfe@example.com"],
+    ["a ligature", "o\ufb03ce@example.com"],
+    ["the Kelvin sign", "mar\u212a@example.com"],
+    ["an IDN domain in Unicode", "ops@bücher.example"],
+    ["a zero-width space", "ana\u200b@example.com"],
+    ["a no-break space", "ana\u00a0@example.com"],
     ["a mailto", "mailto:ana@example.com"],
     ["a newline inside", "ana@example.com\nbo@example.com"],
-    ["a percent trick", "ana%example.com@evil.example"],
+    [
+      "a 255-character address",
+      `${"a".repeat(64)}@${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(58)}.com`,
+    ],
     ["empty", ""],
     ["not text", 42],
-  ])("%s is not an address: %s", (_what, entry) => {
-    expect(canonicalAdminAddress(entry)).toBeNull();
+  ])("%s is not an entry: %s", (_what, entry) => {
+    expect(adminListEntry(entry)).toBeNull();
     // As a list entry it is ignored and counted — and grants nothing, to anyone.
-    const list = parseAdminList(`ok@example.com, ${String(entry)}`);
-    if (String(entry).trim() !== "") expect(list.invalid).toBeGreaterThanOrEqual(1);
-    expect(
-      [...list.addresses].filter((address) => address !== "ok@example.com" && address !== "bo@example.com"),
-    ).toEqual([]);
-    for (const probe of ["anyone@example.com", "ana@example.com", "x@gmail.com", String(entry)]) {
-      expect(isListedAdmin(parseAdminList(String(entry)), probe), probe).toBe(false);
+    const alone = parseAdminList(String(entry));
+    for (const probe of [
+      "anyone@example.com",
+      "ana@example.com",
+      "admin@example.com",
+      "x@gmail.com",
+      String(entry),
+    ]) {
+      expect(isListedAdmin(alone, probe), probe).toBe(false);
     }
+    const beside = parseAdminList(`ok@example.org, ${String(entry)}`);
+    if (String(entry).trim() !== "" && !String(entry).includes(",")) expect(beside.invalid).toBe(1);
+    expect(beside.addresses.has("ok@example.org")).toBe(true);
   });
 
-  it("matching is exact on the canonical form: case folds, nothing else does", () => {
-    const list = parseAdminList("Ana@Example.com, a.b@gmail.com , ");
-    expect(list).toEqual({ addresses: new Set(["ana@example.com", "a.b@gmail.com"]), invalid: 0 });
-    for (const same of ["ana@example.com", "ANA@EXAMPLE.COM", " ana@example.com ", "ＡＮＡ@example.com"]) {
+  it("the stored address is compared as stored: only the case of its ASCII letters is ignored", () => {
+    const list = parseAdminList("Admin@Example.com, a.b@gmail.com , ");
+    expect(list).toEqual({ addresses: new Set(["admin@example.com", "a.b@gmail.com"]), invalid: 0 });
+    for (const same of ["admin@example.com", "ADMIN@EXAMPLE.COM", "Admin@Example.Com"]) {
       expect(isListedAdmin(list, same), same).toBe(true);
     }
-    for (const other of [
-      "ana+x@example.com", // no plus folding
-      "ab@gmail.com", // no dot folding
-      "a.b+x@gmail.com",
-      "a.b@googlemail.com",
-      "ana@sub.example.com",
-      "ana@example.com.evil.example",
-      "xana@example.com",
-      "аna@example.com", // Cyrillic а
-      "ana@exаmple.com",
-      "example.com",
-      "",
-      null,
-      undefined,
-    ]) {
-      expect(isListedAdmin(list, other), String(other)).toBe(false);
+    // Everything a normaliser might "helpfully" fold onto the entry is ANOTHER address — a
+    // mailbox somebody else can own.
+    for (const [what, other] of [
+      ["surrounding spaces", " admin@example.com "],
+      ["a trailing newline", "admin@example.com\n"],
+      ["full-width", "ａｄｍｉｎ@example.com"],
+      ["full-width at-sign", "admin＠example.com"],
+      ["mathematical bold", "𝐚𝐝𝐦𝐢𝐧@example.com"],
+      ["dotless i", "adm\u0131n@example.com"],
+      ["capital dotted I (lower-cases to i + combining dot)", "ADM\u0130N@example.com"],
+      [
+        "the Kelvin sign in the domain (lower-cases to k)",
+        "admin@example.\u212aom".replace("\u212aom", "com"),
+      ],
+      ["Cyrillic а", "\u0430dmin@example.com"],
+      ["a zero-width joiner", "ad\u200dmin@example.com"],
+      ["a soft hyphen", "ad\u00admin@example.com"],
+      ["a combining mark", "admin\u0301@example.com"],
+      ["a plus tag", "admin+x@example.com"],
+      ["dots removed", "ab@gmail.com"],
+      ["googlemail", "a.b@googlemail.com"],
+      ["a trailing dot", "admin@example.com."],
+      ["a quoted local part", '"admin"@example.com'],
+      ["a comment", "admin(x)@example.com"],
+      ["a sub-domain", "admin@sub.example.com"],
+      ["a suffix", "admin@example.com.evil.example"],
+      ["a prefix", "xadmin@example.com"],
+      ["the domain only", "example.com"],
+      ["empty", ""],
+      ["null", null],
+      ["undefined", undefined],
+    ] as const) {
+      if (what.startsWith("the Kelvin sign in the domain")) continue; // (covered just below, explicitly)
+      expect(isListedAdmin(list, other), what).toBe(false);
     }
+    // The classic: `String#toLowerCase` folds U+212A (Kelvin) to `k` and `İ` to `i̇`. Not here.
+    const k = parseAdminList("mark@example.com");
+    expect("mar\u212a@example.com".toLowerCase()).toBe("mark@example.com");
+    expect(asciiLower("MAR\u212a@Example.com")).toBe("mar\u212a@example.com");
+    expect(isListedAdmin(k, "mar\u212a@example.com")).toBe(false);
+    expect(isListedAdmin(k, "MARK@example.com")).toBe(true);
+    // An IDN domain is only ever the bytes it is stored as.
+    const idn = parseAdminList("ops@xn--bcher-kva.example");
+    expect(isListedAdmin(idn, "ops@xn--bcher-kva.example")).toBe(true);
+    expect(isListedAdmin(idn, "ops@bücher.example")).toBe(false);
   });
 });
 
@@ -239,11 +293,152 @@ describe("what the list grants, through real sign-ins", () => {
         }),
         state,
       );
-    for (const spelling of [real, real.toUpperCase(), ` ${real} `]) {
+    for (const spelling of [real, real.toUpperCase()]) {
       expect((await exchange(spelling)).status, spelling).toBe(400);
     }
+    // A spelling that only `toLowerCase()` folds onto a real admin (the Kelvin sign for a `k`).
+    const kelvin = `mar\u212a-${crypto.randomUUID().slice(0, 6)}@gmail.com`;
+    const folded = { ...state, realAdmins: realAdminAddresses(kelvin.toLowerCase()) };
+    expect(
+      (
+        await routeTestOutbound(
+          new Request("https://oauth2.googleapis.com/token", {
+            method: "POST",
+            body: new URLSearchParams({ code: testGoogleCode({ sub: "1", email: kelvin }), client_id: "c" }),
+          }),
+          folded,
+        )
+      ).status,
+    ).toBe(400);
     expect((await exchange(env.ADMIN_EMAILS)).status).toBe(200);
     expect((await exchange("someone-else@gmail.com")).status).toBe(200);
     void createInvite;
+  });
+});
+
+describe("the role is decided on the bytes that were proven", () => {
+  const roleOf = async (email: string) => (await userByEmail(email))?.role ?? null;
+  const tag = () => crypto.randomUUID().slice(0, 8);
+
+  it("look-alikes and variants of an admin address: each either cannot be registered, or is a distinct user who is not an admin", async () => {
+    const domain = `${tag()}.holdfast-test.example`;
+    const admin = `admin@${domain}`;
+    const listed = { env: { ADMIN_EMAILS: admin } };
+    const variants: Array<[string, string]> = [
+      ["upper case", admin.toUpperCase()],
+      ["mixed case", `Admin@${domain}`],
+      ["full-width letters", `ａｄｍｉｎ@${domain}`],
+      ["mathematical letters", `𝐚𝐝𝐦𝐢𝐧@${domain}`],
+      ["dotless i", `adm\u0131n@${domain}`],
+      ["capital dotted I", `adm\u0130n@${domain}`],
+      ["a Cyrillic а", `\u0430dmin@${domain}`],
+      ["a ligature (NFKC-equivalent to plain letters)", `adm\ufb01@${domain}`],
+      ["a zero-width space", `ad\u200bmin@${domain}`],
+      ["a zero-width joiner", `admin\u200d@${domain}`],
+      ["a soft hyphen", `ad\u00admin@${domain}`],
+      ["a leading space", ` ${admin}`],
+      ["a trailing space", `${admin} `],
+      ["a trailing dot", `${admin}.`],
+      ["a quoted local part", `"admin"@${domain}`],
+      ["a comment", `admin(x)@${domain}`],
+      ["a Unicode domain", `admin@bücher-${domain}`],
+      ["a plus tag", `admin+x@${domain}`],
+      ["a dot in the local part", `ad.min@${domain}`],
+      ["a punycode domain (its own domain)", `admin@xn--bcher-kva.${domain}`],
+      ["a sub-domain", `admin@mail.${domain}`],
+    ];
+    const registered: string[] = [];
+    for (const [what, address] of variants) {
+      const client = newClient(listed);
+      const { sent } = await signUp(client, { email: address });
+      if (sent.status !== 200) {
+        // Cannot be registered: refused for free, and no row was made under any spelling.
+        expect(sent.status, what).toBe(400);
+        expect(await userByEmail(address.trim().toLowerCase()), what).toBeNull();
+        continue;
+      }
+      // Registered: it is stored exactly as sent — a DIFFERENT address from the admin's.
+      registered.push(what);
+      const row = await userByEmail(address);
+      expect(row?.email, what).toBe(address);
+      expect(address, what).not.toBe(admin);
+      // Verified and signed in — with the admin list in force — it is a user.
+      expect((await send(client, linkIn(await waitForMail(address, "verification")))).status, what).toBe(302);
+      expect((await signIn(newClient(listed), address)).status, what).toBe(200);
+      expect(await roleOf(address), what).toBe("user");
+    }
+    // The ones that are simply other ASCII addresses.
+    expect(registered).toEqual([
+      "a plus tag",
+      "a dot in the local part",
+      "a punycode domain (its own domain)",
+      "a sub-domain",
+    ]);
+    // Nobody became the admin's row on the way.
+    expect(await userByEmail(admin)).toBeNull();
+  });
+
+  it("an exact ASCII match of a VERIFIED user is an admin; unverified it is not; changing the address away drops the role on the next request", async () => {
+    const domain = `${tag()}.holdfast-test.example`;
+    const admin = `boss@${domain}`;
+    const listed = { env: { ADMIN_EMAILS: `someone@elsewhere.example, ${admin}` } };
+    // Unverified exact match: not an admin, and cannot sign in.
+    const pending = newClient(listed);
+    await signUp(pending, { email: admin });
+    expect((await signIn(newClient(listed), admin)).status).toBe(403);
+    expect(await roleOf(admin)).toBe("user");
+    // Verified, signed in: admin — and the grant is audited.
+    await send(pending, linkIn(await waitForMail(admin, "verification")));
+    const client = newClient(listed);
+    expect((await signIn(client, admin)).status).toBe(200);
+    const id = (await userByEmail(admin))!.id;
+    expect(await roleOf(admin)).toBe("admin");
+    expect(await auditRows({ action: "auth.admin_granted", targetId: id })).toHaveLength(1);
+    type Seen = { user: { role: string; email: string } };
+    expect(((await send(client, "/api/auth/get-session")).body as Seen).user.role).toBe("admin");
+
+    // The stored address changes (to one that is not on the list): the role goes with it —
+    // seen by the very next request, and audited.
+    const moved = `boss-moved@${domain}`;
+    await testDb().update(user).set({ email: moved }).where(eq(user.id, id));
+    const next = (await send(client, "/api/auth/get-session")).body as Seen;
+    expect(next.user.email).toBe(moved);
+    expect(next.user.role).toBe("user");
+    expect(await roleOf(moved)).toBe("user");
+    expect(await auditRows({ action: "auth.admin_revoked", targetId: id })).toHaveLength(1);
+    // Once: a second request finds nothing left to revoke.
+    await send(client, "/api/auth/get-session");
+    expect(await auditRows({ action: "auth.admin_revoked", targetId: id })).toHaveLength(1);
+    // The address changed back: the role returns only at a new verified sign-in.
+    await testDb().update(user).set({ email: admin }).where(eq(user.id, id));
+    expect(((await send(client, "/api/auth/get-session")).body as Seen).user.role).toBe("user");
+    expect((await signIn(newClient(listed), admin)).status).toBe(200);
+    expect(await roleOf(admin)).toBe("admin");
+  });
+
+  it("an entry that leaves the list takes its role with it; a role another admin gave is not the list's to take", async () => {
+    const domain = `${tag()}.holdfast-test.example`;
+    const admin = `lead@${domain}`;
+    const made = await verifiedUser({ email: admin });
+    const listed = newClient({ env: { ADMIN_EMAILS: admin } });
+    expect((await signIn(listed, admin)).status).toBe(200);
+    expect(await roleOf(admin)).toBe("admin");
+    type Seen = { user: { role: string } };
+    // The same session, on a deploy whose list no longer has the entry.
+    const unlisted = newClient({
+      cookies: new Map(listed.cookies),
+      ip: listed.ip,
+      env: { ADMIN_EMAILS: "other@elsewhere.example" },
+    });
+    expect(((await send(unlisted, "/api/auth/get-session")).body as Seen).user.role).toBe("user");
+    expect(await roleOf(admin)).toBe("user");
+    expect(await auditRows({ action: "auth.admin_revoked", targetId: made.user.id })).toHaveLength(1);
+
+    // An admin made by an admin (no bootstrap mark) and not on any list: keeps the role.
+    const appointed = await verifiedUser();
+    await testDb().update(user).set({ role: "admin" }).where(eq(user.id, appointed.user.id));
+    expect(((await send(appointed.client, "/api/auth/get-session")).body as Seen).user.role).toBe("admin");
+    expect(await roleOf(appointed.email)).toBe("admin");
+    expect(await auditRows({ action: "auth.admin_revoked", targetId: appointed.user.id })).toEqual([]);
   });
 });

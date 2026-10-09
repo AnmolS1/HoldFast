@@ -19,7 +19,7 @@ import {
   PasskeyIcon,
   TurnstileBox,
 } from "./parts";
-import { isEmail, safeNext } from "./validation";
+import { isEmail, safeNext, storedForm } from "./validation";
 
 const REASONS: Record<string, { key: MessageKey; tone: "neutral" | "danger" }> = {
   suspended: { key: "login.suspended", tone: "danger" },
@@ -124,7 +124,7 @@ export function LoginPage() {
     setBusy("password");
     const result = await callAuth(() =>
       authClient.signIn.email({
-        email: email.trim(),
+        email: storedForm(email),
         password,
         fetchOptions: captchaOptions(turnstile.token),
       }),
@@ -135,7 +135,7 @@ export function LoginPage() {
       if (result.error.status === 403 && result.error.code === "EMAIL_NOT_VERIFIED") {
         // The right password for an address that was never confirmed. Nothing has been sent by
         // this attempt: the next screen offers to send the link again, at once.
-        navigate("/verify-email", { state: { email: email.trim(), unconfirmed: true } });
+        navigate("/verify-email", { state: { email: storedForm(email), unconfirmed: true } });
         return;
       }
       setError(authErrorMessage(result.error));

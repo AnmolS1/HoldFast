@@ -422,8 +422,11 @@ describe("the throttle's key and Better Auth's look-up normalise an address the 
   // the throttle (no row), OR it is the owner's account under the owner's key, OR it is another
   // address — another key AND no way into the owner's account.
   it.each([
-    ["upper case", (e: string) => e.toUpperCase(), "same"],
-    ["mixed case", (e: string) => e.replace(/^./, (c) => c.toUpperCase()), "same"],
+    // Only the form an address is STORED in is accepted (auth/preflight.ts): the forms lower-case
+    // what a person types; the server folds nothing.
+    ["upper case", (e: string) => e.toUpperCase(), "refused"],
+    ["mixed case", (e: string) => e.replace(/^./, (c) => c.toUpperCase()), "refused"],
+    ["as stored", (e: string) => e, "same"],
     ["a leading space", (e: string) => ` ${e}`, "refused"],
     ["a trailing space", (e: string) => `${e} `, "refused"],
     ["a trailing tab", (e: string) => `${e}\t`, "refused"],

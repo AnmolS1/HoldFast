@@ -38,6 +38,8 @@ import { authLog } from "./logger";
 import { VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
+import { asciiLower } from "../../shared/admin-emails";
+import { isStoredFormAddress } from "./preflight";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
 import { provingVerify } from "./signin-throttle";
 import { afterAnswer, createScope, emptyFacts, type AuthScope } from "./scope";
@@ -203,6 +205,16 @@ export function buildAuthOptions(scope: AuthScope) {
         // takes an ID token in a POST — no redirect, no state, an optional caller-chosen nonce —
         // is something the app never uses (api/routes/sign-in.mjs → ID_TOKEN_NOT_SUPPORTED).
         disableIdTokenSignIn: true,
+        // The address Google vouches for is taken ONLY in the form it will be stored in. Better
+        // Auth lower-cases a provider's address with `toLowerCase()` before storing or matching
+        // it (oauth2/link-account.mjs:119, :152) — which would fold, say, a Kelvin sign onto `k`:
+        // another address than the one that was vouched for. An address that is not printable
+        // ASCII is dropped here (the callback then answers `email_not_found`); upper-case ASCII
+        // letters are lower-cased, which changes no mailbox.
+        mapProfileToUser: (profile: { email?: unknown }) => {
+          const address = typeof profile.email === "string" ? asciiLower(profile.email) : "";
+          return isStoredFormAddress(address) ? { email: address } : { email: "", emailVerified: false };
+        },
       },
     },
     account: {

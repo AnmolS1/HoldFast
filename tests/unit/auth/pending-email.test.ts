@@ -69,7 +69,13 @@ describe("PATCH /api/account/pending-email", () => {
     const next = freshEmail();
 
     const started = Date.now();
-    const sent = await change(client, ` ${next.toUpperCase()} `.trim());
+    // Only the form an address is stored in is accepted: nothing typed is folded here.
+    for (const spelled of [next.toUpperCase(), ` ${next}`, `${next} `, next.replace("@", "\u200b@")]) {
+      const refused = await change(client, spelled);
+      expect(refused.status, JSON.stringify(spelled)).toBe(400);
+      expect((await userById(row!.id))!.email, JSON.stringify(spelled)).toBe(email);
+    }
+    const sent = await change(client, next);
     expect(sent.status, sent.text).toBe(200);
     expect(sent.body).toEqual({ ok: true });
     expect(Date.now() - started).toBeGreaterThanOrEqual(PENDING_EMAIL_MIN_MS - 30);

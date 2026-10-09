@@ -202,8 +202,10 @@ export function resetAdminListReportForTests(): void {
 }
 
 /**
- * Is the address one of `ADMIN_EMAILS`? Used for ONE thing: granting the admin role when a
- * verified account signs in. It must never change what a sign-up is answered.
+ * Is the address one of `ADMIN_EMAILS`? `email` is a user row's STORED address — the bytes whose
+ * mailbox was proven — compared exactly (shared/admin-emails.ts). Used for ONE thing: the admin
+ * role of a verified account (granted at sign-in, taken back when the stored address is no
+ * longer on the list). It must never change what a sign-up is answered.
  */
 export function isAdminEmail(env: AdminListEnv, email: string): boolean {
   return isListedAdmin(adminListOf(env), email);

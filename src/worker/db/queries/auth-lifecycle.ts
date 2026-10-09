@@ -277,13 +277,50 @@ export async function ensureUserPrefs(db: Executor, userId: string): Promise<voi
 }
 
 /** Gives the account the `admin` role. False when it already has it or does not exist. */
+const bootstrapMarker = (userId: string) => `admin-bootstrap:${userId}`;
+
+/**
+ * Makes the account an admin BY THE BOOTSTRAP LIST — and marks it so (a `verification` row
+ * `admin-bootstrap:<user id>`): a role that `ADMIN_EMAILS` gave is one that `ADMIN_EMAILS` can
+ * take back (`revokeBootstrapAdmin`); a role another admin gave through /admin/set-role carries
+ * no mark and is not the list's to revoke. One transaction. False when it already was an admin.
+ */
 export async function grantAdminRole(db: Executor, userId: string): Promise<boolean> {
-  const rows = await db
-    .update(user)
-    .set({ role: "admin" })
-    .where(and(eq(user.id, userId), sql`${user.role} IS DISTINCT FROM 'admin'`))
-    .returning({ id: user.id });
-  return rows.length > 0;
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .update(user)
+      .set({ role: "admin" })
+      .where(and(eq(user.id, userId), sql`${user.role} IS DISTINCT FROM 'admin'`))
+      .returning({ id: user.id });
+    if (rows.length === 0) return false;
+    const at = new Date();
+    await tx.delete(verification).where(eq(verification.identifier, bootstrapMarker(userId)));
+    await tx.insert(verification).values({
+      id: crypto.randomUUID(),
+      identifier: bootstrapMarker(userId),
+      value: "ADMIN_EMAILS",
+      // Never, in practice: the nightly sweep removes only rows that have expired.
+      expiresAt: new Date(at.getTime() + 20 * 365 * 86_400_000),
+      createdAt: at,
+      updatedAt: at,
+    });
+    return true;
+  });
+}
+
+/**
+ * Takes the admin role back from an account that has it FROM THE BOOTSTRAP LIST (the mark) — one
+ * statement, so it happens once however many requests see it. True when the role was taken.
+ */
+export async function revokeBootstrapAdmin(db: Executor, userId: string): Promise<boolean> {
+  const result = await db.execute<{ id: string }>(sql`
+    WITH marked AS (
+      DELETE FROM verification WHERE identifier = ${bootstrapMarker(userId)} RETURNING id
+    )
+    UPDATE "user" SET role = 'user'
+    WHERE id = ${userId} AND role = 'admin' AND EXISTS (SELECT 1 FROM marked)
+    RETURNING id`);
+  return result.rows.length > 0;
 }
 
 // ── sessions ────────────────────────────────────────────────────────────────────────────────
