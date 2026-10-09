@@ -4,6 +4,10 @@
 // Exempt, exact paths only: stopping the impersonation and signing out. /api/auth/* as a whole is
 // NOT exempt — change-password, delete-user and passkey registration live there.
 //
+// Under /api/auth/* the session middleware has already applied the allow-list of
+// auth/endpoint-policy.ts to an impersonated session — GETs included (some of them return session
+// tokens or act on the account). The two exempt paths below are allowed there too.
+//
 // Minting content access is a GET in places (download URLs), so those routes call
 // `forbidImpersonation(c)` themselves (through the permissions service).
 

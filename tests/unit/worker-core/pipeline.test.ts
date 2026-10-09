@@ -189,13 +189,15 @@ describe("session", () => {
     ],
     ["suspended (string)", { suspendedAt: past.toISOString() as unknown as Date }],
   ] as const) {
-    it(`${label} → 403 account_suspended on an app route, signed out on /api/auth/*`, async () => {
+    it(`${label} → 403 account_suspended on an app route, the allow-list on /api/auth/*`, async () => {
       const { fake, send } = setup();
       signIn(fake, flags);
       const app = await send("/api/nodes");
       expect(app.status).toBe(403);
       expect(app.body).toMatchObject({ error: "forbidden", details: { reason: "account_suspended" } });
-      for (const path of ["/api/auth/list-sessions", "/api/auth/sign-out"]) {
+      // Under /api/auth/* only what the allow-list names for a suspended account passes (the
+      // whole table is in auth-endpoints.test.ts) — and it passes as nobody.
+      for (const path of ["/api/auth/ok", "/api/auth/sign-out"]) {
         const auth = await send(path, {
           method: path.endsWith("sign-out") ? "POST" : "GET",
           headers: sameOrigin,
@@ -203,6 +205,9 @@ describe("session", () => {
         expect(auth.status).toBe(200);
         expect(auth.body).toMatchObject({ reached: path, user: null });
       }
+      const listed = await send("/api/auth/list-sessions");
+      expect(listed.status).toBe(403);
+      expect(listed.body).toMatchObject({ error: "forbidden", details: { reason: "account_suspended" } });
     });
   }
 
@@ -233,52 +238,13 @@ describe("session", () => {
       const { fake, send } = setup();
       signIn(fake, { deleteScheduledAt: value });
       expect((await send("/api/nodes")).body.user).toBeNull();
-      expect((await send("/api/auth/list-sessions")).body.user).toBeNull();
+      expect((await send("/api/auth/ok")).body).toMatchObject({ reached: "/api/auth/ok", user: null });
+      expect((await send("/api/auth/list-sessions")).status).toBe(401);
       expect((await send("/api/_guard/user")).status).toBe(401);
     });
   }
 
-  // Better Auth still honours the cookie of an account whose deletion date has passed (nothing
-  // revokes its sessions until the purge runs — and a held account is never purged). On our own
-  // routes that user is nobody; under /api/auth/* the same must hold for anything that changes
-  // the account.
-  for (const [label, value] of [
-    ["a Date", past],
-    ["an unreadable value", "not-a-date" as unknown as Date],
-  ] as const) {
-    it(`a deletion date in the past (${label}) → writes under /api/auth/* are refused, 401`, async () => {
-      const { fake, send, post } = setup();
-      signIn(fake, { deleteScheduledAt: value });
-      for (const path of [
-        "/api/auth/change-email",
-        "/api/auth/change-password",
-        "/api/auth/update-user",
-        "/api/auth/delete-user",
-        "/api/auth/passkey/add-passkey",
-        "/api/auth/two-factor/disable",
-        "/api/auth/revoke-sessions",
-        "/api/auth/sign-outx",
-        "/api/auth/sign-in",
-      ]) {
-        for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
-          const answer = await post(path, { method });
-          expect(answer.status, `${method} ${path}`).toBe(401);
-          expect(answer.body.error).toBe("unauthorized");
-          expect(answer.body.reached).toBeUndefined();
-        }
-      }
-      // Leaving, and signing in (as anyone), do not act on the dead account: they pass.
-      for (const path of ["/api/auth/sign-out", "/api/auth/sign-in/email", "/api/auth/sign-up/email"]) {
-        const answer = await post(path);
-        expect(answer.body, path).toMatchObject({ reached: path, user: null });
-      }
-      // Reads pass to the auth layer as before, with no user on the context.
-      expect((await send("/api/auth/list-sessions")).body).toMatchObject({ user: null });
-      expect((await send("/api/auth/get-session")).status).toBe(200);
-    });
-  }
-
-  it("a deletion date in the future, or none, changes nothing for writes under /api/auth/*", async () => {
+  it("a deletion date in the future, or none, restricts nothing under /api/auth/*", async () => {
     const { fake, post } = setup();
     signIn(fake, { deleteScheduledAt: future });
     expect((await post("/api/auth/change-email")).body).toMatchObject({ reached: "/api/auth/change-email" });
@@ -641,7 +607,7 @@ describe("impersonation is read-only", () => {
       signIn(fake, flags, { impersonatedBy: "a".repeat(32) });
       const label = JSON.stringify(Object.keys(flags));
       // Not put on c.var as a user — and still an impersonated session.
-      expect((await send("/api/auth/list-sessions")).body, label).toMatchObject({
+      expect((await send("/api/auth/ok")).body, label).toMatchObject({
         user: null,
         impersonating: true,
       });

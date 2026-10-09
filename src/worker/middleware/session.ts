@@ -10,18 +10,21 @@
 //
 //   deletion date passed     the session does not exist: user = null on every path (→ 401 from
 //                            requireUser on our routes), whether or not the purge has run.
-//                            Under /api/auth/* Better Auth would still honour the cookie, so a
-//                            request there that is not a GET or HEAD is answered 401 here —
-//                            except sign-out and the sign-in / sign-up endpoints, which do not
-//                            act on that account. Reads go through (the auth task makes the
-//                            session read itself answer "signed out" for such a user).
-//   banned (not expired)     /api/auth/*: treated as signed out, Better Auth answers.
-//   or suspended             anywhere else: 403 forbidden, details.reason = "account_suspended".
+//   banned (not expired)     our routes: 403 forbidden, details.reason = "account_suspended".
+//   or suspended
 //   deletion date in future  allowed: the owner must reach the cancel banner and their files.
+//
+// Under /api/auth/* Better Auth answers, and it honours the cookie whatever those flags say. So
+// for a session in a restricted state — impersonated, past its deletion date, suspended or
+// banned — this middleware consults the allow-list in auth/endpoint-policy.ts BEFORE the auth
+// handler runs: only the endpoints listed there for that state pass; everything else, known or
+// unknown, GET or not, is refused here (401 for a deleted account, 403 otherwise). The session
+// read of a deleted account is answered as signed out.
 //
 // Anything that must be immediate (not ≤ 60 s) reads the database, not this.
 
 import type { MiddlewareHandler } from "hono";
+import { AUTH_PREFIX, authGateDecision, type AuthGateState } from "../auth/endpoint-policy";
 import type { SessionUser } from "../auth/types";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
@@ -29,15 +32,19 @@ import { auth, settings, type AppEnv } from "../services/request-context";
 
 const SKIPPED_PREFIXES = ["/api/public/", "/api/_test/"];
 
-/** Auth endpoints that end a session or start another one: they never change the signed-in account. */
-const SESSION_NEUTRAL_AUTH = ["/api/auth/sign-out", "/api/auth/sign-in/", "/api/auth/sign-up/"];
-
-/** A request under /api/auth/* that could change the account the session belongs to. */
-function isAuthWriteOnAccount(method: string, path: string): boolean {
-  if (!path.startsWith("/api/auth/") || method === "GET" || method === "HEAD") return false;
-  return !SESSION_NEUTRAL_AUTH.some((allowed) =>
-    allowed.endsWith("/") ? path.startsWith(allowed) : path === allowed,
-  );
+function refusal(state: AuthGateState): AppError {
+  switch (state) {
+    case "impersonating":
+      return new AppError("forbidden", "This is not available while impersonating.", {
+        reason: "impersonation_read_only",
+      });
+    case "suspended":
+      return new AppError("forbidden", "This account is suspended.", { reason: "account_suspended" });
+    case "deleted":
+      // The answer a request with no session gets: the account behaves as deleted, and the answer
+      // is the same whether the purge has run, is pending, or is held back.
+      return new AppError("unauthorized");
+  }
 }
 
 /**
@@ -93,23 +100,33 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
   // Fail closed on an unreadable date: a deletion date that cannot be read counts as passed, a
   // ban expiry that cannot be read as "no expiry".
   const deleteAt = toDate(user.deleteScheduledAt as unknown);
-  if (deleteAt === undefined || (deleteAt !== null && deleteAt.getTime() <= at)) {
-    // The same answer a request with no session gets: the account behaves as deleted, and the
-    // answer is identical whether the purge has run, is pending, or is held back.
-    // (An impersonated session is left to the read-only rule that follows: it refuses every
-    // write but `stop-impersonating`, which an admin must still be able to reach.)
-    if (!c.get("impersonating") && isAuthWriteOnAccount(c.req.method, path)) {
-      throw new AppError("unauthorized");
-    }
-    return next();
-  }
-
+  const deleted = deleteAt === undefined || (deleteAt !== null && deleteAt.getTime() <= at);
   const banExpires = toDate(user.banExpires as unknown);
   const banned = user.banned === true && !(banExpires instanceof Date && banExpires.getTime() <= at);
   const suspended = user.suspendedAt !== null && user.suspendedAt !== undefined;
+
+  // Impersonation first: whatever the target account's state, the admin must be able to stop.
+  const state: AuthGateState | null = c.get("impersonating")
+    ? "impersonating"
+    : deleted
+      ? "deleted"
+      : banned || suspended
+        ? "suspended"
+        : null;
+  const onAuth = path.startsWith(`${AUTH_PREFIX}/`);
+  if (onAuth && state) {
+    // The path exactly as it was sent, not Hono's percent-decoded one: the allow-list matches
+    // literal spellings only, so an encoded or otherwise unusual path is simply not on it.
+    const decision = authGateDecision(state, new URL(c.req.url).pathname);
+    if (decision === "deny") throw refusal(state);
+    // Better Auth's own signed-out body, without reaching Better Auth.
+    if (decision === "signed_out") return c.json(null);
+  }
+
+  if (deleted) return next();
   if (banned || suspended) {
-    if (path.startsWith("/api/auth/")) return next();
-    throw new AppError("forbidden", "This account is suspended.", { reason: "account_suspended" });
+    if (onAuth) return next();
+    throw refusal("suspended");
   }
 
   c.set("user", user);
