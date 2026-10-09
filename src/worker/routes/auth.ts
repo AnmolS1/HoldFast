@@ -11,11 +11,10 @@
 //      403 here and never reaches Better Auth;
 //   2. the client facts the hooks cannot see for themselves (the address the pipeline resolved,
 //      Cloudflare's ASN and country);
-//   3. the WATCHDOG for Better Auth issue #10315 — detection, not cure. The handler is raced
-//      against a 10 s timer. On a deployed Worker a module-scope promise that an aborted request
-//      left pending never settles, and every later request in that isolate would wait on it for
-//      ever; the mitigation is auth/als-preseed.ts, and this makes anything that still hangs
-//      visible: 503, an error report and `metric("auth", { outcome: "hang" })`;
+//   3. the WATCHDOG for Better Auth issue #10315 (auth/watchdog.ts) — detection, not cure: the
+//      handler is raced against a 10 s timer; a hang is a 503, an error report and
+//      `metric("auth", { outcome: "hang" })`. The session read in front of this route
+//      (middleware/session.ts) is under the same watchdog;
 //   4. the audit rows, the auth metric and the security emails (auth/audit.ts), from the
 //      finished response.
 
@@ -26,24 +25,12 @@ import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
+import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { AppError } from "../services/errors";
 import { auth, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
 
-/** How long the auth handler may take before the request is answered 503. */
-export const AUTH_HANDLER_TIMEOUT_MS = 10_000;
-
-let handlerTimeoutMs = AUTH_HANDLER_TIMEOUT_MS;
-/** Tests only: a 10-second wait cannot be part of a unit test. Returns the function that restores it. */
-export function setAuthHandlerTimeoutForTests(ms: number): () => void {
-  handlerTimeoutMs = ms;
-  return () => {
-    handlerTimeoutMs = AUTH_HANDLER_TIMEOUT_MS;
-  };
-}
-
-const HANG = Symbol("auth handler timed out");
 const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
 
 /** The only request body this route keeps a copy of: a sign-in's, to name the account a failed attempt tried. */
@@ -153,30 +140,11 @@ router.all(
     const request = withoutSessionCache(withClientAddress(c.req.raw, c.get("ip")));
     const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
 
-    // 3. The watchdog.
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<typeof HANG>((resolve) => {
-      timer = setTimeout(() => resolve(HANG), handlerTimeoutMs);
-    });
+    // 3. The watchdog (auth/watchdog.ts).
     let response: Response;
     try {
-      const handled = instance.handler(request);
-      // The loser of the race must not become an unhandled rejection.
-      handled.catch(() => {});
-      const outcome = await Promise.race([handled, timeout]);
-      if (outcome === HANG) {
-        count("auth", { outcome: "hang" });
-        reportError(new Error("the auth handler did not answer within 10 s"), { kind: "auth_hang" });
-        return c.json(
-          {
-            error: INTERNAL_ERROR,
-            message: "Sign-in is not available right now.",
-            requestId: c.get("requestId"),
-          },
-          503,
-          { "Retry-After": "30" },
-        );
-      }
+      const outcome = await watched(instance.handler(request));
+      if (outcome === HANG) return hungAnswer(c, "handler");
       response = outcome;
     } catch (error) {
       // Not one of Better Auth's own errors (those are answers): a failure inside the handler.
@@ -191,8 +159,6 @@ router.all(
         { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
         500,
       );
-    } finally {
-      clearTimeout(timer);
     }
 
     // 4. What happened, for the audit log.

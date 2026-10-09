@@ -33,6 +33,7 @@
 import type { MiddlewareHandler } from "hono";
 import { AUTH_PREFIX, authGateDecision, type AuthGateState } from "../auth/endpoint-policy";
 import type { SessionUser } from "../auth/types";
+import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { auth, settings, type AppEnv } from "../services/request-context";
@@ -93,10 +94,15 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
     return next();
   }
 
-  const found = await auth(c).api.getSession({
-    headers: c.req.raw.headers,
-    query: { disableCookieCache: true },
-  });
+  // Under the #10315 watchdog (auth/watchdog.ts): this is the first Better Auth call of every
+  // /api/* request, so a hang here would hang every API route — it is answered 503 instead.
+  const found = await watched(
+    auth(c).api.getSession({
+      headers: c.req.raw.headers,
+      query: { disableCookieCache: true },
+    }),
+  );
+  if (found === HANG) return hungAnswer(c, "session");
   if (!found) return next();
 
   // Before any early return below: an impersonated session stays read-only even when its user is

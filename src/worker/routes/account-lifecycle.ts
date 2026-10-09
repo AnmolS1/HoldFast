@@ -14,6 +14,7 @@
 //
 // A held account answers exactly like any other on all three.
 
+import { HANG, watched } from "../auth/watchdog";
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { guard } from "../auth/observe";
@@ -38,11 +39,14 @@ async function refreshSessionCookie(c: Context<AppEnv>): Promise<void> {
   }) => Promise<{ headers?: Headers | null } | null>;
   try {
     const read = auth(c).api.getSession as unknown as Fresh;
-    const fresh = await read({
-      headers: c.req.raw.headers,
-      query: { disableCookieCache: true },
-      returnHeaders: true,
-    });
+    const fresh = await watched(
+      read({
+        headers: c.req.raw.headers,
+        query: { disableCookieCache: true },
+        returnHeaders: true,
+      }),
+    );
+    if (fresh === HANG) return;
     for (const cookie of fresh?.headers?.getSetCookie() ?? [])
       c.header("Set-Cookie", cookie, { append: true });
   } catch {

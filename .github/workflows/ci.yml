@@ -125,6 +125,13 @@ jobs:
       - name: The build is a dev build
         run: bash .github/workflows/lib/deploy-lib.sh built-env dev
 
+      # Better Auth issue #10315. The unit test proves the pre-seed in the TEST bundle; this reads
+      # the bundle that would be deployed: the installed core still returns an existing storage
+      # before it awaits its loader, the pre-seed and the loader are each in exactly one chunk,
+      # both evaluated at start-up, the pre-seed first, and no lazy chunk brings in either.
+      - name: C2 static guards on the built Worker
+        run: node scripts/c2-abort-test.mjs --static
+
       - name: Install the Playwright browser
         run: npx playwright install --with-deps chromium chromium-headless-shell
 
