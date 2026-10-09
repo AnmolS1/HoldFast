@@ -203,6 +203,15 @@ describe("the redaction function", () => {
       "INVALID_EMAIL_OR_PASSWORD (SQLSTATE 23505) in user_email_unique",
     );
     expect(scrubText("x".repeat(5000)).length).toBeLessThanOrEqual(501);
+    // A relative URL loses its WHOLE query — short values have no shape a scan could find, and
+    // the shared rules only know `token`, `code` and `password` by name.
+    expect(scrubText("GET /api/auth/callback/google?state=qZ7&x=ab&name=Zeb#frag failed")).toBe(
+      "GET /api/auth/callback/google?[query] failed",
+    );
+    expect(scrubText("redirect to /login?error=x&error_description=Zeb+Q+is+not+allowed.")).toBe(
+      "redirect to /login?[query]",
+    );
+    expect(scrubText("is it /invite/J4K? yes")).toBe("is it /invite/[redacted]? yes");
     // A failed query's parameter list is the row: cut off whole, name and all.
     expect(
       scrubText(

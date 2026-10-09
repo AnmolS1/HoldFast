@@ -194,6 +194,9 @@ const NEEDLES = [
   "Zebediah",
   "Quillfeather",
   "SentinelBrowser",
+  // Short values, in the query of a relative URL: nothing about their shape gives them away.
+  "qZ7x",
+  "Zeb9",
 ];
 
 function serialise(value: unknown, depth = 0): string {
@@ -253,7 +256,7 @@ function hostileError(): Error {
   });
   return Object.assign(
     new Error(
-      `Failed query for ${S.email} at ${S.resetUrl} with ${S.token}\nparams: ${S.name},${S.password}`,
+      `Failed query for ${S.email} at ${S.resetUrl} with ${S.token} via /api/auth/callback/google?state=qZ7x&n=Zeb9\nparams: ${S.name},${S.password}`,
       {
         cause: pg,
       },
@@ -404,7 +407,7 @@ describe("sentinel secrets in a request never reach a sink", () => {
     const [reported, tags] = vi.mocked(sentry.captureError).mock.calls[0]!;
     expect(tags).toEqual({ kind: "auth_handler" });
     expect((reported as Error).message).toBe(
-      "Failed query for [email] at [url] with [token]\nparams: [dropped]",
+      "Failed query for [email] at [url] with [token] via /api/auth/callback/google?[query]\nparams: [dropped]",
     );
     expect(Object.keys(reported as Error)).toEqual([]);
     expect((reported as Error).cause).toBeUndefined();

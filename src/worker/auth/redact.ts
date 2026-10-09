@@ -38,6 +38,8 @@ const IPV4 = /\b(?:\d{1,3}\.){3}\d{1,3}\b/g;
 const IPV6 = /(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])/gi;
 
 const QUERY_PARAMS = /\bparams:[\s\S]*$/i;
+// A path, then `?` and at least one `key=`: its query and fragment, up to the next space or quote.
+const RELATIVE_QUERY = /((?:^|[\s"'(=])\/[^\s"'<>?#]*)\?[^\s"'<>=]*=[^\s"'<>]*/g;
 
 const isWordLike = (run: string) => /^[A-Z_]+$/.test(run) || /^[a-z_-]+$/.test(run);
 
@@ -60,7 +62,12 @@ export function scrubText(text: string): string {
   // A query's parameters are the row itself — names, hashes, tokens, in no recognisable shape.
   // Drizzle puts them in the MESSAGE of the error it wraps a failed query in ("Failed query: …
   // params: a,b,c"), so everything after that word goes, unread.
-  const withoutParams = text.slice(0, 4 * MAX_TEXT).replace(QUERY_PARAMS, "params: [dropped]");
+  // The query (and fragment) of a relative URL goes whole too: the shared rules know three
+  // parameters by name, and a short `state` or a name in a redirect has no shape to scan for.
+  const withoutParams = text
+    .slice(0, 4 * MAX_TEXT)
+    .replace(QUERY_PARAMS, "params: [dropped]")
+    .replace(RELATIVE_QUERY, "$1?[query]");
   // Whole URLs first: the shared rules rewrite parts of a URL, and what they leave would no
   // longer read as one.
   const scanned = redactText(withoutParams.replace(ABSOLUTE_URL, "[url]"))
