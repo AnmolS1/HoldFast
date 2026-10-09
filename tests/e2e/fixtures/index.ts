@@ -14,11 +14,14 @@ export interface HarnessFixtures {
   /** This checkout's two origins, e.g. http://localhost:5173 and http://files.localhost:5173. */
   origins: { app: string; files: string; port: number };
   /**
-   * The client address this test's browser is seen as. Automatic: every test is its own client.
-   * The Worker rate-limits by client IP (`cf-connecting-ip`, which Cloudflare sets at the edge and
-   * a local server takes from the request). Without this every test would share 127.0.0.1 and
-   * one bucket — and the auth limiter (20 requests a minute per IP, session reads included) runs
-   * out part-way through a run, failing whichever unmocked test comes next.
+   * A client address of this test's own, for the browser's requests to the app origin. NOT
+   * automatic: a test (or a fixture built on this one) asks for it by naming `clientIp`.
+   * The Worker rate-limits by client address (`cf-connecting-ip`, which Cloudflare sets at the
+   * edge and a local server takes from the request); without this a test is 127.0.0.1 like every
+   * other. That shared address is the default on purpose — the suite then exercises the limits
+   * the way one busy network would, and it is how the session read spending the sign-in limit
+   * was found. Ask for an address only where a test must not share a bucket: one that signs in
+   * (20 auth writes a minute per address) or that exhausts a limit deliberately.
    */
   clientIp: string;
 }
@@ -53,7 +56,7 @@ export const test = base.extend<HarnessFixtures>({
       );
       await use(ip);
     },
-    { auto: true },
+    { auto: false },
   ],
   // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring pattern.
   origins: async ({}, use) => {

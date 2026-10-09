@@ -85,6 +85,27 @@ test.describe("fixtures", () => {
     expect(credentials[0]).toMatchObject({ isResidentCredential: true, rpId: "localhost" });
   });
 
+  test("clientIp gives the browser an address of its own for the rate limits", async ({
+    page,
+    request,
+    clientIp,
+  }) => {
+    expect(clientIp).toMatch(/^10\.\d+\.\d+\.\d+$/);
+    await page.goto("/login");
+    // Empty the auth bucket of the browser's address (20 a minute) from inside the page.
+    const refusedAfter = await page.evaluate(async () => {
+      for (let attempt = 1; attempt <= 41; attempt++) {
+        const answer = await fetch("/api/auth/sign-in/email", { method: "POST", body: "{}" });
+        if (answer.status === 429) return attempt;
+      }
+      return 0;
+    });
+    expect(refusedAfter).toBeGreaterThanOrEqual(21);
+    // A client without the fixture is 127.0.0.1 — another bucket, so its attempt is not refused.
+    const other = await request.post("/api/auth/sign-in/email", { data: {} });
+    expect(other.status()).toBe(404);
+  });
+
   test("axe finds no violations on the shell", async ({ page }) => {
     await stubTurnstile(page);
     await page.goto("/");
