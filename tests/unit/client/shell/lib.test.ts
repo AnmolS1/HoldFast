@@ -22,14 +22,11 @@ import {
   SHORTCUTS,
 } from "../../../../src/client/lib/shortcuts";
 
-// The shared redaction is a stub that throws until the worker-core task fills it in.
-vi.mock("../../../../src/shared/sentry-redact", () => ({
-  redactUrl: (url: string) => url.replace(/\/(s|d|i|t)\/[^/?#]+/g, "/$1/[redacted]"),
-  redactEvent: vi.fn(
-    <T>(event: T): T =>
-      JSON.parse(JSON.stringify(event).replace(/\/(s|d|i|t)\/[^/?#"]+/g, "/$1/[redacted]")) as T,
-  ),
-}));
+// The real shared redaction, wrapped in a spy only so one test can make it throw.
+vi.mock("../../../../src/shared/sentry-redact", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../../src/shared/sentry-redact")>();
+  return { ...actual, redactEvent: vi.fn(actual.redactEvent) };
+});
 
 describe("formatBytes", () => {
   it.each([
@@ -234,8 +231,22 @@ describe("sentry", () => {
     expect(options.beforeSend({ request: { url: "https://app.test/s/SECRETTOKEN" } })).toEqual({
       request: { url: "https://app.test/s/[redacted]" },
     });
+    // Everything after the marker segment goes: the node id, the size and the bearer token.
     expect(options.beforeBreadcrumb({ data: { url: "https://files.test/t/n1/320/BEARER" } })).toEqual({
-      data: { url: "https://files.test/t/[redacted]/320/BEARER" },
+      data: { url: "https://files.test/t/[redacted]" },
+    });
+    // What the real redaction also covers: query tokens, cookies, emails.
+    expect(
+      options.beforeSend({
+        request: {
+          url: "https://app.test/reset-password?token=SECRET",
+          headers: { cookie: "session=SECRET", accept: "text/html" },
+        },
+        message: "mail to ada@example.com failed",
+      }),
+    ).toEqual({
+      request: { url: "https://app.test/reset-password?token=[redacted]", headers: { accept: "text/html" } },
+      message: "mail to [email] failed",
     });
     reportError(new Error("x"), { where: "test" });
     expect(captureException).toHaveBeenCalledTimes(1);
@@ -244,7 +255,7 @@ describe("sentry", () => {
   it("when redaction throws the item is dropped, never sent raw", async () => {
     const redact = await import("../../../../src/shared/sentry-redact");
     vi.mocked(redact.redactEvent).mockImplementationOnce(() => {
-      throw new Error("not implemented: T07");
+      throw new Error("redaction failed");
     });
     expect(redactOrDrop({ request: { url: "https://app.test/s/SECRET" } })).toBeNull();
   });

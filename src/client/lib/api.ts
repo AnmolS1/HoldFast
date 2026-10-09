@@ -6,10 +6,17 @@
 // needs through `configureApi`, which keeps the import graph acyclic.
 import type { ZodType } from "zod";
 import { toast } from "../components/Toaster/store";
-import type { ErrorCode, ErrorEnvelope } from "./contracts";
+import { INTERNAL_ERROR, isErrorCode, type ErrorCode } from "./contracts";
 import { t } from "./i18n";
 
-export type ApiErrorCode = ErrorCode | "network" | "invalid_response" | "http_error";
+/**
+ * `ErrorCode` is what the server's table can answer. The rest are the client's own:
+ *  - `internal`          the server's 500 envelope (`{ error: "internal" }`) — deliberately outside the table
+ *  - `network`           the request never got an answer
+ *  - `invalid_response`  a 2xx whose body is not what the schema says
+ *  - `http_error`        a failure with no envelope, or with a code this build does not know
+ */
+export type ApiErrorCode = ErrorCode | typeof INTERNAL_ERROR | "network" | "invalid_response" | "http_error";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -253,10 +260,15 @@ function parseRetryAfter(value: string | null): number | undefined {
   return Math.max(0, Math.ceil((date - Date.now()) / 1000));
 }
 
-function isEnvelope(value: unknown): value is ErrorEnvelope {
-  if (!value || typeof value !== "object") return false;
-  const v = value as Record<string, unknown>;
-  return typeof v.error === "string" && typeof v.message === "string";
+/** Anything shaped like the server's envelope; `error` is not yet known to be a code we know. */
+type RawEnvelope = { error: string; message: string; requestId?: unknown; details?: unknown };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isEnvelope(value: unknown): value is RawEnvelope {
+  return isRecord(value) && typeof value.error === "string" && typeof value.message === "string";
 }
 
 async function toApiError(response: Response): Promise<ApiError> {
@@ -267,20 +279,33 @@ async function toApiError(response: Response): Promise<ApiError> {
   } catch {
     body = undefined;
   }
-  if (isEnvelope(body)) {
+  if (!isEnvelope(body)) {
+    return new ApiError({
+      status: response.status,
+      code: "http_error",
+      message: t("toast.generic"),
+      retryAfter,
+    });
+  }
+  // The request id is kept in every case: it is what support uses to find the call.
+  const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+  if (isErrorCode(body.error)) {
     return new ApiError({
       status: response.status,
       code: body.error,
       message: body.message,
-      requestId: typeof body.requestId === "string" ? body.requestId : undefined,
-      details: body.details && typeof body.details === "object" ? body.details : undefined,
+      requestId,
+      details: isRecord(body.details) ? body.details : undefined,
       retryAfter,
     });
   }
+  // An unexpected failure (`500 internal`), or a code newer than this build: a generic failure
+  // in the client's own words — the server's text for these says nothing a user can act on.
   return new ApiError({
     status: response.status,
-    code: "http_error",
+    code: body.error === INTERNAL_ERROR ? INTERNAL_ERROR : "http_error",
     message: t("toast.generic"),
+    requestId,
     retryAfter,
   });
 }

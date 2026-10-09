@@ -10,6 +10,7 @@ import {
   configureApi,
   isReauthPending,
   shouldReauth,
+  toastApiError,
   type ReauthInput,
   type RouteInfo,
 } from "../../../../src/client/lib/api";
@@ -228,6 +229,38 @@ describe("other statuses", () => {
       message: "conflict message",
       requestId: "req-1234",
       details: { name: "taken" },
+    });
+  });
+
+  it("500 internal (outside the code table) → a generic failure that keeps the request id", async () => {
+    // Exactly what the Worker's onError answers for an unexpected failure.
+    mockFetch(() => json({ error: "internal", message: "Something went wrong.", requestId: "req-500" }, 500));
+    const error = await api("/api/nodes").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 500,
+      code: "internal",
+      message: "Something went wrong. Try again.",
+      requestId: "req-500",
+      details: undefined,
+    });
+    expect(isReauthPending()).toBe(false);
+    expect(navigated).toEqual([]);
+    toastApiError(error);
+    expect(getToasts().map(({ message, requestId }) => ({ message, requestId }))).toEqual([
+      { message: "Something went wrong. Try again.", requestId: "req-500" },
+    ]);
+  });
+
+  it("a code this build does not know is an http_error, never passed off as a known code", async () => {
+    mockFetch(() => envelope("teapot", 418, { reason: "account_suspended" }));
+    const error = await api("/api/nodes").catch((e: unknown) => e);
+    expect(error).toMatchObject({
+      status: 418,
+      code: "http_error",
+      message: "Something went wrong. Try again.",
+      requestId: "req-1234",
+      details: undefined,
     });
   });
 

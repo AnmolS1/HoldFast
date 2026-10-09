@@ -3,8 +3,8 @@
 import { z } from "zod";
 
 export { PublicConfig } from "../../shared/public-config";
-export { ERROR_STATUS } from "../../shared/errors";
-export type { ErrorCode, ErrorEnvelope } from "../../shared/errors";
+export { ERROR_STATUS, INTERNAL_ERROR, isErrorCode } from "../../shared/errors";
+export type { ErrorCode, ErrorEnvelope, InternalErrorEnvelope } from "../../shared/errors";
 
 /** The user fields the shell reads from the session. Dates arrive as ISO strings in the browser. */
 export const SessionUserShape = z.object({
