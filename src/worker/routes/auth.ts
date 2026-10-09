@@ -2,7 +2,8 @@
 //
 // IN FRONT of this route the pipeline has already: resolved the session (middleware/session.ts —
 // which also applies the allow-list for suspended, deleted and impersonated sessions,
-// auth/endpoint-policy.ts), and applied RL_AUTH to every non-GET request. Better Auth then runs
+// auth/endpoint-policy.ts), refused every (method, path) that is not an endpoint of the handler,
+// and applied RL_AUTH to the credential-bearing POSTs (middleware/rate-limit.ts). Better Auth then runs
 // its own origin check, its own rate limit (the `rate_limit` table) and the Turnstile check.
 //
 // THIS ROUTE adds four things around `auth.handler()`:
@@ -18,16 +19,17 @@
 //   4. the audit rows, the auth metric and the security emails (auth/audit.ts), from the
 //      finished response.
 
+import { requestMethod, requestPath } from "../middleware/canonical";
 import { Hono } from "hono";
 import { INTERNAL_ERROR } from "../../shared/errors";
 import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath, recordAdminDenial } from "../auth/admin-gate";
 import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
-import { AUTH_PREFIX } from "../auth/endpoint-policy";
+import { AUTH_PREFIX, isAuthEndpoint } from "../auth/endpoint-policy";
 import { CHANGE_EMAIL_UNAVAILABLE } from "../auth/mailbox-proof";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
 import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
-import { hashGuard, preflight } from "../auth/preflight";
+import { preflight } from "../auth/preflight";
 import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { isUniqueViolation } from "../db/errors";
 import { AppError } from "../services/errors";
@@ -76,9 +78,10 @@ router.all(
   guard("auth", async (c) => {
     const instance = auth(c);
     const scope = scopeOf(instance);
-    // The path exactly as it was sent (Hono's `c.req.path` is percent-decoded).
-    const relativePath = new URL(c.req.url).pathname.slice(AUTH_PREFIX.length);
-    const method = c.req.method;
+    // The canonical path and method (middleware/canonical.ts): what every layer in front of this
+    // route decided on, and — being canonical — exactly what Better Auth's router will read.
+    const relativePath = requestPath(c).slice(AUTH_PREFIX.length);
+    const method = requestMethod(c);
 
     // 1. The admin plugin: by raw path, before Better Auth routes anything.
     if (isAdminPluginPath(relativePath) && !ALLOWED_ADMIN.includes(relativePath)) {
@@ -87,6 +90,11 @@ router.all(
         reason: "admin_endpoint_denied",
       });
     }
+
+    // 1b. Only an exact (method, path) of the installed handler goes on (the pipeline has already
+    // refused the rest — middleware/rate-limit.ts; this is the same rule for the admin paths it
+    // lets through to the refusal above, and for a caller that mounts this route alone).
+    if (!isAuthEndpoint(method, relativePath)) throw new AppError("not_found");
 
     // 2. What the hooks need from the request.
     const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
@@ -100,11 +108,10 @@ router.all(
     }
     const request = withClientAddress(c.req.raw, c.get("ip"));
 
-    // (a) Free refusals, then (b) the global guard — before Better Auth, the database or a hash
-    // is touched for this request (auth/preflight.ts). `RL_AUTH` has already run in the pipeline.
-    const checked = await preflight(relativePath, request);
+    // (a) Free refusals — before Better Auth, the database or a hash is touched for this request
+    // (auth/preflight.ts). `RL_AUTH` has already run in the pipeline, for its own table of pairs.
+    const checked = await preflight(method, relativePath, request);
     if (checked.refusal) return c.json(checked.refusal.body, checked.refusal.status);
-    await hashGuard(c.env, relativePath);
     // The one body the audit step needs (a failed sign-in names the account it tried).
     const body = relativePath === "/sign-in/email" ? checked.body : null;
 
@@ -148,7 +155,8 @@ router.all(
       // work: one that Better Auth's own limiter or the captcha turned away is not padded (it
       // would be work to be had for nothing). `hooks.before` sets the endpoint once it runs.
       if (method === "GET" && relativePath === "/verify-email") response = genericLinkError(response);
-      const reached = scope !== null && scope.facts.endpointPath !== null;
+      // … and not one the sign-in throttle turned away (its answer depends on the request alone).
+      const reached = scope !== null && scope.facts.endpointPath !== null && !scope.facts.throttled;
       const budget = linkFailed(relativePath, response) ? LINK_ERROR_BUDGET : STATEMENT_BUDGET[relativePath];
       if (reached && budget !== undefined) await padStatements(db(c), budget);
 

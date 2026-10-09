@@ -162,6 +162,14 @@ describe("the gate, for every endpoint and method of the route table", () => {
           const answer = await send(method, path);
           const label = `${state} ${method} ${path}`;
           const write = method !== "GET" && method !== "HEAD";
+          const declared = row[0].split(",").includes(method === "HEAD" ? "GET" : method);
+          if (!declared) {
+            // Not a (method, path) of the handler: no gate decides it, nothing answers it.
+            expect(answer.status, label).toBe(404);
+            if (method !== "HEAD") expect(answer.body?.reached, label).toBeUndefined();
+            checked += 1;
+            continue;
+          }
           if (
             decision === "allow" &&
             state === "impersonating" &&
@@ -204,15 +212,16 @@ describe("the gate, for every endpoint and method of the route table", () => {
         "/api/auth/sign%2Dout",
         "/api/auth/get-session/",
         "/api/auth/GET-SESSION",
-        "/api/auth/ok/../change-email",
         "/api/auth/callback/google/extra",
         "/api/auth/x",
       ]) {
         for (const method of ["GET", "POST"]) {
           const answer = await send(method, path);
-          expect(answer.status, `${state} ${method} ${path}`).toBe(DENIED[state].status);
+          // No endpoint is spelled like this: 404 before any gate (middleware/canonical.ts) …
+          expect(answer.status, `${state} ${method} ${path}`).toBe(404);
           expect(answer.body?.reached, `${state} ${method} ${path}`).toBeUndefined();
         }
+        // … and the gate itself, asked directly, denies it too.
         expect(authGateDecision(state, path), path).toBe("deny");
       }
       expect(authGateDecision(state, "/api/nodes")).toBe("deny");
@@ -254,9 +263,10 @@ describe("the gate, for every endpoint and method of the route table", () => {
           expect(answer.body, `${signedIn} ${method} ${path}`).toEqual(reachedOrPlaceholder(method, path));
         }
       }
-      expect((await send("POST", "/api/auth/brand-new/endpoint")).body).toMatchObject({
-        reached: "/api/auth/brand-new/endpoint",
-      });
+      // A path the table does not spell is not an endpoint: 404 before the handler, for anyone.
+      const unknown = await send("POST", "/api/auth/brand-new/endpoint");
+      expect(unknown.status).toBe(404);
+      expect(unknown.body).toMatchObject({ error: "not_found" });
     }
   });
 

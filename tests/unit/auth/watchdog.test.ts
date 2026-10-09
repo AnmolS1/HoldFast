@@ -136,7 +136,7 @@ describe("the #10315 watchdog", () => {
         handler: async () => new Response("answered", { status: 418, headers: { "x-from": "auth" } }),
       }),
     });
-    const response = await request(app, "/api/auth/anything");
+    const response = await request(app, "/api/auth/ok");
     expect(response.status).toBe(418);
     expect(response.headers.get("x-from")).toBe("auth");
     expect(await response.text()).toBe("answered");

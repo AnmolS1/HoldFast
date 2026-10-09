@@ -782,7 +782,10 @@ describe("'remember this device' does not outlive the password (A8)", () => {
     const link = linkIn(await waitForMail(made.email, "passwordReset"));
     const token = /reset-password\/([^?/]+)/.exec(link)![1]!;
     const newPassword = "after the reset, another 4!";
-    const reset = await send(newClient(), "/api/auth/reset-password", { json: { newPassword, token } });
+    const reset = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
+      json: { newPassword, token },
+    });
     expect(reset.status, reset.text).toBe(200);
     expect(await trustRows(made.user.id)).toEqual([]);
     // Whoever holds the old trust cookie and the NEW password is still asked for the code.

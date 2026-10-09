@@ -27,12 +27,18 @@
 // on the server, per sign-up: the cookie's own number must agree with it, so an older copy of the
 // cookie (a replay) is refused and cannot start the count again.
 //
+// THE ORDER (auth/preflight.ts): what costs nothing first — the cookie's signature, the captcha
+// header's presence, the body's shape; then RL_AUTH for the caller's address; then the Turnstile
+// token, verified once (auth/captcha.ts — this is our route, Better Auth's plugin never sees it);
+// and only then anything in the database, the MX lookup, or a mail.
+//
 // Paths are relative to /api. The pipeline applies CSRF; RL_AUTH is applied here.
 
 import { generateId } from "@better-auth/core/utils/id";
 import { createEmailVerificationToken } from "better-auth/api";
 import { Hono } from "hono";
 import { z } from "zod";
+import { captchaToken, verifyCaptcha } from "../auth/captcha";
 import { scopeOf, VERIFICATION_EXPIRES_IN_S } from "../auth/create-auth";
 import { afterAnswer, type AuthScope } from "../auth/scope";
 import {
@@ -83,8 +89,6 @@ router.patch(
     }
 
     async function answer(scope: AuthScope): Promise<Response> {
-      await enforceRateLimit(c.env, "RL_AUTH", ipKey(c.get("ip")));
-
       const at = now(c);
       const sessionUser = c.get("user");
       const pending = await readPending(c.env, scope.keys, c.req.header("cookie"), at);
@@ -98,6 +102,14 @@ router.patch(
         throw new AppError("forbidden", "Sign up again to change the address.", {
           reason: "no_pending_signup",
         });
+      const token = captchaToken(c.req.raw);
+      const newEmail = Body.parse(await jsonBody(c))
+        .email.trim()
+        .toLowerCase();
+      // The caller's own budget, then the challenge — and only then the database.
+      await enforceRateLimit(c.env, "RL_AUTH", ipKey(c.get("ip")));
+      await verifyCaptcha(c.env, token, c.get("ip"));
+
       // The count of changes is the SERVER's (db/queries/auth-lifecycle.ts). A cookie that says
       // another number is an older copy being sent again: refused like no cookie at all, before
       // anything is spent or looked up. (It says nothing about any account: it is about the cookie.)
@@ -112,9 +124,6 @@ router.patch(
         throw new AppError("rate_limited", "The address has been changed too many times. Sign up again.");
       }
 
-      const newEmail = Body.parse(await jsonBody(c))
-        .email.trim()
-        .toLowerCase();
       // Checks 4 and 5 of the sign-up policy, on the new address alone.
       const problem = await emailProblem(scope, newEmail);
       if (problem) throw new AppError("validation", SIGNUP_REFUSALS[problem], { reason: problem });

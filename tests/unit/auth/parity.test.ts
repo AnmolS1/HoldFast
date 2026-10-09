@@ -230,7 +230,7 @@ describe("an address that has an account, and one that has none: the same answer
     const lookAlike = newClient({ settings });
     await signUp(lookAlike, { email: taken.email });
     const change = (client: typeof real, email: string) => () =>
-      measured(client, "/api/account/pending-email", { method: "PATCH", json: { email } });
+      measured(client, "/api/account/pending-email", { headers: CAPTCHA, method: "PATCH", json: { email } });
     const outlines = await expectAlike([
       ["the account moves", change(real, freshEmail())],
       ["a look-alike sign-up (nothing to move)", change(lookAlike, freshEmail())],
@@ -295,7 +295,7 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
     const choose =
       (token: string, newPassword = "a perfectly fine password 3!") =>
       () =>
-        measured(newClient(), "/api/auth/reset-password", { json: { newPassword, token } });
+        measured(newClient(), "/api/auth/reset-password", { headers: CAPTCHA, json: { newPassword, token } });
     // The first use works (and is the measure of the round trips a VALID token costs).
     const worked = await outline(choose(used));
     expect(worked).toMatchObject({ status: 200, scrypt: 1 });
@@ -402,7 +402,7 @@ describe("what depends only on the input is refused first — at the same stage 
       linkIn(await waitForMail(owner.email, "passwordReset")),
     )![1]!;
     const choose = (token: string, newPassword: string) => () =>
-      measured(newClient(), "/api/auth/reset-password", { json: { newPassword, token } });
+      measured(newClient(), "/api/auth/reset-password", { headers: CAPTCHA, json: { newPassword, token } });
     for (const [what, password, code] of [
       ["short", "short-1", "PASSWORD_TOO_SHORT"],
       ["breached", BREACHED_TEST_PASSWORDS[0], "PASSWORD_COMPROMISED"],

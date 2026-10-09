@@ -162,6 +162,8 @@ function PasswordLinkPage({ copy }: { copy: PasswordLinkCopy }) {
   const [params] = useSearchParams();
   const token = useLinkToken();
   const linkError = params.get("error");
+  const config = usePublicConfig().data;
+  const turnstile = useTurnstile(config?.turnstileSiteKey);
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -178,8 +180,20 @@ function PasswordLinkPage({ copy }: { copy: PasswordLinkCopy }) {
       setError(t("signup.error.passwordLong"));
       return;
     }
+    if (config?.turnstileSiteKey && !turnstile.token) {
+      setError(t(turnstile.status === "error" ? "auth.humanFailed" : "auth.humanWait"));
+      return;
+    }
     setBusy(true);
-    const result = await callAuth(() => authClient.resetPassword({ newPassword: password, token }));
+    const result = await callAuth(() =>
+      authClient.resetPassword({
+        newPassword: password,
+        token,
+        fetchOptions: captchaOptions(turnstile.token),
+      }),
+    );
+    // A token is single-use, whatever the answer was.
+    turnstile.reset();
     setBusy(false);
     if (result.error) {
       if (result.error.code === "PASSWORD_COMPROMISED") setError(t("signup.password.breached"));
@@ -212,6 +226,7 @@ function PasswordLinkPage({ copy }: { copy: PasswordLinkCopy }) {
             help={t("signup.password.help")}
             errorText={error ?? undefined}
           />
+          {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
           <Button type="submit" variant="contained" size="large" disabled={busy}>
             {t(copy.submit)}
           </Button>

@@ -11,6 +11,7 @@
 // Minting content access is a GET in places (download URLs), so those routes call
 // `forbidImpersonation(c)` themselves (through the permissions service).
 
+import { requestMethod, requestPath } from "./canonical";
 import type { Context, MiddlewareHandler } from "hono";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
@@ -34,7 +35,7 @@ export function forbidImpersonation(c: Context<AppEnv>): void {
 }
 
 export const impersonationReadOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
-  if (!c.get("impersonating") || SAFE_METHODS.has(c.req.method)) return next();
-  if (IMPERSONATION_EXEMPT_PATHS.includes(c.req.path)) return next();
+  if (!c.get("impersonating") || SAFE_METHODS.has(requestMethod(c))) return next();
+  if (IMPERSONATION_EXEMPT_PATHS.includes(requestPath(c))) return next();
   refuse();
 };

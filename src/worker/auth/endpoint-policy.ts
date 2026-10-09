@@ -132,3 +132,31 @@ export function authGateDecision(state: AuthGateState, path: string): AuthGateDe
   const found = MATCHERS.find((entry) => entry.test.test(relative));
   return found ? found.row[COLUMN[state]] : "deny";
 }
+
+/**
+ * Is this exact (method, path) an endpoint of the auth handler? `relative` is the path as it was
+ * SENT, after `/api/auth` — no decoding, no case folding, no trailing slash. Anything else is not
+ * routed, not counted by a limiter and not looked at by a preflight (middleware/rate-limit.ts).
+ * (A HEAD is a GET without the body.)
+ */
+export function isAuthEndpoint(method: string, relative: string): boolean {
+  const asked = method === "HEAD" ? "GET" : method;
+  return MATCHERS.some((entry) => entry.row[0].split(",").includes(asked) && entry.test.test(relative));
+}
+
+/** Is this exact path an endpoint of the auth handler, under any method? */
+export function isAuthPath(relative: string): boolean {
+  return MATCHERS.some((entry) => entry.test.test(relative));
+}
+
+/** POSTs that carry no credential and change nothing a stranger could abuse: never counted. */
+const UNCOUNTED_POSTS: ReadonlySet<string> = new Set(["/sign-out", "/get-session"]);
+
+/**
+ * Does this exact (method, path) spend the caller's auth budget (`RL_AUTH`)? Only the POST
+ * endpoints of the table — the requests that carry or test a credential. A GET, a HEAD, an
+ * OPTIONS, a path the table does not spell: never.
+ */
+export function spendsAuthBudget(method: string, relative: string): boolean {
+  return method === "POST" && !UNCOUNTED_POSTS.has(relative) && isAuthEndpoint(method, relative);
+}

@@ -50,6 +50,7 @@ import {
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
 import { BREACH_PATHS, refuseBreachedPassword } from "./breach-check";
+import { afterSignIn, beforeSignIn, SIGN_IN_PATH } from "./signin-throttle";
 import { afterChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
@@ -483,6 +484,7 @@ export function buildHooks(scope: AuthScope) {
       const body = await beforeSecondFactor(scope, ctx);
       if (body) return { context: { body } };
     }
+    if (path === SIGN_IN_PATH && ctx.request) await beforeSignIn(scope, ctx);
     if (path === "/sign-up/email" && ctx.request) {
       // The cheap refusals first — before the password is hashed and looked up in the breach
       // corpus. They depend only on what was submitted, never on whether the address has an
@@ -518,6 +520,10 @@ export function buildHooks(scope: AuthScope) {
     const path = ctx.path;
     if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
       await afterSecondFactor(scope, ctx);
+      return;
+    }
+    if (path === SIGN_IN_PATH && ctx.request) {
+      await afterSignIn(scope, ctx);
       return;
     }
     if (path === "/change-email" && ctx.request) {

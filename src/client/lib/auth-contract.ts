@@ -70,7 +70,11 @@ export interface AuthClientContract {
     redirectTo?: string;
     fetchOptions?: AuthFetchOptions;
   }): Promise<AuthResult>;
-  resetPassword(input: { newPassword: string; token: string }): Promise<AuthResult>;
+  resetPassword(input: {
+    newPassword: string;
+    token: string;
+    fetchOptions?: AuthFetchOptions;
+  }): Promise<AuthResult>;
   twoFactor: {
     verifyTotp(input: { code: string; trustDevice?: boolean }): Promise<AuthResult>;
     verifyBackupCode(input: { code: string; trustDevice?: boolean }): Promise<AuthResult>;

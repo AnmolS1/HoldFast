@@ -4,6 +4,7 @@
 // A route is added by replacing a placeholder under routes/ (see routes/index.ts) — never by
 // editing this file. The order of the pipeline below is load-bearing and asserted by a test.
 
+import { canonicalRequest } from "./middleware/canonical";
 import { Hono, type MiddlewareHandler } from "hono";
 import { metaResponse } from "./meta";
 import { cookieGuard } from "./middleware/cookie-guard";
@@ -24,6 +25,7 @@ export type PipelineStep = { name: string; path: string; handler: MiddlewareHand
 
 /**
  * The middleware of the app host, in order. `createApp` mounts exactly this list.
+ *  0 canonicalRequest        ONE reading of the path and the method; anything else is a 404
  *  1 requestContext          per-request context; closes the pool after deferred work
  *  2 securityHeaders         the header set of every response
  *  3 csrf                    cross-site state changes → 403
@@ -35,6 +37,7 @@ export type PipelineStep = { name: string; path: string; handler: MiddlewareHand
  */
 export function buildPipeline(core: CoreDeps): PipelineStep[] {
   return [
+    { name: "canonicalRequest", path: "*", handler: canonicalRequest("app") },
     { name: "requestContext", path: "*", handler: requestContext(core) },
     { name: "securityHeaders", path: "*", handler: securityHeaders },
     { name: "csrf", path: "/api/*", handler: csrf },

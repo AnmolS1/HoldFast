@@ -358,6 +358,7 @@ describe("an account whose deletion date has passed", () => {
         const follow = await send(newClient(), linkIn(reset));
         const token = new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!;
         await send(newClient(), "/api/auth/reset-password", {
+          headers: CAPTCHA,
           json: { newPassword: "a brand new password 2026!", token },
         });
         expect((await signIn(newClient(), email, "a brand new password 2026!")).status).toBe(401);
@@ -457,6 +458,7 @@ describe("a password reset", () => {
     expect(landing.pathname).toBe("/reset-password");
     const token = landing.searchParams.get("token")!;
     const done = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "a brand new password 2026!", token },
     });
     expect(done.status, done.text).toBe(200);
@@ -471,6 +473,7 @@ describe("a password reset", () => {
     expect((await signIn(newClient(), email, "a brand new password 2026!")).status).toBe(200);
     // The token is single-use.
     const reuse = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "yet another password 2026!", token },
     });
     expect(reuse.status).toBe(400);

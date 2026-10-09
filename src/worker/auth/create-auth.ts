@@ -50,12 +50,18 @@ export const VERIFICATION_EXPIRES_IN_S = VERIFY_LINK_EXPIRES_IN_S;
 
 export { PASSWORD_COMPROMISED_MESSAGE } from "./breach-check";
 
-/** Endpoints that need a Turnstile token (`x-captcha-response`). */
+/**
+ * Endpoints that need a valid Turnstile token (`x-captcha-response`) — every unauthenticated
+ * endpoint that hashes a password or does work that depends on an account. The plugin verifies
+ * it in `onRequest` (better-auth/dist/plugins/captcha/index.mjs:22, called from api/index.mjs:174
+ * — after the per-address limiter at :172, before the endpoint and its hooks).
+ */
 export const CAPTCHA_ENDPOINTS = [
   "/sign-up/email",
   "/sign-in/email",
   "/request-password-reset",
   "/send-verification-email",
+  "/reset-password",
 ];
 
 /** Does a verification token change an address (rather than verify a new account's)? */
@@ -269,7 +275,8 @@ export function buildAuthOptions(scope: AuthScope) {
           const localDeps: ServiceDeps = { db, env, defer: (promise) => void local.push(promise) };
           await scheduleDeletion(localDeps, user.id);
           while (local.length) await Promise.allSettled(local.splice(0));
-          if (request && new URL(request.url).pathname.endsWith("/delete-user/callback")) {
+          // The endpoint the request reached, as Better Auth matched it (hooks.before records it).
+          if (request && scope.facts.endpointPath === "/delete-user/callback") {
             throw new APIError("FOUND", undefined, {
               Location: `${env.APP_ORIGIN}/account?deletion=scheduled`,
             });

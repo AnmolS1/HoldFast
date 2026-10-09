@@ -7,6 +7,7 @@ import { PENDING_EMAIL_MIN_MS } from "../../../src/worker/routes/pending-email";
 import { createKeys } from "../../../src/worker/services/keys";
 import { testVars } from "../../setup/test-vars";
 import {
+  CAPTCHA,
   auditRows,
   freshEmail,
   getSession,
@@ -24,7 +25,12 @@ import {
 
 const keys = createKeys(testVars.FILES_TOKEN_SECRET);
 const change = (client: Client, email: unknown, options: Parameters<typeof send>[2] = {}) =>
-  send(client, "/api/account/pending-email", { method: "PATCH", json: { email }, ...options });
+  send(client, "/api/account/pending-email", {
+    headers: CAPTCHA,
+    method: "PATCH",
+    json: { email },
+    ...options,
+  });
 
 describe("the pending-sign-up cookie", () => {
   it("is set by a successful sign-up: signed, HttpOnly, SameSite=Lax, one hour, Path=/ (two routes read it)", async () => {

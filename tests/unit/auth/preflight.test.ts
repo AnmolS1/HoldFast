@@ -7,14 +7,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { STATEMENT_BUDGET } from "../../../src/worker/auth/parity";
 import * as passwordWork from "../../../src/worker/auth/password";
-import { HASH_PATHS, MAX_BODY_BYTES, PREFLIGHT } from "../../../src/worker/auth/preflight";
+import { MAX_BODY_BYTES, PREFLIGHT } from "../../../src/worker/auth/preflight";
+import { testOutbound } from "../../../src/worker/auth/test-outbound";
 import {
   CAPTCHA,
   freshEmail,
   measured,
   newClient,
   PASSWORD,
+  send,
+  signUp,
   verifiedUser,
+  type Client,
   type Measured,
   type SendOptions,
 } from "./helpers";
@@ -245,9 +249,6 @@ describe("stage (a): free refusals — no database, no hash, nothing echoed", ()
       expect(PREFLIGHT[path], path).toBeDefined();
       expect(STATEMENT_BUDGET[path], path).toBeGreaterThan(0);
     }
-    for (const path of ["/sign-up/email", "/sign-in/email", "/reset-password", "/change-password"]) {
-      expect(HASH_PATHS.has(path), path).toBe(true);
-    }
   });
 });
 
@@ -289,47 +290,155 @@ describe("stages (b) and (c): the limiters and the captcha come before the work"
     expect(done.scrypt).toBe(0);
   });
 
-  it("the global guard: when all clients together are over the limit for hashing endpoints, a new one is refused — and only on those endpoints", async () => {
-    const seen: string[] = [];
-    const guard = {
+  // There is NO counter shared between clients (one was here, and was withdrawn: whoever filled
+  // it locked everybody out of sign-in). Every limiter key is one client's own.
+  it("one client that has used up its budget changes nothing for another client", async () => {
+    const keys: string[] = [];
+    const noisy = newClient();
+    // The binding, standing in: the noisy client's own key is over its limit, nobody else's is.
+    const limiter = {
       limit: async ({ key }: { key: string }) => {
-        seen.push(key);
-        return { success: key !== "global:auth-hash" };
+        keys.push(key);
+        return { success: !key.endsWith(noisy.ip) };
       },
     };
-    const done = await cost(() =>
-      measured(newClient(), "/api/auth/sign-in/email", { ...signIn(freshEmail()), env: { RL_API: guard } }),
-    );
-    expect(done.sent.status).toBe(429);
-    expect(done.sent.headers.get("retry-after")).toBe("60");
-    expect(done.statementsTotal).toBe(0);
-    expect(done.scrypt).toBe(0);
-    expect(seen).toContain("global:auth-hash");
-    // An endpoint that hashes nothing is not counted against it.
-    seen.length = 0;
-    const resend = await measured(newClient(), "/api/auth/send-verification-email", {
-      ...json({ email: freshEmail() }),
-      env: { RL_API: guard },
+    const limited = { RL_AUTH: limiter, RL_API: limiter };
+    const owner = await verifiedUser();
+    const refused = await measured(noisy, "/api/auth/sign-in/email", {
+      ...json({ email: owner.email, password: PASSWORD }),
+      env: limited,
     });
-    expect(resend.sent.status).toBe(200);
-    expect(seen).not.toContain("global:auth-hash");
+    expect(refused.sent.status).toBe(429);
+    // The same endpoint, the same account, the same moment — from another address: served.
+    const other = newClient();
+    const served = await measured(other, "/api/auth/sign-in/email", {
+      ...json({ email: owner.email, password: PASSWORD }),
+      env: limited,
+    });
+    expect(served.sent.status, served.sent.text).toBe(200);
+    // Every key that was asked for names exactly one client (an address or a user): none is shared.
+    expect(keys.length).toBeGreaterThanOrEqual(3);
+    for (const key of keys) expect(key).toMatch(/^(ip:\d+\.\d+\.\d+\.\d+|u:[A-Za-z0-9]{32})$/);
+    expect(new Set(keys.filter((key) => key.startsWith("ip:")))).toEqual(
+      new Set([`ip:${noisy.ip}`, `ip:${other.ip}`]),
+    );
   });
 
-  it("a captcha token that does not verify: no hash, and no padding", async () => {
+  it("a GET, a HEAD or an OPTIONS never spends an auth budget — the binding's or Better Auth's own", async () => {
+    const owner = await verifiedUser();
+    const client = newClient();
+    const auth: string[] = [];
+    const counting = { limit: async ({ key }: { key: string }) => (auth.push(key), { success: true }) };
+    // Better Auth allows an address 5 sign-in requests a minute, keyed by address and PATH
+    // whatever the method (api/rate-limiter/index.mjs:247). Thirty reads of that path first:
+    for (let n = 0; n < 10; n++) {
+      for (const method of ["GET", "HEAD", "OPTIONS"]) {
+        const read = await measured(client, "/api/auth/sign-in/email", {
+          method,
+          env: { RL_AUTH: counting },
+        });
+        expect(read.sent.status, method).toBe(404);
+        expect(read.statementsTotal, method).toBe(0);
+      }
+    }
+    expect(auth).toEqual([]);
+    // … and all five attempts are still there.
+    for (let n = 1; n <= 5; n++) {
+      const tried = await send(
+        client,
+        "/api/auth/sign-in/email",
+        json({ email: owner.email, password: PASSWORD }),
+      );
+      expect(tried.status, `attempt ${n}`).toBe(200);
+    }
+  });
+
+  it("the captcha is verified exactly once per request — by the plugin on the handler's endpoints, by the route on ours", async () => {
+    const outbound = testOutbound()!;
+    const verifications = () =>
+      outbound.calls.filter((call) => call.host === "challenges.cloudflare.com").length;
+    const signedUp = newClient();
+    await signUp(signedUp);
+    const cases: Array<[string, Client, SendOptions]> = [
+      ["/api/auth/sign-in/email", newClient(), json({ email: freshEmail(), password: PASSWORD })],
+      ["/api/auth/sign-up/email", newClient(), json({ ...SIGN_UP, email: freshEmail() })],
+      ["/api/auth/request-password-reset", newClient(), json({ email: freshEmail() })],
+      ["/api/auth/send-verification-email", newClient(), json({ email: freshEmail() })],
+      [
+        "/api/auth/reset-password",
+        newClient(),
+        json({ newPassword: PASSWORD, token: "nobody-issued-this-token-00" }),
+      ],
+      ["/api/account/pending-email", signedUp, { ...json({ email: freshEmail() }), method: "PATCH" }],
+    ];
+    for (const [path, client, options] of cases) {
+      const before = verifications();
+      const sent = await send(client, path, options);
+      expect(sent.status, `${path}: ${sent.text}`).not.toBe(403);
+      expect(verifications() - before, path).toBe(1);
+    }
+    // The control: an endpoint that needs no token asks Turnstile nothing.
+    const before = verifications();
+    await send(newClient(), "/api/auth/get-session");
+    expect(verifications()).toBe(before);
+  });
+
+  it("a captcha token that does not verify: no hash, nothing about any account, and no padding", async () => {
     // Cloudflare's published always-FAIL secret.
     const failing = { TURNSTILE_SECRET: "2x0000000000000000000000000000000AA" };
-    for (const [path, body] of [
-      ["/api/auth/sign-in/email", { email: freshEmail(), password: PASSWORD }],
-      ["/api/auth/sign-up/email", { ...SIGN_UP, email: freshEmail() }],
-      ["/api/auth/request-password-reset", { email: freshEmail() }],
-    ] as const) {
-      const done = await cost(() => measured(newClient(), path, { ...json(body), env: failing }));
-      expect(done.sent.status, `${path}: ${done.sent.text}`).toBeGreaterThanOrEqual(400);
-      expect(done.sent.status, path).toBeLessThan(500);
+    const real = await verifiedUser();
+    const pendingClient = newClient();
+    await signUp(pendingClient);
+    const outbound = testOutbound()!;
+    const cases: Array<[string, Client, SendOptions]> = [
+      ["/api/auth/sign-in/email", newClient(), json({ email: real.email, password: PASSWORD })],
+      ["/api/auth/sign-up/email", newClient(), json({ ...SIGN_UP, email: real.email })],
+      ["/api/auth/request-password-reset", newClient(), json({ email: real.email })],
+      ["/api/auth/send-verification-email", newClient(), json({ email: real.email })],
+      [
+        "/api/auth/reset-password",
+        newClient(),
+        json({ newPassword: PASSWORD, token: "nobody-issued-this-token-00" }),
+      ],
+    ];
+    for (const [path, client, options] of cases) {
+      const lookups = outbound.calls.length;
+      const done = await cost(() => measured(client, path, { ...options, env: failing }));
+      expect(done.sent.status, `${path}: ${done.sent.text}`).toBe(403);
       expect(done.scrypt, path).toBe(0);
-      // Not brought up to the endpoint's budget: the padding is for requests that reached the work.
-      expect(done.statementsTotal, path).toBeLessThan(STATEMENT_BUDGET[path.replace("/api/auth", "")]! / 2);
+      expect(done.mails, path).toBe(0);
+      // Only Better Auth's own per-address limiter has been to the database (its row is keyed by
+      // the caller's address and the path: nothing in it depends on an account) — at most the
+      // read and the write of that one row. Not the endpoint's budget: no padding either.
+      expect(done.statementsTotal, path).toBeLessThanOrEqual(3);
+      // … and the only outbound request was the verification itself (no breach or MX lookup).
+      expect(
+        outbound.calls.slice(lookups).map((call) => call.host),
+        path,
+      ).toEqual(["challenges.cloudflare.com"]);
     }
+    // Our own route: refused before ANY statement (its limiter is the binding, not a table).
+    const ours = await cost(() =>
+      measured(pendingClient, "/api/account/pending-email", {
+        ...json({ email: freshEmail() }),
+        method: "PATCH",
+        env: failing,
+      }),
+    );
+    expect(ours.sent.status, ours.sent.text).toBe(403);
+    expect(ours.statementsTotal).toBe(0);
+    expect(ours.scrypt).toBe(0);
+    // … and with no token at all: refused without asking Turnstile either.
+    const asked = outbound.calls.length;
+    const none = await cost(() =>
+      measured(pendingClient, "/api/account/pending-email", {
+        ...json({ email: freshEmail() }, {}),
+        method: "PATCH",
+      }),
+    );
+    expect(none.sent.status).toBe(400);
+    expect(none.statementsTotal).toBe(0);
+    expect(outbound.calls.length).toBe(asked);
   });
 });
 
@@ -341,7 +450,7 @@ describe("stage (d): a well-formed request about nobody costs the endpoint's con
       ["/send-verification-email", json({ email: freshEmail() }), 0],
       [
         "/reset-password",
-        json({ newPassword: "a perfectly fine password 3!", token: "nobody-issued-this-token-00" }, {}),
+        json({ newPassword: "a perfectly fine password 3!", token: "nobody-issued-this-token-00" }),
         0,
       ],
     ];

@@ -178,7 +178,9 @@ describe("every plugin endpoint outside the allow-list", () => {
 
   it("a path that does not exist yet under /admin/ is refused too — by prefix, not by a deny-list", async () => {
     const admin = await admin2fa();
-    for (const path of ["/admin/some-future-endpoint", "/admin", "/admin/", "/admin/ban-user/extra"]) {
+    // (`/admin/` — a trailing slash — is not a path at all: middleware/canonical.ts answers it 404.)
+    expect((await send(admin.client, "/api/auth/admin/", { json: {} })).status).toBe(404);
+    for (const path of ["/admin/some-future-endpoint", "/admin", "/admin/ban-user/extra"]) {
       const sent = await send(admin.client, `/api/auth${path}`, { json: {} });
       expect(sent.status, path).toBe(403);
       expect(sent.body, path).toMatchObject({

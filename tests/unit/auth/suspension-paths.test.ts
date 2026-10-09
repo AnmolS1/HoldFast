@@ -174,6 +174,7 @@ describe("a suspended account cannot start a session", () => {
     const token = /reset-password\/([^?/]+)/.exec(mailed)?.[1] ?? "";
     expect(token).not.toBe("");
     const reset = await send(client, "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "a brand new password 42!", token },
     });
     expect(reset.status, reset.text).toBe(200);
@@ -238,6 +239,7 @@ describe("a suspended account cannot start a session", () => {
     const token =
       /reset-password\/([^?/]+)/.exec(linkIn(await waitForMail(email, "passwordReset")))?.[1] ?? "";
     const reset = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "a brand new password 42!", token },
     });
     expect(reset.status, reset.text).toBe(200);

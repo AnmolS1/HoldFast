@@ -12,45 +12,31 @@
 //       format), and the captcha header present where the endpoint needs one. The answer says
 //       only which FIELDS of the caller's own request are wrong — never a value, never anything
 //       about an account.
-//   (b) THE LIMITERS — `RL_AUTH` (20 a minute per client address, middleware/rate-limit.ts —
-//       it runs in the pipeline, in front of this route), the global guard below for the
-//       endpoints that hash, then Better Auth's own per-address rules.
-//   (c) THE CAPTCHA, verified (Better Auth's plugin, in its `onRequest` — before any endpoint
-//       code, any hook of ours and any password work).
-//   (d) only then the constant-shape section: the sign-up statement and breach check, one
-//       hash, the endpoint's fixed number of statements. `hooks.before` marks the request as
-//       having reached it; only such a request is padded (a refusal at (a)–(c) is not).
+//   (b) THE LIMITERS, each keyed by ONE client: `RL_AUTH` (20 a minute per client address,
+//       middleware/rate-limit.ts — it runs in the pipeline, in front of this route, and only for
+//       the exact (method, path) pairs of its table), then Better Auth's own per-address,
+//       per-path rule (api/index.mjs:172 — before any plugin).
+//   (c) THE CAPTCHA, verified: a valid, single-use Turnstile token, on every endpoint of
+//       CAPTCHA_ENDPOINTS (auth/create-auth.ts) — sign-up, sign-in, the reset request, the
+//       resend, and the step that SETS a password. Better Auth's plugin verifies it in its
+//       `onRequest` (api/index.mjs:174 — after the limiter, before any endpoint code, any hook
+//       of ours and any password work), once per request; nothing here verifies it a second
+//       time (a token is single-use: the second verification would fail). Our own route
+//       PATCH /api/account/pending-email verifies its token itself (auth/captcha.ts).
+//   (d) only then the constant-shape section: the sign-in throttle (auth/signin-throttle.ts),
+//       the sign-up statement and breach check, one hash, the endpoint's fixed number of
+//       statements. `hooks.before` marks the request as having reached it; only such a request
+//       is padded (a refusal at (a)–(c) is not).
 //
-// THE GLOBAL GUARD. Per-address limits do not bound a flood from many addresses, and every
-// request that reaches a hash costs CPU. The endpoints in HASH_PATHS share ONE counter per
-// Cloudflare location — HASH_GUARD_LIMIT a minute (the `RL_API` namespace's limit, under a key
-// of its own) — and are refused `429` beyond it. At ~0.1 s of CPU a hash that is at most about a
-// minute of CPU per minute per location, whatever the number of clients; one request does at
-// most ONE hash (a tenth of a second against a 120 s CPU limit).
-
-import { enforceRateLimit } from "../services/ratelimit";
+// NO GLOBAL COUNTER. A flood from many addresses is bounded by the ORDER above, not by a shared
+// cap: every request that reaches a hash has cost its sender one solved challenge, and one
+// request does at most ONE hash. (A counter shared by all clients was here and was withdrawn:
+// whoever filled it locked everyone out of sign-in.)
 
 export const MAX_BODY_BYTES = 8 * 1024;
 export const PASSWORD_MIN = 12;
 export const PASSWORD_MAX = 128;
 export const EMAIL_MAX = 254;
-
-/** Requests a minute, per location, that may reach a password hash (all clients together). */
-export const HASH_GUARD_LIMIT = 600;
-const HASH_GUARD_KEY = "global:auth-hash";
-
-/** The endpoints (relative to /api/auth) on which a password is hashed or verified. */
-export const HASH_PATHS: ReadonlySet<string> = new Set([
-  "/sign-up/email",
-  "/sign-in/email",
-  "/reset-password",
-  "/change-password",
-  "/verify-password",
-  "/two-factor/enable",
-  "/two-factor/disable",
-  "/two-factor/generate-backup-codes",
-  "/two-factor/get-totp-uri",
-]);
 
 type Rule = (value: unknown) => boolean;
 const text =
@@ -95,6 +81,7 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },
   "/reset-password": {
+    captcha: true,
     fields: { newPassword: text(PASSWORD_MIN, PASSWORD_MAX), token: text(1, 128, /^[A-Za-z0-9_-]+$/) },
   },
   "/two-factor/verify-totp": { fields: { code: text(6, 6, /^\d{6}$/) } },
@@ -155,11 +142,12 @@ async function readBody(request: Request): Promise<{ json: unknown } | Refusal> 
  * the refusal. Touches nothing but the request.
  */
 export async function preflight(
+  method: string,
   relativePath: string,
   request: Request,
 ): Promise<{ refusal: Refusal } | { refusal: null; body: unknown }> {
   const spec = PREFLIGHT[relativePath];
-  if (!spec || request.method !== "POST") return { refusal: null, body: null };
+  if (!spec || method !== "POST") return { refusal: null, body: null };
   // The cheapest first: a header that is not there.
   if (spec.captcha) {
     const token = request.headers.get(CAPTCHA_HEADER);
@@ -194,12 +182,4 @@ export async function preflight(
     return { refusal: refuse(400, code, "Check the request: some fields are missing or not valid.", wrong) };
   }
   return { refusal: null, body };
-}
-
-/** Stage (b), the global part: one counter per location for every request that may reach a hash. */
-export async function hashGuard(
-  env: Parameters<typeof enforceRateLimit>[0],
-  relativePath: string,
-): Promise<void> {
-  if (HASH_PATHS.has(relativePath)) await enforceRateLimit(env, "RL_API", HASH_GUARD_KEY);
 }

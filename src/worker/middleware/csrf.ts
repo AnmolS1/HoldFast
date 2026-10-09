@@ -7,6 +7,7 @@
 // Exempt: /api/public/* (no session is ever read there), /api/auth/* (Better Auth checks its own
 // trusted origins), /api/_test/* (exists only in test mode). /api/auth-intent is NOT exempt.
 
+import { requestMethod, requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
@@ -17,8 +18,8 @@ export const SAFE_METHODS = new Set(["GET", "HEAD"]);
 const EXEMPT_PREFIXES = ["/api/public/", "/api/auth/", "/api/_test/"];
 
 export const csrf: MiddlewareHandler<AppEnv> = async (c, next) => {
-  if (SAFE_METHODS.has(c.req.method)) return next();
-  const path = c.req.path;
+  if (SAFE_METHODS.has(requestMethod(c))) return next();
+  const path = requestPath(c);
   if (EXEMPT_PREFIXES.some((prefix) => path.startsWith(prefix))) return next();
 
   const site = c.req.header("sec-fetch-site");

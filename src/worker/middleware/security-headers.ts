@@ -13,6 +13,7 @@
 // hardening task replaces it and `script-src 'self'` with nonces. `'wasm-unsafe-eval'` stays.
 // A later policy must keep every directive here that it does not deliberately tighten.
 
+import { requestMethod, requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
 import type { AppEnv } from "../services/request-context";
 
@@ -164,13 +165,13 @@ export const securityHeaders: MiddlewareHandler<AppEnv> = async (c, next) => {
   await next();
   const response = c.res;
   if (response.status === 101) return;
-  const path = c.req.path;
+  const path = requestPath(c);
 
   let replacement: Response;
   if (isApiPath(path)) {
     replacement = rebuilt(response, response.body, apiHeaders(c.env));
   } else if (isHtml(response)) {
-    if (!isHttps(c.env) && response.body && c.req.method === "GET") {
+    if (!isHttps(c.env) && response.body && requestMethod(c) === "GET") {
       const html = await response.text();
       replacement = rebuilt(response, html, htmlHeaders(c.env, path, await vitePreambleHashes(html)));
     } else {

@@ -91,18 +91,23 @@ test.describe("app origin", () => {
     const octet = () => 1 + Math.floor(Math.random() * 254);
     const headers = { "cf-connecting-ip": `10.${octet()}.${octet()}.${octet()}` };
 
-    // Empty the address's auth bucket with auth writes. 20 are let through to the auth handler;
-    // allow for the limiter's minute rolling over part-way. Sign-out, not sign-in: Better Auth
-    // has a limit of its own on the sign-in path (5 a minute, another envelope), which would
-    // answer first — sign-out is under its default of 30, so the pipeline's 20 is what trips.
+    // Empty the address's auth bucket with credential POSTs. 20 are let through to the auth
+    // handler; allow for the limiter's minute rolling over part-way. `/verify-password` with no
+    // session (answered 401), not sign-in: Better Auth has a limit of its own on the sign-in path
+    // (5 a minute, another envelope), which would answer first — this one is under its default of
+    // 30, so the pipeline's 20 is what trips. (Not sign-out either: signing out carries no
+    // credential and is never counted.)
     let refusedAfter = 0;
     for (let attempt = 1; attempt <= 41 && refusedAfter === 0; attempt++) {
-      const answer = await request.post("/api/auth/sign-out", { headers, data: {} });
+      const answer = await request.post("/api/auth/verify-password", {
+        headers: { ...headers, origin: origins.app },
+        data: { password: "correct horse battery staple 9!" },
+      });
       if (answer.status() === 429) {
         expect(await answer.json()).toMatchObject({ error: "rate_limited" });
         refusedAfter = attempt;
       } else {
-        expect(answer.status(), `attempt ${attempt}`).toBe(200);
+        expect(answer.status(), `attempt ${attempt}`).toBe(401);
       }
     }
     expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);
@@ -127,6 +132,32 @@ test.describe("app origin", () => {
       expect(answer.status(), `session read ${read}`).toBe(200);
       expect(await answer.json()).toBeNull();
     }
+  });
+});
+
+// One reading of the request line (src/worker/middleware/canonical.ts) — through the real dev
+// server: a spelling that is not canonical is a 404 on either host, with that host's headers.
+test.describe("a path that is not in canonical form", () => {
+  test("is a 404 on the app host — encoded, doubled or slash-ended (the files host: canonical.test.ts)", async ({
+    request,
+    origins,
+  }) => {
+    for (const path of [
+      "/api/%61uth/get-session",
+      "/api/auth/get-session/",
+      "/api/auth//get-session",
+      "/api/auth%2Fget-session",
+      "/api/public/config%20",
+      "/api/public//config",
+    ]) {
+      const answer = await request.get(`${origins.app}${path}`);
+      expect(answer.status(), path).toBe(404);
+      expect(await answer.json(), path).toMatchObject({ error: "not_found" });
+      expect(answer.headers()["x-content-type-options"], path).toBe("nosniff");
+    }
+    // The control: the canonical spellings answer.
+    expect((await request.get(`${origins.app}/api/auth/get-session`)).status()).toBe(200);
+    expect((await request.get(`${origins.app}/api/public/config`)).status()).toBe(200);
   });
 });
 

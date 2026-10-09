@@ -254,6 +254,7 @@ describe("Turnstile", () => {
       "/sign-in/email",
       "/request-password-reset",
       "/send-verification-email",
+      "/reset-password",
     ]);
     for (const path of CAPTCHA_ENDPOINTS) {
       const sent = await send(newClient(), `/api/auth${path}`, {
@@ -387,6 +388,7 @@ describe("the breach check", () => {
     const follow = await send(newClient(), linkIn(reset));
     const token = new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!;
     const refused = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: BREACHED_TEST_PASSWORDS[0], token },
     });
     expect(refused.status).toBe(400);
@@ -397,6 +399,7 @@ describe("the breach check", () => {
     // And the refusal came BEFORE the token was looked at: the link is not spent — the same
     // token then takes a password that is not in the corpus.
     const accepted = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "a password nobody breached 61!", token },
     });
     expect(accepted.status, accepted.text).toBe(200);
@@ -447,19 +450,20 @@ describe("rate limits", () => {
     const ip = newClient().ip;
     const a = newClient({ ip });
     const b = newClient({ ip });
-    // Sign-out is limited by Better Auth at its default 30 a minute, so RL_AUTH (20) trips first.
+    // An unauthenticated POST /verify-password is answered 401 and is limited by Better Auth at
+    // its default 30 a minute, so RL_AUTH (20) trips first.
     // The limiter counts in fixed one-minute windows. Twenty writes pass in any window, so the
     // first refusal is the 21st write — or, when the minute rolls over part-way (a loaded
     // machine), the 21st of the new window: never earlier than the 21st, never later than the 41st.
     let refused: Awaited<ReturnType<typeof send>> | null = null;
     let refusedAt = 0;
     for (let i = 1; i <= 41 && refused === null; i++) {
-      const sent = await send(i % 2 ? a : b, "/api/auth/sign-out", { json: {} });
+      const sent = await send(i % 2 ? a : b, "/api/auth/verify-password", { json: { password: PASSWORD } });
       if (sent.status === 429) {
         refused = sent;
         refusedAt = i;
       } else {
-        expect(sent.status, `write ${i}`).toBe(200);
+        expect(sent.status, `write ${i}`).toBe(401);
       }
     }
     expect(refusedAt, "the first refused write").toBeGreaterThanOrEqual(21);
@@ -470,6 +474,8 @@ describe("rate limits", () => {
     const signInAttempt = await signIn(b, freshEmail());
     expect(signInAttempt.status).toBe(429);
     expect(signInAttempt.body).toMatchObject({ error: "rate_limited" });
+    // Signing out is not a credential: it is never counted, so it still answers.
+    expect((await send(a, "/api/auth/sign-out", { json: {} })).status).toBe(200);
     // …while the shell's session read, from two clients behind that one address, is not counted.
     // (60, not 30: Better Auth's own default limit of 30 a minute per address must not apply
     // to this endpoint either.)

@@ -90,10 +90,20 @@ export function VerifyEmailPage() {
       setDraftError(t("signup.error.email"));
       return;
     }
+    if (config?.turnstileSiteKey && !turnstile.token) {
+      setDraftError(t(turnstile.status === "error" ? "auth.humanFailed" : "auth.humanWait"));
+      return;
+    }
     setBusy(true);
     try {
-      await api("/api/account/pending-email", { method: "PATCH", body: { email: next } });
+      await api("/api/account/pending-email", {
+        method: "PATCH",
+        body: { email: next },
+        ...captchaOptions(turnstile.token),
+      });
+      turnstile.reset();
     } catch (cause) {
+      turnstile.reset();
       setBusy(false);
       setDraftError(
         cause instanceof ApiError && cause.code === "validation" ? cause.message : t("verify.change.failed"),

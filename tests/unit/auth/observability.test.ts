@@ -344,7 +344,10 @@ describe("sentinel secrets in a request never reach a sink", () => {
       json: { email: S.email, redirectTo: S.resetUrl },
       headers: CAPTCHA,
     });
-    await send(hostile(), "/api/auth/reset-password", { json: { token: S.token, newPassword: S.password } });
+    await send(hostile(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
+      json: { token: S.token, newPassword: S.password },
+    });
     await send(hostile(), "/api/auth/two-factor/verify-totp", {
       json: { code: "492817", trustDevice: true },
     });
@@ -359,7 +362,11 @@ describe("sentinel secrets in a request never reach a sink", () => {
     await send(hostile(), "/api/auth-intent", {
       json: { inviteCode: S.token, birthYear: 1990, birthMonth: 5, acceptTerms: true },
     });
-    await send(hostile(), "/api/account/pending-email", { method: "PATCH", json: { email: S.email } });
+    await send(hostile(), "/api/account/pending-email", {
+      headers: CAPTCHA,
+      method: "PATCH",
+      json: { email: S.email },
+    });
     const seen = expectClean();
     // The audit sink saw the failed sign-in and the refused admin call — as codes and a scanned path.
     expect(

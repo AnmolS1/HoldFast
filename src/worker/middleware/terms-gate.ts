@@ -8,6 +8,7 @@
 // Exempt: /api/auth/*, /api/public/*, the accept route itself, and the deletion routes (a user
 // must always be able to leave).
 
+import { requestMethod, requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
 import { AppError } from "../services/errors";
 import { coreOf, db, settings, type AppEnv } from "../services/request-context";
@@ -25,7 +26,8 @@ function exempt(path: string): boolean {
 
 export const termsGate: MiddlewareHandler<AppEnv> = async (c, next) => {
   const user = c.get("user");
-  if (!user || !c.get("termsStale") || SAFE_METHODS.has(c.req.method) || exempt(c.req.path)) return next();
+  if (!user || !c.get("termsStale") || SAFE_METHODS.has(requestMethod(c)) || exempt(requestPath(c)))
+    return next();
 
   const current = (await settings(c)).termsVersion;
   const stored = await coreOf(c).termsVersionOf(db(c), user.id);

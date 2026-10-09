@@ -26,6 +26,7 @@ import { createKeys } from "../../../src/worker/services/keys";
 import { checkSessionStart, isAdminEmail } from "../../../src/worker/services/signup-policy";
 import { testVars } from "../../setup/test-vars";
 import {
+  CAPTCHA,
   ADMIN_EMAIL,
   auditRows,
   createInvite,
@@ -121,7 +122,7 @@ async function forgetAdmin(): Promise<void> {
 }
 
 const change = (client: Client, email: unknown) =>
-  send(client, "/api/account/pending-email", { method: "PATCH", json: { email } });
+  send(client, "/api/account/pending-email", { headers: CAPTCHA, method: "PATCH", json: { email } });
 
 // ── Google, as in google.test.ts ────────────────────────────────────────────────────────────
 const profileFor = (email: string): TestGoogleProfile => ({
@@ -587,9 +588,13 @@ describe("a pending-address change is held to what a sign-up with the new addres
     expect(await ipCount(client.ip)).toBe(1);
     const next = freshEmail();
     expect(await domainCount(next)).toBe(0);
+    // (The /24 is counted as a DIFFERENCE: 16 384 test /24s are shared by every client any test
+    // file has made today, so another client may sit in this one — the address itself is unique.)
+    const in24 = await ip24Count(client.ip);
+    expect(in24).toBeGreaterThanOrEqual(1);
     expect((await change(client, next)).status).toBe(200);
     expect(await ipCount(client.ip)).toBe(2);
-    expect(await ip24Count(client.ip)).toBe(2);
+    expect(await ip24Count(client.ip)).toBe(in24 + 1);
     expect(await domainCount(next)).toBe(1);
     // The same address again is not a change: nothing is taken.
     expect((await change(client, next)).status).toBe(200);

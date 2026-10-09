@@ -62,6 +62,10 @@ export type AuthFacts = {
   } | null;
   /** The admin whose impersonation this request is ending. */
   impersonatorId: string | null;
+  /** The sign-in throttle turned this request away (auth/signin-throttle.ts). */
+  throttled: boolean;
+  /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
+  signInAttempt: string | null;
 };
 
 export type AuthScope = {
@@ -111,6 +115,8 @@ export function emptyFacts(): AuthFacts {
     passkeySecondFactorFor: null,
     secondFactor: null,
     impersonatorId: null,
+    throttled: false,
+    signInAttempt: null,
   };
 }
 

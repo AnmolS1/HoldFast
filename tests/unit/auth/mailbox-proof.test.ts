@@ -92,6 +92,7 @@ describe("a verification link opened in a browser that did not sign up", () => {
     expect(strangerSignIn.body).toMatchObject({ code: "INVALID_EMAIL_OR_PASSWORD" });
     // …and so is the stranger's hold on the pending address.
     const moved = await send(stranger, "/api/account/pending-email", {
+      headers: CAPTCHA,
       method: "PATCH",
       json: { email: freshEmail() },
     });
@@ -100,6 +101,7 @@ describe("a verification link opened in a browser that did not sign up", () => {
 
     // The owner sets a password with the token, and signs in with it.
     const set = await send(victim, "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: NEW_PASSWORD, token },
     });
     expect(set.status, set.text).toBe(200);
@@ -107,6 +109,7 @@ describe("a verification link opened in a browser that did not sign up", () => {
     expect((await getSession(victim))?.user).toMatchObject({ email, emailVerified: true });
     // The token worked once.
     const again = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
       json: { newPassword: "yet another long passphrase 3!", token },
     });
     expect(again.status).toBe(400);
@@ -178,7 +181,10 @@ describe("a verification link opened in a browser that did not sign up", () => {
     const { stranger, email, link, id } = await strangerSignsUp();
     const victim = newClient();
     const token = setPasswordToken((await send(victim, link)).headers.get("location"));
-    await send(victim, "/api/auth/reset-password", { json: { newPassword: NEW_PASSWORD, token } });
+    await send(victim, "/api/auth/reset-password", {
+      headers: CAPTCHA,
+      json: { newPassword: NEW_PASSWORD, token },
+    });
 
     for (const who of [victim, stranger, newClient()]) {
       const replay = await send(who, link);
@@ -271,7 +277,10 @@ describe("the admin role and the verification click", () => {
     expect((await signIn(stranger, email)).status).toBe(401);
     expect((await userById(id))!.role).toBe("user");
 
-    await send(victim, "/api/auth/reset-password", { json: { newPassword: NEW_PASSWORD, token } });
+    await send(victim, "/api/auth/reset-password", {
+      headers: CAPTCHA,
+      json: { newPassword: NEW_PASSWORD, token },
+    });
     expect((await userById(id))!.role).toBe("user");
     expect((await signIn(victim, email, NEW_PASSWORD)).status).toBe(200);
     expect((await userById(id))!.role).toBe("admin");
@@ -440,7 +449,11 @@ describe("races (real concurrent requests against Postgres)", () => {
       const victim = newClient();
       const [clicked, moved] = await Promise.all([
         send(victim, link),
-        send(stranger, "/api/account/pending-email", { method: "PATCH", json: { email: elsewhere } }),
+        send(stranger, "/api/account/pending-email", {
+          headers: CAPTCHA,
+          method: "PATCH",
+          json: { email: elsewhere },
+        }),
       ]);
       expect(moved.status).toBe(200);
       expect(clicked.status).toBe(302);

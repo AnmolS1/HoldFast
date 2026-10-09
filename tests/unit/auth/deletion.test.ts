@@ -173,6 +173,8 @@ describe("beforeDelete defers nothing (the hook awaits everything it starts)", (
     try {
       const scope = createScope({ ...env, EMAIL_TRANSPORT: "resend" }, testDb(), ctx);
       const { beforeDelete } = buildAuthOptions(scope).user.deleteUser;
+      // What `hooks.before` records for the link's request (the hook decides by it, not by a URL).
+      scope.facts.endpointPath = "/delete-user/callback";
       const started = Date.now();
       const request = new Request("http://localhost/api/auth/delete-user/callback?token=x");
       const thrown: unknown = await beforeDelete({ id: row.id }, request).then(
@@ -196,6 +198,7 @@ describe("beforeDelete defers nothing (the hook awaits everything it starts)", (
 
       // On the non-callback path it throws the 200 instead — and still throws.
       const other = await verifiedUser();
+      scope.facts.endpointPath = "/delete-user";
       const viaPost: unknown = await beforeDelete(
         { id: other.user.id },
         new Request("http://localhost/api/auth/delete-user", { method: "POST" }),

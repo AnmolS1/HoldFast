@@ -1,6 +1,7 @@
 // The middleware pipeline of the app host, driven through the real app with a fake CoreDeps and
 // a catch-all probe router mounted after the (placeholder) registry. `reached` in a probe answer
 // means the request passed every middleware.
+import { existsOnAppHost } from "../../../src/worker/middleware/canonical";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 import { buildPipeline } from "../../../src/worker/app";
@@ -343,6 +344,7 @@ describe("middleware order", () => {
   it("is the documented sequence, with session before rateLimit", () => {
     const names = buildPipeline(fakeCore().core).map((step) => step.name);
     expect(names).toEqual([
+      "canonicalRequest",
       "requestContext",
       "securityHeaders",
       "csrf",
@@ -398,7 +400,8 @@ describe("rate limit", () => {
     await post("/api/auth/sign-in/email", { env, headers });
     await post("/api/auth-intent", { env, headers });
     await send("/api/invites/abc", { env, headers });
-    expect(auth).toEqual(["ip:203.0.113.9", "ip:203.0.113.9", "ip:203.0.113.9"]);
+    // Each under a key of its own: reading invites cannot spend the budget for signing in.
+    expect(auth).toEqual(["ip:203.0.113.9", "intent:203.0.113.9", "inv:203.0.113.9"]);
   });
 
   // The shell reads the session in every route guard and on every window focus. Counted against
@@ -424,13 +427,35 @@ describe("rate limit", () => {
     expect(api).toHaveLength(32);
     expect(new Set(api)).toEqual(new Set(["ip:203.0.113.9"]));
 
-    // The same address, the same empty bucket: every write under /api/auth/ is refused …
-    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
-      const write = await post("/api/auth/sign-in/email", { method, env: exhausted, headers });
-      expect(write.status, method).toBe(429);
-      expect(write.body.error).toBe("rate_limited");
+    // The same address, the same empty bucket: a credential-bearing POST is refused …
+    const write = await post("/api/auth/sign-in/email", { env: exhausted, headers });
+    expect(write.status).toBe(429);
+    expect(write.body.error).toBe("rate_limited");
+    expect(auth).toEqual(["ip:203.0.113.9"]);
+    // … and only that exact (method, path): another method on the same path, an OPTIONS, a
+    // trailing slash, another case, an encoded spelling or an unknown path is no endpoint — 404
+    // before either limiter, and nothing is counted. Signing out is never counted either.
+    auth.length = 0;
+    const counted = api.length;
+    for (const [method, path] of [
+      ["PUT", "/api/auth/sign-in/email"],
+      ["PATCH", "/api/auth/sign-in/email"],
+      ["DELETE", "/api/auth/sign-in/email"],
+      ["OPTIONS", "/api/auth/sign-in/email"],
+      ["GET", "/api/auth/sign-in/email"],
+      ["POST", "/api/auth/sign-in/email/"],
+      ["POST", "/api/auth/Sign-In/email"],
+      ["POST", "/api/auth/sign-in/%65mail"],
+      ["POST", "/api/auth//sign-in/email"],
+      ["POST", "/api/auth/no-such-endpoint"],
+    ] as const) {
+      const other = await send(path, { method, env: exhausted, headers });
+      expect(other.status, `${method} ${path}`).toBe(404);
     }
-    expect(auth).toHaveLength(4);
+    expect(auth).toEqual([]);
+    expect(api).toHaveLength(counted);
+    expect((await post("/api/auth/sign-out", { env: exhausted, headers })).status).not.toBe(429);
+    expect(auth).toEqual([]);
     // … and so are the two unauthenticated lookups that are not under /api/auth/, GET included:
     // an invite code is guessable, so reading one is throttled like a sign-in.
     expect((await send("/api/invites/abc", { env: exhausted, headers })).status).toBe(429);
@@ -579,7 +604,7 @@ describe("impersonation is read-only", () => {
       "/api/auth-intent",
       "/api/auth/change-password",
       "/api/auth/delete-user",
-      "/api/auth/passkey/add-passkey",
+      "/api/auth/passkey/delete-passkey",
       "/api/auth/admin/ban-user",
     ].map((path) => ({ path, methods: MUTATING }));
 
@@ -588,6 +613,11 @@ describe("impersonation is read-only", () => {
       if (IMPERSONATION_EXEMPT_PATHS.includes(path) || sessionless(path)) continue;
       for (const method of methods) {
         const answer = await send(path, { method, headers: sameOrigin });
+        if (path.startsWith("/api/auth/") && !existsOnAppHost(method, path)) {
+          // Not a (method, path) of the auth handler: there is nothing to write to.
+          expect(answer.status, `${method} ${path}`).toBe(404);
+          continue;
+        }
         expect(answer.status, `${method} ${path}`).toBe(403);
         expect(answer.body.details, `${method} ${path}`).toEqual({ reason: "impersonation_read_only" });
         checked += 1;
@@ -648,7 +678,7 @@ describe("impersonation is read-only", () => {
       for (const path of [
         "/api/auth/change-password",
         "/api/auth/delete-user",
-        "/api/auth/passkey/add-passkey",
+        "/api/auth/passkey/delete-passkey",
       ]) {
         const refused = await post(path);
         expect(refused.status, `${label} ${path}`).toBe(403);

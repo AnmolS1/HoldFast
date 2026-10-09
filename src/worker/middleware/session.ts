@@ -28,6 +28,7 @@
 //
 // Still read by the routes themselves where a decision hangs on one field: the terms gate.
 
+import { requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
 import { AUTH_PREFIX, authGateDecision, type AuthGateState } from "../auth/endpoint-policy";
 import type { SessionUser } from "../auth/types";
@@ -82,7 +83,7 @@ function withDates(user: SessionUser): SessionUser {
 }
 
 export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
-  const path = c.req.path;
+  const path = requestPath(c);
   if (
     !path.startsWith("/api/") ||
     path === "/api/health" ||
@@ -130,7 +131,7 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (onAuth && state) {
     // The path exactly as it was sent, not Hono's percent-decoded one: the allow-list matches
     // literal spellings only, so an encoded or otherwise unusual path is simply not on it.
-    const decision = authGateDecision(state, new URL(c.req.url).pathname);
+    const decision = authGateDecision(state, path);
     if (decision === "deny") throw refusal(state);
     // Better Auth's own signed-out body, without reaching Better Auth.
     if (decision === "signed_out") return c.json(null);

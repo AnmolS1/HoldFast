@@ -19,6 +19,7 @@ import { describe, expect, it } from "vitest";
 import { testGoogleCode, type TestGoogleProfile } from "../../../src/worker/auth/test-outbound";
 import { account, passkey, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
 import {
+  CAPTCHA,
   accountsOf,
   auditRows,
   createInvite,
@@ -178,6 +179,7 @@ describe("pre-hijacking: a stranger's unverified account at the victim's address
     expect(await getSession(attacker)).toBeNull();
     // Their pending-address cookie cannot move the account either (it is verified now).
     const moved = await send(attacker, "/api/account/pending-email", {
+      headers: CAPTCHA,
       method: "PATCH",
       json: { email: freshEmail() },
     });

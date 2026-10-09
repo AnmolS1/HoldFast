@@ -9,6 +9,7 @@
 //     router.post("/uploads", requireSwitch("uploadsEnabled"), handler)
 // This file does not enforce `uploadsEnabled` / `linksEnabled` anywhere itself.
 
+import { requestMethod, requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
 import { AppError } from "../services/errors";
 import { settings, type AppEnv } from "../services/request-context";
@@ -19,7 +20,7 @@ function exempt(path: string): boolean {
 }
 
 export const killSwitch: MiddlewareHandler<AppEnv> = async (c, next) => {
-  if (SAFE_METHODS.has(c.req.method) || exempt(c.req.path)) return next();
+  if (SAFE_METHODS.has(requestMethod(c)) || exempt(requestPath(c))) return next();
   if ((await settings(c)).readOnly) throw new AppError("read_only");
   return next();
 };

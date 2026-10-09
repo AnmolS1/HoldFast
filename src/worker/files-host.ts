@@ -5,6 +5,7 @@
 // shell), never a JSON error envelope — bodies are plain text — and the fixed header set of
 // middleware/security-headers.ts on every response.
 
+import { canonicalRequest } from "./middleware/canonical";
 import { Hono } from "hono";
 import { rateLimitByIp } from "./middleware/rate-limit";
 import { requestContext } from "./middleware/request-context";
@@ -20,6 +21,8 @@ export function createFilesHost(core: CoreDeps): Hono<AppEnv> {
   app.onError(handlePlainError);
   app.notFound(() => new Response("Not found\n", { status: 404, headers: TEXT }));
 
+  // First: one reading of the path and the method (middleware/canonical.ts).
+  app.use("*", canonicalRequest("files"));
   app.use("*", requestContext(core));
   app.use("*", filesHostHeaders);
   app.use("*", rateLimitByIp("RL_FILES"));

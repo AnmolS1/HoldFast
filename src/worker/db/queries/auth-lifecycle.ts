@@ -897,3 +897,74 @@ export async function purgeAuthRows(db: Executor, userId: string): Promise<boole
     return removed.length > 0;
   });
 }
+
+/**
+ * The sign-in throttle (auth/signin-throttle.ts), in ONE statement: counts this attempt on the
+ * client's row for the account — unless the client has to wait, in which case nothing is written
+ * and the wait is returned. `rate_limit.last_request` is in milliseconds; the clock is the
+ * database's, for the write and for the comparison alike.
+ *
+ * The wait of a row with `k` counted attempts, where all OTHER clients have `n` on the account
+ * within the window: the whole `maxDelaySeconds` once `n + k >= pressure`; nothing while
+ * `k < free`; else 2^(k - free) seconds, at most `maxDelaySeconds`.
+ */
+export async function admitSignIn(
+  db: Executor,
+  keys: { account: string; pair: string },
+  rule: { windowSeconds: number; free: number; maxDelaySeconds: number; pressure: number },
+): Promise<{ ok: true; count: number } | { ok: false; retryAfterSeconds: number }> {
+  const windowMs = rule.windowSeconds * 1000;
+  const result = await db.execute<{
+    admitted: number | null;
+    wait_ms: string | number | null;
+    others: number | null;
+  }>(sql`
+    WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
+    others AS (
+      SELECT coalesce(sum(r.count), 0)::int AS n FROM rate_limit r, clock
+      WHERE r.key LIKE ${keys.account + "%"} AND r.key <> ${keys.pair} AND r.last_request > clock.ms - ${windowMs}
+    ),
+    held AS (
+      SELECT r.last_request + 1000 * (
+               CASE WHEN others.n + r.count >= ${rule.pressure} THEN ${rule.maxDelaySeconds}
+                    WHEN r.count < ${rule.free} THEN 0
+                    ELSE least(${rule.maxDelaySeconds}, power(2, least(r.count - ${rule.free}, 20)))
+               END)::bigint AS free_at
+      FROM rate_limit r, others, clock
+      WHERE r.key = ${keys.pair} AND r.last_request > clock.ms - ${windowMs}
+    ),
+    admitted AS (
+      INSERT INTO rate_limit AS r (id, key, count, last_request)
+      -- (an id of its own: two first attempts at once must collide on the KEY, which is arbitrated)
+      SELECT gen_random_uuid()::text, ${keys.pair}, 1, clock.ms FROM clock
+      ON CONFLICT (key) DO UPDATE SET
+        count = CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN 1 ELSE r.count + 1 END,
+        last_request = (SELECT ms FROM clock)
+      WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs}
+         OR r.last_request + 1000 * (
+              CASE WHEN (SELECT n FROM others) + r.count >= ${rule.pressure} THEN ${rule.maxDelaySeconds}
+                   WHEN r.count < ${rule.free} THEN 0
+                   ELSE least(${rule.maxDelaySeconds}, power(2, least(r.count - ${rule.free}, 20)))
+              END)::bigint <= (SELECT ms FROM clock)
+      RETURNING r.count
+    )
+    SELECT (SELECT count FROM admitted) AS admitted,
+           (SELECT free_at FROM held) - (SELECT ms FROM clock) AS wait_ms,
+           (SELECT n FROM others) AS others`);
+  const row = result.rows[0];
+  if (row && row.admitted !== null) return { ok: true, count: Number(row.admitted) };
+  // No row of its own in this statement's snapshot: another attempt of the same client made it
+  // this very moment (count 1) — the wait is that of a first failure.
+  const waitMs =
+    row?.wait_ms != null
+      ? Number(row.wait_ms)
+      : Number(row?.others ?? 0) + 1 >= rule.pressure
+        ? rule.maxDelaySeconds * 1000
+        : 1000;
+  return { ok: false, retryAfterSeconds: Math.ceil(Math.max(waitMs, 1) / 1000) };
+}
+
+/** The password was right: this client's failures on the account are forgotten. */
+export async function forgetSignInFailures(db: Executor, pair: string): Promise<void> {
+  await db.execute(sql`DELETE FROM rate_limit WHERE key = ${pair}`);
+}
