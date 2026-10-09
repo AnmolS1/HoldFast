@@ -59,7 +59,7 @@ describe("claim", () => {
     const t = await target();
     const first = await claim(db, t);
     if (!first.claimed) throw new Error("not claimed");
-    expect(await finish(db, first.jobId, "done", { engine: "clamav", outcome: "clean" })).toBe(true);
+    expect(await finish(db, first, "done", { engine: "clamav", outcome: "clean" })).toBe(true);
     expect(await claim(db, t)).toEqual({ claimed: false, status: "done" });
     expect(await job(t.r2Key)).toMatchObject({
       status: "done",
@@ -75,7 +75,7 @@ describe("claim", () => {
     const t = await target();
     const first = await claim(db, t);
     if (!first.claimed) throw new Error("not claimed");
-    expect(await finish(db, first.jobId, "failed", null, "timeout")).toBe(true);
+    expect(await finish(db, first, "failed", null, "timeout")).toBe(true);
     expect(await job(t.r2Key)).toMatchObject({ status: "failed", lastError: "timeout" });
     const second = await claim(db, t);
     expect(second).toEqual({ claimed: true, jobId: first.jobId, attempt: 2 });
@@ -107,7 +107,7 @@ describe("claim", () => {
     const first = await claim(db, t);
     if (!first.claimed) throw new Error("not claimed");
     expect(await claim(db, { ...t, force: true })).toEqual({ claimed: false, status: "running" });
-    await finish(db, first.jobId, "done", { outcome: "clean" });
+    await finish(db, first, "done", { outcome: "clean" });
     expect(await claim(db, { ...t, force: false })).toEqual({ claimed: false, status: "done" });
     const rescan = await claim(db, { ...t, force: true });
     expect(rescan).toEqual({ claimed: true, jobId: first.jobId, attempt: 2 });
@@ -122,19 +122,55 @@ describe("finish", () => {
     const t = await target();
     const first = await claim(db, t);
     if (!first.claimed) throw new Error("not claimed");
-    await finish(db, first.jobId, "done", { outcome: "clean", effects: ["blocklist"] });
-    expect(await finish(db, first.jobId, "failed", null, "late")).toBe(false);
+    await finish(db, first, "done", { outcome: "clean", effects: ["blocklist"] });
+    expect(await finish(db, first, "failed", null, "late")).toBe(false);
     expect((await job(t.r2Key)).status).toBe("done");
 
-    await claim(db, { ...t, force: true });
-    expect(await finish(db, first.jobId, "failed", undefined, "engine")).toBe(true);
+    const rescan = await claim(db, { ...t, force: true });
+    if (!rescan.claimed) throw new Error("not claimed");
+    expect(await finish(db, rescan, "failed", undefined, "engine")).toBe(true);
     expect(await job(t.r2Key)).toMatchObject({
       status: "failed",
       lastError: "engine",
       verdict: { outcome: "clean", effects: ["blocklist"] },
     });
-    expect(await finish(db, uuidv7(), "done", {})).toBe(false);
-    expect(await finish(db, "junk", "done", {})).toBe(false);
+    expect(await finish(db, { jobId: uuidv7(), attempt: 1 }, "done", {})).toBe(false);
+    expect(await finish(db, { jobId: "junk", attempt: 1 }, "done", {})).toBe(false);
+  });
+
+  // A consumer whose claim went stale (it hung past the 20 minutes) was taken over. When it
+  // wakes up it must not end the new owner's claim: that would let a third delivery claim the
+  // key while the second is still scanning, and store the stale worker's verdict as the job's.
+  it("a taken-over attempt cannot finish the new owner's claim", async () => {
+    const t = await target();
+    const stale = await claim(db, t);
+    if (!stale.claimed) throw new Error("not claimed");
+    await db
+      .update(scanJobs)
+      .set({ startedAt: minutesAgo(SCAN_CLAIM_STALE_MINUTES + 1) })
+      .where(eq(scanJobs.id, stale.jobId));
+    const owner = await claim(db, t);
+    expect(owner).toEqual({ claimed: true, jobId: stale.jobId, attempt: 2 });
+    if (!owner.claimed) throw new Error("not claimed");
+
+    expect(await finish(db, stale, "done", { outcome: "clean", from: "stale" })).toBe(false);
+    expect(await finish(db, stale, "failed", null, "stale worker gave up")).toBe(false);
+    expect(await job(t.r2Key)).toMatchObject({
+      status: "running",
+      attempt: 2,
+      verdict: null,
+      lastError: null,
+      finishedAt: null,
+    });
+    // Still owned: a third delivery is told to retry, not handed the job.
+    expect(await claim(db, t)).toEqual({ claimed: false, status: "running" });
+
+    expect(await finish(db, owner, "done", { outcome: "infected", from: "owner" })).toBe(true);
+    expect(await job(t.r2Key)).toMatchObject({
+      status: "done",
+      verdict: { outcome: "infected", from: "owner" },
+    });
+    expect(await finish(db, { jobId: stale.jobId, attempt: Number.NaN }, "done", {})).toBe(false);
   });
 
   it("works inside the caller's transaction", async () => {
@@ -143,7 +179,7 @@ describe("finish", () => {
     if (!first.claimed) throw new Error("not claimed");
     await expect(
       db.transaction(async (tx) => {
-        expect(await finish(tx, first.jobId, "done", { outcome: "clean" })).toBe(true);
+        expect(await finish(tx, first, "done", { outcome: "clean" })).toBe(true);
         throw new Error("undo");
       }),
     ).rejects.toThrow("undo");
@@ -164,7 +200,7 @@ describe("backlog", () => {
     expect(during.running).toBeGreaterThanOrEqual(1);
     expect(before.running).toBeGreaterThanOrEqual(0);
     expect(during.oldestStartedAt!.getTime()).toBe(old.getTime());
-    await finish(db, first.jobId, "done", {});
+    await finish(db, first, "done", {});
     const after = await backlog(db);
     expect(after.oldestStartedAt === null || after.oldestStartedAt.getTime() > old.getTime()).toBe(true);
   });

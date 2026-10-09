@@ -1,7 +1,7 @@
 // Scan jobs: one row per object key (keys are immutable), claimed idempotently.
 //
 // Queue delivery is at-least-once, so the consumer contract is:
-//   claimed                      → scan, then `finish`;
+//   claimed                      → scan, then `finish` with the claim (job id AND attempt);
 //   not claimed, status `done`   → ack (the work is finished);
 //   not claimed, status `running`→ retry (another delivery owns it; never ack);
 //   not claimed, status `failed` → cannot happen: a failed row is always claimable.
@@ -56,18 +56,20 @@ export async function claim(
 }
 
 /**
- * Ends an attempt. `done` stores the verdict; `failed` stores the error and keeps whatever
- * verdict an earlier attempt stored. Only a `running` row changes: false = it was not running
- * (already finished, taken over and finished, or gone).
+ * Ends ONE attempt — the one `claim` returned (`jobId` and `attempt`). `done` stores the verdict;
+ * `failed` stores the error and keeps whatever verdict an earlier attempt stored.
+ * Only that attempt's own `running` claim changes. False = this caller no longer owns the job:
+ * it already finished, or the claim went stale and another delivery took it over (the row then
+ * carries a higher `attempt`, and that owner's claim is left running), or the row is gone.
  */
 export async function finish(
   db: Executor,
-  jobId: string,
+  claimed: { jobId: string; attempt: number },
   status: "done" | "failed",
   verdict?: Record<string, unknown> | null,
   error?: string | null,
 ): Promise<boolean> {
-  if (!isUuid(jobId)) return false;
+  if (!isUuid(claimed.jobId) || !Number.isSafeInteger(claimed.attempt)) return false;
   const engine = typeof verdict?.engine === "string" ? verdict.engine : undefined;
   const rows = await db
     .update(scanJobs)
@@ -78,7 +80,9 @@ export async function finish(
       ...(verdict != null ? { verdict } : {}),
       ...(engine !== undefined ? { engine } : {}),
     })
-    .where(sql`${scanJobs.id} = ${jobId} AND ${scanJobs.status} = 'running'`)
+    .where(
+      sql`${scanJobs.id} = ${claimed.jobId} AND ${scanJobs.attempt} = ${claimed.attempt} AND ${scanJobs.status} = 'running'`,
+    )
     .returning({ id: scanJobs.id });
   return rows.length > 0;
 }
