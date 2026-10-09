@@ -20,6 +20,7 @@ import { createAuthClient } from "better-auth/client";
 import { adminClient, inferAdditionalFields, twoFactorClient } from "better-auth/client/plugins";
 import type { AuthClientContract, AuthError, AuthResult } from "./auth-contract";
 import { registerUserStatePurger } from "./contracts";
+import { OPTIONS_PATH, passkeyCeremonies } from "./passkey-ceremony";
 
 // Before the client exists: no cross-tab note is ever written anywhere.
 const SILENT_CHANNEL = {
@@ -34,6 +35,14 @@ export const betterAuthClient = createAuthClient({
   // Same origin, the Worker's /api/auth. No token is handled by this client: the browser sends
   // the HttpOnly cookie itself.
   basePath: "/api/auth",
+  fetchOptions: {
+    // Tells the ceremony queue that a passkey sign-in has its options (lib/passkey-ceremony.ts).
+    onResponse(context) {
+      if (new URL(context.response.url, window.location.origin).pathname.endsWith(OPTIONS_PATH)) {
+        passkeyCeremonies.optionsArrived();
+      }
+    },
+  },
   plugins: [
     passkeyClient(),
     twoFactorClient(),
@@ -76,7 +85,10 @@ export const authClient: AuthClientContract = {
   signIn: {
     email: (input) => run(betterAuthClient.signIn.email(input)),
     social: (input) => run(betterAuthClient.signIn.social(input)),
-    passkey: (input) => run(betterAuthClient.signIn.passkey(input) as Promise<RawResult>),
+    // One ceremony starts at a time: the autofill request and the button would otherwise abort
+    // each other (lib/passkey-ceremony.ts).
+    passkey: (input) =>
+      passkeyCeremonies.run(() => run(betterAuthClient.signIn.passkey(input) as Promise<RawResult>)),
   },
   signUp: {
     email: (input) => run(betterAuthClient.signUp.email(input)),
