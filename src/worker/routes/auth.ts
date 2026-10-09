@@ -24,8 +24,10 @@ import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath, recordAdminDenial } from "../a
 import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
+import { CHANGE_EMAIL_UNAVAILABLE } from "../auth/mailbox-proof";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
 import { HANG, hungAnswer, watched } from "../auth/watchdog";
+import { isUniqueViolation } from "../db/errors";
 import { AppError } from "../services/errors";
 import { auth, type AppEnv } from "../services/request-context";
 
@@ -125,6 +127,12 @@ router.all(
       // it — and answered here. The caught object goes nowhere: not to a sink, and not to the
       // app's error handler.
       if (isAnswer(error)) throw error;
+      if (relativePath === "/verify-email" && isUniqueViolation(error)) {
+        // The address a change-of-address link confirms was taken between the look-up and the
+        // write (two accounts confirming one address at the same moment): not an error page on a
+        // link somebody clicked — the same answer as "taken a while ago" (auth/mailbox-proof.ts).
+        return c.redirect(`${c.env.APP_ORIGIN}${CHANGE_EMAIL_UNAVAILABLE}`, 302);
+      }
       count("auth", { outcome: "error" });
       reportError(error, { kind: "auth_handler" });
       return c.json(

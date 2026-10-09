@@ -35,6 +35,7 @@ import type { AuthContext, ServiceDeps } from "../services/request-context";
 import { sessionAdditionalFields, userAdditionalFields } from "./fields";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
+import { VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
@@ -45,7 +46,7 @@ import type { Auth } from "./types";
 export const SESSION_EXPIRES_IN_S = 60 * 60 * 24 * 14;
 export const SESSION_UPDATE_AGE_S = 60 * 60 * 24;
 export const IMPERSONATION_SESSION_S = 60 * 15;
-export const VERIFICATION_EXPIRES_IN_S = 60 * 60;
+export const VERIFICATION_EXPIRES_IN_S = VERIFY_LINK_EXPIRES_IN_S;
 
 export const PASSWORD_COMPROMISED_MESSAGE = "This password appears in a known breach. Choose another.";
 

@@ -37,7 +37,7 @@ import {
 import { activatePendingShares } from "../db/queries/shares";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
-import { sendSignInMethodAdded, sendSignupAttempt } from "../services/email";
+import { sendChangeEmailConfirmation, sendSignInMethodAdded, sendSignupAttempt } from "../services/email";
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
   checkSessionStart,
@@ -49,7 +49,7 @@ import {
   type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
-import { beforeVerifyEmail } from "./mailbox-proof";
+import { afterChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
   afterPasskeyDeleted,
@@ -482,6 +482,12 @@ export function buildHooks(scope: AuthScope) {
     const path = ctx.path;
     if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
       await afterSecondFactor(scope, ctx);
+      return;
+    }
+    if (path === "/change-email" && ctx.request) {
+      await quietly(env, "change_email", () =>
+        afterChangeEmail(scope, ctx, (mail) => sendChangeEmailConfirmation(scope.deps, mail)),
+      );
       return;
     }
     if (ctx.request && typeof path === "string" && SECOND_FACTOR_AFTER.has(path)) {

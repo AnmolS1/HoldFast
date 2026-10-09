@@ -16,7 +16,7 @@
 //                                                     person is sent to "set your password" with
 //                                                     a single-use token.
 // The admin role is never granted by the click itself — only by a sign-in after it.
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
 import { passkey, twoFactor, user, verification } from "../../../src/worker/db/schema";
@@ -30,6 +30,7 @@ import {
   linkIn,
   makeFolder,
   makePendingShare,
+  mailTo,
   newClient,
   PASSWORD,
   send,
@@ -338,6 +339,96 @@ describe("the link that confirms a NEW address for an existing account", () => {
     expect(clicked.status).toBe(302);
     expect(clicked.headers.get("location")).toBe("/account");
     expect(await userById(owner.user.id)).toMatchObject({ email: target, emailVerified: true });
+  });
+});
+
+describe("changing to an address: what the caller can and cannot learn (A7)", () => {
+  /** Asks for a change and follows the confirmation mailed to the CURRENT address. */
+  async function askAndConfirm(owner: Awaited<ReturnType<typeof verifiedUser>>, target: string) {
+    const before = mailTo(owner.email, "changeEmailConfirmation").length;
+    const asked = await send(owner.client, "/api/auth/change-email", {
+      json: { newEmail: target, callbackURL: "/account" },
+    });
+    const mail = await waitForMail(owner.email, "changeEmailConfirmation", before + 1);
+    const confirmed = await send(owner.client, linkIn(mail));
+    return { asked, mail, confirmed };
+  }
+
+  it("a TAKEN address answers and mails exactly as a free one does — and the address's owner hears nothing", async () => {
+    const taken = await verifiedUser();
+    const mailsToTaken = mailTo(taken.email).length;
+    const prober = await verifiedUser();
+    const forTaken = await askAndConfirm(prober, taken.email);
+    const honest = await verifiedUser();
+    const free = freshEmail();
+    const forFree = await askAndConfirm(honest, free);
+
+    // The answer, the mail to the caller's own inbox, and the answer to its link: alike.
+    expect(forTaken.asked.status).toBe(forFree.asked.status);
+    expect(forTaken.asked.body).toEqual(forFree.asked.body);
+    expect(forTaken.mail.subject).toBe(forFree.mail.subject);
+    expect(forTaken.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(taken.email, "<new>")).toBe(
+      forFree.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(free, "<new>"),
+    );
+    expect(forTaken.confirmed.status).toBe(302);
+    expect(forTaken.confirmed.headers.get("location")).toBe(forFree.confirmed.headers.get("location"));
+    // What differs is invisible to the caller: the free address gets the second mail, the taken
+    // one's owner gets nothing at all, and nothing about either account changes.
+    await waitForMail(free, "newAddressVerification");
+    expect(mailTo(taken.email)).toHaveLength(mailsToTaken);
+    expect((await userById(prober.user.id))!.email).toBe(prober.email);
+    expect((await userById(taken.user.id))!.email).toBe(taken.email);
+  });
+
+  it("taken BETWEEN the request and the last click: the link says 'unavailable', nothing changes, no error page", async () => {
+    const owner = await verifiedUser();
+    const target = freshEmail();
+    await askAndConfirm(owner, target);
+    const verify = linkIn(await waitForMail(target, "newAddressVerification"));
+    // Somebody else takes the address in the meantime.
+    const other = await verifiedUser({ email: target });
+    const clicked = await send(owner.client, verify);
+    expect(clicked.status).toBe(302);
+    expect(clicked.headers.get("location")).toBe("http://localhost/account?email=unavailable");
+    expect((await userById(owner.user.id))!.email).toBe(owner.email);
+    expect((await userById(other.user.id))!.email).toBe(target);
+  });
+
+  it("two accounts confirming the SAME new address at the same moment: one gets it, the other 'unavailable' — never a 500", async () => {
+    const target = freshEmail();
+    const one = await verifiedUser();
+    const two = await verifiedUser();
+    await askAndConfirm(one, target);
+    const linkOne = linkIn(await waitForMail(target, "newAddressVerification", 1));
+    await askAndConfirm(two, target);
+    const linkTwo = linkIn(await waitForMail(target, "newAddressVerification", 2));
+    expect(linkTwo).not.toBe(linkOne);
+    // Hold each UPDATE that writes this address for a moment, so that both requests are past
+    // their look-up before either row is written: the loser meets the unique index itself.
+    const name = `hf_test_${crypto.randomUUID().replace(/-/g, "")}`;
+    await testDb().execute(
+      sql.raw(`
+        CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.email = '${target}' AND OLD.email <> NEW.email THEN PERFORM pg_sleep(0.4); END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER ${name} BEFORE UPDATE ON "user" FOR EACH ROW EXECUTE FUNCTION ${name}();`),
+    );
+    let answers: Awaited<ReturnType<typeof send>>[];
+    try {
+      answers = await Promise.all([send(one.client, linkOne), send(two.client, linkTwo)]);
+    } finally {
+      await testDb().execute(
+        sql.raw(`DROP TRIGGER IF EXISTS ${name} ON "user"; DROP FUNCTION IF EXISTS ${name}();`),
+      );
+    }
+    expect(answers.map((answer) => answer.status)).toEqual([302, 302]);
+    const locations = answers.map((answer) => answer.headers.get("location")).sort();
+    expect(locations).toEqual(["/account", "http://localhost/account?email=unavailable"]);
+    const emails = [(await userById(one.user.id))!.email, (await userById(two.user.id))!.email];
+    expect(emails.filter((email) => email === target)).toHaveLength(1);
+    expect(emails.filter((email) => email === one.email || email === two.email)).toHaveLength(1);
   });
 });
 

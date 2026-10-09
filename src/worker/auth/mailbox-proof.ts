@@ -35,7 +35,7 @@
 // on the strength of a link that is forged or expired.
 
 import { generateId } from "@better-auth/core/utils/id";
-import { APIError, getSessionFromCtx } from "better-auth/api";
+import { APIError, createEmailVerificationToken, getSessionFromCtx } from "better-auth/api";
 import { verifyJWT } from "better-auth/crypto";
 import { clearForMailboxProof, getAccountByEmail } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
@@ -44,8 +44,50 @@ import { record } from "./observe";
 import type { AuthScope } from "./scope";
 import { readPending } from "./signed-cookie";
 
+/**
+ * `hooks.after` for `POST /change-email`. Better Auth answers `{ status: true }` either way, but
+ * mails the caller's CURRENT address only when the new address is free
+ * (api/routes/update-user.mjs) — so the caller's own inbox said which addresses have an
+ * account. When the address is taken, the same mail is sent here, with a link of the same kind;
+ * following it does nothing (`beforeVerifyEmail`, step one).
+ */
+export async function afterChangeEmail(
+  scope: AuthScope,
+  ctx: {
+    body?: unknown;
+    context: {
+      returned?: unknown;
+      baseURL: string;
+      session?: { user: { id: string; email: string; name: string; emailVerified: boolean } } | null;
+    };
+  },
+  send: (mail: { to: string; name: string; newEmail: string; url: string }) => Promise<unknown>,
+): Promise<void> {
+  if (ctx.context.returned instanceof Error) return;
+  const user = ctx.context.session?.user;
+  const body = (ctx.body ?? {}) as { newEmail?: unknown; callbackURL?: unknown };
+  // Only a verified address gets the confirmation step from Better Auth at all.
+  if (!user || !user.emailVerified || typeof body.newEmail !== "string") return;
+  const newEmail = body.newEmail.toLowerCase();
+  if (newEmail === user.email.toLowerCase()) return;
+  const holder = await getAccountByEmail(scope.db, newEmail);
+  if (!holder || holder.id === user.id) return;
+  const token = await createEmailVerificationToken(
+    scope.env.BETTER_AUTH_SECRET,
+    user.email,
+    newEmail,
+    VERIFY_LINK_EXPIRES_IN_S,
+    { requestType: "change-email-confirmation" },
+  );
+  const callback = typeof body.callbackURL === "string" ? body.callbackURL : "/";
+  const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(callback)}`;
+  await send({ to: user.email, name: user.name, newEmail, url });
+}
+
 /** The screen that takes the token (src/client/routes/auth/Password.tsx). */
 export const SET_PASSWORD_PATH = "/set-password";
+/** The lifetime of a verification link (create-auth.ts `emailVerification.expiresIn`). */
+export const VERIFY_LINK_EXPIRES_IN_S = 60 * 60;
 /** How long the set-password token of a cross-browser verification lasts. */
 export const SET_PASSWORD_TOKEN_S = 60 * 60;
 /** Where an address-change link sends a browser that is not signed in to the account. */
@@ -95,8 +137,21 @@ export async function beforeVerifyEmail(scope: AuthScope, ctx: VerifyContext): P
   if (!claims) return;
 
   if (claims.updateTo !== null) {
-    // Step one (mailed to the CURRENT address) only sends the second mail.
-    if (claims.requestType === "change-email-confirmation") return;
+    // Step one (mailed to the CURRENT address) only sends the second mail — to the new address.
+    // When that address already has an account, the link answers exactly as it would for a free
+    // one and nothing is sent: the address's owner is not mailed on a stranger's say-so, and the
+    // caller cannot tell (`afterChangeEmail` below is why they hold this link at all).
+    if (claims.requestType === "change-email-confirmation") {
+      if (await getAccountByEmail(db, claims.updateTo)) {
+        const target = new URL(ctx.request.url).searchParams.get("callbackURL");
+        // The same check Better Auth's own redirect goes through would refuse anything but a
+        // path of this app; a path is all a link of ours ever carries.
+        const path = target && /^\/(?![/\\])[^\s]*$/.test(target) ? target : "/";
+        // Relative, exactly as Better Auth redirects to the `callbackURL` it was given.
+        throw new APIError("FOUND", undefined, { Location: path });
+      }
+      return;
+    }
     const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
     if (!session || session.user.email.toLowerCase() !== claims.email) {
       throw redirect(env, CHANGE_EMAIL_SIGN_IN);
