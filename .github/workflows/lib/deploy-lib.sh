@@ -547,19 +547,20 @@ is_local_host() {
 #     setting comes from — a zone set by the connection itself hides the database's own, so it fails;
 #   - every `ALTER DATABASE … SET timezone` / `ALTER ROLE … [IN DATABASE …] SET timezone` that
 #     applies to this database, for ANY role (the Worker's role may not be the one that migrates).
-# One row per zone found: kind|zone|january offset (s)|july offset (s)|database.
+# One row per zone found: kind|zone|january offset (s)|july offset (s)|database|role (stored settings only).
 UTC_ZONE_SQL="
 with instants(jan, jul) as (
   select date_trunc('year', now() at time zone 'UTC') + interval '14 days 12 hours',
          date_trunc('year', now() at time zone 'UTC') + interval '6 months 14 days 12 hours'
-), zones(kind, zone) as (
-  select 'session:' || source, setting from pg_settings where name = 'TimeZone'
+), zones(kind, zone, role) as (
+  select 'session:' || source, setting, '' from pg_settings where name = 'TimeZone'
   union all
   select case when s.setrole = 0 and s.setdatabase = 0 then 'setting:all-roles'
               when s.setrole = 0 then 'setting:database'
               when s.setdatabase = 0 then 'setting:role'
               else 'setting:role-in-database' end,
-         substr(c.cfg, strpos(c.cfg, '=') + 1)
+         substr(c.cfg, strpos(c.cfg, '=') + 1),
+         coalesce((select r.rolname from pg_roles r where r.oid = s.setrole), '')
   from pg_db_role_setting s cross join lateral unnest(s.setconfig) as c(cfg)
   where s.setdatabase in (0, (select oid from pg_database where datname = current_database()))
     and lower(split_part(c.cfg, '=', 1)) = 'timezone'
@@ -567,7 +568,7 @@ with instants(jan, jul) as (
 select z.kind, z.zone,
        extract(epoch from (i.jan at time zone 'UTC') - (i.jan at time zone z.zone))::int,
        extract(epoch from (i.jul at time zone 'UTC') - (i.jul at time zone z.zone))::int,
-       current_database()
+       current_database(), z.role
 from zones z cross join instants i
 order by 1, 2"
 
@@ -576,21 +577,22 @@ eval_utc_zone() {
   [ -s "$1" ] || { echo "utc-zone: the query returned nothing — the time zone was not observed" && return 1; }
   awk -F '|' '
     function hhmm(s,   sign, a) { sign = (s < 0) ? "-" : "+"; a = (s < 0) ? -s : s; return sprintf("UTC%s%02d:%02d", sign, int(a / 3600), int((a % 3600) / 60)) }
-    function fix(kind, db) {
+    function fix(kind, db, role) {
+      if (role == "") role = "<the connecting role>"
       if (kind == "session:database" || kind == "setting:database") return "ALTER DATABASE \"" db "\" SET timezone TO \x27UTC\x27;"
-      if (kind == "session:user" || kind == "setting:role") return "a role has its own zone: ALTER ROLE <that role> SET timezone TO \x27UTC\x27; (or RESET timezone)"
-      if (kind == "session:database user" || kind == "setting:role-in-database") return "a role has its own zone in this database: ALTER ROLE <that role> IN DATABASE \"" db "\" RESET timezone;"
+      if (kind == "session:user" || kind == "setting:role") return "a role has its own zone: ALTER ROLE \"" role "\" RESET timezone;"
+      if (kind == "session:database user" || kind == "setting:role-in-database") return "a role has its own zone in this database: ALTER ROLE \"" role "\" IN DATABASE \"" db "\" RESET timezone;"
       if (kind == "setting:all-roles") return "ALTER ROLE ALL RESET timezone;"
       return "the SERVER default is not UTC: set timezone = \x27UTC\x27 in the server configuration (local docker: the image default is UTC — check TZ/PGTZ and `-c timezone` on the container), or pin the database: ALTER DATABASE \"" db "\" SET timezone TO \x27UTC\x27;"
     }
     BEGIN { bad = 0; sessions = 0 }
-    NF != 5 || $1 !~ /^(session|setting):[a-z -]+$/ || $3 !~ /^-?[0-9]+$/ || $4 !~ /^-?[0-9]+$/ {
+    NF != 6 || $1 !~ /^(session|setting):[a-z -]+$/ || $3 !~ /^-?[0-9]+$/ || $4 !~ /^-?[0-9]+$/ {
       print "utc-zone: unreadable row in the query output (" NF " field(s)) — the time zone was not observed"; bad = 1; next
     }
     {
-      kind = $1; zone = $2; jan = $3 + 0; jul = $4 + 0; db = $5
+      kind = $1; zone = $2; jan = $3 + 0; jul = $4 + 0; db = $5; role = $6
       what = kind; sub(/^session:/, "a new session (source: ", what); if (kind ~ /^session:/) what = what ")"
-      sub(/^setting:/, "a stored setting (", what); if (kind ~ /^setting:/) what = what ")"
+      sub(/^setting:/, "a stored setting (", what); if (kind ~ /^setting:/) what = what (role == "" ? "" : ", role \"" role "\"") ")"
       printf "utc-zone: database \"%s\", %s: zone \x27%s\x27, January %s, July %s\n", db, what, zone, hhmm(jan), hhmm(jul)
       if (kind ~ /^session:/) {
         sessions++
@@ -601,7 +603,7 @@ eval_utc_zone() {
         }
       }
       if (jan != 0 || jul != 0) {
-        print "utc-zone: NOT UTC — \x27" zone "\x27 is " hhmm(jan) " in January and " hhmm(jul) " in July. Every DEFAULT now() written to a zone-less timestamp column would be off by that much. Fix: " fix(kind, db)
+        print "utc-zone: NOT UTC — \x27" zone "\x27 is " hhmm(jan) " in January and " hhmm(jul) " in July. Every DEFAULT now() written to a zone-less timestamp column would be off by that much. Fix: " fix(kind, db, role)
         bad = 1
       }
     }
@@ -795,6 +797,7 @@ cmd_utc_zone_self_test() {
   PGOPTIONS="-c timezone=UTC" check fail "America/Chicago" "Chicago database, PGOPTIONS sets UTC (must not mask it)" guard "$base/${prefix}_chicago"
   check fail "this connection set its own time zone" "a URL that sets the zone itself (options=-c timezone=UTC)" guard "$base/${prefix}_chicago?options=-c%20timezone%3DUTC"
   check fail "Asia/Tokyo" "UTC database, another role pinned to Asia/Tokyo in it" guard "$base/${prefix}_role"
+  check fail "ALTER ROLE \"${prefix}_role\" IN DATABASE \"${prefix}_role\" RESET timezone" "… and the message names the role and the fix" guard "$base/${prefix}_role"
   PGTZ=America/Chicago check pass "utc-zone: OK" "UTC database, PGTZ=America/Chicago in the shell (the shell is not the database)" guard "$base/${prefix}_utc"
   echo "fails closed when the query cannot run:"
   check fail "NOT checked" "nothing listening (port 1)" guard "postgres://postgres:postgres@127.0.0.1:1/${prefix}_utc"
@@ -971,7 +974,8 @@ STUB
   node "$tmp/stub.js" "$tmp/ports" "$planted" >/dev/null 2>&1 &
   stub_pid=$!
   # shellcheck disable=SC2064
-  trap "kill $stub_pid 2>/dev/null; rm -rf '$tmp'" EXIT
+  # `|| true`: under `set -e` a failing command inside an EXIT trap becomes the exit status.
+  trap "kill $stub_pid 2>/dev/null || true; rm -rf '$tmp'" EXIT
   local waited=0
   while [ ! -s "$tmp/ports" ] && [ "$waited" -lt 100 ]; do
     sleep 0.1
@@ -1019,16 +1023,17 @@ STUB
 
   echo "utc-zone (the verdict on the query's rows):"
   utc_rows() { printf '%s\n' "$@" >"$tmp/utc.rows" && eval_utc_zone "$tmp/utc.rows"; }
-  expect pass "Etc/UTC from the server configuration" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast"
-  expect pass "GMT, set on the database" utc_rows "session:database|GMT|0|0|neondb" "setting:database|GMT|0|0|neondb"
-  expect fail "America/Chicago" utc_rows "session:database|America/Chicago|-21600|-18000|holdfast"
-  expect fail "Europe/London (UTC in January only)" utc_rows "session:database|Europe/London|0|3600|holdfast"
-  expect fail "a zone that is UTC in July only" utc_rows "session:configuration file|Atlantic/Azores|-3600|0|holdfast"
-  expect fail "UTC session, but another role is pinned to Tokyo" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast" "setting:role-in-database|Asia/Tokyo|32400|32400|holdfast"
-  expect fail "the connection set its own zone (PGOPTIONS / options=)" utc_rows "session:client|UTC|0|0|holdfast"
-  expect fail "no session row" utc_rows "setting:database|UTC|0|0|holdfast"
+  expect pass "Etc/UTC from the server configuration" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast|"
+  expect pass "GMT, set on the database" utc_rows "session:database|GMT|0|0|neondb|" "setting:database|GMT|0|0|neondb|"
+  expect fail "America/Chicago" utc_rows "session:database|America/Chicago|-21600|-18000|holdfast|"
+  expect fail "Europe/London (UTC in January only)" utc_rows "session:database|Europe/London|0|3600|holdfast|"
+  expect fail "a zone that is UTC in July only" utc_rows "session:configuration file|Atlantic/Azores|-3600|0|holdfast|"
+  expect fail "UTC session, but another role is pinned to Tokyo" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast|" "setting:role-in-database|Asia/Tokyo|32400|32400|holdfast|app_role"
+  expect fail "the connection set its own zone (PGOPTIONS / options=)" utc_rows "session:client|UTC|0|0|holdfast|"
+  expect fail "no session row" utc_rows "setting:database|UTC|0|0|holdfast|"
   expect fail "an error instead of rows" utc_rows 'psql: error: connection to server failed'
-  expect fail "offsets missing" utc_rows "session:database|UTC|||holdfast"
+  expect fail "a row in the old five-field shape" utc_rows "session:database|UTC|0|0|holdfast"
+  expect fail "offsets missing" utc_rows "session:database|UTC|||holdfast|"
   : >"$tmp/utc.empty"
   expect fail "empty output" eval_utc_zone "$tmp/utc.empty"
   expect fail "no output file" eval_utc_zone "$tmp/utc.absent"
