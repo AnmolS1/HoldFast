@@ -22,6 +22,7 @@ import { createScope } from "../../../src/worker/auth/scope";
 import {
   BREACHED_TEST_PASSWORDS,
   installTestOutbound,
+  realAdminAddresses,
   routeTestOutbound,
   testGoogleCode,
   testOutbound,
@@ -337,6 +338,42 @@ describe("third parties under `vite dev` (test mode, not the unit-test environme
       state,
     );
     expect(await token.json()).toMatchObject({ token_type: "Bearer" });
+    expect(network).toEqual([]);
+  });
+
+  it("T19 — the stand-in Google never vouches for a REAL admin mailbox: only test admins at reserved domains", async () => {
+    // What a developer's `.dev.vars` may hold: their own address, beside the test admins.
+    const realAdmins = realAdminAddresses(
+      " Operator@Gmail.com , admin@example.test,*@e2e-admin.example, ops@holdfast.ponderance.dev ",
+    );
+    expect([...realAdmins].sort()).toEqual(["operator@gmail.com", "ops@holdfast.ponderance.dev"]);
+    const exchange = (email: unknown) =>
+      routeTestOutbound(
+        new Request("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          body: new URLSearchParams({
+            code: testGoogleCode({ sub: "1", email: email as string }),
+            client_id: "c",
+          }),
+        }),
+        { ...state, realAdmins },
+      );
+    network.length = 0;
+    for (const email of [
+      "operator@gmail.com",
+      "OPERATOR@GMAIL.COM",
+      " ops@holdfast.ponderance.dev",
+      undefined,
+    ]) {
+      const refused = await exchange(email);
+      expect(refused.status, String(email)).toBe(400);
+      expect(await refused.json(), String(email)).toEqual({ error: "invalid_grant" });
+    }
+    // The control: a test admin, and anybody who is not an admin, get a token.
+    for (const email of ["admin@example.test", "someone@gmail.com"]) {
+      expect((await exchange(email)).status, email).toBe(200);
+    }
+    // Refused here — never passed on to Google.
     expect(network).toEqual([]);
   });
 

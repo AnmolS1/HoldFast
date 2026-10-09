@@ -18,14 +18,21 @@
 //                                other than the URL itself, or the check checks nothing.
 //   --i-know-this-is-prod        for the production go-live checks, and nothing else.
 //
+// WHICH USER. Only a user THIS SCRIPT made (T20): the address must be a seed address — its local
+// part starts with `remote-spec`, at holdfast.ponderance.dev or at a reserved test domain
+// (`.example`, `.test`) — and an existing row is reused, changed or deleted only if it carries
+// the script's own marker (a `verification` row `create-session:<user id>`, which nothing a user
+// can do writes). Anyone can SIGN UP with a seed-shaped address and choose its password; without
+// the marker rule this script would then verify that row, lift its suspension and hand out a
+// session — or, with `--delete`, remove a real person's account past the deletion rules.
+//
 // The rows are what Better Auth itself would have written: ids from its own generator (32
 // characters of [A-Za-z0-9] — never a UUID), the session token likewise, and the cookie signed
 // by the library's own cookie serializer with that environment's secret, under the name the
 // Worker uses there (`__Host-hf.session_token` on https, `hf.session_token` on plain http).
 
-import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { generateId } from "@better-auth/core/utils/id";
@@ -33,78 +40,26 @@ import { hashPassword } from "better-auth/crypto";
 import { serializeSignedCookie } from "better-call";
 import { eq } from "drizzle-orm";
 import { withDb, type Db } from "../src/worker/db/client";
-import { account, session, settings, user, userPrefs } from "../src/worker/db/schema";
+import { account, session, settings, user, userPrefs, verification } from "../src/worker/db/schema";
 import { redactText } from "../src/shared/sentry-redact";
+import { classifyTarget, isSeedAddress, outsideRepo } from "./lib/session-target";
 
-const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_EMAIL = "remote-spec@holdfast.ponderance.dev";
 /** The default of the `TERMS_VERSION` var; the `settings` row, when there is one, wins. */
 const DEFAULT_TERMS_VERSION = "2026-10";
 
-export type Target = "local" | "non-prod" | "prod";
+const markerOf = (userId: string) => `create-session:${userId}`;
 
-/**
- * Where a database URL points, and whether this run may touch it. Throws when it may not.
- * Decided from the URL and the flags alone — no connection is made.
- */
-export function classifyTarget(
-  rawUrl: string | undefined,
-  flags: { nonProdHost?: string; iKnowThisIsProd?: boolean },
-): { url: string; host: string; target: Target } {
-  if (!rawUrl) throw new Error("DATABASE_URL_DIRECT is not set in this shell");
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    throw new Error("DATABASE_URL_DIRECT is not a URL");
-  }
-  if (!/^postgres(ql)?:$/.test(url.protocol)) throw new Error("DATABASE_URL_DIRECT is not a postgres URL");
-  const host = url.hostname.toLowerCase();
-  if (LOCAL_HOSTS.has(host)) return { url: url.toString(), host, target: "local" };
-  // A hosted database is asked for full certificate verification.
-  url.searchParams.set("sslmode", "verify-full");
-  if (flags.iKnowThisIsProd) return { url: url.toString(), host, target: "prod" };
-  if (flags.nonProdHost !== undefined && flags.nonProdHost.trim().toLowerCase() === host) {
-    return { url: url.toString(), host, target: "non-prod" };
-  }
-  throw new Error(
-    `refusing to touch the database at ${host}: a database that is not on this machine is presumed to be ` +
-      "PRODUCTION. Pass --non-prod-host <that host> if it is the non-production database, or " +
-      "--i-know-this-is-prod if production is really meant.",
-  );
+/** Did this script make that user? */
+async function isOurs(db: Db, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: verification.id })
+    .from(verification)
+    .where(eq(verification.identifier, markerOf(userId)));
+  return rows.length > 0;
 }
-
-/** Is `path` the directory `root` or something under it? */
-function isUnder(root: string, path: string): boolean {
-  const inside = relative(root, path);
-  return inside === "" || (!inside.startsWith("..") && !isAbsolute(inside));
-}
-
-/** The main checkout too, when this file lives in a git worktree of it. */
-function repositoryRoots(): string[] {
-  const roots = [REPO_ROOT];
-  try {
-    const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
-      cwd: REPO_ROOT,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (common) roots.push(dirname(common));
-  } catch {
-    // Not a git checkout: the script's own tree is all there is to protect.
-  }
-  return roots;
-}
-
-/** `--out` resolved, and refused when it lies inside the repository (a secret must not land there). */
-export function outsideRepo(out: string, roots: string[] = repositoryRoots()): string {
-  const path = resolve(out);
-  if (roots.some((root) => isUnder(root, path))) {
-    throw new Error("--out must be a path OUTSIDE the repository (use a `mktemp -d` directory)");
-  }
-  return path;
-}
+const NOT_OURS =
+  "refusing: a user with that address exists and was NOT made by this script — it is not reused, changed or deleted";
 
 async function currentTermsVersion(db: Db): Promise<string> {
   const [row] = await db
@@ -117,6 +72,8 @@ async function currentTermsVersion(db: Db): Promise<string> {
 async function removeUser(db: Db, email: string): Promise<boolean> {
   const [row] = await db.select({ id: user.id }).from(user).where(eq(user.email, email));
   if (!row) return false;
+  if (!(await isOurs(db, row.id))) throw new Error(NOT_OURS);
+  await db.delete(verification).where(eq(verification.identifier, markerOf(row.id)));
   // Sessions, accounts and preferences go with the user (ON DELETE CASCADE); a user that owns
   // files is not a seeded test user and is left alone by the foreign keys.
   await db.delete(session).where(eq(session.userId, row.id));
@@ -145,6 +102,7 @@ async function ensureUser(
   };
   const [existing] = await db.select({ id: user.id }).from(user).where(eq(user.email, email));
   if (existing) {
+    if (!(await isOurs(db, existing.id))) throw new Error(NOT_OURS);
     await db.update(user).set(wanted).where(eq(user.id, existing.id));
     return { id: existing.id, created: false };
   }
@@ -161,6 +119,15 @@ async function ensureUser(
     updatedAt: now,
   });
   await db.insert(userPrefs).values({ userId: id }).onConflictDoNothing();
+  // The marker: this row is the script's (it never expires in practice, and names no secret).
+  await db.insert(verification).values({
+    id: generateId(),
+    identifier: markerOf(id),
+    value: "1",
+    expiresAt: new Date(now.getTime() + 10 * 365 * 86_400_000),
+    createdAt: now,
+    updatedAt: now,
+  });
   return { id, created: true };
 }
 
@@ -181,6 +148,11 @@ async function main(): Promise<void> {
   });
   const email = (values.email ?? DEFAULT_EMAIL).trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("--email is not an address");
+  if (!isSeedAddress(email)) {
+    throw new Error(
+      "--email must be a seed address: remote-spec…@holdfast.ponderance.dev, or remote-spec…@ a .example / .test domain",
+    );
+  }
   if (values.role !== undefined && values.role !== "admin" && values.role !== "user") {
     throw new Error("--role must be admin or user");
   }
@@ -260,7 +232,7 @@ async function main(): Promise<void> {
   );
 }
 
-// Run only as a script (the two pure functions above are imported by a test).
+// Run only as a script. (Its pure decisions live in ./lib/session-target.ts, where a test imports them.)
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error: unknown) => {
     // The message only, with any URL removed: a driver error can carry the connection string.

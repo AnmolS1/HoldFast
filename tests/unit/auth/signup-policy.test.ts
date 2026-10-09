@@ -372,6 +372,38 @@ describe("velocity: a day's sign-ups per subject", () => {
     expect((await signUp(newClient())).sent.status).toBe(200);
   });
 
+  // T8 — one IPv6 subscriber owns a whole /64 (2^64 addresses): counted by the raw address, the
+  // per-address limit would never be reached.
+  it("IPv6: the per-address limit is per /64, and the network limit per /48 — whatever spelling the address arrives in", async () => {
+    const net = () => crypto.getRandomValues(new Uint16Array(1))[0]!.toString(16);
+    const site = `2001:db8:${net()}`;
+    const subscriber = `${site}:${net()}`;
+    const day = dayUTC(new Date());
+    // Three sign-ups from three DIFFERENT addresses of one /64 — one of them spelled in upper case.
+    const addresses = [
+      `${subscriber}::1`,
+      `${subscriber}:ffff:ffff:ffff:ffff`,
+      `${subscriber.toUpperCase()}:0:0:0:ABCD`,
+    ];
+    expect(addresses).toHaveLength(SIGNUP_VELOCITY_DEFAULTS.signupIpDay);
+    for (const ip of addresses) expect((await signUp(newClient({ ip }))).sent.status, ip).toBe(200);
+    // All three are ONE subject …
+    const subject = await ipHashDaily(keys, addresses[0]!, day);
+    for (const ip of addresses) expect(await ipHashDaily(keys, ip, day), ip).toBe(subject);
+    expect(await ledgerCount("signup_ip", subject)).toBe(3);
+    // … so a fourth address of that /64 is refused.
+    await expectRefused("SIGNUP_LIMIT", {}, newClient({ ip: `${subscriber}:1:2:3:4` }));
+    expect(await ledgerCount("signup_ip", subject)).toBe(3);
+    // The control: another /64 of the same /48 has its own per-address count — and shares the
+    // network's (the /48), which now stands at four.
+    const neighbour = `${site}:${(parseInt(subscriber.split(":")[3]!, 16) ^ 1).toString(16)}::1`;
+    expect(await ipHashDaily(keys, neighbour, day)).not.toBe(subject);
+    expect((await signUp(newClient({ ip: neighbour }))).sent.status).toBe(200);
+    const network = await ipHashDaily(keys, ipPrefix(neighbour), day);
+    expect(await ipHashDaily(keys, ipPrefix(addresses[1]!), day)).toBe(network);
+    expect(await ledgerCount("signup_ip24", network)).toBe(4);
+  });
+
   it("no oracle: over the limit, a sign-up with an address that HAS an account is refused exactly like a new one", async () => {
     const existing = (await signUp(newClient())).email;
     const ip = freshIp();

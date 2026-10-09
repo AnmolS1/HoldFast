@@ -48,6 +48,8 @@ type Handler = (request: Request, url: URL) => Promise<Response> | Response;
 type State = {
   original: typeof fetch;
   strict: boolean;
+  /** Addresses the stand-in Google must never vouch for (see `googleToken`). */
+  realAdmins: ReadonlySet<string>;
   calls: TestOutboundCall[];
   /** Extra hosts a test answers itself (the Resend API, a failing DoH …). Checked first. */
   overrides: Map<string, Handler>;
@@ -100,8 +102,27 @@ export function testGoogleCode(profile: TestGoogleProfile): string {
   return `test.${base64Url(JSON.stringify(profile))}`;
 }
 
-/** Null: not a test code — a real authorization code from a real Google sign-in in local dev. */
-async function googleToken(request: Request): Promise<Response | null> {
+const RESERVED_DOMAIN = /\.(?:example|test)$/;
+
+/** The ADMIN_EMAILS entries that are real mailboxes — everything not at a reserved test domain. */
+export function realAdminAddresses(list: string | undefined): Set<string> {
+  return new Set(
+    (list ?? "")
+      .split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry !== "" && !RESERVED_DOMAIN.test(entry)),
+  );
+}
+
+/**
+ * Null: not a test code — a real authorization code from a real Google sign-in in local dev.
+ *
+ * The stand-in vouches for whatever address the test code names. So it REFUSES an address on
+ * ADMIN_EMAILS that is a real mailbox (T19): a local dev server reached through a tunnel would
+ * otherwise hand the admin role, on the developer's database, to anyone who can type
+ * `test.<base64>`. Test admins live at reserved domains (`.example`, `.test`) and are not affected.
+ */
+async function googleToken(request: Request, state: Pick<State, "realAdmins">): Promise<Response | null> {
   const form = new URLSearchParams(await request.clone().text());
   const code = form.get("code") ?? "";
   if (!code.startsWith("test.")) return null;
@@ -110,6 +131,9 @@ async function googleToken(request: Request): Promise<Response | null> {
     const padded = code.slice(5).replace(/-/g, "+").replace(/_/g, "/");
     profile = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(padded), (c) => c.charCodeAt(0))));
   } catch {
+    return json({ error: "invalid_grant" }, 400);
+  }
+  if (typeof profile?.email !== "string" || state.realAdmins.has(profile.email.trim().toLowerCase())) {
     return json({ error: "invalid_grant" }, 400);
   }
   const nowSeconds = Math.floor(Date.now() / 1000);
@@ -154,9 +178,9 @@ async function turnstile(request: Request, state: State): Promise<Response | nul
  */
 export async function routeTestOutbound(
   request: Request,
-  state: Pick<State, "original" | "strict"> & Partial<Pick<State, "calls" | "overrides">>,
+  state: Pick<State, "original" | "strict"> & Partial<Pick<State, "calls" | "overrides" | "realAdmins">>,
 ): Promise<Response> {
-  return route(request, { calls: [], overrides: new Map(), ...state });
+  return route(request, { calls: [], overrides: new Map(), realAdmins: new Set(), ...state });
 }
 
 async function route(request: Request, state: State): Promise<Response> {
@@ -171,7 +195,7 @@ async function route(request: Request, state: State): Promise<Response> {
   if (host === "api.pwnedpasswords.com" && url.pathname.startsWith("/range/")) return pwnedRange(url);
   if (host === "cloudflare-dns.com" && url.pathname === "/dns-query") return dnsAnswer(url);
   if (host === "oauth2.googleapis.com" && url.pathname === "/token") {
-    const answered = await googleToken(request);
+    const answered = await googleToken(request, state);
     if (answered) return answered;
   }
   if (host === "challenges.cloudflare.com" && url.pathname.endsWith("/siteverify")) {
@@ -185,7 +209,12 @@ async function route(request: Request, state: State): Promise<Response> {
   return state.original(request);
 }
 
-type ModeEnv = { EMAIL_TRANSPORT?: string; SENTRY_ENVIRONMENT?: string; APP_ORIGIN?: string };
+type ModeEnv = {
+  EMAIL_TRANSPORT?: string;
+  SENTRY_ENVIRONMENT?: string;
+  APP_ORIGIN?: string;
+  ADMIN_EMAILS?: string;
+};
 
 /**
  * Wraps the global `fetch` — in test mode only, once per isolate. Returns whether the stand-ins
@@ -198,6 +227,7 @@ export function installTestOutbound(env: ModeEnv): boolean {
   const state: State = {
     original,
     strict: env.SENTRY_ENVIRONMENT === "test",
+    realAdmins: realAdminAddresses(env.ADMIN_EMAILS),
     calls: [],
     overrides: new Map(),
   };
