@@ -12,6 +12,28 @@ import {
   type CoreDeps,
 } from "../services/request-context";
 
+/** The largest unread request body that is read to its end before the response goes out. */
+export const DRAIN_MAX_BYTES = 64 * 1024;
+
+/**
+ * Reads and discards a small request body that no handler read (a request refused by CSRF, a
+ * guard, a rate limit, a 404 …). An unread body makes the server in front close the connection
+ * after the response; under `vite dev` the proxy's connection pool then gives that closing socket
+ * to the next request, which fails with "fetch failed" (a 500 for an unrelated request).
+ * Only a body whose declared length is at most `DRAIN_MAX_BYTES`: an upload that is refused is
+ * never buffered, and a body of unknown length is left alone.
+ */
+async function drainUnreadBody(request: Request): Promise<void> {
+  if (request.body === null || request.bodyUsed) return;
+  const declared = request.headers.get("content-length");
+  if (declared === null || !/^\d+$/.test(declared) || Number(declared) > DRAIN_MAX_BYTES) return;
+  try {
+    await request.arrayBuffer();
+  } catch {
+    // The client went away, or the body was already locked: nothing left to read.
+  }
+}
+
 /** A route pattern without its parameter regexes: `/api/nodes/:id`, never a concrete path. */
 function routeTag(pattern: string): string {
   return pattern.replace(/\{(?:[^{}]|\{[^{}]*\})*\}/g, "");
@@ -50,6 +72,7 @@ export function requestContext(core: CoreDeps): MiddlewareHandler<AppEnv> {
         route,
         ms: Date.now() - started,
       });
+      await drainUnreadBody(c.req.raw);
       finishRequestContext(c);
     }
   };

@@ -14,7 +14,18 @@ import { PublicConfig } from "../../../src/shared/public-config";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { BA_ID_PARAM, TOKEN_PARAM, UUID_PARAM } from "../../../src/shared/ids";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
-import { appWith, call, fakeCore, sameOrigin, signIn, type CallOptions, type FakeCore } from "./helpers";
+import {
+  ALLOW_ALL,
+  appWith,
+  call,
+  fakeCore,
+  fakeCtx,
+  sameOrigin,
+  signIn,
+  testEnv,
+  type CallOptions,
+  type FakeCore,
+} from "./helpers";
 import { parsePath } from "./registry-check";
 
 // Probes under /api/auth/ use paths the auth router does not declare (it answers only
@@ -420,6 +431,54 @@ describe("rate limit", () => {
     const { send } = setup();
     const broken = { limit: async () => Promise.reject(new Error("limiter down")) };
     expect((await send("/api/nodes", { env: { RL_API: broken } })).status).toBe(200);
+  });
+});
+
+// A request refused before any handler read its body (CSRF, a 404, a 429 …) leaves that body on
+// the connection, and the server in front then closes the connection instead of reusing it. Under
+// `vite dev` the proxy's connection pool hands the dying socket to the next request, which fails
+// with "fetch failed" → 500: one early-refused POST poisons an unrelated request.
+describe("a request body nobody read", () => {
+  const send = async (init: { method: string; body?: string; length?: string; origin?: string }) => {
+    const fake = fakeCore();
+    const app = appWith(fake, { extraRouters: [probeRouter()] });
+    const request = new Request(`${TEST_APP_ORIGIN}/api/nodes/folder`, {
+      method: init.method,
+      headers: {
+        origin: init.origin ?? "https://evil.example",
+        ...(init.body === undefined ? {} : { "content-type": "application/json" }),
+        ...(init.length === undefined ? {} : { "content-length": init.length }),
+      },
+      body: init.body,
+    });
+    const ctx = fakeCtx();
+    const response = await app.fetch(request, testEnv(ALLOW_ALL), ctx);
+    await response.text();
+    await ctx.settle();
+    return { request, status: response.status };
+  };
+
+  it("is read to its end before the refusal is answered, when it is small", async () => {
+    const refused = await send({ method: "POST", body: '{"name":"x"}', length: "12" });
+    expect(refused.status).toBe(403);
+    expect(refused.request.bodyUsed).toBe(true);
+  });
+
+  it("is left alone when it is large or of unknown length (an upload is never buffered to refuse it)", async () => {
+    const large = await send({ method: "POST", body: "x".repeat(70_000), length: "70000" });
+    expect(large.status).toBe(403);
+    expect(large.request.bodyUsed).toBe(false);
+    const unknown = await send({ method: "POST", body: "{}" });
+    expect(unknown.status).toBe(403);
+    expect(unknown.request.bodyUsed).toBe(false);
+    const lying = await send({ method: "POST", body: "{}", length: "not-a-number" });
+    expect(lying.request.bodyUsed).toBe(false);
+  });
+
+  it("changes nothing for a request without a body", async () => {
+    const read = await send({ method: "GET" });
+    expect(read.status).toBe(200);
+    expect(read.request.bodyUsed).toBe(false);
   });
 });
 
