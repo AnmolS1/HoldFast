@@ -302,6 +302,32 @@ describe("3. leaving the re-auth modal", () => {
     expect(screen.getByRole("dialog", { name: "Your session ended" })).toBeTruthy();
   });
 
+  // With the server answering "nobody" on the first session read after a session ends, the
+  // session query is often already null when the dialog opens — or turns null while it is open.
+  it("the dialog signs the SAME address in even when the session query already holds null, or turns null while it is open", async () => {
+    for (const when of ["before the dialog opens", "while it is open"] as const) {
+      const scene = await aliceWithHeldRequest(() => ALICE);
+      const signIn = vi.spyOn(authClient.signIn, "email").mockImplementation(async () => {
+        scene.signInAs();
+        return { data: {}, error: null };
+      });
+      if (when === "before the dialog opens") queryClient.setQueryData(["session"], null);
+      const view = renderShell(<ReauthDialog />);
+      const email = (await screen.findByLabelText("Email")) as HTMLInputElement;
+      if (when === "while it is open") {
+        queryClient.setQueryData(["session"], null);
+        await flush();
+      }
+      expect(email.value, when).toBe(ALICE!.user.email);
+      fireEvent.change(screen.getByLabelText("Password"), { target: { value: "correct horse" } });
+      fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+      await expect(scene.held, when).resolves.toEqual({ deleted: true, as: ALICE!.user.id });
+      expect(signIn.mock.calls.at(-1)![0], when).toMatchObject({ email: ALICE!.user.email });
+      view.unmount();
+      signIn.mockRestore();
+    }
+  });
+
   it("the email in the modal is the expired account's and cannot be edited", async () => {
     await aliceWithHeldRequest(() => ALICE);
     renderShell(<ReauthDialog />);

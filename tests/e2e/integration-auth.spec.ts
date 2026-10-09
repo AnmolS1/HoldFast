@@ -3,10 +3,9 @@
 // with the identity guard; a session past its deletion date; the operator's bootstrap invite.
 // Nothing under /api is mocked. The Turnstile widget script is the stand-in; Google is not used.
 //
-// "A session that has really ended": the session row is deleted in the database AND the browser
-// loses the signed cookie cache (`hf.session_data`), from which the Worker would otherwise go on
-// answering for up to 60 seconds. After that the next request under /api carries a session
-// cookie that names nothing, and the server — not a mock — answers 401.
+// "A session that has really ended": the session row is deleted in the database. The browser
+// still sends its session cookie and the signed cookie cache (`hf.session_data`); the server —
+// not a mock — reads the database, finds nobody, and answers 401 from the next request on.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { BrowserContext, Page } from "@playwright/test";
@@ -43,16 +42,20 @@ const deletionDate = async (userId: string) =>
     )
   ).rows[0]?.delete_scheduled_at ?? null;
 
-/** Ends every session of the user for real: the rows, and this browser's cached copy. */
+/**
+ * Ends every session of the user for real: the rows are deleted. The browser keeps BOTH its
+ * cookies — the session token and Better Auth's 60-second cookie cache — and neither is worth
+ * anything from the next request on (the server asks the database, not the cache).
+ */
 async function endSessionsOf(context: BrowserContext, userId: string): Promise<void> {
+  const cookies = await context.cookies();
+  expect(cookies.some((cookie) => cookie.name.includes("session_token"))).toBe(true);
+  expect(
+    cookies.some((cookie) => cookie.name.includes("session_data")),
+    "the cookie cache is held",
+  ).toBe(true);
   const removed = await localDb((db) => db.query("DELETE FROM session WHERE user_id = $1", [userId]));
   expect(removed.rowCount, "the user had a session row").toBeGreaterThan(0);
-  const cookies = await context.cookies();
-  const cache = cookies.filter((cookie) => cookie.name.includes("session_data"));
-  expect(cache.length, "the browser held the cookie cache").toBeGreaterThan(0);
-  for (const cookie of cache) await context.clearCookies({ name: cookie.name });
-  // The session cookie itself stays — a browser whose session ended still sends it.
-  expect((await context.cookies()).some((cookie) => cookie.name.includes("session_token"))).toBe(true);
 }
 
 /** Schedules the signed-in user's deletion the real way: Better Auth's request, then the mailed link. */
@@ -186,6 +189,74 @@ test.describe("re-authentication after the session really ended", () => {
     // Nothing of A is on B's screen: no banner about a deletion B never asked for, no A address.
     await expect(page.getByText(/This account is scheduled for deletion on /)).toHaveCount(0);
     expect(await page.evaluate(() => document.body.innerText)).not.toContain(user.email);
+  });
+});
+
+test.describe("a suspended account", () => {
+  test("cannot sign in with its passkey; the session it had is nobody on the next request", async ({
+    page,
+    clientIp,
+    origins,
+    virtualAuthenticator,
+  }, testInfo) => {
+    test.skip(testInfo.project.name !== "chromium", "one virtual authenticator, one project");
+    await stubTurnstile(page);
+    const user = await signedInUser(page, { clientIp });
+    await page.goto("/");
+    await expectSignedIn(page);
+    const registered = await page.evaluate(async () => {
+      const path = "/src/client/lib/auth-client.ts";
+      const { betterAuthClient } = (await import(/* @vite-ignore */ path)) as {
+        betterAuthClient: {
+          passkey: { addPasskey(input: { name: string }): Promise<{ error?: unknown } | undefined> };
+        };
+      };
+      return (await betterAuthClient.passkey.addPasskey({ name: "key" }))?.error ? "error" : "ok";
+    });
+    expect(registered).toBe("ok");
+    expect(await virtualAuthenticator.credentials()).toHaveLength(1);
+
+    // Control: in good standing the passkey signs in.
+    await page.request.post("/api/auth/sign-out", {
+      headers: { origin: origins.app, "cf-connecting-ip": clientIp },
+      data: {},
+    });
+    await page.goto("/login");
+    await page.getByRole("button", { name: "Continue with passkey" }).click();
+    await expectSignedIn(page);
+    expect((await sessionUser(page))?.id).toBe(user.id);
+
+    // What suspendUser does (the admin console that calls it is a later task): the flag, and
+    // every session row gone. The browser keeps its cookies — session token and cookie cache.
+    await localDb(async (db) => {
+      await db.query(
+        `UPDATE "user" SET suspended_at = (now() AT TIME ZONE 'UTC'), suspended_reason = 'e2e' WHERE id = $1`,
+        [user.id],
+      );
+      await db.query("DELETE FROM session WHERE user_id = $1", [user.id]);
+    });
+    expect((await page.context().cookies()).some((cookie) => cookie.name.includes("session_data"))).toBe(
+      true,
+    );
+    // The very next request with those cookies is nobody: no 60-second grace from the cache.
+    const next = await page.request.get("/api/account/deletion-status");
+    expect(next.status()).toBe(401);
+    const write = await page.request.post("/api/auth/update-user", {
+      headers: { origin: origins.app, "cf-connecting-ip": clientIp },
+      data: { name: "Still Here" },
+    });
+    expect(write.status()).toBe(401);
+
+    // And the passkey starts no session.
+    await page.goto("/login");
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    await page.getByRole("button", { name: "Continue with passkey" }).click();
+    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+    expect(await sessionUser(page)).toBeNull();
+    expect(
+      (await localDb((db) => db.query("SELECT 1 FROM session WHERE user_id = $1", [user.id]))).rowCount,
+    ).toBe(0);
   });
 });
 

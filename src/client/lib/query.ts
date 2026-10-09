@@ -29,10 +29,19 @@ export const queryClient = createQueryClient();
 // session ending (so a re-authentication can be compared with it) and is forgotten only by an
 // explicit purge.
 let knownUserId: string | null = null;
+// The address that goes with it: the re-auth dialog signs THAT account in again, and by the time
+// it opens the session query may already hold `null` (the server now says "nobody" on the very
+// first read after a session ends, not a minute later).
+let knownUserEmail: string | null = null;
 
 /** The account the in-memory state belongs to, or null when there is none. */
 export function getKnownUserId(): string | null {
   return knownUserId;
+}
+
+/** The address of that account, for the re-auth dialog. Null when there is none. */
+export function getKnownUserEmail(): string | null {
+  return knownUserEmail;
 }
 
 const SESSION_KEY = "session";
@@ -55,6 +64,7 @@ export async function purgeUserState(options: { keepSession?: boolean } = {}): P
   if (!options.keepSession) {
     queryClient.setQueryData([SESSION_KEY], null);
     knownUserId = null;
+    knownUserEmail = null;
   }
   await runUserStatePurgers();
 }
@@ -70,12 +80,14 @@ export async function adoptIdentity(session: SessionShape): Promise<boolean> {
   const changed = knownUserId !== null && knownUserId !== next;
   if (changed) await purgeUserState({ keepSession: true });
   knownUserId = next;
+  knownUserEmail = session?.user.email ?? null;
   return changed;
 }
 
 /** Tests only. */
 export function resetIdentityForTests(): void {
   knownUserId = null;
+  knownUserEmail = null;
 }
 
 /**

@@ -12,6 +12,7 @@ import { t } from "../../lib/i18n";
 import {
   confirmReauthIdentity,
   getCachedSession,
+  getKnownUserEmail,
   getKnownUserId,
   purgeUserState,
   usePublicConfig,
@@ -25,8 +26,10 @@ import { Field, FormError, PasskeyIcon, TurnstileBox } from "./parts";
 function ReauthForm() {
   const config = usePublicConfig().data;
   const turnstile = useTurnstile(config?.turnstileSiteKey);
-  // The session query still holds the user the session belonged to.
-  const email = getCachedSession()?.user.email ?? "";
+  // Whose session ended — read ONCE, when the dialog opens. The session query cannot be trusted
+  // to still hold that user: its next refetch answers `null`, and the dialog would then try to
+  // sign in an empty address.
+  const [email] = useState(() => getCachedSession()?.user.email ?? getKnownUserEmail() ?? "");
   // Whose session ended. The held requests carry THAT person's intent.
   const [expectedUserId] = useState(() => getCachedSession()?.user.id ?? getKnownUserId());
   const [password, setPassword] = useState("");
