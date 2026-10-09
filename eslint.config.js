@@ -49,14 +49,32 @@ export default tseslint.config(
   {
     // Deferred work goes through defer(c, p): a raw waitUntil is not awaited before the database
     // pool closes. Only the request context and the Worker entry may call it.
+    // A JSON body is read with jsonBody(c): c.req.json() turns a malformed body into a 500.
     files: ["src/worker/**/*.ts"],
-    ignores: ["src/worker/services/request-context.ts", "src/worker/index.ts"],
+    ignores: ["src/worker/services/body.ts", "src/worker/services/request-context.ts", "src/worker/index.ts"],
     rules: {
       "no-restricted-syntax": [
         "error",
         {
           selector: "CallExpression[callee.property.name='waitUntil']",
           message: "Use defer(c, promise) from services/request-context (or bg.defer / deps.defer).",
+        },
+        {
+          selector: "CallExpression[callee.property.name='json'][callee.object.property.name='req']",
+          message: "Use jsonBody(c) from services/body: c.req.json() answers a malformed body with a 500.",
+        },
+      ],
+    },
+  },
+  {
+    // In the two files that may call waitUntil, the body rule still applies.
+    files: ["src/worker/services/request-context.ts", "src/worker/index.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "CallExpression[callee.property.name='json'][callee.object.property.name='req']",
+          message: "Use jsonBody(c) from services/body: c.req.json() answers a malformed body with a 500.",
         },
       ],
     },

@@ -12,6 +12,7 @@ import { dayUTC, ipHashDaily, ipHashStable, ipPrefix, normalise } from "../../..
 import { createKeys, hmacHex, KEY_PURPOSES } from "../../../src/worker/services/keys";
 import { metric, writeMetric } from "../../../src/worker/services/metrics";
 import * as outbox from "../../../src/worker/services/outbox";
+import { jsonBody } from "../../../src/worker/services/body";
 import { checkRateLimit, enforceRateLimit } from "../../../src/worker/services/ratelimit";
 import {
   deps,
@@ -33,8 +34,14 @@ describe("error envelope", () => {
     throw new Error('SELECT * FROM "user" WHERE secret = hunter2 — connection string postgres://u:p@h/db');
   });
   router.post("/_zod", async (c) => {
-    z.object({ name: z.string().min(1) }).parse(await c.req.json());
+    z.object({ name: z.string().min(1) }).parse(await jsonBody(c));
     return c.json({ ok: true });
+  });
+  router.post("/_json", async (c) => c.json({ got: await jsonBody(c) }));
+  router.get("/_syntax-bug", () => {
+    // A SyntaxError of the server's own (a bad stored value, say) is still a fault, not a 400.
+    JSON.parse("{not json");
+    throw new Error("unreachable");
   });
   const app = () => appWith(fakeCore(), { extraRouters: [router] });
 
@@ -83,6 +90,40 @@ describe("error envelope", () => {
     const body = (await response.json()) as { error: string; details: { issues: Array<{ path: string }> } };
     expect(body.error).toBe("validation");
     expect(body.details.issues.map((issue) => issue.path)).toEqual(["name"]);
+  });
+
+  // The body is the client's: one that is not JSON is the client's mistake (400), not a fault
+  // (500 and an error report per request).
+  it("a request body that is not JSON is a 400 validation, never a 500", async () => {
+    const post = (body: string | undefined, type = "application/json") =>
+      call(app(), "/api/_json", { method: "POST", headers: { ...sameOrigin, "content-type": type }, body });
+    for (const bad of ["{not json", "", "{", '{"a":1}trailing', "\u0000", "undefined", "'single'"]) {
+      const { response, ctx } = await post(bad === "" ? undefined : bad);
+      expect(response.status, JSON.stringify(bad)).toBe(400);
+      const body = (await response.json()) as {
+        error: string;
+        details?: { reason?: string };
+        message: string;
+      };
+      expect(body.error).toBe("validation");
+      expect(body.details).toEqual({ reason: "malformed_json" });
+      // Nothing of the parser's own message (it quotes the input).
+      expect(body.message).not.toMatch(/token|position|JSON\.parse|Unexpected/i);
+      await ctx.settle();
+    }
+    for (const good of ['{"a":1}', "[1,2]", '"text"', "null", "12"]) {
+      const { response, ctx } = await post(good);
+      expect(response.status, good).toBe(200);
+      expect(await response.json()).toEqual({ got: JSON.parse(good) as unknown });
+      await ctx.settle();
+    }
+  });
+
+  it("a SyntaxError that is the server's own is still a 500", async () => {
+    const { response, ctx } = await call(app(), "/api/_syntax-bug");
+    expect(response.status).toBe(500);
+    expect(((await response.json()) as { error: string }).error).toBe("internal");
+    await ctx.settle();
   });
 
   it("AppError derives its status from the table and only from it", () => {
