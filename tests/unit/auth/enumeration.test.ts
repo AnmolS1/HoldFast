@@ -149,6 +149,26 @@ describe("sign-up: an address that has an account, and one that has none", () =>
     }
   });
 
+  it("over the day's limit both are refused alike — and before any password is hashed", async () => {
+    const existing = await verifiedUser();
+    const settings = { signupMode: "open" as const, ceilings: { signupIpDay: 1 } };
+    const refusals: Sent[] = [];
+    for (const email of [existing.email, freshEmail()]) {
+      const client = newClient({ settings });
+      expect((await signUp(client, { inviteCode: null })).sent.status).toBe(200);
+      const before = scryptRuns();
+      const refused = await signUp(client, { email, inviteCode: null });
+      expect(refused.sent.status, email).toBe(400);
+      expect(errorOf(refused.sent)?.code).toBe("SIGNUP_LIMIT");
+      // The limit is read before the expensive part of a sign-up: a refused request has not
+      // made the Worker hash a password or ask the breach corpus about it.
+      expect(scryptRuns() - before, email).toBe(0);
+      refusals.push(refused.sent);
+    }
+    expect(outline(refusals[0]!)).toEqual(outline(refusals[1]!));
+    expect(refusals[0]!.body).toEqual(refusals[1]!.body);
+  });
+
   it("nothing about the existing account changes, and its owner is told — with a notice, not a verification link", async () => {
     const existing = await verifiedUser();
     const before = await userByEmail(existing.email);

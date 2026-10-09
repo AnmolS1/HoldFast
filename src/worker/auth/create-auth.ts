@@ -9,8 +9,8 @@ import "./als-preseed"; // MUST stay the first import: Better Auth issue #10315,
 // whatever Better Auth runs "in the background" (the mails, its rate-limit pruning) is drained
 // before the database pool closes.
 //
-// Ids: Better Auth's own generator (32 characters of [A-Za-z0-9]) — `advanced.database.generateId`
-// is deliberately not set. Our own tables use UUIDs; the two families never mix.
+// Ids: Better Auth's own (32 characters of [A-Za-z0-9]) — no id function is configured under
+// `advanced.database`, deliberately. Our own tables use UUIDs; the two families never mix.
 //
 // The plugin list and the additional fields decide the generated schema (db/auth-schema.ts, from
 // auth/config.ts); a unit test holds this file and that one to the same list.
