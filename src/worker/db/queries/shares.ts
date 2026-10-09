@@ -1,10 +1,10 @@
 // Shares to people. A share to an address with no account is a real row with no
 // `granteeUserId`: it is PENDING and grants nothing until the address is verified by an account.
 
-import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { type Node, nodes, type Share, shares } from "../schema";
+import { type Node, nodes, type ScanStatus, type Share, shares } from "../schema";
 import { notEffectivelyTrashed } from "./tree";
 import { ownerIsActive } from "./users";
 
@@ -76,10 +76,17 @@ export async function activatePendingShares(db: Executor, userId: string, email:
 
 /**
  * What other people share with the user: active shares only, on nodes that are live (not
- * trashed, taken down or system) and whose owner is active (not banned, suspended or scheduled
- * for deletion).
+ * trashed, taken down or system), whose owner is active (not banned, suspended or scheduled
+ * for deletion), and whose scan status is one of the MANDATORY `visibleStatuses` — a grantee's
+ * view passes `['clean']`, like every other listing a non-owner sees (a folder is `clean`). A
+ * share root that is `infected` or `suspected_csam` is not listed, name included.
  */
-export async function sharedWithMe(db: Executor, userId: string): Promise<{ share: Share; node: Node }[]> {
+export async function sharedWithMe(
+  db: Executor,
+  userId: string,
+  opts: { visibleStatuses: readonly ScanStatus[] },
+): Promise<{ share: Share; node: Node }[]> {
+  if (opts.visibleStatuses.length === 0) return [];
   return db
     .select({ share: shares, node: nodes })
     .from(shares)
@@ -90,6 +97,7 @@ export async function sharedWithMe(db: Executor, userId: string): Promise<{ shar
         isNotNull(shares.activatedAt),
         isNull(nodes.system),
         isNull(nodes.takedownAt),
+        inArray(nodes.scanStatus, [...opts.visibleStatuses]),
         notEffectivelyTrashed(),
         ownerIsActive(sql`${nodes.ownerId}`),
       ),

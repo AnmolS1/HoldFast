@@ -39,7 +39,10 @@ export type SearchOptions = {
 
 export type SearchHit = {
   node: Node;
-  /** The parent folder's name; null at the top level. */
+  /**
+   * The parent folder's name; null at the top level — and, for a hit shared with the user, null
+   * when the parent is not itself shared with them (the hit is the root of the share).
+   */
   pathHint: string | null;
   role: Role;
 };
@@ -156,7 +159,11 @@ async function searchShared(
       SELECT c.id, reach.role FROM nodes c JOIN reach ON c.parent_id = reach.id
     ),
     best AS (SELECT id, max(role) AS role FROM reach GROUP BY id)
-    SELECT n.id, best.role::text AS role, p.name AS path_hint, ${m.rank} AS rank, ${m.sim} AS sim, n.name_key
+    SELECT n.id, best.role::text AS role,
+           -- The parent's name only when the parent is itself shared with this user. Above a
+           -- share root sits the owner's own, unshared folder: its name is not the grantee's.
+           CASE WHEN p.id IN (SELECT id FROM best) THEN p.name END AS path_hint,
+           ${m.rank} AS rank, ${m.sim} AS sim, n.name_key
     FROM best JOIN nodes n ON n.id = best.id LEFT JOIN nodes p ON p.id = n.parent_id
     WHERE ${m.where}
     ORDER BY ${ORDER} LIMIT ${take}`);

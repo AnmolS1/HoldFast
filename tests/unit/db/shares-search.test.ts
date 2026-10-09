@@ -137,7 +137,24 @@ describe("shares", () => {
     const pendingOnly = await makeFolder(db, good, null, `pending-${rand()}`);
     await makeShare(db, pendingOnly.id, good, { email: await emailOf(me) });
 
-    const mine = await sharedWithMe(db, me);
+    // Blocked share roots: a grantee's view is `clean` only, so these are not listed at all.
+    const blocked: string[] = [];
+    for (const scanStatus of ["infected", "suspected_csam", "under_review", "pending"] as const) {
+      const file = await makeFile(db, good, null, `blocked-${scanStatus}-${rand()}.bin`, { scanStatus });
+      await makeShare(db, file.id, good, { userId: me });
+      blocked.push(file.id);
+    }
+
+    const mine = await sharedWithMe(db, me, { visibleStatuses: ["clean"] });
+    expect(mine.map((r) => r.node.id).filter((id) => blocked.includes(id))).toEqual([]);
+    expect(JSON.stringify(mine)).not.toContain("blocked-");
+    expect(await sharedWithMe(db, me, { visibleStatuses: [] })).toEqual([]);
+    // The statuses are the caller's list, nothing more: an admin view that asks for one gets it.
+    expect(
+      (await sharedWithMe(db, me, { visibleStatuses: ["clean", "infected"] })).filter((r) =>
+        blocked.includes(r.node.id),
+      ),
+    ).toHaveLength(1);
     expect(mine.map((r) => r.node.id).sort()).toEqual([visible.id, fromExpiredBan.id].sort());
     const entry = mine.find((r) => r.node.id === visible.id)!;
     expect(entry.share).toMatchObject({ id: visibleShare.id, role: "editor", granteeUserId: me });
@@ -145,7 +162,7 @@ describe("shares", () => {
 
     const granted = await sharedByMe(db, good);
     expect(granted.map((r) => r.node.id).sort()).toEqual(
-      [visible.id, trashed.id, insideTrash.id, down.id, pendingOnly.id].sort(),
+      [visible.id, trashed.id, insideTrash.id, down.id, pendingOnly.id, ...blocked].sort(),
     );
     expect(granted.find((r) => r.node.id === pendingOnly.id)!.share).toMatchObject({
       granteeUserId: null,
@@ -390,5 +407,48 @@ describe("searchNames", () => {
     for (const attempt of bad) {
       expect(((await rejection(attempt())) as QueryError).code).toBe("validation");
     }
+  });
+});
+
+// The owner shares only `offer.pdf`, which sits in a folder whose NAME is confidential. The
+// grantee can see the file; the folder above it is not shared with them.
+describe("shared search does not disclose an unshared parent folder", () => {
+  it("pathHint is null at a share root and the parent's name inside a shared folder", async () => {
+    const owner = await makeUser(db);
+    const grantee = await makeUser(db);
+    const token = `zq${rand(5)}`;
+    const secret = await makeFolder(db, owner, null, `Acme redundancy plan ${rand()}`);
+    const offer = await makeFile(db, owner, secret.id, `${token} offer.pdf`);
+    await makeShare(db, offer.id, owner, { userId: grantee });
+
+    const sharedFolder = await makeFolder(db, owner, secret.id, `Handover ${rand()}`);
+    const inside = await makeFile(db, owner, sharedFolder.id, `${token} notes.txt`);
+    const deeper = await makeFolder(db, owner, sharedFolder.id, `Deeper ${rand()}`);
+    const nested = await makeFile(db, owner, deeper.id, `${token} nested.txt`);
+    await makeShare(db, sharedFolder.id, owner, { userId: grantee });
+
+    const result = await searchNames(db, grantee, token, {
+      scope: "shared",
+      visibleStatuses: ["clean"],
+      limit: 50,
+    });
+    const hint = (id: string) => result.items.find((item) => item.node.id === id)?.pathHint;
+    expect(result.items.map((item) => item.node.id).sort()).toEqual([offer.id, inside.id, nested.id].sort());
+    expect(hint(offer.id)).toBeNull();
+    expect(hint(inside.id)).toBe(sharedFolder.name);
+    expect(hint(nested.id)).toBe(deeper.name);
+    expect(JSON.stringify(result.items.map((item) => item.pathHint))).not.toContain("Acme");
+
+    // The shared folder itself is a share root too: its parent is the secret folder.
+    const folders = await searchNames(db, grantee, "Handover", {
+      scope: "all",
+      visibleStatuses: { mine: OWNER, shared: ["clean"] },
+      limit: 50,
+    });
+    expect(folders.items.find((item) => item.node.id === sharedFolder.id)).toMatchObject({ pathHint: null });
+
+    // The owner's own search still names the folder.
+    const mine = await searchNames(db, owner, token, { scope: "mine", visibleStatuses: OWNER, limit: 50 });
+    expect(mine.items.find((item) => item.node.id === offer.id)?.pathHint).toBe(secret.name);
   });
 });
