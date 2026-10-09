@@ -25,7 +25,6 @@ export type FakeCore = {
     session: { session: SessionInfo; user: SessionUser } | null;
     settings: Settings;
     termsVersionInDb: string | null;
-    queryFails: boolean;
   };
 };
 
@@ -33,7 +32,7 @@ export type FakeCore = {
 export function fakeCore(): FakeCore {
   const calls: string[] = [];
   const audits: FakeCore["audits"] = [];
-  const state: FakeCore["state"] = { session: null, settings: {}, termsVersionInDb: null, queryFails: false };
+  const state: FakeCore["state"] = { session: null, settings: {}, termsVersionInDb: null };
 
   const core: CoreDeps = {
     createDb() {
@@ -42,7 +41,6 @@ export function fakeCore(): FakeCore {
       const db = {
         async execute() {
           if (closed) throw new Error(POOL_ENDED);
-          if (state.queryFails) throw new Error("connect ECONNREFUSED");
           calls.push("query");
           return { rows: [{ "?column?": 1 }] };
         },

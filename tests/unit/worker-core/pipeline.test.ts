@@ -633,23 +633,8 @@ describe("GET /api/public/config", () => {
     expect(fake.calls).not.toContain("getSession");
   });
 
-  it("reflects a settings override", async () => {
-    const { fake, send } = setup();
-    fake.state.settings = {
-      signupMode: "open",
-      termsVersion: "2027-01-01",
-      uploadsEnabled: false,
-      readOnly: true,
-    };
-    const config = PublicConfig.parse((await send("/api/public/config")).body);
-    expect(config).toMatchObject({
-      signupMode: "open",
-      termsVersion: "2027-01-01",
-      uploadsEnabled: false,
-      linksEnabled: true,
-      readOnly: true,
-    });
-  });
+  // "Reflects a settings override" is proven against the real settings table in
+  // integration.test.ts (a row written through setSetting), not against a fake here.
 
   it("carries no secret", async () => {
     const { send } = setup();
@@ -667,23 +652,8 @@ describe("GET /api/public/config", () => {
 });
 
 describe("GET /api/health", () => {
-  it("{ ok: true, db: true, r2: true } when select 1 resolves (test doubles for both probes)", async () => {
-    const { fake, send } = setup();
-    const r2 = { head: async () => null };
-    const answer = await send("/api/health", { env: { FILES: r2 } });
-    expect(answer.status).toBe(200);
-    expect(answer.body).toEqual({ ok: true, db: true, r2: true });
-    expect(fake.calls).toEqual(["createDb", "query", "close"]);
-  });
-
-  it("503 when the database probe rejects", async () => {
-    const { fake, send } = setup();
-    fake.state.queryFails = true;
-    const answer = await send("/api/health");
-    expect(answer.status).toBe(503);
-    expect(answer.body).toEqual({ ok: false, db: false, r2: true });
-  });
-
+  // The 200 and the dead-database 503 run against real Postgres and Miniflare's R2 in
+  // integration.test.ts. What stays here is the half no real binding can produce: R2 failing.
   it("503 when R2 throws, and the body carries no error text", async () => {
     const { send } = setup();
     const r2 = { head: async () => Promise.reject(new Error("r2 secret detail")) };

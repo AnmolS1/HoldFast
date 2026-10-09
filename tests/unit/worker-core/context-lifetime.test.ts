@@ -357,8 +357,8 @@ describe("runBackground: queue and scheduled", () => {
 });
 
 describe("the Worker's own queue and scheduled exports", () => {
-  // The real entry with the real modules: nothing here asks for the database, so nothing opens
-  // (in a checkout where the database layer is still a stub, opening it would throw).
+  // The real entry with the real modules. Neither placeholder asks for the database, so no pool
+  // is opened; the real-pool lifetime of runBackground is proven in integration.test.ts.
   it("scheduled() runs the stub through runBackground without error", async () => {
     const controller = createScheduledController({ cron: "3 * * * *", scheduledTime: new Date() });
     const ctx = createExecutionContext();

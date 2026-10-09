@@ -200,7 +200,7 @@ describe("settings", () => {
     "reconcileCursor",
     "dmcaAutoCloseDays",
   ];
-  beforeEach(async () => {
+  const clearKeys = async () => {
     await db.delete(settings).where(
       sql`${settings.key} IN (${sql.join(
         KEYS.map((k) => sql`${k}`),
@@ -208,7 +208,11 @@ describe("settings", () => {
       )})`,
     );
     clearSettingsCache();
-  });
+  };
+  beforeEach(clearKeys);
+  // The table is this checkout's one `settings` table: the dev server and the Worker tests read
+  // it too. Rows left behind here (a read-only switch, a ceiling) would configure them.
+  afterAll(clearKeys);
 
   it("an empty table yields no keys; every key round-trips with its type", async () => {
     expect(await getSettings(db)).toEqual({});
