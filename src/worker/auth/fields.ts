@@ -1,17 +1,16 @@
 // The additional `user` and `session` fields the RUNTIME instance declares (create-auth.ts).
 //
-// They are the fields of auth/config.ts — the file `npm run auth:generate` reads — and a unit
-// test (tests/unit/auth/config-agreement.test.ts) fails when the two differ in anything that
-// decides a column: name, type, bigint, required, default, input.
+// The single definition: auth/config.ts — the file `npm run auth:generate` reads — imports and
+// re-exports these same objects, so the generated schema and the runtime cannot drift.
 //
-// Why create-auth.ts does not import them from config.ts: importing ANY binding from that module
+// Why they live here and not in config.ts (create-auth.ts must not import that module): importing ANY binding from that module
 // evaluates it, and it builds a second `betterAuth()` instance at module scope — over a database
 // URL that is never connected to and with no Drizzle schema. In the Worker that is an instance
 // cached on the isolate (the one thing the #10315 rules forbid) and an
 // "ERROR [Better Auth]: Drizzle schema mismatch — Missing tables user, session, …" line in the
 // log at every isolate start. This module has no imports.
 //
-// The one deliberate difference from config.ts is `returned: false` (not a column attribute):
+// `returned: false` is not a column attribute (the generated schema is the same without it):
 // a field so marked is never part of a session answer — neither `GET /api/auth/get-session` nor
 // the signed-but-readable cookie cache — so the browser never sees it:
 //   legalHold        a hold must not be observable by the account holder
