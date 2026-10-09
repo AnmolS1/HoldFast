@@ -5,12 +5,37 @@
 // breadcrumbs — so download tokens, link tokens, invite codes, cookies and email addresses never
 // reach Sentry. The wiring of `beforeSend` / `beforeBreadcrumb` to src/shared/sentry-redact.ts
 // must survive any later change to this file.
+//
+// Two more rules, for errors:
+//  - `captureError` is the one explicit exit to Sentry for the whole Worker, and it never hands
+//    over the object it was given: it sends `safeError(error)` — the class, the code, the scanned
+//    message and the stack frames. A driver error's own fields (`detail`, `parameters`, `where`,
+//    `cause`, a captured `response` or `request`) stay behind, whoever the caller is.
+//  - an exception the SDK captured by itself (one that escaped a queue or cron handler) has its
+//    message scanned by the same rules in `beforeSend`: a failed query's parameter list, whole
+//    URLs, tokens, one-time codes and addresses are cut from it.
 
 import * as Sentry from "@sentry/cloudflare";
 import { redactEvent } from "../shared/sentry-redact";
+// A pure module (text rules only; its one import is the shared redaction above).
+import { safeError, scrubText } from "./auth/redact";
 import { buildMeta } from "./meta";
 
 type SentryEnv = Pick<Env, "SENTRY_DSN" | "SENTRY_ENVIRONMENT">;
+
+type ExceptionValues = { exception?: { values?: Array<{ value?: unknown }> } };
+
+/** `redactEvent`, and every exception message scanned as free text. The input is not modified. */
+export function redactOutgoing<T>(event: T): T {
+  const out = redactEvent(event);
+  const values = (out as ExceptionValues | null | undefined)?.exception?.values;
+  if (Array.isArray(values)) {
+    for (const item of values) {
+      if (item && typeof item.value === "string") item.value = scrubText(item.value);
+    }
+  }
+  return out;
+}
 
 export function sentryOptions(env: SentryEnv): Sentry.CloudflareOptions | undefined {
   if (!env.SENTRY_DSN) return undefined;
@@ -20,7 +45,7 @@ export function sentryOptions(env: SentryEnv): Sentry.CloudflareOptions | undefi
     release: buildMeta().commit,
     // Errors only. Tracing is switched on, if ever, by the observability task.
     tracesSampleRate: 0,
-    beforeSend: (event) => redactEvent(event),
+    beforeSend: (event) => redactOutgoing(event),
     beforeSendTransaction: (event) => redactEvent(event),
     beforeBreadcrumb: (breadcrumb) => redactEvent(breadcrumb),
   };
@@ -32,14 +57,15 @@ export function withSentry(handler: ExportedHandler<Env>): ExportedHandler<Env> 
 }
 
 /**
- * Report an unexpected error. `tags` are short enums (a request id, a route pattern, a job name)
+ * Report an unexpected error — as a sanitised copy (`safeError`), never the object itself. `tags` are short enums (a request id, a route pattern, a job name)
  * — never a URL, an id from a path or anything a user typed. Never throws.
  */
 export function captureError(error: unknown, tags: Record<string, string> = {}): void {
   try {
     Sentry.withScope((scope) => {
       for (const [key, value] of Object.entries(tags)) scope.setTag(key, value);
-      Sentry.captureException(error);
+      // Never the caught object itself: see the header.
+      Sentry.captureException(safeError(error));
     });
   } catch {
     // Reporting must never break the thing being reported on.
