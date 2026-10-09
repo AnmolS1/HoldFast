@@ -128,15 +128,19 @@ const isApiPath = (path: string) => path === "/api" || path.startsWith("/api/") 
 /**
  * LOCAL DEV ONLY (an http:// APP_ORIGIN — every deploy is https). The Vite dev server injects an
  * inline React-refresh preamble into index.html; under `script-src 'self'` it is blocked and the
- * SPA never renders. Instead of loosening the policy, the exact inline scripts of the HTML being
- * served are allowed by hash. A built bundle has no inline script, and on https this never runs.
+ * SPA never renders. Instead of loosening the policy, that one script is allowed by its hash.
+ *
+ * Only the preamble: any OTHER inline script stays blocked locally exactly as it is on a deploy,
+ * so a script added to index.html fails here first instead of only in production.
  */
-async function inlineScriptHashes(html: string): Promise<string[]> {
+const VITE_REACT_PREAMBLE = "/@react-refresh";
+
+async function vitePreambleHashes(html: string): Promise<string[]> {
   const hashes: string[] = [];
   for (const match of html.matchAll(/<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi)) {
     const attributes = match[1] ?? "";
     const body = match[2] ?? "";
-    if (/\ssrc\s*=/i.test(attributes) || body === "") continue;
+    if (/\ssrc\s*=/i.test(attributes) || !body.includes(VITE_REACT_PREAMBLE)) continue;
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
     hashes.push(`sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}`);
   }
@@ -168,7 +172,7 @@ export const securityHeaders: MiddlewareHandler<AppEnv> = async (c, next) => {
   } else if (isHtml(response)) {
     if (!isHttps(c.env) && response.body && c.req.method === "GET") {
       const html = await response.text();
-      replacement = rebuilt(response, html, htmlHeaders(c.env, path, await inlineScriptHashes(html)));
+      replacement = rebuilt(response, html, htmlHeaders(c.env, path, await vitePreambleHashes(html)));
     } else {
       replacement = rebuilt(response, response.body, htmlHeaders(c.env, path));
     }

@@ -119,10 +119,13 @@ export function resolveSettings(
 
 // ── The lifetime core, shared by the fetch path and by runBackground ──────────────────────────
 
+/** All this module needs of an ExecutionContext. Hono's own context type satisfies it too. */
+export type WaitUntil = { waitUntil(promise: Promise<unknown>): void };
+
 type Lifetime = {
   core: CoreDeps;
   env: Env;
-  ctx: ExecutionContext;
+  ctx: WaitUntil;
   deferred: Promise<unknown>[];
   /** Set once the drain loop has ended and `close()` is about to run. Nothing is accepted after it. */
   closed: boolean;
@@ -131,7 +134,7 @@ type Lifetime = {
   settings: Promise<ResolvedSettings> | null;
 };
 
-function newLifetime(core: CoreDeps, env: Env, ctx: ExecutionContext): Lifetime {
+function newLifetime(core: CoreDeps, env: Env, ctx: WaitUntil): Lifetime {
   return { core, env, ctx, deferred: [], closed: false, handle: null, keys: null, settings: null };
 }
 
@@ -173,7 +176,13 @@ async function drainAndClose(life: Lifetime): Promise<void> {
 
 // ── Request path ──────────────────────────────────────────────────────────────────────────────
 
-type RequestState = Lifetime & { requestId: string; ip: string; colo: string | null; auth: Auth | null };
+type RequestState = Lifetime & {
+  requestId: string;
+  ip: string;
+  colo: string | null;
+  auth: Auth | null;
+  executionCtx: ExecutionContext;
+};
 
 const states = new WeakMap<object, RequestState>();
 
@@ -191,7 +200,7 @@ export function openRequestContext(
 ): void {
   // Hono types its own narrower ExecutionContext; at runtime it is the Worker's.
   const ctx = c.executionCtx as unknown as ExecutionContext;
-  states.set(c, { ...newLifetime(core, c.env, ctx), ...eager, auth: null });
+  states.set(c, { ...newLifetime(core, c.env, ctx), ...eager, auth: null, executionCtx: ctx });
 }
 
 /**
@@ -211,7 +220,7 @@ export function db(c: Context<AppEnv>): Db {
 
 export function auth(c: Context<AppEnv>): Auth {
   const state = stateOf(c);
-  state.auth ??= state.core.createAuth(state.env, lifeDb(state), state.ctx);
+  state.auth ??= state.core.createAuth(state.env, lifeDb(state), state.executionCtx);
   return state.auth;
 }
 
@@ -293,11 +302,13 @@ export function coreFor(source: ServiceDeps): CoreDeps {
  * Runs `fn` with a full `BackgroundContext` — one pool for the whole batch or job run — then
  * drains the deferred work until none is left and closes the pool, also when `fn` throws.
  * `index.ts` wraps `queue()` and `scheduled()` with it; an admin "run job" route can give a job
- * the same context: `runBackground(c.env, c.executionCtx, (bg) => runJob(name, bg))`.
+ * the same context: `runBackground(c.env, c.executionCtx, (bg) => runJob(name, bg))` — note that
+ * this opens a SECOND pool beside the request's own (a Worker may hold 6 connections at once and
+ * each pool takes up to 5), so such a route should not also query through `db(c)` while it runs.
  */
 export async function runBackground<T>(
   env: Env,
-  ctx: ExecutionContext,
+  ctx: WaitUntil,
   fn: (bg: BackgroundContext) => Promise<T>,
   core?: CoreDeps,
 ): Promise<T> {

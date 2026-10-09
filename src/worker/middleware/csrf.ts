@@ -11,7 +11,8 @@ import type { MiddlewareHandler } from "hono";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
 
-export const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+/** Everything else is state-changing as far as the CSRF, impersonation, terms and read-only checks go. */
+export const SAFE_METHODS = new Set(["GET", "HEAD"]);
 
 const EXEMPT_PREFIXES = ["/api/public/", "/api/auth/", "/api/_test/"];
 

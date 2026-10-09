@@ -66,6 +66,11 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
   const found = await auth(c).api.getSession({ headers: c.req.raw.headers });
   if (!found) return next();
 
+  // Before any early return below: an impersonated session stays read-only even when its user is
+  // suspended, banned or past its deletion date and is therefore not put on c.var. Better Auth
+  // would still honour the cookie on /api/auth/*.
+  c.set("impersonating", Boolean(found.session.impersonatedBy));
+
   const user = withDates(found.user);
   const at = now(c).getTime();
 
@@ -84,7 +89,6 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
 
   c.set("user", user);
   c.set("session", found.session);
-  c.set("impersonating", Boolean(found.session.impersonatedBy));
   c.set("termsStale", user.termsVersion !== (await settings(c)).termsVersion);
   return next();
 };

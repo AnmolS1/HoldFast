@@ -12,8 +12,10 @@ import {
 import { requireAdmin, requireUser, requireVerified } from "../../../src/worker/middleware/guards";
 import { PublicConfig } from "../../../src/shared/public-config";
 import type { AppEnv } from "../../../src/worker/services/request-context";
+import { BA_ID_PARAM, TOKEN_PARAM, UUID_PARAM } from "../../../src/shared/ids";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 import { appWith, call, fakeCore, sameOrigin, signIn, type CallOptions, type FakeCore } from "./helpers";
+import { parsePath } from "./registry-check";
 
 type Probe = { reached: string; user: string | null; impersonating: boolean; termsStale: boolean };
 type Envelope = { error: string; message: string; requestId: string; details?: Record<string, unknown> };
@@ -120,11 +122,14 @@ describe("csrf", () => {
     expect((await send("/api/auth-intent", { method: "POST", headers: evil })).status).toBe(403);
   });
 
-  it("never applies to GET", async () => {
+  it("never applies to GET or HEAD, and does apply to every other method", async () => {
     const { send } = setup();
-    expect((await send("/api/nodes", { headers: { origin: "https://evil.example" } })).body.reached).toBe(
-      "/api/nodes",
-    );
+    const evil = { origin: "https://evil.example" };
+    expect((await send("/api/nodes", { headers: evil })).body.reached).toBe("/api/nodes");
+    expect((await send("/api/nodes", { method: "HEAD", headers: evil })).status).toBe(200);
+    for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
+      expect((await send("/api/nodes", { method, headers: evil })).status, method).toBe(403);
+    }
   });
 });
 
@@ -355,18 +360,43 @@ describe("rate limit", () => {
 describe("impersonation is read-only", () => {
   const impersonated = (fake: FakeCore) => signIn(fake, {}, { impersonatedBy: "a".repeat(32) });
 
-  it("refuses every state-changing method on every non-public route of the app", async () => {
+  /** A concrete path for a route pattern: every parameter filled with a value its own pattern accepts. */
+  const concrete = (pattern: string) =>
+    "/" +
+    parsePath(pattern)
+      .map((segment) => {
+        if (segment.kind === "static") return segment.value;
+        if (segment.kind === "wild") return "x";
+        if (segment.pattern === UUID_PARAM) return "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e";
+        if (segment.pattern === BA_ID_PARAM) return "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL";
+        if (segment.pattern === TOKEN_PARAM) return "AbCdEfGhIjKlMnOpQrSt";
+        return "x";
+      })
+      .join("/");
+  const sessionless = (path: string) =>
+    path.startsWith("/api/public/") || path.startsWith("/api/_test/") || path === "/api/health";
+
+  it("refuses every state-changing method on every route of the app that reads a session", async () => {
     const { fake, app, post, send } = setup();
     impersonated(fake);
-    // Every route the app has, plus one representative path per registry area (the placeholders
-    // declare almost nothing yet; at each wave integration the first list grows by itself).
-    const fromApp = app.routes
-      .filter(
-        (route) => route.path.startsWith("/api/") && !route.path.includes("*") && !route.path.includes(":"),
-      )
-      .map((route) => route.path);
+    const MUTATING = ["POST", "PUT", "PATCH", "DELETE"];
+    // Every route the app has — parameterised ones included, with their parameters filled in —
+    // under its own method (all four for a GET or method-agnostic entry: the middleware must
+    // refuse the path whatever a later router registers on it). At each wave integration this
+    // list grows by itself with the real routers.
+    const qualifying = app.routes.filter(
+      (route) => route.path.startsWith("/api/") && !sessionless(route.path),
+    );
+    const fromApp = qualifying.map((route) => ({
+      path: concrete(route.path),
+      methods: MUTATING.includes(route.method) ? [route.method] : MUTATING,
+    }));
+    expect(fromApp).toHaveLength(qualifying.length);
+    expect(fromApp.length).toBeGreaterThanOrEqual(8);
+    // Plus one representative path per registry area, since the placeholders declare almost nothing yet.
     const representative = [
       "/api/nodes/folder",
+      "/api/nodes/0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e/trash",
       "/api/uploads",
       "/api/trash",
       "/api/shares/x",
@@ -379,20 +409,79 @@ describe("impersonation is read-only", () => {
       "/api/auth/delete-user",
       "/api/auth/passkey/add-passkey",
       "/api/auth/admin/ban-user",
-    ];
-    const paths = [...new Set([...fromApp, ...representative])].filter(
-      (path) => !path.startsWith("/api/public/") && !path.startsWith("/api/_test/") && path !== "/api/health",
-    );
-    expect(paths.length).toBeGreaterThan(10);
-    for (const path of paths) {
-      if (IMPERSONATION_EXEMPT_PATHS.includes(path)) continue;
-      for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+    ].map((path) => ({ path, methods: MUTATING }));
+
+    let checked = 0;
+    for (const { path, methods } of [...fromApp, ...representative]) {
+      if (IMPERSONATION_EXEMPT_PATHS.includes(path) || sessionless(path)) continue;
+      for (const method of methods) {
         const answer = await send(path, { method, headers: sameOrigin });
         expect(answer.status, `${method} ${path}`).toBe(403);
         expect(answer.body.details, `${method} ${path}`).toEqual({ reason: "impersonation_read_only" });
+        checked += 1;
       }
     }
+    expect(checked).toBeGreaterThan(60);
     expect((await post("/api/nodes/folder")).status).toBe(403);
+  });
+
+  it("fills route parameters with values their patterns accept", async () => {
+    const router = new Hono<AppEnv>();
+    router.post(`/nodes/:id{${UUID_PARAM}}/copy`, (c) => c.json({ reached: "copy" }));
+    router.delete(`/account/sessions/:id{${BA_ID_PARAM}}`, (c) => c.json({ reached: "session" }));
+    const fake = fakeCore();
+    fake.state.settings = { termsVersion: "2026-10-01" };
+    const app = appWith(fake, { extraRouters: [router] });
+    const routes = app.routes.filter((route) => route.path.includes(":"));
+    expect(routes.map((route) => `${route.method} ${concrete(route.path)}`)).toEqual([
+      "POST /api/nodes/0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e/copy",
+      "DELETE /api/account/sessions/aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL",
+    ]);
+    // Signed in normally they are reached; impersonated they are refused.
+    for (const [who, expected] of [
+      [() => signIn(fake), 200],
+      [() => impersonated(fake), 403],
+    ] as const) {
+      who();
+      for (const route of routes) {
+        const { response, ctx } = await call(app, concrete(route.path), {
+          method: route.method,
+          headers: sameOrigin,
+        });
+        expect(response.status, `${route.method} ${route.path}`).toBe(expected);
+        await response.text();
+        await ctx.settle();
+      }
+    }
+  });
+
+  it("stays read-only when the impersonated user is suspended, banned or past its deletion date", async () => {
+    const past = new Date(Date.now() - 86_400_000);
+    for (const flags of [
+      { suspendedAt: past },
+      { banned: true, banExpires: null },
+      { deleteScheduledAt: past },
+    ]) {
+      const { fake, post, send } = setup();
+      signIn(fake, flags, { impersonatedBy: "a".repeat(32) });
+      const label = JSON.stringify(Object.keys(flags));
+      // Not put on c.var as a user — and still an impersonated session.
+      expect((await send("/api/auth/get-session")).body, label).toMatchObject({
+        user: null,
+        impersonating: true,
+      });
+      for (const path of [
+        "/api/auth/change-password",
+        "/api/auth/delete-user",
+        "/api/auth/passkey/add-passkey",
+      ]) {
+        const refused = await post(path);
+        expect(refused.status, `${label} ${path}`).toBe(403);
+        expect(refused.body.details, `${label} ${path}`).toEqual({ reason: "impersonation_read_only" });
+      }
+      for (const path of IMPERSONATION_EXEMPT_PATHS)
+        expect((await post(path)).body.reached, label).toBe(path);
+    }
   });
 
   it("lets stop-impersonating and sign-out through, and every GET", async () => {

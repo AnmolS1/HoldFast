@@ -3,6 +3,7 @@
 import { exports } from "cloudflare:workers";
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
+import { createApp } from "../../../src/worker/app";
 import { createFilesHost } from "../../../src/worker/files-host";
 import { filesHostHeaders, htmlCsp } from "../../../src/worker/middleware/security-headers";
 import type { AppEnv } from "../../../src/worker/services/request-context";
@@ -322,24 +323,53 @@ describe("app host headers", () => {
     }
   });
 
-  it("local dev only: an inline script in the served HTML is allowed by its hash, never on https", async () => {
-    const inline = "window.$RefreshReg$ = () => {};";
-    const page = `<!doctype html><script type="module">${inline}</script><script type="module" src="/x.js"></script>`;
+  it("local dev only: the Vite React-refresh preamble is allowed by its hash — and nothing else, never on https", async () => {
+    const preamble =
+      'import { injectIntoGlobalHook } from "/@react-refresh";\ninjectIntoGlobalHook(window);\nwindow.$RefreshReg$ = () => {};';
+    const other = 'document.documentElement.dataset.theme = "dark";';
+    const page =
+      `<!doctype html><script type="module">${preamble}</script><script>${other}</script>` +
+      '<script type="module" src="/x.js"></script>';
     const ASSETS = { fetch: async () => new Response(page, { headers: { "content-type": "text/html" } }) };
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(inline));
-    const hash = `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
+    const hashOf = async (body: string) => {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
+      return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
+    };
 
     const local = await appCall("/", { env: { ASSETS } });
     const localCsp = local.response.headers.get("content-security-policy") ?? "";
     expect(localCsp).toContain(
-      `script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com ${hash};`,
+      `script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com ${await hashOf(preamble)};`,
     );
-    expect(localCsp).not.toContain("'unsafe-inline' https");
+    // Any other inline script stays blocked locally, exactly as it is on a deploy.
+    expect(localCsp).not.toContain(await hashOf(other));
+    expect(localCsp.match(/'sha256-/g)).toHaveLength(1);
+    expect(localCsp).not.toMatch(/script-src[^;]*'unsafe-inline'/);
     expect(await local.response.text()).toBe(page);
 
     const deployed = await appCall("/", { origin: HTTPS.APP_ORIGIN, env: { ...HTTPS, ASSETS } });
     expect(deployed.response.headers.get("content-security-policy")).toBe(CSP_HTTPS);
     await deployed.response.text();
+  });
+
+  it("keeps every Set-Cookie of an auth response intact", async () => {
+    const router = new Hono<AppEnv>();
+    const cookies = [
+      "hf.session_token=abc.def; Max-Age=1209600; Path=/; Expires=Thu, 22 Oct 2026 00:00:00 GMT; HttpOnly; SameSite=Lax",
+      "hf.session_data=xyz; Max-Age=60; Path=/; Expires=Thu, 08 Oct 2026 00:01:00 GMT; HttpOnly; SameSite=Lax",
+    ];
+    router.post("/auth/sign-in/email", () => {
+      const headers = new Headers({ "content-type": "application/json" });
+      for (const cookie of cookies) headers.append("set-cookie", cookie);
+      return new Response("{}", { headers });
+    });
+    const app = createApp(fakeCore().core, { extraRouters: [router] });
+    const { response, ctx } = await call(app, "/api/auth/sign-in/email", { method: "POST" });
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toEqual(cookies);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await response.text();
+    await ctx.settle();
   });
 
   it("the asset path opens neither the database nor a session", async () => {
