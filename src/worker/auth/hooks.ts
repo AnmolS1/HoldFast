@@ -25,11 +25,12 @@
 import { generateId } from "@better-auth/core/utils/id";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
-import { ensureUserPrefs, releaseSignup } from "../db/queries/auth-lifecycle";
+import { ensureUserPrefs, getAccountByEmail, releaseSignup } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
 import { captureError } from "../sentry";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
+import { sendSignupAttempt } from "../services/email";
 import { writeMetric } from "../services/metrics";
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
@@ -39,8 +40,10 @@ import {
   SessionRefusal,
   SignupRefusal,
   takeSignup,
+  type SignupGrant,
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
+import { safeError } from "./redact";
 import type { AuthScope, ClientFacts } from "./scope";
 import {
   cookieAttributes,
@@ -87,7 +90,7 @@ async function quietly(env: Env, kind: string, work: () => Promise<void>): Promi
   try {
     await work();
   } catch (error) {
-    captureError(error, { kind: `auth_hook_${kind}` });
+    captureError(safeError(error), { kind: `auth_hook_${kind}` });
     writeMetric(env, "error", { kind: "auth_hook", reason: kind });
   }
 }
@@ -302,6 +305,47 @@ export function buildHooks(scope: AuthScope) {
         const code = (returned as { body?: { code?: unknown } }).body?.code;
         await releaseUnusedReservation(scope, code === FAILED_TO_CREATE_USER);
         return;
+      }
+      const submitted = (ctx.body as { email?: unknown } | undefined)?.email;
+      if (!scope.facts.createdUserId && typeof submitted === "string") {
+        // The look-alike answer: the address already has an account, and Better Auth has answered
+        // as if it had made one (api/routes/sign-up.mjs — it hashes the password too, and never
+        // reaches the `user.create` hook). A new sign-up would have used its invite and taken
+        // its place in the day's counts at this point; so does this one — otherwise "is my
+        // invite still good?" or "how many sign-ups do I have left today?" would tell the
+        // caller, one request later, that the address was taken. A refusal here (the invite
+        // went to somebody else in between) is the refusal a new address would have got.
+        const address = submitted.toLowerCase();
+        let grant: SignupGrant;
+        try {
+          grant = await takeSignup(scope, address, parseStatement(ctx.body), clientOf(scope, ctx), null);
+        } catch (error) {
+          scope.reservation = null;
+          return refused(error);
+        }
+        // Spent, not held: there is no account creation left to wait for.
+        scope.reservation = null;
+        // Better Auth's made-up user has only the fields' defaults. A real new user carries what
+        // the policy wrote on it (the terms it accepted and when, the role) — so the made-up one
+        // is given the same, or the two answers could be told apart by reading them.
+        const body = returned as { user?: Record<string, unknown> } | null | undefined;
+        if (body?.user && typeof body.user === "object") {
+          Object.assign(body.user, {
+            termsAcceptedAt: grant.termsAcceptedAt,
+            termsVersion: grant.termsVersion,
+            ageVerifiedAt: grant.ageVerifiedAt,
+            quotaBytes: grant.quotaBytes,
+            role: "user",
+          });
+        }
+        // The owner hears about it — a notice, never a link: whoever sent the request must not
+        // be able to make the owner's inbox hand them anything.
+        scope.deps.defer(
+          quietly(env, "signup_attempt", async () => {
+            const owner = await getAccountByEmail(scope.db, address);
+            if (owner) await sendSignupAttempt(scope.deps, { to: owner.email, name: owner.name });
+          }),
+        );
       }
       // "This browser just signed up with that address" — what lets the next screen fix a
       // mistyped address. Set for EVERY successful answer, the look-alike one for an address

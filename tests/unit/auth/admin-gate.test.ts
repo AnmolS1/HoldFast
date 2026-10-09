@@ -284,6 +284,16 @@ describe("the four allowed paths an admin calls", () => {
       expect(asPlain.status, "plain user").toBe(403);
       expect(await deniedRows(path, plain.user.id)).toHaveLength(1);
 
+      // Two-factor alone is not the role: a user who has enrolled a second factor is refused
+      // by OUR gate (its audit row), not merely by the plugin's own permission check.
+      const enrolled = await verifiedUser();
+      await testDb().update(user).set({ twoFactorEnabled: true }).where(eq(user.id, enrolled.user.id));
+      const asEnrolled = await send(enrolled.client, `/api/auth${path}`, {
+        json: bodyFor(path, target.user.id),
+      });
+      expect(asEnrolled.status, "user with 2FA, without the role").toBe(403);
+      expect(await deniedRows(path, enrolled.user.id)).toHaveLength(1);
+
       const noSecondFactor = await verifiedUser();
       await promoteToAdmin(noSecondFactor.user.id, false);
       const asWeakAdmin = await send(noSecondFactor.client, `/api/auth${path}`, {

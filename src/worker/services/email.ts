@@ -30,6 +30,7 @@
 
 import { Resend } from "resend";
 import { tryConsume } from "../db/queries/email-ledger";
+import { safeError } from "../auth/redact";
 import { captureError } from "../sentry";
 import { createKeys, hmacHex } from "./keys";
 import { writeMetric } from "./metrics";
@@ -187,6 +188,21 @@ export const templates = {
       },
       { link: { label: "Confirm email address", url: d.url } },
       { text: `The link works for one hour. ${IGNORE}` },
+    ],
+  }),
+  signupAttempt: (d: { name?: unknown; loginUrl: string }): Draft => ({
+    subject: "Someone tried to sign up with your email address",
+    heading: "You already have a Holdfast account",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: "Someone tried to create a Holdfast account with this email address. It already has an account, so nothing was created and nothing about your account has changed.",
+      },
+      {
+        text: "If that was you, sign in instead. If you have forgotten your password, the sign-in page can send you a link to choose a new one.",
+      },
+      { link: { label: "Sign in", url: d.loginUrl } },
+      { text: "If it wasn't you, there is nothing you need to do." },
     ],
   }),
   newAddressVerification: (d: { name?: unknown; url: string }): Draft => ({
@@ -459,6 +475,7 @@ export type TemplateName = keyof typeof templates;
 
 const CLASS_OF: Record<TemplateName, EmailClass> = {
   verification: "auth",
+  signupAttempt: "auth",
   newAddressVerification: "auth",
   passwordReset: "auth",
   changeEmailConfirmation: "auth",
@@ -525,7 +542,7 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
       failure = error;
     }
     // Reported once per failed attempt; the address and the content are never part of it.
-    captureError(failure, { kind: "email", attempt: String(attempt + 1) });
+    captureError(safeError(failure), { kind: "email", attempt: String(attempt + 1) });
   }
   throw failure;
 }
@@ -559,7 +576,7 @@ async function deliver(
     writeMetric(env, "email", { outcome: "sent", kind });
     return "sent";
   } catch (error) {
-    captureError(error, { kind: "email", template: name });
+    captureError(safeError(error), { kind: "email", template: name });
     writeMetric(env, "email", { outcome: "failed", kind });
     return "failed";
   }
@@ -572,6 +589,11 @@ type To = { to: string; name?: unknown };
 // auth class
 export const sendVerification = (deps: ServiceDeps, d: To & { url: string; resend?: boolean }) =>
   deliver(deps, "verification", d.to, () => templates.verification(d));
+/** To the owner of an address somebody tried to sign up with. A notice: it carries no token. */
+export const sendSignupAttempt = (deps: ServiceDeps, d: To) =>
+  deliver(deps, "signupAttempt", d.to, () =>
+    templates.signupAttempt({ ...d, loginUrl: appUrl(deps.env, "/login") }),
+  );
 export const sendNewAddressVerification = (deps: ServiceDeps, d: To & { url: string }) =>
   deliver(deps, "newAddressVerification", d.to, () => templates.newAddressVerification(d));
 export const sendPasswordReset = (deps: ServiceDeps, d: To & { url: string }) =>

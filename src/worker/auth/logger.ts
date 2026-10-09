@@ -1,39 +1,32 @@
 // Better Auth's log lines, on their way to the Worker's log.
 //
 // The library logs through `console` by default, and what it logs can carry personal data: an
-// email address in a message ("Sign-up attempt for existing email: …"), a whole database error
-// object beside "Failed to create user" (Postgres puts the offending key — the address — in the
-// error's `detail`), a token inside a URL. Workers Logs are kept; none of that belongs there.
-// So every line goes through the same redaction as a Sentry event (src/shared/sentry-redact.ts:
-// addresses, token-bearing path segments and query values), an Error is reduced to its name and
-// messages (never its fields), and a line is capped in length.
+// address in a message ("Sign-up attempt for existing email: …"), a whole database error object
+// beside "Failed to create user" (Postgres puts the offending key — the address — in the error's
+// `detail`), an error whose message holds a link. Workers Logs are kept; none of that belongs
+// there. So Better Auth is given this logger (create-auth.ts: `logger.log`), and every part of
+// every line — the message and each argument — goes through the auth layer's one redaction
+// function (./redact.ts) before it is written:
+//
+//   a string            scanned: addresses, URLs, tokens, codes, IP addresses replaced
+//   an Error            its class, its code, its scanned message — never its other fields
+//   any other object    the allow-listed fields (event, userId, requestId, code); the rest dropped
+//
+// The level is `warn` (set in create-auth.ts): Better Auth's `info` and `debug` lines are the
+// ones that narrate a request, address included, and nothing is lost without them — what
+// happened to an account is in the audit log.
 
-import { redactText } from "../../shared/sentry-redact";
+import { describeValue } from "./redact";
 
 const MAX_LINE = 2_000;
 
-function describe(value: unknown, depth = 0): string {
-  if (typeof value === "string") return value;
-  if (value instanceof Error) {
-    const cause =
-      value.cause !== undefined && depth < 3 ? ` (cause: ${describe(value.cause, depth + 1)})` : "";
-    return `${value.name}: ${value.message}${cause}`;
-  }
-  if (value === null || value === undefined || typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
-    return Object.prototype.toString.call(value);
-  }
-}
-
 /** One log line, safe to keep. Exported for the test. */
 export function authLogLine(message: unknown, args: unknown[]): string {
-  const line = [message, ...args].map((part) => describe(part)).join(" ");
-  const safe = redactText(line);
-  return safe.length > MAX_LINE ? `${safe.slice(0, MAX_LINE)}…` : safe;
+  const line = [message, ...args]
+    .map((part) => describeValue(part))
+    .filter((part) => part !== "")
+    .join(" ");
+  return line.length > MAX_LINE ? `${line.slice(0, MAX_LINE)}…` : line;
 }
 
 /** `logger.log` for Better Auth's options. */

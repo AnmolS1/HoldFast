@@ -27,6 +27,7 @@ import authSchemaSource from "../../../src/worker/db/auth-schema.ts?raw";
 import schemaSource from "../../../src/worker/db/schema.ts?raw";
 import { testVars } from "../../setup/test-vars";
 import {
+  forgetMailCountOf,
   ADMIN_EMAIL,
   auditRows,
   createInvite,
@@ -311,7 +312,7 @@ describe("the gates, one at a time", () => {
 });
 
 describe("an address that already has an account", () => {
-  it("answers exactly like a new sign-up, creates nothing and spends nothing", async () => {
+  it("answers exactly like a new sign-up and creates nothing — and spends what a new sign-up spends", async () => {
     const first = await signUp(newClient());
     const firstRow = await userByEmail(first.email);
     const code = await createInvite();
@@ -325,7 +326,9 @@ describe("an address that already has an account", () => {
       Object.keys((first.sent.body as { user: object }).user).sort(),
     );
     expect((again.sent.body as { user: { id: string } }).user.id).not.toBe(firstRow!.id);
-    expect((await inviteRow(code))!.uses).toBe(0);
+    // The invite is used either way: a code that stayed good would say "that address was taken"
+    // (tests/unit/auth/enumeration.test.ts has the pairs).
+    expect((await inviteRow(code))!.uses).toBe(1);
     expect((await userByEmail(first.email))!.id).toBe(firstRow!.id);
     // The pending cookie is set either way (and names nobody here) — see pending-email.test.ts.
     expect([...client.cookies.keys()]).toEqual(["hf_pending"]);
@@ -488,6 +491,7 @@ describe("ADMIN_EMAILS", () => {
   beforeAll(async () => {
     const existing = await userByEmail(ADMIN_EMAIL);
     if (existing) await purgeAuthRows(testDb(), existing.id);
+    await forgetMailCountOf(ADMIN_EMAIL);
   });
 
   it("bypasses the invite, is not an admin while unverified, and becomes one at its first session", async () => {

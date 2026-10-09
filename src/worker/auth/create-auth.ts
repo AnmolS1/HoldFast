@@ -34,6 +34,7 @@ import type { AuthContext, ServiceDeps } from "../services/request-context";
 import { sessionAdditionalFields, userAdditionalFields } from "./fields";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
+import { hashPassword, verifyPassword } from "./password";
 import { createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
@@ -81,7 +82,7 @@ export function buildAuthOptions(scope: AuthScope) {
     database: drizzleAdapter(db, { provider: "pg", schema }),
     telemetry: { enabled: false },
     // Warnings and errors only, and every line redacted before it reaches the Worker's log.
-    logger: { level: "warn" as const, log: authLog },
+    logger: { disabled: false, level: "warn" as const, log: authLog },
     advanced: {
       useSecureCookies: secure,
       cookiePrefix: "hf",
@@ -120,6 +121,8 @@ export function buildAuthOptions(scope: AuthScope) {
       minPasswordLength: 12,
       maxPasswordLength: 128,
       revokeSessionsOnPasswordReset: true,
+      // Better Auth's own scrypt, through a module a test can count calls on (./password.ts).
+      password: { hash: hashPassword, verify: verifyPassword },
       sendResetPassword: async ({ user, url }: { user: { email: string; name: string }; url: string }) => {
         await sendPasswordReset(deps, { to: user.email, name: user.name, url });
       },

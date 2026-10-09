@@ -27,6 +27,7 @@ import {
 import {
   account,
   auditLog,
+  emailLedger,
   invites,
   nodes,
   type PauseReason,
@@ -35,6 +36,7 @@ import {
   shares,
   user,
 } from "../../../src/worker/db/schema";
+import { recipientHash } from "../../../src/worker/services/email";
 import * as outbox from "../../../src/worker/services/outbox";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 
@@ -287,6 +289,17 @@ export async function waitForMail(address: string, template: string, count = 1):
     const found = mailTo(address, template);
     return found.length >= count ? found.at(-1)! : null;
   });
+}
+
+/**
+ * Forgets the mail already counted against an address. For the ONE address every run shares
+ * (ADMIN_EMAIL): its per-recipient cap (5 an hour) is otherwise used up by earlier runs, and the
+ * sixth run in an hour would wait for a verification mail that was — correctly — never sent.
+ */
+export async function forgetMailCountOf(address: string): Promise<void> {
+  await testDb()
+    .delete(emailLedger)
+    .where(eq(emailLedger.recipientHash, await recipientHash(env as unknown as Env, address)));
 }
 
 /** The first link in a message, as a path (its origin is asserted where a test is about origins). */

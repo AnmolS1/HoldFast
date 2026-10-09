@@ -38,6 +38,7 @@ import {
 } from "../services/email";
 import { metric } from "../services/metrics";
 import { db, defer, deps, type AppEnv } from "../services/request-context";
+import { responseCode } from "./redact";
 import type { AuthScope } from "./scope";
 
 /** How a completed sign-in is named, by the endpoint that completed it. */
@@ -93,7 +94,7 @@ async function errorCodeOf(response: Response): Promise<string | null> {
   const location = response.headers.get("location");
   if (location) {
     try {
-      return new URL(location, "http://x").searchParams.get("error")?.slice(0, 64) ?? null;
+      return responseCode(new URL(location, "http://x").searchParams.get("error"));
     } catch {
       return null;
     }
@@ -101,7 +102,7 @@ async function errorCodeOf(response: Response): Promise<string | null> {
   if (!(response.headers.get("content-type") ?? "").includes("json")) return null;
   try {
     const body = (await response.clone().json()) as { code?: unknown };
-    return typeof body?.code === "string" ? body.code.slice(0, 64) : null;
+    return responseCode(body?.code);
   } catch {
     return null;
   }

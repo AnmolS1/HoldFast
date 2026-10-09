@@ -36,6 +36,7 @@ import { getAccount } from "../db/queries/auth-lifecycle";
 import { audit } from "../services/audit";
 import { metric } from "../services/metrics";
 import type { ServiceDeps } from "../services/request-context";
+import { scrubText } from "./redact";
 import type { AuthScope } from "./scope";
 
 /** Relative to Better Auth's `basePath` (/api/auth). The five plugin calls the admin console makes. */
@@ -107,8 +108,12 @@ export async function recordAdminDenial(
 ): Promise<void> {
   scope.facts.adminDenied = true;
   metric("auth", { outcome: "denied", kind: "admin_endpoint" });
-  // The path is recorded as sent, capped: it is attacker-controlled text.
-  await auditNow(scope, actorUserId, { path: path.slice(0, 200), method: method.slice(0, 16) });
+  // The path is attacker-controlled text: recorded capped, and scanned like any free text (an
+  // address or a token typed into it does not belong in the audit log).
+  await auditNow(scope, actorUserId, {
+    path: scrubText(path).slice(0, 200),
+    method: /^[A-Z]{1,16}$/.test(method) ? method : "OTHER",
+  });
 }
 
 type GateContext = Parameters<typeof getSessionFromCtx>[0] & { path?: string; method?: string };

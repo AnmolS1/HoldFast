@@ -67,6 +67,7 @@ function draftsWith(value: string) {
   const when = new Date("2026-10-16T09:30:00Z");
   return {
     verification: templates.verification({ name: value, url: `${APP}/api/auth/verify-email?token=t` }),
+    signupAttempt: templates.signupAttempt({ name: value, loginUrl: `${APP}/login` }),
     verificationResend: templates.verification({
       name: value,
       url: `${APP}/api/auth/verify-email?token=t`,
@@ -144,6 +145,9 @@ describe("templates", () => {
     expect(names).toEqual(
       [
         "verification",
+        // Not in the plan's list: the notice an address's owner gets when somebody tries to
+        // sign up with it (the enumeration-safe answer to a duplicate sign-up).
+        "signupAttempt",
         "newAddressVerification",
         "passwordReset",
         "changeEmailConfirmation",

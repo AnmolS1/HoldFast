@@ -58,7 +58,13 @@ async function request(client: Client, row: (typeof AUTH_ENDPOINTS)[number]) {
     ? send(client, `${path}?token=abcdef&callbackURL=%2F`)
     : send(client, path, {
         method,
-        json: { userId: "x".repeat(32), newEmail: "moved@holdfast-test.example", password: "x" },
+        // `name` so that /update-user, were it let through, would visibly change the account.
+        json: {
+          userId: "x".repeat(32),
+          newEmail: "moved@holdfast-test.example",
+          password: "x",
+          name: "Changed Through A Restricted Session",
+        },
       });
 }
 
