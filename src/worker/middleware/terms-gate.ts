@@ -1,9 +1,9 @@
 // A user whose accepted terms are older than the current version may read but not change
 // anything until they accept: state-changing /api/* → 403 terms_required.
 //
-// The session's user can lag an accept by up to 60 s (cookie cache), so before refusing this
-// re-reads `user.termsVersion` from the database — one primary-key read — and lets the request
-// through when it is current. An accept therefore takes effect at once.
+// Before refusing, this re-reads `user.termsVersion` from the database — one primary-key read —
+// and lets the request through when it is current, so an accept made a moment ago by a request
+// still in flight beside this one takes effect at once.
 //
 // Exempt: /api/auth/*, /api/public/*, the accept route itself, and the deletion routes (a user
 // must always be able to leave).

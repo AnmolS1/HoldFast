@@ -156,7 +156,6 @@ describe("a SUSPENDED session against the real handler", () => {
       .update(user)
       .set({ suspendedAt: new Date(), suspendedReason: "test" })
       .where(eq(user.id, row.id));
-    client.cookies.delete("hf.session_data");
     const before = await fingerprint(row.id);
 
     // The emailed delete link (a GET that would act on the account) is refused as well.
@@ -183,7 +182,6 @@ describe("an IMPERSONATED session against the real handler", () => {
   it("every denied endpoint is refused and changes nothing about the target; stop-impersonating works", async () => {
     const admin = await verifiedUser();
     await promoteToAdmin(admin.user.id);
-    admin.client.cookies.delete("hf.session_data");
     const target = await verifiedUser();
     const started = await send(admin.client, "/api/auth/admin/impersonate-user", {
       json: { userId: target.user.id },
@@ -217,7 +215,6 @@ describe("a session past its DELETION date against the real handler", () => {
       const { client, user: row } = await verifiedUser();
       const past = new Date(Date.now() - 3_600_000);
       await testDb().update(user).set({ deleteScheduledAt: past }).where(eq(user.id, row.id));
-      client.cookies.delete("hf.session_data");
       const before = await fingerprint(row.id);
       const sent = await request(client, policyRow);
       expectDecision(state, policyRow[COLUMN[state]], sent, `${policyRow[0]} ${policyRow[1]}`);
@@ -267,7 +264,6 @@ describe("how the real router reads a path", () => {
       .update(user)
       .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
       .where(eq(user.id, row.id));
-    client.cookies.delete("hf.session_data");
     for (const spelling of [
       "/api/auth/get-session/",
       "/api/auth/GET-SESSION",

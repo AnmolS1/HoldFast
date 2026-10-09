@@ -802,7 +802,6 @@ test.describe("account state", () => {
     const user = await signedInUser(page, { clientIp });
     // This account accepted an older version (the setting itself is shared by every test).
     await localDb((db) => db.query(`UPDATE "user" SET terms_version = '2001-01' WHERE id = $1`, [user.id]));
-    // The cookie cache catches up (60 s in real time).
     expect((await sessionOf(page.request, true))?.user.termsVersion).toBe("2001-01");
 
     const mutate = () =>

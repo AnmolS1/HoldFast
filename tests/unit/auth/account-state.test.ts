@@ -336,12 +336,8 @@ describe("an account whose deletion date has passed", () => {
         false,
       );
 
-      // The session that existed before. Its browser also holds the 60-second cookie cache, a
-      // snapshot of the user from before the date was written; in real time that snapshot has
-      // carried the date for seven days. Here the date was written a moment ago, so the cache
-      // is dropped — which is what its expiry does.
+      // The session that existed before.
       expect(await sessionsOf(row.id)).toHaveLength(1);
-      client.cookies.delete("hf.session_data");
       // Nobody, on the session read and on our own routes …
       const read = await send(client, "/api/auth/get-session");
       expect(read.status).toBe(200);
@@ -406,8 +402,7 @@ describe("terms", () => {
     expect(await auditRows({ action: "account.terms_accepted", targetId: row.id })).toMatchObject([
       { actorUserId: row.id, meta: { version: "2027-01" } },
     ]);
-    // No wait: the very next mutation is not a terms refusal, although the cookie cache still
-    // carries the old version.
+    // No wait: the very next mutation is not a terms refusal.
     const next = await mutate();
     expect(next.status).not.toBe(403);
   });

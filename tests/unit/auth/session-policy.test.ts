@@ -124,10 +124,10 @@ describe("the session cookie", () => {
     expect(token).toMatch(/; SameSite=Lax/);
     expect(token).not.toMatch(/; Secure/);
     expect(token).not.toMatch(/Domain=/i);
-    const cache = sent.setCookies.find((c) => c.startsWith("hf.session_data="))!;
-    expect(cache).toMatch(/; Max-Age=60;/);
-    expect(cache).toMatch(/; HttpOnly/);
-    expect(cache).toMatch(/; SameSite=Lax/);
+    // No cookie cache: no signed copy of the session or the user row is handed to the browser
+    // (auth/create-auth.ts — with one, a revoked session lived on until the copy expired).
+    expect(sent.setCookies.filter((c) => /session_data|account_data/.test(c.split("=")[0]!))).toEqual([]);
+    expect((await send(client, "/api/auth/get-session")).setCookies).toEqual([]);
     // No cookie of ours or Better Auth's is readable by script.
     for (const cookie of sent.setCookies) expect(cookie, cookie.split("=")[0]).toMatch(/; HttpOnly/);
   });
@@ -143,7 +143,7 @@ describe("the session cookie", () => {
     expect(verified.status).toBe(302);
     const names = verified.setCookies.map((c) => c.split("=")[0]);
     expect(names).toContain("__Secure-hf.session_token");
-    expect(names).toContain("__Secure-hf.session_data");
+    expect(names.filter((name) => name.includes("session_data"))).toEqual([]);
     for (const cookie of verified.setCookies) {
       expect(cookie.startsWith("__Secure-"), cookie.split("=")[0]).toBe(true);
       expect(cookie).toMatch(/; Secure/);
@@ -157,7 +157,7 @@ describe("the session cookie", () => {
     expect(await getSession(downgrade)).toBeNull();
   });
 
-  it("a session answer never carries the hold flag, the inviter or the suspension note — nor does the cookie cache", async () => {
+  it("a session answer never carries the hold flag, the inviter or the suspension note — and no cookie carries a copy of the user", async () => {
     const { client, user: row } = await verifiedUser();
     await testDb()
       .update(user)
@@ -173,10 +173,8 @@ describe("the session cookie", () => {
       const text = JSON.stringify(body);
       expect(text).not.toMatch(/legalHold|legal_hold|invitedBy|suspendedReason/);
     }
-    const cached = client.cookies.get("hf.session_data")!;
-    const decoded = atob(cached.replace(/-/g, "+").replace(/_/g, "/"));
-    expect(decoded).toContain(row.email);
-    expect(decoded).not.toMatch(/legalHold|invitedBy|suspendedReason/);
+    // And there is no cookie that carries a copy of the user row at all.
+    expect([...client.cookies.keys()].filter((name) => name.includes("session_data"))).toEqual([]);
     // What the shell does need is there.
     expect(session!.user).toMatchObject({
       emailVerified: true,
@@ -562,7 +560,7 @@ describe("the options object", () => {
         cookiePrefix: "hf",
         ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] },
       },
-      session: { expiresIn: 1_209_600, updateAge: 86_400, cookieCache: { enabled: true, maxAge: 60 } },
+      session: { expiresIn: 1_209_600, updateAge: 86_400, cookieCache: { enabled: false } },
       emailAndPassword: {
         requireEmailVerification: true,
         minPasswordLength: 12,

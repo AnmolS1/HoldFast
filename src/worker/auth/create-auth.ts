@@ -43,8 +43,6 @@ import type { Auth } from "./types";
 
 export const SESSION_EXPIRES_IN_S = 60 * 60 * 24 * 14;
 export const SESSION_UPDATE_AGE_S = 60 * 60 * 24;
-/** The upper bound on how long a revoked session or a changed user field can linger in a cookie. */
-export const COOKIE_CACHE_MAX_AGE_S = 60;
 export const IMPERSONATION_SESSION_S = 60 * 15;
 export const VERIFICATION_EXPIRES_IN_S = 60 * 60;
 
@@ -96,7 +94,13 @@ export function buildAuthOptions(scope: AuthScope) {
     session: {
       expiresIn: SESSION_EXPIRES_IN_S,
       updateAge: SESSION_UPDATE_AGE_S,
-      cookieCache: { enabled: true, maxAge: COOKIE_CACHE_MAX_AGE_S },
+      // OFF, explicitly. The cache is a signed copy of the session AND of the user row that the
+      // browser holds and Better Auth answers from without asking the database: with it, a
+      // session revoked a second ago (a suspension, a ban, a password reset, "sign out
+      // everywhere") went on working until the copy expired. Every request reads the session row
+      // instead; nothing is cached in a cookie. (A `session_data` cookie a browser still holds
+      // from before is ignored: api/routes/session.mjs reads it only when the cache is enabled.)
+      cookieCache: { enabled: false },
       additionalFields: sessionAdditionalFields,
     },
     rateLimit: {

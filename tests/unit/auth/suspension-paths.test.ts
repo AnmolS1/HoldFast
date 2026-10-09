@@ -191,15 +191,11 @@ describe("a suspended account cannot start a session", () => {
     const { client, user: row } = await verifiedUser();
     expect((await getSession(client))?.user.id).toBe(row.id);
     await suspend(row.id);
-    // NO COOKIE-CACHE WINDOW. The browser still holds Better Auth's signed copy of the session
-    // (good for 60 s), and sends it. Nothing reads it: the pipeline resolves the session from
-    // the database on every request, and the auth handler is handed the request without that
-    // cookie. So the very next request — an app route, an auth write, even the session read the
-    // shell draws from — finds nobody.
-    expect(
-      [...client.cookies.keys()].some((name) => name.includes("session_data")),
-      "the cache cookie is sent",
-    ).toBe(true);
+    // NO COOKIE-CACHE WINDOW: the cache is off (auth/create-auth.ts), so the browser holds no
+    // signed copy of the session, and both the pipeline and the auth handler resolve the session
+    // from the database. The very next request — an app route, an auth write, even the session
+    // read the shell draws from — finds nobody.
+    expect([...client.cookies.keys()].filter((name) => name.includes("session_data"))).toEqual([]);
     // One browser per request, each holding the same cookies as they were at the suspension: an
     // answer that deletes the cookies (Better Auth does, once it finds nobody) must not be what
     // makes the NEXT request fail.
@@ -251,10 +247,6 @@ describe("a suspended account cannot start a session", () => {
       ["phone", phone],
     ] as const) {
       // Each request with the device's cookies as they were (see the suspension case above).
-      expect(
-        [...browser.cookies.keys()].some((name) => name.includes("session_data")),
-        device,
-      ).toBe(true);
       const asThen = sameCookies(browser);
       expect((await send(asThen(), "/api/account/deletion-status")).status, device).toBe(401);
       expect((await send(asThen(), "/api/auth/update-user", { json: { name: "x" } })).status, device).toBe(

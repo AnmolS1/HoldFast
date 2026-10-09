@@ -289,9 +289,8 @@ export async function grantAdminRole(db: Executor, userId: string): Promise<bool
 // ── sessions ────────────────────────────────────────────────────────────────────────────────
 
 /**
- * Deletes every session row of the user and returns how many there were. A browser that holds
- * one keeps working until its cookie cache expires (at most 60 s); the session middleware
- * refuses a suspended, banned or deleted account in the meantime.
+ * Deletes every session row of the user and returns how many there were. Effective at once:
+ * every request reads the session row (there is no cookie cache).
  */
 export async function deleteUserSessions(db: Executor, userId: string): Promise<number> {
   const rows = await db.delete(session).where(eq(session.userId, userId)).returning({ id: session.id });

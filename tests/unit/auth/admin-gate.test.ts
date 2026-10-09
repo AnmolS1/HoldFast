@@ -65,8 +65,6 @@ async function call(client: Client, endpoint: { path: string; method: string }, 
 async function admin2fa() {
   const admin = await verifiedUser();
   await promoteToAdmin(admin.user.id);
-  // The 60-second cookie cache still says "user"; a real admin's has long since caught up.
-  admin.client.cookies.delete("hf.session_data");
   return admin;
 }
 
@@ -347,12 +345,11 @@ describe("the four allowed paths an admin calls", () => {
     expect(impersonated).toMatchObject({ status: "FORBIDDEN" });
     expect((await userById(target.user.id))!.banned).not.toBe(true);
 
-    // An admin whose session rows were just deleted, but whose browser still holds the cookie
-    // and its 60-second cache: refused, because the gate reads the database.
+    // An admin whose session rows were just deleted, but whose browser still holds the cookie:
+    // refused, because the gate reads the database.
     const revoked = await admin2fa();
     expect((await getSession(revoked.client))?.user.id).toBe(revoked.user.id);
     await testDb().delete(session).where(eq(session.userId, revoked.user.id));
-    expect(revoked.client.cookies.has("hf.session_data")).toBe(true);
     const afterRevoke: unknown = await api.banUser!({
       body: { userId: target.user.id },
       headers: cookieHeader(revoked.client),
@@ -365,7 +362,7 @@ describe("the four allowed paths an admin calls", () => {
     expect(await sessionsOf(target.user.id)).toHaveLength(1);
   });
 
-  it("a demoted admin stops at once, not when the cookie cache expires", async () => {
+  it("a demoted admin stops at once", async () => {
     const admin = await admin2fa();
     const target = await verifiedUser();
     expect(
@@ -376,7 +373,7 @@ describe("the four allowed paths an admin calls", () => {
       ).status,
     ).toBe(200);
     await testDb().update(user).set({ role: "user" }).where(eq(user.id, admin.user.id));
-    // The session cookie and its 60-second cache are untouched.
+    // The session cookie is untouched.
     const sent = await send(admin.client, "/api/auth/admin/ban-user", { json: { userId: target.user.id } });
     expect(sent.status).toBe(403);
     expect((await userById(target.user.id))!.banned).not.toBe(true);

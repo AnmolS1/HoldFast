@@ -11,8 +11,8 @@
 // log at every isolate start. This module has no imports.
 //
 // `returned: false` is not a column attribute (the generated schema is the same without it):
-// a field so marked is never part of a session answer — neither `GET /api/auth/get-session` nor
-// the signed-but-readable cookie cache — so the browser never sees it:
+// a field so marked is never part of a session answer (`GET /api/auth/get-session`), so the
+// browser never sees it:
 //   legalHold        a hold must not be observable by the account holder
 //   invitedBy        another account's id
 //   suspendedReason  an operator's note

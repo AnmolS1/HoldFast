@@ -4,14 +4,12 @@
 // read a session, so they never open the database for one. Sets `c.var.user`, `c.var.session`,
 // `c.var.impersonating`, `c.var.termsStale`.
 //
-// THE SESSION IS READ FROM THE DATABASE, on every request — never from Better Auth's cookie cache.
-// The cache is a signed copy of the session AND of the user row that the browser holds for up to
-// 60 s. Read from it, a session that was revoked a second ago (a suspension, a ban, a password
-// reset, "sign out everywhere") went on being a session for the rest of the minute, and the
-// user's flags below were the flags of a minute ago: a just-suspended account kept the whole API.
-// One indexed read per request is the price of "revoked" meaning revoked. (The cache still
-// serves the browser's own GET /api/auth/get-session, which only decides what the shell draws;
-// every request the shell then makes comes through here.)
+// THE SESSION IS READ FROM THE DATABASE, on every request. Better Auth's cookie cache — a signed
+// copy of the session and of the user row, held by the browser — is switched OFF
+// (auth/create-auth.ts): read from it, a session that was revoked a second ago (a suspension, a
+// ban, a password reset, "sign out everywhere") went on being a session until the copy expired.
+// One indexed read per request is the price of "revoked" meaning revoked. `disableCookieCache`
+// below says the same thing a second time, should the cache ever be switched on again.
 //
 // The user's own flags are checked as well, because a revoke is not the only way to lose access:
 //
@@ -56,8 +54,7 @@ function refusal(state: AuthGateState): AppError {
 }
 
 /**
- * A date field as a Date. Through the cookie cache Better Auth re-creates only `createdAt`,
- * `updatedAt` and `expiresAt`; every other date arrives as the ISO string it was serialised to.
+ * A date field as a Date (a value that went through JSON arrives as its ISO string).
  * `undefined` for a value that is present but not a date.
  */
 function toDate(value: unknown): Date | null | undefined {

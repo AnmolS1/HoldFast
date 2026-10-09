@@ -16,8 +16,8 @@
 //     AND two-factor enabled, AND THIS SESSION has passed a second factor (auth/second-factor.ts;
 //     otherwise 403 `admin_requires_2fa`), AND the session is not an impersonated one — the same condition
 //     as `requireAdmin` (middleware/guards.ts), evaluated here because /api/auth/* does not pass
-//     through that guard. Role and two-factor are read from the DATABASE, with the cookie cache
-//     bypassed: a demoted admin stops at once, not within 60 s.
+//     through that guard. Role and two-factor are read from the DATABASE: a demoted admin stops
+//     at once.
 //   stop-impersonating: called FROM the impersonated session, whose user is the target and not
 //     an admin — allowed exactly when the session carries the plugin's `impersonatedBy` marker.
 //
@@ -129,7 +129,7 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
   if (typeof path !== "string" || !path.startsWith("/admin/")) return;
   const method = ctx.request?.method ?? ctx.method ?? "";
 
-  // Straight from the database: neither a revoked session nor a stale role survives 60 s here.
+  // Straight from the database: neither a revoked session nor a stale role survives here.
   const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
   const sessionUserId = session?.user.id ?? null;
   const impersonatedBy = (session?.session as { impersonatedBy?: string | null } | undefined)?.impersonatedBy;

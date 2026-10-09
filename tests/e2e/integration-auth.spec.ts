@@ -4,8 +4,8 @@
 // Nothing under /api is mocked. The Turnstile widget script is the stand-in; Google is not used.
 //
 // "A session that has really ended": the session row is deleted in the database. The browser
-// still sends its session cookie and the signed cookie cache (`hf.session_data`); the server —
-// not a mock — reads the database, finds nobody, and answers 401 from the next request on.
+// still sends its session cookie; the server — not a mock — reads the database, finds nobody,
+// and answers 401 from the next request on.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { BrowserContext, Page } from "@playwright/test";
@@ -43,17 +43,17 @@ const deletionDate = async (userId: string) =>
   ).rows[0]?.delete_scheduled_at ?? null;
 
 /**
- * Ends every session of the user for real: the rows are deleted. The browser keeps BOTH its
- * cookies — the session token and Better Auth's 60-second cookie cache — and neither is worth
- * anything from the next request on (the server asks the database, not the cache).
+ * Ends every session of the user for real: the rows are deleted. The browser keeps its session
+ * cookie, which is worth nothing from the next request on: the server asks the database, and
+ * there is no cookie cache (no signed copy of the session in the browser) to answer instead.
  */
 async function endSessionsOf(context: BrowserContext, userId: string): Promise<void> {
   const cookies = await context.cookies();
   expect(cookies.some((cookie) => cookie.name.includes("session_token"))).toBe(true);
   expect(
-    cookies.some((cookie) => cookie.name.includes("session_data")),
-    "the cookie cache is held",
-  ).toBe(true);
+    cookies.filter((cookie) => cookie.name.includes("session_data")),
+    "no cookie cache is ever set",
+  ).toEqual([]);
   const removed = await localDb((db) => db.query("DELETE FROM session WHERE user_id = $1", [userId]));
   expect(removed.rowCount, "the user had a session row").toBeGreaterThan(0);
 }
@@ -251,7 +251,7 @@ test.describe("a suspended account", () => {
     expect((await sessionUser(page))?.id).toBe(user.id);
 
     // What suspendUser does (the admin console that calls it is a later task): the flag, and
-    // every session row gone. The browser keeps its cookies — session token and cookie cache.
+    // every session row gone. The browser keeps its session cookie.
     await localDb(async (db) => {
       await db.query(
         `UPDATE "user" SET suspended_at = (now() AT TIME ZONE 'UTC'), suspended_reason = 'e2e' WHERE id = $1`,
@@ -259,10 +259,7 @@ test.describe("a suspended account", () => {
       );
       await db.query("DELETE FROM session WHERE user_id = $1", [user.id]);
     });
-    expect((await page.context().cookies()).some((cookie) => cookie.name.includes("session_data"))).toBe(
-      true,
-    );
-    // The very next request with those cookies is nobody: no 60-second grace from the cache.
+    // The very next request with that cookie is nobody: there is no grace period of any kind.
     const next = await page.request.get("/api/account/deletion-status");
     expect(next.status()).toBe(401);
     const write = await page.request.post("/api/auth/update-user", {
@@ -301,8 +298,6 @@ test.describe("a session past its deletion date", () => {
         [user.id],
       ),
     );
-    const cache = (await page.context().cookies()).filter((cookie) => cookie.name.includes("session_data"));
-    for (const cookie of cache) await page.context().clearCookies({ name: cookie.name });
 
     expect(await sessionUser(page)).toBeNull();
     // A write under /api/auth with that cookie changes nothing (endpoint-policy: only sign-out).

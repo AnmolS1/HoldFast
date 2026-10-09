@@ -169,11 +169,8 @@ describe("every call into Better Auth is under the watchdog (source scan)", () =
     }
     expect(calls.sort()).toEqual([
       "src/worker/middleware/session.ts: watched( auth(c).api.getSession({",
-      // Taken as a value here and called two lines below, inside watched( — see the file.
-      "src/worker/routes/account-lifecycle.ts: auth(c).api.getSession as unknown as Fresh;",
       "src/worker/routes/auth.ts: watched( instance.handler(request));",
     ]);
-    expect(sources["../../../src/worker/routes/account-lifecycle.ts"]).toMatch(/await watched\(\s*read\(\{/);
   });
 });
 

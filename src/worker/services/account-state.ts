@@ -16,8 +16,8 @@
 //
 // SESSIONS are revoked by deleting the user's rows (`revokeSessions`) — never through the admin
 // plugin's revoke endpoints, which are outside the allow-list and need an admin session the
-// queue consumer does not have. A signed-in browser keeps a cookie-cached session for at most
-// 60 s; the session middleware refuses the account in the meantime.
+// queue consumer does not have. A revocation is effective on the browser's very next request:
+// every request reads the session row (there is no cookie cache).
 
 import {
   clearSuspended,

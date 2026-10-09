@@ -48,8 +48,8 @@ export function isActive(state: UserState | null): boolean {
 }
 
 /**
- * Deletes every session row of the user and returns how many there were. A signed-in browser
- * keeps working until its cookie cache expires (60 s).
+ * Deletes every session row of the user and returns how many there were. Effective at once:
+ * every request reads the session row (the auth layer keeps no cookie cache).
  */
 export async function revokeAllSessions(db: Executor, userId: string): Promise<number> {
   const rows = await db.delete(session).where(eq(session.userId, userId)).returning({ id: session.id });
