@@ -1,5 +1,6 @@
 // GET /api/_test/outbox?to=&clear=1 — the in-memory mail outbox, for tests.
-// Exists only in test mode (EMAIL_TRANSPORT=memory outside production); anywhere else the path
+// Exists only in test mode (services/clock.ts: memory transport, not production, and a
+// plain-http APP_ORIGIN — so never on a deploy); anywhere else the path
 // is a plain 404. `env` is only known per request, so the gate is inside the router.
 
 import { Hono } from "hono";

@@ -308,10 +308,62 @@ describe("clock", () => {
   });
 
   it("isTestMode is the one gate", () => {
-    expect(isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "test" })).toBe(true);
-    expect(isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "production" })).toBe(false);
-    expect(isTestMode({ EMAIL_TRANSPORT: "resend", SENTRY_ENVIRONMENT: "dev" })).toBe(false);
+    const http = "http://localhost:5173";
+    expect(isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "test", APP_ORIGIN: http })).toBe(
+      true,
+    );
+    expect(
+      isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "production", APP_ORIGIN: http }),
+    ).toBe(false);
+    expect(isTestMode({ EMAIL_TRANSPORT: "resend", SENTRY_ENVIRONMENT: "dev", APP_ORIGIN: http })).toBe(
+      false,
+    );
     expect(isTestMode({})).toBe(false);
+  });
+
+  // Fail closed: every deploy is served over https, so one wrong var on a deploy (the memory
+  // transport, a misspelt environment name) must not be enough to open the test seams.
+  const NOT_PLAIN_HTTP = [
+    "https://holdfast-dev.ponderance.dev",
+    "https://holdfast.ponderance.dev",
+    "HTTPS://holdfast-dev.ponderance.dev",
+    " https://holdfast-dev.ponderance.dev",
+    "https://localhost:5173",
+    "//holdfast-dev.ponderance.dev",
+    "holdfast-dev.ponderance.dev",
+    "localhost:5173",
+    "http:",
+    "ftp://localhost",
+    "",
+    undefined,
+  ];
+
+  it("isTestMode needs a plain-http APP_ORIGIN, whatever the other two vars say", () => {
+    for (const SENTRY_ENVIRONMENT of ["dev", "test", "prodution", undefined]) {
+      for (const APP_ORIGIN of NOT_PLAIN_HTTP) {
+        expect(
+          isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT, APP_ORIGIN }),
+          `${String(APP_ORIGIN)} / ${String(SENTRY_ENVIRONMENT)}`,
+        ).toBe(false);
+      }
+      for (const APP_ORIGIN of ["http://localhost", "http://localhost:5173", "http://127.0.0.1:5180"]) {
+        expect(isTestMode({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT, APP_ORIGIN }), APP_ORIGIN).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  it("the clock header is dead on an https origin even under the memory transport", async () => {
+    const near = (iso: string) => Math.abs(new Date(iso).getTime() - Date.now()) < 5_000;
+    // (Without any APP_ORIGIN the app cannot answer at all; isTestMode's own test covers that.)
+    for (const APP_ORIGIN of NOT_PLAIN_HTTP.filter((origin) => origin !== undefined)) {
+      const seen = await ask({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "dev", APP_ORIGIN });
+      expect(near(seen), String(APP_ORIGIN)).toBe(true);
+    }
+    expect(
+      await ask({ EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT: "dev", APP_ORIGIN: "http://localhost" }),
+    ).toBe(forced);
   });
 });
 
@@ -362,6 +414,31 @@ describe("test outbox", () => {
       expect(JSON.stringify(answer.body)).not.toContain("must not leak");
     }
     expect((await get("/api/_test/outbox")).status).toBe(200);
+    outbox.clear();
+  });
+
+  it("is a 404 on an https origin even under the memory transport", async () => {
+    outbox.clear();
+    outbox.push({ to: "secret@example.test", subject: "must not leak" });
+    for (const APP_ORIGIN of [
+      "https://holdfast-dev.ponderance.dev",
+      "https://holdfast.ponderance.dev",
+      "HTTPS://holdfast-dev.ponderance.dev",
+      "holdfast-dev.ponderance.dev",
+      "",
+    ]) {
+      for (const SENTRY_ENVIRONMENT of ["dev", "prodution"]) {
+        const env = { EMAIL_TRANSPORT: "memory", SENTRY_ENVIRONMENT, APP_ORIGIN };
+        for (const path of ["/api/_test/outbox", "/api/_test/outbox?clear=1", "/api/_test/anything"]) {
+          const answer = await get(path, env);
+          expect(answer.status, `${path} ${JSON.stringify(env)}`).toBe(404);
+          expect(JSON.stringify(answer.body)).not.toContain("must not leak");
+        }
+      }
+    }
+    // Nothing was cleared by the refused `clear=1`.
+    expect(outbox.list()).toHaveLength(1);
+    expect((await get("/api/_test/outbox")).body.messages).toHaveLength(1);
     outbox.clear();
   });
 });
