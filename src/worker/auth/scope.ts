@@ -70,6 +70,8 @@ export type AuthFacts = {
   throttled: boolean;
   /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
   signInAttempt: string | null;
+  /** The kinds of unauthenticated mail this request has caused to be sent (services/email.ts). */
+  mailed: string[];
   /** This request verified the right password for the account of `signInAttempt`. */
   signInProved: boolean;
 };
@@ -124,6 +126,7 @@ export function emptyFacts(): AuthFacts {
     throttled: false,
     signInAttempt: null,
     signInProved: false,
+    mailed: [],
   };
 }
 

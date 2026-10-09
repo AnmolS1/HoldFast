@@ -48,6 +48,15 @@ export async function tryConsume(
   }
 }
 
+/** Gives one send back to this hour's and this day's count of a key (a send that did not happen). */
+export async function refund(db: Executor, recipientHash: string): Promise<void> {
+  await db.execute(sql`
+    UPDATE email_ledger SET count = count - 1
+    WHERE recipient_hash = ${recipientHash} AND count > 0
+      AND ((window_kind = 'hour' AND window_start = date_trunc('hour', now(), 'UTC'))
+        OR (window_kind = 'day' AND window_start = date_trunc('day', now(), 'UTC')))`);
+}
+
 // ── operator alerts held for a digest (services/email.ts) ───────────────────────────────────
 //
 // A ROUTINE operator alert beyond the mailbox's hourly count is not sent on its own and is not
@@ -64,16 +73,19 @@ export async function holdAlert(db: Executor, mailboxKey: string, alert: HeldAle
     INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at)
     VALUES (gen_random_uuid()::text, ${HELD_PREFIX + mailboxKey}, ${JSON.stringify(alert)},
             (now() AT TIME ZONE 'UTC') + make_interval(days => ${HELD_DAYS}),
-            now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')`);
+            clock_timestamp() AT TIME ZONE 'UTC', clock_timestamp() AT TIME ZONE 'UTC')`);
 }
 
 /** Takes (removes and returns) up to `limit` held alerts of one mailbox, oldest first. */
 export async function takeHeldAlerts(db: Executor, mailboxKey: string, limit: number): Promise<HeldAlert[]> {
-  const result = await db.execute<{ value: string }>(sql`
-    DELETE FROM verification WHERE id IN (
-      SELECT id FROM verification WHERE identifier = ${HELD_PREFIX + mailboxKey}
-      ORDER BY created_at, id LIMIT ${limit} FOR UPDATE SKIP LOCKED)
-    RETURNING value`);
+  // (A DELETE returns its rows in no particular order: the digest lists them as they arrived.)
+  const result = await db.execute<{ value: string; at: string }>(sql`
+    WITH taken AS (
+      DELETE FROM verification WHERE id IN (
+        SELECT id FROM verification WHERE identifier = ${HELD_PREFIX + mailboxKey}
+        ORDER BY created_at, id LIMIT ${limit} FOR UPDATE SKIP LOCKED)
+      RETURNING value, created_at, id)
+    SELECT value, created_at AS at FROM taken ORDER BY created_at, id`);
   const alerts: HeldAlert[] = [];
   for (const row of result.rows) {
     try {

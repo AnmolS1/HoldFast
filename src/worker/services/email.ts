@@ -32,14 +32,18 @@
 //
 // KINDS, CLASSES AND CAPS (`KINDS` below is the one table; the counters live in `email_ledger`):
 //   unauth_triggered     verification, sign-up attempt, reset link — anyone can cause these.
-//                        Per recipient 5 an hour / 50 a day (the reset link counted apart from
-//                        the other two), AND per triggering client address 10 an hour / 40 a day
-//                        across all recipients: the anti-mail-bomb limit.
+//                        Per recipient 5 an hour (the reset link counted apart from the other
+//                        two; 20 and 10 a day), AND per triggering client address 10 an hour /
+//                        40 a day across all recipients: the anti-mail-bomb limit. The counts are
+//                        CHARGED whether or not a mail results (`chargeUnsent`): an address with
+//                        no account uses up the same budget as one with an account, so the
+//                        moment a limit starts refusing says nothing about who exists.
 //   session_action       address-change confirmation, new-address link, deletion confirmation —
-//                        only a signed-in session causes these. Per recipient 5 / 50, and per
-//                        acting user 10 / 40.
+//                        only a signed-in session causes these. Per recipient 5 an hour / 10 a
+//                        day, and per acting user 10 / 40.
 //   transactional_user   share invitation, quarantine, link paused, digest, … Per recipient
-//                        5 / 50, and per sending user 30 / 200 where a user sent it.
+//                        5 an hour / 10 a day, and per sending user 30 / 200 where a user sent it.
+//   (Per recipient, the four counted buckets add up to at most 50 a day.)
 //   account_security     password changed, 2FA, passkey, new device, suspended, deletion
 //                        scheduled / cancelled, admin alert. NEVER suppressed by any other
 //                        class: its own count, 20 an hour / 100 a day per recipient; beyond
@@ -80,7 +84,14 @@
 // No `send*` function throws.
 
 import { Resend } from "resend";
-import { heldAlertMailboxes, holdAlert, takeHeldAlerts, tryConsume } from "../db/queries/email-ledger";
+import {
+  heldAlertMailboxes,
+  holdAlert,
+  refund,
+  takeHeldAlerts,
+  tryConsume,
+} from "../db/queries/email-ledger";
+import { isTestMode } from "./clock";
 import { countFor, reportError } from "../auth/observe";
 import { normalise as normaliseIp } from "./ip-hash";
 import { createKeys, hmacHex } from "./keys";
@@ -101,8 +112,17 @@ export const ESTATE_LINKS = {
 } as const;
 
 type Caps = { perHour: number; perDay: number };
-/** Per recipient, for every class but `account_security`. */
+/**
+ * Per recipient: 5 an hour in each bucket — and 50 a DAY IN ALL, split between the buckets so
+ * that no bucket can use up another's day (signup 20, reset 10, session 10, product 10).
+ */
 export const EMAIL_CAPS = { perHour: 5, perDay: 50 } as const;
+export const BUCKET_CAPS = {
+  signup: { perHour: EMAIL_CAPS.perHour, perDay: 20 },
+  reset: { perHour: EMAIL_CAPS.perHour, perDay: 10 },
+  session: { perHour: EMAIL_CAPS.perHour, perDay: 10 },
+  product: { perHour: EMAIL_CAPS.perHour, perDay: 10 },
+} as const;
 /** Per triggering client address (unauth_triggered) and per acting user (session_action). */
 export const ACTOR_CAPS = { perHour: 10, perDay: 40 } as const;
 /** Per sending user (transactional_user). */
@@ -160,7 +180,14 @@ function neutralise(text: string): string {
 export function safeLabel(value: unknown, max = LABEL_MAX): string {
   const text = typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
   // (A cap before the work, too: nobody normalises a megabyte for a label.)
-  const stripped = neutralise(text.slice(0, max * 8))
+  // (cut on a code-point boundary: half a surrogate pair is not a character)
+  const stripped = neutralise(
+    Array.from(text.slice(0, max * 16))
+      .slice(0, max * 8)
+      .join("")
+      // (a lone surrogate is not a character either)
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, ""),
+  )
     .replace(/\s+/g, " ")
     .trim();
   const chars = Array.from(stripped);
@@ -744,10 +771,11 @@ const kindOf = (name: TemplateName): KindRow | undefined =>
   Object.hasOwn(KINDS, name) ? (KINDS as Record<TemplateName, KindRow>)[name] : undefined;
 
 /** What each class counts, per recipient and per actor (null: not counted per actor). */
-const CLASS_CAPS: Record<EmailClass, { recipient: Caps; actor: Caps | null }> = {
-  unauth_triggered: { recipient: EMAIL_CAPS, actor: ACTOR_CAPS },
-  session_action: { recipient: EMAIL_CAPS, actor: ACTOR_CAPS },
-  transactional_user: { recipient: EMAIL_CAPS, actor: SENDER_CAPS },
+const CLASS_CAPS: Record<EmailClass, { recipient: Caps | null; actor: Caps | null }> = {
+  // (`recipient: null`: the bucket's own caps — BUCKET_CAPS.)
+  unauth_triggered: { recipient: null, actor: ACTOR_CAPS },
+  session_action: { recipient: null, actor: ACTOR_CAPS },
+  transactional_user: { recipient: null, actor: SENDER_CAPS },
   account_security: { recipient: SECURITY_CAPS, actor: null },
   operator_alert: { recipient: OPERATOR_CAPS, actor: null },
 };
@@ -842,12 +870,76 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
   throw failure;
 }
 
+/**
+ * The ONE way a rendered message leaves — every path (a single mail, a digest, a critical alert,
+ * a retry) ends here. The memory outbox exists in TEST MODE only (services/clock.ts: the memory
+ * transport, not production, AND a plain-http origin): asked for anywhere else it is refused —
+ * loudly — rather than swallowing real mail into an isolate's memory.
+ */
 function transmit(env: Env, name: TemplateName, address: string, rendered: RenderedEmail): Promise<void> {
+  // Once more, where it matters: one plain address, whatever path brought it here.
+  const to = normaliseRecipient(address);
+  if (!to) return Promise.reject(new Error("email: the recipient is not a single well-formed address"));
   if (env.EMAIL_TRANSPORT === "memory") {
-    outbox.push({ to: address, ...rendered, template: name, class: KINDS[name].class });
+    if (!isTestMode(env)) {
+      return Promise.reject(new Error("email: the memory transport was asked for outside test mode"));
+    }
+    outbox.push({ to, ...rendered, template: name, class: KINDS[name].class });
     return Promise.resolve();
   }
-  return viaResend(env, { to: address, ...rendered });
+  return viaResend(env, { to, ...rendered });
+}
+
+/**
+ * The counts of one mail of a kind to an address by an actor — taken. True when it may be sent.
+ * Shared by `deliver` and `chargeUnsent`, so that the two cannot count differently. Throws when
+ * the ledger cannot be reached (the caller decides what that means).
+ */
+async function admit(
+  deps: ServiceDeps,
+  name: TemplateName,
+  row: KindRow,
+  address: string,
+  actor: EmailActor | undefined,
+): Promise<boolean> {
+  const env = deps.env;
+  const caps = CLASS_CAPS[row.class];
+  const by = caps.actor ? await actorKey(env, row.class, actor) : null;
+  if (by !== null && caps.actor && !(await tryConsume(deps.db, by, caps.actor))) {
+    countFor(env, "email", { outcome: "capped", kind: name, reason: "actor" });
+    return false;
+  }
+  const recipient = caps.recipient ?? (BUCKET_CAPS as Record<string, Caps>)[row.bucket];
+  // A bucket with no caps of its own is not sent from: nothing is uncounted by default.
+  if (!recipient) throw new Error("email: a bucket without caps was refused");
+  if (!(await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), recipient))) {
+    countFor(env, "email", { outcome: "capped", kind: name, reason: "recipient" });
+    return false;
+  }
+  return true;
+}
+
+/**
+ * The counts of a mail that is NOT sent — because the address has no account, or the account is
+ * not in a state to be mailed. An unauthenticated request charges the same budgets, with the
+ * same statements, whichever it was: otherwise the triggering client's own budget would run out
+ * faster for addresses that exist, and "my next mail did not arrive" would say which they were.
+ * Never throws; returns nothing — there is nothing to tell.
+ */
+export async function chargeUnsent(
+  deps: ServiceDeps,
+  name: TemplateName,
+  to: unknown,
+  actor: EmailActor,
+): Promise<void> {
+  try {
+    const row = kindOf(name);
+    const address = normaliseRecipient(to);
+    if (!row || row.class !== "unauth_triggered" || !address) return;
+    await admit(deps, name, row, address, actor);
+  } catch (error) {
+    reportError(error, { kind: "email_ledger", template: name });
+  }
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -912,11 +1004,11 @@ const DIGEST_MAX_ITEMS = 500;
  * Sends the operator digest for one mailbox if one is due (at most one an hour) and anything is
  * held: every held alert is taken and LISTED. If the send fails they are put back.
  */
-export async function sendOperatorDigestIfDue(
-  deps: ServiceDeps,
-  address: string,
-): Promise<EmailOutcome | null> {
+export async function sendOperatorDigestIfDue(deps: ServiceDeps, to: string): Promise<EmailOutcome | null> {
   const env = deps.env;
+  // The address may come from a stored row (the hourly flush): validated like any recipient.
+  const address = normaliseRecipient(to);
+  if (!address) return null;
   const mailbox = await ledgerKey(env, address, KINDS.adminAlert.bucket);
   let due = true;
   try {
@@ -935,6 +1027,7 @@ export async function sendOperatorDigestIfDue(
     return "sent";
   } catch (error) {
     for (const item of items) await holdAlert(deps.db, mailbox, item);
+    await refund(deps.db, await ledgerKey(env, address, KINDS.operatorDigest.bucket)).catch(() => {});
     reportError(error, { kind: "email", template: "operatorDigest" });
     countFor(env, "email", { outcome: "failed", kind: "operatorDigest" });
     return "failed";
@@ -987,7 +1080,7 @@ export async function deliver(
       // be reached is reported and the notice goes out (fail OPEN).
       let within = true;
       try {
-        within = await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), caps.recipient);
+        within = await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), caps.recipient!);
       } catch (error) {
         reportError(error, { kind: "email_ledger", template: name });
         countFor(env, "email", { outcome: "ledger_failed", kind });
@@ -1000,15 +1093,7 @@ export async function deliver(
       }
     } else {
       // Every other class fails CLOSED: a ledger error is thrown from here and nothing is sent.
-      const by = caps.actor ? await actorKey(env, row.class, actor) : null;
-      if (by !== null && caps.actor && !(await tryConsume(deps.db, by, caps.actor))) {
-        countFor(env, "email", { outcome: "capped", kind, reason: "actor" });
-        return "capped";
-      }
-      if (!(await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), caps.recipient))) {
-        countFor(env, "email", { outcome: "capped", kind, reason: "recipient" });
-        return "capped";
-      }
+      if (!(await admit(deps, name, row, address, actor))) return "capped";
     }
 
     await transmit(env, name, address, rendered);
@@ -1032,7 +1117,23 @@ async function holdForDigest(
   item: OperatorItem | undefined,
 ): Promise<EmailOutcome> {
   const mailbox = await ledgerKey(deps.env, address, KINDS.adminAlert.bucket);
-  await holdAlert(deps.db, mailbox, { kind: item?.kind ?? "report", id: safeId(item?.id), to: address });
+  try {
+    await holdAlert(deps.db, mailbox, { kind: item?.kind ?? "report", id: safeId(item?.id), to: address });
+  } catch (error) {
+    // It could not be held, so it is not held back: the alert itself goes out (fail OPEN).
+    reportError(error, { kind: "email_ledger", template: name });
+    const alert = render(
+      deps.env,
+      templates.adminAlert({
+        kind: item?.kind ?? "report",
+        id: item?.id,
+        adminUrl: `${deps.env.APP_ORIGIN}/admin`,
+      }),
+    );
+    await transmit(deps.env, "adminAlert", address, alert);
+    countFor(deps.env, "email", { outcome: "sent", kind: name, reason: "not_held" });
+    return "sent";
+  }
   countFor(deps.env, "email", { outcome: "coalesced", kind: name });
   await sendOperatorDigestIfDue(deps, address);
   return "coalesced";
@@ -1056,7 +1157,14 @@ async function coalesce(deps: ServiceDeps, name: CoalescibleName, address: strin
   }
   if (first) {
     const digest = render(env, templates.securityDigest({ accountUrl: `${env.APP_ORIGIN}/account` }));
-    await transmit(env, "securityDigest", address, digest);
+    try {
+      await transmit(env, "securityDigest", address, digest);
+    } catch (error) {
+      // The digest did not go out: its place in the hour is given back, so that the next notice
+      // tries again — a digest that was never delivered must not stand for anything.
+      await refund(deps.db, await ledgerKey(env, address, KINDS.securityDigest.bucket)).catch(() => {});
+      throw error;
+    }
   }
   countFor(env, "email", { outcome: "coalesced", kind: name });
   return "coalesced";

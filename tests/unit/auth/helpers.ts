@@ -10,6 +10,7 @@
 //
 // Postgres is shared by every test file and every run: rows are found by random markers (a
 // fresh address, a fresh client address), never by table-wide counts.
+import { onTestFinished } from "vitest";
 import { env } from "cloudflare:workers";
 import { eq, inArray } from "drizzle-orm";
 import { createApp } from "../../../src/worker/app";
@@ -36,7 +37,8 @@ import {
   shares,
   user,
 } from "../../../src/worker/db/schema";
-import { EMAIL_BUCKETS, ledgerKey } from "../../../src/worker/services/email";
+import { testOutbound } from "../../../src/worker/auth/test-outbound";
+import { EMAIL_BUCKETS, ledgerKey, templates } from "../../../src/worker/services/email";
 import * as outbox from "../../../src/worker/services/outbox";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 
@@ -393,6 +395,34 @@ export async function forgetMailCountOf(address: string): Promise<void> {
         await Promise.all(EMAIL_BUCKETS.map((bucket) => ledgerKey(env as unknown as Env, address, bucket))),
       ),
     );
+}
+
+/**
+ * A client on an HTTPS origin. The memory outbox does not exist there (services/email.ts: test
+ * mode needs a plain-http origin), so its mail goes the way real mail does — through the Resend
+ * transport — to a stand-in at the fetch boundary that files it in the outbox for `waitForMail`.
+ * No request leaves the isolate.
+ */
+export function httpsClient(origin: string): { client: Client } {
+  installTestOutbound(env as unknown as Env);
+  const outbound = testOutbound();
+  if (!outbound) throw new Error("the outbound stand-ins are not installed");
+  const subjects = new Map<string, string>(
+    Object.entries({
+      verification: templates.verification({ url: "x" }).subject,
+      passwordReset: templates.passwordReset({ url: "x" }).subject,
+    }).map(([template, subject]) => [`[dev] ${subject}`, template]),
+  );
+  outbound.answer("api.resend.com", async (request) => {
+    const body = (await request.json()) as { to: string; subject: string; html?: string; text?: string };
+    outbox.push({ ...body, template: subjects.get(body.subject) ?? "other", class: "stand-in" });
+    return Response.json({ id: crypto.randomUUID() });
+  });
+  // The stand-in goes when the test does.
+  onTestFinished(() => outbound.answer("api.resend.com", null));
+  return {
+    client: newClient({ origin, env: { EMAIL_TRANSPORT: "resend", RESEND_API_KEY: "re_test_key" } }),
+  };
 }
 
 /** The first link in a message, as a path (its origin is asserted where a test is about origins). */

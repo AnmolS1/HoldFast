@@ -152,6 +152,7 @@ export function buildAuthOptions(scope: AuthScope) {
         // Handed to the request's deferred work and started only once the request is answered —
         // never awaited here: an answer that waited for a mail, or shared its round trips with
         // one, would be slower exactly when the address has an account (auth/parity.ts).
+        scope.facts.mailed.push("passwordReset");
         deps.defer(
           afterAnswer(scope, () => sendPasswordReset(deps, { to: user.email, url, by: byClient(scope) })),
         );
@@ -184,6 +185,7 @@ export function buildAuthOptions(scope: AuthScope) {
           );
         } else {
           const resend = scope.facts.endpointPath === "/send-verification-email";
+          scope.facts.mailed.push("verification");
           deps.defer(
             afterAnswer(scope, () =>
               sendVerification(deps, { to: user.email, url, resend, by: byClient(scope) }),

@@ -7,6 +7,8 @@ import { describe, expect, it, vi } from "vitest";
 import * as ledger from "../../../src/worker/db/queries/email-ledger";
 import {
   ACTOR_CAPS,
+  actorKey,
+  BUCKET_CAPS,
   canonicalRecipient,
   CRITICAL_RETRY_WAITS_MS,
   deliver,
@@ -38,11 +40,25 @@ import {
 } from "../../../src/worker/services/email";
 import emailSource from "../../../src/worker/services/email.ts?raw";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
-import { freshEmail, freshIp, mailTo, serviceDeps, testDb } from "./helpers";
+import * as outbox from "../../../src/worker/services/outbox";
+import {
+  CAPTCHA,
+  freshEmail,
+  freshIp,
+  mailTo,
+  measured,
+  newClient,
+  send,
+  serviceDeps,
+  signUp,
+  testDb,
+  verifiedUser,
+  type Client,
+} from "./helpers";
 
 vi.mock("../../../src/worker/db/queries/email-ledger", async (original) => {
   const real = await original<typeof import("../../../src/worker/db/queries/email-ledger")>();
-  return { ...real, tryConsume: vi.fn(real.tryConsume) };
+  return { ...real, tryConsume: vi.fn(real.tryConsume), holdAlert: vi.fn(real.holdAlert) };
 });
 
 const APP = "http://localhost";
@@ -702,5 +718,298 @@ describe("operator alerts", () => {
     ).toBe("sent");
     expect(emailSource).toMatch(/if \(row\.severity === "critical"\) return await sendCritical/);
     expect(emailSource).toMatch(/assertCoalescible\(name\);\s+return row\.class === "operator_alert"/);
+  });
+});
+
+// ── existence privacy: the mail budgets say nothing about who has an account ────────────────
+
+const ALLOW = { limit: async () => ({ success: true }) };
+/** A client whose per-address request limits are out of the way: the MAIL budget is the subject. */
+const quiet = () => newClient({ env: { RL_AUTH: ALLOW, RL_API: ALLOW } });
+async function forgetAddressRule(client: Client) {
+  await testDb().execute(
+    sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${client.ip}%`}`,
+  );
+}
+/** This hour's count under a ledger key. */
+async function counted(key: string | null): Promise<number> {
+  if (key === null) return 0;
+  const result = await testDb().execute<{ count: number }>(sql`
+    SELECT count FROM email_ledger
+    WHERE recipient_hash = ${key} AND window_kind = 'hour' AND window_start = date_trunc('hour', now(), 'UTC')`);
+  return Number(result.rows[0]?.count ?? 0);
+}
+const clientCount = async (client: Client) =>
+  counted(await actorKey(env, "unauth_triggered", { client: client.ip }));
+
+describe("the mail budgets are charged the same whether or not the address has an account", () => {
+  const ENDPOINTS = [
+    [
+      "/api/auth/request-password-reset",
+      "reset",
+      (email: string) => ({ email, redirectTo: "/reset-password" }),
+    ],
+    ["/api/auth/send-verification-email", "signup", (email: string) => ({ email })],
+  ] as const;
+
+  it.each(ENDPOINTS)(
+    "%s: same answer, same charges — a verified account, an unverified one, and nobody",
+    async (path, bucket, body) => {
+      const verified = await verifiedUser();
+      const pending = (await signUp(newClient())).email;
+      const nobody = freshEmail();
+      const seen: unknown[] = [];
+      for (const email of [verified.email, pending, nobody]) {
+        const client = quiet();
+        const before = await counted(await ledgerKey(env, email, bucket));
+        const done = await measured(client, path, { json: body(email), headers: CAPTCHA });
+        seen.push({
+          status: done.sent.status,
+          body: done.sent.body,
+          cookies: done.sent.setCookies.length,
+          statementsBeforeTheAnswer: done.statements,
+          // What the request cost the caller's own mail budget, and the address's.
+          chargedToClient: await clientCount(client),
+          chargedToRecipient: (await counted(await ledgerKey(env, email, bucket))) - before,
+        });
+      }
+      expect(seen[1]).toEqual(seen[0]);
+      expect(seen[2]).toEqual(seen[0]);
+      expect(seen[0]).toMatchObject({ status: 200, chargedToClient: 1, chargedToRecipient: 1 });
+    },
+  );
+
+  it("what the caller can observe — when their OWN next mail stops arriving — is the same after ten addresses that exist and ten that do not", async () => {
+    const world = async (addresses: string[]) => {
+      const client = quiet();
+      for (const email of addresses) {
+        await forgetAddressRule(client);
+        const sent = await send(client, "/api/auth/request-password-reset", {
+          json: { email, redirectTo: "/reset-password" },
+          headers: CAPTCHA,
+        });
+        expect(sent.status).toBe(200);
+      }
+      // The probe: a mail to an inbox the caller owns, caused from the same client.
+      const mine = (await verifiedUser()).email;
+      await forgetAddressRule(client);
+      await send(client, "/api/auth/request-password-reset", {
+        json: { email: mine, redirectTo: "/reset-password" },
+        headers: CAPTCHA,
+      });
+      return { arrived: mailTo(mine, "passwordReset").length, charged: await clientCount(client) };
+    };
+    const existing: string[] = [];
+    for (let i = 0; i < ACTOR_CAPS.perHour; i++) existing.push((await verifiedUser()).email);
+    const made = await world(existing);
+    const madeUp = await world(Array.from({ length: ACTOR_CAPS.perHour }, () => freshEmail()));
+    expect(madeUp).toEqual(made);
+    // Both are over the client's budget: the probe did not arrive in either world.
+    expect(made).toEqual({ arrived: 0, charged: ACTOR_CAPS.perHour });
+    // The control: with one request fewer the probe does arrive.
+    const under = await world(Array.from({ length: ACTOR_CAPS.perHour - 1 }, () => freshEmail()));
+    expect(under.arrived).toBe(1);
+  });
+
+  it("a pending sign-up's address change: moved, or a taken address — the same charges", async () => {
+    const taken = (await verifiedUser()).email;
+    const trace = async (target: string) => {
+      const client = quiet();
+      await signUp(client);
+      const before = await clientCount(client);
+      const sent = await send(client, "/api/account/pending-email", {
+        method: "PATCH",
+        json: { email: target },
+        headers: CAPTCHA,
+      });
+      return {
+        status: sent.status,
+        body: sent.body,
+        chargedToClient: (await clientCount(client)) - before,
+        chargedToRecipient: await counted(await ledgerKey(env, target, "signup")),
+      };
+    };
+    const moved = await trace(freshEmail());
+    const refusedQuietly = await trace(taken);
+    expect(refusedQuietly.status).toBe(moved.status);
+    expect(refusedQuietly.body).toEqual(moved.body);
+    expect(refusedQuietly.chargedToClient).toBe(moved.chargedToClient);
+    expect(moved.chargedToClient).toBe(1);
+    // (the taken address's own count includes the mail its owner got when signing up)
+    expect(refusedQuietly.chargedToRecipient).toBe(moved.chargedToRecipient + 1);
+  });
+});
+
+describe("the mail subsystem's outcome never reaches an unauthenticated response", () => {
+  it("ledger unreachable, or every budget used up: the same generic answer and the same work before it, for an account and for nobody", async () => {
+    const owner = await verifiedUser();
+    const outline = async (email: string, client: Client) => {
+      const done = await measured(client, "/api/auth/request-password-reset", {
+        json: { email, redirectTo: "/reset-password" },
+        headers: CAPTCHA,
+      });
+      return {
+        status: done.sent.status,
+        body: done.sent.body,
+        statements: done.statements,
+        cookies: done.sent.setCookies,
+      };
+    };
+    const normal = await outline(owner.email, quiet());
+    expect(normal.status).toBe(200);
+
+    // The ledger failing for the whole request.
+    const broken = vi.mocked(ledger.tryConsume);
+    broken.mockRejectedValue(new Error("connection terminated"));
+    try {
+      expect(await outline(owner.email, quiet())).toEqual(normal);
+      expect(await outline(freshEmail(), quiet())).toEqual(normal);
+      expect(broken).toHaveBeenCalled();
+    } finally {
+      broken.mockRestore();
+    }
+    // Every budget used up (the client's, by ten earlier mails).
+    const spent = quiet();
+    const { deps } = serviceDeps();
+    for (let i = 0; i < ACTOR_CAPS.perHour; i++) {
+      await sendVerification(deps, { to: freshEmail(), url, by: { client: spent.ip } });
+    }
+    const before = mailTo(owner.email, "passwordReset").length;
+    expect(await outline(owner.email, spent)).toEqual(normal);
+    expect(await outline(freshEmail(), spent)).toEqual(normal);
+    expect(mailTo(owner.email, "passwordReset")).toHaveLength(before);
+  });
+
+  it("nothing about a recipient is in what the mailer counts: only an outcome, a kind and which budget", () => {
+    const tags = [...emailSource.matchAll(/countFor\(\s*(?:deps\.)?env,\s*"email",\s*\{([^}]*)\}/g)].map(
+      (m) => m[1]!,
+    );
+    expect(tags.length).toBeGreaterThan(10);
+    for (const tag of tags) {
+      const keys = [...tag.matchAll(/(\w+)\s*[:,]|(\w+)\s*$/g)].map((m) => m[1] ?? m[2]).filter(Boolean);
+      for (const key of keys) expect(["outcome", "kind", "reason", "name"], tag).toContain(key);
+      expect(tag, tag).not.toMatch(/address|\bto\b|recipient:|email:/);
+    }
+  });
+});
+
+// ── nothing the module did before this pass has been lost on a new path ─────────────────────
+
+describe("every path a message can leave by keeps the transport's guards", () => {
+  it("the memory outbox exists in test mode only: on an https origin, or in production, it is refused — for a single mail, a digest and a critical alert", async () => {
+    for (const overrides of [
+      { APP_ORIGIN: "https://app.example.test" },
+      { SENTRY_ENVIRONMENT: "production" },
+    ]) {
+      const { deps } = serviceDeps(overrides);
+      const origin = (deps.env as unknown as { APP_ORIGIN: string }).APP_ORIGIN;
+      const to = freshEmail();
+      const held = outbox.list({}).length;
+      expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("failed");
+      expect(
+        await sendVerification(deps, { to, url: `${origin}/api/auth/verify-email?token=t`, by: anyone() }),
+      ).toBe("failed");
+      expect(await sendOperatorCritical(deps, { to, event: "kill_switch" })).toBe("retrying");
+      expect(outbox.list({}).length).toBe(held);
+      expect(mailTo(to)).toEqual([]);
+    }
+    // The control: in test mode the same calls are delivered to the outbox.
+    const { deps } = serviceDeps();
+    const to = freshEmail();
+    expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("sent");
+    expect(mailTo(to)).toHaveLength(1);
+  });
+
+  it("the hourly flush validates the stored address like any recipient: a row that is not one plain address sends nothing", async () => {
+    const { deps } = serviceDeps();
+    const bad = `a${crypto.randomUUID().slice(0, 6)}@x.example, victim@y.example`;
+    await testDb().execute(sql`
+      INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at)
+      VALUES (${crypto.randomUUID()}, ${`opalert:${crypto.randomUUID()}`},
+              ${JSON.stringify({ kind: "report", id: "rep_1", to: bad })},
+              now() + interval '1 day', now(), now())`);
+    const before = outbox.list({}).length;
+    await flushOperatorDigests(deps);
+    expect(outbox.list({ to: "victim@y.example" })).toEqual([]);
+    expect(outbox.list({}).filter((mail) => String(mail.to).includes(","))).toEqual([]);
+    expect(outbox.list({}).length).toBeGreaterThanOrEqual(before);
+  });
+
+  it("a digest that could not be sent does not stand for anything: its place is given back, and the next notice sends it", async () => {
+    const outbound = testOutbound()!;
+    let failing = true;
+    const subjects: string[] = [];
+    outbound.answer("api.resend.com", async (request) => {
+      const subject = ((await request.json()) as { subject: string }).subject;
+      if (failing && subject.includes("More security activity")) {
+        return Response.json({ name: "x", message: "down", statusCode: 500 }, { status: 500 });
+      }
+      subjects.push(subject);
+      return Response.json({ id: "ok" });
+    });
+    try {
+      const { deps } = serviceDeps({ EMAIL_TRANSPORT: "resend", RESEND_API_KEY: "re_test_key" });
+      const to = freshEmail();
+      for (let i = 0; i < SECURITY_CAPS.perHour; i++) await sendPasswordChanged(deps, { to, name: "Ana" });
+      // Over the count while the digest cannot be sent: reported as failed — not as "coalesced".
+      expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("failed");
+      expect(subjects.filter((subject) => subject.includes("More security activity"))).toEqual([]);
+      // The transport is back: the very next notice sends the digest.
+      failing = false;
+      expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("coalesced");
+      expect(subjects.filter((subject) => subject.includes("More security activity"))).toHaveLength(1);
+    } finally {
+      outbound.answer("api.resend.com", null);
+    }
+  });
+
+  it("a routine operator alert that cannot be HELD is sent itself — it is not dropped", async () => {
+    const { deps } = serviceDeps();
+    const to = freshEmail();
+    for (let i = 0; i < OPERATOR_CAPS.perHour; i++)
+      await sendAdminAlert(deps, { to, kind: "report", id: `rep_${i}` });
+    const hold = vi.mocked(ledger.holdAlert);
+    hold.mockRejectedValue(new Error("connection terminated"));
+    try {
+      expect(await sendAdminAlert(deps, { to, kind: "quarantine", id: "node_42" })).toBe("sent");
+    } finally {
+      hold.mockRestore();
+    }
+    expect(mailTo(to, "adminAlert").at(-1)!.text).toContain("Node node_42");
+  });
+
+  it("per recipient the counted buckets add up to 50 a day, each with a day of its own", async () => {
+    expect(Object.values(BUCKET_CAPS).reduce((sum, caps) => sum + caps.perDay, 0)).toBe(EMAIL_CAPS.perDay);
+    for (const caps of Object.values(BUCKET_CAPS)) expect(caps.perHour).toBe(EMAIL_CAPS.perHour);
+    // Every counted kind's bucket has caps (a bucket without caps is refused, not sent uncounted).
+    for (const [name, kind] of Object.entries(KINDS)) {
+      if (kind.class !== "account_security" && kind.class !== "operator_alert") {
+        expect(Object.keys(BUCKET_CAPS), name).toContain(kind.bucket);
+      }
+    }
+    // The day's count of one bucket, full: that bucket is refused; another is not.
+    const { deps } = serviceDeps();
+    const to = freshEmail();
+    await testDb().execute(sql`
+      INSERT INTO email_ledger (window_kind, window_start, recipient_hash, count)
+      VALUES ('day', date_trunc('day', now(), 'UTC'), ${await ledgerKey(env, to, "reset")}, ${BUCKET_CAPS.reset.perDay})`);
+    expect(await sendPasswordReset(deps, { to, url: resetUrl, by: anyone() })).toBe("capped");
+    expect(await sendVerification(deps, { to, url, by: anyone() })).toBe("sent");
+  });
+
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it("safeLabel cuts on a character boundary and leaves no half of a surrogate pair", () => {
+    for (const value of [
+      "😀".repeat(2_000),
+      `${"a".repeat(1279)}😀`,
+      "\ud83d",
+      "a\udc00b",
+      `${"x".repeat(79)}😀😀`,
+    ]) {
+      const label = safeLabel(value);
+      expect(LONE_SURROGATE.test(label), JSON.stringify(label.slice(-4))).toBe(false);
+      expect(Array.from(label).length).toBeLessThanOrEqual(LABEL_MAX);
+    }
   });
 });

@@ -37,7 +37,12 @@ import {
 import { activatePendingShares } from "../db/queries/shares";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
-import { sendChangeEmailConfirmation, sendSignInMethodAdded, sendSignupAttempt } from "../services/email";
+import {
+  chargeUnsent,
+  sendChangeEmailConfirmation,
+  sendSignInMethodAdded,
+  sendSignupAttempt,
+} from "../services/email";
 import {
   ACCOUNT_SUSPENDED_MESSAGE,
   checkSessionStart,
@@ -184,6 +189,12 @@ function actorOf(ctx: HookContext): Actor {
   return id ? { userId: id, type: "admin" } : SYSTEM_ACTOR;
 }
 
+/** The unauthenticated endpoints that mail an address ONLY when it has an account in the right state. */
+const UNSENT_KIND: Record<string, "passwordReset" | "verification"> = {
+  "/request-password-reset": "passwordReset",
+  "/send-verification-email": "verification",
+};
+
 export function buildHooks(scope: AuthScope) {
   const env = scope.env;
 
@@ -262,7 +273,9 @@ export function buildHooks(scope: AuthScope) {
       // only just been proven, by this very sign-in: there is no earlier owner to tell.)
       if (!linking.cleaned) {
         scope.deps.defer(
-          sendSignInMethodAdded(scope.deps, { to: owner.email, name: owner.name, method: "google" }),
+          afterAnswer(scope, () =>
+            sendSignInMethodAdded(scope.deps, { to: owner.email, name: owner.name, method: "google" }),
+          ),
         );
       }
     });
@@ -524,6 +537,20 @@ export function buildHooks(scope: AuthScope) {
     }
     if (path === SIGN_IN_PATH && ctx.request) {
       await afterSignIn(scope);
+      return;
+    }
+    const uncharged = ctx.request && typeof path === "string" ? UNSENT_KIND[path] : undefined;
+    if (uncharged) {
+      // The mail budgets are charged the same whether or not a mail results (services/email.ts
+      // `chargeUnsent`) — after the answer, like the mail itself, and never awaited.
+      const address = (ctx.body as { email?: unknown } | undefined)?.email;
+      scope.deps.defer(
+        afterAnswer(scope, async () => {
+          if (!scope.facts.mailed.includes(uncharged)) {
+            await chargeUnsent(scope.deps, uncharged, address, { client: scope.client?.ip ?? null });
+          }
+        }),
+      );
       return;
     }
     if (path === "/change-email" && ctx.request) {

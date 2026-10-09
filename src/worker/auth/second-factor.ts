@@ -82,7 +82,7 @@ import { revokeSessions } from "../services/account-state";
 import { now } from "../services/clock";
 import { sendSecondFactorLocked } from "../services/email";
 import { record } from "./observe";
-import type { AuthScope } from "./scope";
+import { afterAnswer, type AuthScope } from "./scope";
 
 export const VERIFY_TOTP_PATH = "/two-factor/verify-totp";
 export const VERIFY_BACKUP_CODE_PATH = "/two-factor/verify-backup-code";
@@ -450,12 +450,15 @@ async function afterSecondFactorFailure(scope: AuthScope, reason: string): Promi
       { type: "user", id: attempt.userId },
       { attempts: SECOND_FACTOR_MAX_ATTEMPTS, seconds: SECOND_FACTOR_LOCK_S },
     );
+    // After the answer, like every mail an auth request causes (auth/scope.ts `afterAnswer`).
     scope.deps.defer(
-      sendSecondFactorLocked(scope.deps, {
-        to: attempt.email,
-        name: attempt.name,
-        minutes: Math.round(SECOND_FACTOR_LOCK_S / 60),
-      }).catch(() => {}),
+      afterAnswer(scope, () =>
+        sendSecondFactorLocked(scope.deps, {
+          to: attempt.email,
+          name: attempt.name,
+          minutes: Math.round(SECOND_FACTOR_LOCK_S / 60),
+        }),
+      ).catch(() => {}),
     );
   }
 }

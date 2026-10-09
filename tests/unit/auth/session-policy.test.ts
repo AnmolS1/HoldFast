@@ -49,6 +49,7 @@ import {
   userByEmail,
   verifiedUser,
   waitForMail,
+  httpsClient,
 } from "./helpers";
 
 describe("verification comes first", () => {
@@ -137,7 +138,8 @@ describe("the session cookie", () => {
 
   it("on an https origin every cookie is Secure and carries the __Host- prefix (no sibling origin can set it)", async () => {
     const https = { origin: "https://holdfast.example" };
-    const client = newClient(https);
+    // (an https origin has no memory outbox: its mail goes through the transport's stand-in)
+    const { client } = httpsClient(https.origin);
     const { email } = await signUp(client);
     const mail = await waitForMail(email, "verification");
     expect(linkIn(mail)).toMatch(/^\/api\/auth\/verify-email/);

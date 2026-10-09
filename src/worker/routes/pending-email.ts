@@ -59,7 +59,7 @@ import { guard, record } from "../auth/observe";
 import { padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
-import { sendVerification } from "../services/email";
+import { chargeUnsent, sendVerification } from "../services/email";
 import { AppError } from "../services/errors";
 import { enforceRateLimit } from "../services/ratelimit";
 import { auth, db, defer, deps, type AppEnv } from "../services/request-context";
@@ -164,6 +164,7 @@ router.patch(
         });
       }
 
+      let mailed = false;
       if (newEmail !== claim.email) {
         const account = await getAccount(db(c), claim.userId);
         // The account this sign-up created, still unverified and still at the address the cookie names.
@@ -177,6 +178,7 @@ router.patch(
             );
             const url = `${c.env.APP_ORIGIN}/api/auth/verify-email?token=${token}&callbackURL=${encodeURIComponent(VERIFIED_CALLBACK)}`;
             // Sent once the request has been answered (auth/scope.ts `afterAnswer`).
+            mailed = true;
             defer(
               c,
               afterAnswer(scope, () =>
@@ -189,6 +191,15 @@ router.patch(
             });
           }
         }
+      }
+
+      // A change that mailed nobody (a look-alike sign-up, a taken address) charges the mail
+      // budgets exactly as the one that did (services/email.ts `chargeUnsent`) — after the answer.
+      if (newEmail !== claim.email && !mailed) {
+        defer(
+          c,
+          afterAnswer(scope, () => chargeUnsent(deps(c), "verification", newEmail, { client: c.get("ip") })),
+        );
       }
 
       if (claim.viaCookie) {

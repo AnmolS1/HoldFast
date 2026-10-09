@@ -39,6 +39,7 @@ import {
   verifiedUser,
   waitForMail,
   type Client,
+  httpsClient,
 } from "./helpers";
 
 const SESSION = "hf.session_token";
@@ -156,7 +157,8 @@ describe("a session cookie that is not alone under its exact name is no session"
 
   it("on https only the __Host- name is the cookie: the prefix-less and the __Secure- name are ignored, alone or beside it", async () => {
     const https = "https://holdfast.example";
-    const client = newClient({ origin: https });
+    // (an https origin has no memory outbox: its mail goes through the transport's stand-in)
+    const { client } = httpsClient(https);
     const { email } = await signUp(client);
     await send(client, linkIn(await waitForMail(email, "verification")));
     const value = client.cookies.get(`__Host-${SESSION}`)!;
