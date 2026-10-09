@@ -2,7 +2,6 @@
 // light. External and render-blocking on purpose: the page's script policy is 'self' only.
 // It mirrors what the UI library's provider does once React runs: storage keys "mui-mode",
 // "mui-color-scheme-light", "mui-color-scheme-dark"; attribute data-light / data-dark on <html>.
-/* global document, localStorage, window */
 (function () {
   try {
     var root = document.documentElement;

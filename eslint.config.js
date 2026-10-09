@@ -3,6 +3,7 @@ import reactHooks from "eslint-plugin-react-hooks";
 import reactRefresh from "eslint-plugin-react-refresh";
 import globals from "globals";
 import tseslint from "typescript-eslint";
+import accentGuard from "./src/client/theme/eslint-accent-guard.mjs";
 
 export default tseslint.config(
   {
@@ -30,6 +31,34 @@ export default tseslint.config(
     rules: {
       ...reactHooks.configs.recommended.rules,
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
+    },
+  },
+  {
+    // The activity colour and `palette.primary` belong to the theme and to the four components
+    // that show activity; everywhere else in the SPA naming them is an error. The rule itself
+    // decides which files are exempt (src/client/theme/eslint-accent-guard.mjs).
+    files: ["src/client/**/*.{ts,tsx}"],
+    plugins: { holdfast: accentGuard },
+    rules: { "holdfast/accent-guard": "error" },
+  },
+  {
+    // Plain scripts served as they are (the first-paint colour-scheme script).
+    files: ["public/**/*.js"],
+    languageOptions: { globals: globals.browser, sourceType: "script" },
+  },
+  {
+    // Deferred work goes through defer(c, p): a raw waitUntil is not awaited before the database
+    // pool closes. Only the request context and the Worker entry may call it.
+    files: ["src/worker/**/*.ts"],
+    ignores: ["src/worker/services/request-context.ts", "src/worker/index.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "CallExpression[callee.property.name='waitUntil']",
+          message: "Use defer(c, promise) from services/request-context (or bg.defer / deps.defer).",
+        },
+      ],
     },
   },
   {
