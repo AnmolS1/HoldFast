@@ -51,7 +51,13 @@ import {
 import { adminGate } from "./admin-gate";
 import { beforeVerifyEmail } from "./mailbox-proof";
 import {
+  afterImpersonationStopped,
+  afterPasskeyDeleted,
+  afterPasskeyRegistered,
+  afterRoleChange,
   afterSecondFactor,
+  afterTwoFactorChange,
+  afterTwoFactorEnable,
   beforeSecondFactor,
   secondFactorOfNewSession,
   VERIFY_BACKUP_CODE_PATH,
@@ -76,6 +82,17 @@ export const INVALID_CREDENTIALS = {
 
 /** The endpoints through which an OAuth profile can create an account. */
 const OAUTH_SIGNUP_PATHS = new Set(["/callback/:id", "/sign-in/social"]);
+
+/** What auth/second-factor.ts does after each of these endpoints. */
+const SECOND_FACTOR_AFTER = new Map([
+  ["/two-factor/enable", afterTwoFactorEnable],
+  ["/two-factor/disable", afterTwoFactorChange],
+  ["/two-factor/generate-backup-codes", afterTwoFactorChange],
+  ["/passkey/verify-registration", afterPasskeyRegistered],
+  ["/passkey/delete-passkey", afterPasskeyDeleted],
+  ["/admin/set-role", afterRoleChange],
+  ["/admin/stop-impersonating", afterImpersonationStopped],
+]);
 
 /** The endpoints whose session is created by following a mailed link, not by a credential. */
 const LINK_SESSION_PATHS = new Set(["/verify-email"]);
@@ -407,7 +424,7 @@ export function buildHooks(scope: AuthScope) {
               uaFamily: uaFamily(client.userAgent),
               // Always written, null included: a session Better Auth makes by copying another
               // must not inherit it (auth/second-factor.ts).
-              secondFactorAt: secondFactorOfNewSession(scope),
+              secondFactorAt: secondFactorOfNewSession(scope, session),
             },
           };
         },
@@ -465,6 +482,12 @@ export function buildHooks(scope: AuthScope) {
     const path = ctx.path;
     if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
       await afterSecondFactor(scope, ctx);
+      return;
+    }
+    if (ctx.request && typeof path === "string" && SECOND_FACTOR_AFTER.has(path)) {
+      // The bookkeeping of auth/second-factor.ts. It must not be skipped silently: a failure
+      // here fails the request (the action itself has happened and is not undone).
+      await SECOND_FACTOR_AFTER.get(path)!(scope, ctx);
       return;
     }
     if (path === "/change-password" && ctx.request && !(ctx.context.returned instanceof Error)) {

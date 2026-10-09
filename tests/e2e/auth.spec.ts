@@ -231,10 +231,11 @@ test.describe("sign-up", () => {
     await expectSignedIn(page);
     const withPasskey = await sessionOf(page.request);
     expect(withPasskey?.user).toMatchObject({ email });
-    // This authenticator verified the user (as a fingerprint or a PIN does), so the session it
-    // made counts as having passed a second factor — src/worker/auth/second-factor.ts. (A key
-    // that proves presence only does not: tests/unit/auth/passkey-second-factor.test.ts.)
-    expect(typeof withPasskey?.session.secondFactorAt).toBe("string");
+    // A real session — but not one that passed a second factor, although this authenticator
+    // verified the user: the key was registered by a session that had not passed one itself
+    // (the verification link's), before two-factor existed. src/worker/auth/second-factor.ts;
+    // the cases that DO count are in tests/unit/auth/passkey-second-factor.test.ts.
+    expect(withPasskey?.session.secondFactorAt ?? null).toBeNull();
 
     // Nothing of the session is in Web Storage, and the auth library wrote nothing there.
     const storage = await page.evaluate(() => ({

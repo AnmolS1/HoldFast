@@ -244,7 +244,7 @@ describe("sign-in with a wrong password", () => {
       .insert(account)
       .values({
         id: `a${crypto.randomUUID().replace(/-/g, "").slice(0, 31)}`,
-        accountId: "google-subject-1",
+        accountId: `google-subject-${crypto.randomUUID()}`,
         providerId: "google",
         userId: googleOnlyId,
         createdAt: new Date(),

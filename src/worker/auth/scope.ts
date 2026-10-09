@@ -47,10 +47,21 @@ export type AuthFacts = {
   signingUpEmail: string | null;
   /** A provider identity is being linked to an account that already existed (hooks.ts). */
   linking: { userId: string; providerId: string; cleaned: boolean; swept?: boolean } | null;
-  /** The passkey assertion this request verified carried the user-verification flag. */
-  passkeyUserVerified: boolean;
-  /** A two-factor code is being checked by this request (auth/second-factor.ts). */
-  secondFactor: { userId: string; sessionId: string | null; stepUp: boolean; claim: string | null } | null;
+  /** The user whose passkey sign-in in this request counts as a second factor (auth/second-factor.ts). */
+  passkeySecondFactorFor: string | null;
+  /** The two-factor code this request is answering with (auth/second-factor.ts). */
+  secondFactor: {
+    userId: string;
+    sessionId: string | null;
+    mode: "sign_in" | "step_up" | "enrolment";
+    method: "totp" | "backup_code";
+    lockedNow: boolean;
+    grantsNewSession: boolean;
+    email: string;
+    name: string;
+  } | null;
+  /** The admin whose impersonation this request is ending. */
+  impersonatorId: string | null;
 };
 
 export type AuthScope = {
@@ -81,8 +92,9 @@ export function emptyFacts(): AuthFacts {
     adminDenied: false,
     signingUpEmail: null,
     linking: null,
-    passkeyUserVerified: false,
+    passkeySecondFactorFor: null,
     secondFactor: null,
+    impersonatorId: null,
   };
 }
 

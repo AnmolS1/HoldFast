@@ -120,24 +120,22 @@ export function totpCode(uriOrSecret: string, at: number = Date.now()): string {
   return String((mac.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
-// A code works ONCE per account (the Worker claims it: src/worker/auth/second-factor.ts), and a
-// code is valid for its own 30-second step and the one before and after. A test that needs a
-// second code for the same authenticator inside one step takes a neighbouring step's.
-const usedCodes = new Map<string, Set<string>>();
+// A TOTP time-step is accepted ONCE per account, and never an older one after a newer (the
+// Worker records the last step: src/worker/auth/second-factor.ts). A code is valid for its own
+// 30-second step and the one before and after, so codes for one authenticator are taken in
+// ascending order: the previous step, the current one, the next.
+const lastStep = new Map<string, number>();
 
-/** A currently valid code for the authenticator that this worker process has not handed out yet. */
+/** A currently valid code for the authenticator, newer than any this worker process has handed out for it. */
 export async function nextTotpCode(uriOrSecret: string): Promise<string> {
-  const used = usedCodes.get(uriOrSecret) ?? new Set<string>();
-  usedCodes.set(uriOrSecret, used);
   for (;;) {
-    for (const offset of [0, 30_000, -30_000]) {
-      const code = totpCode(uriOrSecret, Date.now() + offset);
-      if (!used.has(code)) {
-        used.add(code);
-        return code;
-      }
+    const current = Math.floor(Date.now() / 30_000);
+    const step = Math.max(current - 1, (lastStep.get(uriOrSecret) ?? -1) + 1);
+    if (step <= current + 1) {
+      lastStep.set(uriOrSecret, step);
+      return totpCode(uriOrSecret, step * 30_000);
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
 

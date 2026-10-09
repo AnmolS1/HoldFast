@@ -7,12 +7,15 @@
 // — a security key with no PIN, tapped by whoever holds it — signs in. That is ONE factor. The
 // plugin hands the verified assertion to `authentication.afterVerification`, and
 // `authenticationInfo.userVerified` (@simplewebauthn/server) is what auth/second-factor.ts reads.
+// And any fresh session may register a passkey, so a verified assertion counts only for a key
+// that a session which had itself passed a second factor registered.
 //
 // A browser's virtual authenticator cannot produce a discoverable credential that skips user
 // verification, so the authenticator here is software: a P-256 key, "none" attestation, and the
 // flags byte under the test's control. Everything else is the real handler.
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
+import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
 import { user } from "../../../src/worker/db/schema";
 import { enableTotp, newClient, send, sessionsOf, testDb, verifiedUser, type Client } from "./helpers";
 
@@ -219,6 +222,48 @@ describe("a passkey sign-in and the session's second factor", () => {
     expect(rows.map((row) => row.secondFactorAt !== null).sort()).toEqual([false, true]);
     expect((await adminCall(second)).status).toBe(403);
     expect((await adminCall(first)).status).toBe(200);
+  });
+
+  it("a key PLANTED by a one-factor session never counts — user verification or not", async () => {
+    // The attack: a stolen session that has not passed the second factor (here: Google-made)
+    // registers a passkey of its own, signs in with it "with user verification", and would come
+    // back as a two-factor session.
+    const admin = await adminWithPasskey();
+    const stolen = newClient();
+    const start = await send(stolen, "/api/auth/sign-in/social", {
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login" },
+    });
+    const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
+    const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email: admin.email, name: "G" });
+    await send(
+      stolen,
+      `/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      { browser: false },
+    );
+    expect((await sessionsOf(admin.user.id)).map((row) => row.secondFactorAt)).toEqual([null]);
+    const planted = await registerPasskey(stolen);
+    await send(stolen, "/api/auth/sign-out", { json: {} });
+
+    const attacker = newClient();
+    expect((await signInWithPasskey(attacker, planted, admin.user.id, UP | UV)).status).toBe(200);
+    expect((await sessionsOf(admin.user.id)).map((row) => row.secondFactorAt)).toEqual([null]);
+    expect((await adminCall(attacker)).status).toBe(403);
+    // The owner's own key — registered by a session that had passed the factor — still counts.
+    const owner = newClient();
+    expect((await signInWithPasskey(owner, admin.key, admin.user.id, UP | UV)).status).toBe(200);
+    expect((await adminCall(owner)).status).toBe(200);
+  });
+
+  it("a key registered before the account had two-factor does not start counting when it is switched on", async () => {
+    const made = await verifiedUser();
+    const early = await registerPasskey(made.client);
+    await enableTotp(made.client);
+    await testDb().update(user).set({ role: "admin" }).where(eq(user.id, made.user.id));
+    await send(made.client, "/api/auth/sign-out", { json: {} });
+    const browser = newClient();
+    expect((await signInWithPasskey(browser, early, made.user.id, UP | UV)).status).toBe(200);
+    expect((await sessionsOf(made.user.id)).map((row) => row.secondFactorAt)).toEqual([null]);
+    expect((await adminCall(browser)).status).toBe(403);
   });
 
   it("a signature that does not verify makes no session at all (the software key is really checked)", async () => {

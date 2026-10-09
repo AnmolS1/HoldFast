@@ -294,6 +294,17 @@ export const templates = {
       { text: NOT_YOU },
     ],
   }),
+  secondFactorLocked: (d: { name?: unknown; minutes: number }): Draft => ({
+    subject: "Too many wrong two-factor codes",
+    heading: "Too many wrong two-factor codes",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: `Someone who was already past your password, or already signed in to your Holdfast account, entered several wrong two-factor codes. Codes are not accepted for the next ${d.minutes} minutes; after that they work again.`,
+      },
+      { text: NOT_YOU },
+    ],
+  }),
   twoFactorDisabled: (d: { name?: unknown }): Draft => ({
     subject: "Two-factor authentication is off",
     heading: "Two-factor authentication is off",
@@ -496,6 +507,7 @@ const CLASS_OF: Record<TemplateName, EmailClass> = {
   passwordChanged: "security",
   twoFactorEnabled: "security",
   twoFactorDisabled: "security",
+  secondFactorLocked: "security",
   passkeyAdded: "security",
   signInMethodAdded: "security",
   passkeyRemoved: "security",
@@ -629,6 +641,8 @@ export const sendPasswordChanged = (deps: ServiceDeps, d: To) =>
   deliver(deps, "passwordChanged", d.to, () => templates.passwordChanged(d));
 export const sendTwoFactorEnabled = (deps: ServiceDeps, d: To) =>
   deliver(deps, "twoFactorEnabled", d.to, () => templates.twoFactorEnabled(d));
+export const sendSecondFactorLocked = (deps: ServiceDeps, d: To & { minutes: number }) =>
+  deliver(deps, "secondFactorLocked", d.to, () => templates.secondFactorLocked(d));
 export const sendTwoFactorDisabled = (deps: ServiceDeps, d: To) =>
   deliver(deps, "twoFactorDisabled", d.to, () => templates.twoFactorDisabled(d));
 export const sendSignInMethodAdded = (deps: ServiceDeps, d: To & { method: "google" }) =>

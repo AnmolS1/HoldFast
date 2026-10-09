@@ -419,26 +419,24 @@ export async function totp(uriOrSecret: string, at: number = Date.now()): Promis
   return String(binary % 1_000_000).padStart(6, "0");
 }
 
-// A code works ONCE per account (auth/second-factor.ts claims it), and a code is valid for its
-// own 30-second step and the one before and after. So a test that needs a second code for the
-// same authenticator inside one step takes a neighbouring step's: `nextTotp` hands out, per
-// authenticator, codes this test file has not used yet.
-const usedCodes = new Map<string, Set<string>>();
+// A TOTP time-step is accepted ONCE per account, and never an older one after a newer
+// (auth/second-factor.ts). A code is valid for its own 30-second step and the one before and
+// after, so a test that needs several codes for one authenticator in quick succession takes them
+// in ascending order: the previous step, the current one, the next. `nextTotp` hands out, per
+// authenticator, the oldest step still valid that is newer than the last one it handed out.
+const lastStep = new Map<string, number>();
 
-/** A currently valid code for the authenticator that this file has not yet handed out. */
+/** A currently valid code for the authenticator, newer than any this file has handed out for it. */
 export async function nextTotp(uriOrSecret: string): Promise<string> {
-  const used = usedCodes.get(uriOrSecret) ?? new Set<string>();
-  usedCodes.set(uriOrSecret, used);
   for (;;) {
-    for (const offset of [0, 30_000, -30_000]) {
-      const code = await totp(uriOrSecret, Date.now() + offset);
-      if (!used.has(code)) {
-        used.add(code);
-        return code;
-      }
+    const current = Math.floor(Date.now() / 30_000);
+    const step = Math.max(current - 1, (lastStep.get(uriOrSecret) ?? -1) + 1);
+    if (step <= current + 1) {
+      lastStep.set(uriOrSecret, step);
+      return totp(uriOrSecret, step * 30_000);
     }
-    // All three codes of the window are spent: wait for the next step.
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // All three steps of the window are spent: wait for the next one.
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }
 

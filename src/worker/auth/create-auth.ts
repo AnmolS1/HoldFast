@@ -257,6 +257,10 @@ export function buildAuthOptions(scope: AuthScope) {
         issuer: "Holdfast",
         totpOptions: { digits: 6, period: 30 },
         backupCodeOptions: { amount: 10, length: 10 },
+        // The plugin's own lock reads the counter, checks and then counts — and only for the
+        // sign-in challenge. auth/second-factor.ts keeps the account's attempt budget instead,
+        // in one statement, for every way a code can be offered.
+        accountLockout: { enabled: false },
       }),
       admin({
         defaultRole: "user",

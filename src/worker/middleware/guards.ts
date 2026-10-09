@@ -10,6 +10,7 @@ import type { Context } from "hono";
 import { hasAdminRole } from "../../shared/roles";
 import { hasSecondFactor } from "../auth/second-factor";
 import type { SessionUser } from "../auth/types";
+import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
 
@@ -37,7 +38,8 @@ export function requireAdmin(c: Context<AppEnv>): SessionUser {
   if (user.twoFactorEnabled !== true) throw new AppError("admin_requires_2fa");
   // Two-factor on the ACCOUNT is not enough: this session must have passed it — a session made
   // by Google, a passkey without user verification, a trusted device or a mailed link has not
-  // (auth/second-factor.ts). The way through is a step-up: POST /api/auth/two-factor/verify-totp.
-  if (!hasSecondFactor(c.get("session"))) throw new AppError("admin_requires_2fa");
+  // (auth/second-factor.ts), and not too long ago. The way through is a step-up:
+  // POST /api/auth/two-factor/verify-totp.
+  if (!hasSecondFactor(c.get("session"), now(c).getTime())) throw new AppError("admin_requires_2fa");
   return user;
 }

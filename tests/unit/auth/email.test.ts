@@ -93,6 +93,7 @@ function draftsWith(value: string) {
     passwordChanged: templates.passwordChanged({ name: value }),
     twoFactorEnabled: templates.twoFactorEnabled({ name: value }),
     twoFactorDisabled: templates.twoFactorDisabled({ name: value }),
+    secondFactorLocked: templates.secondFactorLocked({ name: value, minutes: 15 }),
     signInMethodAdded: templates.signInMethodAdded({ name: value, method: "google" }),
     passkeyAdded: templates.passkeyAdded({ name: value }),
     passkeyRemoved: templates.passkeyRemoved({ name: value }),
@@ -158,6 +159,9 @@ describe("templates", () => {
         "passwordChanged",
         "twoFactorEnabled",
         "twoFactorDisabled",
+        // Not in the plan's list: sent when the account's two-factor attempt budget is spent
+        // (auth/second-factor.ts) — a lock nobody is told about is a silent denial of service.
+        "secondFactorLocked",
         "signInMethodAdded",
         "passkeyAdded",
         "passkeyRemoved",

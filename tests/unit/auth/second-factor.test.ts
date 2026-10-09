@@ -10,10 +10,15 @@
 // One case per way a session comes to exist — each made with a REAL sign-in, never by writing
 // the column — plus the step-up, its attempt limit, and that a one-time code works once (A8).
 // Passkeys (with and without user verification) need a browser: tests/e2e/auth.spec.ts.
+import { env } from "cloudflare:workers";
 import { and, eq, like } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { createAuth } from "../../../src/worker/auth/create-auth";
 import {
-  SECOND_FACTOR_MAX_FAILURES,
+  ENROL_PROOF_S,
+  SECOND_FACTOR_LOCK_S,
+  SECOND_FACTOR_MAX_AGE_MS,
+  SECOND_FACTOR_MAX_ATTEMPTS,
   VERIFY_BACKUP_CODE_PATH,
   VERIFY_TOTP_PATH,
 } from "../../../src/worker/auth/second-factor";
@@ -31,7 +36,10 @@ import {
   send,
   sessionsOf,
   signIn,
+  signUp,
   testDb,
+  totp,
+  userByEmail,
   userById,
   verifiedUser,
   waitForMail,
@@ -61,6 +69,11 @@ async function onlySession(userId: string) {
 async function adminCall(client: Client) {
   const target = await verifiedUser();
   return send(client, ADMIN_PATH, { json: { userId: target.user.id, role: "user" } });
+}
+
+/** Refused by the gate, for whatever reason (not an admin, an impersonated session, …). */
+function expectRefused(sent: Awaited<ReturnType<typeof send>>) {
+  expect(sent.status, sent.text).toBe(403);
 }
 
 function expectNeedsSecondFactor(sent: Awaited<ReturnType<typeof send>>) {
@@ -188,19 +201,36 @@ describe("which sessions carry a second factor", () => {
     expectNeedsSecondFactor(await adminCall(made.client));
   });
 
-  it("an impersonated session: NOT carried (and it is never an admin session)", async () => {
+  it("an impersonated session: NOT carried, cannot step up — and stopping takes the admin's own mark away", async () => {
     const admin = await adminWithTotp();
     const client = newClient();
     await signInWithCode(client, admin.email, admin.totpURI);
-    const puppet = await verifiedUser();
-    const started = await send(client, "/api/auth/admin/impersonate-user", {
-      json: { userId: puppet.user.id },
-    });
+    // The target has TOTP too (and is made an admin once the impersonation runs — the plugin
+    // will not start one on an admin): the strongest thing an impersonated session could be.
+    const puppet = await adminWithTotp();
+    await testDb().update(user).set({ role: "user" }).where(eq(user.id, puppet.id));
+    const started = await send(client, "/api/auth/admin/impersonate-user", { json: { userId: puppet.id } });
     expect(started.status, started.text).toBe(200);
-    const impersonated = (await sessionsOf(puppet.user.id)).find((row) => row.impersonatedBy === admin.id)!;
+    await testDb().update(user).set({ role: "admin" }).where(eq(user.id, puppet.id));
+    const impersonated = (await sessionsOf(puppet.id)).find((row) => row.impersonatedBy === admin.id)!;
     expect(impersonated.secondFactorAt).toBeNull();
-    // Stopping gives the admin's own session back, as it was: still carrying its second factor.
+    // It cannot step up — not through the pipeline (the allow-list for impersonated sessions),
+    // and not with the target's own correct code.
+    const attempt = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(puppet.totpURI) },
+    });
+    expect(attempt.status).toBe(403);
+    expect(
+      (await sessionsOf(puppet.id)).find((row) => row.id === impersonated.id)!.secondFactorAt,
+    ).toBeNull();
+    expectRefused(await adminCall(client));
+
+    // Stopping gives the admin's own session back WITHOUT its mark: the factor is proven again
+    // before the next admin action.
     expect((await send(client, "/api/auth/admin/stop-impersonating", { json: {} })).status).toBe(200);
+    expect((await sessionsOf(admin.id)).map((row) => row.secondFactorAt)).toEqual([null]);
+    expectNeedsSecondFactor(await adminCall(client));
+    await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } });
     expect((await adminCall(client)).status).toBe(200);
   });
 
@@ -228,18 +258,89 @@ describe("which sessions carry a second factor", () => {
     expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
   });
 
-  it("no request body sets it: /update-session takes no such field", async () => {
+  it("no request body sets it: update-session, update-user, sign-up and sign-in all refuse or ignore the field", async () => {
     const made = await verifiedUser();
-    const sent = await send(made.client, "/api/auth/update-session", {
-      json: { secondFactorAt: new Date().toISOString() },
+    const stamp = new Date().toISOString();
+    for (const body of [{ secondFactorAt: stamp }, { second_factor_at: stamp, secondFactorAt: stamp }]) {
+      const sent = await send(made.client, "/api/auth/update-session", { json: body });
+      expect(sent.status, sent.text).toBe(400);
+      expect((await onlySession(made.user.id)).secondFactorAt).toBeNull();
+    }
+    // The user row's flags are no more settable than the session's.
+    const flags = await send(made.client, "/api/auth/update-user", {
+      json: { name: "X", role: "admin", twoFactorEnabled: true, secondFactorAt: stamp },
     });
-    expect(sent.status).toBeGreaterThanOrEqual(200);
-    expect((await onlySession(made.user.id)).secondFactorAt).toBeNull();
-    const snake = await send(made.client, "/api/auth/update-session", {
-      json: { second_factor_at: new Date().toISOString(), uaFamily: "x" },
+    expect(flags.status).toBe(400);
+    expect(await userById(made.user.id)).toMatchObject({ role: "user", twoFactorEnabled: false });
+    // A sign-in and a sign-up that carry it: a session without it, or no session.
+    const browser = newClient();
+    const signedIn = await send(browser, "/api/auth/sign-in/email", {
+      json: {
+        email: made.email,
+        password: PASSWORD,
+        secondFactorAt: stamp,
+        session: { secondFactorAt: stamp },
+      },
+      headers: CAPTCHA,
     });
-    expect(snake.status).toBeGreaterThanOrEqual(200);
-    expect((await onlySession(made.user.id)).secondFactorAt).toBeNull();
+    expect(signedIn.status, signedIn.text).toBe(200);
+    for (const row of await sessionsOf(made.user.id)) expect(row.secondFactorAt).toBeNull();
+    const signedUp = await signUp(newClient(), { extra: { secondFactorAt: stamp, role: "admin" } });
+    if (signedUp.sent.status === 200) {
+      const row = (await userByEmail(signedUp.email))!;
+      expect(row.role).toBe("user");
+      expect(await sessionsOf(row.id)).toEqual([]);
+    } else expect(signedUp.sent.status).toBe(400);
+  });
+
+  it("it has a maximum age: a mark older than twelve hours no longer opens an admin action", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithCode(client, admin.email, admin.totpURI);
+    expect((await adminCall(client)).status).toBe(200);
+    const row = await onlySession(admin.id);
+    const set = (ms: number) =>
+      testDb()
+        .update(session)
+        .set({ secondFactorAt: new Date(Date.now() - ms) })
+        .where(eq(session.id, row.id));
+    await set(SECOND_FACTOR_MAX_AGE_MS - 60_000);
+    expect((await adminCall(client)).status).toBe(200);
+    await set(SECOND_FACTOR_MAX_AGE_MS + 60_000);
+    expectNeedsSecondFactor(await adminCall(client));
+    // A step-up renews it.
+    await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } });
+    expect((await adminCall(client)).status).toBe(200);
+  });
+
+  it("a role change takes the mark off the account's sessions; so does a new set of backup codes", async () => {
+    const boss = await adminWithTotp();
+    const bossClient = newClient();
+    await signInWithCode(bossClient, boss.email, boss.totpURI);
+    const other = await adminWithTotp();
+    const otherClient = newClient();
+    await signInWithCode(otherClient, other.email, other.totpURI);
+    expect((await onlySession(other.id)).secondFactorAt).toBeInstanceOf(Date);
+    // Demoted and promoted again: the session is still there, the mark is not.
+    for (const role of ["user", "admin"]) {
+      const changed = await send(bossClient, ADMIN_PATH, { json: { userId: other.id, role } });
+      expect(changed.status, changed.text).toBe(200);
+    }
+    expect((await onlySession(other.id)).secondFactorAt).toBeNull();
+    expectNeedsSecondFactor(await adminCall(otherClient));
+
+    const regenerated = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", {
+      json: { password: PASSWORD },
+    });
+    expect(regenerated.status, regenerated.text).toBe(200);
+    expect((await onlySession(boss.id)).secondFactorAt).toBeNull();
+    // …and re-issuing them needs the password: a session alone cannot mint itself backup codes.
+    const without = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", { json: {} });
+    expect(without.status).toBe(400);
+    const wrong = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", {
+      json: { password: "not the password at all 1!" },
+    });
+    expect(wrong.status).toBeGreaterThanOrEqual(400);
   });
 });
 
@@ -292,9 +393,9 @@ describe("step-up: a code on a session that exists", () => {
     expect(right.status, right.text).toBe(200);
   });
 
-  it(`after ${SECOND_FACTOR_MAX_FAILURES} wrong codes the account is locked: even the right code is refused`, async () => {
+  it(`after ${SECOND_FACTOR_MAX_ATTEMPTS} wrong codes the account is locked: even the right code is refused — audited, mailed, and bounded`, async () => {
     const { admin, client } = await googleSession();
-    for (let attempt = 0; attempt < SECOND_FACTOR_MAX_FAILURES; attempt++) {
+    for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS; attempt++) {
       // A guesser spreads over addresses; the limit is on the ACCOUNT.
       client.ip = freshIp();
       const sent = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, {
@@ -302,9 +403,13 @@ describe("step-up: a code on a session that exists", () => {
       });
       expect(sent.status, `attempt ${attempt + 1}: ${sent.text}`).toBe(401);
     }
-    const [row] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
-    expect(row!.failedVerificationCount).toBeGreaterThanOrEqual(SECOND_FACTOR_MAX_FAILURES);
-    expect(row!.lockedUntil!.getTime()).toBeGreaterThan(Date.now() + 10 * 60 * 1000);
+    const lockRow = async () =>
+      (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id)))[0]!;
+    expect((await lockRow()).failedVerificationCount).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    const until = (await lockRow()).lockedUntil!.getTime();
+    expect(until).toBeGreaterThan(Date.now() + (SECOND_FACTOR_LOCK_S - 60) * 1000);
+    expect(until).toBeLessThanOrEqual(Date.now() + (SECOND_FACTOR_LOCK_S + 60) * 1000);
+
     client.ip = freshIp();
     const right = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, {
       json: { code: await nextTotp(admin.totpURI) },
@@ -313,15 +418,98 @@ describe("step-up: a code on a session that exists", () => {
     expect(right.body).toMatchObject({ code: "ACCOUNT_TEMPORARILY_LOCKED" });
     expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
     expectNeedsSecondFactor(await adminCall(client));
-    // A backup code is refused for as long, on the same budget.
+    // A backup code is refused for as long, on the same budget — and is not used up by it.
     client.ip = freshIp();
     const backup = await send(client, `/api/auth${VERIFY_BACKUP_CODE_PATH}`, {
       json: { code: admin.backupCodes[2] },
     });
     expect(backup.status).toBe(429);
+    // The lock holds for a NEW session and for the sign-in challenge too (one budget per account).
+    const elsewhere = newClient();
+    expect((await signIn(elsewhere, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+    const challenge = await send(elsewhere, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(admin.totpURI) },
+    });
+    expect(challenge.status).toBe(429);
+    expect(elsewhere.cookies.has("hf.session_token")).toBe(false);
+
+    // Audited without any code, and the owner is told.
+    const failed = await auditRows({ action: "auth.second_factor_failed", targetId: admin.id });
+    expect(failed).toHaveLength(SECOND_FACTOR_MAX_ATTEMPTS);
+    expect(JSON.stringify(failed)).not.toMatch(/10000\d/);
+    expect(await auditRows({ action: "auth.second_factor_locked", targetId: admin.id })).toHaveLength(1);
+    const mail = await waitForMail(admin.email, "secondFactorLocked");
+    expect(mail.text).toContain("15 minutes");
+
+    // Bounded: once the lock has run out, codes work again and the count starts over.
+    await testDb()
+      .update(twoFactor)
+      .set({ lockedUntil: new Date(Date.now() - 1000) })
+      .where(eq(twoFactor.userId, admin.id));
+    client.ip = freshIp();
+    const later = await send(client, `/api/auth${VERIFY_BACKUP_CODE_PATH}`, {
+      json: { code: admin.backupCodes[2] },
+    });
+    expect(later.status, later.text).toBe(200);
+    expect(await lockRow()).toMatchObject({ failedVerificationCount: 0, lockedUntil: null });
+    expect((await adminCall(client)).status).toBe(200);
   });
 
-  it("a correct code clears the count of wrong ones", async () => {
+  it("fifty wrong codes at the same moment: no more than the cap are even looked at, and the right code sent with them is refused once it is spent", async () => {
+    const { admin, client } = await googleSession();
+    const from = (code: string) =>
+      send({ ...client, ip: freshIp(), cookies: new Map(client.cookies) }, `/api/auth${VERIFY_TOTP_PATH}`, {
+        json: { code },
+      });
+    const answers = await Promise.all(Array.from({ length: 50 }, (_, index) => from(String(300000 + index))));
+    const statuses = answers.map((answer) => answer.status);
+    const lookedAt = statuses.filter((status) => status === 401).length;
+    const locked = answers.filter(
+      (answer) =>
+        answer.status === 429 && (answer.body as { code?: string })?.code === "ACCOUNT_TEMPORARILY_LOCKED",
+    ).length;
+    expect(lookedAt, statuses.join(",")).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    expect(locked).toBe(50 - SECOND_FACTOR_MAX_ATTEMPTS);
+    const [row] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
+    expect(row!.failedVerificationCount).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    expect(await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).toHaveLength(
+      SECOND_FACTOR_MAX_ATTEMPTS,
+    );
+    // The correct code, sent while the guesses are still arriving: refused like the rest.
+    const [right, ...more] = await Promise.all([
+      from(await nextTotp(admin.totpURI)),
+      ...Array.from({ length: 10 }, (_, index) => from(String(400000 + index))),
+    ]);
+    expect(right!.status).toBe(429);
+    expect(more.every((answer) => answer.status === 429)).toBe(true);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
+    expectNeedsSecondFactor(await adminCall(client));
+  });
+
+  it("the sign-in challenge spends the same budget, one per attempt — and its own correct code clears it", async () => {
+    const admin = await adminWithTotp();
+    const browser = newClient();
+    await signIn(browser, admin.email);
+    const count = async () =>
+      (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id)))[0]!
+        .failedVerificationCount;
+    for (const code of ["500001", "500002"]) {
+      expect((await send(browser, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code } })).status).toBe(401);
+    }
+    // Exactly one per attempt: there is ONE accounting (the plugin's own is switched off).
+    expect(await count()).toBe(2);
+    expect(
+      (await send(browser, `/api/auth${VERIFY_BACKUP_CODE_PATH}`, { json: { code: "nope1-nope2" } })).status,
+    ).toBe(401);
+    expect(await count()).toBe(3);
+    expect(
+      (await send(browser, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } }))
+        .status,
+    ).toBe(200);
+    expect(await count()).toBe(0);
+  });
+
+  it("a correct code starts the count again", async () => {
     const { admin, client } = await googleSession();
     for (let attempt = 0; attempt < 3; attempt++) {
       await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: String(200000 + attempt) } });
@@ -332,6 +520,139 @@ describe("step-up: a code on a session that exists", () => {
     expect(await count()).toBe(3);
     await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } });
     expect(await count()).toBe(0);
+  });
+});
+
+describe("the code endpoints themselves refuse — not only the pipeline in front of them", () => {
+  /** A request straight to Better Auth's handler: no session middleware, no endpoint allow-list. */
+  async function direct(client: Client, path: string, json: unknown) {
+    const auth = createAuth(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} });
+    const response = await auth.handler(
+      new Request(`http://localhost/api/auth${path}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost",
+          "cf-connecting-ip": freshIp(),
+          cookie: [...client.cookies].map(([name, value]) => `${name}=${value}`).join("; "),
+        },
+        body: JSON.stringify(json),
+      }),
+    );
+    return {
+      status: response.status,
+      body: (await response.json().catch(() => null)) as { code?: string } | null,
+    };
+  }
+
+  it("an impersonated session with the target's own correct code: 403, and no mark", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithCode(client, admin.email, admin.totpURI);
+    const puppet = await adminWithTotp();
+    await testDb().update(user).set({ role: "user" }).where(eq(user.id, puppet.id));
+    expect(
+      (await send(client, "/api/auth/admin/impersonate-user", { json: { userId: puppet.id } })).status,
+    ).toBe(200);
+    const answer = await direct(client, VERIFY_TOTP_PATH, { code: await nextTotp(puppet.totpURI) });
+    expect(answer.status).toBe(403);
+    expect(answer.body).toMatchObject({ code: "SECOND_FACTOR_NOT_AVAILABLE" });
+    for (const row of await sessionsOf(puppet.id)) expect(row.secondFactorAt).toBeNull();
+    const backup = await direct(client, VERIFY_BACKUP_CODE_PATH, { code: puppet.backupCodes[0] });
+    expect(backup.status).toBe(403);
+    for (const row of await sessionsOf(puppet.id)) expect(row.secondFactorAt).toBeNull();
+  });
+
+  it("a suspended account's session: 403, and no mark", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithGoogle(client, admin.email);
+    await testDb().update(user).set({ suspendedAt: new Date() }).where(eq(user.id, admin.id));
+    const answer = await direct(client, VERIFY_TOTP_PATH, { code: await nextTotp(admin.totpURI) });
+    expect(answer.status).toBe(403);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
+  });
+
+  it("control: the same direct request from an ordinary session of the account steps up", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithGoogle(client, admin.email);
+    const answer = await direct(client, VERIFY_TOTP_PATH, { code: await nextTotp(admin.totpURI) });
+    expect(answer.status).toBe(200);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeInstanceOf(Date);
+  });
+});
+
+describe("a session cannot hand itself a second factor", () => {
+  it("a stolen session without the password cannot enrol, switch off or re-issue the factor", async () => {
+    // The owner has a password; whoever holds this Google-made session does not know it.
+    const made = await verifiedUser();
+    await testDb().update(user).set({ role: "admin" }).where(eq(user.id, made.user.id));
+    const stolen = newClient();
+    await signInWithGoogle(stolen, made.email);
+    for (const body of [{}, { password: "a guess at the password 1!" }]) {
+      const sent = await send(stolen, "/api/auth/two-factor/enable", { json: body });
+      expect(sent.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(await testDb().select().from(twoFactor).where(eq(twoFactor.userId, made.user.id))).toEqual([]);
+    expect((await userById(made.user.id))!.twoFactorEnabled).not.toBe(true);
+    expectRefused(await adminCall(stolen));
+  });
+
+  it("an enrolment begun elsewhere: confirming it from a session that did not prove the password gives that session no mark", async () => {
+    const made = await verifiedUser();
+    await testDb().update(user).set({ role: "admin" }).where(eq(user.id, made.user.id));
+    // The owner starts enrolling (password proven on the OWNER's session) and is shown the secret…
+    const enabled = await send(made.client, "/api/auth/two-factor/enable", { json: { password: PASSWORD } });
+    const { totpURI } = enabled.body as { totpURI: string };
+    // …which somebody with another (stolen) session of the account has seen.
+    const stolen = newClient();
+    await signInWithGoogle(stolen, made.email);
+    const confirmed = await send(stolen, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(totpURI) },
+    });
+    expect(confirmed.status, confirmed.text).toBe(200);
+    expect((await userById(made.user.id))!.twoFactorEnabled).toBe(true);
+    // Two-factor is on, and NO session of the account carries a second factor.
+    for (const row of await sessionsOf(made.user.id)) expect(row.secondFactorAt).toBeNull();
+    expectNeedsSecondFactor(await adminCall(stolen));
+  });
+
+  it("the proof of the password is for ten minutes and one session: an old one marks nothing", async () => {
+    const made = await verifiedUser();
+    const enabled = await send(made.client, "/api/auth/two-factor/enable", { json: { password: PASSWORD } });
+    const { totpURI } = enabled.body as { totpURI: string };
+    const proofs = () =>
+      testDb().select().from(verification).where(like(verification.identifier, "2fa-enrol:%"));
+    const mine = (await proofs()).filter((row) => row.value === made.user.id);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]!.expiresAt.getTime() - Date.now()).toBeLessThanOrEqual(ENROL_PROOF_S * 1000);
+    await testDb()
+      .update(verification)
+      .set({ expiresAt: new Date(Date.now() - 1000) })
+      .where(eq(verification.id, mine[0]!.id));
+    const confirmed = await send(made.client, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(totpURI) },
+    });
+    expect(confirmed.status, confirmed.text).toBe(200);
+    expect((await onlySession(made.user.id)).secondFactorAt).toBeNull();
+  });
+
+  it("enabling two-factor takes the mark off every OTHER session of the account", async () => {
+    // A session can carry a mark before two-factor exists only if it is written there: this
+    // shows the rule, not a path to it.
+    const made = await verifiedUser();
+    const other = newClient();
+    expect((await signIn(other, made.email)).status).toBe(200);
+    await testDb()
+      .update(session)
+      .set({ secondFactorAt: new Date() })
+      .where(eq(session.userId, made.user.id));
+    await enableTotp(made.client);
+    const rows = await sessionsOf(made.user.id);
+    expect(rows.filter((row) => row.secondFactorAt !== null)).toHaveLength(1);
+    const mine = (await send(made.client, "/api/auth/get-session")).body as { session: { id: string } };
+    expect(rows.find((row) => row.secondFactorAt !== null)!.id).toBe(mine.session.id);
   });
 });
 
@@ -384,7 +705,7 @@ describe("a one-time code works once (A8)", () => {
     expect(await sessionsOf(admin.id)).toHaveLength(1);
   });
 
-  it("the claim is per account: the same six digits are another account's own code", async () => {
+  it("a step is spent per account: the same six digits are another account's own (wrong) code", async () => {
     const one = await adminWithTotp();
     const code = await nextTotp(one.totpURI);
     const first = newClient();
@@ -400,6 +721,31 @@ describe("a one-time code works once (A8)", () => {
       (await send(other, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(two.totpURI) } }))
         .status,
     ).toBe(200);
+  });
+});
+
+describe("TOTP steps only move forward", () => {
+  it("after a newer step was accepted, an older one that is still inside the window is refused", async () => {
+    const admin = await adminWithTotp();
+    const current = Math.floor(Date.now() / 30_000);
+    const browser = newClient();
+    await signIn(browser, admin.email);
+    const newer = await send(browser, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await totp(admin.totpURI, (current + 1) * 30_000) },
+    });
+    expect(newer.status, newer.text).toBe(200);
+    const second = newClient();
+    await signIn(second, admin.email);
+    const older = await send(second, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await totp(admin.totpURI, current * 30_000) },
+    });
+    expect(older.status).toBe(401);
+    expect(second.cookies.has("hf.session_token")).toBe(false);
+    const stored = await testDb()
+      .select()
+      .from(verification)
+      .where(eq(verification.identifier, `totp-step:${admin.id}`));
+    expect(stored.map((row) => row.value)).toEqual([String(current + 1)]);
   });
 });
 
@@ -478,5 +824,58 @@ describe("what a session answer shows", () => {
     };
     expect(plain.session.secondFactorAt ?? null).toBeNull();
     expect(await testDb().select().from(session).where(eq(session.userId, admin.id))).toHaveLength(2);
+  });
+});
+
+describe("the only writers of secondFactorAt (source scan)", () => {
+  const sources = {
+    ...import.meta.glob("../../../src/**/*.ts", { query: "?raw", import: "default", eager: true }),
+    ...import.meta.glob("../../../src/**/*.tsx", { query: "?raw", import: "default", eager: true }),
+    ...import.meta.glob("../../../scripts/*.ts", { query: "?raw", import: "default", eager: true }),
+  };
+  const mentions = (pattern: RegExp) =>
+    Object.entries(sources)
+      .flatMap(([file, text]) =>
+        text
+          .split("\n")
+          .filter((line) => pattern.test(line) && !/^\s*(?:\/\/|\*|\/\*)/.test(line))
+          .map((line) => `${file.replace(/^(?:\.\.\/)+/, "")}: ${line.trim()}`),
+      )
+      .sort();
+
+  it("every line of the Worker, the client and the scripts that names the field is one of these", () => {
+    expect(Object.keys(sources).length).toBeGreaterThan(80);
+    expect(Object.keys(sources).some((file) => file.endsWith("scripts/create-session.ts"))).toBe(true);
+    const outside = mentions(/secondFactorAt|second_factor_at/).filter(
+      (line) => !line.startsWith("src/worker/auth/second-factor.ts:"),
+    );
+    expect(outside).toEqual([
+      // read
+      "src/worker/auth/admin-gate.ts: hasSecondFactor(session.session as { secondFactorAt?: unknown });",
+      // declared: not settable by any request body
+      'src/worker/auth/fields.ts: secondFactorAt: { type: "date", required: false, input: false },',
+      // WRITE 1: every new session, from the grants of this request (null otherwise)
+      "src/worker/auth/hooks.ts: secondFactorAt: secondFactorOfNewSession(scope, session),",
+      "src/worker/auth/types.ts: secondFactorAt?: Date | null;",
+      'src/worker/db/auth-schema.ts: secondFactorAt: timestamp("second_factor_at"),',
+      // WRITE 2: stampSecondFactor (step-up); then clearSecondFactor, which only ever removes it
+      "src/worker/db/queries/auth-lifecycle.ts: .set({ secondFactorAt: at })",
+      "src/worker/db/queries/auth-lifecycle.ts: .set({ secondFactorAt: null })",
+      "src/worker/db/queries/auth-lifecycle.ts: isNotNull(session.secondFactorAt),",
+    ]);
+    // Inside the module itself the field is only read; it writes through the two functions above.
+    const inside = mentions(/secondFactorAt/).filter((line) =>
+      line.startsWith("src/worker/auth/second-factor.ts:"),
+    );
+    for (const line of inside) expect(line, line).not.toMatch(/secondFactorAt\s*[:=][^=]/);
+  });
+
+  it("stampSecondFactor has one caller (the step-up), and no raw SQL anywhere names the column", () => {
+    expect(mentions(/stampSecondFactor\(/).filter((line) => !/export async function/.test(line))).toEqual([
+      "src/worker/auth/second-factor.ts: if (await stampSecondFactor(scope.db, attempt.sessionId, attempt.userId, now())) {",
+    ]);
+    expect(mentions(/second_factor_at/)).toEqual([
+      'src/worker/db/auth-schema.ts: secondFactorAt: timestamp("second_factor_at"),',
+    ]);
   });
 });

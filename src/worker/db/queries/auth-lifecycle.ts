@@ -9,7 +9,7 @@
 // something, the row is read and compared in application code. `invites` and
 // `pending_user_purges` are ours (`timestamptz`) and compare with `now()` freely.
 
-import { and, eq, gt, isNull, like, sql } from "drizzle-orm";
+import { and, eq, gt, isNotNull, isNull, like, ne, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import {
@@ -592,88 +592,125 @@ export async function sweepAfterLink(
   });
 }
 
-// ── the second factor of a session ──────────────────────────────────────────────────────────
+// ── the second factor of a session (auth/second-factor.ts) ──────────────────────────────────
 
-/** The account's two-factor enrolment as the database has it, with the account's role. */
+/** The account's two-factor enrolment as the database has it, with the account's state. */
 export async function secondFactorState(
   db: Executor,
   userId: string,
-): Promise<{ verified: boolean; lockedUntil: Date | null; role: string | null } | null> {
+): Promise<{
+  secret: string;
+  verified: boolean;
+  role: string | null;
+  email: string;
+  name: string;
+  restricted: boolean;
+} | null> {
   const [row] = await db
-    .select({ verified: twoFactor.verified, lockedUntil: twoFactor.lockedUntil, role: user.role })
+    .select({
+      secret: twoFactor.secret,
+      verified: twoFactor.verified,
+      role: user.role,
+      email: user.email,
+      name: user.name,
+      banned: user.banned,
+      suspendedAt: user.suspendedAt,
+      deleteScheduledAt: user.deleteScheduledAt,
+    })
     .from(twoFactor)
     .innerJoin(user, eq(user.id, twoFactor.userId))
     .where(eq(twoFactor.userId, userId))
     .limit(1);
-  // `verified` is null on a row made before the column existed: Better Auth reads that as enrolled.
-  return row ? { verified: row.verified !== false, lockedUntil: row.lockedUntil, role: row.role } : null;
+  if (!row) return null;
+  return {
+    secret: row.secret,
+    // Null on a row made before the column existed: Better Auth reads that as enrolled.
+    verified: row.verified !== false,
+    role: row.role,
+    email: row.email,
+    name: row.name,
+    restricted:
+      row.banned === true ||
+      row.suspendedAt !== null ||
+      (row.deleteScheduledAt !== null && row.deleteScheduledAt.getTime() <= Date.now()),
+  };
 }
 
 /**
- * Claims a one-time code for one use. One transaction under the account's two-factor row lock:
- * true when no live claim for `identifier` existed (and one now does), false when it was used
- * already. Two simultaneous requests with the same code cannot both get true.
+ * Admits ONE attempt at the account's second factor, or refuses it — in a single statement, so
+ * that any number of simultaneous attempts are admitted at most `cap` times: the attempt is
+ * COUNTED HERE, before its code is looked at, and the statement matches no row while the account
+ * is locked. The attempt that brings the count to `cap` sets the lock (`lockSeconds` from now).
+ * A lock that has run out starts a new count. Returns null when refused (locked, or no enrolment).
+ *
+ * The columns are the two-factor plugin's own; its own accounting is switched off
+ * (create-auth.ts `accountLockout`), so this is the one budget for the sign-in challenge and the
+ * step-up, for TOTP and backup codes, across every session and address.
+ * (`now() AT TIME ZONE 'UTC'`: Better Auth's timestamp columns carry no zone.)
  */
-export async function claimTotpCode(
+export async function admitSecondFactorAttempt(
   db: Executor,
   userId: string,
-  claim: { id: string; identifier: string; expiresAt: Date },
-): Promise<boolean> {
-  const { identifier } = claim;
-  return db.transaction(async (tx) => {
-    await tx.select({ id: twoFactor.id }).from(twoFactor).where(eq(twoFactor.userId, userId)).for("update");
-    const existing = await tx
-      .select({ id: verification.id, expiresAt: verification.expiresAt })
-      .from(verification)
-      .where(eq(verification.identifier, identifier));
-    const at = Date.now();
-    if (existing.some((row) => row.expiresAt.getTime() > at)) return false;
-    if (existing.length > 0) await tx.delete(verification).where(eq(verification.identifier, identifier));
-    const created = new Date();
-    await tx.insert(verification).values({
-      id: claim.id,
-      identifier,
-      value: userId,
-      expiresAt: claim.expiresAt,
-      createdAt: created,
-      updatedAt: created,
-    });
-    return true;
-  });
+  cap: number,
+  lockSeconds: number,
+): Promise<{ count: number; lockedNow: boolean } | null> {
+  const result = await db.execute<{ count: number; locked: boolean }>(sql`
+    UPDATE ${twoFactor} SET
+      failed_verification_count =
+        CASE WHEN locked_until IS NOT NULL THEN 1 ELSE coalesce(failed_verification_count, 0) + 1 END,
+      locked_until =
+        CASE WHEN (CASE WHEN locked_until IS NOT NULL THEN 1 ELSE coalesce(failed_verification_count, 0) + 1 END) >= ${cap}
+             THEN (now() AT TIME ZONE 'UTC') + make_interval(secs => ${lockSeconds})
+             ELSE NULL END
+    WHERE user_id = ${userId}
+      AND (locked_until IS NULL OR locked_until <= (now() AT TIME ZONE 'UTC'))
+    RETURNING failed_verification_count AS count, (locked_until IS NOT NULL) AS locked`);
+  const row = result.rows[0];
+  return row ? { count: Number(row.count), lockedNow: row.locked === true } : null;
 }
 
-export async function releaseTotpCode(db: Executor, identifier: string): Promise<void> {
-  await db.delete(verification).where(eq(verification.identifier, identifier));
-}
-
-/**
- * Counts one wrong code against the account and locks it once `max` is reached — the same
- * columns and the same budget as the two-factor plugin's own sign-in accounting.
- */
-export async function recordSecondFactorFailure(
-  db: Executor,
-  userId: string,
-  max: number,
-  lockMs: number,
-): Promise<void> {
-  const [row] = await db
-    .update(twoFactor)
-    .set({ failedVerificationCount: sql`coalesce(${twoFactor.failedVerificationCount}, 0) + 1` })
-    .where(eq(twoFactor.userId, userId))
-    .returning({ count: twoFactor.failedVerificationCount });
-  if ((row?.count ?? 0) >= max) {
-    await db
-      .update(twoFactor)
-      .set({ lockedUntil: new Date(Date.now() + lockMs) })
-      .where(eq(twoFactor.userId, userId));
-  }
-}
-
-export async function resetSecondFactorFailures(db: Executor, userId: string): Promise<void> {
+/** A correct code: the count of attempts starts again, and a lock set by this very attempt is lifted. */
+export async function resetSecondFactorAttempts(db: Executor, userId: string): Promise<void> {
   await db
     .update(twoFactor)
     .set({ failedVerificationCount: 0, lockedUntil: null })
     .where(eq(twoFactor.userId, userId));
+}
+
+const totpStepIdentifier = (userId: string) => `totp-step:${userId}`;
+
+/**
+ * Records `step` as the newest TOTP time-step this account has used — unless it has already used
+ * that step or a later one (then false: a replay). One transaction under the account's
+ * two-factor row lock, so two simultaneous uses of one code cannot both be accepted.
+ */
+export async function acceptTotpStep(
+  db: Executor,
+  userId: string,
+  accepted: { id: string; step: number },
+): Promise<boolean> {
+  const identifier = totpStepIdentifier(userId);
+  return db.transaction(async (tx) => {
+    await tx.select({ id: twoFactor.id }).from(twoFactor).where(eq(twoFactor.userId, userId)).for("update");
+    const rows = await tx
+      .select({ value: verification.value })
+      .from(verification)
+      .where(eq(verification.identifier, identifier));
+    const last = Math.max(-1, ...rows.map((row) => Number(row.value)).filter(Number.isFinite));
+    if (accepted.step <= last) return false;
+    if (rows.length > 0) await tx.delete(verification).where(eq(verification.identifier, identifier));
+    const at = new Date();
+    await tx.insert(verification).values({
+      id: accepted.id,
+      identifier,
+      value: String(accepted.step),
+      // Long past the three steps a code is valid for; the step only ever grows.
+      expiresAt: new Date(at.getTime() + 24 * 60 * 60 * 1000),
+      createdAt: at,
+      updatedAt: at,
+    });
+    return true;
+  });
 }
 
 /** Marks an existing session of `userId` as having passed a second factor. False when it is gone. */
@@ -686,9 +723,74 @@ export async function stampSecondFactor(
   const rows = await db
     .update(session)
     .set({ secondFactorAt: at })
-    .where(and(eq(session.id, sessionId), eq(session.userId, userId)))
+    .where(and(eq(session.id, sessionId), eq(session.userId, userId), isNull(session.impersonatedBy)))
     .returning({ id: session.id });
   return rows.length > 0;
+}
+
+/** Takes the mark off the account's sessions (all of them, or all but one). Returns how many had it. */
+export async function clearSecondFactor(
+  db: Executor,
+  userId: string,
+  exceptSessionId?: string,
+): Promise<number> {
+  const rows = await db
+    .update(session)
+    .set({ secondFactorAt: null })
+    .where(
+      and(
+        eq(session.userId, userId),
+        isNotNull(session.secondFactorAt),
+        exceptSessionId ? ne(session.id, exceptSessionId) : undefined,
+      ),
+    )
+    .returning({ id: session.id });
+  return rows.length;
+}
+
+// Small facts about an account that have no column of their own, kept as `verification` rows whose
+// VALUE is the user id (so every "delete what names this user" removes them too):
+//   2fa-enrol:<sessionId>     the password was just proven on this session (two-factor/enable)
+//   passkey-2f:<passkeyId>    this passkey was registered by a session that had passed a second factor
+export async function putAuthMarker(
+  db: Executor,
+  marker: { id: string; identifier: string; userId: string; expiresAt: Date },
+): Promise<void> {
+  const at = new Date();
+  await db.delete(verification).where(eq(verification.identifier, marker.identifier));
+  await db.insert(verification).values({
+    id: marker.id,
+    identifier: marker.identifier,
+    value: marker.userId,
+    expiresAt: marker.expiresAt,
+    createdAt: at,
+    updatedAt: at,
+  });
+}
+
+export async function hasAuthMarker(db: Executor, identifier: string, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ expiresAt: verification.expiresAt })
+    .from(verification)
+    .where(and(eq(verification.identifier, identifier), eq(verification.value, userId)));
+  return rows.some((row) => row.expiresAt.getTime() > Date.now());
+}
+
+export async function deleteAuthMarker(db: Executor, identifier: string): Promise<void> {
+  await db.delete(verification).where(eq(verification.identifier, identifier));
+}
+
+/** The passkey row behind a WebAuthn credential id. */
+export async function passkeyByCredential(
+  db: Executor,
+  credentialId: string,
+): Promise<{ id: string; userId: string } | null> {
+  const [row] = await db
+    .select({ id: passkey.id, userId: passkey.userId })
+    .from(passkey)
+    .where(eq(passkey.credentialID, credentialId))
+    .limit(1);
+  return row ?? null;
 }
 
 /** "Remember this device" records of an account (the two-factor plugin's `trust-device-…` rows). */

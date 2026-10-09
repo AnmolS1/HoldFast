@@ -139,6 +139,8 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
   if (session && ALLOWED.includes(path)) {
     if (path === ADMIN_STOP_IMPERSONATING) {
       allowed = Boolean(impersonatedBy);
+      // For auth/second-factor.ts: whose impersonation this request ends.
+      scope.facts.impersonatorId = impersonatedBy || null;
     } else if (!impersonatedBy) {
       const account = await getAccount(scope.db, session.user.id);
       const isAdmin =
