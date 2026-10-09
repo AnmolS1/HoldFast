@@ -58,6 +58,18 @@ async function endSessionsOf(context: BrowserContext, userId: string): Promise<v
   expect(removed.rowCount, "the user had a session row").toBeGreaterThan(0);
 }
 
+/**
+ * While it is in force, the shell's background read of the deletion status (refetched on focus
+ * and when stale) does not reach the server — so that the request which meets the ended session
+ * is the one the test makes, the person's own click, and not a read that happened to fire first
+ * and opened the dialog by itself.
+ */
+async function holdBackgroundReads(page: Page): Promise<() => Promise<void>> {
+  const pattern = "**/api/account/deletion-status";
+  await page.route(pattern, (route) => route.abort());
+  return () => page.unroute(pattern);
+}
+
 /** Schedules the signed-in user's deletion the real way: Better Auth's request, then the mailed link. */
 async function scheduleDeletion(page: Page, user: SignedInUser, origin: string, clientIp: string) {
   const asked = await page.request.post("/api/auth/delete-user", {
@@ -71,6 +83,12 @@ async function scheduleDeletion(page: Page, user: SignedInUser, origin: string, 
   await page.goto(link);
   await expect(page.getByText(/This account is scheduled for deletion on /)).toBeVisible();
   expect(await deletionDate(user.id)).not.toBeNull();
+  // The landing re-reads the session and the deletion status and then takes `?deletion=scheduled`
+  // out of the address — a navigation, whose guard reads the session once more. Let all of that
+  // finish: a test that ends the session while it is still under way is racing the shell's own
+  // session read, which (rightly) answers an ended session with the sign-in screen.
+  await expect(page).toHaveURL(/\/account$/);
+  await page.waitForLoadState("networkidle");
 }
 
 test.describe("re-authentication after the session really ended", () => {
@@ -82,6 +100,7 @@ test.describe("re-authentication after the session really ended", () => {
     await stubTurnstile(page);
     const user = await signedInUser(page, { clientIp });
     await scheduleDeletion(page, user, origins.app, clientIp);
+    const release = await holdBackgroundReads(page);
     await endSessionsOf(page.context(), user.id);
 
     // The request the person makes next is answered 401 by the server…
@@ -93,6 +112,7 @@ test.describe("re-authentication after the session really ended", () => {
     // …and the shell asks for the password over the page, instead of losing the click.
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByText("Your session ended")).toBeVisible();
+    await release();
     expect(cancels).toEqual([401]);
     expect(await deletionDate(user.id), "nothing was cancelled by the refused request").not.toBeNull();
     await expect(dialog.getByLabel("Email")).toHaveValue(user.email);
@@ -112,10 +132,12 @@ test.describe("re-authentication after the session really ended", () => {
     await stubTurnstile(page);
     const user = await signedInUser(page, { clientIp });
     await scheduleDeletion(page, user, origins.app, clientIp);
+    const release = await holdBackgroundReads(page);
     await endSessionsOf(page.context(), user.id);
     await page.getByRole("button", { name: "Cancel deletion" }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByText("Your session ended")).toBeVisible();
+    await release();
     await dialog.getByLabel("Password").fill("not the password at all!");
     await dialog.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(dialog.getByRole("alert")).toHaveText(
@@ -167,6 +189,7 @@ test.describe("re-authentication after the session really ended", () => {
     const user = await signedInUser(page, { clientIp });
     expect(user.id).not.toBe(other.id);
     await scheduleDeletion(page, user, origins.app, clientIp);
+    const release = await holdBackgroundReads(page);
     await endSessionsOf(page.context(), user.id);
     const cancels: number[] = [];
     page.on("response", (response) => {
@@ -175,6 +198,7 @@ test.describe("re-authentication after the session really ended", () => {
     await page.getByRole("button", { name: "Cancel deletion" }).click();
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByText("Your session ended")).toBeVisible();
+    await release();
 
     // The passkey on this device is B's. B is who is signed in afterwards…
     await dialog.getByRole("button", { name: "Continue with passkey" }).click();
