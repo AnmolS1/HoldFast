@@ -23,7 +23,8 @@
     "noUncheckedSideEffectImports": true
   },
   // Everything that runs in plain Node: tool configs, scripts, the shared test setup and the
-  // "node" project of vitest.config.ts (keep the three tests/unit paths in step with its globs).
+  // "node" project of vitest.config.ts (keep the tests/unit paths in step with its globs —
+  // tests/unit/db is the exception: it is checked by tsconfig.tests.db.json).
   "include": [
     "vite.config.ts",
     "vitest.config.ts",
@@ -31,11 +32,20 @@
     "playwright.config.ts",
     "scripts/**/*.ts",
     "tests/setup/**/*.ts",
-    "tests/unit/db/**/*.ts",
     "tests/unit/harness/node/**/*.ts",
     "tests/unit/e2e-harness/**/*.ts"
   ],
-  // jsdom.ts belongs to tsconfig.tests.client.json and workers-env.d.ts to
-  // tsconfig.tests.workers.json. scripts/spikes is git-ignored scratch.
-  "exclude": ["tests/setup/jsdom.ts", "tests/setup/workers-env.d.ts", "scripts/spikes/**"]
+  // jsdom.ts belongs to tsconfig.tests.client.json, workers-env.d.ts to tsconfig.tests.workers.json
+  // and node-db-env.d.ts to tsconfig.tests.db.json. scripts/spikes is git-ignored scratch.
+  // The three scripts import src/worker/db/** and are checked by tsconfig.tests.db.json (keep
+  // this list identical to the list there).
+  "exclude": [
+    "tests/setup/jsdom.ts",
+    "tests/setup/workers-env.d.ts",
+    "tests/setup/node-db-env.d.ts",
+    "scripts/spikes/**",
+    "scripts/seed-dev.ts",
+    "scripts/create-invite.ts",
+    "scripts/create-session.ts"
+  ]
 }

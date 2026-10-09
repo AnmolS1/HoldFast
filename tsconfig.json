@@ -5,6 +5,7 @@
     { "path": "./tsconfig.node.json" },
     { "path": "./tsconfig.worker.json" },
     { "path": "./tsconfig.tests.workers.json" },
+    { "path": "./tsconfig.tests.db.json" },
     { "path": "./tsconfig.tests.client.json" },
     { "path": "./tsconfig.tests.e2e.json" }
   ]

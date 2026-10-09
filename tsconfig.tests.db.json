@@ -1,0 +1,21 @@
+{
+  // Node-run code that imports the Worker's database layer (src/worker/db/**): the tests under
+  // tests/unit/db (the "node" project of vitest.config.ts: plain Node, real `pg`) and the scripts
+  // listed below. Same options and Node types as tsconfig.node.json, plus the global `Env` that
+  // the database layer names — a Node-sized one, from tests/setup/node-db-env.d.ts.
+  //
+  // Rule: a script under scripts/ that imports from src/worker/db/** is listed here AND in the
+  // `exclude` of tsconfig.node.json. Keep the two lists identical, so no file is checked twice.
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tests.db.tsbuildinfo"
+  },
+  "include": [
+    "tests/unit/db/**/*.ts",
+    "scripts/seed-dev.ts",
+    "scripts/create-invite.ts",
+    "scripts/create-session.ts",
+    "tests/setup/node-db-env.d.ts"
+  ],
+  "exclude": []
+}
