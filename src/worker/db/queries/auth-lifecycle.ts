@@ -415,7 +415,16 @@ export type UnprovenReset = {
  * stays. Returns what was removed, or null when the account is not there or IS verified (then
  * nothing is touched: a proven owner's credentials are never removed this way).
  *
- * The row is locked first, so a verification racing this either lands before (→ null) or waits.
+ * The row is locked first (`FOR UPDATE`) and its state re-read under the lock, so whatever races
+ * this — a verification, an address change, a second callback for the same address — either
+ * landed before (→ null, nothing touched) or waits and then finds the row changed.
+ *
+ * The same transaction marks the address VERIFIED. The caller only gets here once the provider
+ * has vouched for the address, and from this commit on the row must not be movable: the one thing
+ * its creator can still do without a session is change an UNVERIFIED account's address (the
+ * pending-address route), which would otherwise slip between this cleanup and the link and leave
+ * the owner's Google identity on a row whose address — and so whose password reset — is the
+ * stranger's.
  */
 export async function clearUnprovenAccount(
   db: Executor,
@@ -450,6 +459,7 @@ export async function clearUnprovenAccount(
     await tx
       .update(user)
       .set({
+        emailVerified: true,
         name: reset.name,
         image: null,
         timezone: null,
@@ -467,6 +477,52 @@ export async function clearUnprovenAccount(
       .where(eq(user.id, userId));
     return {
       accounts: accounts.length,
+      sessions: sessions.length,
+      passkeys: passkeys.length,
+      twoFactor: factors.length,
+      tokens: tokens.length,
+    };
+  });
+}
+
+/**
+ * The second half of the cleanup, run AFTER the provider's account row exists and BEFORE the
+ * owner's session does (delete, link, delete again): under the same row lock, everything that
+ * could have been attached to the account in the window between `clearUnprovenAccount` and the
+ * link is removed — every session, every password, passkey, two-factor secret and token — and a
+ * provider identity linked twice by two simultaneous callbacks is reduced to one row. What is
+ * left is the account, its proven address and the provider link. Returns what it removed.
+ */
+export async function sweepAfterLink(
+  db: Executor,
+  userId: string,
+): Promise<{ accounts: number; sessions: number; passkeys: number; twoFactor: number; tokens: number }> {
+  return db.transaction(async (tx) => {
+    await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
+    const sessions = await tx.delete(session).where(eq(session.userId, userId)).returning({ id: session.id });
+    const passwords = await tx
+      .delete(account)
+      .where(and(eq(account.userId, userId), eq(account.providerId, "credential")))
+      .returning({ id: account.id });
+    // One row per provider identity: the earliest stays.
+    const duplicates = await tx.execute<{ id: string }>(sql`
+      DELETE FROM ${account} a USING ${account} b
+      WHERE a.user_id = ${userId} AND b.user_id = a.user_id
+        AND a.provider_id = b.provider_id AND a.account_id = b.account_id
+        AND (a.created_at, a.id) > (b.created_at, b.id)
+      RETURNING a.id`);
+    const passkeys = await tx.delete(passkey).where(eq(passkey.userId, userId)).returning({ id: passkey.id });
+    const factors = await tx
+      .delete(twoFactor)
+      .where(eq(twoFactor.userId, userId))
+      .returning({ id: twoFactor.id });
+    const tokens = await tx
+      .delete(verification)
+      .where(eq(verification.value, userId))
+      .returning({ id: verification.id });
+    await tx.update(user).set({ twoFactorEnabled: false }).where(eq(user.id, userId));
+    return {
+      accounts: passwords.length + duplicates.rows.length,
       sessions: sessions.length,
       passkeys: passkeys.length,
       twoFactor: factors.length,

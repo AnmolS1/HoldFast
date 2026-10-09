@@ -31,6 +31,7 @@ import {
   getAccount,
   getAccountByEmail,
   releaseSignup,
+  sweepAfterLink,
 } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
 import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
@@ -255,11 +256,21 @@ export function buildHooks(scope: AuthScope) {
     //                                    — before the link. Without the intent: refused, and
     //                                    nothing is linked or removed.
     //
-    // Atomicity, as it is: the emptying is ONE transaction, committed here, before Better Auth
-    // inserts the provider's account row and marks the address verified (its own statements, no
-    // transaction — auth/create-auth.ts). If that insert then fails, the account is left
-    // unverified with no credential at all: nobody can enter it, and nothing of the stranger's
-    // survives. The order cannot leave the stranger's password next to a verified address.
+    // Atomicity, as it is. Better Auth inserts the provider's account row with its own statement,
+    // outside any transaction of ours (auth/create-auth.ts), so "check, empty, link" cannot be one
+    // transaction. The order is made safe instead — delete, link, delete again:
+    //   1. `clearUnprovenAccount`: ONE transaction under `SELECT … FOR UPDATE` on the user row,
+    //      its state re-read under the lock — empties the account AND marks the address verified.
+    //      From that commit the row cannot be moved to another address (only an unverified row
+    //      can), cannot be "cleaned" a second time by a simultaneous callback, and has no
+    //      credential at all.
+    //   2. Better Auth links the provider identity.
+    //   3. `sweepAfterLink`, in `session.create.before`, under the same row lock: whatever was
+    //      attached in between is deleted again, a doubled link is reduced to one, and only then
+    //      is the owner's session created. If the sweep fails, the callback issues no session.
+    // An abort between 1 and 2 leaves an account that is verified, has no credential and no
+    // provider link: nobody can enter it with anything the stranger had, and its owner gets in
+    // with Google again (now the "verified" case) or by resetting the password by mail.
     account: {
       create: {
         before: async (account: { userId: string; providerId: string }, ctx: HookContext) => {
@@ -344,6 +355,27 @@ export function buildHooks(scope: AuthScope) {
     session: {
       create: {
         before: async (session: { userId: string; impersonatedBy?: string | null }, ctx: HookContext) => {
+          // The first session of an account that was emptied and linked in this request: sweep
+          // it AGAIN first (delete → link → delete). Anything attached to the row between the
+          // cleanup and the link — by a request that was already in flight — dies here, before
+          // the owner's session exists. If the sweep cannot complete, no session is issued.
+          const linking = scope.facts.linking;
+          if (linking?.cleaned && linking.userId === session.userId && !linking.swept) {
+            const swept = await sweepAfterLink(scope.db, session.userId);
+            linking.swept = true;
+            if (swept.accounts + swept.sessions + swept.passkeys + swept.twoFactor + swept.tokens > 0) {
+              record(
+                scope.deps,
+                "auth.prehijack_cleanup",
+                { type: "user", id: session.userId },
+                { ...swept, phase: "after_link" },
+                {
+                  actorUserId: session.userId,
+                  actorType: "user",
+                },
+              );
+            }
+          }
           try {
             await checkSessionStart(scope, session.userId, Boolean(session.impersonatedBy));
           } catch (error) {

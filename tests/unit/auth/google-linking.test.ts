@@ -14,7 +14,7 @@
 // So with the defaults the attack does not complete — the victim is simply refused, for good
 // (the stranger's unverifiable account squats the address). The policy here instead lets the
 // first person who PROVES the address have it, clean: auth/hooks.ts `account.create`.
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode, type TestGoogleProfile } from "../../../src/worker/auth/test-outbound";
 import { passkey, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
@@ -334,5 +334,172 @@ describe("the reverse: the account was made with Google, and a stranger signs up
     expect(
       (await google(newClient(), profileFor(email, { sub: (await accountsOf(row.id))[0]!.accountId }))).error,
     ).toBeNull();
+  });
+});
+
+// ── races ───────────────────────────────────────────────────────────────────────────────────
+// The cleanup, Better Auth's link and the owner's session are separate statements on the Worker's
+// connection. These tests put ANOTHER actor at the exact points between them — with a database
+// trigger on the `account` table, scoped to one user id, that fires inside the Worker's own
+// insert of the Google row. What the trigger does is what a stranger's request landing at that
+// instant would do, statement for statement. Real Postgres, the Worker's real connection.
+describe("races around the cleanup and the link", () => {
+  /** Installs a trigger for ONE user's Google link; returns its remover. */
+  async function atTheLink(
+    userId: string,
+    timing: "BEFORE" | "AFTER",
+    body: string,
+  ): Promise<() => Promise<void>> {
+    const name = `hf_test_${crypto.randomUUID().replace(/-/g, "")}`;
+    await testDb().execute(
+      sql.raw(`
+        CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.user_id = '${userId}' AND NEW.provider_id = 'google' THEN
+            ${body}
+          END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER ${name} ${timing} INSERT ON account FOR EACH ROW EXECUTE FUNCTION ${name}();`),
+    );
+    return async () => {
+      await testDb().execute(
+        sql.raw(`DROP TRIGGER IF EXISTS ${name} ON account; DROP FUNCTION IF EXISTS ${name}();`),
+      );
+    };
+  }
+
+  async function victimArrives(email: string) {
+    const victim = newClient();
+    expect((await intent(victim, await createInvite())).status).toBe(200);
+    return { victim, landed: await google(victim, profileFor(email)) };
+  }
+
+  it("a password, a passkey, a TOTP secret and a session attached BETWEEN the cleanup and the owner's session are all gone", async () => {
+    const email = freshEmail();
+    const { row } = await plantedAccount(email);
+    const id = () => crypto.randomUUID().replace(/-/g, "");
+    const remove = await atTheLink(
+      row.id,
+      "AFTER",
+      `INSERT INTO account (id, account_id, provider_id, user_id, password, created_at, updated_at)
+         VALUES ('${id()}', NEW.user_id, 'credential', NEW.user_id, 'raced-password-hash', now(), now());
+       INSERT INTO passkey (id, public_key, user_id, credential_id, counter, device_type, backed_up)
+         VALUES ('${id()}', 'raced', NEW.user_id, 'raced-${id()}', 0, 'singleDevice', false);
+       INSERT INTO two_factor (id, secret, backup_codes, user_id) VALUES ('${id()}', 'raced', 'raced', NEW.user_id);
+       INSERT INTO session (id, token, user_id, expires_at, created_at, updated_at)
+         VALUES ('${id()}', 'raced-${id()}', NEW.user_id, now() + interval '1 day', now(), now());
+       UPDATE "user" SET two_factor_enabled = true WHERE id = NEW.user_id;`,
+    );
+    try {
+      const { victim, landed } = await victimArrives(email);
+      expect(landed.error, landed.callback.text).toBeNull();
+      expect((await getSession(victim))?.user.id).toBe(row.id);
+    } finally {
+      await remove();
+    }
+    expect(await planted(row.id)).toEqual({
+      accounts: ["google"],
+      sessions: 1,
+      passkeys: 0,
+      twoFactor: 0,
+      tokens: 0,
+    });
+    expect(
+      (await sessionsOf(row.id)).some((s) => s.token.startsWith("raced-") || s.token.startsWith("planted-")),
+    ).toBe(false);
+    expect((await userById(row.id))!).toMatchObject({ emailVerified: true, twoFactorEnabled: false, email });
+    expect((await signIn(newClient(), email, PASSWORD)).status).toBe(401);
+    // Both phases are in the audit log.
+    const audit = await auditRows({ action: "auth.prehijack_cleanup", targetId: row.id });
+    expect(audit.map((entry) => (entry.meta as { phase?: string }).phase ?? "before_link").sort()).toEqual([
+      "after_link",
+      "before_link",
+    ]);
+  });
+
+  it("the stranger moves the account's address BETWEEN the cleanup and the link: it does not move", async () => {
+    const email = freshEmail();
+    const { row } = await plantedAccount(email);
+    const elsewhere = freshEmail();
+    // The pending-address route's own statement (queries/auth-lifecycle.ts replaceUnverifiedEmail).
+    const remove = await atTheLink(
+      row.id,
+      "BEFORE",
+      `UPDATE "user" SET email = '${elsewhere}' WHERE id = NEW.user_id AND email_verified = false;`,
+    );
+    try {
+      const { victim, landed } = await victimArrives(email);
+      expect(landed.error, landed.callback.text).toBeNull();
+      expect((await getSession(victim))?.user).toMatchObject({ id: row.id, email });
+    } finally {
+      await remove();
+    }
+    expect(await userByEmail(elsewhere)).toBeNull();
+    expect((await userById(row.id))!).toMatchObject({ email, emailVerified: true });
+    // So a password reset for the account goes to the owner's address — never to the stranger's.
+    await send(newClient(), "/api/auth/request-password-reset", {
+      json: { email: elsewhere, redirectTo: "/reset-password" },
+      headers: { "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" },
+    });
+    expect(mailTo(elsewhere, "passwordReset")).toEqual([]);
+  });
+
+  it("two callbacks for the same address at once: one clean account, one Google link, nothing half-done", async () => {
+    const email = freshEmail();
+    const { row } = await plantedAccount(email);
+    const profile = profileFor(email);
+    const browsers = [newClient(), newClient(), newClient()];
+    for (const browser of browsers) expect((await intent(browser, await createInvite())).status).toBe(200);
+    const results = await Promise.all(browsers.map((browser) => google(browser, profile)));
+    const signedIn = (await Promise.all(browsers.map((browser) => getSession(browser)))).filter(Boolean);
+    expect(signedIn.length, results.map((r) => r.error).join(",")).toBeGreaterThanOrEqual(1);
+    for (const who of signedIn) expect(who!.user.id).toBe(row.id);
+    const after = await planted(row.id);
+    expect(after.accounts).toEqual(["google"]);
+    expect({ passkeys: after.passkeys, twoFactor: after.twoFactor, tokens: after.tokens }).toEqual({
+      passkeys: 0,
+      twoFactor: 0,
+      tokens: 0,
+    });
+    expect((await sessionsOf(row.id)).some((s) => s.token.startsWith("planted-"))).toBe(false);
+    expect((await userById(row.id))!).toMatchObject({ emailVerified: true, twoFactorEnabled: false, email });
+    expect((await signIn(newClient(), email, PASSWORD)).status).toBe(401);
+    // Exactly one cleanup of the stranger's rows (the others found a proven account).
+    const before = (await auditRows({ action: "auth.prehijack_cleanup", targetId: row.id })).filter(
+      (entry) => (entry.meta as { phase?: string }).phase === undefined,
+    );
+    expect(before).toHaveLength(1);
+  });
+
+  it("the link fails mid-way: no session for anyone, and the account is fully cleaned — never half", async () => {
+    const email = freshEmail();
+    const { row, attacker } = await plantedAccount(email);
+    const remove = await atTheLink(row.id, "BEFORE", `RAISE EXCEPTION 'the link was aborted here';`);
+    let victim: Client;
+    try {
+      const arrived = await victimArrives(email);
+      victim = arrived.victim;
+      expect(arrived.landed.error ?? String(arrived.landed.callback.status)).not.toBeNull();
+      expect(await getSession(victim)).toBeNull();
+    } finally {
+      await remove();
+    }
+    // Not half: nothing of the stranger's is left, and nothing was linked.
+    expect(await planted(row.id)).toEqual({
+      accounts: [],
+      sessions: 0,
+      passkeys: 0,
+      twoFactor: 0,
+      tokens: 0,
+    });
+    expect((await userById(row.id))!).toMatchObject({ email, emailVerified: true, twoFactorEnabled: false });
+    expect((await signIn(newClient(), email, PASSWORD)).status).toBe(401);
+    expect(await getSession(attacker)).toBeNull();
+    // And the owner is not locked out: Google again (now a proven address) links and signs in.
+    const again = await google(victim!, profileFor(email));
+    expect(again.error).toBeNull();
+    expect((await getSession(victim!))?.user.id).toBe(row.id);
+    expect((await accountsOf(row.id)).map((a) => a.providerId)).toEqual(["google"]);
   });
 });

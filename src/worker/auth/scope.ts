@@ -46,7 +46,7 @@ export type AuthFacts = {
   /** The address of the user row this request is creating (set before the row exists), or null. */
   signingUpEmail: string | null;
   /** A provider identity is being linked to an account that already existed (hooks.ts). */
-  linking: { userId: string; providerId: string; cleaned: boolean } | null;
+  linking: { userId: string; providerId: string; cleaned: boolean; swept?: boolean } | null;
 };
 
 export type AuthScope = {
