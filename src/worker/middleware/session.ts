@@ -4,9 +4,16 @@
 // read a session, so they never open the database for one. Sets `c.var.user`, `c.var.session`,
 // `c.var.impersonating`, `c.var.termsStale`.
 //
-// The session's user comes from Better Auth's cookie cache and can be up to 60 s old, and
-// revoking sessions is only as fast as that cache. So the user's own flags are checked here on
-// every request instead of trusting the revoke:
+// THE SESSION IS READ FROM THE DATABASE, on every request — never from Better Auth's cookie cache.
+// The cache is a signed copy of the session AND of the user row that the browser holds for up to
+// 60 s. Read from it, a session that was revoked a second ago (a suspension, a ban, a password
+// reset, "sign out everywhere") went on being a session for the rest of the minute, and the
+// user's flags below were the flags of a minute ago: a just-suspended account kept the whole API.
+// One indexed read per request is the price of "revoked" meaning revoked. (The cache still
+// serves the browser's own GET /api/auth/get-session, which only decides what the shell draws;
+// every request the shell then makes comes through here.)
+//
+// The user's own flags are checked as well, because a revoke is not the only way to lose access:
 //
 //   deletion date passed     the session does not exist: user = null on every path (→ 401 from
 //                            requireUser on our routes), whether or not the purge has run.
@@ -21,7 +28,7 @@
 // unknown, GET or not, is refused here (401 for a deleted account, 403 otherwise). The session
 // read of a deleted account is answered as signed out.
 //
-// Anything that must be immediate (not ≤ 60 s) reads the database, not this.
+// Still read by the routes themselves where a decision hangs on one field: the terms gate.
 
 import type { MiddlewareHandler } from "hono";
 import { AUTH_PREFIX, authGateDecision, type AuthGateState } from "../auth/endpoint-policy";
@@ -86,7 +93,10 @@ export const session: MiddlewareHandler<AppEnv> = async (c, next) => {
     return next();
   }
 
-  const found = await auth(c).api.getSession({ headers: c.req.raw.headers });
+  const found = await auth(c).api.getSession({
+    headers: c.req.raw.headers,
+    query: { disableCookieCache: true },
+  });
   if (!found) return next();
 
   // Before any early return below: an impersonated session stays read-only even when its user is

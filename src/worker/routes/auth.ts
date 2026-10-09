@@ -61,6 +61,34 @@ function withClientAddress(request: Request, ip: string): Request {
   return new Request(request, { headers });
 }
 
+// Better Auth's cookie cache (`hf.session_data`, possibly in numbered chunks, with or without a
+// `__Secure-` prefix): a signed copy of the session and of the user row, good for 60 s.
+const SESSION_CACHE_COOKIE = /(?:^|[.-])session_data(?:\.\d+)?$/;
+
+/**
+ * `request` WITHOUT the cookie cache, so that Better Auth resolves the session from the database.
+ *
+ * With the cache, a session that was revoked a second ago — the account suspended or banned, the
+ * password reset, "sign out everywhere" — went on working on every /api/auth/* endpoint for the
+ * rest of its minute: the handler read the signed copy and never asked the database, and a
+ * just-suspended account could still change its name, list its sessions or add a passkey. The
+ * pipeline in front of this route already reads the session from the database
+ * (middleware/session.ts); this makes the handler behind it agree. Better Auth still SETS the
+ * cache cookie; nothing reads it.
+ */
+function withoutSessionCache(request: Request): Request {
+  const cookie = request.headers.get("cookie");
+  if (!cookie) return request;
+  const kept = cookie
+    .split(";")
+    .map((pair) => pair.trim())
+    .filter((pair) => pair !== "" && !SESSION_CACHE_COOKIE.test(pair.split("=")[0]!.trim()));
+  const headers = new Headers(request.headers);
+  if (kept.length === 0) headers.delete("cookie");
+  else headers.set("cookie", kept.join("; "));
+  return new Request(request, { headers });
+}
+
 /**
  * A copy of a small JSON request body, or null. Never more than `KEEP_BODY_MAX_BYTES` is read:
  * a larger body (declared, or discovered while reading) is abandoned.
@@ -122,7 +150,7 @@ router.all(
         userAgent: c.req.header("user-agent") ?? null,
       };
     }
-    const request = withClientAddress(c.req.raw, c.get("ip"));
+    const request = withoutSessionCache(withClientAddress(c.req.raw, c.get("ip")));
     const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
 
     // 3. The watchdog.

@@ -66,6 +66,10 @@ export type SessionInfo = {
 export type Auth = {
   handler(request: Request): Promise<Response>;
   api: {
-    getSession(context: { headers: Headers }): Promise<{ session: SessionInfo; user: SessionUser } | null>;
+    getSession(context: {
+      headers: Headers;
+      /** `disableCookieCache: true` reads the session and its user from the database. */
+      query?: { disableCookieCache?: boolean };
+    }): Promise<{ session: SessionInfo; user: SessionUser } | null>;
   };
 };
