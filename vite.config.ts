@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -50,7 +50,15 @@ export default defineConfig({
   // break each other's running dev server. Keep it inside the checkout (.wrangler/ is ignored).
   cacheDir: ".wrangler/vite",
   plugins: [react(), cloudflare({ inspectorPort })],
-  server: { host, port, strictPort: true },
+  server: {
+    host,
+    port,
+    strictPort: true,
+    // In a worktree node_modules is a symlink to the main checkout's, which is outside this
+    // checkout: without its real path here Vite refuses (403) every file served from it by
+    // path — the font files. In the main checkout the two entries are the same tree.
+    fs: { allow: [".", realpathSync("node_modules")] },
+  },
   preview: { host, port, strictPort: true },
   define: {
     __GIT_SHA__: JSON.stringify(commit),
