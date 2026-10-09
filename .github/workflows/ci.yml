@@ -101,6 +101,11 @@ jobs:
           fi
           psql --version
 
+      # The deploy refuses to migrate a database that is not on UTC. Shown here against the real
+      # service Postgres: scratch databases set to America/Chicago and Europe/London must fail.
+      - name: The UTC guard fails on a non-UTC database
+        run: bash .github/workflows/lib/deploy-lib.sh utc-zone-self-test
+
       # A fresh runner has no schema. Not guarded with a skip: this step fails until the tree has
       # migrations, because a migrate step that silently skips would read green forever.
       - name: Migrate the test database

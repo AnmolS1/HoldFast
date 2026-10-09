@@ -6,13 +6,15 @@
 #   deploy-lib.sh built-env <dev|production> [file]  which environment did the last build emit?
 #   deploy-lib.sh stamp <base-url> <sha> [tries] [sleep]   GET /__meta commit == sha
 #   deploy-lib.sh health <base-url>                  GET /api/health is 200 {"ok":true}
-#   deploy-lib.sh files-host <url>                   HEAD is 404 text/plain, no set-cookie
+#   deploy-lib.sh files-host <url> [tries] [sleep]   GET is the Worker's bare 404 (exit 0/10/11/12, see below)
 #   deploy-lib.sh branch-head <branch> <sha>         sha is still the head of origin/<branch>
 #   deploy-lib.sh containers-plan <base-url> <sha>   build the scanner image, or leave containers alone?
 #   deploy-lib.sh worker-ready <worker>              the Worker exists, has a deployment and its secrets
 #   deploy-lib.sh secrets <worker>                   the Worker has the nine secret names
-#   deploy-lib.sh migrate <apply|none-pending> <local|remote>   drizzle migrations, counted
+#   deploy-lib.sh utc-zone                           the database in DATABASE_URL_DIRECT keeps UTC time
+#   deploy-lib.sh migrate <apply|none-pending> <local|remote>   utc-zone, then drizzle migrations, counted
 #   deploy-lib.sh self-test                          every evaluator fails on bad input, passes on good
+#   deploy-lib.sh utc-zone-self-test                 utc-zone against a LOCAL Postgres: UTC passes, others fail
 #
 # Rules for every command here: exit non-zero unless the thing was actually observed and matched (a
 # check that could not run is a failure, never a pass); print what was compared; never print a
@@ -187,7 +189,7 @@ cmd_built_env() {
   echo "built-env: OK ($env)"
 }
 
-# ── stamp / health / files-host ──────────────────────────────────────────────────────────────────
+# ── stamp / health ──────────────────────────────────────────────────────────────────────────────
 # <body> <expected sha> → 0 when the body is the Holdfast build stamp for exactly that commit.
 eval_meta() {
   local body="$1" want="$2" project commit
@@ -234,12 +236,68 @@ cmd_health() {
   echo "health: OK ($base/api/health → 200, ok=true)"
 }
 
-# <response headers> → 0 when they are the files host's bare 404.
+# ── files-host ───────────────────────────────────────────────────────────────────────────────────
+# GET <url> on the files host must be the Worker's bare answer: 404, text/plain, no cookie. The
+# check prints what it saw and ends in exactly one of four outcomes, each with its own exit code:
+#
+#   0   PASS                 404, text/plain, no set-cookie, no edge challenge.
+#   10  WORKER-MISCONFIGURED an answer arrived and nothing marks it as an edge challenge, but it is
+#                            not the bare 404 (a 200, an HTML page, a cookie, a redirect, a 403 …).
+#                            DANGEROUS: the files host may be serving the app shell or another
+#                            Worker's routes. Fix the routes / the Worker; do not ship on top of it.
+#                            This is also the verdict whenever the evidence is ambiguous.
+#   11  EDGE-CHALLENGE       the response carries `cf-mitigated: challenge` — Cloudflare's marker on
+#                            every Challenge Page (developers.cloudflare.com/cloudflare-challenges/
+#                            challenge-types/challenge-pages/detect-response/). Cloudflare answered
+#                            BEFORE the Worker ran, so the Worker was NOT observed: this is not a
+#                            pass and not evidence about the Worker either way. It is zone
+#                            configuration and is resolved in the Cloudflare dashboard, not in code:
+#                            Security → Settings → Bot traffic → Bot Fight Mode on the files zone
+#                            (it challenges datacenter IPs such as CI runners, and cannot be skipped
+#                            by a WAF rule or scoped to a path). Then re-run the check.
+#   12  UNREACHABLE          no complete HTTP answer (DNS, TLS, connect, timeout) after every try.
+#
+# Deliberately absent: any bypass, any user-agent or header that would make the probe look like a
+# browser, and any retry of a request that WAS answered. Only "no answer at all" is tried again.
+FILES_RC_MISCONFIGURED=10
+FILES_RC_EDGE_CHALLENGE=11
+FILES_RC_UNREACHABLE=12
+
+# The last header block of a curl -D dump, without carriage returns.
+last_header_block() { tr -d '\r' | awk '/^HTTP\// { block = "" } { block = block $0 "\n" } END { printf "%s", block }'; }
+
+header_value() { # <headers> <lowercase name> → the first value
+  printf '%s\n' "$1" | awk -v want="$2:" 'tolower($1) == want { sub(/^[^:]*:[ \t]*/, ""); print; exit }'
+}
+
+# Printable ASCII only, and nothing that could be a credential: query strings and every run of 16
+# or more token characters go. Over-redaction is the intended direction.
+redact_tokens() {
+  LC_ALL=C tr -c '\40-\176' ' ' | LC_ALL=C sed -E 's#\?[^[:space:]"'"'"'<>]*#?<query>#g; s#[A-Za-z0-9_+/=%~-]{16,}#<redacted>#g'
+}
+
+show_value() { # one header value, made safe to print
+  local v
+  v="$(printf '%s' "$1" | redact_tokens | cut -c1-80)"
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '(absent)'; fi
+}
+
+# <response headers> → 0 PASS, 10 WORKER-MISCONFIGURED, 11 EDGE-CHALLENGE. Prints the reasons.
 eval_files_head() {
-  local headers status ctype bad=0
-  headers="$(printf '%s' "$1" | tr -d '\r')"
-  status="$(printf '%s\n' "$headers" | awk 'NR == 1 { print $2 }')"
-  ctype="$(printf '%s\n' "$headers" | awk 'tolower($1) == "content-type:" { print tolower($2) }' | tr -d ';')"
+  local headers status ctype mitigated bad=0
+  headers="$(printf '%s' "$1" | last_header_block)"
+  status="$(printf '%s\n' "$headers" | awk 'NR == 1 && /^HTTP\// { print $2 }')"
+  ctype="$(header_value "$headers" content-type | tr '[:upper:]' '[:lower:]' | sed -E 's/[;[:space:]].*$//')"
+  mitigated="$(header_value "$headers" cf-mitigated | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if ! [[ "$status" =~ ^[0-9]{3}$ ]]; then
+    echo "files-host: no HTTP status line in the response"
+    return "$FILES_RC_MISCONFIGURED"
+  fi
+  # The edge marker is read first: a challenge page also sets cookies and is text/html.
+  if [ "$mitigated" = "challenge" ]; then
+    echo "files-host: cf-mitigated: challenge — Cloudflare's edge answered (status $status), the Worker did not run"
+    return "$FILES_RC_EDGE_CHALLENGE"
+  fi
   if [ "$status" != "404" ]; then
     echo "files-host: status '$status', expected 404"
     bad=1
@@ -252,23 +310,79 @@ eval_files_head() {
     echo "files-host: the response sets a cookie"
     bad=1
   fi
-  [ "$bad" = 0 ] && echo "files-host: 404, text/plain, no set-cookie"
-  return "$bad"
+  if [ "$bad" = 0 ]; then
+    echo "files-host: 404, text/plain, no set-cookie, no edge challenge"
+    return 0
+  fi
+  return "$FILES_RC_MISCONFIGURED"
+}
+
+# What was seen, for the person reading a red run. Values are cut and redacted; cf-ray and cookie
+# values are never printed.
+describe_files_response() { # <headers file> <body file>
+  local headers status ctype size cookies ray sandbox robots
+  headers="$(last_header_block <"$1")"
+  status="$(printf '%s\n' "$headers" | awk 'NR == 1 && /^HTTP\// { print $2 }')"
+  ctype="$(header_value "$headers" content-type)"
+  if [ -n "$(header_value "$headers" cf-ray)" ]; then ray="present"; else ray="absent"; fi
+  cookies="$(printf '%s\n' "$headers" | awk 'tolower($1) == "set-cookie:" { split($2, kv, "="); printf "%s%s", sep, kv[1]; sep = "," }' | redact_tokens | cut -c1-80)"
+  echo "files-host: saw status=$(show_value "$status") content-type=$(show_value "$ctype") server=$(show_value "$(header_value "$headers" server)")"
+  echo "files-host: saw cf-mitigated=$(show_value "$(header_value "$headers" cf-mitigated)") cf-ray=$ray set-cookie=${cookies:-(none)} location=$(show_value "$(header_value "$headers" location)")"
+  # Context only, never the verdict: the Worker stamps these on every files-host answer.
+  if header_value "$headers" content-security-policy | grep -qi 'sandbox'; then sandbox="present"; else sandbox="absent"; fi
+  if [ -n "$(header_value "$headers" x-robots-tag)" ]; then robots="present"; else robots="absent"; fi
+  echo "files-host: saw the Worker's own headers: content-security-policy sandbox=$sandbox, x-robots-tag=$robots"
+  size="$(wc -c <"$2" | tr -d ' ')"
+  case "$(printf '%s' "$ctype" | tr '[:upper:]' '[:lower:]')" in
+    text/* | *json* | *xml*)
+      echo "files-host: saw body ($size bytes; first 200, redacted): $(head -c 2048 "$2" | redact_tokens | tr -s ' ' | cut -c1-200)"
+      ;;
+    *) echo "files-host: saw body ($size bytes) — not a text content-type, not shown" ;;
+  esac
+}
+
+files_verdict() { # <exit code> <class> <message> — the one line a person needs, then exit
+  if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ "$1" != 0 ]; then printf '::error::files-host: %s — %s\n' "$2" "$3"; fi
+  if [ "$1" = 0 ]; then printf 'files-host: %s — %s\n' "$2" "$3"; else printf 'FAIL: files-host: %s — %s\n' "$2" "$3" >&2; fi
+  exit "$1"
 }
 
 cmd_files_host() {
-  [ "$#" -ge 1 ] || fail "usage: deploy-lib.sh files-host <url>"
-  need curl
-  local url="$1" headers="" i=1
-  while [ "$i" -le 3 ]; do
-    headers="$(curl -sS -I --max-time 15 "$url" 2>/dev/null)" && [ -n "$headers" ] && break
-    headers=""
-    sleep 5
+  [ "$#" -ge 1 ] || fail "usage: deploy-lib.sh files-host <url> [tries] [sleep-seconds]"
+  need curl awk sed
+  local url="$1" tries="${2:-3}" pause="${3:-5}" i=1 rc=0 tmp answered=0 curl_error="" verdict=0
+  [[ "$tries" =~ ^[1-9][0-9]*$ ]] && [[ "$pause" =~ ^[0-9]+$ ]] || fail "files-host: tries and sleep must be numbers"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-files-host.XXXXXX")"
+  # Tried again ONLY when nothing answered. A response of any kind is final.
+  while [ "$i" -le "$tries" ]; do
+    rc=0
+    : >"$tmp/headers" && : >"$tmp/body"
+    curl -sS --max-time 15 -D "$tmp/headers" -o "$tmp/body" "$url" 2>"$tmp/err" || rc=$?
+    if [ "$rc" = 0 ] && grep -q '^HTTP/' "$tmp/headers"; then
+      answered=1
+      break
+    fi
+    curl_error="curl exit $rc: $(redact_tokens <"$tmp/err" | tr -s ' ' | cut -c1-160)"
+    echo "files-host: try $i of $tries got no complete answer ($curl_error)"
+    [ "$i" -lt "$tries" ] && sleep "$pause"
     i=$((i + 1))
   done
-  [ -n "$headers" ] || fail "files-host: no answer from $url"
-  eval_files_head "$headers" || fail "files-host: $url is not the bare files host"
-  echo "files-host: OK ($url)"
+  if [ "$answered" != 1 ]; then
+    rm -rf "$tmp"
+    files_verdict "$FILES_RC_UNREACHABLE" "UNREACHABLE" "no complete HTTP answer from $url after $tries tries ($curl_error). Nothing was observed: check DNS, the custom domain and the route, then run again."
+  fi
+  describe_files_response "$tmp/headers" "$tmp/body"
+  eval_files_head "$(cat "$tmp/headers")" || verdict=$?
+  rm -rf "$tmp"
+  case "$verdict" in
+    0) files_verdict 0 "PASS" "$url is the bare files host" ;;
+    "$FILES_RC_EDGE_CHALLENGE")
+      files_verdict "$FILES_RC_EDGE_CHALLENGE" "EDGE-CHALLENGE" "Cloudflare challenged this probe before the Worker ran, so $url was NOT checked (this is not a pass, and says nothing about the Worker). Not fixable in code: in the Cloudflare dashboard, on the files zone, Security → Settings → Bot traffic → turn Bot Fight Mode off (it challenges datacenter IPs such as this runner), then re-run. From a residential network the same URL shows what the Worker really serves."
+      ;;
+    *)
+      files_verdict "$FILES_RC_MISCONFIGURED" "WORKER-MISCONFIGURED" "$url answered, without Cloudflare's challenge marker (cf-mitigated), something other than the bare 404 text/plain. Treat it as the Worker or its routes serving the wrong thing on the files host until shown otherwise — read the lines above (if the body is plainly a Cloudflare block page and the Worker's own headers are absent, an edge rule intercepted it)."
+      ;;
+  esac
 }
 
 # ── branch-head ──────────────────────────────────────────────────────────────────────────────────
@@ -420,6 +534,120 @@ is_local_host() {
   case "$1" in localhost | 127.0.0.1 | ::1 | '[::1]') return 0 ;; *) return 1 ;; esac
 }
 
+# ── utc-zone ─────────────────────────────────────────────────────────────────────────────────────
+# The auth tables (generated; not ours to edit) keep time in zone-less `timestamp` columns filled
+# by `DEFAULT now()`. Postgres converts now() to the SESSION's zone when it stores it there, so on
+# a database whose zone is not UTC every such default is wrong by the zone's offset (-5 h / -6 h
+# under America/Chicago). The Worker's sessions come through Hyperdrive, which keeps no session
+# state: their zone is whatever the server, the database or the role says. This check reads that,
+# and requires a ZERO offset from UTC in January and in July of the current year — a name is not
+# compared (UTC, Etc/UTC, GMT all pass), and a zone that is UTC only in winter (Europe/London)
+# fails. It looks at:
+#   - the zone a plain new session gets (with this shell's PGTZ / PGOPTIONS removed), and where the
+#     setting comes from — a zone set by the connection itself hides the database's own, so it fails;
+#   - every `ALTER DATABASE … SET timezone` / `ALTER ROLE … [IN DATABASE …] SET timezone` that
+#     applies to this database, for ANY role (the Worker's role may not be the one that migrates).
+# One row per zone found: kind|zone|january offset (s)|july offset (s)|database.
+UTC_ZONE_SQL="
+with instants(jan, jul) as (
+  select date_trunc('year', now() at time zone 'UTC') + interval '14 days 12 hours',
+         date_trunc('year', now() at time zone 'UTC') + interval '6 months 14 days 12 hours'
+), zones(kind, zone) as (
+  select 'session:' || source, setting from pg_settings where name = 'TimeZone'
+  union all
+  select case when s.setrole = 0 and s.setdatabase = 0 then 'setting:all-roles'
+              when s.setrole = 0 then 'setting:database'
+              when s.setdatabase = 0 then 'setting:role'
+              else 'setting:role-in-database' end,
+         substr(c.cfg, strpos(c.cfg, '=') + 1)
+  from pg_db_role_setting s cross join lateral unnest(s.setconfig) as c(cfg)
+  where s.setdatabase in (0, (select oid from pg_database where datname = current_database()))
+    and lower(split_part(c.cfg, '=', 1)) = 'timezone'
+)
+select z.kind, z.zone,
+       extract(epoch from (i.jan at time zone 'UTC') - (i.jan at time zone z.zone))::int,
+       extract(epoch from (i.jul at time zone 'UTC') - (i.jul at time zone z.zone))::int,
+       current_database()
+from zones z cross join instants i
+order by 1, 2"
+
+# <file with the rows of UTC_ZONE_SQL> → 0 only when a session row was read and every zone is UTC.
+eval_utc_zone() {
+  [ -s "$1" ] || { echo "utc-zone: the query returned nothing — the time zone was not observed" && return 1; }
+  awk -F '|' '
+    function hhmm(s,   sign, a) { sign = (s < 0) ? "-" : "+"; a = (s < 0) ? -s : s; return sprintf("UTC%s%02d:%02d", sign, int(a / 3600), int((a % 3600) / 60)) }
+    function fix(kind, db) {
+      if (kind == "session:database" || kind == "setting:database") return "ALTER DATABASE \"" db "\" SET timezone TO \x27UTC\x27;"
+      if (kind == "session:user" || kind == "setting:role") return "a role has its own zone: ALTER ROLE <that role> SET timezone TO \x27UTC\x27; (or RESET timezone)"
+      if (kind == "session:database user" || kind == "setting:role-in-database") return "a role has its own zone in this database: ALTER ROLE <that role> IN DATABASE \"" db "\" RESET timezone;"
+      if (kind == "setting:all-roles") return "ALTER ROLE ALL RESET timezone;"
+      return "the SERVER default is not UTC: set timezone = \x27UTC\x27 in the server configuration (local docker: the image default is UTC — check TZ/PGTZ and `-c timezone` on the container), or pin the database: ALTER DATABASE \"" db "\" SET timezone TO \x27UTC\x27;"
+    }
+    BEGIN { bad = 0; sessions = 0 }
+    NF != 5 || $1 !~ /^(session|setting):[a-z -]+$/ || $3 !~ /^-?[0-9]+$/ || $4 !~ /^-?[0-9]+$/ {
+      print "utc-zone: unreadable row in the query output (" NF " field(s)) — the time zone was not observed"; bad = 1; next
+    }
+    {
+      kind = $1; zone = $2; jan = $3 + 0; jul = $4 + 0; db = $5
+      what = kind; sub(/^session:/, "a new session (source: ", what); if (kind ~ /^session:/) what = what ")"
+      sub(/^setting:/, "a stored setting (", what); if (kind ~ /^setting:/) what = what ")"
+      printf "utc-zone: database \"%s\", %s: zone \x27%s\x27, January %s, July %s\n", db, what, zone, hhmm(jan), hhmm(jul)
+      if (kind ~ /^session:/) {
+        sessions++
+        src = substr(kind, 9)
+        if (src !~ /^(default|environment variable|configuration file|command line|global|database|user|database user)$/) {
+          print "utc-zone: NOT OBSERVED — this connection set its own time zone (source: " src "), which hides the database\x27s. Remove `options=-c timezone…` from the connection string and run again."
+          bad = 1
+        }
+      }
+      if (jan != 0 || jul != 0) {
+        print "utc-zone: NOT UTC — \x27" zone "\x27 is " hhmm(jan) " in January and " hhmm(jul) " in July. Every DEFAULT now() written to a zone-less timestamp column would be off by that much. Fix: " fix(kind, db)
+        bad = 1
+      }
+    }
+    END {
+      if (sessions != 1) { print "utc-zone: expected exactly one session row, read " sessions " — the time zone was not observed"; bad = 1 }
+      exit bad
+    }' "$1"
+}
+
+# psql error text with the connection's parts taken out (psql names the host and the user).
+scrub_connection() { # <text> <url>
+  local text="$1" url="$2" host userinfo user="" password=""
+  host="$(url_host "$url")"
+  userinfo="${url#*://}"
+  if [[ "$userinfo" == *@* ]]; then
+    userinfo="${userinfo%%@*}"
+    user="${userinfo%%:*}"
+    if [[ "$userinfo" == *:* ]]; then password="${userinfo#*:}"; fi
+  fi
+  if [ -n "$password" ]; then text="${text//"$password"/<password>}"; fi
+  if [ -n "$host" ]; then text="${text//"$host"/<host>}"; fi
+  if [ -n "$user" ]; then text="${text//"$user"/<user>}"; fi
+  # psql also prints the address the host resolved to.
+  printf '%s\n' "$text" | redact | sed -E 's/\(([0-9]{1,3}\.){3}[0-9]{1,3}\)|\([0-9A-Fa-f:]*:[0-9A-Fa-f:]+\)/(<address>)/g'
+}
+
+# Reads DATABASE_URL_DIRECT from the environment; never prints it or any part of it.
+cmd_utc_zone() {
+  need psql awk
+  local url="${DATABASE_URL_DIRECT:-}" tmp rc=0 verdict=0
+  [ -n "$url" ] || fail "utc-zone: DATABASE_URL_DIRECT is empty — no database was checked"
+  [[ "$url" =~ ^postgres(ql)?:// ]] || fail "utc-zone: DATABASE_URL_DIRECT is not a postgres:// URL — no database was checked"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-utc-zone.XXXXXX")"
+  # PGTZ / PGOPTIONS in this shell would set the session's zone and answer for the database.
+  env -u PGTZ -u PGOPTIONS PGCONNECT_TIMEOUT=15 psql "$url" -X -Atq -F '|' -v ON_ERROR_STOP=1 -c "$UTC_ZONE_SQL" >"$tmp/rows" 2>"$tmp/err" || rc=$?
+  if [ "$rc" != 0 ]; then
+    scrub_connection "$(head -c 600 "$tmp/err")" "$url" | sed 's/^/  psql: /' >&2
+    rm -rf "$tmp"
+    fail "utc-zone: the time zone query could not run (psql exit $rc) — the database's zone was NOT checked, so this stops here. Check that the database is reachable and the URL is right."
+  fi
+  eval_utc_zone "$tmp/rows" || verdict=1
+  rm -rf "$tmp"
+  [ "$verdict" = 0 ] || fail "utc-zone: the target database does not keep UTC time (or its zone could not be read) — see the lines above. Nothing was migrated."
+  echo "utc-zone: OK (zero UTC offset in January and July, for the session default and every stored setting)"
+}
+
 migration_rows() { # prints the number of applied migrations, or "none" when the table does not exist
   local exists
   exists="$(psql "$DATABASE_URL_DIRECT" -X -Atq -v ON_ERROR_STOP=1 -c "select to_regclass('$MIGRATIONS_TABLE') is not null" 2>&1)" ||
@@ -455,6 +683,9 @@ cmd_migrate() {
     *) fail "migrate: target must be 'local' or 'remote'" ;;
   esac
 
+  # Before anything is read or written: a database that is not on UTC must not be migrated.
+  cmd_utc_zone
+
   cd "$repo_root"
   # Never read green on a tree that has no migrations: absence is a failure, not "0 to apply".
   [ -f drizzle.config.ts ] || fail "migrate: drizzle.config.ts is missing — this tree has no migrations to apply"
@@ -484,6 +715,102 @@ cmd_migrate() {
   else
     echo "migrate: OK — $((after - before)) migration(s) newly applied"
   fi
+}
+
+# ── utc-zone-self-test ───────────────────────────────────────────────────────────────────────────
+# The guard against a real LOCAL Postgres (the docker-compose.test.yml server / the CI service):
+# scratch databases with a zone set by ALTER DATABASE, dropped afterwards. Never a skip: no
+# reachable local Postgres is a failure. It only issues ALTER DATABASE / ALTER ROLE … IN DATABASE
+# on its own scratch objects — nothing server-wide, nothing on another database.
+cmd_utc_zone_self_test() {
+  need psql awk
+  local host="${HOLDFAST_DB_HOST:-localhost}" port="${HOLDFAST_DB_PORT:-5432}" failures=0 base n
+  # Not `local`: the EXIT trap below runs after this function's scope is gone.
+  utc_st_prefix="holdfast_ciguards" utc_st_admin="" utc_st_tmp=""
+  local prefix="$utc_st_prefix" admin tmp
+  is_local_host "$host" || fail "utc-zone-self-test: the host is '$host' — this only ever runs against a local Postgres"
+  [[ "$port" =~ ^[0-9]+$ ]] || fail "utc-zone-self-test: HOLDFAST_DB_PORT must be a number"
+  # The local test server's well-known credentials (docker-compose.test.yml, ci.yml) — not a secret.
+  base="postgres://postgres:postgres@$host:$port"
+  admin="$base/postgres"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-utc-selftest.XXXXXX")"
+  utc_st_admin="$admin" utc_st_tmp="$tmp"
+  PGCONNECT_TIMEOUT=10 psql "$admin" -X -Atqc 'select 1' >/dev/null 2>&1 ||
+    { rm -rf "$tmp" && fail "utc-zone-self-test: no local Postgres on $host:$port — nothing was tested"; }
+
+  cleanup_utc_selftest() {
+    local d
+    for d in utc chicago london role; do
+      psql "$utc_st_admin" -X -q -c "DROP DATABASE IF EXISTS \"${utc_st_prefix}_$d\" WITH (FORCE)" >/dev/null 2>&1 || true
+    done
+    psql "$utc_st_admin" -X -q -c "DROP ROLE IF EXISTS \"${utc_st_prefix}_role\"" >/dev/null 2>&1 || true
+    rm -rf "$utc_st_tmp"
+  }
+  trap cleanup_utc_selftest EXIT
+  cleanup_utc_selftest
+  mkdir -p "$tmp"
+  for n in utc chicago london role; do
+    psql "$admin" -X -q -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${prefix}_$n\"" || fail "utc-zone-self-test: could not create a scratch database"
+  done
+  PGOPTIONS="-c client_min_messages=warning" psql "$admin" -X -q -v ON_ERROR_STOP=1 \
+    -c "ALTER DATABASE \"${prefix}_utc\" SET timezone TO 'UTC'" \
+    -c "ALTER DATABASE \"${prefix}_chicago\" SET timezone TO 'America/Chicago'" \
+    -c "ALTER DATABASE \"${prefix}_london\" SET timezone TO 'Europe/London'" \
+    -c "ALTER DATABASE \"${prefix}_role\" SET timezone TO 'UTC'" \
+    -c "CREATE ROLE \"${prefix}_role\" NOLOGIN" \
+    -c "ALTER ROLE \"${prefix}_role\" IN DATABASE \"${prefix}_role\" SET timezone TO 'Asia/Tokyo'" ||
+    fail "utc-zone-self-test: could not set up the scratch databases"
+
+  check() { # <pass|fail> <text the output must contain> <label> <command...>
+    local want="$1" needle="$2" label="$3" got
+    shift 3
+    if ("$@") >"$tmp/out" 2>&1; then got="pass"; else got="fail"; fi
+    # No output may ever carry the password part of a URL that was used.
+    if [ "$got" = "$want" ] && grep -qF -- "$needle" "$tmp/out" && ! grep -qE 'postgres(ql)?://[^[:space:]]*@|:postgres@|wrong-pw-ciguards' "$tmp/out"; then
+      echo "  ok    $label → $got ($needle)"
+    else
+      echo "  WRONG $label → $got, expected $want with '$needle' and no connection string in the output"
+      sed -E 's#postgres(ql)?://[^[:space:]]+#<database-url>#g; s/^/        /' "$tmp/out"
+      failures=$((failures + 1))
+    fi
+  }
+  guard() { DATABASE_URL_DIRECT="$1" cmd_utc_zone; }
+  migrate_refused() { # the migrate path stops before drizzle-kit: no bookkeeping table afterwards
+    local rc=0
+    (DATABASE_URL_DIRECT="$1" cmd_migrate apply local) >"$tmp/migrate.out" 2>&1 || rc=$?
+    [ "$rc" != 0 ] || { echo "migrate did not fail" && return 1; }
+    grep -q 'utc-zone: NOT UTC' "$tmp/migrate.out" || { echo "migrate failed, but not on the time zone" && return 1; }
+    ! grep -q 'drizzle-kit' "$tmp/migrate.out" || { echo "drizzle-kit ran" && return 1; }
+    [ "$(psql "$1" -X -Atqc "select to_regclass('$MIGRATIONS_TABLE') is null")" = "t" ] || { echo "migrations WERE applied" && return 1; }
+    echo "migrate refused; no migration table was created"
+  }
+
+  echo "utc-zone against the local Postgres on $host:$port:"
+  check pass "utc-zone: OK" "a database on UTC" guard "$base/${prefix}_utc"
+  check fail "America/Chicago" "a database on America/Chicago" guard "$base/${prefix}_chicago"
+  check fail "ALTER DATABASE \"${prefix}_chicago\" SET timezone TO 'UTC'" "… and the message gives the fix" guard "$base/${prefix}_chicago"
+  check fail "Europe/London" "a database on Europe/London (UTC in winter only)" guard "$base/${prefix}_london"
+  check fail "UTC+01:00" "… and the July offset is what fails it" guard "$base/${prefix}_london"
+  PGTZ=Etc/UTC check fail "America/Chicago" "Chicago database, PGTZ=Etc/UTC in the shell (must not mask it)" guard "$base/${prefix}_chicago"
+  PGOPTIONS="-c timezone=UTC" check fail "America/Chicago" "Chicago database, PGOPTIONS sets UTC (must not mask it)" guard "$base/${prefix}_chicago"
+  check fail "this connection set its own time zone" "a URL that sets the zone itself (options=-c timezone=UTC)" guard "$base/${prefix}_chicago?options=-c%20timezone%3DUTC"
+  check fail "Asia/Tokyo" "UTC database, another role pinned to Asia/Tokyo in it" guard "$base/${prefix}_role"
+  PGTZ=America/Chicago check pass "utc-zone: OK" "UTC database, PGTZ=America/Chicago in the shell (the shell is not the database)" guard "$base/${prefix}_utc"
+  echo "fails closed when the query cannot run:"
+  check fail "NOT checked" "nothing listening (port 1)" guard "postgres://postgres:postgres@127.0.0.1:1/${prefix}_utc"
+  check fail "NOT checked" "wrong password" guard "postgres://postgres:wrong-pw-ciguards@$host:$port/${prefix}_utc"
+  check fail "NOT checked" "a database that does not exist" guard "$base/${prefix}_absent"
+  check fail "not a postgres:// URL" "a URL that is not a database URL" guard "http://localhost/x"
+  check fail "is empty" "an empty URL" guard ""
+  echo "the migrate path:"
+  check pass "migrate refused; no migration table was created" "migrate on the Chicago database stops before any migration" migrate_refused "$base/${prefix}_chicago"
+
+  [ "$failures" = 0 ] || fail "utc-zone-self-test: $failures case(s) gave the wrong verdict"
+  # Proof that nothing is left behind, not an assumption that the trap will manage.
+  cleanup_utc_selftest
+  n="$(psql "$admin" -X -Atqc "select (select count(*) from pg_database where datname in ('${prefix}_utc', '${prefix}_chicago', '${prefix}_london', '${prefix}_role')) + (select count(*) from pg_roles where rolname = '${prefix}_role')")" || n="unknown"
+  [ "$n" = "0" ] || fail "utc-zone-self-test: $n scratch object(s) were left on the server"
+  echo "utc-zone-self-test: OK (scratch databases and role dropped)"
 }
 
 # ── self-test ────────────────────────────────────────────────────────────────────────────────────
@@ -517,8 +844,11 @@ cmd_self_test() {
   expect fail "empty body (no answer)" eval_meta "" "$sha_a"
   expect fail "commit 'unknown'" eval_meta '{"project":"holdfast","commit":"unknown"}' "$sha_a"
 
-  echo "files-host:"
+  echo "files-host (the verdict on a set of headers):"
   expect pass "bare 404" eval_files_head "$(printf 'HTTP/2 404 \r\ncontent-type: text/plain; charset=utf-8\r\ncache-control: no-store\r\n')"
+  expect fail "403 challenge page" eval_files_head "$(printf 'HTTP/2 403 \r\ncontent-type: text/html; charset=UTF-8\r\ncf-mitigated: challenge\r\nserver: cloudflare\r\n')"
+  expect fail "404 text/plain that carries the challenge marker" eval_files_head "$(printf 'HTTP/2 404 \r\ncontent-type: text/plain\r\nCF-Mitigated: challenge\r\n')"
+  expect fail "a body with no status line" eval_files_head "content-type: text/plain"
   expect fail "200 SPA shell" eval_files_head "$(printf 'HTTP/2 200 \r\ncontent-type: text/html\r\n')"
   expect fail "404 as HTML" eval_files_head "$(printf 'HTTP/2 404 \r\ncontent-type: text/html\r\n')"
   expect fail "404 with a cookie" eval_files_head "$(printf 'HTTP/2 404 \r\ncontent-type: text/plain\r\nSet-Cookie: a=b\r\n')"
@@ -602,6 +932,111 @@ cmd_self_test() {
   expect fail "a live commit that is not in the checkout" live_base "$sha_a"
   repo_root="$saved_root"
 
+  echo "files-host (the whole check, against a stub server on 127.0.0.1; exit code AND verdict):"
+  need node curl
+  local stub_pid="" base dead planted="hfsecretTOKEN0123456789abcdefXYZ"
+  cat >"$tmp/stub.js" <<'STUB'
+const http = require("node:http");
+const fs = require("node:fs");
+const worker = { "content-security-policy": "sandbox; default-src 'none'", "x-robots-tag": "noindex", "cache-control": "private, no-store" };
+const edge = { server: "cloudflare", "cf-ray": "8f00000000000000-IAD" };
+const token = process.argv[3];
+const routes = {
+  "/ok": [404, { "content-type": "text/plain; charset=utf-8", ...worker, ...edge }, "Not found"],
+  "/spa": [200, { "content-type": "text/html; charset=utf-8", ...edge }, "<!doctype html><title>Holdfast</title><div id=root></div>"],
+  "/html404": [404, { "content-type": "text/html", ...edge }, "<h1>Not found</h1>"],
+  "/cookie": [404, { "content-type": "text/plain", "set-cookie": `session=${token}; Path=/`, ...worker, ...edge }, "Not found"],
+  "/worker403": [403, { "content-type": "application/json", ...worker, ...edge }, '{"error":"invalid_token"}'],
+  "/redirect": [301, { location: `https://holdfast-dev.ponderance.dev/?next=${token}`, ...edge }, ""],
+  "/block": [403, { "content-type": "text/html", ...edge }, "<title>Attention Required! | Cloudflare</title>"],
+  "/challenge": [403, { "content-type": "text/html; charset=UTF-8", "cf-mitigated": "challenge", "set-cookie": `__cf_bm=${token}; path=/`, ...edge },
+    `<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=${token}"></script>`],
+  "/challenge404": [404, { "content-type": "text/plain", "cf-mitigated": "challenge", ...edge }, "Not found"],
+  "/leak": [200, { "content-type": "text/plain", ...edge }, `token=${token} Bearer ${token}\u0000\u0007 https://x.example/dl?sig=${token.slice(0, 12)}`],
+  "/binary": [200, { "content-type": "application/octet-stream", ...edge }, `${token}`],
+};
+const server = http.createServer((req, res) => {
+  const r = routes[req.url];
+  if (!r) return req.socket.destroy();
+  res.writeHead(r[0], r[1]);
+  res.end(r[2]);
+});
+// A port nobody listens on: bound once, then closed.
+const spare = http.createServer();
+spare.listen(0, "127.0.0.1", () => {
+  const dead = spare.address().port;
+  spare.close(() => server.listen(0, "127.0.0.1", () => fs.writeFileSync(process.argv[2], `${server.address().port} ${dead}\n`)));
+});
+STUB
+  node "$tmp/stub.js" "$tmp/ports" "$planted" >/dev/null 2>&1 &
+  stub_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill $stub_pid 2>/dev/null; rm -rf '$tmp'" EXIT
+  local waited=0
+  while [ ! -s "$tmp/ports" ] && [ "$waited" -lt 100 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # No stub = nothing was tested = a failure of the self-test, never a skip.
+  [ -s "$tmp/ports" ] || fail "self-test: the files-host stub server did not start"
+  base="http://127.0.0.1:$(cut -d' ' -f1 "$tmp/ports")"
+  dead="http://127.0.0.1:$(cut -d' ' -f2 "$tmp/ports" | tr -d '\n')"
+
+  expect_rc() { # <exit code> <text the output must contain> <label> <command...>
+    local want="$1" needle="$2" label="$3" rc=0
+    shift 3
+    ("$@") >"$tmp/out" 2>&1 || rc=$?
+    if [ "$rc" = "$want" ] && grep -qF -- "$needle" "$tmp/out" && ! grep -qF -- "$planted" "$tmp/out"; then
+      echo "  ok    $label → exit $rc, $needle"
+    else
+      echo "  WRONG $label → exit $rc, expected exit $want with '$needle' and no planted token in the output"
+      sed 's/^/        /' "$tmp/out"
+      failures=$((failures + 1))
+    fi
+  }
+  expect_rc 0 "files-host: PASS" "the Worker's bare 404" cmd_files_host "$base/ok" 1 0
+  expect_rc 10 "WORKER-MISCONFIGURED" "200 SPA shell" cmd_files_host "$base/spa" 1 0
+  expect_rc 10 "WORKER-MISCONFIGURED" "404 as HTML" cmd_files_host "$base/html404" 1 0
+  expect_rc 10 "the response sets a cookie" "404 with a cookie (value not printed)" cmd_files_host "$base/cookie" 1 0
+  expect_rc 10 "WORKER-MISCONFIGURED" "the Worker's own 403" cmd_files_host "$base/worker403" 1 0
+  expect_rc 10 "status '301'" "a redirect (not followed)" cmd_files_host "$base/redirect" 1 0
+  expect_rc 10 "WORKER-MISCONFIGURED" "403 HTML with NO challenge marker (ambiguous → the dangerous verdict)" cmd_files_host "$base/block" 1 0
+  expect_rc 11 "EDGE-CHALLENGE" "403 challenge page (cf-mitigated: challenge)" cmd_files_host "$base/challenge" 1 0
+  expect_rc 11 "Bot Fight Mode" "the challenge verdict names the dashboard setting" cmd_files_host "$base/challenge" 1 0
+  expect_rc 11 "Just a moment..." "the challenge page's title is shown" cmd_files_host "$base/challenge" 1 0
+  expect_rc 11 "EDGE-CHALLENGE" "a 404 text/plain with the challenge marker is not a pass" cmd_files_host "$base/challenge404" 1 0
+  expect_rc 10 "<redacted>" "a token in the body is redacted" cmd_files_host "$base/leak" 1 0
+  expect_rc 10 "not a text content-type, not shown" "a binary body is not printed" cmd_files_host "$base/binary" 1 0
+  expect_rc 12 "UNREACHABLE" "nothing listening" cmd_files_host "$dead/" 2 0
+  expect_rc 12 "UNREACHABLE" "the connection is dropped without an answer" cmd_files_host "$base/no-such-route" 1 0
+  # The control for expect_rc itself: the planted token must be detectable when it IS printed.
+  leak_control() { echo "files-host: PASS $planted"; }
+  if ("leak_control") >"$tmp/out" 2>&1 && grep -qF -- "$planted" "$tmp/out"; then echo "  ok    control: a printed token is detected"; else
+    echo "  WRONG control: the planted token was not detected"
+    failures=$((failures + 1))
+  fi
+  kill "$stub_pid" 2>/dev/null || true
+
+  echo "utc-zone (the verdict on the query's rows):"
+  utc_rows() { printf '%s\n' "$@" >"$tmp/utc.rows" && eval_utc_zone "$tmp/utc.rows"; }
+  expect pass "Etc/UTC from the server configuration" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast"
+  expect pass "GMT, set on the database" utc_rows "session:database|GMT|0|0|neondb" "setting:database|GMT|0|0|neondb"
+  expect fail "America/Chicago" utc_rows "session:database|America/Chicago|-21600|-18000|holdfast"
+  expect fail "Europe/London (UTC in January only)" utc_rows "session:database|Europe/London|0|3600|holdfast"
+  expect fail "a zone that is UTC in July only" utc_rows "session:configuration file|Atlantic/Azores|-3600|0|holdfast"
+  expect fail "UTC session, but another role is pinned to Tokyo" utc_rows "session:configuration file|Etc/UTC|0|0|holdfast" "setting:role-in-database|Asia/Tokyo|32400|32400|holdfast"
+  expect fail "the connection set its own zone (PGOPTIONS / options=)" utc_rows "session:client|UTC|0|0|holdfast"
+  expect fail "no session row" utc_rows "setting:database|UTC|0|0|holdfast"
+  expect fail "an error instead of rows" utc_rows 'psql: error: connection to server failed'
+  expect fail "offsets missing" utc_rows "session:database|UTC|||holdfast"
+  : >"$tmp/utc.empty"
+  expect fail "empty output" eval_utc_zone "$tmp/utc.empty"
+  expect fail "no output file" eval_utc_zone "$tmp/utc.absent"
+  scrubs() { [ "$(scrub_connection 'connection to server at "ep-x.neon.tech" (203.0.113.7), port 5432 failed: password authentication failed for user "owner_a" pw=hunter2secret' 'postgresql://owner_a:hunter2secret@ep-x.neon.tech:5432/neondb?sslmode=require')" = 'connection to server at "<host>" (<address>), port 5432 failed: password authentication failed for user "<user>" pw=<password>' ]; }
+  expect pass "host, user and password are taken out of a psql error" scrubs
+  expect fail "no DATABASE_URL_DIRECT → not checked" env -u DATABASE_URL_DIRECT bash "${BASH_SOURCE[0]}" utc-zone
+  expect fail "DATABASE_URL_DIRECT that is not a postgres URL → not checked" env DATABASE_URL_DIRECT=mysql://localhost/x bash "${BASH_SOURCE[0]}" utc-zone
+
   echo "redaction:"
   redacts() { [ "$(printf 'error connecting to postgresql://user:pw@ep-x.neon.tech/neondb?sslmode=require now\n' | redact)" = "error connecting to <database-url> now" ]; }
   expect pass "a database URL in tool output is replaced" redacts
@@ -623,10 +1058,12 @@ case "$command" in
   live-migration-rule) cmd_live_migration_rule "$@" ;;
   worker-ready) cmd_worker_ready "$@" ;;
   secrets) cmd_secrets "$@" ;;
+  utc-zone) cmd_utc_zone "$@" ;;
   migrate) cmd_migrate "$@" ;;
+  utc-zone-self-test) cmd_utc_zone_self_test "$@" ;;
   self-test) cmd_self_test "$@" ;;
   *)
-    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
     ;;
 esac
