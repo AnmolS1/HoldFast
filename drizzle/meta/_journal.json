@@ -22,6 +22,13 @@
       "when": 1791519118827,
       "tag": "0002_purge_attempted_at",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791573197119,
+      "tag": "0003_session_second_factor_account_unique",
+      "breakpoints": true
     }
   ]
 }

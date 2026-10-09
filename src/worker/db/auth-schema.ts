@@ -61,6 +61,7 @@ export const session = pgTable(
     impersonatedBy: text("impersonated_by"),
     country: text("country"),
     uaFamily: text("ua_family"),
+    secondFactorAt: timestamp("second_factor_at"),
   },
   (table) => [index("session_userId_idx").on(table.userId)],
 );

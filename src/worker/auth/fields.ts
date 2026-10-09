@@ -46,4 +46,11 @@ export const userAdditionalFields = {
 export const sessionAdditionalFields = {
   country: { type: "string", required: false, input: false },
   uaFamily: { type: "string", required: false, input: false },
+  // When THIS session passed a second factor — a TOTP or backup code (at sign-in, at enrolment
+  // or as a step-up on the session), or a passkey assertion with user verification. Null for a
+  // session that Google, a passkey without user verification, a trusted device or a mailed link
+  // created. "An admin has two-factor" is a property of the session, not of the account
+  // (middleware/guards.ts, auth/admin-gate.ts). `input: false`: no request body can set it
+  // (Better Auth's /update-session takes only input fields) — only auth/second-factor.ts does.
+  secondFactorAt: { type: "date", required: false, input: false },
 } as const;
