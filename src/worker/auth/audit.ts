@@ -38,7 +38,7 @@ import {
 import { db, defer, deps, type AppEnv } from "../services/request-context";
 import { count, record as auditRow } from "./observe";
 import { responseCode } from "./redact";
-import type { AuthScope } from "./scope";
+import { afterAnswer, type AuthScope } from "./scope";
 import { sessionCookieName } from "./signed-cookie";
 
 /** How a completed sign-in is named, by the endpoint that completed it. */
@@ -150,6 +150,8 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
   const redirectedWithError = status >= 300 && status < 400 && code !== null;
   const ok = status < 400 && !redirectedWithError;
 
+  // (Mail is started only once the request has been answered — `afterAnswer`: a notice consults
+  // the mail ledger, and those round trips must not sit beside the request's own. auth/parity.ts.)
   // ── a session was started ────────────────────────────────────────────────────────────────
   const started = facts.newSessions.filter((s) => !s.impersonatedBy).at(-1);
   if (ok && started && started.userId !== before?.id && setsSessionCookie(response, c.env)) {
@@ -175,13 +177,15 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       if (account) {
         defer(
           c,
-          sendNewDeviceSignIn(deps(c), {
-            to: account.email,
-            name: account.name,
-            country: started.country,
-            uaFamily: started.uaFamily,
-            at: now(c),
-          }),
+          afterAnswer(scope, () =>
+            sendNewDeviceSignIn(deps(c), {
+              to: account.email,
+              name: account.name,
+              country: started.country,
+              uaFamily: started.uaFamily,
+              at: now(c),
+            }),
+          ),
         );
       }
     }
@@ -210,7 +214,10 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       case "/change-password":
         if (before && account) {
           auditRow(c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
-          defer(c, sendPasswordChanged(deps(c), account));
+          defer(
+            c,
+            afterAnswer(scope, () => sendPasswordChanged(deps(c), account)),
+          );
         }
         break;
       case "/reset-password":
@@ -224,32 +231,48 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
             { actorUserId: id, actorType: "user" },
           );
           const owner = await getAccount(db(c), id);
-          if (owner) defer(c, sendPasswordChanged(deps(c), { to: owner.email, name: owner.name }));
+          if (owner)
+            defer(
+              c,
+              afterAnswer(scope, () => sendPasswordChanged(deps(c), { to: owner.email, name: owner.name })),
+            );
         }
         break;
       case "/two-factor/verify-totp":
         // With a session and two-factor not yet on, a correct code is what switches it on.
         if (before && account && before.twoFactorEnabled !== true) {
           auditRow(c, "auth.2fa_enabled", userTarget(before.id), null, self);
-          defer(c, sendTwoFactorEnabled(deps(c), account));
+          defer(
+            c,
+            afterAnswer(scope, () => sendTwoFactorEnabled(deps(c), account)),
+          );
         }
         break;
       case "/two-factor/disable":
         if (before && account) {
           auditRow(c, "auth.2fa_disabled", userTarget(before.id), null, self);
-          defer(c, sendTwoFactorDisabled(deps(c), account));
+          defer(
+            c,
+            afterAnswer(scope, () => sendTwoFactorDisabled(deps(c), account)),
+          );
         }
         break;
       case "/passkey/verify-registration":
         if (before && account) {
           auditRow(c, "auth.passkey_added", userTarget(before.id), null, self);
-          defer(c, sendPasskeyAdded(deps(c), account));
+          defer(
+            c,
+            afterAnswer(scope, () => sendPasskeyAdded(deps(c), account)),
+          );
         }
         break;
       case "/passkey/delete-passkey":
         if (before && account) {
           auditRow(c, "auth.passkey_removed", userTarget(before.id), null, self);
-          defer(c, sendPasskeyRemoved(deps(c), account));
+          defer(
+            c,
+            afterAnswer(scope, () => sendPasskeyRemoved(deps(c), account)),
+          );
         }
         break;
     }

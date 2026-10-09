@@ -61,7 +61,13 @@ export async function afterChangeEmail(
       session?: { user: { id: string; email: string; name: string; emailVerified: boolean } } | null;
     };
   },
-  send: (mail: { to: string; name: string; newEmail: string; url: string }) => Promise<unknown>,
+  send: (mail: {
+    to: string;
+    name: string;
+    newEmail: string;
+    url: string;
+    by: { user: string };
+  }) => Promise<unknown>,
 ): Promise<void> {
   if (ctx.context.returned instanceof Error) return;
   const user = ctx.context.session?.user;
@@ -81,7 +87,7 @@ export async function afterChangeEmail(
   );
   const callback = typeof body.callbackURL === "string" ? body.callbackURL : "/";
   const url = `${ctx.context.baseURL}/verify-email?token=${token}&callbackURL=${encodeURIComponent(callback)}`;
-  await send({ to: user.email, name: user.name, newEmail, url });
+  await send({ to: user.email, name: user.name, newEmail, url, by: { user: user.id } });
 }
 
 /** The screen that takes the token (src/client/routes/auth/Password.tsx). */

@@ -6,7 +6,8 @@ import { describe, expect, it } from "vitest";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
 import { emailLedger } from "../../../src/worker/db/schema";
 import {
-  clean,
+  LABEL_MAX,
+  safeLabel,
   EMAIL_CAPS,
   emailClassOf,
   escapeHtml,
@@ -34,6 +35,7 @@ import emailSource from "../../../src/worker/services/email.ts?raw";
 import {
   auditRows,
   freshEmail,
+  freshIp,
   getSession,
   linkIn,
   mailTo,
@@ -50,6 +52,9 @@ import {
   verifiedUser,
   waitForMail,
 } from "./helpers";
+
+/** A client address of its own: the per-client count is not what these tests are about. */
+const anyone = () => ({ client: freshIp() });
 
 const RTLO = "\u202e";
 const HOSTILE = [
@@ -125,14 +130,16 @@ function draftsWith(value: string) {
     adminDigest: templates.adminDigest({ lines: [{ label: value, value }], adminUrl: `${APP}/admin` }),
     adminAlert: templates.adminAlert({
       kind: "report",
-      reportId: value,
+      id: value,
       category: value,
       adminUrl: `${APP}/admin`,
     }),
-    adminAlertCsam: templates.adminAlert({
-      kind: "csam_lock",
-      reportId: value,
-      category: value,
+    operatorCritical: templates.operatorCritical({ event: "csam_lock", id: value, adminUrl: `${APP}/admin` }),
+    operatorDigest: templates.operatorDigest({
+      items: [
+        { kind: value, id: value },
+        { kind: "quarantine", id: value },
+      ],
       adminUrl: `${APP}/admin`,
     }),
     reportReviewed: templates.reportReviewed(),
@@ -143,6 +150,7 @@ function draftsWith(value: string) {
       counterNoticeUrl: `${APP}/dmca`,
     }),
     contentRestored: templates.contentRestored({ name: value, itemName: value }),
+    securityDigest: templates.securityDigest({ name: value, accountUrl: `${APP}/account` }),
   };
 }
 
@@ -172,6 +180,14 @@ describe("templates", () => {
         "passkeyRemoved",
         "newDeviceSignIn",
         "accountSuspended",
+        // Not in the plan's list: what goes out INSTEAD of further single security notices once
+        // an hour's worth has been sent — a notice is coalesced, never dropped silently.
+        "securityDigest",
+        // Not in the plan's list: the operator's CRITICAL alert (a suspected-CSAM lock, a legal
+        // hold, a kill switch …) — a template of its own, so that it can never share a count or a
+        // digest with anything else; and the digest that lists routine alerts held back.
+        "operatorCritical",
+        "operatorDigest",
         "shareInvitation",
         "quarantineNotice",
         "uploadNotIntact",
@@ -237,27 +253,28 @@ describe("templates", () => {
 
   it("escapes and cleans the way the tests above rely on", () => {
     expect(escapeHtml(`<a href="x">&'</a>`)).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;");
-    expect(clean("a\r\nb\tc")).toBe("a b c");
-    expect(clean(`x${RTLO}y`)).toBe("x y");
-    expect(clean("x".repeat(500)).length).toBe(200);
-    expect(clean(null)).toBe("");
-    expect(clean(42)).toBe("42");
+    expect(safeLabel("a\r\nb\tc")).toBe("a b c");
+    expect(safeLabel(`x${RTLO}y`)).toBe("x y");
+    expect(Array.from(safeLabel("x".repeat(500))).length).toBe(LABEL_MAX);
+    expect(safeLabel("x".repeat(500), 200).length).toBe(200);
+    expect(safeLabel(null)).toBe("");
+    expect(safeLabel(42)).toBe("42");
   });
 
   it("the admin alert carries the report id and category — it has no field for a file name", () => {
     const alert = render(
       renderEnv,
       templates.adminAlert({
-        kind: "csam_lock",
-        reportId: "rep_123",
-        category: "csam",
+        kind: "report",
+        id: "rep_123",
+        category: "copyright",
         adminUrl: `${APP}/admin`,
       }),
     );
     expect(alert.text).toContain("rep_123");
-    expect(alert.text).toContain("category csam");
+    expect(alert.text).toContain("category copyright");
     expect(alert.text).not.toMatch(/\.(jpg|png|pdf|zip)/i);
-    expect(emailClassOf("adminAlert")).toBe("security");
+    expect(emailClassOf("adminAlert")).toBe("operator_alert");
   });
 
   it("the copyright notice quotes the notice and gives the counter-notice instructions", () => {
@@ -266,11 +283,12 @@ describe("templates", () => {
       templates.contentRemovedCopyright({
         name: "Ana",
         itemName: "song.mp3",
-        noticeText: "I own this.\nRemove it.",
+        noticeText: "I own this.\nRemove it. See evil.example/claim",
         counterNoticeUrl: `${APP}/dmca`,
       }),
     );
-    expect(message.text).toContain("> I own this.\n> Remove it.");
+    // Quoted line for line, sentences intact — and nothing in it that a mail client would link.
+    expect(message.text).toContain("> I own this.\n> Remove it. See evil·example claim");
     expect(message.text).toContain("counter-notice");
     expect(message.text).toContain(`${APP}/dmca`);
   });
@@ -295,7 +313,7 @@ describe("templates", () => {
       "http://localhost",
       "http://localhost/a b",
     ]) {
-      expect(await sendVerification(deps, { to, name: "Ana", url }), url).toBe("failed");
+      expect(await sendVerification(deps, { to, url, by: anyone() }), url).toBe("failed");
     }
     await settle();
     expect(mailTo(to)).toEqual([]);
@@ -319,47 +337,51 @@ describe("templates", () => {
 });
 
 describe("caps", () => {
-  it("the 6th auth-class mail to one recipient in an hour is skipped; a security notice still goes", async () => {
+  it("per recipient: the 6th mail of a kind in an hour is skipped — and each class of mail has a count of its own", async () => {
     const { deps } = serviceDeps();
     const to = freshEmail();
     const url = `${APP}/api/auth/verify-email?token=t`;
     for (let i = 1; i <= EMAIL_CAPS.perHour; i++) {
-      expect(await sendVerification(deps, { to, name: "Ana", url }), `mail ${i}`).toBe("sent");
+      expect(await sendVerification(deps, { to, url, by: anyone() }), `mail ${i}`).toBe("sent");
     }
-    expect(await sendVerification(deps, { to, name: "Ana", url })).toBe("capped");
-    // What a stranger can cause shares that cap — another such template, and product mail.
-    expect(await sendSignupAttempt(deps, { to, name: "Ana" })).toBe("capped");
-    expect(await sendQuarantineNotice(deps, { to, name: "Ana", fileName: "a.exe" })).toBe("capped");
+    expect(await sendVerification(deps, { to, url, by: anyone() })).toBe("capped");
+    // The other mail a stranger can cause about a sign-up shares that count.
+    expect(await sendSignupAttempt(deps, { to, by: anyone() })).toBe("capped");
     expect(mailTo(to)).toHaveLength(5);
-    // S8 — it does NOT stop the owner's own mail: the reset link has a cap of its own …
+    // S8 — it does NOT stop the owner's own mail: the reset link is counted apart …
     const resetUrl = `${APP}/api/auth/reset-password/t`;
     for (let i = 1; i <= EMAIL_CAPS.perHour; i++) {
-      expect(await sendPasswordReset(deps, { to, name: "Ana", url: resetUrl }), `reset ${i}`).toBe("sent");
+      expect(await sendPasswordReset(deps, { to, url: resetUrl, by: anyone() }), `reset ${i}`).toBe("sent");
     }
-    expect(await sendPasswordReset(deps, { to, name: "Ana", url: resetUrl })).toBe("capped");
-    // … and so has mail that only a signed-in session of the account can cause — five of those,
-    // of whichever kind, with both other caps already used up.
+    expect(await sendPasswordReset(deps, { to, url: resetUrl, by: anyone() })).toBe("capped");
+    // … and so is mail that only a signed-in session of the account can cause — five of those,
+    // of whichever kind, with both other counts already used up.
     const confirmUrl = `${APP}/api/auth/verify-email?token=c`;
     const deleteUrl = `${APP}/api/auth/delete-user/callback?token=d`;
-    expect(
-      await sendChangeEmailConfirmation(deps, { to, name: "Ana", newEmail: "n@x.example", url: confirmUrl }),
-    ).toBe("sent");
-    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
-    expect(await sendNewAddressVerification(deps, { to, name: "Ana", url: confirmUrl })).toBe("sent");
-    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
-    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("sent");
-    expect(await sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl })).toBe("capped");
-    expect(
-      await sendChangeEmailConfirmation(deps, { to, name: "Ana", newEmail: "n@x.example", url: confirmUrl }),
-    ).toBe("capped");
+    const by = { user: crypto.randomUUID() };
+    const change = () =>
+      sendChangeEmailConfirmation(deps, { to, name: "Ana", newEmail: "n@x.example", url: confirmUrl, by });
+    const confirmDelete = () => sendDeleteAccountVerification(deps, { to, name: "Ana", url: deleteUrl, by });
+    expect(await change()).toBe("sent");
+    expect(await confirmDelete()).toBe("sent");
+    expect(await sendNewAddressVerification(deps, { to, url: confirmUrl, by })).toBe("sent");
+    expect(await confirmDelete()).toBe("sent");
+    expect(await confirmDelete()).toBe("sent");
+    expect(await confirmDelete()).toBe("capped");
+    expect(await change()).toBe("capped");
     expect(mailTo(to)).toHaveLength(15);
-    // Security notices are never dropped — and do not count against the cap either.
+    // Product mail: its own five.
+    for (let i = 1; i <= EMAIL_CAPS.perHour; i++) {
+      expect(await sendQuarantineNotice(deps, { to, name: "Ana", fileName: "a.exe" })).toBe("sent");
+    }
+    expect(await sendQuarantineNotice(deps, { to, name: "Ana", fileName: "a.exe" })).toBe("capped");
+    // Security notices are not touched by any of it.
     expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("sent");
     expect(await sendAccountSuspended(deps, { to, name: "Ana" })).toBe("sent");
-    expect(await sendAdminAlert(deps, { to, kind: "report", reportId: "r1", category: "spam" })).toBe("sent");
-    expect(mailTo(to)).toHaveLength(18);
+    expect(await sendAdminAlert(deps, { to, kind: "report", id: "r1", category: "spam" })).toBe("sent");
+    expect(mailTo(to)).toHaveLength(23);
     // Another recipient is not affected.
-    expect(await sendVerification(deps, { to: freshEmail(), name: "Bo", url })).toBe("sent");
+    expect(await sendVerification(deps, { to: freshEmail(), url, by: anyone() })).toBe("sent");
   });
 
   it("the daily cap is 50, counted per recipient under a keyed hash (never the address)", async () => {
@@ -379,6 +401,7 @@ describe("caps", () => {
         itemName: "Plans",
         role: "viewer",
         hasAccount: true,
+        senderId: crypto.randomUUID(),
       }),
     ).toBe("capped");
     expect(mailTo(to)).toEqual([]);
@@ -451,7 +474,9 @@ describe("changing the address of a verified account", () => {
     expect(asked.status, asked.text).toBe(200);
     // Step 1: only the current address hears about it.
     const confirm = await waitForMail(email, "changeEmailConfirmation");
-    expect(confirm.text).toContain(newEmail);
+    // The new address is shown as a label, not as something a mail client would link.
+    expect(confirm.text).toContain(safeLabel(newEmail, 254));
+    expect(confirm.text).not.toContain(newEmail);
     expect(mailTo(newEmail)).toEqual([]);
     expect((await userById(row.id))!.email).toBe(email);
 

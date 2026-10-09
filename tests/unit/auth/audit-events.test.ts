@@ -234,7 +234,7 @@ describe("the new-device notice", () => {
     expect(notices).toHaveLength(1);
     expect(notices[0]!.text).toContain("Firefox on Windows");
     expect(notices[0]!.text).not.toContain(elsewhere.ip);
-    expect(notices[0]!.class).toBe("security");
+    expect(notices[0]!.class).toBe("account_security");
 
     // That browser is now known; the same one from another country is new again.
     await send(elsewhere, "/api/auth/sign-out", { json: {} });

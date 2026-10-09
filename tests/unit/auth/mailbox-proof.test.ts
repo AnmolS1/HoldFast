@@ -16,6 +16,7 @@
 //                                                     person is sent to "set your password" with
 //                                                     a single-use token.
 // The admin role is never granted by the click itself — only by a sign-in after it.
+import { safeLabel } from "../../../src/worker/services/email";
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
@@ -376,9 +377,11 @@ describe("changing to an address: what the caller can and cannot learn (A7)", ()
     expect(forTaken.asked.status).toBe(forFree.asked.status);
     expect(forTaken.asked.body).toEqual(forFree.asked.body);
     expect(forTaken.mail.subject).toBe(forFree.mail.subject);
-    expect(forTaken.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(taken.email, "<new>")).toBe(
-      forFree.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(free, "<new>"),
-    );
+    // (The new address is shown as a label — services/email.ts `safeLabel` — not as typed.)
+    expect(
+      forTaken.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(safeLabel(taken.email, 254), "<new>"),
+    ).toBe(forFree.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(safeLabel(free, 254), "<new>"));
+    expect(forFree.mail.text).toContain(safeLabel(free, 254));
     expect(forTaken.confirmed.status).toBe(302);
     expect(forTaken.confirmed.headers.get("location")).toBe(forFree.confirmed.headers.get("location"));
     // What differs is invisible to the caller: the free address gets the second mail, the taken

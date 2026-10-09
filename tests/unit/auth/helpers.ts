@@ -36,7 +36,7 @@ import {
   shares,
   user,
 } from "../../../src/worker/db/schema";
-import { EMAIL_BUCKETS, ledgerKey, recipientHash } from "../../../src/worker/services/email";
+import { EMAIL_BUCKETS, ledgerKey } from "../../../src/worker/services/email";
 import * as outbox from "../../../src/worker/services/outbox";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 
@@ -388,12 +388,10 @@ export async function forgetMailCountOf(address: string): Promise<void> {
   await testDb()
     .delete(emailLedger)
     .where(
-      inArray(emailLedger.recipientHash, [
-        await recipientHash(env as unknown as Env, address),
-        ...(await Promise.all(
-          EMAIL_BUCKETS.map((bucket) => ledgerKey(env as unknown as Env, address, bucket)),
-        )),
-      ]),
+      inArray(
+        emailLedger.recipientHash,
+        await Promise.all(EMAIL_BUCKETS.map((bucket) => ledgerKey(env as unknown as Env, address, bucket))),
+      ),
     );
 }
 

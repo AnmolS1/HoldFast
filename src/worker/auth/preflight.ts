@@ -62,6 +62,9 @@ const email: Rule = (value) =>
   EMAIL.safeParse(value).success;
 const link = optional(text(1, 2048));
 
+const personName: Rule = (value) =>
+  text(1, 80)(value) && !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(value as string);
+
 type Spec = {
   fields: Record<string, Rule>;
   /** The Turnstile header must be present (it is VERIFIED later, by the plugin). */
@@ -76,7 +79,9 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
       email,
       // A password being chosen: the policy's own bounds.
       password: text(PASSWORD_MIN, PASSWORD_MAX),
-      name: text(1, 80),
+      // Defence in depth only — the rule that counts is applied where a name is USED
+      // (services/email.ts `safeLabel`): no control or format characters in a name.
+      name: personName,
       inviteCode: optional(text(1, 64)),
       // The age statement and the assent are judged by the sign-up policy (stage d), which
       // answers them in its own neutral words.
@@ -98,6 +103,7 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   },
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },
+  "/update-user": { fields: { name: optional(personName) } },
   "/reset-password": {
     captcha: true,
     fields: { newPassword: text(PASSWORD_MIN, PASSWORD_MAX), token: text(1, 128, /^[A-Za-z0-9_-]+$/) },

@@ -179,7 +179,9 @@ router.patch(
             // Sent once the request has been answered (auth/scope.ts `afterAnswer`).
             defer(
               c,
-              afterAnswer(scope, () => sendVerification(deps(c), { to: newEmail, name: account.name, url })),
+              afterAnswer(scope, () =>
+                sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip") } }),
+              ),
             );
             record(c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
               actorUserId: account.id,

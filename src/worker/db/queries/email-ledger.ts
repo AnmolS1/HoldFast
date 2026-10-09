@@ -47,3 +47,60 @@ export async function tryConsume(
     throw error;
   }
 }
+
+// ── operator alerts held for a digest (services/email.ts) ───────────────────────────────────
+//
+// A ROUTINE operator alert beyond the mailbox's hourly count is not sent on its own and is not
+// dropped: it is held here until the next digest lists it. The rows live in `verification`
+// (identifier `opalert:<ledger key of the mailbox>`, value = the alert as JSON — a kind, an id
+// and the operator's own address; never anything a user typed), expiring after a week.
+
+export type HeldAlert = { kind: string; id: string; to: string };
+const HELD_PREFIX = "opalert:";
+const HELD_DAYS = 7;
+
+export async function holdAlert(db: Executor, mailboxKey: string, alert: HeldAlert): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO verification (id, identifier, value, expires_at, created_at, updated_at)
+    VALUES (gen_random_uuid()::text, ${HELD_PREFIX + mailboxKey}, ${JSON.stringify(alert)},
+            (now() AT TIME ZONE 'UTC') + make_interval(days => ${HELD_DAYS}),
+            now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC')`);
+}
+
+/** Takes (removes and returns) up to `limit` held alerts of one mailbox, oldest first. */
+export async function takeHeldAlerts(db: Executor, mailboxKey: string, limit: number): Promise<HeldAlert[]> {
+  const result = await db.execute<{ value: string }>(sql`
+    DELETE FROM verification WHERE id IN (
+      SELECT id FROM verification WHERE identifier = ${HELD_PREFIX + mailboxKey}
+      ORDER BY created_at, id LIMIT ${limit} FOR UPDATE SKIP LOCKED)
+    RETURNING value`);
+  const alerts: HeldAlert[] = [];
+  for (const row of result.rows) {
+    try {
+      const parsed = JSON.parse(row.value) as Partial<HeldAlert>;
+      if (typeof parsed.kind === "string" && typeof parsed.id === "string" && typeof parsed.to === "string") {
+        alerts.push({ kind: parsed.kind, id: parsed.id, to: parsed.to });
+      }
+    } catch {
+      // Not one of ours.
+    }
+  }
+  return alerts;
+}
+
+/** One address per mailbox that has alerts waiting (for the hourly flush). */
+export async function heldAlertMailboxes(db: Executor, limit = 50): Promise<string[]> {
+  const result = await db.execute<{ value: string }>(sql`
+    SELECT DISTINCT ON (identifier) value FROM verification
+    WHERE identifier LIKE ${`${HELD_PREFIX}%`} ORDER BY identifier, created_at LIMIT ${limit}`);
+  const addresses: string[] = [];
+  for (const row of result.rows) {
+    try {
+      const to = (JSON.parse(row.value) as { to?: unknown }).to;
+      if (typeof to === "string") addresses.push(to);
+    } catch {
+      // Not one of ours.
+    }
+  }
+  return addresses;
+}

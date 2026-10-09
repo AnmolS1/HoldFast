@@ -7,20 +7,71 @@
 //
 // HOW A MESSAGE IS BUILT. A template is a list of plain-text blocks and link blocks. There is no
 // inline HTML anywhere in a template: the HTML part is produced by escaping every block as a
-// whole, so a name, a file name or any other value a person typed cannot become markup. Such
-// values also pass through `clean()` first (control and format characters — CR, LF, the
-// right-to-left override — removed, length capped). SUBJECTS ARE CONSTANTS: no user value ever
-// reaches a subject, so there is nothing to inject a header with. Every link is checked to start
-// with `APP_ORIGIN` (or to be one of the fixed estate pages below) before a message is built —
-// never a URL derived from a request's Host header.
+// whole, so no value can become markup.
 //
-// CLASSES AND CAPS (the counters live in `email_ledger`, because a Worker has no shared memory):
-//   auth      verification, reset, change-email, delete confirmation     5 an hour, 50 a day
-//   product   share invitation, quarantine, link paused, digest, …        per recipient
-//   security  password changed, 2FA, passkey, new device, suspended,      never dropped: sent
-//             deletion scheduled / cancelled, admin alert                 without the ledger
+// WHAT A PERSON TYPED IS A LABEL, NEVER A MESSAGE. Validation at the form is somewhere else; the
+// rule is applied HERE, where the value is used. Every interpolated value — a name, a file or
+// folder name, an address shown in a sentence, a report category, a line of a quoted notice —
+// passes through `safeLabel()`:
+//   - NFKC-normalised (full-width and other compatibility forms become the plain characters);
+//   - control and format characters removed (CR, LF, NUL, the bidirectional overrides and
+//     isolates, zero-width spaces and joiners, the line and paragraph separators);
+//   - white space collapsed;
+//   - NOTHING LINK-LIKE LEFT: a `.` (or `。`) inside a run of characters becomes `·`, `@` becomes
+//     ` at `, `/` and `\` become a space, and so does a `:` that something follows — so there
+//     is no `://`, no `www.`, no `label.tld`, no address, nothing a mail client turns into a
+//     link ("report.pdf" reads "report·pdf"; the full stop that ends a sentence stays);
+//   - capped: LABEL_MAX (80) characters by default, NAME_MAX (40) for a greeting.
+// The plain-text part is built from the same blocks, so the same rules hold for it.
+// SUBJECTS ARE CONSTANTS: no value ever reaches a subject. EVERY LINK is one this Worker built —
+// checked to start with `APP_ORIGIN` (or to be one of the fixed estate pages below) before a
+// message exists; never a URL from a request's Host, Origin or Referer, or from a body field.
+// MAIL A STRANGER CAN CAUSE to be sent to somebody else's address (the verification link, the
+// "someone tried to sign up" notice, the reset link, the new-address link) carries NO free text
+// from anyone: fixed copy and our own links, and no name.
+//
+// KINDS, CLASSES AND CAPS (`KINDS` below is the one table; the counters live in `email_ledger`):
+//   unauth_triggered     verification, sign-up attempt, reset link — anyone can cause these.
+//                        Per recipient 5 an hour / 50 a day (the reset link counted apart from
+//                        the other two), AND per triggering client address 10 an hour / 40 a day
+//                        across all recipients: the anti-mail-bomb limit.
+//   session_action       address-change confirmation, new-address link, deletion confirmation —
+//                        only a signed-in session causes these. Per recipient 5 / 50, and per
+//                        acting user 10 / 40.
+//   transactional_user   share invitation, quarantine, link paused, digest, … Per recipient
+//                        5 / 50, and per sending user 30 / 200 where a user sent it.
+//   account_security     password changed, 2FA, passkey, new device, suspended, deletion
+//                        scheduled / cancelled, admin alert. NEVER suppressed by any other
+//                        class: its own count, 20 an hour / 100 a day per recipient; beyond
+//                        that the notices of the hour are COALESCED into one digest mail
+//                        ("more security activity than we mail one by one") — never dropped
+//                        silently.
+//   operator_alert       mail to the operator about moderation and system safety — a class and a
+//                        count of ITS OWN (never the admin's `account_security` count for the
+//                        same mailbox), with a SEVERITY per template:
+//                          critical  a suspected-CSAM lock, a legal hold, a kill-switch change,
+//                                    an admin lock-out, the storage-budget switch, the scanner
+//                                    down. NEVER counted, capped, coalesced or dropped: it does
+//                                    not touch the ledger at all. A transport failure is retried
+//                                    in the request's deferred work and every failure is reported
+//                                    and counted (`metric("email", { outcome: "critical_failed" })`
+//                                    — what the T27 alarm pages on).
+//                          routine   an abuse report, a quarantine. 30 an hour / 200 a day; beyond
+//                                    that the alerts are held and go out as ONE specific digest an
+//                                    hour: the count per kind and the report / node IDS — ids only,
+//                                    never a file name, a reporter or anything typed — and the
+//                                    link to /admin. A critical alert can never be folded into it
+//                                    (the types say so, and `deliver` checks).
+//                        Operator mail carries no free text at all: ids, counts, fixed copy.
+//                        (Volume is limited where it starts — reports per reporter, address and
+//                        link, and their de-duplication: T22 — not here.)
+// A recipient is counted under its CANONICAL address (`canonicalRecipient`): lower case, NFKC,
+// plus-tag removed, and for Gmail the dots removed — spellings of one mailbox share one budget.
 // Over a cap the send is skipped and counted (`metric("email", { outcome: "capped" })`); the
 // caller gets "capped", never an error — nothing here tells a caller whether an address exists.
+// IF THE LEDGER CANNOT BE REACHED: every class but one fails CLOSED (nothing is sent);
+// `account_security` fails OPEN (the notice is sent and the failure reported) — an alert must
+// not depend on a counter.
 //
 // TRANSPORT. `EMAIL_TRANSPORT=memory` pushes to the in-memory outbox (services/outbox.ts; tests
 // read it at /api/_test/outbox). Anything else sends through Resend with `RESEND_API_KEY`; a
@@ -29,8 +80,9 @@
 // No `send*` function throws.
 
 import { Resend } from "resend";
-import { tryConsume } from "../db/queries/email-ledger";
+import { heldAlertMailboxes, holdAlert, takeHeldAlerts, tryConsume } from "../db/queries/email-ledger";
 import { countFor, reportError } from "../auth/observe";
+import { normalise as normaliseIp } from "./ip-hash";
 import { createKeys, hmacHex } from "./keys";
 import * as outbox from "./outbox";
 import type { ServiceDeps } from "./request-context";
@@ -48,10 +100,34 @@ export const ESTATE_LINKS = {
   help: "https://ponderance.dev/support/holdfast",
 } as const;
 
+type Caps = { perHour: number; perDay: number };
+/** Per recipient, for every class but `account_security`. */
 export const EMAIL_CAPS = { perHour: 5, perDay: 50 } as const;
+/** Per triggering client address (unauth_triggered) and per acting user (session_action). */
+export const ACTOR_CAPS = { perHour: 10, perDay: 40 } as const;
+/** Per sending user (transactional_user). */
+export const SENDER_CAPS = { perHour: 30, perDay: 200 } as const;
+/** Per recipient, security notices one by one; beyond it they are coalesced. */
+export const SECURITY_CAPS = { perHour: 20, perDay: 100 } as const;
+/** Per operator mailbox, routine alerts one by one; beyond it they are held for the digest. */
+export const OPERATOR_CAPS = { perHour: 30, perDay: 200 } as const;
+/** How often a failed CRITICAL alert is tried again in the deferred work, and the waits between. */
+export const CRITICAL_RETRY_WAITS_MS = [2_000, 6_000] as const;
+/** The coalesced notice itself: one an hour. */
+export const DIGEST_CAPS = { perHour: 1, perDay: 24 } as const;
 
-export type EmailClass = "auth" | "product" | "security";
-export type EmailOutcome = "sent" | "capped" | "failed";
+export type EmailClass =
+  "unauth_triggered" | "session_action" | "transactional_user" | "account_security" | "operator_alert";
+export type EmailSeverity = "critical" | "routine";
+/** `retrying`: a critical alert whose first send failed and is being tried again (deferred). */
+export type EmailOutcome = "sent" | "capped" | "coalesced" | "retrying" | "failed";
+
+/**
+ * Who caused a mail: the client address of an unauthenticated request, the user of a session, or
+ * the system itself (a job, a moderation action). `client: null` = an address was not known —
+ * counted under one shared key, so it is the tightest case, not a free one.
+ */
+export type EmailActor = { client: string | null } | { user: string } | { system: true };
 
 type Block = { text: string } | { link: { label: string; url: string } } | { quote: string };
 type Draft = { subject: string; heading: string; blocks: Block[] };
@@ -59,27 +135,50 @@ export type RenderedEmail = { subject: string; text: string; html: string };
 
 // ── sanitising ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * A value a person typed, made safe to place in a message: control characters (CR, LF, NUL …)
- * and format characters (the bidirectional overrides, zero-width joiners) removed, runs of
- * white space collapsed, and capped in length. NOT HTML-escaped — the renderer does that.
- */
-export function clean(value: unknown, max = 200): string {
-  const text = typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
-  const stripped = text
-    .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return stripped.length > max ? `${stripped.slice(0, max - 1)}…` : stripped;
+export const LABEL_MAX = 80;
+
+/** The character-level part of `safeLabel`, for one line. */
+function neutralise(text: string): string {
+  return (
+    text
+      .normalize("NFKC")
+      .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ")
+      // A dot or a colon INSIDE a run of characters (`evil.example`, `www.x`, `https:`, `mailto:x`);
+      // one that ends a sentence — followed by a space or by nothing — stays.
+      .replace(/[.\u3002](?=[^\s.\u3002])/gu, "·")
+      .replace(/:(?=\S)/g, " ")
+      .replace(/@/g, " at ")
+      .replace(/[/\\]/g, " ")
+  );
 }
 
-/** As `clean`, for a longer passage whose line breaks matter (a notice quoted in full). */
-function cleanMultiline(value: unknown, max = 8000): string {
+/**
+ * A value a person typed, as a LABEL that is safe to place in a message (see the header):
+ * normalised, without control or format characters, with nothing link-like left, white space
+ * collapsed, at most `max` characters. NOT HTML-escaped — the renderer does that.
+ */
+export function safeLabel(value: unknown, max = LABEL_MAX): string {
+  const text = typeof value === "string" ? value : value === null || value === undefined ? "" : String(value);
+  // (A cap before the work, too: nobody normalises a megabyte for a label.)
+  const stripped = neutralise(text.slice(0, max * 8))
+    .replace(/\s+/g, " ")
+    .trim();
+  const chars = Array.from(stripped);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : stripped;
+}
+
+/** As `safeLabel`, for a longer passage whose line breaks matter (a notice quoted in full). */
+function safeQuote(value: unknown, max = 8000): string {
   const text = typeof value === "string" ? value : "";
   const lines = text
+    .slice(0, max * 4)
     .replace(/\r\n?/g, "\n")
     .split("\n")
-    .map((line) => line.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, " ").trimEnd());
+    .map((line) =>
+      neutralise(line)
+        .replace(/[^\S\n]+/g, " ")
+        .trimEnd(),
+    );
   const joined = lines
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -97,17 +196,20 @@ export function escapeHtml(text: string): string {
 }
 
 // A name is something a person TYPED — at sign-up, before any address was proved theirs — and
-// the greeting is the first line of a mail from our own sender. So a name is used only when it
-// reads as one: letters, spaces, apostrophes and hyphens, at most NAME_MAX characters. No dot,
-// slash, colon, at-sign or digit: nothing a mail client turns into a link, and no room for a
-// sentence ("your account is locked, visit evil.example/x"). Anything else: "Hello,".
+// the greeting is the first line of a mail from our own sender. So beyond `safeLabel` a name is
+// greeted only when it reads as one: letters, spaces, apostrophes and hyphens, at most NAME_MAX
+// characters. No digit and no punctuation: no room for a sentence ("your account is locked,
+// visit …"). Anything else: "Hello,".
 const NAME_MAX = 40;
 const READS_AS_A_NAME = /^[\p{L}\p{M}][\p{L}\p{M} '’-]*$/u;
 export const greeting = (name: unknown) => {
-  const who = clean(name, 200);
-  return who.length <= NAME_MAX && READS_AS_A_NAME.test(who) ? `Hello ${who},` : "Hello,";
+  const who = safeLabel(name, 200);
+  return Array.from(who).length <= NAME_MAX && READS_AS_A_NAME.test(who) ? `Hello ${who},` : "Hello,";
 };
-/** For mail to an address that nobody has proved theirs yet: no name at all. */
+/**
+ * For mail a stranger can cause to be sent to somebody else's address, and mail to an address
+ * nobody has proved theirs: no name, nothing anyone typed.
+ */
 const GREETING_UNPROVEN = "Hello,";
 
 /** A link a message may carry: under APP_ORIGIN, or one of the fixed estate pages. */
@@ -176,6 +278,33 @@ export function render(env: Pick<Env, "APP_ORIGIN" | "SENTRY_ENVIRONMENT">, draf
   return { subject, text: textParts.join("\n\n"), html };
 }
 
+// ── operator alerts: fixed copy and ids ─────────────────────────────────────────────────────
+
+export type OperatorRoutineKind = "report" | "quarantine";
+const OPERATOR_ROUTINE: Record<OperatorRoutineKind, string> = {
+  report: "New abuse report",
+  quarantine: "A file was quarantined",
+};
+const OPERATOR_CRITICAL = {
+  csam_lock: "Content was locked as suspected CSAM and needs review now",
+  legal_hold: "A legal hold was placed or changed",
+  kill_switch: "A kill switch was changed",
+  admin_lockout: "An administrator account is locked out",
+  storage_budget: "The storage budget switch was triggered",
+  scanner_down: "The virus scanner is not answering",
+  unknown: "A critical event needs attention",
+} as const;
+export type OperatorCriticalEvent = Exclude<keyof typeof OPERATOR_CRITICAL, "unknown">;
+
+/** An id as an id: URL-safe characters only, at most 64 — anything else is "unknown". */
+export function safeId(value: unknown): string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value) ? value : "unknown";
+}
+/** A report category: a short lower-case word from the report form's list, or "other". */
+function safeCategory(value: unknown): string {
+  return typeof value === "string" && /^[a-z_]{1,32}$/.test(value) ? value.replace(/_/g, " ") : "other";
+}
+
 // ── templates ───────────────────────────────────────────────────────────────────────────────
 
 const IGNORE = "If this wasn't you, you can ignore this email.";
@@ -203,7 +332,7 @@ export const templates = {
     subject: "Someone tried to sign up with your email address",
     heading: "You already have a Holdfast account",
     blocks: [
-      { text: greeting(d.name) },
+      { text: GREETING_UNPROVEN },
       {
         text: "Someone tried to create a Holdfast account with this email address. It already has an account, so nothing was created and nothing about your account has changed.",
       },
@@ -229,7 +358,7 @@ export const templates = {
     subject: "Reset your password",
     heading: "Reset your password",
     blocks: [
-      { text: greeting(d.name) },
+      { text: GREETING_UNPROVEN },
       { text: "Someone asked to reset the password of your Holdfast account." },
       { link: { label: "Choose a new password", url: d.url } },
       { text: `The link works for one hour and only once. ${IGNORE} Your password stays as it is.` },
@@ -241,7 +370,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `Someone asked to change the email address of your Holdfast account to ${clean(d.newEmail, 254)}.`,
+        text: `Someone asked to change the email address of your Holdfast account to ${safeLabel(d.newEmail, 254)}.`,
       },
       { link: { label: "Confirm the change", url: d.url } },
       { text: `We will then send a second link to the new address. ${NOT_YOU}` },
@@ -365,7 +494,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `Your Holdfast account was signed in to from a browser or place we have not seen in the last 30 days: ${clean(d.uaFamily, 80) || "an unknown browser"}, ${clean(d.country, 8) || "unknown country"}, ${formatInstant(d.at)}.`,
+        text: `Your Holdfast account was signed in to from a browser or place we have not seen in the last 30 days: ${safeLabel(d.uaFamily, 80) || "an unknown browser"}, ${safeLabel(d.country, 8) || "unknown country"}, ${formatInstant(d.at)}.`,
       },
       { text: NOT_YOU },
     ],
@@ -393,7 +522,7 @@ export const templates = {
     heading: "Shared with you",
     blocks: [
       {
-        text: `${clean(d.sharerName, 80) || "Someone"} shared “${clean(d.itemName)}” with you on Holdfast. You can ${d.role === "editor" ? "view and add to" : "view"} it.`,
+        text: `${safeLabel(d.sharerName, 80) || "Someone"} shared “${safeLabel(d.itemName)}” with you on Holdfast. You can ${d.role === "editor" ? "view and add to" : "view"} it.`,
       },
       d.hasAccount
         ? { link: { label: "Open shared files", url: d.url } }
@@ -411,7 +540,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `The virus scan flagged “${clean(d.fileName)}”. The file is blocked: it cannot be downloaded, previewed or shared.`,
+        text: `The virus scan flagged “${safeLabel(d.fileName)}”. The file is blocked: it cannot be downloaded, previewed or shared.`,
       },
       {
         text: "You can delete it from your files. Repeated uploads of malicious files can suspend an account.",
@@ -424,7 +553,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `“${clean(d.fileName)}” does not match what your browser sent, so it has been blocked. This usually means the upload was interrupted.`,
+        text: `“${safeLabel(d.fileName)}” does not match what your browser sent, so it has been blocked. This usually means the upload was interrupted.`,
       },
       { text: "Please delete it and upload the file again." },
     ],
@@ -435,7 +564,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `The public link to “${clean(d.itemName)}” reached today's traffic limit and is paused. It becomes available again at midnight UTC.`,
+        text: `The public link to “${safeLabel(d.itemName)}” reached today's traffic limit and is paused. It becomes available again at midnight UTC.`,
       },
     ],
   }),
@@ -444,31 +573,72 @@ export const templates = {
     heading: "A public link is available again",
     blocks: [
       { text: greeting(d.name) },
-      { text: `The public link to “${clean(d.itemName)}” is available again.` },
+      { text: `The public link to “${safeLabel(d.itemName)}” is available again.` },
     ],
   }),
   adminDigest: (d: { lines: Array<{ label: unknown; value: unknown }>; adminUrl: string }): Draft => ({
     subject: "Holdfast admin digest",
     heading: "Admin digest",
     blocks: [
-      ...d.lines.slice(0, 40).map((line) => ({ text: `${clean(line.label, 80)}: ${clean(line.value, 80)}` })),
+      ...d.lines
+        .slice(0, 40)
+        .map((line) => ({ text: `${safeLabel(line.label, 80)}: ${safeLabel(line.value, 80)}` })),
       { link: { label: "Open the admin console", url: d.adminUrl } },
     ],
   }),
-  /** Carries the report id and category only — never a file name. */
+  /**
+   * ROUTINE operator alert: one report or one quarantined file. An id and a category from a fixed
+   * list — never a file name, never anything a reporter or an owner typed.
+   */
   adminAlert: (d: {
-    kind: "report" | "csam_lock";
-    reportId: unknown;
-    category: unknown;
+    kind: OperatorRoutineKind;
+    id: unknown;
+    category?: unknown;
     adminUrl: string;
   }): Draft => ({
-    subject: d.kind === "csam_lock" ? "Holdfast: content locked for review" : "Holdfast: new abuse report",
-    heading: d.kind === "csam_lock" ? "Content locked for review" : "New abuse report",
+    subject: "Holdfast: an item for review",
+    heading: OPERATOR_ROUTINE[d.kind] ?? OPERATOR_ROUTINE.report,
     blocks: [
-      { text: `Report ${clean(d.reportId, 64)} · category ${clean(d.category, 32)}.` },
+      {
+        text: `${d.kind === "quarantine" ? "Node" : "Report"} ${safeId(d.id)}${d.category === undefined ? "" : ` · category ${safeCategory(d.category)}`}.`,
+      },
       { link: { label: "Open the admin console", url: d.adminUrl } },
     ],
   }),
+  /**
+   * CRITICAL operator alert. Fixed copy per event and at most an id. Sent at once, every time:
+   * never counted, never coalesced (see the header).
+   */
+  operatorCritical: (d: { event: OperatorCriticalEvent; id?: unknown; adminUrl: string }): Draft => ({
+    subject: "Holdfast: CRITICAL — action needed",
+    heading: OPERATOR_CRITICAL[d.event] ?? OPERATOR_CRITICAL.unknown,
+    blocks: [
+      { text: `${OPERATOR_CRITICAL[d.event] ?? OPERATOR_CRITICAL.unknown}.` },
+      ...(d.id === undefined ? [] : [{ text: `Reference ${safeId(d.id)}.` }]),
+      { link: { label: "Open the admin console", url: d.adminUrl } },
+    ],
+  }),
+  /** The routine alerts that were held back, all of them: a count per kind and the ids. */
+  operatorDigest: (d: { items: Array<{ kind: unknown; id: unknown }>; adminUrl: string }): Draft => {
+    const byKind = new Map<OperatorRoutineKind, string[]>();
+    for (const item of d.items) {
+      const kind: OperatorRoutineKind = item.kind === "quarantine" ? "quarantine" : "report";
+      byKind.set(kind, [...(byKind.get(kind) ?? []), safeId(item.id)]);
+    }
+    return {
+      subject: "Holdfast: items for review (digest)",
+      heading: "Items waiting for review",
+      blocks: [
+        {
+          text: `${d.items.length} alert${d.items.length === 1 ? "" : "s"} arrived faster than they are mailed one by one. None of them was dropped: every one is listed here.`,
+        },
+        ...[...byKind].map(([kind, ids]) => ({
+          text: `${OPERATOR_ROUTINE[kind]} — ${ids.length}: ${ids.join(", ")}`,
+        })),
+        { link: { label: "Open the admin console", url: d.adminUrl } },
+      ],
+    };
+  },
   /** To a reporter who left an address. Says only that the report was reviewed. */
   reportReviewed: (): Draft => ({
     subject: "Your report was reviewed",
@@ -489,9 +659,9 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `We received a copyright notice about “${clean(d.itemName)}” and have removed access to it. The notice is quoted below.`,
+        text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice is quoted below.`,
       },
-      { quote: cleanMultiline(d.noticeText) },
+      { quote: safeQuote(d.noticeText) },
       {
         text: "If you believe the content was removed by mistake or misidentification, you can send a counter-notice. It must identify the content, state under penalty of perjury that you believe in good faith it was removed by mistake, give your name, address and telephone number, consent to the jurisdiction of the federal court for your address, and be signed.",
       },
@@ -501,43 +671,89 @@ export const templates = {
   contentRestored: (d: { name?: unknown; itemName: unknown }): Draft => ({
     subject: "Your content has been restored",
     heading: "Content restored",
-    blocks: [{ text: greeting(d.name) }, { text: `Access to “${clean(d.itemName)}” has been restored.` }],
+    blocks: [{ text: greeting(d.name) }, { text: `Access to “${safeLabel(d.itemName)}” has been restored.` }],
+  }),
+  /** Sent INSTEAD of further single notices once an hour's worth has gone out (see the header). */
+  securityDigest: (d: { name?: unknown; accountUrl: string }): Draft => ({
+    subject: "More security activity on your account",
+    heading: "More security activity on your account",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: "There has been more security activity on your Holdfast account in the last hour than we send separate emails for. This one message stands for the rest of this hour's notices.",
+      },
+      { link: { label: "Review your account", url: d.accountUrl } },
+      { text: NOT_YOU },
+    ],
   }),
 } as const;
 
 export type TemplateName = keyof typeof templates;
 
-const CLASS_OF: Record<TemplateName, EmailClass> = {
-  verification: "auth",
-  signupAttempt: "auth",
-  newAddressVerification: "auth",
-  passwordReset: "auth",
-  changeEmailConfirmation: "auth",
-  deleteAccountVerification: "auth",
-  deletionScheduled: "security",
-  deletionCancelled: "security",
-  passwordChanged: "security",
-  twoFactorEnabled: "security",
-  twoFactorDisabled: "security",
-  secondFactorLocked: "security",
-  passkeyAdded: "security",
-  signInMethodAdded: "security",
-  passkeyRemoved: "security",
-  newDeviceSignIn: "security",
-  accountSuspended: "security",
-  adminAlert: "security",
-  shareInvitation: "product",
-  quarantineNotice: "product",
-  uploadNotIntact: "product",
-  linkPaused: "product",
-  linkAvailableAgain: "product",
-  adminDigest: "product",
-  reportReviewed: "product",
-  contentRemovedCopyright: "product",
-  contentRestored: "product",
+/** Only an operator alert can be critical; every row states both its class and its severity. */
+type KindRow =
+  | { class: Exclude<EmailClass, "operator_alert">; severity: "routine"; bucket: string }
+  | { class: "operator_alert"; severity: EmailSeverity; bucket: string };
+
+/**
+ * EVERY kind of mail: its class, its severity, and the per-recipient count it belongs to. The
+ * type makes the table exhaustive — a template without a row, or a row without a class or a
+ * severity, does not compile — and at run time a kind with no row is never sent (`deliver`).
+ * `bucket` separates per-recipient counts INSIDE a class (the reset link from the sign-up mail:
+ * five sign-up attempts on somebody's address must not stop that person's own reset).
+ */
+export const KINDS = {
+  verification: { class: "unauth_triggered", severity: "routine", bucket: "signup" },
+  signupAttempt: { class: "unauth_triggered", severity: "routine", bucket: "signup" },
+  passwordReset: { class: "unauth_triggered", severity: "routine", bucket: "reset" },
+  newAddressVerification: { class: "session_action", severity: "routine", bucket: "session" },
+  changeEmailConfirmation: { class: "session_action", severity: "routine", bucket: "session" },
+  deleteAccountVerification: { class: "session_action", severity: "routine", bucket: "session" },
+  deletionScheduled: { class: "account_security", severity: "routine", bucket: "security" },
+  deletionCancelled: { class: "account_security", severity: "routine", bucket: "security" },
+  passwordChanged: { class: "account_security", severity: "routine", bucket: "security" },
+  twoFactorEnabled: { class: "account_security", severity: "routine", bucket: "security" },
+  twoFactorDisabled: { class: "account_security", severity: "routine", bucket: "security" },
+  secondFactorLocked: { class: "account_security", severity: "routine", bucket: "security" },
+  passkeyAdded: { class: "account_security", severity: "routine", bucket: "security" },
+  signInMethodAdded: { class: "account_security", severity: "routine", bucket: "security" },
+  passkeyRemoved: { class: "account_security", severity: "routine", bucket: "security" },
+  newDeviceSignIn: { class: "account_security", severity: "routine", bucket: "security" },
+  accountSuspended: { class: "account_security", severity: "routine", bucket: "security" },
+  securityDigest: { class: "account_security", severity: "routine", bucket: "digest" },
+  adminAlert: { class: "operator_alert", severity: "routine", bucket: "operator" },
+  operatorDigest: { class: "operator_alert", severity: "routine", bucket: "operator-digest" },
+  shareInvitation: { class: "transactional_user", severity: "routine", bucket: "product" },
+  quarantineNotice: { class: "transactional_user", severity: "routine", bucket: "product" },
+  uploadNotIntact: { class: "transactional_user", severity: "routine", bucket: "product" },
+  linkPaused: { class: "transactional_user", severity: "routine", bucket: "product" },
+  linkAvailableAgain: { class: "transactional_user", severity: "routine", bucket: "product" },
+  adminDigest: { class: "transactional_user", severity: "routine", bucket: "product" },
+  reportReviewed: { class: "transactional_user", severity: "routine", bucket: "product" },
+  contentRemovedCopyright: { class: "transactional_user", severity: "routine", bucket: "product" },
+  contentRestored: { class: "transactional_user", severity: "routine", bucket: "product" },
+  operatorCritical: { class: "operator_alert", severity: "critical", bucket: "operator-critical" },
+} as const satisfies Record<TemplateName, KindRow>;
+
+type CriticalName = {
+  [K in TemplateName]: (typeof KINDS)[K]["severity"] extends "critical" ? K : never;
+}[TemplateName];
+/** The kinds that MAY be held back and coalesced: every kind that is not critical. */
+export type CoalescibleName = Exclude<TemplateName, CriticalName>;
+const kindOf = (name: TemplateName): KindRow | undefined =>
+  Object.hasOwn(KINDS, name) ? (KINDS as Record<TemplateName, KindRow>)[name] : undefined;
+
+/** What each class counts, per recipient and per actor (null: not counted per actor). */
+const CLASS_CAPS: Record<EmailClass, { recipient: Caps; actor: Caps | null }> = {
+  unauth_triggered: { recipient: EMAIL_CAPS, actor: ACTOR_CAPS },
+  session_action: { recipient: EMAIL_CAPS, actor: ACTOR_CAPS },
+  transactional_user: { recipient: EMAIL_CAPS, actor: SENDER_CAPS },
+  account_security: { recipient: SECURITY_CAPS, actor: null },
+  operator_alert: { recipient: OPERATOR_CAPS, actor: null },
 };
 
-export const emailClassOf = (name: TemplateName): EmailClass => CLASS_OF[name];
+export const emailClassOf = (name: TemplateName): EmailClass => KINDS[name].class;
+export const EMAIL_BUCKETS: string[] = [...new Set(Object.values(KINDS).map((kind) => kind.bucket))];
 
 // ── delivery ────────────────────────────────────────────────────────────────────────────────
 
@@ -553,40 +769,51 @@ export function normaliseRecipient(to: unknown): Recipient | null {
 }
 
 /**
- * Which cap a template counts against. Mail a STRANGER can cause to be sent to an address
- * (a sign-up, a resend, a sign-up attempt — and all product mail) shares the recipient's ordinary
- * cap. If the owner's own mail counted there too, five such mails an hour would silently stop
- * their password reset, their address change and their deletion confirmation. So:
- *   reset     the reset link, alone: only other reset links — which are what the owner asked
- *             for — can use it up;
- *   session   mail only a signed-in session of the account can cause.
- * Each bucket has the same caps (EMAIL_CAPS), so one recipient gets at most three times the cap.
+ * The address a mailbox is COUNTED under — never the one a message is sent to. Spellings that
+ * reach one mailbox share one budget: lower case, NFKC, a `+tag` removed; for Gmail (and
+ * googlemail.com) the dots in the local part removed too. Without it, `victim+1@…`, `victim+2@…`
+ * would each be a fresh recipient for whoever wants to fill one inbox.
  */
-const BUCKET_OF: Partial<Record<TemplateName, "reset" | "session">> = {
-  passwordReset: "reset",
-  changeEmailConfirmation: "session",
-  deleteAccountVerification: "session",
-  newAddressVerification: "session",
-};
-export const EMAIL_BUCKETS = ["reset", "session"] as const;
+export function canonicalRecipient(address: string): string {
+  const lower = address.normalize("NFKC").trim().toLowerCase();
+  const at = lower.lastIndexOf("@");
+  if (at <= 0) return lower;
+  let local = lower.slice(0, at).split("+")[0]!;
+  let domain = lower.slice(at + 1);
+  if (domain === "googlemail.com") domain = "gmail.com";
+  if (domain === "gmail.com") local = local.replaceAll(".", "");
+  return `${local}@${domain}`;
+}
 
-/** The ledger key a template's mail to `address` is counted under. */
+const ledgerHash = (env: Pick<Env, "FILES_TOKEN_SECRET">, text: string) =>
+  hmacHex(createKeys(env.FILES_TOKEN_SECRET), "email-ledger", text);
+
+/** The ledger key of a recipient's count in one bucket: a keyed hash, never the address. */
 export async function ledgerKey(
   env: Pick<Env, "FILES_TOKEN_SECRET">,
   address: string,
-  bucket?: (typeof EMAIL_BUCKETS)[number],
+  bucket: string,
 ): Promise<string> {
-  if (!bucket) return recipientHash(env, address);
-  return hmacHex(
-    createKeys(env.FILES_TOKEN_SECRET),
-    "email-ledger",
-    `${bucket}|${address.trim().toLowerCase()}`,
-  );
+  return ledgerHash(env, `to|${bucket}|${canonicalRecipient(address)}`);
 }
 
-/** The ledger key of a recipient: HMAC(email-ledger key, lower-cased address). */
+/** The ledger key of an actor's count in one class (a client address, a user). */
+export async function actorKey(
+  env: Pick<Env, "FILES_TOKEN_SECRET">,
+  emailClass: EmailClass,
+  actor: EmailActor | undefined,
+): Promise<string | null> {
+  if (actor && "system" in actor) return null;
+  const who =
+    actor && "user" in actor
+      ? `user|${actor.user}`
+      : `client|${actor?.client ? normaliseIp(actor.client) : "unknown"}`;
+  return ledgerHash(env, `by|${emailClass}|${who}`);
+}
+
+/** The keyed hash of a canonical address (what the ledger stores is never an address). */
 export async function recipientHash(env: Pick<Env, "FILES_TOKEN_SECRET">, address: string): Promise<string> {
-  return hmacHex(createKeys(env.FILES_TOKEN_SECRET), "email-ledger", address.trim().toLowerCase());
+  return ledgerKey(env, address, "product");
 }
 
 async function viaResend(env: Env, message: { to: string } & RenderedEmail): Promise<void> {
@@ -615,32 +842,176 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
   throw failure;
 }
 
-async function deliver(
+function transmit(env: Env, name: TemplateName, address: string, rendered: RenderedEmail): Promise<void> {
+  if (env.EMAIL_TRANSPORT === "memory") {
+    outbox.push({ to: address, ...rendered, template: name, class: KINDS[name].class });
+    return Promise.resolve();
+  }
+  return viaResend(env, { to: address, ...rendered });
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Throws for a critical kind: a critical alert is never held back or folded into anything. */
+function assertCoalescible(name: TemplateName): asserts name is CoalescibleName {
+  if (kindOf(name)?.severity !== "routine") {
+    throw new Error("email: a critical alert was about to be coalesced");
+  }
+}
+
+/**
+ * A CRITICAL operator alert: sent now, whatever any count says — the ledger is not asked. If the
+ * transport fails it is tried again in the deferred work, and every failure is reported and
+ * counted; a failure of the last try is counted as `critical_lost`.
+ */
+async function sendCritical(
+  deps: ServiceDeps,
+  name: TemplateName,
+  address: string,
+  rendered: RenderedEmail,
+): Promise<EmailOutcome> {
+  const env = deps.env;
+  const failed = (error: unknown, attempt: number) => {
+    reportError(error, { kind: "email_critical", template: name, attempt: String(attempt) });
+    countFor(env, "email", { outcome: "critical_failed", kind: name });
+  };
+  try {
+    await transmit(env, name, address, rendered);
+    countFor(env, "email", { outcome: "sent", kind: name });
+    return "sent";
+  } catch (error) {
+    failed(error, 1);
+  }
+  deps.defer(
+    (async () => {
+      for (const [index, wait] of CRITICAL_RETRY_WAITS_MS.entries()) {
+        await sleep(wait);
+        try {
+          await transmit(env, name, address, rendered);
+          countFor(env, "email", { outcome: "sent", kind: name, reason: "retry" });
+          return;
+        } catch (error) {
+          failed(error, index + 2);
+        }
+      }
+      reportError(new Error("email: a critical operator alert could not be delivered"), {
+        kind: "email_critical_lost",
+        template: name,
+      });
+      countFor(env, "email", { outcome: "critical_lost", kind: name });
+    })(),
+  );
+  return "retrying";
+}
+
+/** A routine operator alert, as the digest will list it: a kind and an id — nothing else. */
+export type OperatorItem = { kind: OperatorRoutineKind; id: string };
+const DIGEST_MAX_ITEMS = 500;
+
+/**
+ * Sends the operator digest for one mailbox if one is due (at most one an hour) and anything is
+ * held: every held alert is taken and LISTED. If the send fails they are put back.
+ */
+export async function sendOperatorDigestIfDue(
+  deps: ServiceDeps,
+  address: string,
+): Promise<EmailOutcome | null> {
+  const env = deps.env;
+  const mailbox = await ledgerKey(env, address, KINDS.adminAlert.bucket);
+  let due = true;
+  try {
+    due = await tryConsume(deps.db, await ledgerKey(env, address, KINDS.operatorDigest.bucket), DIGEST_CAPS);
+  } catch (error) {
+    // An alert does not depend on a counter.
+    reportError(error, { kind: "email_ledger", template: "operatorDigest" });
+  }
+  if (!due) return null;
+  const items = await takeHeldAlerts(deps.db, mailbox, DIGEST_MAX_ITEMS);
+  if (items.length === 0) return null;
+  try {
+    const digest = render(env, templates.operatorDigest({ items, adminUrl: `${env.APP_ORIGIN}/admin` }));
+    await transmit(env, "operatorDigest", address, digest);
+    countFor(env, "email", { outcome: "sent", kind: "operatorDigest" });
+    return "sent";
+  } catch (error) {
+    for (const item of items) await holdAlert(deps.db, mailbox, item);
+    reportError(error, { kind: "email", template: "operatorDigest" });
+    countFor(env, "email", { outcome: "failed", kind: "operatorDigest" });
+    return "failed";
+  }
+}
+
+/** The hourly job: every mailbox with alerts waiting gets its digest, if one is due. */
+export async function flushOperatorDigests(deps: ServiceDeps): Promise<number> {
+  let sent = 0;
+  for (const address of await heldAlertMailboxes(deps.db)) {
+    if ((await sendOperatorDigestIfDue(deps, address)) === "sent") sent += 1;
+  }
+  return sent;
+}
+
+/**
+ * One mail of one kind to one address — counted first (see the header for each class's rule).
+ * Exported for its tests; everything else calls a `send*` function.
+ */
+export async function deliver(
   deps: ServiceDeps,
   name: TemplateName,
   to: unknown,
   draft: () => Draft,
+  actor?: EmailActor,
+  item?: OperatorItem,
 ): Promise<EmailOutcome> {
   const env = deps.env;
   const kind = name;
   try {
+    // A kind the table does not have is never sent — whatever the compiler was told.
+    const row = kindOf(name);
+    if (
+      !row ||
+      !Object.hasOwn(CLASS_CAPS, row.class) ||
+      (row.severity !== "critical" && row.severity !== "routine")
+    ) {
+      throw new Error("email: an unclassified kind was refused");
+    }
+    const caps = CLASS_CAPS[row.class];
     const address = normaliseRecipient(to);
     if (!address) throw new Error("email: the recipient is not a single well-formed address");
     const rendered = render(env, draft());
 
-    if (CLASS_OF[name] !== "security") {
-      const allowed = await tryConsume(deps.db, await ledgerKey(env, address, BUCKET_OF[name]), EMAIL_CAPS);
-      if (!allowed) {
-        countFor(env, "email", { outcome: "capped", kind });
+    // CRITICAL: before, and instead of, every count.
+    if (row.severity === "critical") return await sendCritical(deps, name, address, rendered);
+
+    if (row.class === "account_security" || row.class === "operator_alert") {
+      // Never suppressed by another class, never dependent on the counter: a ledger that cannot
+      // be reached is reported and the notice goes out (fail OPEN).
+      let within = true;
+      try {
+        within = await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), caps.recipient);
+      } catch (error) {
+        reportError(error, { kind: "email_ledger", template: name });
+        countFor(env, "email", { outcome: "ledger_failed", kind });
+      }
+      if (!within) {
+        assertCoalescible(name);
+        return row.class === "operator_alert"
+          ? await holdForDigest(deps, name, address, item)
+          : await coalesce(deps, name, address);
+      }
+    } else {
+      // Every other class fails CLOSED: a ledger error is thrown from here and nothing is sent.
+      const by = caps.actor ? await actorKey(env, row.class, actor) : null;
+      if (by !== null && caps.actor && !(await tryConsume(deps.db, by, caps.actor))) {
+        countFor(env, "email", { outcome: "capped", kind, reason: "actor" });
+        return "capped";
+      }
+      if (!(await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), caps.recipient))) {
+        countFor(env, "email", { outcome: "capped", kind, reason: "recipient" });
         return "capped";
       }
     }
 
-    if (env.EMAIL_TRANSPORT === "memory") {
-      outbox.push({ to: address, ...rendered, template: name, class: CLASS_OF[name] });
-    } else {
-      await viaResend(env, { to: address, ...rendered });
-    }
+    await transmit(env, name, address, rendered);
     countFor(env, "email", { outcome: "sent", kind });
     return "sent";
   } catch (error) {
@@ -650,27 +1021,82 @@ async function deliver(
   }
 }
 
+/**
+ * A routine operator alert beyond the hour's count: HELD, and listed — by kind and id — in the
+ * mailbox's next digest (now, if one is due; else within the hour, by the flush job).
+ */
+async function holdForDigest(
+  deps: ServiceDeps,
+  name: CoalescibleName,
+  address: string,
+  item: OperatorItem | undefined,
+): Promise<EmailOutcome> {
+  const mailbox = await ledgerKey(deps.env, address, KINDS.adminAlert.bucket);
+  await holdAlert(deps.db, mailbox, { kind: item?.kind ?? "report", id: safeId(item?.id), to: address });
+  countFor(deps.env, "email", { outcome: "coalesced", kind: name });
+  await sendOperatorDigestIfDue(deps, address);
+  return "coalesced";
+}
+
+/**
+ * A security notice beyond the hour's count: not sent on its own and not dropped — the FIRST one
+ * of the hour sends the digest that stands for all of them; the rest are counted into it.
+ */
+async function coalesce(deps: ServiceDeps, name: CoalescibleName, address: string): Promise<EmailOutcome> {
+  const env = deps.env;
+  let first = true;
+  try {
+    first = await tryConsume(
+      deps.db,
+      await ledgerKey(env, address, KINDS.securityDigest.bucket),
+      DIGEST_CAPS,
+    );
+  } catch (error) {
+    reportError(error, { kind: "email_ledger", template: "securityDigest" });
+  }
+  if (first) {
+    const digest = render(env, templates.securityDigest({ accountUrl: `${env.APP_ORIGIN}/account` }));
+    await transmit(env, "securityDigest", address, digest);
+  }
+  countFor(env, "email", { outcome: "coalesced", kind: name });
+  return "coalesced";
+}
+
 const appUrl = (env: Pick<Env, "APP_ORIGIN">, path: string) => `${env.APP_ORIGIN}${path}`;
 
 type To = { to: string; name?: unknown };
 
-// auth class
-export const sendVerification = (deps: ServiceDeps, d: To & { url: string; resend?: boolean }) =>
-  deliver(deps, "verification", d.to, () => templates.verification(d));
+/** The client address of the request that caused an unauthenticated mail (null: not known). */
+type ByClient = { by: { client: string | null } };
+/** The user whose session caused a mail. */
+type ByUser = { by: { user: string } };
+const SYSTEM: EmailActor = { system: true };
+
+// unauth_triggered
+export const sendVerification = (deps: ServiceDeps, d: To & ByClient & { url: string; resend?: boolean }) =>
+  deliver(deps, "verification", d.to, () => templates.verification(d), d.by);
 /** To the owner of an address somebody tried to sign up with. A notice: it carries no token. */
-export const sendSignupAttempt = (deps: ServiceDeps, d: To) =>
-  deliver(deps, "signupAttempt", d.to, () =>
-    templates.signupAttempt({ ...d, loginUrl: appUrl(deps.env, "/login") }),
+export const sendSignupAttempt = (deps: ServiceDeps, d: To & ByClient) =>
+  deliver(
+    deps,
+    "signupAttempt",
+    d.to,
+    () => templates.signupAttempt({ ...d, loginUrl: appUrl(deps.env, "/login") }),
+    d.by,
   );
-export const sendNewAddressVerification = (deps: ServiceDeps, d: To & { url: string }) =>
-  deliver(deps, "newAddressVerification", d.to, () => templates.newAddressVerification(d));
-export const sendPasswordReset = (deps: ServiceDeps, d: To & { url: string }) =>
-  deliver(deps, "passwordReset", d.to, () => templates.passwordReset(d));
+export const sendPasswordReset = (deps: ServiceDeps, d: To & ByClient & { url: string }) =>
+  deliver(deps, "passwordReset", d.to, () => templates.passwordReset(d), d.by);
+
+// session_action
+export const sendNewAddressVerification = (deps: ServiceDeps, d: To & ByUser & { url: string }) =>
+  deliver(deps, "newAddressVerification", d.to, () => templates.newAddressVerification(d), d.by);
 /** To the CURRENT address; the new one gets `sendNewAddressVerification` after the click. */
-export const sendChangeEmailConfirmation = (deps: ServiceDeps, d: To & { newEmail: string; url: string }) =>
-  deliver(deps, "changeEmailConfirmation", d.to, () => templates.changeEmailConfirmation(d));
-export const sendDeleteAccountVerification = (deps: ServiceDeps, d: To & { url: string }) =>
-  deliver(deps, "deleteAccountVerification", d.to, () => templates.deleteAccountVerification(d));
+export const sendChangeEmailConfirmation = (
+  deps: ServiceDeps,
+  d: To & ByUser & { newEmail: string; url: string },
+) => deliver(deps, "changeEmailConfirmation", d.to, () => templates.changeEmailConfirmation(d), d.by);
+export const sendDeleteAccountVerification = (deps: ServiceDeps, d: To & ByUser & { url: string }) =>
+  deliver(deps, "deleteAccountVerification", d.to, () => templates.deleteAccountVerification(d), d.by);
 
 // security class
 export const sendDeletionScheduled = (deps: ServiceDeps, d: To & { scheduledFor: Date }) =>
@@ -701,13 +1127,34 @@ export const sendNewDeviceSignIn = (
 ) => deliver(deps, "newDeviceSignIn", d.to, () => templates.newDeviceSignIn(d));
 export const sendAccountSuspended = (deps: ServiceDeps, d: To) =>
   deliver(deps, "accountSuspended", d.to, () => templates.accountSuspended(d));
-/** A new report, or a suspected-CSAM lock. The report id and category only — never a file name. */
+// operator_alert
+/** ROUTINE: a new abuse report or a quarantined file. An id and a category — never a file name. */
 export const sendAdminAlert = (
   deps: ServiceDeps,
-  d: { to: string; kind: "report" | "csam_lock"; reportId: string; category: string },
+  d: { to: string; kind: OperatorRoutineKind; id: string; category?: string },
 ) =>
-  deliver(deps, "adminAlert", d.to, () =>
-    templates.adminAlert({ ...d, adminUrl: appUrl(deps.env, "/admin") }),
+  deliver(
+    deps,
+    "adminAlert",
+    d.to,
+    () => templates.adminAlert({ ...d, adminUrl: appUrl(deps.env, "/admin") }),
+    SYSTEM,
+    { kind: d.kind, id: d.id },
+  );
+/**
+ * CRITICAL: a suspected-CSAM lock, a legal hold, a kill-switch change, an admin lock-out, the
+ * storage-budget switch, the scanner down. Always sent, at once; never counted or coalesced.
+ */
+export const sendOperatorCritical = (
+  deps: ServiceDeps,
+  d: { to: string; event: OperatorCriticalEvent; id?: string },
+) =>
+  deliver(
+    deps,
+    "operatorCritical",
+    d.to,
+    () => templates.operatorCritical({ ...d, adminUrl: appUrl(deps.env, "/admin") }),
+    SYSTEM,
   );
 
 // product class
@@ -724,39 +1171,54 @@ export const sendShareInvitation = (
     role: "viewer" | "editor";
     hasAccount: boolean;
     inviteCode?: string;
+    /** The user who shared: counted per sender as well as per recipient. */
+    senderId: string;
   },
 ) =>
-  deliver(deps, "shareInvitation", d.to, () =>
-    templates.shareInvitation({
-      ...d,
-      url: d.hasAccount
-        ? appUrl(deps.env, "/shared")
-        : appUrl(deps.env, d.inviteCode ? `/invite/${encodeURIComponent(d.inviteCode)}` : "/signup"),
-    }),
+  deliver(
+    deps,
+    "shareInvitation",
+    d.to,
+    () =>
+      templates.shareInvitation({
+        ...d,
+        url: d.hasAccount
+          ? appUrl(deps.env, "/shared")
+          : appUrl(deps.env, d.inviteCode ? `/invite/${encodeURIComponent(d.inviteCode)}` : "/signup"),
+      }),
+    { user: d.senderId },
   );
 export const sendQuarantineNotice = (deps: ServiceDeps, d: To & { fileName: string }) =>
-  deliver(deps, "quarantineNotice", d.to, () => templates.quarantineNotice(d));
+  deliver(deps, "quarantineNotice", d.to, () => templates.quarantineNotice(d), SYSTEM);
 export const sendUploadNotIntact = (deps: ServiceDeps, d: To & { fileName: string }) =>
-  deliver(deps, "uploadNotIntact", d.to, () => templates.uploadNotIntact(d));
+  deliver(deps, "uploadNotIntact", d.to, () => templates.uploadNotIntact(d), SYSTEM);
 export const sendLinkPaused = (deps: ServiceDeps, d: To & { itemName: string }) =>
-  deliver(deps, "linkPaused", d.to, () => templates.linkPaused(d));
+  deliver(deps, "linkPaused", d.to, () => templates.linkPaused(d), SYSTEM);
 export const sendLinkAvailableAgain = (deps: ServiceDeps, d: To & { itemName: string }) =>
-  deliver(deps, "linkAvailableAgain", d.to, () => templates.linkAvailableAgain(d));
+  deliver(deps, "linkAvailableAgain", d.to, () => templates.linkAvailableAgain(d), SYSTEM);
 export const sendAdminDigest = (
   deps: ServiceDeps,
   d: { to: string; lines: Array<{ label: string; value: string | number }> },
 ) =>
-  deliver(deps, "adminDigest", d.to, () =>
-    templates.adminDigest({ lines: d.lines, adminUrl: appUrl(deps.env, "/admin") }),
+  deliver(
+    deps,
+    "adminDigest",
+    d.to,
+    () => templates.adminDigest({ lines: d.lines, adminUrl: appUrl(deps.env, "/admin") }),
+    SYSTEM,
   );
 export const sendReportReviewed = (deps: ServiceDeps, d: { to: string }) =>
-  deliver(deps, "reportReviewed", d.to, () => templates.reportReviewed());
+  deliver(deps, "reportReviewed", d.to, () => templates.reportReviewed(), SYSTEM);
 export const sendContentRemovedCopyright = (
   deps: ServiceDeps,
   d: To & { itemName: string; noticeText: string },
 ) =>
-  deliver(deps, "contentRemovedCopyright", d.to, () =>
-    templates.contentRemovedCopyright({ ...d, counterNoticeUrl: appUrl(deps.env, "/dmca") }),
+  deliver(
+    deps,
+    "contentRemovedCopyright",
+    d.to,
+    () => templates.contentRemovedCopyright({ ...d, counterNoticeUrl: appUrl(deps.env, "/dmca") }),
+    SYSTEM,
   );
 export const sendContentRestored = (deps: ServiceDeps, d: To & { itemName: string }) =>
-  deliver(deps, "contentRestored", d.to, () => templates.contentRestored(d));
+  deliver(deps, "contentRestored", d.to, () => templates.contentRestored(d), SYSTEM);

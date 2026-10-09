@@ -65,6 +65,9 @@ export const CAPTCHA_ENDPOINTS = [
   "/reset-password",
 ];
 
+/** The client address of the request in hand, for the per-client mail cap (services/email.ts). */
+const byClient = (scope: AuthScope) => ({ client: scope.client?.ip ?? null });
+
 /** Does a verification token change an address (rather than verify a new account's)? */
 function isAddressChangeToken(token: string): boolean {
   try {
@@ -150,7 +153,7 @@ export function buildAuthOptions(scope: AuthScope) {
         // never awaited here: an answer that waited for a mail, or shared its round trips with
         // one, would be slower exactly when the address has an account (auth/parity.ts).
         deps.defer(
-          afterAnswer(scope, () => sendPasswordReset(deps, { to: user.email, name: user.name, url })),
+          afterAnswer(scope, () => sendPasswordReset(deps, { to: user.email, url, by: byClient(scope) })),
         );
       },
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
@@ -168,7 +171,7 @@ export function buildAuthOptions(scope: AuthScope) {
         url,
         token,
       }: {
-        user: { email: string; name: string };
+        user: { id: string; email: string; name: string };
         url: string;
         token: string;
       }) => {
@@ -176,14 +179,14 @@ export function buildAuthOptions(scope: AuthScope) {
         if (isAddressChangeToken(token)) {
           deps.defer(
             afterAnswer(scope, () =>
-              sendNewAddressVerification(deps, { to: user.email, name: user.name, url }),
+              sendNewAddressVerification(deps, { to: user.email, url, by: { user: user.id } }),
             ),
           );
         } else {
           const resend = scope.facts.endpointPath === "/send-verification-email";
           deps.defer(
             afterAnswer(scope, () =>
-              sendVerification(deps, { to: user.email, name: user.name, url, resend }),
+              sendVerification(deps, { to: user.email, url, resend, by: byClient(scope) }),
             ),
           );
         }
@@ -243,13 +246,19 @@ export function buildAuthOptions(scope: AuthScope) {
           newEmail,
           url,
         }: {
-          user: { email: string; name: string };
+          user: { id: string; email: string; name: string };
           newEmail: string;
           url: string;
         }) => {
           deps.defer(
             afterAnswer(scope, () =>
-              sendChangeEmailConfirmation(deps, { to: user.email, name: user.name, newEmail, url }),
+              sendChangeEmailConfirmation(deps, {
+                to: user.email,
+                name: user.name,
+                newEmail,
+                url,
+                by: { user: user.id },
+              }),
             ),
           );
         },
@@ -260,10 +269,15 @@ export function buildAuthOptions(scope: AuthScope) {
           user,
           url,
         }: {
-          user: { email: string; name: string };
+          user: { id: string; email: string; name: string };
           url: string;
         }) => {
-          await sendDeleteAccountVerification(deps, { to: user.email, name: user.name, url });
+          await sendDeleteAccountVerification(deps, {
+            to: user.email,
+            name: user.name,
+            url,
+            by: { user: user.id },
+          });
         },
         // THE VETO. Better Auth deletes the account the moment this returns, so it never
         // returns: it schedules the deletion instead and always throws, and the thrown APIError

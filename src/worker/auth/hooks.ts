@@ -615,7 +615,12 @@ export function buildHooks(scope: AuthScope) {
           afterAnswer(scope, () =>
             quietly(env, "signup_attempt", async () => {
               const owner = await getAccountByEmail(scope.db, address);
-              if (owner) await sendSignupAttempt(scope.deps, { to: owner.email, name: owner.name });
+              if (owner) {
+                await sendSignupAttempt(scope.deps, {
+                  to: owner.email,
+                  by: { client: scope.client?.ip ?? null },
+                });
+              }
             }),
           ),
         );
