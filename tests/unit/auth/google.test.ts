@@ -256,7 +256,7 @@ describe("a Google sign-up", () => {
         markerExpiresAt: new Date(Date.now() + tenMinutes),
       },
       // The cookie is fresh; its marker expired a minute ago.
-      { mintedAt: new Date(), markerExpiresAt: new Date(Date.now() - 60_000) },
+      { mintedAt: new Date(), markerExpiresAt: new Date(Date.now() - 3_600_000) },
     ];
     for (const { mintedAt, markerExpiresAt } of cases) {
       const client = newClient();

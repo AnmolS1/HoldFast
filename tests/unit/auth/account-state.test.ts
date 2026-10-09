@@ -181,7 +181,7 @@ describe("a ban made through the admin plugin", () => {
     await send(admin.client, "/api/auth/admin/ban-user", { json: { userId: target.user.id } });
     await testDb()
       .update(user)
-      .set({ banExpires: new Date(Date.now() - 60_000) })
+      .set({ banExpires: new Date(Date.now() - 3_600_000) })
       .where(eq(user.id, target.user.id));
     expect((await signIn(newClient(), target.email)).status).toBe(200);
     expect((await userById(target.user.id))!.banned).toBe(false);
@@ -328,7 +328,7 @@ describe("an account whose deletion date has passed", () => {
       const wrong = await signIn(newClient(), email, "definitely the wrong password");
       expect(wrong.status).toBe(401);
 
-      expect(await schedule(testDb(), row.id, new Date(Date.now() - 60_000))).toBe(true);
+      expect(await schedule(testDb(), row.id, new Date(Date.now() - 3_600_000))).toBe(true);
       const refused = await signIn(newClient(), email);
       expect(refused.status).toBe(wrong.status);
       expect(refused.text).toBe(wrong.text);

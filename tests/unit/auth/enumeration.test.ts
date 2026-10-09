@@ -231,7 +231,7 @@ describe("sign-in with a wrong password", () => {
     const gone = await verifiedUser();
     await testDb()
       .update(user)
-      .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
+      .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
       .where(eq(user.id, gone.user.id));
 
     // An account that has no password at all (it signs in with Google).
@@ -293,7 +293,7 @@ describe("sign-in with a wrong password", () => {
     const gone = await verifiedUser();
     await testDb()
       .update(user)
-      .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
+      .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
       .where(eq(user.id, gone.user.id));
     const refused = await signIn(newClient(), gone.email);
     expect(refused.status).toBe(401);

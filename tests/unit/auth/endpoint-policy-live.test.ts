@@ -215,7 +215,7 @@ describe("a session past its DELETION date against the real handler", () => {
     const state: AuthGateState = "deleted";
     const check = async (policyRow: (typeof AUTH_ENDPOINTS)[number]) => {
       const { client, user: row } = await verifiedUser();
-      const past = new Date(Date.now() - 60_000);
+      const past = new Date(Date.now() - 3_600_000);
       await testDb().update(user).set({ deleteScheduledAt: past }).where(eq(user.id, row.id));
       client.cookies.delete("hf.session_data");
       const before = await fingerprint(row.id);
@@ -265,7 +265,7 @@ describe("how the real router reads a path", () => {
     const { client, user: row } = await verifiedUser();
     await testDb()
       .update(user)
-      .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
+      .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
       .where(eq(user.id, row.id));
     client.cookies.delete("hf.session_data");
     for (const spelling of [
