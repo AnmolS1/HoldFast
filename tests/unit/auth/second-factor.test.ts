@@ -313,7 +313,7 @@ describe("which sessions carry a second factor", () => {
     expect((await adminCall(client)).status).toBe(200);
   });
 
-  it("a role change takes the mark off the account's sessions; so does a new set of backup codes", async () => {
+  it("a role change ends the account's sessions; a new set of backup codes takes the mark off", async () => {
     const boss = await adminWithTotp();
     const bossClient = newClient();
     await signInWithCode(bossClient, boss.email, boss.totpURI);
@@ -321,13 +321,11 @@ describe("which sessions carry a second factor", () => {
     const otherClient = newClient();
     await signInWithCode(otherClient, other.email, other.totpURI);
     expect((await onlySession(other.id)).secondFactorAt).toBeInstanceOf(Date);
-    // Demoted and promoted again: the session is still there, the mark is not.
-    for (const role of ["user", "admin"]) {
-      const changed = await send(bossClient, ADMIN_PATH, { json: { userId: other.id, role } });
-      expect(changed.status, changed.text).toBe(200);
-    }
-    expect((await onlySession(other.id)).secondFactorAt).toBeNull();
-    expectNeedsSecondFactor(await adminCall(otherClient));
+    // A change of privilege: the account signs in again, as what it now is.
+    const changed = await send(bossClient, ADMIN_PATH, { json: { userId: other.id, role: "admin" } });
+    expect(changed.status, changed.text).toBe(200);
+    expect(await sessionsOf(other.id)).toEqual([]);
+    expect((await adminCall(otherClient)).status).toBe(403);
 
     const regenerated = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", {
       json: { password: PASSWORD },

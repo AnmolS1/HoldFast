@@ -6,6 +6,7 @@
 
 import { Hono, type MiddlewareHandler } from "hono";
 import { metaResponse } from "./meta";
+import { cookieGuard } from "./middleware/cookie-guard";
 import { csrf } from "./middleware/csrf";
 import { htmlNonce } from "./middleware/html-nonce";
 import { impersonationReadOnly } from "./middleware/impersonation";
@@ -37,6 +38,8 @@ export function buildPipeline(core: CoreDeps): PipelineStep[] {
     { name: "requestContext", path: "*", handler: requestContext(core) },
     { name: "securityHeaders", path: "*", handler: securityHeaders },
     { name: "csrf", path: "/api/*", handler: csrf },
+    // In front of everything that reads a cookie: one strict reading of the header.
+    { name: "cookieGuard", path: "/api/*", handler: cookieGuard },
     { name: "session", path: "/api/*", handler: session },
     { name: "impersonationReadOnly", path: "/api/*", handler: impersonationReadOnly },
     { name: "termsGate", path: "/api/*", handler: termsGate },

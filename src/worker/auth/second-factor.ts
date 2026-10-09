@@ -78,6 +78,7 @@ import {
   secondFactorState,
   stampSecondFactor,
 } from "../db/queries/auth-lifecycle";
+import { revokeSessions } from "../services/account-state";
 import { now } from "../services/clock";
 import { sendSecondFactorLocked } from "../services/email";
 import { record } from "./observe";
@@ -283,11 +284,14 @@ export async function afterTwoFactorChange(scope: AuthScope, ctx: SessionContext
   if (userId) await clearSecondFactor(scope.db, userId);
 }
 
-/** After `/admin/set-role`: the account whose role changed proves the factor again. */
+/**
+ * After `/admin/set-role`: a change of privilege ends every session of the account whose role
+ * changed — it signs in again, as what it now is (and proves its second factor again).
+ */
 export async function afterRoleChange(scope: AuthScope, ctx: SessionContext): Promise<void> {
   if (!succeeded(ctx)) return;
   const userId = (ctx.body as { userId?: unknown } | undefined)?.userId;
-  if (typeof userId === "string" && userId !== "") await clearSecondFactor(scope.db, userId);
+  if (typeof userId === "string" && userId !== "") await revokeSessions(scope.deps, userId);
 }
 
 /** After `/admin/stop-impersonating`: the admin who was impersonating proves the factor again. */

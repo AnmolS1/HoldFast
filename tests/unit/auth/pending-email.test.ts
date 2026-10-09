@@ -41,7 +41,7 @@ describe("the pending-sign-up cookie", () => {
     const payload = JSON.parse(
       atob(client.cookies.get("hf_pending")!.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/")),
     );
-    expect(payload).toMatchObject({ v: 1, m: email, c: 0 });
+    expect(payload).toMatchObject({ v: 2, p: "hf_pending", m: email, c: 0 });
     expect(payload.u).toBe((await userByEmail(email))!.id);
     // A refused sign-up sets none.
     const refused = await signUp(newClient(), { acceptTerms: false });

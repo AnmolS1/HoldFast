@@ -123,9 +123,17 @@ export function readCookie(header: string | null | undefined, name: string): str
   return found.length === 1 ? found[0]! : null;
 }
 
-/** `payload` (must carry `e`, the expiry in epoch seconds) as a signed cookie value. */
+/** The version of the signed payload. 2: the payload names its own cookie (`p`). */
+const PAYLOAD_VERSION = 2;
+
+/**
+ * `payload` (must carry `e`, the expiry in epoch seconds) as a signed cookie value. What is
+ * signed always says WHICH cookie it is (`p`) and its version (`v`), beside what the caller
+ * binds it to (the account, the nonce, the expiry): a value signed as one cookie is not another,
+ * even where two cookies are signed under one purpose key.
+ */
 export async function sign(keys: Keys, spec: CookieSpec, payload: Record<string, unknown>): Promise<string> {
-  const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
+  const body = toBase64Url(encoder.encode(JSON.stringify({ ...payload, v: PAYLOAD_VERSION, p: spec.base })));
   const mac = await crypto.subtle.sign("HMAC", await keys.get(spec.purpose), encoder.encode(body));
   return `${body}.${toBase64Url(new Uint8Array(mac))}`;
 }
@@ -159,7 +167,8 @@ export async function verify(
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const record = payload as Record<string, unknown>;
-  if (record.v !== 1 || typeof record.e !== "number" || record.e * 1000 <= at.getTime()) return null;
+  if (record.v !== PAYLOAD_VERSION || record.p !== spec.base) return null;
+  if (typeof record.e !== "number" || record.e * 1000 <= at.getTime()) return null;
   return record;
 }
 
@@ -176,7 +185,6 @@ export async function mintIntent(
   const nonce = toBase64Url(crypto.getRandomValues(new Uint8Array(18)));
   const expiresAt = new Date(at.getTime() + INTENT_COOKIE.maxAge * 1000);
   const value = await sign(keys, INTENT_COOKIE, {
-    v: 1,
     e: Math.floor(expiresAt.getTime() / 1000),
     n: nonce,
     i: inviteCode,
@@ -220,7 +228,6 @@ export async function mintPending(
   at: Date,
 ): Promise<string> {
   return sign(keys, PENDING_COOKIE, {
-    v: 1,
     e: Math.floor(at.getTime() / 1000) + PENDING_COOKIE.maxAge,
     m: who.email,
     u: who.userId,

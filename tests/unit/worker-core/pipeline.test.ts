@@ -346,6 +346,7 @@ describe("middleware order", () => {
       "requestContext",
       "securityHeaders",
       "csrf",
+      "cookieGuard",
       "session",
       "impersonationReadOnly",
       "termsGate",
@@ -354,6 +355,8 @@ describe("middleware order", () => {
     ]);
     expect(names.indexOf("session")).toBeLessThan(names.indexOf("rateLimit"));
     expect(names.indexOf("csrf")).toBeLessThan(names.indexOf("session"));
+    // Nothing reads a cookie before the header has been read strictly, once.
+    expect(names.indexOf("cookieGuard")).toBeLessThan(names.indexOf("session"));
   });
 
   it("a rate-limited auth request has still been through getSession", async () => {

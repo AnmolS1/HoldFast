@@ -92,7 +92,8 @@ describe("POST /api/auth-intent", () => {
     const payload = JSON.parse(
       atob(cookie.split("=")[1]!.split(".")[0]!.replace(/-/g, "+").replace(/_/g, "/")),
     );
-    expect(Object.keys(payload).sort()).toEqual(["e", "i", "n", "v"]);
+    expect(Object.keys(payload).sort()).toEqual(["e", "i", "n", "p", "v"]);
+    expect(payload).toMatchObject({ v: 2, p: "hf_intent" });
     expect(JSON.stringify(payload)).not.toMatch(/1990|birth/);
   });
 

@@ -450,14 +450,16 @@ describe("changing the address of a verified account", () => {
     expect((await signIn(newClient(), newEmail)).status).toBe(200);
   });
 
-  it("to an address that already has an account: the same answer, and nobody is mailed", async () => {
+  it("to an address that already has an account: the same answer and the same mail to the CALLER; the address's owner is not mailed", async () => {
     const { client, user: row, email } = await verifiedUser();
     const other = await verifiedUser();
     const before = mailTo(other.email).length;
     const asked = await send(client, "/api/auth/change-email", { json: { newEmail: other.email } });
     expect(asked.status).toBe(200);
     expect(asked.body).toEqual({ status: true });
-    expect(mailTo(email, "changeEmailConfirmation")).toEqual([]);
+    // The caller's own inbox must not say whether the address is taken: it gets the same
+    // confirmation as for a free one (tests/unit/auth/mailbox-proof.test.ts, A7).
+    await waitForMail(email, "changeEmailConfirmation");
     expect(mailTo(other.email)).toHaveLength(before);
     expect((await userById(row.id))!.email).toBe(email);
     expect((await userByEmail(other.email))!.id).toBe(other.user.id);
