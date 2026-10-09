@@ -17,9 +17,9 @@ import {
   type AuthGateState,
 } from "../../../src/worker/auth/endpoint-policy";
 import { account, pendingUserPurges, user } from "../../../src/worker/db/schema";
+import { IMPERSONATION_EXEMPT_PATHS } from "../../../src/worker/middleware/impersonation";
 import {
   linkIn,
-  newClient,
   promoteToAdmin,
   send,
   sessionsOf,
@@ -51,8 +51,13 @@ function liveRouteTable(): string[] {
 
 const concrete = (path: string) => `/api/auth${path.replace(":id", "google").replace(":token", "abcdef")}`;
 
-async function request(client: Client, row: (typeof AUTH_ENDPOINTS)[number]) {
-  const method = row[0].split(",")[0]!;
+type PolicyRow = (typeof AUTH_ENDPOINTS)[number];
+/** Every (method, path) pair of the table — T13: each declared method reaches the live handler. */
+const PAIRS: Array<{ row: PolicyRow; method: string }> = AUTH_ENDPOINTS.flatMap((row) =>
+  row[0].split(",").map((method) => ({ row, method })),
+);
+
+async function request(client: Client, row: PolicyRow, method: string = row[0].split(",")[0]!) {
   const path = concrete(row[1]);
   return method === "GET"
     ? send(client, `${path}?token=abcdef&callbackURL=%2F`)
@@ -80,7 +85,15 @@ function expectDecision(
     sent.status === refusal.status &&
     body?.error === refusal.error &&
     body?.details?.reason === refusal.reason;
-  if (decision === "deny") {
+  const [method = "", path = ""] = label.split(" ");
+  // Allowed by PATH, then narrowed for an impersonated session: it is read-only, so a write goes
+  // through only on its two exempt paths (middleware/impersonation.ts).
+  const readOnlyWrite =
+    state === "impersonating" &&
+    decision === "allow" &&
+    method !== "GET" &&
+    !IMPERSONATION_EXEMPT_PATHS.includes(`/api/auth${path}`);
+  if (decision === "deny" || readOnlyWrite) {
     expect(sent.status, label).toBe(refusal.status);
     expect(body, label).toMatchObject(
       refusal.reason
@@ -92,6 +105,32 @@ function expectDecision(
     expect(sent.text, label).toBe("null");
   } else {
     expect(refusedByGate, `${label} must reach Better Auth`).toBe(false);
+    // T13 — and it must be ANSWERED by Better Auth, with that endpoint's own answer: "not the
+    // gate's refusal" alone would also be true of a 404 or a 500.
+    const answer = sent.body as Record<string, unknown> | null;
+    if (path === "/ok") {
+      expect(sent.status, label).toBe(200);
+      expect(answer, label).toEqual({ ok: true });
+    } else if (path === "/error") {
+      // Better Auth's error endpoint sends the browser to the app's own error screen.
+      expect(sent.status, label).toBe(302);
+      expect(sent.headers.get("location") ?? "", label).toMatch(/^(\/|http:\/\/localhost)/);
+    } else if (path === "/get-session" && method === "POST") {
+      // Better Auth's own answer to the POST form of the session read, as we configure it.
+      expect(sent.status, label).toBe(405);
+    } else if (path === "/get-session") {
+      expect(sent.status, label).toBe(200);
+      expect((answer as { session?: { id?: unknown } } | null)?.session?.id, label).toEqual(
+        expect.any(String),
+      );
+    } else if (path === "/sign-out") {
+      expect(sent.status, label).toBe(200);
+      expect(answer, label).toEqual({ success: true });
+    } else {
+      // A new "allow" in the table needs its expected answer written here.
+      expect(["/admin/stop-impersonating"], label).toContain(path);
+      expect(sent.status, label).toBe(200);
+    }
   }
 }
 
@@ -164,12 +203,13 @@ describe("a SUSPENDED session against the real handler", () => {
     expect(viaLink.body).toMatchObject({ details: { reason: "account_suspended" } });
 
     const state: AuthGateState = "suspended";
-    const rows = [...AUTH_ENDPOINTS].sort(
-      (a, b) => Number(a[1] === "/sign-out") - Number(b[1] === "/sign-out"),
+    const pairs = [...PAIRS].sort(
+      (a, b) => Number(a.row[1] === "/sign-out") - Number(b.row[1] === "/sign-out"),
     );
-    for (const policyRow of rows) {
-      const sent = await request(client, policyRow);
-      expectDecision(state, policyRow[COLUMN[state]], sent, `${policyRow[0]} ${policyRow[1]}`);
+    expect(pairs.length).toBeGreaterThan(AUTH_ENDPOINTS.length);
+    for (const { row: policyRow, method } of pairs) {
+      const sent = await request(client, policyRow, method);
+      expectDecision(state, policyRow[COLUMN[state]], sent, `${method} ${policyRow[1]}`);
       if (policyRow[1] === "/list-sessions") expect(sent.text).not.toMatch(/"token"/);
       if (policyRow[1] !== "/sign-out") expect(await sessionsOf(row.id), policyRow[1]).toHaveLength(1);
     }
@@ -192,10 +232,10 @@ describe("an IMPERSONATED session against the real handler", () => {
 
     const state: AuthGateState = "impersonating";
     const last = ["/admin/stop-impersonating", "/sign-out"];
-    const rows = AUTH_ENDPOINTS.filter((r) => !last.includes(r[1]));
-    for (const policyRow of rows) {
-      const sent = await request(client, policyRow);
-      expectDecision(state, policyRow[COLUMN[state]], sent, `${policyRow[0]} ${policyRow[1]}`);
+    const pairs = PAIRS.filter((pair) => !last.includes(pair.row[1]));
+    for (const { row: policyRow, method } of pairs) {
+      const sent = await request(client, policyRow, method);
+      expectDecision(state, policyRow[COLUMN[state]], sent, `${method} ${policyRow[1]}`);
       if (policyRow[1] === "/list-sessions") expect(sent.text).not.toMatch(/"token"/);
     }
     expect(await fingerprint(target.user.id), "nothing about the target changed").toEqual(before);
@@ -211,13 +251,13 @@ describe("an IMPERSONATED session against the real handler", () => {
 describe("a session past its DELETION date against the real handler", () => {
   it("every endpoint: refused as 'no session' (or answered signed-out), nothing changes, and the session is revoked", async () => {
     const state: AuthGateState = "deleted";
-    const check = async (policyRow: (typeof AUTH_ENDPOINTS)[number]) => {
+    const check = async ({ row: policyRow, method }: (typeof PAIRS)[number]) => {
       const { client, user: row } = await verifiedUser();
       const past = new Date(Date.now() - 3_600_000);
       await testDb().update(user).set({ deleteScheduledAt: past }).where(eq(user.id, row.id));
       const before = await fingerprint(row.id);
-      const sent = await request(client, policyRow);
-      expectDecision(state, policyRow[COLUMN[state]], sent, `${policyRow[0]} ${policyRow[1]}`);
+      const sent = await request(client, policyRow, method);
+      expectDecision(state, policyRow[COLUMN[state]], sent, `${method} ${policyRow[1]}`);
       expect(await fingerprint(row.id), `${policyRow[1]}: nothing changed`).toEqual(before);
       // No answer hands the browser a working session again.
       expect(
@@ -227,8 +267,8 @@ describe("a session past its DELETION date against the real handler", () => {
       expect(await sessionsOf(row.id), `${policyRow[1]}: the session was revoked on first sight`).toEqual([]);
     };
     // One fresh account per endpoint (the first request revokes the session), eight at a time.
-    for (let i = 0; i < AUTH_ENDPOINTS.length; i += 8) {
-      await Promise.all(AUTH_ENDPOINTS.slice(i, i + 8).map(check));
+    for (let i = 0; i < PAIRS.length; i += 8) {
+      await Promise.all(PAIRS.slice(i, i + 8).map(check));
     }
   });
 });
@@ -258,21 +298,89 @@ describe("how the real router reads a path", () => {
     expect(await sessionsOf(row.id)).toEqual([]);
   });
 
-  it("a restricted session cannot reach a session read under another spelling", async () => {
-    const { client, user: row } = await verifiedUser();
-    await testDb()
-      .update(user)
-      .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
-      .where(eq(user.id, row.id));
-    for (const spelling of [
+  // T15 — for EVERY restricted state, against the real handler: another spelling of an endpoint
+  // (of one the state may reach, and of ones it may not) is no endpoint at all — 404 before any
+  // gate (middleware/canonical.ts) — and nothing about the account or its sessions changes.
+  it("a restricted session — suspended, impersonated, past its deletion date — reaches nothing under another spelling", async () => {
+    const SPELLINGS = [
       "/api/auth/get-session/",
       "/api/auth/GET-SESSION",
       "/api/auth//get-session",
       "/api/auth/get%2Dsession",
-    ]) {
-      const anew = newClient({ cookies: new Map(client.cookies), ip: client.ip });
-      const sent = await send(anew, spelling);
-      expect(sent.text, spelling).not.toContain(row.email);
+      "/api/auth/%67et-session",
+      "/api/auth/get-session%2F",
+      "/api/auth/sign-out/",
+      "/api/auth/update-user/",
+      "/api/auth//update-user",
+      "/api/auth/Update-User",
+      "/api/auth/update%2Duser",
+      "/api/auth/change-email;x=1/",
+      "/api/auth/admin/stop-impersonating/",
+      "/api/auth/list-sessions%20",
+    ];
+    const restricted: Array<[AuthGateState, () => Promise<{ client: Client; id: string; email: string }>]> = [
+      [
+        "suspended",
+        async () => {
+          const made = await verifiedUser();
+          await testDb()
+            .update(user)
+            .set({ suspendedAt: new Date(), suspendedReason: "test" })
+            .where(eq(user.id, made.user.id));
+          return { client: made.client, id: made.user.id, email: made.email };
+        },
+      ],
+      [
+        "deleted",
+        async () => {
+          const made = await verifiedUser();
+          await testDb()
+            .update(user)
+            .set({ deleteScheduledAt: new Date(Date.now() - 3_600_000) })
+            .where(eq(user.id, made.user.id));
+          return { client: made.client, id: made.user.id, email: made.email };
+        },
+      ],
+      [
+        "impersonating",
+        async () => {
+          const admin = await verifiedUser();
+          await promoteToAdmin(admin.user.id);
+          const target = await verifiedUser();
+          const started = await send(admin.client, "/api/auth/admin/impersonate-user", {
+            json: { userId: target.user.id },
+          });
+          expect(started.status, started.text).toBe(200);
+          return { client: admin.client, id: target.user.id, email: target.email };
+        },
+      ],
+    ];
+    for (const [state, make] of restricted) {
+      const { client, id, email } = await make();
+      const before = await fingerprint(id);
+      const sessions = (await sessionsOf(id)).length;
+      for (const spelling of SPELLINGS) {
+        for (const method of ["GET", "POST"]) {
+          const sent = await send(
+            client,
+            spelling,
+            method === "GET"
+              ? {}
+              : {
+                  json: { name: "Changed Through Another Spelling", newEmail: "moved@holdfast-test.example" },
+                },
+          );
+          const label = `${state} ${method} ${spelling}`;
+          expect(sent.status, label).toBe(404);
+          expect(sent.body, label).toMatchObject({ error: "not_found" });
+          expect(sent.text, label).not.toContain(email);
+          expect(sent.setCookies, label).toEqual([]);
+        }
+      }
+      expect(await fingerprint(id), `${state}: nothing about the account changed`).toEqual(before);
+      // (a deleted account's session is revoked the first time a real endpoint sees it — these
+      // requests reached none)
+      expect((await sessionsOf(id)).length, `${state}: sessions`).toBe(sessions);
     }
   });
 });
