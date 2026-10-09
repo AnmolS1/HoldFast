@@ -18,6 +18,7 @@ import {
   SIGNUP_REFUSALS,
   SIGNUP_VELOCITY_DEFAULTS,
 } from "../../../src/worker/services/signup-policy";
+import { isThirteenOrOlder as sharedIsThirteenOrOlder } from "../../../src/shared/age";
 import { BA_ID } from "../../../src/shared/ids";
 import authSchemaSource from "../../../src/worker/db/auth-schema.ts?raw";
 import schemaSource from "../../../src/worker/db/schema.ts?raw";
@@ -203,6 +204,34 @@ describe("the gates, one at a time", () => {
     expect(isThirteenOrOlder(2026, 10, at)).toBe(false);
     expect(isThirteenOrOlder(2027, 1, at)).toBe(false);
     expect(() => parseStatement({ acceptTerms: true, birthYear: 2020, birthMonth: 1 }, at)).toThrow();
+  });
+
+  it("the age rule is the one the sign-up form uses (src/shared/age.ts), at every boundary", () => {
+    // The same table as tests/unit/client/shell/forms.test.tsx.
+    const table: Array<[number, number, string, boolean]> = [
+      [2013, 9, "2026-10-08T12:00:00Z", true],
+      [2013, 10, "2026-10-08T12:00:00Z", false],
+      [2013, 11, "2026-10-08T12:00:00Z", false],
+      [2013, 12, "2026-11-30T23:59:59Z", false],
+      [2012, 12, "2025-12-01T00:00:00Z", false],
+      [2012, 12, "2026-01-01T00:00:00Z", true],
+      [2013, 1, "2026-01-31T12:00:00Z", false],
+      [2013, 1, "2026-02-01T00:00:00Z", true],
+      [2013, 9, "2026-09-30T23:59:59Z", false],
+      [2013, 9, "2026-10-01T00:00:00Z", true],
+      [1990, 5, "2026-10-08T12:00:00Z", true],
+      [2026, 10, "2026-10-08T12:00:00Z", false],
+      [2027, 1, "2026-10-08T12:00:00Z", false],
+      [1899, 12, "2026-10-08T12:00:00Z", false],
+      [2000, 0, "2026-10-08T12:00:00Z", false],
+      [2000, 13, "2026-10-08T12:00:00Z", false],
+      [2000.5, 5, "2026-10-08T12:00:00Z", false],
+    ];
+    for (const [year, month, at, expected] of table) {
+      const when = new Date(at);
+      expect(isThirteenOrOlder(year, month, when), `${year}-${month} at ${at}`).toBe(expected);
+      expect(sharedIsThirteenOrOlder(year, month, when), `shared ${year}-${month} at ${at}`).toBe(expected);
+    }
   });
 
   it("4. allowed domains: when SIGNUP_ALLOWED_DOMAINS is set, only those may sign up", async () => {

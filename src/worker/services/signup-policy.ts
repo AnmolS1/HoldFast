@@ -32,6 +32,7 @@
 // the FUTURE refuses nothing and cancels nothing: the owner signs in, sees the banner, and
 // cancels explicitly. A banned account is refused by the admin plugin's own session hook.
 
+import { isThirteenOrOlder as sharedIsThirteenOrOlder } from "../../shared/age";
 import { hasAdminRole } from "../../shared/roles";
 import { isDisposableDomain } from "../auth/data/disposable-domains";
 import { PUBLIC_MAIL_PROVIDERS } from "../auth/data/public-mail-providers";
@@ -112,17 +113,11 @@ export function parseStatement(raw: unknown, at: Date = now()): SignupStatement 
 }
 
 /**
- * Certainly thirteen, from a birth month and year (the day is never asked). Counted in whole
- * months and strictly: someone whose thirteenth birthday falls in the current month may not have
- * had it yet, so that month does not count. A date in the future, or before 1900, is not an age.
+ * Certainly thirteen — the rule itself is src/shared/age.ts, the one copy the sign-up form uses
+ * too. Here it reads the server's clock.
  */
 export function isThirteenOrOlder(birthYear: number, birthMonth: number, at: Date = now()): boolean {
-  if (!isInt(birthYear) || !isInt(birthMonth) || birthMonth < 1 || birthMonth > 12) return false;
-  const year = at.getUTCFullYear();
-  const month = at.getUTCMonth() + 1;
-  if (birthYear < 1900 || birthYear > year) return false;
-  const monthsOld = (year - birthYear) * 12 + (month - birthMonth);
-  return monthsOld > 13 * 12;
+  return sharedIsThirteenOrOlder(birthYear, birthMonth, at);
 }
 
 // ── addresses ───────────────────────────────────────────────────────────────────────────────

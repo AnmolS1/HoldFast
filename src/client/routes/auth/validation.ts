@@ -1,5 +1,6 @@
 // Pure checks for the auth forms. The server is the authority on every one of them; these exist
 // so a person sees what is wrong before a round trip.
+import { isThirteenOrOlder as sharedIsThirteenOrOlder } from "../../../shared/age";
 import type { MessageKey } from "../../lib/i18n";
 
 export const PASSWORD_MIN = 12;
@@ -43,11 +44,12 @@ export function passwordStrength(password: string): 0 | 1 | 2 | 3 | 4 {
   return Math.min(4, score) as 1 | 2 | 3 | 4;
 }
 
-/** Thirteen or older, from a birth month and year (the day is never asked). */
+/**
+ * Certainly thirteen, from a birth month and year (the day is never asked). The rule is the
+ * server's own function (src/shared/age.ts): the form must never accept what the server refuses.
+ */
 export function isThirteenOrOlder(birthYear: number, birthMonth: number, now: Date = new Date()): boolean {
-  const years = now.getFullYear() - birthYear;
-  if (years !== 13) return years > 13;
-  return now.getMonth() + 1 >= birthMonth;
+  return sharedIsThirteenOrOlder(birthYear, birthMonth, now);
 }
 
 export interface SignupValues {
@@ -70,7 +72,8 @@ export function parseBirth(
   if (!/^\d{1,2}$/.test(values.birthMonth.trim()) || !/^\d{4}$/.test(values.birthYear.trim())) return null;
   const month = Number(values.birthMonth);
   const year = Number(values.birthYear);
-  if (month < 1 || month > 12 || year < 1900 || year > now.getFullYear()) return null;
+  // The current year in UTC, as the age rule reads it.
+  if (month < 1 || month > 12 || year < 1900 || year > now.getUTCFullYear()) return null;
   return { month, year };
 }
 
