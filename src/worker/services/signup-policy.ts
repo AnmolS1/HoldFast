@@ -11,7 +11,12 @@
 //   4. allowed domains    when `SIGNUP_ALLOWED_DOMAINS` is set, only those (and 5 is skipped)
 //   5. disposable email   the vendored list, then an MX lookup (a failed lookup does not block)
 //   6. velocity           per address, per network, per ASN, per email domain — a day's counters
-//   7. invite             when sign-up is invite-only; `ADMIN_EMAILS` are exempt (bootstrap)
+//   7. invite             when sign-up is invite-only — for EVERY address. An `ADMIN_EMAILS`
+//                         address needs one like any other (the first admin's is made with
+//                         scripts/create-invite.ts): an exemption would answer a sign-up without
+//                         an invite differently for an admin address, telling anyone who asks
+//                         which addresses are admins. `ADMIN_EMAILS` only decides who is given
+//                         the admin role at their first VERIFIED session (`checkSessionStart`).
 // 6 and 7 are TAKEN, not just checked: one transaction counts the sign-up on every velocity
 // subject and uses the invite, or does neither (db/queries/auth-lifecycle.ts `reserveSignup`).
 // That is what makes them hold under concurrency — a check here and an increment after the
@@ -141,7 +146,10 @@ function listOf(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-/** Is the address one of `ADMIN_EMAILS`? (Exempt from the invite; `admin` once verified.) */
+/**
+ * Is the address one of `ADMIN_EMAILS`? Used for ONE thing: granting the admin role when a
+ * verified account starts a session. It must never change what a sign-up is answered.
+ */
 export function isAdminEmail(env: Pick<Env, "ADMIN_EMAILS">, email: string): boolean {
   return listOf(env.ADMIN_EMAILS).includes(email.trim().toLowerCase());
 }
@@ -254,9 +262,9 @@ export async function velocitySubjects(
 
 // ── the checks ──────────────────────────────────────────────────────────────────────────────
 
-/** Is an invite needed for this address right now? */
-export async function inviteRequired(scope: AuthScope, email: string): Promise<boolean> {
-  return (await scope.settings()).signupMode === "invite" && !isAdminEmail(scope.env, email);
+/** Is an invite needed right now? The same answer for every address (see check 7 above). */
+export async function inviteRequired(scope: AuthScope): Promise<boolean> {
+  return (await scope.settings()).signupMode === "invite";
 }
 
 /**
@@ -290,7 +298,7 @@ export async function precheckSignup(
       throw new SignupRefusal("SIGNUP_LIMIT");
     }
   }
-  const needsInvite = settings.signupMode === "invite" && !(email !== null && isAdminEmail(scope.env, email));
+  const needsInvite = settings.signupMode === "invite";
   if (needsInvite && !(statement.inviteCode && (await inviteUsable(scope.db, statement.inviteCode)))) {
     throw new SignupRefusal("INVITE_INVALID");
   }
@@ -323,7 +331,7 @@ export async function takeSignup(
   const problem = await emailProblem(scope, email);
   if (problem) throw new SignupRefusal(problem);
 
-  const needsInvite = await inviteRequired(scope, email);
+  const needsInvite = await inviteRequired(scope);
   if (needsInvite && !statement.inviteCode) throw new SignupRefusal("INVITE_INVALID");
 
   const day = utcDay(at);
@@ -350,6 +358,33 @@ export async function takeSignup(
     invitedBy: result.invitedBy,
     quotaBytes: Number.isSafeInteger(quota) && quota > 0 ? quota : 5_368_709_120,
   };
+}
+
+/**
+ * What changing an unverified account's address costs: one count on every velocity subject of
+ * the NEW address — the same budget a sign-up with that address takes (check 6), in the same
+ * transaction shape. Throws `SignupRefusal("SIGNUP_LIMIT")` at a limit. No invite is involved:
+ * the account being moved already used one.
+ *
+ * The caller takes this BEFORE it looks at any account, and never gives it back: whether the
+ * change then moved an account, or the address belongs to someone, or the cookie names nobody,
+ * costs the same — so the route cannot be used to try addresses for free.
+ */
+export async function takeAddressChange(
+  scope: AuthScope,
+  newEmail: string,
+  client: ClientFacts,
+): Promise<void> {
+  const at = now();
+  const day = utcDay(at);
+  const result = await reserveSignup(scope.db, {
+    day,
+    subjects: await velocitySubjects(scope, newEmail, client, day),
+    inviteCode: null,
+    intentNonce: null,
+    now: at,
+  });
+  if (!result.ok) throw new SignupRefusal("SIGNUP_LIMIT");
 }
 
 // ── sessions ────────────────────────────────────────────────────────────────────────────────

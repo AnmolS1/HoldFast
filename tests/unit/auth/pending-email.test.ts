@@ -204,7 +204,9 @@ describe("PATCH /api/account/pending-email", () => {
   });
 
   it("one sign-up may change its address five times", async () => {
-    const client = newClient();
+    // Each change also counts against the day's sign-up budget of the address (three by default —
+    // tests/unit/auth/invite-gate.test.ts); raised here so that the cap under test is the cookie's.
+    const client = newClient({ settings: { ceilings: { signupIpDay: 50 } } });
     await signUp(client);
     for (let i = 1; i <= 5; i++) expect((await change(client, freshEmail())).status, `change ${i}`).toBe(200);
     const sixth = await change(client, freshEmail());

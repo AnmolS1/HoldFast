@@ -13,6 +13,14 @@
 // else. Only the new address ITSELF can make it fail (not an address, a disposable or
 // disallowed domain). The response is held to a minimum time for the same reason.
 //
+// THE NEW ADDRESS PASSES WHAT A SIGN-UP WITH IT WOULD. Everything in the sign-up policy that
+// depends on the address is applied to the new one: allowed domains, disposable domains and the
+// MX check (checks 4 and 5), and the day's velocity counters (check 6) — a change COUNTS as a
+// sign-up on every subject of the new address, the address's domain included, and is refused at
+// a limit. The count is taken before any account is looked at and is never given back, so trying
+// an address costs the same whatever the answer to "does it exist" is. The invite (check 7) is
+// not re-used: the account being moved was created with one, and keeps its `invitedBy`.
+//
 // The account is changed only while it is unverified (the condition is part of the UPDATE), the
 // old verification link stops working (it names the old address, which no account has any
 // more), and a new one is sent to the new address. One sign-up may do this five times.
@@ -39,7 +47,7 @@ import { sendVerification } from "../services/email";
 import { AppError } from "../services/errors";
 import { enforceRateLimit } from "../services/ratelimit";
 import { auth, db, defer, deps, type AppEnv } from "../services/request-context";
-import { emailProblem, SIGNUP_REFUSALS } from "../services/signup-policy";
+import { emailProblem, SIGNUP_REFUSALS, SignupRefusal, takeAddressChange } from "../services/signup-policy";
 
 export const router = new Hono<AppEnv>();
 
@@ -84,6 +92,21 @@ router.patch(
     if (problem) throw new AppError("validation", SIGNUP_REFUSALS[problem], { reason: problem });
 
     if (newEmail !== claim.email) {
+      // Check 6, taken — before anything is known about any account (see the header).
+      const cf = c.req.raw.cf as { asn?: unknown; country?: unknown } | undefined;
+      try {
+        await takeAddressChange(scope, newEmail, {
+          ip: c.get("ip"),
+          asn: typeof cf?.asn === "number" ? cf.asn : null,
+          country: typeof cf?.country === "string" ? cf.country : null,
+          userAgent: c.req.header("user-agent") ?? null,
+        });
+      } catch (error) {
+        if (error instanceof SignupRefusal) {
+          throw new AppError("rate_limited", error.message, { reason: error.code });
+        }
+        throw error;
+      }
       const account = await getAccount(db(c), claim.userId);
       // The account this sign-up created, still unverified and still at the address the cookie names.
       if (account && !account.emailVerified && account.email === claim.email) {

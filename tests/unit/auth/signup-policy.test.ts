@@ -1,20 +1,16 @@
 // The sign-up policy, through the real handler: every gate refuses (never a fake success, never
 // a user row, never a spent invite), the counters hold under concurrency, and nothing a person
 // states about their age is stored.
-import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { DISPOSABLE_DOMAINS, isDisposableDomain } from "../../../src/worker/auth/data/disposable-domains";
 import { PUBLIC_MAIL_PROVIDERS } from "../../../src/worker/auth/data/public-mail-providers";
-import { createScope } from "../../../src/worker/auth/scope";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
-import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
 import { addUsage, utcDay } from "../../../src/worker/db/queries/ledger";
 import { downloadLedger, user, userPrefs } from "../../../src/worker/db/schema";
 import { dayUTC, ipHashDaily, ipPrefix } from "../../../src/worker/services/ip-hash";
 import { createKeys } from "../../../src/worker/services/keys";
 import {
-  checkSessionStart,
   domainAcceptsMail,
   emailDomain,
   isThirteenOrOlder,
@@ -27,22 +23,17 @@ import authSchemaSource from "../../../src/worker/db/auth-schema.ts?raw";
 import schemaSource from "../../../src/worker/db/schema.ts?raw";
 import { testVars } from "../../setup/test-vars";
 import {
-  forgetMailCountOf,
-  ADMIN_EMAIL,
-  auditRows,
   createInvite,
   freshEmail,
   freshIp,
   getSession,
   inviteRow,
-  linkIn,
   newClient,
   send,
   sessionsOf,
   signUp,
   testDb,
   userByEmail,
-  waitForMail,
   type SignUpInput,
 } from "./helpers";
 
@@ -503,77 +494,9 @@ describe("concurrency", () => {
   });
 });
 
-describe("ADMIN_EMAILS", () => {
-  beforeAll(async () => {
-    const existing = await userByEmail(ADMIN_EMAIL);
-    if (existing) await purgeAuthRows(testDb(), existing.id);
-    await forgetMailCountOf(ADMIN_EMAIL);
-  });
-
-  it("bypasses the invite, is not an admin while unverified, and becomes one at its first session", async () => {
-    // The control: any other address without an invite is refused.
-    await expectRefused("INVITE_INVALID", { inviteCode: null });
-
-    const client = newClient();
-    const { sent } = await signUp(client, { email: ADMIN_EMAIL, inviteCode: null });
-    expect(sent.status, sent.text).toBe(200);
-    const unverified = await userByEmail(ADMIN_EMAIL);
-    expect(unverified!.emailVerified).toBe(false);
-    expect(unverified!.role).toBe("user");
-    expect(unverified!.invitedBy).toBeNull();
-
-    const verified = await send(client, linkIn(await waitForMail(ADMIN_EMAIL, "verification")));
-    expect(verified.status).toBe(302);
-    const row = await userByEmail(ADMIN_EMAIL);
-    expect(row!.emailVerified).toBe(true);
-    expect(row!.role).toBe("admin");
-    expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
-
-    // A second session does not grant (or audit) again.
-    await send(client, "/api/auth/sign-out", { json: {} });
-    const again = await send(client, "/api/auth/sign-in/email", {
-      json: { email: ADMIN_EMAIL, password: "correct horse battery staple 9!" },
-      headers: { "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" },
-    });
-    expect(again.status).toBe(200);
-    expect(await auditRows({ action: "auth.admin_granted", targetId: row!.id })).toHaveLength(1);
-    await purgeAuthRows(testDb(), row!.id);
-  });
-
-  it("the role is granted only to a VERIFIED admin address, and never through an impersonated session", async () => {
-    const existing = await userByEmail(ADMIN_EMAIL);
-    if (existing) await purgeAuthRows(testDb(), existing.id);
-    const scope = createScope(env, testDb(), { waitUntil: () => {}, passThroughOnException: () => {} });
-    const roleOf = async (id: string) =>
-      (await testDb().select({ role: user.role }).from(user).where(eq(user.id, id)))[0]!.role;
-    const { sent } = await signUp(newClient(), { email: ADMIN_EMAIL, inviteCode: null });
-    expect(sent.status).toBe(200);
-    const row = await userByEmail(ADMIN_EMAIL);
-
-    // Unverified: a session start (were one possible) grants nothing.
-    await checkSessionStart(scope, row!.id, false);
-    expect(await roleOf(row!.id)).toBe("user");
-    // Verified, but the session being started is an admin impersonating this account: nothing.
-    await testDb().update(user).set({ emailVerified: true }).where(eq(user.id, row!.id));
-    await checkSessionStart(scope, row!.id, true);
-    expect(await roleOf(row!.id)).toBe("user");
-    // Verified, its own session: granted.
-    await checkSessionStart(scope, row!.id, false);
-    expect(await roleOf(row!.id)).toBe("admin");
-    // Any other verified account: never.
-    const other = await signUp(newClient());
-    const otherRow = await userByEmail(other.email);
-    await testDb().update(user).set({ emailVerified: true }).where(eq(user.id, otherRow!.id));
-    await checkSessionStart(scope, otherRow!.id, false);
-    expect(await roleOf(otherRow!.id)).toBe("user");
-    await purgeAuthRows(testDb(), row!.id);
-  });
-
-  it("matches the whole address, case-insensitively, and nothing else", async () => {
-    await expectRefused("INVITE_INVALID", { email: `x${ADMIN_EMAIL}`, inviteCode: null });
-    await expectRefused("INVITE_INVALID", { email: ADMIN_EMAIL.replace("@", "+tag@"), inviteCode: null });
-  });
-});
+// ADMIN_EMAILS — who gets the admin role, and that it changes nothing about a sign-up — is
+// tests/unit/auth/invite-gate.test.ts (one file, because the test environment names one admin
+// address and two files signing it up at once would see each other's rows).
 
 describe("the date of birth is stored nowhere", () => {
   it("no table has a column for it", () => {
