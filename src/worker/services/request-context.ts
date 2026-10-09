@@ -17,6 +17,25 @@
 // work, and only then closes the pool. Closing while deferred work still uses the pool is the one
 // placement that fails ("Cannot use a pool after calling end on the pool").
 //
+// BOUNDS. Waiting "until nothing is left" is bounded three ways, so no deferred task can hold the
+// pool or the invocation open:
+//   DRAIN_DEADLINE_MS     20 s for the WHOLE drain, counted from when the handler returned. The
+//                         platform gives `waitUntil` 30 s after the response, shared by every
+//                         call of one request, and cancels what is left ("`ctx.waitUntil()` can
+//                         extend execution for up to 30 seconds after the response is sent or the
+//                         client disconnects … If any Promises have not settled after 30 seconds,
+//                         they are canceled" — developers.cloudflare.com/workers/runtime-apis/
+//                         context/#waituntil). At the deadline the pool is closed regardless —
+//                         forcibly, connections still lent out included — and the number of
+//                         abandoned tasks is logged and counted. The 10 s left are for the close.
+//   MAX_DEFERRED_TASKS    100 `defer` calls per invocation.
+//   MAX_DEFER_ROUNDS      8 drain passes: work deferred by deferred work, eight levels deep.
+// Past either cap `defer()` throws `DEFER_LIMIT` and does not register the promise — a task that
+// re-defers itself forever stops there. Queue and cron runs (`runBackground`) have the same three
+// bounds on what they defer; the work a job awaits itself is not deferred work and is bounded by
+// the platform's 15 minutes. So: deferred work is for short follow-ups (an audit row, a metric,
+// a mail) that finish well inside 20 s. Anything longer goes to a queue.
+//
 // RULES FOR ROUTE AUTHORS
 //  (a) Never call `c.executionCtx.waitUntil` for anything that touches the database: use `defer`.
 //  (b) A handler that returns a streaming body fed from the database passes the stream's
@@ -34,7 +53,7 @@ import type { insertAudit } from "../db/queries/audit";
 import type { getSettings, Settings } from "../db/queries/settings";
 import type { termsVersionOf } from "../db/queries/users";
 import { createKeys, type Keys } from "./keys";
-import { metric } from "./metrics";
+import { metric, writeMetric } from "./metrics";
 
 /** Hono environment of both apps. `Variables` holds the eager per-request values only. */
 export type AppEnv = {
@@ -58,6 +77,8 @@ export type ServiceDeps = {
 
 /** The concrete modules injected into the apps. Only the Worker entry imports them. */
 export type CoreDeps = {
+  /** Overrides of the drain bounds. For tests only (a 20 s deadline cannot be waited for). */
+  limits?: Partial<DeferLimits>;
   createDb: typeof createDb;
   createAuth: (env: Env, db: Db, ctx: ExecutionContext) => Auth;
   getSettings: typeof getSettings;
@@ -101,6 +122,16 @@ export type BackgroundContext = ServiceDeps & {
 };
 
 export const CONTEXT_CLOSED = "request context closed";
+export const DEFER_LIMIT = "too much deferred work in one invocation";
+
+/** The whole drain, from the moment the handler returned. Under the platform's 30 s. */
+export const DRAIN_DEADLINE_MS = 20_000;
+/** `defer` calls per invocation. */
+export const MAX_DEFERRED_TASKS = 100;
+/** Drain passes per invocation: how deep deferred work may defer more work. */
+export const MAX_DEFER_ROUNDS = 8;
+
+export type DeferLimits = { drainDeadlineMs: number; maxDeferredTasks: number; maxDeferRounds: number };
 
 /** Env defaults under the settings table. An unknown `SIGNUP_MODE` is the closed one. */
 export function resolveSettings(
@@ -126,16 +157,41 @@ type Lifetime = {
   core: CoreDeps;
   env: Env;
   ctx: WaitUntil;
+  limits: DeferLimits;
   deferred: Promise<unknown>[];
+  /** `defer` calls accepted so far, and how many of their promises have not settled. */
+  accepted: number;
+  unsettled: number;
+  /** The drain pass that is running (0 = the handler has not returned yet). */
+  round: number;
   /** Set once the drain loop has ended and `close()` is about to run. Nothing is accepted after it. */
   closed: boolean;
-  handle: { db: Db; close: () => Promise<void> } | null;
+  handle: ReturnType<typeof createDb> | null;
   keys: Keys | null;
   settings: Promise<ResolvedSettings> | null;
 };
 
 function newLifetime(core: CoreDeps, env: Env, ctx: WaitUntil): Lifetime {
-  return { core, env, ctx, deferred: [], closed: false, handle: null, keys: null, settings: null };
+  const limits: DeferLimits = {
+    drainDeadlineMs: DRAIN_DEADLINE_MS,
+    maxDeferredTasks: MAX_DEFERRED_TASKS,
+    maxDeferRounds: MAX_DEFER_ROUNDS,
+    ...core.limits,
+  };
+  return {
+    core,
+    env,
+    ctx,
+    limits,
+    deferred: [],
+    accepted: 0,
+    unsettled: 0,
+    round: 0,
+    closed: false,
+    handle: null,
+    keys: null,
+    settings: null,
+  };
 }
 
 function lifeDb(life: Lifetime): Db {
@@ -146,7 +202,26 @@ function lifeDb(life: Lifetime): Db {
 
 function lifeDefer(life: Lifetime, p: Promise<unknown>): void {
   // Work registered on a pool that is closing cannot be honoured; say so instead of losing it.
-  if (life.closed) throw new Error(CONTEXT_CLOSED);
+  if (life.closed) {
+    p.catch(() => {});
+    throw new Error(CONTEXT_CLOSED);
+  }
+  // Past a cap the promise is NOT registered: nothing waits for it and the pool will not stay
+  // open for it. Throwing is what stops a task that re-defers itself forever.
+  const tooMany = life.accepted >= life.limits.maxDeferredTasks;
+  const tooDeep = life.round >= life.limits.maxDeferRounds;
+  if (tooMany || tooDeep) {
+    p.catch(() => {});
+    writeMetric(life.env, "error", { kind: "defer_refused", reason: tooMany ? "tasks" : "rounds" });
+    console.warn(`defer() refused: ${tooMany ? "task" : "round"} limit reached`);
+    throw new Error(DEFER_LIMIT);
+  }
+  life.accepted += 1;
+  life.unsettled += 1;
+  const settled = () => {
+    life.unsettled -= 1;
+  };
+  p.then(settled, settled);
   life.deferred.push(p);
   life.ctx.waitUntil(p);
 }
@@ -167,11 +242,39 @@ function lifeSettings(life: Lifetime): Promise<ResolvedSettings> {
  * A single `Promise.allSettled(deferred)` would miss work deferred by deferred work, and the pool
  * would close under it — hence the loop: each pass takes what is there, and it ends only when a
  * pass registered nothing new.
+ *
+ * The loop is bounded (see BOUNDS in the header): one deadline for the whole drain, after which
+ * the pool is closed whatever is still running, and `lifeDefer` refuses work past the pass limit.
+ * A per-task timeout would not be a bound — tasks can be many, and can defer more.
  */
 async function drainAndClose(life: Lifetime): Promise<void> {
-  while (life.deferred.length) await Promise.allSettled(life.deferred.splice(0));
-  life.closed = true;
-  if (life.handle) await life.handle.close();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"deadline">((resolve) => {
+    timer = setTimeout(() => resolve("deadline"), life.limits.drainDeadlineMs);
+  });
+  let abandoned = 0;
+  try {
+    while (life.deferred.length) {
+      life.round += 1;
+      const pass = Promise.allSettled(life.deferred.splice(0)).then(() => "settled" as const);
+      if ((await Promise.race([pass, deadline])) === "deadline") {
+        abandoned = life.unsettled;
+        break;
+      }
+    }
+  } finally {
+    clearTimeout(timer);
+    life.closed = true;
+    life.deferred.length = 0;
+  }
+  if (abandoned > 0) {
+    // The count only: never what the tasks were.
+    writeMetric(life.env, "error", { kind: "deferred_abandoned" }, abandoned);
+    console.warn(`deferred work abandoned at the drain deadline: ${abandoned} task(s) had not settled`);
+  }
+  // Forced when tasks were abandoned: one of them may hold a connection, and an ordinary close
+  // waits for every connection to come back.
+  if (life.handle) await life.handle.close({ force: abandoned > 0 });
 }
 
 // ── Request path ──────────────────────────────────────────────────────────────────────────────

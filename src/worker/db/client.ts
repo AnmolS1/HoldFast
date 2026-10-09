@@ -29,7 +29,7 @@
 import type { ExtractTablesWithRelations } from "drizzle-orm";
 import { drizzle, type NodePgDatabase, type NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
-import { Pool, types } from "pg";
+import { Pool, types, type PoolClient } from "pg";
 import * as schema from "./schema";
 
 /** OID of `timestamp` WITHOUT time zone. */
@@ -59,16 +59,38 @@ export type Tx = PgTransaction<NodePgQueryResultHKT, Schema, ExtractTablesWithRe
  */
 export type Executor = PgDatabase<NodePgQueryResultHKT, Schema, ExtractTablesWithRelations<Schema>>;
 
-/** Takes no ExecutionContext and schedules nothing. `close()` is idempotent. */
-export function createDb(env: Env): { db: Db; close: () => Promise<void> } {
+/**
+ * Takes no ExecutionContext and schedules nothing. `close()` is idempotent.
+ *
+ * `close()` waits for every checked-out connection to be returned (pg's `pool.end()`), so it
+ * never resolves while some task still holds one. `close({ force: true })` is for the caller
+ * that has given up on such tasks: it first destroys the connections that are still checked out
+ * — their owners' next query fails — and then ends the pool.
+ */
+export function createDb(env: Env): { db: Db; close: (opts?: { force?: boolean }) => Promise<void> } {
   const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
   const db = drizzle(pool, { schema, casing: "snake_case" });
+  // Connections currently lent out, so a forced close can take them back.
+  const lent = new Set<PoolClient>();
+  pool.on("acquire", (client) => lent.add(client));
+  pool.on("release", (_error, client) => lent.delete(client));
   let closed = false;
   return {
     db,
-    close: async () => {
+    close: async (opts = {}) => {
       if (closed) return;
       closed = true;
+      if (opts.force) {
+        for (const client of [...lent]) {
+          lent.delete(client);
+          try {
+            // `true` destroys the connection instead of returning it to the pool.
+            client.release(true);
+          } catch {
+            // Already released by its owner in the meantime.
+          }
+        }
+      }
       await pool.end();
     },
   };

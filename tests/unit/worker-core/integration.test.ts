@@ -26,6 +26,10 @@ import { audit } from "../../../src/worker/services/audit";
 import {
   db,
   defer,
+  DEFER_LIMIT,
+  DRAIN_DEADLINE_MS,
+  MAX_DEFER_ROUNDS,
+  MAX_DEFERRED_TASKS,
   runBackground,
   type AppEnv,
   type CoreDeps,
@@ -287,6 +291,211 @@ describe("deferred work on a real pool", () => {
     );
     expect(rows).toEqual([{ answer: 42 }]);
     await expectPoolEnded(seen.db);
+  });
+
+  // ── the drain is bounded ──────────────────────────────────────────────────────────────────
+  // The real pool, real Postgres; only the deadline is shortened (20 s cannot be waited for).
+  const quick = (limits: CoreDeps["limits"]): CoreDeps => ({ ...realCore, limits });
+  const metricsSink = () => {
+    const points: Array<{ blobs: string[]; doubles: number[] }> = [];
+    const METRICS = {
+      writeDataPoint: (point: { blobs: string[]; doubles: number[] }) => void points.push(point),
+    };
+    return { points, METRICS };
+  };
+  /** The drain-then-close promise: the last thing the middleware hands to waitUntil. */
+  const drainOf = (ctx: { pending: Promise<unknown>[] }) => ctx.pending.at(-1)!;
+  const healthy = async () => {
+    const { response, ctx } = await call(createApp(realCore), "/api/health");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, db: true, r2: true });
+    await ctx.settle();
+  };
+
+  it("fetch: a deferred task that never settles — holding a connection — is abandoned at the deadline and the pool is closed", async () => {
+    const seen: { db?: Db } = {};
+    let release!: () => void;
+    const never = new Promise<void>((resolve) => (release = resolve));
+    let holding = false;
+    const sink = metricsSink();
+    const router = new Hono<AppEnv>();
+    router.get("/_it/hung", (c) => {
+      seen.db = db(c);
+      // Checks a connection out of the pool and keeps it: an ordinary pool.end() waits for it.
+      defer(
+        c,
+        db(c).transaction(async (tx) => {
+          await tx.execute(sql`select 1`);
+          holding = true;
+          await never;
+        }),
+      );
+      defer(c, sleep(5));
+      return c.json({ ok: true });
+    });
+    const started = Date.now();
+    const { response, ctx } = await call(
+      createApp(quick({ drainDeadlineMs: 300 }), { extraRouters: [router] }),
+      "/api/_it/hung",
+      { env: { METRICS: sink.METRICS } },
+    );
+    expect(response.status).toBe(200);
+    await response.text();
+    await drainOf(ctx);
+    const took = Date.now() - started;
+
+    expect(holding).toBe(true);
+    expect(took).toBeGreaterThanOrEqual(290);
+    expect(took).toBeLessThan(5_000);
+    await expectPoolEnded(seen.db);
+    // Counted and logged: how many, never what.
+    const abandoned = sink.points.filter((point) => point.blobs[2] === "deferred_abandoned");
+    expect(abandoned).toHaveLength(1);
+    expect(abandoned[0]!.doubles[0]).toBe(1);
+    expect(JSON.stringify(abandoned)).not.toContain("_it/hung");
+    // The connection it held was taken back: the server no longer has it in a transaction.
+    // And the next invocation is unaffected.
+    await healthy();
+    release();
+  });
+
+  it("fetch: a task that re-defers itself forever stops at the round limit, and the pool is closed", async () => {
+    const seen: { db?: Db } = {};
+    let runs = 0;
+    let refusal: unknown;
+    const sink = metricsSink();
+    const router = new Hono<AppEnv>();
+    router.get("/_it/forever", (c) => {
+      seen.db = db(c);
+      const again = async (): Promise<void> => {
+        runs += 1;
+        await db(c).execute(sql`select 1`);
+        try {
+          defer(c, again());
+        } catch (error) {
+          // The first refusal: the already-started next run is refused again, later, as "closed".
+          refusal ??= error;
+        }
+      };
+      // The handler's own defer is not a re-deferral; `again` starts on the first drain pass.
+      defer(c, sleep(1).then(again));
+      return c.json({ ok: true });
+    });
+    const { response, ctx } = await call(
+      createApp(quick({ maxDeferRounds: 4 }), { extraRouters: [router] }),
+      "/api/_it/forever",
+      { env: { METRICS: sink.METRICS } },
+    );
+    await response.text();
+    await ctx.settle();
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(DEFER_LIMIT);
+    // Passes 1–4 ran one task each; the fifth run is the one whose defer was refused (it had
+    // already started a sixth, which nothing waits for and which finds the pool closed).
+    expect(runs).toBeGreaterThanOrEqual(5);
+    expect(runs).toBeLessThanOrEqual(6);
+    expect(sink.points.filter((point) => point.blobs[2] === "defer_refused").map((p) => p.blobs[3])).toEqual([
+      "rounds",
+    ]);
+    await expectPoolEnded(seen.db);
+    await healthy();
+  });
+
+  it("fetch: defer() refuses the task past the per-invocation cap; the first ones still run", async () => {
+    let ran = 0;
+    let refused = 0;
+    const router = new Hono<AppEnv>();
+    router.get("/_it/many", (c) => {
+      for (let n = 0; n < 12; n++) {
+        try {
+          defer(
+            c,
+            (async () => {
+              await db(c).execute(sql`select 1`);
+              ran += 1;
+            })(),
+          );
+        } catch (error) {
+          expect((error as Error).message).toBe(DEFER_LIMIT);
+          refused += 1;
+        }
+      }
+      return c.json({ ok: true });
+    });
+    const { response, ctx } = await call(
+      createApp(quick({ maxDeferredTasks: 10 }), { extraRouters: [router] }),
+      "/api/_it/many",
+    );
+    await response.text();
+    await ctx.settle();
+    expect(refused).toBe(2);
+    expect(ran).toBe(12); // the two refused tasks had already started; they are just not waited for
+  });
+
+  it("the defaults are under the platform's 30 s waitUntil window", () => {
+    expect(DRAIN_DEADLINE_MS).toBe(20_000);
+    expect(DRAIN_DEADLINE_MS).toBeLessThanOrEqual(30_000 - 10_000);
+    expect(MAX_DEFERRED_TASKS).toBe(100);
+    expect(MAX_DEFER_ROUNDS).toBe(8);
+  });
+
+  it("runBackground: a deferred task that never settles is abandoned at the deadline; the next run works", async () => {
+    const seen: { db?: Db } = {};
+    let release!: () => void;
+    const never = new Promise<void>((resolve) => (release = resolve));
+    const sink = metricsSink();
+    const started = Date.now();
+    await runBackground(
+      testEnv({ METRICS: sink.METRICS }),
+      fakeCtx(),
+      async (bg) => {
+        seen.db = bg.db;
+        bg.defer(
+          bg.db.transaction(async (tx) => {
+            await tx.execute(sql`select 1`);
+            await never;
+          }),
+        );
+      },
+      quick({ drainDeadlineMs: 300 }),
+    );
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await expectPoolEnded(seen.db);
+    expect(sink.points.filter((point) => point.blobs[2] === "deferred_abandoned")).toHaveLength(1);
+    const again = await runBackground(
+      testEnv(),
+      fakeCtx(),
+      async (bg) => bg.db.execute(sql`select 7 as n`),
+      realCore,
+    );
+    expect(again.rows).toEqual([{ n: 7 }]);
+    release();
+  });
+
+  it("runBackground: a task that re-defers forever stops at the round limit", async () => {
+    let runs = 0;
+    let refusal: unknown;
+    await runBackground(
+      testEnv(),
+      fakeCtx(),
+      async (bg) => {
+        const again = async (): Promise<void> => {
+          runs += 1;
+          await bg.db.execute(sql`select 1`);
+          try {
+            bg.defer(again());
+          } catch (error) {
+            // The first refusal: the already-started next run is refused again, later, as "closed".
+            refusal ??= error;
+          }
+        };
+        bg.defer(sleep(1).then(again));
+      },
+      quick({ maxDeferRounds: 3 }),
+    );
+    expect((refusal as Error).message).toBe(DEFER_LIMIT);
+    expect(runs).toBeGreaterThanOrEqual(4);
+    expect(runs).toBeLessThanOrEqual(5);
   });
 
   it("audit(c, …) writes a real audit_log row after the response", async () => {
