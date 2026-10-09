@@ -49,7 +49,7 @@ export function SearchBox({ compact = false }: { compact?: boolean }) {
     >
       <Box
         component="label"
-        sx={{ display: "flex", alignItems: "center", gap: 2, height: compact ? 40 : 32, padding: compact ? "0 12px" : "0 10px", border: `1px solid ${hf.hairline}`, borderRadius: `${compact ? layout.radius.card : layout.radius.control}px`, backgroundColor: hf.bg, "&:focus-within": { borderColor: hf.text } }}
+        sx={{ display: "flex", alignItems: "center", gap: 2, height: compact ? 44 : 32, padding: compact ? "0 12px" : "0 10px", border: `1px solid ${hf.hairline}`, borderRadius: `${compact ? layout.radius.card : layout.radius.control}px`, backgroundColor: hf.bg, "&:focus-within": { borderColor: hf.text } }}
       >
         <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
           <Search size={16} />

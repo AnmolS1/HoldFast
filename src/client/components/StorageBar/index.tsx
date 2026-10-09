@@ -19,7 +19,7 @@ export const ALMOST_FULL = 0.9;
 export function StorageBar({ usage, footer }: StorageBarProps) {
   if (!usage) {
     return (
-      <Box aria-busy="true" aria-label={t("storage.loading")} sx={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <Box role="status" aria-busy="true" aria-label={t("storage.loading")} sx={{ display: "flex", flexDirection: "column", gap: "6px" }}>
         <Skeleton variant="text" width="70%" height={16} />
         <Skeleton variant="rectangular" height={3} sx={{ borderRadius: "2px" }} />
       </Box>

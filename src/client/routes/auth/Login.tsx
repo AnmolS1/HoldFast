@@ -117,12 +117,12 @@ export function LoginPage() {
     <AuthCard title={t("login.title")}>
       {reason ? <FormNotice tone={reason.tone}>{t(reason.key)}</FormNotice> : null}
       <Box component="form" noValidate onSubmit={onSubmit} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-        <Field label={t("auth.email")} type="email" name="email" autoComplete="username webauthn" value={email} onChange={(e) => setEmail(e.target.value)} required />
+        <Field label={t("auth.email")} type="email" name="email" autoComplete="username webauthn" value={email} onChange={(e) => setEmail(e.target.value)} />
         <Button size="large" onClick={onPasskey} disabled={busy !== null} startIcon={<PasskeyIcon />}>
           {t("auth.passkey")}
         </Button>
         <OrDivider />
-        <Field label={t("auth.password")} type="password" name="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+        <Field label={t("auth.password")} type="password" name="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
         {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
         <FormError>{error}</FormError>
         <Button type="submit" variant="contained" size="large" disabled={busy !== null}>

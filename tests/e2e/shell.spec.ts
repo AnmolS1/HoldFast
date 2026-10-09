@@ -2,6 +2,13 @@
 // layer (in this checkout the Worker has no /api/public/config and no auth backend).
 //
 //   npm run e2e -- tests/e2e/shell.spec.ts
+//
+// OFFLINE MODE. With HOLDFAST_E2E_DIST=<path to dist/client> (and a Playwright config that starts
+// no server) every request to the app origin is answered from the production build on disk, by
+// request interception — no listening socket at all. It exists for machines where a dev server
+// cannot start; the two tests that need Vite's module graph are skipped there and say so.
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { extname, join } from "node:path";
 import type { Page, Route } from "@playwright/test";
 import { expect, expectNoA11yViolations, test } from "./fixtures";
 
@@ -37,6 +44,31 @@ interface MockOptions {
   api?: (route: Route, path: string) => Promise<boolean> | boolean;
 }
 
+const DIST = process.env.HOLDFAST_E2E_DIST;
+const CONTENT_TYPES: Record<string, string> = {
+  ".html": "text/html",
+  ".js": "text/javascript",
+  ".css": "text/css",
+  ".woff2": "font/woff2",
+  ".woff": "font/woff",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webmanifest": "application/manifest+json",
+};
+/** The application's entry script: Vite's module in dev, the hashed bundle in a build. */
+const APP_ENTRY = DIST ? "**/assets/index-*.js" : "**/src/client/main.tsx";
+
+/** Offline mode only: answer the app origin from the build, with the SPA fallback. */
+async function serveBuild(page: Page, port: number): Promise<void> {
+  if (!DIST) return;
+  await page.route(`http://localhost:${port}/**`, (route) => {
+    const path = decodeURIComponent(new URL(route.request().url()).pathname);
+    let file = join(DIST, path);
+    if (!existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "index.html");
+    return route.fulfill({ body: readFileSync(file), contentType: CONTENT_TYPES[extname(file)] ?? "application/octet-stream" });
+  });
+}
+
 function envelope(error: string, message: string) {
   return { error, message, requestId: "req-e2e" };
 }
@@ -61,6 +93,7 @@ async function mockShell(page: Page, port: number, options: MockOptions = {}): P
     ...options.config,
   };
   const session = options.user === null ? null : { user: { ...USER, ...options.user }, session: {} };
+  await serveBuild(page, port);
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/health") return route.fallback();
@@ -139,7 +172,8 @@ test.describe("shell routes", () => {
     await expect(page.locator("[data-frame]")).toHaveCount(0);
   });
 
-  test("without a config the app says it could not start (this checkout's plain `npm run dev`)", async ({ page }) => {
+  test("without a config the app says it could not start (this checkout's plain `npm run dev`)", async ({ page, origins }) => {
+    await serveBuild(page, origins.port);
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Holdfast couldn't start" })).toBeVisible();
   });
@@ -295,7 +329,7 @@ test.describe("theme", () => {
     // Hold the application bundle back: whatever is on <html> now was put there before React.
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
-    await page.route("**/src/client/main.tsx", async (route) => {
+    await page.route(APP_ENTRY, async (route) => {
       await held;
       await route.fallback();
     });
@@ -317,12 +351,14 @@ test.describe("theme", () => {
     await page.route("**/color-scheme-init.js", (route) => route.fulfill({ contentType: "text/javascript", body: "" }));
     let release: () => void = () => {};
     const held = new Promise<void>((resolve) => (release = resolve));
-    await page.route("**/src/client/main.tsx", async (route) => {
+    await page.route(APP_ENTRY, async (route) => {
       await held;
       await route.fallback();
     });
     await page.goto("/", { waitUntil: "commit" });
-    await page.waitForLoadState("domcontentloaded");
+    // The document is parsed (the root element exists) while the application script is held back.
+    await expect(page.locator("#root")).toBeAttached();
+    expect(await page.locator("#root").innerHTML()).toBe("");
     await expect(page.locator("html")).not.toHaveAttribute("data-dark");
     release();
     // The provider still gets there once React runs — late, which is the flash the script prevents.
@@ -382,6 +418,8 @@ test.describe("accessibility (light)", () => {
     const palette = page.getByRole("dialog", { name: "Command palette" });
     await expect(palette).toBeVisible();
     await expect(page.getByPlaceholder("Type a command or search")).toBeFocused();
+    // Let the 120 ms fade finish: a half-transparent dialog measures as low contrast.
+    await page.waitForTimeout(300);
     await expectNoA11yViolations(page);
     for (let i = 0; i < 6; i += 1) await page.keyboard.press("Tab");
     expect(await palette.evaluate((node) => node.contains(document.activeElement))).toBe(true);
@@ -392,6 +430,8 @@ test.describe("accessibility (light)", () => {
 });
 
 test.describe("session expiry", () => {
+  test.skip(Boolean(DIST), "needs the dev server: the trigger imports the app's API client module, which a build does not expose (the same matrix runs in jsdom: api-401.test.ts)");
+
   // The same trigger in both tests: the app's own API client asks for an app route and gets 401.
   async function trigger401(page: Page): Promise<void> {
     await page.evaluate(async () => {
@@ -440,17 +480,25 @@ test.describe("storage and layout", () => {
     for (const path of ["/", "/shared", "/recent", "/account", "/admin", "/help", "/preview/n1", "/search?q=secret"]) await gotoFrame(page, path);
     await page.goto("/login?next=/recent");
     await gotoFrame(page, "/");
-    await page.evaluate(async () => {
-      const prefs = (await import("/src/client/lib/prefs.ts" as string)) as { setPrefs(patch: Record<string, string>): void };
-      prefs.setPrefs({ theme: "dark", viewMode: "grid", density: "comfortable" });
-    });
+    // Change every preference through the UI: theme (menu or sheet) and view mode (toggle).
+    if (isMobile(page)) {
+      await page.locator('[data-bottom-nav-item="account"]').click();
+      await page.getByRole("radio", { name: "Dark" }).click();
+      await page.keyboard.press("Escape");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+    } else {
+      await page.locator("[data-user-menu]").click();
+      await page.locator('[data-theme-option="dark"]').click();
+      await page.keyboard.press("Escape");
+    }
+    await page.getByRole("button", { name: "Grid view" }).click();
     await expect(page.locator("html")).toHaveAttribute("data-dark", "");
     const stored = await page.evaluate(() => ({ local: Object.keys(localStorage).sort(), session: Object.keys(sessionStorage), prefs: localStorage.getItem("hf.prefs.v1") }));
     const allowed = ["hf.prefs.v1", "mui-color-scheme-dark", "mui-color-scheme-light", "mui-mode"];
     expect(stored.local.filter((key) => !allowed.includes(key))).toEqual([]);
     expect(stored.local).toContain("hf.prefs.v1");
     expect(stored.session).toEqual([]);
-    expect(JSON.parse(stored.prefs ?? "{}")).toEqual({ density: "comfortable", viewMode: "grid" });
+    expect(JSON.parse(stored.prefs ?? "{}")).toEqual({ density: "compact", viewMode: "grid" });
     // Nothing that looks like a session or a token, in any key or value.
     const dump = await page.evaluate(() => JSON.stringify({ ...localStorage }));
     expect(dump).not.toMatch(/token|session|ada@example\.com|a{32}/i);
@@ -466,8 +514,8 @@ test.describe("storage and layout", () => {
           if (element.closest("[inert], [aria-hidden='true']")) continue;
           const style = getComputedStyle(element);
           if (style.visibility === "hidden" || style.display === "none") continue;
-          // A checkbox's target is its label.
-          const target = element instanceof HTMLInputElement && element.type === "checkbox" ? (element.closest("label") ?? element) : element;
+          // A checkbox's target is its label; so is a bare input drawn inside a labelled box (search).
+          const target = element instanceof HTMLInputElement && (element.type === "checkbox" || element.type === "search") ? (element.closest("label") ?? element) : element;
           const rect = target.getBoundingClientRect();
           if (rect.width === 0 && rect.height === 0) continue;
           // The skip link is off-screen until focused.
