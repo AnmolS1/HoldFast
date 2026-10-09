@@ -13,7 +13,16 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
 import { createAuth } from "../../../src/worker/auth/create-auth";
-import { guard, record, reportError, safeMeta, safeTag, sinkPath } from "../../../src/worker/auth/observe";
+import {
+  count,
+  countFor,
+  guard,
+  record,
+  reportError,
+  safeMeta,
+  safeTag,
+  sinkPath,
+} from "../../../src/worker/auth/observe";
 import * as sentry from "../../../src/worker/sentry";
 import * as auditLog from "../../../src/worker/services/audit";
 import { AppError } from "../../../src/worker/services/errors";
@@ -437,7 +446,15 @@ describe("sentinel secrets in a request never reach a sink", () => {
         ok: true,
       },
     );
-    expectClean();
+    count("auth", { outcome: "failed", kind: S.token, reason: `${S.email} ${S.resetUrl}` });
+    countFor(env, "email", { outcome: S.name, kind: "verification" });
+    const seen = expectClean();
+    expect(seen.metrics).toEqual(
+      expect.arrayContaining([
+        "0=auth;1=outcome=failed;kind=other;reason=other",
+        "0=email;1=outcome=other;kind=verification",
+      ]),
+    );
     expect(vi.mocked(sentry.captureError).mock.calls[0]![1]).toEqual({
       kind: "other",
       route: "other",

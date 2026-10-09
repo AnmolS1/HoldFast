@@ -5,10 +5,10 @@
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
-import { createAuth } from "../../../src/worker/auth/create-auth";
+import { createAuth, scopeOf } from "../../../src/worker/auth/create-auth";
 import type { Db } from "../../../src/worker/db/client";
 import * as sentry from "../../../src/worker/sentry";
-import { ORIGIN, realCore } from "./helpers";
+import { CAPTCHA, freshEmail, freshIp, ORIGIN, PASSWORD, realCore, testDb } from "./helpers";
 
 vi.mock("../../../src/worker/sentry", async (original) => {
   const real = await original<typeof import("../../../src/worker/sentry")>();
@@ -73,15 +73,44 @@ describe("an error inside Better Auth's handler that is not its own", () => {
     vi.mocked(sentry.captureError).mockClear();
   });
 
-  it("is thrown out of the handler, and nothing of it is printed on the way", async () => {
+  it("thrown before an endpoint runs (the rate limiter's storage): it leaves the handler, nothing is printed", async () => {
     const written = captureConsole();
     const auth = createAuth(env, brokenDb(), ctx);
-    // Any endpoint: the rate limiter's storage is the database, so the request fails at once.
     await expect(
       auth.handler(new Request(`${ORIGIN}/api/auth/ok`, { headers: { "cf-connecting-ip": "198.51.100.9" } })),
     ).rejects.toThrow(/Failed query/);
     expect(leaks(written.join("\n"))).toEqual([]);
+  });
+
+  it("thrown INSIDE an endpoint: it leaves the handler too — the router underneath does not get to print it", async () => {
+    // Without `onAPIError.throw`, better-call answers this case itself: a bare 500, after
+    // `console.error("# SERVER_ERROR: ", error)` — the error object, whole.
+    const written = captureConsole();
+    const auth = createAuth(env, testDb(), ctx);
+    // A failure in the middle of a sign-up: the settings read of the sign-up policy.
+    scopeOf(auth)!.settings = async () => {
+      throw databaseError();
+    };
+    const request = new Request(`${ORIGIN}/api/auth/sign-up/email`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: ORIGIN,
+        "cf-connecting-ip": freshIp(),
+        ...CAPTCHA,
+      },
+      body: JSON.stringify({
+        email: freshEmail(),
+        password: PASSWORD,
+        name: NAME,
+        birthYear: 1990,
+        birthMonth: 5,
+        acceptTerms: true,
+      }),
+    });
+    await expect(auth.handler(request)).rejects.toThrow(/Failed query/);
     expect(written.join("\n")).not.toContain("SERVER_ERROR");
+    expect(leaks(written.join("\n"))).toEqual([]);
   });
 
   it("the route answers 500 with the envelope and reports a sanitised copy: its class, code and scanned message", async () => {
