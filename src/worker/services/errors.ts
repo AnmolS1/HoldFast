@@ -4,7 +4,9 @@
 //   throw new AppError("forbidden", "This account is suspended.", { reason: "account_suspended" });
 //
 // The status comes from the table in src/shared/errors.ts — never pass one. `401 unauthorized`
-// has a single meaning (no session) and is produced only by `requireUser`.
+// has a single meaning (no session) and is produced only by `requireUser` — and by the session
+// middleware for a write under /api/auth/* from an account whose deletion date has passed (that
+// session does not exist either).
 // A response never carries a stack trace, SQL text or an upstream error message.
 //
 // The query helpers (src/worker/db/**) cannot import this file — they also run under plain Node —

@@ -1,6 +1,6 @@
 // What a route asks of the session. Each returns the user or throws.
 //
-//   const user = requireUser(c);       401 unauthorized — the ONLY source of a 401
+//   const user = requireUser(c);       401 unauthorized — the source of a 401 on our routes
 //   const user = requireVerified(c);   + 403 forbidden (email_unverified)
 //   const admin = requireAdmin(c);     + 403 forbidden (not an admin, or an impersonated session)
 //                                      + 403 admin_requires_2fa (an admin without two-factor)

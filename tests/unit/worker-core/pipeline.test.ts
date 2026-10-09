@@ -238,6 +238,56 @@ describe("session", () => {
     });
   }
 
+  // Better Auth still honours the cookie of an account whose deletion date has passed (nothing
+  // revokes its sessions until the purge runs — and a held account is never purged). On our own
+  // routes that user is nobody; under /api/auth/* the same must hold for anything that changes
+  // the account.
+  for (const [label, value] of [
+    ["a Date", past],
+    ["an unreadable value", "not-a-date" as unknown as Date],
+  ] as const) {
+    it(`a deletion date in the past (${label}) → writes under /api/auth/* are refused, 401`, async () => {
+      const { fake, send, post } = setup();
+      signIn(fake, { deleteScheduledAt: value });
+      for (const path of [
+        "/api/auth/change-email",
+        "/api/auth/change-password",
+        "/api/auth/update-user",
+        "/api/auth/delete-user",
+        "/api/auth/passkey/add-passkey",
+        "/api/auth/two-factor/disable",
+        "/api/auth/revoke-sessions",
+        "/api/auth/sign-outx",
+        "/api/auth/sign-in",
+      ]) {
+        for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+          const answer = await post(path, { method });
+          expect(answer.status, `${method} ${path}`).toBe(401);
+          expect(answer.body.error).toBe("unauthorized");
+          expect(answer.body.reached).toBeUndefined();
+        }
+      }
+      // Leaving, and signing in (as anyone), do not act on the dead account: they pass.
+      for (const path of ["/api/auth/sign-out", "/api/auth/sign-in/email", "/api/auth/sign-up/email"]) {
+        const answer = await post(path);
+        expect(answer.body, path).toMatchObject({ reached: path, user: null });
+      }
+      // Reads pass to the auth layer as before, with no user on the context.
+      expect((await send("/api/auth/list-sessions")).body).toMatchObject({ user: null });
+      expect((await send("/api/auth/get-session")).status).toBe(200);
+    });
+  }
+
+  it("a deletion date in the future, or none, changes nothing for writes under /api/auth/*", async () => {
+    const { fake, post } = setup();
+    signIn(fake, { deleteScheduledAt: future });
+    expect((await post("/api/auth/change-email")).body).toMatchObject({ reached: "/api/auth/change-email" });
+    signIn(fake);
+    expect((await post("/api/auth/change-email")).body).toMatchObject({ reached: "/api/auth/change-email" });
+    fake.state.session = null;
+    expect((await post("/api/auth/change-email")).body).toMatchObject({ reached: "/api/auth/change-email" });
+  });
+
   it("the user on c.var has real Dates even when the cache delivered strings", async () => {
     const fake = fakeCore();
     const router = new Hono<AppEnv>();
