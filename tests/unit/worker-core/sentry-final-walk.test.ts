@@ -14,7 +14,7 @@
 import * as Sentry from "@sentry/cloudflare";
 import { Hono } from "hono";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { redactEvent, scanText, scanUrl } from "../../../src/shared/sentry-redact";
+import { REDACTION_FAILED, redactEvent, redactText } from "../../../src/shared/sentry-redact";
 import { reportError } from "../../../src/worker/auth/observe";
 import { sentryOptions } from "../../../src/worker/sentry";
 import type { AppEnv } from "../../../src/worker/services/request-context";
@@ -74,7 +74,7 @@ function corpusEvent(plant: string): Record<string, unknown> {
             frames: [
               {
                 filename: "file:///worker/index.js",
-                function: "handleUnexpectedErrorInRoute",
+                function: "handleError",
                 lineno: 10,
                 colno: 4,
                 in_app: true,
@@ -152,12 +152,11 @@ describe("the final walk over a fully assembled event", () => {
     },
   );
 
-  it("is idempotent: redacting twice equals redacting once — for the event, the text scan and the URL scan", () => {
+  it("is idempotent: redacting twice equals redacting once — for the event and for a string", () => {
     for (const secret of [...SECRETS, SENTENCE, `x ${SENTENCE} `.repeat(40), "", "plain words stay"]) {
       const once = redactEvent(corpusEvent(secret));
       expect(redactEvent(once), secret.slice(0, 30)).toEqual(once);
-      expect(scanText(scanText(secret))).toBe(scanText(secret));
-      expect(scanUrl(scanUrl(secret))).toBe(scanUrl(secret));
+      expect(redactText(redactText(secret))).toBe(redactText(secret));
     }
   });
 
@@ -166,8 +165,8 @@ describe("the final walk over a fully assembled event", () => {
     const raw = corpusEvent(SENTENCE);
     const early = {
       ...corpusEvent(SENTENCE),
-      message: scanText(SENTENCE),
-      transaction: `GET ${scanText(SENTENCE)}`,
+      message: redactText(SENTENCE),
+      transaction: `GET ${redactText(SENTENCE)}`,
     };
     expect(redactEvent(early)).toEqual(redactEvent(raw));
   });
@@ -189,7 +188,7 @@ describe("the final walk over a fully assembled event", () => {
               frames: [
                 {
                   filename: "file:///worker/assets/index-AbCdEf12.js",
-                  function: "handleUnexpectedErrorInRoute",
+                  function: "handleError",
                   lineno: 3,
                 },
               ],
@@ -204,7 +203,7 @@ describe("the final walk over a fully assembled event", () => {
       environment: "dev",
       tags: { requestId: "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e", route: "/api/nodes/:id", kind: "unhandled" },
       contexts: { trace: { trace_id: "0123456789abcdef0123456789abcdef", span_id: "0123456789abcdef" } },
-      request: { url: "https://holdfast.example/api/nodes/folder?[query]", method: "POST" },
+      request: { url: "https://holdfast.example/api/nodes/folder", method: "POST" },
       exception: {
         values: [
           {
@@ -214,7 +213,7 @@ describe("the final walk over a fully assembled event", () => {
               frames: [
                 {
                   filename: "file:///worker/assets/index-AbCdEf12.js",
-                  function: "handleUnexpectedErrorInRoute",
+                  function: "handleError",
                   lineno: 3,
                 },
               ],
@@ -244,34 +243,102 @@ describe("the final walk over a fully assembled event", () => {
     expect(JSON.stringify(out)).not.toContain("0123456789abcdef0123456789abcde");
   });
 
-  it("is bounded and cycle-safe: depth, breadth, a cycle, and things that are not data", () => {
-    let deep: Record<string, unknown> = { leaf: TOKEN };
-    for (let i = 0; i < 40; i++) deep = { next: deep };
+  it("is cycle-safe, and never opens what is not data: an Error, a Map, a Date, a function, a getter", () => {
     const cyclic: Record<string, unknown> = { note: TOKEN };
     cyclic.self = cyclic;
-    const wide = Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`k${i}`, TOKEN]));
+    const withGetter = {};
+    Object.defineProperty(withGetter, "trap", {
+      enumerable: true,
+      get() {
+        throw new Error(TOKEN);
+      },
+    });
     const out = redactEvent({
       extra: {
-        deep,
         cyclic,
-        wide,
-        list: Array.from({ length: 5000 }, () => TOKEN),
+        withGetter,
         error: Object.assign(new Error(TOKEN), { detail: TOKEN }),
         map: new Map([[TOKEN, TOKEN]]),
         date: new Date(0),
+        bytes: new Uint8Array(4),
+        instance: new (class Custom {
+          secret = TOKEN;
+          toJSON() {
+            return TOKEN;
+          }
+        })(),
         fn: () => TOKEN,
         big: `${"word ".repeat(2000)}${TOKEN}`,
+        count: 10n,
       },
     }) as { extra: Record<string, unknown> };
-    expectClean(out, "bounds");
-    expect(JSON.stringify(out.extra.deep)).toContain("[too deep]");
-    expect(Object.keys(out.extra.wide as object)).toHaveLength(1000);
-    expect(out.extra.list as unknown[]).toHaveLength(1000);
-    expect(out.extra.error).toBe("[Error]");
-    expect(out.extra.map).toBe("[Map]");
-    expect(out.extra.fn).toBeUndefined();
-    expect((out.extra.big as string).length).toBeLessThanOrEqual(501);
+    expectClean(out, "not data");
+    expect(out.extra).toMatchObject({
+      cyclic: { note: "[token]", self: "[cycle]" },
+      withGetter: { trap: "[getter]" },
+      error: "[Error]",
+      map: "[Map]",
+      date: "[Date]",
+      bytes: "[bytes]",
+      instance: "[object]",
+      count: "[bigint]",
+    });
+    expect("fn" in out.extra && out.extra.fn).toBeFalsy();
+    expect((out.extra.big as string).length).toBeLessThanOrEqual(1001);
     expect(redactEvent(out)).toEqual(out);
+  });
+
+  it("past a bound it FAILS CLOSED: the marker event, built from nothing of the payload, and the failure is counted", () => {
+    let deep: Record<string, unknown> = { leaf: TOKEN };
+    for (let i = 0; i < 40; i++) deep = { next: deep };
+    const safe = {
+      release: "03e19b8f6c1d4e5a9b7c2d3e4f5a6b7c8d9e0f1a",
+      environment: "dev",
+      tags: { requestId: "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e", route: TOKEN },
+      message: SENTENCE,
+    };
+    const tooBig: Array<[string, Record<string, unknown>]> = [
+      ["depth", { ...safe, extra: { deep } }],
+      [
+        "keys",
+        { ...safe, extra: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`k${i}`, TOKEN])) },
+      ],
+      ["array", { ...safe, extra: { list: Array.from({ length: 5000 }, () => TOKEN) } }],
+      [
+        "values",
+        {
+          ...safe,
+          extra: { grid: Array.from({ length: 400 }, () => Array.from({ length: 400 }, () => TOKEN)) },
+        },
+      ],
+    ];
+    for (const [what, event] of tooBig) {
+      const counted: string[] = [];
+      const out = redactEvent(event, (kind) => counted.push(kind));
+      expect(out, what).toEqual({
+        message: REDACTION_FAILED,
+        level: "error",
+        release: safe.release,
+        environment: "dev",
+        tags: { requestId: safe.tags.requestId },
+      });
+      expect(counted, what).toEqual(["event"]);
+      expect(redactEvent(out), `${what}: the marker is itself a fixed point`).toEqual(out);
+    }
+    // The marker takes a field only in exactly its own shape — never "whatever was there".
+    const hostile = redactEvent({
+      release: SENTENCE,
+      environment: VERIFY_URL,
+      tags: { requestId: TOKEN },
+      extra: { deep },
+    });
+    expect(hostile).toEqual({ message: REDACTION_FAILED, level: "error" });
+    // A counter that throws does not turn the failure into an exception or a raw event.
+    expect(
+      redactEvent({ extra: { deep } }, () => {
+        throw new Error("the metric is down");
+      }),
+    ).toEqual({ message: REDACTION_FAILED, level: "error" });
   });
 });
 
@@ -422,6 +489,38 @@ describe("what reaches the transport, whichever helper made the event", () => {
     expect(all).toContain('"request"');
     expect(all).toContain("params: [dropped]");
     await client.close(100);
+  });
+
+  it("an event the Worker cannot redact: the marker is what is sent, and the failure is a metric", () => {
+    const points: Array<{ blobs?: unknown[] }> = [];
+    const options = sentryOptions({
+      SENTRY_DSN: "https://k@o1.ingest.sentry.example.test/1",
+      SENTRY_ENVIRONMENT: "test",
+      METRICS: { writeDataPoint: (point: { blobs?: unknown[] }) => void points.push(point) },
+    } as unknown as Parameters<typeof sentryOptions>[0])!;
+    const tooLong = Array.from({ length: 5000 }, () => SENTENCE);
+    const sentInstead = options.beforeSend!({ message: SENTENCE, extra: { tooLong } } as never, {});
+    expect(sentInstead).toEqual({ message: REDACTION_FAILED, level: "error" });
+    expect(
+      options.beforeSendTransaction!({ transaction: SENTENCE, extra: { tooLong } } as never, {}),
+    ).toEqual({
+      message: REDACTION_FAILED,
+      level: "error",
+    });
+    expect(options.beforeBreadcrumb!({ message: SENTENCE, data: { tooLong } } as never)).toBeNull();
+    const counted = points.map((point) =>
+      (point.blobs ?? []).filter((blob) => typeof blob === "string" && blob !== ""),
+    );
+    expect(counted.map((blobs) => blobs.slice(0, 1))).toEqual([["error"], ["error"], ["error"]]);
+    expect(counted.map((blobs) => blobs.includes("redaction_failed"))).toEqual([true, true, true]);
+    expect(counted.map((blobs) => blobs.filter((blob) => blob === "event" || blob === "breadcrumb"))).toEqual(
+      [["event"], ["event"], ["breadcrumb"]],
+    );
+    expectClean(points, "the metric");
+    // An ordinary event writes no such metric.
+    points.length = 0;
+    options.beforeSend!({ message: "ok" } as never, {});
+    expect(points).toEqual([]);
   });
 
   it("control — without the final walk the same producers leak, although the early redaction is still there", async () => {

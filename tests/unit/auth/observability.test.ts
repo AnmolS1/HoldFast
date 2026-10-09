@@ -190,7 +190,6 @@ const NEEDLES = [
   "SENTINEL",
   "sentinel.person",
   "mail-example.org",
-  "holdfast.example",
   "Zebediah",
   "Quillfeather",
   "SentinelBrowser",
@@ -407,7 +406,7 @@ describe("sentinel secrets in a request never reach a sink", () => {
     const [reported, tags] = vi.mocked(sentry.captureError).mock.calls[0]!;
     expect(tags).toEqual({ kind: "auth_handler" });
     expect((reported as Error).message).toBe(
-      "Failed query for [email] at [url] with [token] via /api/auth/callback/google?[query]\nparams: [dropped]",
+      "Failed query for [email] at https://holdfast.example/reset-password/[redacted] with [token] via /api/auth/callback/google\nparams: [dropped]",
     );
     expect(Object.keys(reported as Error)).toEqual([]);
     expect((reported as Error).cause).toBeUndefined();

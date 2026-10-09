@@ -11,6 +11,8 @@ import {
 import { t } from "../../../../src/client/lib/i18n";
 import {
   initSentry,
+  redactCrumbOrDrop,
+  redactionFailures,
   redactOrDrop,
   reportError,
   resetSentryForTests,
@@ -246,7 +248,7 @@ describe("sentry", () => {
       }),
     ).toEqual({
       // The query of a URL goes whole (a `state`, a name in a redirect have no shape to scan for).
-      request: { url: "https://app.test/reset-password?[query]", headers: { accept: "text/html" } },
+      request: { url: "https://app.test/reset-password", headers: { accept: "text/html" } },
       message: "mail to [email] failed",
     });
     reportError(new Error("x"), { where: "test" });
@@ -259,6 +261,28 @@ describe("sentry", () => {
       throw new Error("redaction failed");
     });
     expect(redactOrDrop({ request: { url: "https://app.test/s/SECRET" } })).toBeNull();
+  });
+
+  it("an item that cannot be redacted: the event becomes the fixed marker, the breadcrumb is dropped, both are counted", () => {
+    const before = redactionFailures();
+    // Past the walk's bounds (an array longer than it will read).
+    const tooLong = Array.from({ length: 5000 }, () => "https://app.test/s/SECRETTOKEN");
+    const marker = redactOrDrop({
+      release: "abc",
+      environment: "test",
+      message: "mail to ada@example.com failed",
+      extra: { tooLong },
+    });
+    expect(marker).toEqual({ message: "redaction_failed", level: "error", environment: "test" });
+    expect(JSON.stringify(marker)).not.toContain("SECRETTOKEN");
+    expect(redactCrumbOrDrop({ category: "fetch", data: { tooLong } })).toBeNull();
+    expect(redactionFailures() - before).toBe(2);
+    // The ordinary case counts nothing.
+    expect(redactCrumbOrDrop({ category: "fetch", data: { url: "/s/SECRETTOKEN" } })).toEqual({
+      category: "fetch",
+      data: { url: "/s/[redacted]" },
+    });
+    expect(redactionFailures() - before).toBe(2);
   });
 
   it("reportError never throws, initialised or not", () => {

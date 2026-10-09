@@ -34,6 +34,7 @@ import { serializeSignedCookie } from "better-call";
 import { eq } from "drizzle-orm";
 import { withDb, type Db } from "../src/worker/db/client";
 import { account, session, settings, user, userPrefs } from "../src/worker/db/schema";
+import { redactText } from "../src/shared/sentry-redact";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -263,8 +264,7 @@ async function main(): Promise<void> {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error: unknown) => {
     // The message only, with any URL removed: a driver error can carry the connection string.
-    const message =
-      error instanceof Error ? error.message.replace(/postgres(ql)?:\/\/\S+/g, "<url>") : "failed";
+    const message = error instanceof Error ? redactText(error.message) : "failed";
     console.error(`create-session: ${message}`);
     process.exitCode = 1;
   });

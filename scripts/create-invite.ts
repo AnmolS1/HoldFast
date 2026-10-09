@@ -11,6 +11,7 @@ import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { withDb } from "../src/worker/db/client";
 import { invites } from "../src/worker/db/schema";
+import { redactText } from "../src/shared/sentry-redact";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
@@ -87,8 +88,6 @@ async function main(): Promise<void> {
 
 main().catch((error: unknown) => {
   // The message only: a driver error can carry the connection string.
-  console.error(
-    `create-invite: ${error instanceof Error ? error.message.replace(/postgres(ql)?:\/\/\S+/g, "<url>") : "failed"}`,
-  );
+  console.error(`create-invite: ${error instanceof Error ? redactText(error.message) : "failed"}`);
   process.exitCode = 1;
 });

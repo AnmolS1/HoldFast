@@ -60,7 +60,9 @@ function leaksIn(output: string): string[] {
   needles.email!.push("victim.person", "mail-example.org");
   needles.name!.push("Zebediah", "Quillfeather");
   needles.userAgent!.push("Macintosh", "AppleWebKit");
-  needles.verifyUrl!.push("holdfast.example/api/auth/verify-email", "eyJhbGciOiJIUzI1NiJ9");
+  // The link's secret is its token. The site and the path it is on are kept by the URL reducer
+  // (scheme + host + path; userinfo, query and fragment dropped) and are not a leak.
+  needles.verifyUrl!.push("eyJhbGciOiJIUzI1NiJ9", "callbackURL");
   needles.resetUrl!.push("Rz4Kq8Wm2Xv6Bn0Lp3Tj7Yc");
   needles.cookie!.push("Qm9ndXNTaWduYXR1cmVCeXRlczEyMw");
   needles.password!.push("Tr0ub4dor");
@@ -203,13 +205,16 @@ describe("the redaction function", () => {
       "INVALID_EMAIL_OR_PASSWORD (SQLSTATE 23505) in user_email_unique",
     );
     expect(scrubText("x".repeat(5000)).length).toBeLessThanOrEqual(501);
-    // A relative URL loses its WHOLE query — short values have no shape a scan could find, and
-    // the shared rules only know `token`, `code` and `password` by name.
+    // Any URL — relative or absolute — loses its WHOLE query and fragment: short values have no
+    // shape a scan could find. Its scheme, host and path are kept.
     expect(scrubText("GET /api/auth/callback/google?state=qZ7&x=ab&name=Zeb#frag failed")).toBe(
-      "GET /api/auth/callback/google?[query] failed",
+      "GET /api/auth/callback/google failed",
     );
     expect(scrubText("redirect to /login?error=x&error_description=Zeb+Q+is+not+allowed.")).toBe(
-      "redirect to /login?[query]",
+      "redirect to /login",
+    );
+    expect(scrubText("see https://User:pw@Holdfast.Example/api/auth/verify-email?token=abc#x.")).toBe(
+      "see https://holdfast.example/api/auth/verify-email",
     );
     expect(scrubText("is it /invite/J4K? yes")).toBe("is it /invite/[redacted]? yes");
     // A failed query's parameter list is the row: cut off whole, name and all.
@@ -234,7 +239,7 @@ describe("the redaction function", () => {
     expect(describeValue(wrapped)).toContain("user_email_unique");
     expect(describeValue(wrapped)).not.toContain("Key (email)");
     expect(describeValue(api)).toMatch(
-      /^APIError \[code=INVALID_TOKEN\]: could not verify \[url\] for \[email\]$/,
+      /^APIError \[code=INVALID_TOKEN\]: could not verify https:\/\/holdfast\.example\/api\/auth\/verify-email for \[email\]$/,
     );
     expect((safeError(api) as Error & { code?: string }).code).toBe("INVALID_TOKEN");
     // The stack keeps its frames (where it happened) and loses its message line.
@@ -272,9 +277,11 @@ describe("Better Auth's logger", () => {
 
   it("a thrown Better Auth error is logged as its code and its redacted message only", () => {
     const [, api] = hostileErrors();
-    expect(authLogLine(api, [])).toBe("APIError [code=INVALID_TOKEN]: could not verify [url] for [email]");
+    expect(authLogLine(api, [])).toBe(
+      "APIError [code=INVALID_TOKEN]: could not verify https://holdfast.example/api/auth/verify-email for [email]",
+    );
     expect(authLogLine("BAD_REQUEST", [api])).toBe(
-      "BAD_REQUEST APIError [code=INVALID_TOKEN]: could not verify [url] for [email]",
+      "BAD_REQUEST APIError [code=INVALID_TOKEN]: could not verify https://holdfast.example/api/auth/verify-email for [email]",
     );
   });
 

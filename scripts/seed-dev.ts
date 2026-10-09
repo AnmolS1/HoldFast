@@ -14,6 +14,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { type Db, withDb } from "../src/worker/db/client";
 import { invites, nodes, settings, user } from "../src/worker/db/schema";
 import { nameKeyOf } from "../src/worker/services/filename";
+import { redactText } from "../src/shared/sentry-redact";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
@@ -157,8 +158,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  console.error(
-    `seed-dev: ${error instanceof Error ? error.message.replace(/postgres(ql)?:\/\/\S+/g, "<url>") : "failed"}`,
-  );
+  console.error(`seed-dev: ${error instanceof Error ? redactText(error.message) : "failed"}`);
   process.exitCode = 1;
 });

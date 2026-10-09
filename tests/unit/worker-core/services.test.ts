@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { ERROR_STATUS, isErrorCode, type ErrorCode } from "../../../src/shared/errors";
-import { redactEvent, redactText, redactUrl } from "../../../src/shared/sentry-redact";
+import { redactEvent, redactText } from "../../../src/shared/sentry-redact";
 import { sentryOptions } from "../../../src/worker/sentry";
 import { audit } from "../../../src/worker/services/audit";
 import { isTestMode, now } from "../../../src/worker/services/clock";
@@ -625,17 +625,18 @@ describe("audit", () => {
 
 describe("Sentry redaction", () => {
   it("replaces what follows a token-bearing path segment", () => {
-    expect(redactUrl("https://holdfastusercontent.com/d/0199c6f0-aaaa/eyJhbGciOi.sig?x=1")).toBe(
-      "https://holdfastusercontent.com/d/[redacted]?x=1",
+    // The query and the fragment of a URL go whole, whatever is in them.
+    expect(redactText("https://holdfastusercontent.com/d/0199c6f0-aaaa/eyJhbGciOi.sig?x=1")).toBe(
+      "https://holdfastusercontent.com/d/[redacted]",
     );
-    expect(redactUrl("/i/node/tok")).toBe("/i/[redacted]");
-    expect(redactUrl("/t/node/256/tok")).toBe("/t/[redacted]");
-    expect(redactUrl("https://app.example/s/AbCdEfGhIjKlMnOp#frag")).toBe(
-      "https://app.example/s/[redacted]#frag",
+    expect(redactText("/i/node/tok")).toBe("/i/[redacted]");
+    expect(redactText("/t/node/256/tok")).toBe("/t/[redacted]");
+    expect(redactText("https://app.example/s/AbCdEfGhIjKlMnOp#frag")).toBe(
+      "https://app.example/s/[redacted]",
     );
-    expect(redactUrl("/api/public/links/AbCdEfGhIjKlMnOp/files")).toBe("/api/public/links/[redacted]");
-    expect(redactUrl("/api/invites/CODE-123")).toBe("/api/invites/[redacted]");
-    expect(redactUrl("/invite/CODE-123")).toBe("/invite/[redacted]");
+    expect(redactText("/api/public/links/AbCdEfGhIjKlMnOp/files")).toBe("/api/public/links/[redacted]");
+    expect(redactText("/api/invites/CODE-123")).toBe("/api/invites/[redacted]");
+    expect(redactText("/invite/CODE-123")).toBe("/invite/[redacted]");
   });
 
   it("leaves ordinary paths alone", () => {
@@ -646,40 +647,40 @@ describe("Sentry redaction", () => {
       "/api/health",
       "/settings",
     ]) {
-      expect(redactUrl(url)).toBe(url);
+      expect(redactText(url)).toBe(url);
     }
   });
 
-  it("drops token, code, state and password query values", () => {
-    expect(redactUrl("/api/auth/delete-user/callback?token=SECRET&callbackURL=/x")).toBe(
-      "/api/auth/delete-user/callback?token=[redacted]&callbackURL=/x",
+  it("drops the whole query of a URL, and sensitive name=value pairs outside one", () => {
+    expect(redactText("/api/auth/delete-user/callback?token=SECRET&callbackURL=/x")).toBe(
+      "/api/auth/delete-user/callback",
     );
-    // The OAuth `state` goes like the `code` does: it is what ties a callback to a browser.
-    expect(redactUrl("/cb?state=1&code=4/0AbC&password=hunter2&scope=email")).toBe(
-      "/cb?state=[redacted]&code=[redacted]&password=[redacted]&scope=email",
+    // The OAuth `state` goes like the `code` does — and so does everything else in a query: a
+    // short value has no shape, and which parameter is harmless is not this function's guess.
+    expect(redactText("/cb?state=1&code=4/0AbC&password=hunter2&scope=email")).toBe("/cb");
+    expect(redactText("/x?estate=1&statement=2")).toBe("/x");
+    // A query string on its own (no URL around it): the values under sensitive names go.
+    expect(redactText("token=abc&x=1")).toBe("token=[redacted]&x=1");
+    expect(redactText("state=1&code=4_0AbC&password=hunter2&scope=email&barcode=1&estate=2")).toBe(
+      "state=[redacted]&code=[redacted]&password=[redacted]&scope=email&barcode=1&estate=2",
     );
-    expect(redactUrl("/x?estate=1&statement=2")).toBe("/x?estate=1&statement=2");
-    expect(redactUrl("token=abc&x=1")).toBe("token=[redacted]&x=1");
-    expect(redactUrl("/x?barcode=1")).toBe("/x?barcode=1");
   });
 
   // Better Auth's reset link is GET /api/auth/reset-password/<token>: the token is a path segment.
   it("drops the token of a Better Auth reset link, in a URL and in free text", () => {
     expect(
-      redactUrl("https://holdfast.example/api/auth/reset-password/Zx9TOKENvalue?callbackURL=/reset-password"),
-    ).toBe("https://holdfast.example/api/auth/reset-password/[redacted]?callbackURL=/reset-password");
-    expect(redactUrl("/api/auth/reset-password/Zx9TOKENvalue")).toBe("/api/auth/reset-password/[redacted]");
+      redactText(
+        "https://holdfast.example/api/auth/reset-password/Zx9TOKENvalue?callbackURL=/reset-password",
+      ),
+    ).toBe("https://holdfast.example/api/auth/reset-password/[redacted]");
+    expect(redactText("/api/auth/reset-password/Zx9TOKENvalue")).toBe("/api/auth/reset-password/[redacted]");
     expect(redactText("GET /api/auth/reset-password/Zx9TOKENvalue failed")).toBe(
       "GET /api/auth/reset-password/[redacted] failed",
     );
     // The screens and the POST endpoint carry no token in the path.
-    for (const url of [
-      "/reset-password",
-      "/api/auth/reset-password",
-      "/reset-password?reason=x",
-      "/forgot-password",
-    ])
-      expect(redactUrl(url)).toBe(url);
+    for (const url of ["/reset-password", "/api/auth/reset-password", "/forgot-password"])
+      expect(redactText(url)).toBe(url);
+    expect(redactText("/reset-password?reason=x")).toBe("/reset-password");
     const event = redactEvent({
       request: { url: "https://h.example/api/auth/reset-password/Zx9TOKENvalue" },
     });
@@ -762,7 +763,8 @@ describe("Sentry redaction", () => {
       message: "download failed for [email] at /d/[redacted]",
       request: {
         url: "https://files.example/d/[redacted]",
-        query_string: "token=[redacted]&x=1",
+        // A query string is replaced whole, like the query of a URL.
+        query_string: "[redacted]",
         // Credentials and the client's address are gone; the User-Agent is its family only.
         headers: { "user-agent": "Firefox", accept: "application/json" },
         cookies: "[redacted]",
@@ -808,7 +810,7 @@ describe("Sentry redaction", () => {
     });
     // A value that is a URL keeps its (scanned) path; its query goes whole, whatever is in it.
     expect(crumb({ data: { url: "/d/a/b?token=x" } }, {})).toEqual({
-      data: { url: "/d/[redacted]?[query]" },
+      data: { url: "/d/[redacted]" },
     });
   });
 });

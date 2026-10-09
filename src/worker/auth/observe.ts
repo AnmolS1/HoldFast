@@ -24,7 +24,6 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { ZodError } from "zod";
 import { INTERNAL_ERROR } from "../../shared/errors";
-import { redactUrl } from "../../shared/sentry-redact";
 import { QueryError } from "../db/errors";
 import { captureError } from "../sentry";
 import { audit, type AuditOptions, type AuditTarget } from "../services/audit";
@@ -114,7 +113,7 @@ export function sinkPath(urlOrPath: string): string {
   } catch {
     pathname = urlOrPath.split(/[?#]/)[0] ?? "";
   }
-  return scrubText(redactUrl(pathname)).slice(0, 200);
+  return scrubText(pathname).slice(0, 200);
 }
 
 /**

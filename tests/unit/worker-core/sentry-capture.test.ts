@@ -169,7 +169,7 @@ describe("an error on its way to Sentry", () => {
     const out = options!.beforeSend!(event as never, {}) as unknown as typeof event;
     expect(JSON.stringify(event)).toBe(frozen);
     const text = JSON.stringify(out);
-    for (const leak of [...SENTINELS, "Sentinel Person", "203.0.113.9", "app.example"])
+    for (const leak of [...SENTINELS, "Sentinel Person", "203.0.113.9", "state="])
       expect(text).not.toContain(leak);
     expect(out.exception.values[0]!.value).toContain("params: [dropped]");
     expect(out.tags).toEqual({ requestId: "r-1" });

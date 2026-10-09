@@ -8,7 +8,7 @@
 //    shape that field has (an identifier; for `code`, an error code). Every other field is
 //    dropped, whatever it is called: a user row, a request body, a session, a credential, a
 //    header bag never get as far as being looked at.
-//  - FREE TEXT (a message, an error's message) is scanned (`scanText`, src/shared/sentry-redact.ts —
+//  - FREE TEXT (a message, an error's message) is scanned (`redactText`, src/shared/sentry-redact.ts —
 //    one implementation for this layer and for the final Sentry walk), and everything shaped like a
 //    secret or like personal data is replaced: the named rules first (
 //    email addresses, token-bearing path segments, `token=` / `code=` / `password=` values),
@@ -20,15 +20,18 @@
 // the one place a library puts a row into a sentence (the parameter list of a failed query, in
 // the error's message), the whole list is cut off.
 
-import { scanText } from "../../shared/sentry-redact";
+import { redactText } from "../../shared/sentry-redact";
+
+const MAX_TEXT = 500;
 
 /**
- * Free text, safe to keep: scanned, and capped in length. The rules themselves are the shared
- * scan (src/shared/sentry-redact.ts `scanText`) — the same function the final Sentry walk uses,
- * so a string redacted here and again on its way out reads the same.
+ * Free text, safe to keep: scanned, and capped in length. The rules themselves are THE string
+ * redaction (src/shared/sentry-redact.ts `redactText`) — the one function the final Sentry walk
+ * uses too, so a string redacted here and again on its way out reads the same.
  */
 export function scrubText(text: string): string {
-  return scanText(text);
+  const scanned = redactText(text);
+  return scanned.length > MAX_TEXT ? `${scanned.slice(0, MAX_TEXT)}…` : scanned;
 }
 
 /** An event name, a user id, a request id: one short token of identifier characters. */

@@ -61,8 +61,9 @@ function captureConsole(): string[] {
 }
 
 const leaks = (text: string) =>
-  [ADDRESS, "victim.person", NAME, "Zebediah", "Rz4Kq8Wm2Xv6Bn0Lp3Tj7Yc", "holdfast.example"].filter(
-    (secret) => text.includes(secret),
+  // (The reset link's site is kept by the URL reducer; its token is what must not appear.)
+  [ADDRESS, "victim.person", NAME, "Zebediah", "Rz4Kq8Wm2Xv6Bn0Lp3Tj7Yc", "callbackURL"].filter((secret) =>
+    text.includes(secret),
   );
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} };

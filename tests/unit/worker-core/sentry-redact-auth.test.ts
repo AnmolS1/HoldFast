@@ -3,12 +3,12 @@
 // Sentry's own request capture runs for these routes like for any other, and `redactEvent` is
 // what stands between it and Sentry.
 import { describe, expect, it } from "vitest";
-import { redactEvent, redactUrl, userAgentFamily } from "../../../src/shared/sentry-redact";
+import { redactEvent, redactText, userAgentFamily } from "../../../src/shared/sentry-redact";
 
 describe("redactEvent on a request under /api/auth/*", () => {
   it("an OAuth callback: the `state` value goes like the `code` does", () => {
     const url = "/api/auth/callback/google?code=SENTINEL-CODE&state=SENTINEL-STATE&scope=email";
-    expect(redactUrl(url)).not.toContain("SENTINEL-STATE");
+    expect(redactText(url)).not.toContain("SENTINEL-STATE");
     const event = redactEvent({
       request: {
         url: "https://app.example/api/auth/callback/google",
@@ -20,7 +20,7 @@ describe("redactEvent on a request under /api/auth/*", () => {
 
   it("an error redirect: `error_description` is free text from a provider or a hook and is not kept", () => {
     const url = "/login?error=access_denied&error_description=Sentinel+Person+is+not+allowed";
-    expect(redactUrl(url)).not.toContain("Sentinel");
+    expect(redactText(url)).not.toContain("Sentinel");
   });
 
   it("request headers: no raw client address, and no User-Agent beyond what a family needs", () => {
