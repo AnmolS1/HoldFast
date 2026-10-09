@@ -17,19 +17,43 @@
 // dropped — never sent as it was, never dropped without a trace: each is counted in the metric
 // `error / redaction_failed`.
 //
+// COLLECT NOTHING FROM THE REQUEST. The SDK's defaults (@sentry/core 11.5
+// utils/data-collection/resolveDataCollectionOptions.js) read up to 10 KB of every non-GET body
+// before the handler runs and attach it, with every cookie, header, the query string and the
+// client address, to any event of that request. A sign-up body is a password, a name and a birth
+// date, and a name has no shape a scan could find. So every category is switched off here —
+// `DATA_COLLECTION` — and redaction is what cleans the REST, not what keeps a body in.
+// (`sendDefaultPii` no longer exists in 11.x; `dataCollection` is the only switch.)
+//
 // Defence in depth, relied on by nothing: `captureError` — the one explicit exit to Sentry for
 // the whole Worker — never hands over the object it was given. It sends `safeError(error)`: the
 // class, the code, the scanned message and the stack frames. A driver error's own fields
 // (`detail`, `parameters`, `where`, `cause`, a captured `response` or `request`) stay behind.
 
 import * as Sentry from "@sentry/cloudflare";
-import { redactBreadcrumb, redactEvent, type RedactionFailure } from "../shared/sentry-redact";
+import {
+  redactBreadcrumb,
+  redactEvent,
+  SENTRY_DATA_COLLECTION,
+  type RedactionFailure,
+} from "../shared/sentry-redact";
 // A pure module (text rules only; its one import is the shared redaction above).
 import { safeError } from "./auth/redact";
 import { buildMeta } from "./meta";
 import { writeMetric } from "./services/metrics";
 
 type SentryEnv = Pick<Env, "SENTRY_DSN" | "SENTRY_ENVIRONMENT"> & Partial<Pick<Env, "METRICS">>;
+
+/**
+ * Every category of request-derived data the SDK can collect, off — by the option names of the
+ * installed @sentry/core (types/datacollection.d.ts). With `httpBodies: []` the request body is
+ * not even READ (cloudflare integrations/httpServer.js: `effectiveBodySize === "none"`), so
+ * nothing is teed in front of the auth handler or an upload. What is left on an event's
+ * `request` is its method and its URL without the query.
+ */
+export const DATA_COLLECTION = SENTRY_DATA_COLLECTION satisfies NonNullable<
+  Sentry.CloudflareOptions["dataCollection"]
+>;
 
 export function sentryOptions(env: SentryEnv): Sentry.CloudflareOptions | undefined {
   if (!env.SENTRY_DSN) return undefined;
@@ -41,6 +65,7 @@ export function sentryOptions(env: SentryEnv): Sentry.CloudflareOptions | undefi
     release: buildMeta().commit,
     // Errors only. Tracing is switched on, if ever, by the observability task.
     tracesSampleRate: 0,
+    dataCollection: DATA_COLLECTION,
     beforeSend: (event) => redactEvent(event, failed),
     beforeSendTransaction: (event) => redactEvent(event, failed),
     beforeBreadcrumb: (breadcrumb) => redactBreadcrumb(breadcrumb, failed),

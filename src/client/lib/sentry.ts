@@ -3,7 +3,7 @@
 // Every event and breadcrumb passes through the shared redaction as the last step before it is
 // sent. It fails closed: an event that cannot be redacted is replaced by the fixed
 // `redaction_failed` marker (so the failure is visible), a breadcrumb is dropped — never sent raw.
-import { redactBreadcrumb, redactEvent } from "../../shared/sentry-redact";
+import { redactBreadcrumb, redactEvent, SENTRY_DATA_COLLECTION } from "../../shared/sentry-redact";
 import type { PublicConfig } from "./contracts";
 
 type SentryModule = typeof import("@sentry/react");
@@ -53,6 +53,12 @@ export function initSentry(
         dsn,
         environment: config.sentryEnvironment,
         release: config.release,
+        // Nothing user- or request-derived is collected: no cookies, headers, bodies or query
+        // strings, and — `userInfo: false` — Sentry is told NEVER to infer the client's IP
+        // address from the connection (`sdk.settings.infer_ip`), which no `beforeSend` could
+        // remove afterwards. No replay, feedback or HTTP-client integration is added either:
+        // the SDK's defaults only.
+        dataCollection: SENTRY_DATA_COLLECTION,
         beforeSend: (event) => redactOrDrop(event),
         beforeBreadcrumb: (breadcrumb) => redactCrumbOrDrop(breadcrumb),
       });

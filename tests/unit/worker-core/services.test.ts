@@ -709,15 +709,9 @@ describe("Sentry redaction", () => {
         values: [{ type: "DatabaseError", value: "duplicate key", mechanism: { data: { code: "23505" } } }],
       },
     });
-    expect(out.request.data).toEqual({
-      code: "[redacted]",
-      otp: "[redacted]",
-      totp: "[redacted]",
-      backupCodes: "[redacted]",
-      backupCode: "[redacted]",
-      trustDevice: true,
-      nested: { code: "[redacted]", statusCode: 200, postcode: "N1" },
-    });
+    // A captured body is never opened: it is replaced whole (it also holds values with no shape
+    // and no telling name — a person's name, a birth year).
+    expect(out.request.data).toBe("[redacted]");
     expect(out.extra).toEqual({ code: "23505", statusCode: 500, otpAuthUrlBuilt: true });
     expect(out.exception.values[0]!.mechanism.data.code).toBe("23505");
     expect(JSON.stringify(out)).not.toMatch(/123456|654321|111222|aaaa-bbbb|999999/);
@@ -768,7 +762,8 @@ describe("Sentry redaction", () => {
         // Credentials and the client's address are gone; the User-Agent is its family only.
         headers: { "user-agent": "Firefox", accept: "application/json" },
         cookies: "[redacted]",
-        data: { email: "[email]", password: "[redacted]", newPassword: "[redacted]", name: "Bob" },
+        // The body is replaced whole: "Bob" has no shape a scan could know it by.
+        data: "[redacted]",
       },
       breadcrumbs: [{ category: "fetch", data: { url: "/api/public/links/[redacted]", status_code: 200 } }],
       exception: { values: [{ type: "Error", value: "invite /invite/[redacted] rejected for [email]" }] },
@@ -790,6 +785,7 @@ describe("Sentry redaction", () => {
       "198.51.100",
       "Gecko",
       "Linux",
+      "Bob",
     ]) {
       expect(text).not.toContain(leak);
     }

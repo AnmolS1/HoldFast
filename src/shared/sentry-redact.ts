@@ -33,6 +33,25 @@
 // query (dropped whole), under a named key (replaced whole), or in a failed query's parameter
 // list (cut off whole).
 
+// ── what the SDKs may collect ──────────────────────────────────────────────────────────────────
+//
+// Both SDKs (Worker and browser) are given this as their `dataCollection` option: every category
+// of request- and user-derived data OFF, by the option names of the installed @sentry/core 11.5
+// (build/types/types/datacollection.d.ts). The defaults are all ON — up to 10 KB of every
+// non-GET request body, every cookie and header, the query string, the client address (and, in
+// the browser, a request to Sentry to infer the address from the connection, which no
+// `beforeSend` can undo). Redaction is for what is left, not for what should never be read.
+// (Plain data: this module imports no SDK. Each caller checks it against its SDK's type.)
+export const SENTRY_DATA_COLLECTION = {
+  userInfo: false,
+  cookies: false,
+  httpHeaders: false,
+  httpBodies: [] as never[],
+  urlQueryParams: false,
+  databaseQueryData: false,
+  stackFrameVariables: false,
+};
+
 // ── placeholders ───────────────────────────────────────────────────────────────────────────────
 
 const REDACTED = "[redacted]";
@@ -162,7 +181,16 @@ const SENSITIVE_WHOLE = new Set([
 
 // A query string kept apart from its URL (Sentry's `request.query_string`, a fetch breadcrumb's
 // `url.query` / `url.fragment`): replaced whole wherever it is, like the query of a URL.
-const QUERY_NAMES = new Set(["querystring", "urlquery", "urlfragment"]);
+// Likewise a span's copy of a request body (`http.request.body.data`).
+const QUERY_NAMES = new Set(["querystring", "urlquery", "urlfragment", "httprequestbodydata"]);
+
+// What the SDK's request-data integration can attach under an event's `request` (and what its
+// processing metadata holds before that): the body, the cookies, the server's environment. A
+// body is a password, a name, a birth date — values with no shape — so these are never scanned
+// for what might be kept: they are replaced whole. (The Worker's options switch their collection
+// off; this is what holds if an option is ever renamed or an integration added.)
+const REQUEST_HOLDERS = new Set(["request", "normalizedRequest"]);
+const REQUEST_WHOLE = new Set(["data", "cookies", "env"]);
 
 const normaliseName = (name: string) => name.toLowerCase().replace(/[^a-z0-9]/g, "");
 
@@ -614,7 +642,11 @@ function walk(value: unknown, state: Walk, path: string, inRequest: boolean, dep
       if (typeof item === "string") put(outKey, userAgentFamily(item));
       continue;
     }
-    if (names.some((name) => isSensitiveName(name, inRequest))) {
+    const holder = path.slice(path.lastIndexOf("/") + 1);
+    if (
+      (REQUEST_HOLDERS.has(holder) && REQUEST_WHOLE.has(key)) ||
+      names.some((name) => isSensitiveName(name, inRequest))
+    ) {
       // Replaced without being read. (Null and undefined say nothing and are kept as they are.)
       put(outKey, item === undefined || item === null ? item : REDACTED);
       continue;
