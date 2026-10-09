@@ -117,6 +117,16 @@ describe("sign-up: an address that has an account, and one that has none", () =>
       expect(body.token).toBeNull();
       expect(body.user).toMatchObject({ email: existing.email, name: "Same Name", emailVerified: false });
       expect(body.user.id).not.toBe(existing.user.id);
+      // A3: the `hf_pending` cookie is signed, not encrypted — anyone can read the id in it. It
+      // is the id in the ANSWER for a new address and for a taken one alike; a cookie with an id
+      // of its own would say "taken" in one request.
+      const pendingId = (sent: Sent) => {
+        const cookie = sent.setCookies.find((c) => c.startsWith("hf_pending="))!;
+        const payload = cookie.split(";")[0]!.split("=")[1]!.split(".")[0]!;
+        return (JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as { u: string }).u;
+      };
+      expect(pendingId(fresh.sent)).toBe((fresh.sent.body as { user: { id: string } }).user.id);
+      expect(pendingId(again.sent)).toBe(body.user.id);
     }
   });
 

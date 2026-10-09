@@ -395,6 +395,56 @@ export async function replaceUnverifiedEmail(
   }
 }
 
+// ── how often one sign-up has changed its pending address ───────────────────────────────────
+//
+// Kept HERE, not in the cookie: a signed cookie can be sent again, and a counter that travels in
+// it starts from wherever the oldest copy says. One `verification` row per sign-up
+// (`pending-email:<userId>`, value = the number of changes so far).
+
+const pendingChangesIdentifier = (userId: string) => `pending-email:${userId}`;
+
+/** How many address changes the sign-up `userId` has made (0 when none is recorded). */
+export async function pendingChanges(db: Executor, userId: string): Promise<number> {
+  const rows = await db
+    .select({ value: verification.value, expiresAt: verification.expiresAt })
+    .from(verification)
+    .where(eq(verification.identifier, pendingChangesIdentifier(userId)));
+  const live = rows.filter((row) => row.expiresAt.getTime() > Date.now()).map((row) => Number(row.value));
+  return Math.max(0, ...live.filter(Number.isInteger));
+}
+
+/**
+ * Takes one change for the sign-up — only if the count is still `expected` (what the presented
+ * cookie says, or null when there is no cookie to compare) and below `max`. One transaction
+ * under an advisory lock on the sign-up's id, so the same cookie sent several times at once is
+ * honoured once. Returns the new count, or why not.
+ */
+export async function takePendingChange(
+  db: Executor,
+  change: { id: string; userId: string; expected: number | null; max: number },
+): Promise<{ ok: true; count: number } | { ok: false; reason: "stale" | "exhausted" }> {
+  const identifier = pendingChangesIdentifier(change.userId);
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${identifier}, 0))`);
+    const stored = await pendingChanges(tx, change.userId);
+    if (change.expected !== null && change.expected !== stored)
+      return { ok: false, reason: "stale" } as const;
+    if (stored >= change.max) return { ok: false, reason: "exhausted" } as const;
+    await tx.delete(verification).where(eq(verification.identifier, identifier));
+    const at = new Date();
+    await tx.insert(verification).values({
+      id: change.id,
+      identifier,
+      value: String(stored + 1),
+      // Longer than any chain of re-minted one-hour cookies can last.
+      expiresAt: new Date(at.getTime() + 24 * 60 * 60 * 1000),
+      createdAt: at,
+      updatedAt: at,
+    });
+    return { ok: true, count: stored + 1 } as const;
+  });
+}
+
 // ── an account whose address was never proven ───────────────────────────────────────────────
 
 export type UnprovenReset = {

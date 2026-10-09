@@ -23,10 +23,13 @@
 //
 // The account is changed only while it is unverified (the condition is part of the UPDATE), the
 // old verification link stops working (it names the old address, which no account has any
-// more), and a new one is sent to the new address. One sign-up may do this five times.
+// more), and a new one is sent to the new address. One sign-up may do this five times — counted
+// on the server, per sign-up: the cookie's own number must agree with it, so an older copy of the
+// cookie (a replay) is refused and cannot start the count again.
 //
 // Paths are relative to /api. The pipeline applies CSRF; RL_AUTH is applied here.
 
+import { generateId } from "@better-auth/core/utils/id";
 import { createEmailVerificationToken } from "better-auth/api";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -38,7 +41,12 @@ import {
   readPending,
   setCookieHeader,
 } from "../auth/signed-cookie";
-import { getAccount, replaceUnverifiedEmail } from "../db/queries/auth-lifecycle";
+import {
+  getAccount,
+  pendingChanges,
+  replaceUnverifiedEmail,
+  takePendingChange,
+} from "../db/queries/auth-lifecycle";
 import { ipKey } from "../middleware/rate-limit";
 import { guard, record } from "../auth/observe";
 import { jsonBody } from "../services/body";
@@ -80,7 +88,17 @@ router.patch(
       throw new AppError("forbidden", "Sign up again to change the address.", {
         reason: "no_pending_signup",
       });
-    if (claim.changes >= PENDING_MAX_CHANGES) {
+    // The count of changes is the SERVER's (db/queries/auth-lifecycle.ts). A cookie that says
+    // another number is an older copy being sent again: refused like no cookie at all, before
+    // anything is spent or looked up. (It says nothing about any account: it is about the cookie.)
+    const expected = claim.viaCookie ? claim.changes : null;
+    const made = await pendingChanges(db(c), claim.userId);
+    if (expected !== null && expected !== made) {
+      throw new AppError("forbidden", "Sign up again to change the address.", {
+        reason: "no_pending_signup",
+      });
+    }
+    if (made >= PENDING_MAX_CHANGES) {
       throw new AppError("rate_limited", "The address has been changed too many times. Sign up again.");
     }
 
@@ -107,6 +125,27 @@ router.patch(
         }
         throw error;
       }
+    }
+
+    // The change is taken now — atomically, and only if the count is still what it was above: the
+    // same cookie sent twice at once is honoured once. Taken whether or not an account will move
+    // (a look-alike sign-up, a taken address): the answer must not depend on that.
+    const taken = await takePendingChange(db(c), {
+      id: generateId(),
+      userId: claim.userId,
+      expected,
+      max: PENDING_MAX_CHANGES,
+    });
+    if (!taken.ok) {
+      if (taken.reason === "exhausted") {
+        throw new AppError("rate_limited", "The address has been changed too many times. Sign up again.");
+      }
+      throw new AppError("forbidden", "Sign up again to change the address.", {
+        reason: "no_pending_signup",
+      });
+    }
+
+    if (newEmail !== claim.email) {
       const account = await getAccount(db(c), claim.userId);
       // The account this sign-up created, still unverified and still at the address the cookie names.
       if (account && !account.emailVerified && account.email === claim.email) {
@@ -128,12 +167,7 @@ router.patch(
     }
 
     if (claim.viaCookie) {
-      const value = await mintPending(
-        scope.keys,
-        { email: newEmail, userId: claim.userId },
-        claim.changes + 1,
-        at,
-      );
+      const value = await mintPending(scope.keys, { email: newEmail, userId: claim.userId }, taken.count, at);
       c.header("Set-Cookie", setCookieHeader(c.env, PENDING_COOKIE, value));
     }
     const remaining = PENDING_EMAIL_MIN_MS - (Date.now() - started);

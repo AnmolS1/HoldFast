@@ -571,9 +571,15 @@ export function buildHooks(scope: AuthScope) {
       // that already has an account included: its presence says nothing about that.
       const email = (ctx.body as { email?: unknown } | undefined)?.email;
       if (typeof email === "string") {
-        // For the look-alike answer no account was created: the cookie then names nobody, in
-        // the same shape, so it cannot be told apart from a real one.
-        const who = { email: email.toLowerCase(), userId: scope.facts.createdUserId ?? generateId() };
+        // The id is the one in the ANSWER: the new account's — or, for the look-alike answer
+        // (no account was created), the id of the user Better Auth made up for it. The cookie is
+        // signed, not encrypted: an id of its own there would differ from the answer's exactly
+        // when the address was taken, and say so in one request.
+        const answered = (ctx.context.returned as { user?: { id?: unknown } } | null | undefined)?.user?.id;
+        const who = {
+          email: email.toLowerCase(),
+          userId: typeof answered === "string" && answered !== "" ? answered : generateId(),
+        };
         const value = await mintPending(scope.keys, who, 0, now());
         ctx.setCookie(cookieName(env, PENDING_COOKIE), value, cookieAttributes(env, PENDING_COOKIE));
       }

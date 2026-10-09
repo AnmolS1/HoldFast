@@ -204,6 +204,85 @@ describe("PATCH /api/account/pending-email", () => {
     expect(mailTo(other.email)).toHaveLength(before);
   });
 
+  it("an OLDER copy of the cookie is refused: the count is the server's, so replaying it neither moves the account nor starts the count again (A4)", async () => {
+    const client = newClient({ settings: { ceilings: { signupIpDay: 50 } } });
+    const { email } = await signUp(client);
+    const row = (await userByEmail(email))!;
+    const original = client.cookies.get("hf_pending")!;
+    const first = freshEmail();
+    expect((await change(client, first)).status).toBe(200);
+    const afterFirst = client.cookies.get("hf_pending")!;
+    expect(afterFirst).not.toBe(original);
+
+    // The review's probe: put the first cookie back and move again.
+    const replayer = newClient({ settings: client.settings, ip: client.ip });
+    replayer.cookies.set("hf_pending", original);
+    const target = freshEmail();
+    const replay = await change(replayer, target);
+    expect(replay.status).toBe(403);
+    expect(replay.body).toMatchObject({ error: "forbidden", details: { reason: "no_pending_signup" } });
+    expect((await userById(row.id))!.email).toBe(first);
+    expect(mailTo(target)).toEqual([]);
+    // The newest cookie still works, and each cookie works once.
+    const second = freshEmail();
+    expect((await change(client, second)).status).toBe(200);
+    replayer.cookies.set("hf_pending", afterFirst);
+    expect((await change(replayer, freshEmail())).status).toBe(403);
+    expect((await userById(row.id))!.email).toBe(second);
+  });
+
+  it("the cap holds against replay: five changes for one sign-up, whichever cookies are presented", async () => {
+    const client = newClient({ settings: { ceilings: { signupIpDay: 50 } } });
+    const { email } = await signUp(client);
+    const row = (await userByEmail(email))!;
+    const seen = [client.cookies.get("hf_pending")!];
+    for (let i = 1; i <= 5; i++) {
+      expect((await change(client, freshEmail())).status, `change ${i}`).toBe(200);
+      seen.push(client.cookies.get("hf_pending")!);
+    }
+    const settled = (await userById(row.id))!.email;
+    // Every cookie this sign-up ever held, newest included: none buys a sixth change.
+    for (const [index, cookie] of seen.entries()) {
+      const again = newClient({ settings: client.settings, ip: client.ip });
+      again.cookies.set("hf_pending", cookie);
+      const sent = await change(again, freshEmail());
+      expect(sent.status, `cookie ${index}`).toBe(index === 5 ? 429 : 403);
+    }
+    expect((await userById(row.id))!.email).toBe(settled);
+  });
+
+  it("the same cookie sent four times at once is honoured once", async () => {
+    const client = newClient({ settings: { ceilings: { signupIpDay: 50 } } });
+    const { email } = await signUp(client);
+    const row = (await userByEmail(email))!;
+    const targets = [freshEmail(), freshEmail(), freshEmail(), freshEmail()];
+    const answers = await Promise.all(
+      targets.map((target) => {
+        const copy = newClient({ settings: client.settings, ip: client.ip });
+        copy.cookies.set("hf_pending", client.cookies.get("hf_pending")!);
+        return change(copy, target);
+      }),
+    );
+    expect(answers.map((answer) => answer.status).sort()).toEqual([200, 403, 403, 403]);
+    const winner = targets[answers.findIndex((answer) => answer.status === 200)]!;
+    expect((await userById(row.id))!.email).toBe(winner);
+    for (const target of targets.filter((address) => address !== winner)) expect(mailTo(target)).toEqual([]);
+  });
+
+  it("no oracle left in the replay: a look-alike sign-up's cookie is counted the same way", async () => {
+    const existing = await verifiedUser();
+    const impostor = newClient({ settings: { ceilings: { signupIpDay: 50 } } });
+    await signUp(impostor, { email: existing.email });
+    const original = impostor.cookies.get("hf_pending")!;
+    expect((await change(impostor, freshEmail())).status).toBe(200);
+    const replayer = newClient({ settings: impostor.settings, ip: impostor.ip });
+    replayer.cookies.set("hf_pending", original);
+    const replay = await change(replayer, freshEmail());
+    // Exactly what a real sign-up's replay gets.
+    expect(replay.status).toBe(403);
+    expect(replay.body).toMatchObject({ details: { reason: "no_pending_signup" } });
+  });
+
   it("one sign-up may change its address five times", async () => {
     // Each change also counts against the day's sign-up budget of the address (three by default —
     // tests/unit/auth/invite-gate.test.ts); raised here so that the cap under test is the cookie's.
