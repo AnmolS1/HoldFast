@@ -282,7 +282,7 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
     });
   });
 
-  it("choosing a password with a token — unknown, already used, another kind of token: one refusal, one hash", async () => {
+  it("choosing a password with a token — unknown, already used, another kind of token: one refusal, the round trips of a good one, and NO hash", async () => {
     const owner = await verifiedUser();
     await measured(
       newClient(),
@@ -296,24 +296,27 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
       (token: string, newPassword = "a perfectly fine password 3!") =>
       () =>
         measured(newClient(), "/api/auth/reset-password", { json: { newPassword, token } });
-    // The first use works (and is the measure of the work a VALID token does).
+    // The first use works (and is the measure of the round trips a VALID token costs).
     const worked = await outline(choose(used));
     expect(worked).toMatchObject({ status: 200, scrypt: 1 });
     expect(worked.statements).toBeGreaterThanOrEqual(STATEMENT_BUDGET["/reset-password"]!);
     const outlines = await expectAlike([
       ["a token nobody issued", choose("nobody-issued-this-token-00")],
       ["a token already used", choose(used)],
-      ["an empty-looking token", choose("x")],
+      ["a one-character token", choose("x")],
       [
         "a session token, offered as a reset token",
         choose(decodeURIComponent(owner.client.cookies.get("hf.session_token") ?? "x").split(".")[0]!),
       ],
     ]);
-    // The same work as the valid one: one hash, the same round trips — only the answer differs.
+    // The same round trips as the valid one — and no hash: there is no captcha in front of
+    // this endpoint, and a stranger with a made-up token must not be able to buy a tenth of a
+    // second of CPU per request (auth/preflight.ts). A token is not an address: that one of
+    // 62^24 exists is not a thing to hide.
     expect(outlines[0]![1]).toMatchObject({
       status: 400,
       code: "INVALID_TOKEN",
-      scrypt: 1,
+      scrypt: 0,
       statements: worked.statements,
     });
   });

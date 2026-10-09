@@ -142,8 +142,8 @@ describe("the auth router", () => {
       headers: sameOrigin,
       body: "{}",
     });
-    // Better Auth's own answer (its captcha plugin refuses a sign-in without a token), not the
-    // registry's 404 envelope.
+    // The auth route's answer in Better Auth's own words (a sign-in without a captcha token is
+    // refused before anything else is looked at — auth/preflight.ts), not the registry's 404.
     expect(signIn.response.status).toBe(400);
     const refused = (await signIn.response.json()) as { code?: string; error?: string };
     expect(refused.code).toBe("MISSING_RESPONSE");

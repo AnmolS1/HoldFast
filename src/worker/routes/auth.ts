@@ -26,7 +26,8 @@ import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX } from "../auth/endpoint-policy";
 import { CHANGE_EMAIL_UNAVAILABLE } from "../auth/mailbox-proof";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
-import { LINK_ERROR_BUDGET, padStatements, spendHash, STATEMENT_BUDGET } from "../auth/parity";
+import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
+import { hashGuard, preflight } from "../auth/preflight";
 import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { isUniqueViolation } from "../db/errors";
 import { AppError } from "../services/errors";
@@ -38,10 +39,6 @@ const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
 /** The one error a verification link answers with (the client has one sentence for it). */
 export const LINK_INVALID = "LINK_INVALID";
 
-/** The only request body this route keeps a copy of: a sign-in's, to name the account a failed attempt tried. */
-const KEEP_BODY_PATH = "/sign-in/email";
-const KEEP_BODY_MAX_BYTES = 8 * 1024;
-
 /** `request` with the client address the pipeline resolved, when the edge did not send one. */
 function withClientAddress(request: Request, ip: string): Request {
   // Cloudflare sets (and overwrites) cf-connecting-ip on every deployed request, so this only
@@ -51,40 +48,6 @@ function withClientAddress(request: Request, ip: string): Request {
   const headers = new Headers(request.headers);
   headers.set("cf-connecting-ip", ip);
   return new Request(request, { headers });
-}
-
-/**
- * A copy of a small JSON request body, or null. Never more than `KEEP_BODY_MAX_BYTES` is read:
- * a larger body (declared, or discovered while reading) is abandoned.
- */
-async function smallJsonBody(request: Request): Promise<unknown> {
-  const declared = request.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > KEEP_BODY_MAX_BYTES)) return null;
-  const reader = request.clone().body?.getReader();
-  if (!reader) return null;
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > KEEP_BODY_MAX_BYTES) {
-        await reader.cancel();
-        return null;
-      }
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-  } catch {
-    return null;
-  }
 }
 
 /** A link's answer that is a redirect carrying `error=`. */
@@ -106,16 +69,6 @@ function genericLinkError(response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set("location", location.replace(/([?&]error=)[^&#]*/, `$1${LINK_INVALID}`));
   return new Response(null, { status: 302, headers });
-}
-
-/** The `code` of a JSON error answer, read from a copy. */
-async function errorCode(response: Response): Promise<string | null> {
-  try {
-    const body = (await response.clone().json()) as { code?: unknown } | null;
-    return typeof body?.code === "string" ? body.code : null;
-  } catch {
-    return null;
-  }
 }
 
 router.all(
@@ -146,7 +99,14 @@ router.all(
       };
     }
     const request = withClientAddress(c.req.raw, c.get("ip"));
-    const body = method === "POST" && relativePath === KEEP_BODY_PATH ? await smallJsonBody(request) : null;
+
+    // (a) Free refusals, then (b) the global guard — before Better Auth, the database or a hash
+    // is touched for this request (auth/preflight.ts). `RL_AUTH` has already run in the pipeline.
+    const checked = await preflight(relativePath, request);
+    if (checked.refusal) return c.json(checked.refusal.body, checked.refusal.status);
+    await hashGuard(c.env, relativePath);
+    // The one body the audit step needs (a failed sign-in names the account it tried).
+    const body = relativePath === "/sign-in/email" ? checked.body : null;
 
     // Mail this request causes waits until it has been answered (auth/scope.ts `afterAnswer`).
     if (scope) scope.answered.held = true;
@@ -184,16 +144,13 @@ router.all(
         );
       }
 
-      // 3b. One answer, one amount of work (auth/parity.ts).
+      // 3b. One answer, one amount of work (auth/parity.ts) — for a request that REACHED the
+      // work: one that Better Auth's own limiter or the captcha turned away is not padded (it
+      // would be work to be had for nothing). `hooks.before` sets the endpoint once it runs.
       if (method === "GET" && relativePath === "/verify-email") response = genericLinkError(response);
+      const reached = scope !== null && scope.facts.endpointPath !== null;
       const budget = linkFailed(relativePath, response) ? LINK_ERROR_BUDGET : STATEMENT_BUDGET[relativePath];
-      if (budget !== undefined) {
-        // A reset whose token did not check out has hashed nothing; one that did has hashed once.
-        if (relativePath === "/reset-password" && method === "POST" && response.status === 400) {
-          if ((await errorCode(response)) === "INVALID_TOKEN") await spendHash();
-        }
-        await padStatements(db(c), budget);
-      }
+      if (reached && budget !== undefined) await padStatements(db(c), budget);
 
       // 4. What happened, for the audit log.
       if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });

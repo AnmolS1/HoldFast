@@ -218,6 +218,8 @@ export type Sent = {
 export type SendOptions = {
   method?: string;
   json?: unknown;
+  /** A request body sent as it is; the test sets (or leaves out) the content type itself. */
+  rawBody?: string;
   headers?: Record<string, string>;
   /** `false`: no Origin / fetch-metadata headers (a non-browser client). */
   browser?: boolean;
@@ -227,7 +229,8 @@ export type SendOptions = {
 
 /** One request from `client` through the Worker; cookies in the answer are kept. */
 export async function send(client: Client, path: string, options: SendOptions = {}): Promise<Sent> {
-  const method = options.method ?? (options.json === undefined ? "GET" : "POST");
+  const method =
+    options.method ?? (options.json === undefined && options.rawBody === undefined ? "GET" : "POST");
   const headers = new Headers({ "cf-connecting-ip": client.ip, ...client.headers });
   if (options.browser !== false) {
     headers.set("origin", client.origin);
@@ -252,6 +255,8 @@ export async function send(client: Client, path: string, options: SendOptions = 
     headers.set("content-type", "application/json");
     body = JSON.stringify(options.json);
   }
+  // A body exactly as given, with no content type of its own (for requests no form would send).
+  if (options.rawBody !== undefined) body = options.rawBody;
   for (const [name, value] of Object.entries(options.headers ?? {})) headers.set(name, value);
 
   const pending: Promise<unknown>[] = [];

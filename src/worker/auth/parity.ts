@@ -6,9 +6,9 @@
 //   1. everything that depends only on the caller's INPUT is checked first and identically —
 //      shape, password policy (the breach check included), captcha, rate limits, the sign-up
 //      statement — before anything is looked up (hooks.ts `before`, Better Auth's own schema);
-//   2. then both branches do the same expensive work: exactly one password hash (Better Auth
-//      hashes on its unknown-address branches; `spendHash` does where it does not), and the same
-//      number of database round trips BEFORE THE ANSWER — `padStatements` brings every answer of
+//   2. then both branches do the same expensive work: exactly one password hash where an
+//      ADDRESS is the question (Better Auth hashes on its unknown-address branches — behind the
+//      captcha), and the same number of database round trips BEFORE THE ANSWER — `padStatements` brings every answer of
 //      an endpoint up to that endpoint's fixed number, so "the account exists" is not "three
 //      more round trips";
 //   3. mail and audit rows are DEFERRED on every branch (never awaited before the answer);
@@ -16,13 +16,20 @@
 // A wall clock cannot be compared in a test; the COUNTS can, and tests/unit/auth/parity.test.ts
 // holds every endpoint here to them (statements before the answer, hashes, mails, cookies).
 //
+// A TOKEN is not an address: whether a 24-character random token exists is not something to
+// hide by hashing — a reset with a token nobody issued does the same round trips as one with a
+// good token and NO hash (a hash there would be a tenth of a second of CPU for any stranger who
+// asks, with no captcha in front of it).
+//
+// Only a request that got past the free refusals, the limiters and the captcha is padded
+// (auth/preflight.ts): the padding is itself work.
+//
 // The numbers below are ceilings measured on the heaviest branch of each endpoint, with room.
 // A branch that needs MORE than its endpoint's number is not padded and the test fails: the
 // number is then raised, deliberately.
 
 import { sql } from "drizzle-orm";
 import { statementsSent, type Db } from "../db/client";
-import { hashPassword } from "./password";
 
 /** Round trips before the answer, per endpoint (paths relative to /api/auth, and our own routes). */
 export const STATEMENT_BUDGET: Readonly<Record<string, number>> = Object.freeze({
@@ -48,14 +55,5 @@ export async function padStatements(db: Db, target: number): Promise<void> {
   // Bounded twice over: by the target, and by a hard stop no budget comes near.
   for (let guard = 0; guard < 64 && statementsSent(db) < target; guard++) {
     await db.execute(sql`SELECT 1`);
-  }
-}
-
-/** One password hash of the same cost as a real one, thrown away. Never throws. */
-export async function spendHash(): Promise<void> {
-  try {
-    await hashPassword("a password nobody has, hashed for its cost alone");
-  } catch {
-    // Its only purpose was the time it took.
   }
 }
