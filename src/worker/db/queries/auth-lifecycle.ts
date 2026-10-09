@@ -851,6 +851,31 @@ export async function deleteTrustedDevices(db: Executor, userId: string): Promis
   return rows.length;
 }
 
+// ── housekeeping ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Deletes `verification` rows that expired more than a day ago — at most `limit` per call —
+ * and returns how many. Such rows are created by requests nobody has authenticated (a sign-up
+ * intent, passkey options, an OAuth state, a two-factor challenge) and Better Auth removes one
+ * only when it is used: without this the table only grows. A day's grace: nothing that expired
+ * is ever read again, and a clock that is a little off deletes nothing live.
+ * (`now() AT TIME ZONE 'UTC'`: the column carries no zone.)
+ */
+export async function sweepExpiredVerifications(
+  db: Executor,
+  options: { limit?: number } = {},
+): Promise<number> {
+  const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 5000), 50_000));
+  const result = await db.execute(sql`
+    DELETE FROM ${verification}
+    WHERE id IN (
+      SELECT id FROM ${verification}
+      WHERE expires_at < (now() AT TIME ZONE 'UTC') - interval '1 day'
+      LIMIT ${limit}
+    )`);
+  return result.rowCount ?? 0;
+}
+
 // ── the end of an account ───────────────────────────────────────────────────────────────────
 
 /**
