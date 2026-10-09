@@ -91,7 +91,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # check the deploy runs before it migrates (one implementation: deploy-lib.sh utc-zone); it runs
 # whether or not there are migrations yet.
 DATABASE_URL_DIRECT="$url" bash "$root/.github/workflows/lib/deploy-lib.sh" utc-zone ||
-  die "the local Postgres on $host:$port does not keep UTC time (lines above), so $db was NOT migrated. The compose server's default is UTC: look for TZ / PGTZ or '-c timezone=…' on the container, or a server-wide ALTER ROLE … SET timezone."
+  die "the local Postgres on $host:$port does not keep UTC time (lines above), so $db was NOT migrated. The compose server's default is UTC: look for a TZ / PGTZ variable or a zone option passed to postgres on the container, or a zone stored on the server's roles or databases."
 if [ -f "$root/drizzle.config.ts" ]; then
   (cd "$root" && DATABASE_URL_DIRECT="$url" npm run --silent db:migrate)
   echo "db-reset: migrations applied to $db"
