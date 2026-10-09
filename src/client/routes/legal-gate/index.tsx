@@ -4,12 +4,12 @@ import Typography from "@mui/material/Typography";
 import { useState, type FormEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Wordmark } from "../../components/Mark";
-import { api, ApiError, cancelTermsGate, completeTermsGate } from "../../lib/api";
+import { api, ApiError, completeTermsGate } from "../../lib/api";
 import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
 import { EXTERNAL_LINKS } from "../../lib/contracts";
 import { t } from "../../lib/i18n";
-import { clearSession, refreshSession, usePublicConfig } from "../../lib/query";
+import { purgeUserState, refreshSession, usePublicConfig } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
 import { safeNext } from "../auth/validation";
 
@@ -36,6 +36,8 @@ export function AcceptTermsPage() {
     setBusy(true);
     try {
       await api("/api/account/accept-terms", { method: "POST", body: { version: config.termsVersion } });
+      // The refreshed session passes the identity guard: if another account is signed in by now,
+      // the previous account's state is purged and its waiting requests are discarded, not replayed.
       await refreshSession();
     } catch (cause) {
       setBusy(false);
@@ -52,8 +54,8 @@ export function AcceptTermsPage() {
   const onSignOut = async () => {
     setBusy(true);
     await callAuth(() => authClient.signOut());
-    cancelTermsGate();
-    clearSession();
+    // Discards the requests waiting behind the gate and everything cached for this account.
+    await purgeUserState();
     navigate("/login", { replace: true });
   };
 

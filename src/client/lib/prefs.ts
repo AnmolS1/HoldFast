@@ -8,6 +8,7 @@
 // own key (`mui-mode`), because `public/color-scheme-init.js` and the theme provider both read
 // that key and there must be exactly one source. Nothing else is ever written to Web Storage.
 import { useSyncExternalStore } from "react";
+import { registerUserStatePurger } from "./contracts";
 
 export type ThemePref = "system" | "light" | "dark";
 export type Density = "compact" | "comfortable";
@@ -159,3 +160,10 @@ export function usePrefs(): UsePrefs {
 }
 
 applyDensity();
+
+// The sync is bound to one account's prefs API: an identity change or sign-out removes it, and a
+// pending save for the previous account is dropped. The local values are device UI preferences.
+registerUserStatePurger(() => {
+  sync = null;
+  clearTimeout(timer);
+});

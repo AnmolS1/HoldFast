@@ -1,6 +1,8 @@
 // In-memory cache of minted thumbnail URLs, keyed (nodeId, versionKey, size). A URL is a bearer
 // token: it lives here and in the <img> only — never in storage, logs or error reports.
 
+import { registerUserStatePurger } from "../../lib/contracts";
+
 export type ThumbSize = 160 | 320 | 1280;
 
 export interface ThumbRequest {
@@ -50,8 +52,11 @@ export async function resolveUrl(props: ThumbRequest, force: boolean): Promise<C
   return request;
 }
 
-/** Tests only. */
+/** Back to empty: run by `purgeUserState()` and by tests. */
 export function resetThumbCacheForTests(): void {
   thumbCache.clear();
   inFlight.clear();
 }
+
+// Minted URLs are bearer tokens of the account that asked for them.
+registerUserStatePurger(resetThumbCacheForTests);

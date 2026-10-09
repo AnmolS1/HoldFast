@@ -7,7 +7,7 @@ import { callAuth } from "../../lib/auth-contract";
 import { EXTERNAL_LINKS } from "../../lib/contracts";
 import { t } from "../../lib/i18n";
 import type { ThemePref } from "../../lib/prefs";
-import { clearSession, queryClient, useSession } from "../../lib/query";
+import { purgeUserState, useSession } from "../../lib/query";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { openShortcuts } from "../help";
 
@@ -37,9 +37,8 @@ export function useSignOut(): () => Promise<void> {
   const navigate = useNavigate();
   return async () => {
     await callAuth(() => authClient.signOut());
-    clearSession();
-    // Nothing of the previous account may linger in the cache.
-    queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== "public-config" && query.queryKey[0] !== "session" });
+    // Nothing of this account may linger for whoever signs in next.
+    await purgeUserState();
     navigate("/login", { replace: true });
   };
 }

@@ -5,11 +5,11 @@ import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import Typography from "@mui/material/Typography";
 import { useId, useState, useSyncExternalStore, type FormEvent } from "react";
-import { cancelReauth, completeReauth, isReauthPending, subscribeGates } from "../../lib/api";
+import { completeReauth, isReauthPending, subscribeGates } from "../../lib/api";
 import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
 import { t } from "../../lib/i18n";
-import { clearSession, getCachedSession, refreshSession, usePublicConfig } from "../../lib/query";
+import { confirmReauthIdentity, getCachedSession, getKnownUserId, purgeUserState, usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
@@ -20,15 +20,24 @@ function ReauthForm() {
   const turnstile = useTurnstile(config?.turnstileSiteKey);
   // The session query still holds the user the session belonged to.
   const email = getCachedSession()?.user.email ?? "";
+  // Whose session ended. The held requests carry THAT person's intent.
+  const [expectedUserId] = useState(() => getCachedSession()?.user.id ?? getKnownUserId());
   const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
   const [step, setStep] = useState<"password" | "code">("password");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Replay only for the same account. A passkey (or a 2FA step) can sign a DIFFERENT account in:
+  // then the held requests are discarded, the old account's state is purged, and the page starts
+  // again at the root as the new account.
   const finish = async () => {
-    await refreshSession();
-    completeReauth();
+    const outcome = await confirmReauthIdentity(expectedUserId);
+    if (outcome === "same") {
+      completeReauth();
+      return;
+    }
+    window.location.assign("/");
   };
 
   const onPasskey = async () => {
@@ -80,9 +89,12 @@ function ReauthForm() {
     await finish();
   };
 
-  const signOut = () => {
-    cancelReauth();
-    clearSession();
+  // Leaving instead of signing in: end the session on the server too, discard what was held,
+  // drop the account's state, and load the sign-in page fresh.
+  const signOut = async () => {
+    setBusy(true);
+    await callAuth(() => authClient.signOut());
+    await purgeUserState();
     window.location.assign("/login");
   };
 
@@ -105,7 +117,7 @@ function ReauthForm() {
       <Button type="submit" variant="contained" size="large" disabled={busy}>
         {t(step === "password" ? "reauth.submit" : "app.continue")}
       </Button>
-      <Button variant="text" onClick={signOut} disabled={busy}>
+      <Button variant="text" onClick={() => void signOut()} disabled={busy}>
         {t("reauth.signOut")}
       </Button>
     </Box>
@@ -114,7 +126,8 @@ function ReauthForm() {
 
 /**
  * "Your session ended — sign in to continue." Opens when the API client holds a request that got
- * a qualifying 401; signing in here replays every held request. It cannot be dismissed: the only
+ * a qualifying 401; signing in here AS THE SAME ACCOUNT replays every held request (another
+ * account discards them and starts clean). The backdrop is opaque. It cannot be dismissed: the only
  * ways out are to sign in or to leave for the sign-in page. Mounted once at the app root.
  */
 export function ReauthDialog() {
@@ -122,7 +135,16 @@ export function ReauthDialog() {
   const titleId = useId();
   const bodyId = useId();
   return (
-    <Dialog open={open} aria-labelledby={titleId} aria-describedby={bodyId} maxWidth="xs" fullWidth data-reauth-dialog>
+    <Dialog
+      open={open}
+      aria-labelledby={titleId}
+      aria-describedby={bodyId}
+      maxWidth="xs"
+      fullWidth
+      data-reauth-dialog
+      // Opaque, not the usual scrim: with no session, the previous screen must not stay readable.
+      slotProps={{ backdrop: { "data-reauth-backdrop": true, sx: { backgroundColor: hf.bg } } as object }}
+    >
       <DialogTitle id={titleId}>{t("reauth.title")}</DialogTitle>
       <DialogContent>
         <Typography id={bodyId} sx={{ color: hf.textSecondary, marginBottom: 3 }}>

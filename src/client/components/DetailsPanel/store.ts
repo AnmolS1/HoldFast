@@ -1,5 +1,6 @@
 // The details slot's store. A feature supplies the content with `useDetailsPanel().setContent(node)`.
 import { useMemo, useSyncExternalStore, type ReactNode } from "react";
+import { registerUserStatePurger } from "../../lib/contracts";
 
 interface DetailsState {
   content: ReactNode | null;
@@ -49,7 +50,9 @@ export function useDetailsPanel(): DetailsPanelApi {
   return useMemo(() => ({ ...detailsApi, isOpen: current.open, hasContent: current.content !== null }), [current.open, current.content]);
 }
 
-/** Tests only. */
+/** Back to empty: run by `purgeUserState()` and by tests. */
 export function resetDetailsPanelForTests(): void {
   set({ content: null, open: false, title: null });
 }
+
+registerUserStatePurger(resetDetailsPanelForTests);

@@ -2,6 +2,7 @@
 // shell registers navigation and its own actions. The "New" menu and the FAB run the same
 // commands by id, so there is one implementation of each action.
 import { useSyncExternalStore, type ReactNode } from "react";
+import { registerUserStatePurger } from "../../lib/contracts";
 import type { ShortcutId } from "../../lib/shortcuts";
 
 export type CommandSection = "selection" | "goto" | "actions";
@@ -109,9 +110,12 @@ export function usePaletteOpen(): boolean {
   return useSyncExternalStore(subscribe, getOpen, getOpen);
 }
 
-/** Tests only. */
+/** Back to empty: run by `purgeUserState()` and by tests. */
 export function resetCommandsForTests(): void {
   sources.clear();
   open = false;
   emit();
 }
+
+// Selection-aware commands name files; the shell re-registers its own when the frame mounts.
+registerUserStatePurger(resetCommandsForTests);

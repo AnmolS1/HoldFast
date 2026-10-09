@@ -1,5 +1,6 @@
 // The breadcrumb trail store. A feature sets the trail for its page with `useBreadcrumbs([...])`.
 import { useEffect, useSyncExternalStore } from "react";
+import { registerUserStatePurger } from "../../lib/contracts";
 
 export interface Crumb {
   label: string;
@@ -37,7 +38,10 @@ export function useTrail(): Crumb[] | null {
   return useSyncExternalStore(subscribe, get, get);
 }
 
-/** Tests only. */
+/** Back to empty: run by `purgeUserState()` and by tests. */
 export function resetBreadcrumbsForTests(): void {
   setTrail(null);
 }
+
+// Folder names are account data.
+registerUserStatePurger(resetBreadcrumbsForTests);

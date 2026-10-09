@@ -2,6 +2,7 @@
 // `sourceId` ("upload", "zip:<id>", "export"); the ribbon shows the most recently updated active
 // source and collapses when every source is gone or done.
 import { useSyncExternalStore, type ReactNode } from "react";
+import { registerUserStatePurger } from "../../lib/contracts";
 
 export type RibbonStatus = "active" | "paused" | "error" | "done";
 
@@ -105,10 +106,13 @@ export function useTransferRibbon(): RibbonSnapshot {
   return useSyncExternalStore(subscribeRibbon, getRibbonSnapshot, getRibbonSnapshot);
 }
 
-/** Tests only. */
+/** Back to empty: run by `purgeUserState()` and by tests. */
 export function resetRibbonForTests(): void {
   sources.clear();
   panels.clear();
   clock = 0;
   emit();
 }
+
+// Transfers belong to the account that started them.
+registerUserStatePurger(resetRibbonForTests);

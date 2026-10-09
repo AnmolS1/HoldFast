@@ -1,5 +1,6 @@
 // Toast queue as a tiny external store, so non-React code (the API client) can raise a toast.
 import type { ReactNode } from "react";
+import { registerUserStatePurger } from "../../lib/contracts";
 
 export interface ToastInput {
   message: string;
@@ -54,3 +55,6 @@ export function subscribeToasts(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
+
+// A toast may name a file or carry an Undo for the previous account.
+registerUserStatePurger(clearToasts);

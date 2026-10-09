@@ -49,3 +49,28 @@ export const EXTERNAL_LINKS = {
   help: "https://ponderance.dev/support/holdfast",
   support: "https://ponderance.dev/support/holdfast#contact",
 } as const;
+
+// ---------------------------------------------------------------------------------------------
+// User-scoped client state. RULE FOR EVERY FEATURE: anything held in memory or on the device that
+// belongs to the signed-in account — a zustand store, an upload queue, an idb-keyval entry, a
+// module-level cache — registers a purger here at module load. `purgeUserState()` (lib/query.ts)
+// runs them all on sign-out and whenever the signed-in identity changes, so nothing cached or
+// queued for one account can be shown to, or acted on by, another. TanStack Query data needs no
+// purger: the whole cache (except the public config) is cleared by the same routine.
+
+export type UserStatePurger = () => void | Promise<void>;
+
+const userStatePurgers = new Set<UserStatePurger>();
+
+/** Register a purger; returns the function that removes it again. */
+export function registerUserStatePurger(purger: UserStatePurger): () => void {
+  userStatePurgers.add(purger);
+  return () => {
+    userStatePurgers.delete(purger);
+  };
+}
+
+/** Run every registered purger. One failing purger never stops the others. */
+export async function runUserStatePurgers(): Promise<void> {
+  await Promise.allSettled(Array.from(userStatePurgers, async (purger) => purger()));
+}
