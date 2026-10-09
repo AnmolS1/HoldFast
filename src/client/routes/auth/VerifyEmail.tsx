@@ -16,15 +16,16 @@ import { isEmail } from "./validation";
 
 export const RESEND_COOLDOWN_S = 60;
 
-/** Seconds left until `until` (ms epoch), ticking once a second. */
-function useCountdown(until: number): number {
+/** Seconds left until `until` (ms epoch), ticking once a second; never more than `max`. */
+function useCountdown(until: number, max: number): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (until <= Date.now()) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [until]);
-  return Math.max(0, Math.ceil((until - now) / 1000));
+  // `now` is up to a second old when `until` is pushed out, hence the cap.
+  return Math.min(max, Math.max(0, Math.ceil((until - now) / 1000)));
 }
 
 /** "Check your email", with the two escapes people need: send it again, and fix a wrong address. */
@@ -42,7 +43,7 @@ export function VerifyEmailPage() {
   const [changing, setChanging] = useState(false);
   const [draft, setDraft] = useState("");
   const [draftError, setDraftError] = useState<string | null>(null);
-  const left = useCountdown(cooldownUntil);
+  const left = useCountdown(cooldownUntil, RESEND_COOLDOWN_S);
 
   const onResend = async () => {
     if (!email || left > 0) return;

@@ -67,7 +67,7 @@ describe("ThumbImage", () => {
     act(() => intersect());
     await waitFor(() => expect(p.getUrl).toHaveBeenCalledTimes(2));
     third.unmount();
-    const fourth = renderShell(<ThumbImage {...p} versionKey="v2" />);
+    renderShell(<ThumbImage {...p} versionKey="v2" />);
     act(() => intersect());
     await waitFor(() => expect(p.getUrl).toHaveBeenCalledTimes(3));
   });
@@ -79,7 +79,7 @@ describe("ThumbImage", () => {
     act(() => intersect());
     await waitFor(() => expect(img(first.container)).not.toBeNull());
     first.unmount();
-    const second = renderShell(<ThumbImage {...p} />);
+    renderShell(<ThumbImage {...p} />);
     act(() => intersect());
     await waitFor(() => expect(getUrl).toHaveBeenCalledTimes(2));
   });

@@ -7,7 +7,7 @@ import { t, type MessageKey } from "../../lib/i18n";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { Kbd } from "../Kbd";
-import { closePalette, useCommands, usePaletteOpen, type Command, type CommandSection } from "./registry";
+import { closePalette, paletteFilter, useCommands, usePaletteOpen, type Command, type CommandSection } from "./registry";
 
 // Selection-aware commands come first, then navigation, then actions.
 const SECTIONS: Array<{ id: CommandSection; heading: MessageKey }> = [
@@ -78,13 +78,13 @@ export function CommandPalette() {
       onClose={closePalette}
       fullWidth
       maxWidth={false}
-      aria-label={t("palette.label")}
       slotProps={{
-        paper: { sx: { maxWidth: 640, overflow: "hidden", alignSelf: "flex-start", marginTop: { xs: 4, md: 24 } } },
+        // The name belongs on the element with role="dialog" (the paper), not on the modal root.
+        paper: { "aria-label": t("palette.label"), sx: { maxWidth: 640, overflow: "hidden", alignSelf: "flex-start", marginTop: { xs: 4, md: 24 } } },
         transition: { onExited: () => setQuery("") },
       }}
     >
-      <Cmdk label={t("palette.label")} loop>
+      <Cmdk label={t("palette.label")} loop filter={paletteFilter}>
         <Box sx={{ display: "flex", alignItems: "center", gap: "10px", padding: "10px 16px", borderBottom: `1px solid ${hf.hairline}` }}>
           <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
             <Search size={16} />

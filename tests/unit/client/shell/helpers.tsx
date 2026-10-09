@@ -11,10 +11,11 @@ import { resetThumbCacheForTests } from "../../../../src/client/components/Thumb
 import { clearToasts } from "../../../../src/client/components/Toaster";
 import { resetRibbonForTests } from "../../../../src/client/components/TransferRibbon";
 import { resetApiForTests } from "../../../../src/client/lib/api";
-import type { PublicConfig, SessionShape } from "../../../../src/client/lib/contracts";
+import type { PublicConfig, SessionShape, SessionUserShape } from "../../../../src/client/lib/contracts";
 import { resetPrefsForTests } from "../../../../src/client/lib/prefs";
 import { publicConfigQuery, queryClient, resetIdentityForTests, sessionQuery } from "../../../../src/client/lib/query";
 import { connectRouter } from "../../../../src/client/router";
+import { closeShortcuts } from "../../../../src/client/routes/help";
 import { HoldfastThemeProvider } from "../../../../src/client/theme";
 
 export const CONFIG: PublicConfig = {
@@ -34,7 +35,7 @@ export const CONFIG: PublicConfig = {
   release: "test",
 };
 
-export const USER = {
+export const USER: SessionUserShape = {
   id: "a".repeat(32),
   name: "Ada Lovelace",
   email: "ada@example.com",
@@ -45,7 +46,7 @@ export const USER = {
   deleteScheduledAt: null,
 };
 
-export function sessionOf(patch: Partial<typeof USER> = {}, session: { impersonatedBy?: string | null } = {}): NonNullable<SessionShape> {
+export function sessionOf(patch: Partial<SessionUserShape> = {}, session: { impersonatedBy?: string | null } = {}): NonNullable<SessionShape> {
   return { user: { ...USER, ...patch }, session };
 }
 
@@ -282,6 +283,7 @@ export function setupShell(): void {
     resetCommandsForTests();
     resetThumbCacheForTests();
     clearToasts();
+    closeShortcuts();
     // query.ts registered these with the API client at import; resetApiForTests dropped them.
     return import("../../../../src/client/lib/query").then((query) => query.reconnectApiForTests());
   });

@@ -31,6 +31,19 @@ export const COMMAND_IDS = {
   trash: "explorer.trash",
 } as const;
 
+/**
+ * The palette's filter: every word typed must appear in the command's text (label + keywords),
+ * in any order, ignoring case. Commands whose label starts with the query rank first.
+ * Deliberately not a fuzzy subsequence match: "theme" must not find "Trash 3 items".
+ */
+export function paletteFilter(value: string, search: string): number {
+  const haystack = value.toLowerCase();
+  const terms = search.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return 1;
+  if (!terms.every((term) => haystack.includes(term))) return 0;
+  return haystack.startsWith(terms[0]!) ? 1 : 0.5;
+}
+
 const sources = new Map<string, Command[]>();
 const listeners = new Set<() => void>();
 let all: Command[] = [];
