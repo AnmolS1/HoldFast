@@ -661,6 +661,65 @@ describe("Sentry redaction", () => {
     expect(redactUrl("/x?barcode=1")).toBe("/x?barcode=1");
   });
 
+  // Better Auth's reset link is GET /api/auth/reset-password/<token>: the token is a path segment.
+  it("drops the token of a Better Auth reset link, in a URL and in free text", () => {
+    expect(
+      redactUrl("https://holdfast.example/api/auth/reset-password/Zx9TOKENvalue?callbackURL=/reset-password"),
+    ).toBe("https://holdfast.example/api/auth/reset-password/[redacted]?callbackURL=/reset-password");
+    expect(redactUrl("/api/auth/reset-password/Zx9TOKENvalue")).toBe("/api/auth/reset-password/[redacted]");
+    expect(redactText("GET /api/auth/reset-password/Zx9TOKENvalue failed")).toBe(
+      "GET /api/auth/reset-password/[redacted] failed",
+    );
+    // The screens and the POST endpoint carry no token in the path.
+    for (const url of [
+      "/reset-password",
+      "/api/auth/reset-password",
+      "/reset-password?reason=x",
+      "/forgot-password",
+    ])
+      expect(redactUrl(url)).toBe(url);
+    const event = redactEvent({
+      request: { url: "https://h.example/api/auth/reset-password/Zx9TOKENvalue" },
+    });
+    expect(JSON.stringify(event)).not.toContain("Zx9TOKENvalue");
+  });
+
+  // One-time codes are short-lived but they are credentials while they live.
+  it("drops one-time codes from a captured request body, and only there", () => {
+    const out = redactEvent({
+      request: {
+        url: "https://h.example/api/auth/two-factor/verify-totp",
+        data: {
+          code: "123456",
+          otp: "654321",
+          totp: "111222",
+          backupCodes: ["aaaa-bbbb", "cccc-dddd"],
+          backupCode: "aaaa-bbbb",
+          trustDevice: true,
+          nested: { code: "999999", statusCode: 200, postcode: "N1" },
+        },
+      },
+      // Outside the request an error's own code is what makes the event readable: kept.
+      extra: { code: "23505", statusCode: 500, otpAuthUrlBuilt: true },
+      contexts: { response: { status_code: 500 } },
+      exception: {
+        values: [{ type: "DatabaseError", value: "duplicate key", mechanism: { data: { code: "23505" } } }],
+      },
+    });
+    expect(out.request.data).toEqual({
+      code: "[redacted]",
+      otp: "[redacted]",
+      totp: "[redacted]",
+      backupCodes: "[redacted]",
+      backupCode: "[redacted]",
+      trustDevice: true,
+      nested: { code: "[redacted]", statusCode: 200, postcode: "N1" },
+    });
+    expect(out.extra).toEqual({ code: "23505", statusCode: 500, otpAuthUrlBuilt: true });
+    expect(out.exception.values[0]!.mechanism.data.code).toBe("23505");
+    expect(JSON.stringify(out)).not.toMatch(/123456|654321|111222|aaaa-bbbb|999999/);
+  });
+
   it("replaces email addresses in text", () => {
     expect(redactText("user Alice.Smith+tag@example.co.uk could not sign in")).toBe(
       "user [email] could not sign in",
