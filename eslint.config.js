@@ -5,6 +5,19 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 import accentGuard from "./src/client/theme/eslint-accent-guard.mjs";
 
+const SINK_MESSAGE = "Sentry, metrics and the audit log are reached only through src/worker/auth/observe.ts.";
+const OBSERVE_MESSAGE = "Use reportError / count / record from src/worker/auth/observe.ts.";
+// The two worker-wide syntax rules. A later block's `no-restricted-syntax` REPLACES an earlier
+// one for the files it matches, so every block that sets the rule for worker files repeats these.
+const NO_RAW_WAIT_UNTIL = {
+  selector: "CallExpression[callee.property.name='waitUntil']",
+  message: "Use defer(c, promise) from services/request-context (or bg.defer / deps.defer).",
+};
+const NO_RAW_JSON_BODY = {
+  selector: "CallExpression[callee.property.name='json'][callee.object.property.name='req']",
+  message: "Use jsonBody(c) from services/body: c.req.json() answers a malformed body with a 500.",
+};
+
 export default tseslint.config(
   {
     ignores: [
@@ -53,32 +66,75 @@ export default tseslint.config(
     files: ["src/worker/**/*.ts"],
     ignores: ["src/worker/services/body.ts", "src/worker/services/request-context.ts", "src/worker/index.ts"],
     rules: {
-      "no-restricted-syntax": [
-        "error",
-        {
-          selector: "CallExpression[callee.property.name='waitUntil']",
-          message: "Use defer(c, promise) from services/request-context (or bg.defer / deps.defer).",
-        },
-        {
-          selector: "CallExpression[callee.property.name='json'][callee.object.property.name='req']",
-          message: "Use jsonBody(c) from services/body: c.req.json() answers a malformed body with a 500.",
-        },
-      ],
+      "no-restricted-syntax": ["error", NO_RAW_WAIT_UNTIL, NO_RAW_JSON_BODY],
     },
   },
   {
     // In the two files that may call waitUntil, the body rule still applies.
     files: ["src/worker/services/request-context.ts", "src/worker/index.ts"],
     rules: {
-      "no-restricted-syntax": [
+      "no-restricted-syntax": ["error", NO_RAW_JSON_BODY],
+    },
+  },
+  {
+    // The auth layer has ONE exit to each sink: Sentry, the metrics and the audit log are reached
+    // only through auth/observe.ts, the console only through auth/logger.ts — both redact what
+    // they are given. Anything else in the layer that names a sink directly is an error.
+    files: [
+      "src/worker/auth/**/*.ts",
+      "src/worker/routes/{auth,signup-intent,invites,pending-email,account-lifecycle}.ts",
+      "src/worker/services/{email,signup-policy,account-state}.ts",
+    ],
+    ignores: ["src/worker/auth/observe.ts", "src/worker/auth/logger.ts"],
+    rules: {
+      "no-console": "error",
+      "no-restricted-imports": [
         "error",
         {
-          selector: "CallExpression[callee.property.name='json'][callee.object.property.name='req']",
-          message: "Use jsonBody(c) from services/body: c.req.json() answers a malformed body with a 500.",
+          patterns: [
+            { regex: "(^|/)sentry$", message: SINK_MESSAGE },
+            { regex: "^@sentry/", message: SINK_MESSAGE },
+            { regex: "(^\\.\\./services/|^\\./)metrics$", message: SINK_MESSAGE },
+            { regex: "^\\.\\./services/audit$", message: SINK_MESSAGE },
+          ],
+        },
+      ],
+      "no-restricted-syntax": [
+        "error",
+        NO_RAW_WAIT_UNTIL,
+        NO_RAW_JSON_BODY,
+        {
+          selector:
+            "CallExpression[callee.name=/^(captureError|captureException|captureMessage|addBreadcrumb|setContext|setTag|setTags|setExtra|setExtras|setUser|writeMetric|insertAudit)$/]",
+          message: OBSERVE_MESSAGE,
+        },
+        {
+          selector:
+            "CallExpression[callee.property.name=/^(captureException|captureMessage|addBreadcrumb|setContext|setTag|setTags|setExtra|setExtras|setUser|writeDataPoint)$/]",
+          message: OBSERVE_MESSAGE,
         },
       ],
     },
   },
+  {
+    // In src/worker/services, "./audit" is the audit SERVICE (in src/worker/auth it is the
+    // layer's own file), so there it is a sink too.
+    files: ["src/worker/services/{email,signup-policy,account-state}.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { regex: "(^|/)sentry$", message: SINK_MESSAGE },
+            { regex: "^@sentry/", message: SINK_MESSAGE },
+            { regex: "^\\./(metrics|audit)$", message: SINK_MESSAGE },
+          ],
+        },
+      ],
+    },
+  },
+  // observe.ts is the exit to Sentry, metrics and the audit log — not to the console.
+  { files: ["src/worker/auth/observe.ts"], rules: { "no-console": "error" } },
   {
     // Node-side files: tool configs, scripts and the placeholder container server.
     files: ["*.config.{js,ts,mjs}", "scripts/**/*.{js,mjs,ts}", "containers/**/*.{js,mjs}"],
