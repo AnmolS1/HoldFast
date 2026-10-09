@@ -24,13 +24,18 @@ FILES_URL="https://dev.holdfastusercontent.com"
 DEV_WORKER="holdfast-dev"
 NEON_PROJECT="old-scene-29128384"
 NEON_BRANCH="dev"
+# Pinned: the gate must not run whatever version is newest on the day.
+NEONCTL_VERSION="8.3.0"
 C2_TEST="tests/unit/auth/c2-preseed.test.ts"
 C2_SCRIPT="scripts/c2-abort-test.mjs"
 # The only keys the client bundle may write to localStorage. Extend only with a reviewed reason.
 ALLOWED_STORAGE_KEYS="hf.prefs.v1"
-# Call sites whose key is not a string literal (third-party code), as reviewed substrings of the
-# minified call. Empty: every such site fails until someone has read it and listed it here.
-KNOWN_DYNAMIC_STORAGE_SITES=""
+# Storage writes whose key is NOT a string literal in the built bundle (a constant the minifier
+# did not inline, or third-party code such as the UI library's colour-mode store). The scan cannot
+# read those keys, so a person does: the gate prints every such site, and this is the number of
+# sites that have been read and found to store no token, cookie value or session id. Any other
+# number — more OR fewer — fails until they are read again. 0 = none reviewed yet.
+REVIEWED_NONLITERAL_STORAGE_SITES=0
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
 EXPECTED_CHECKS=13
@@ -112,12 +117,13 @@ eval_vitest() { # <vitest --reporter=json output file>
 eval_storage_keys() { # <built client directory>
   local dir="$1"
   [ -d "$dir" ] || { echo "bundle-hygiene: $dir does not exist (no build)" && return 1; }
-  ALLOWED="$ALLOWED_STORAGE_KEYS" KNOWN="$KNOWN_DYNAMIC_STORAGE_SITES" node - "$dir" <<'NODE'
+  ALLOWED="$ALLOWED_STORAGE_KEYS" REVIEWED="$REVIEWED_NONLITERAL_STORAGE_SITES" node - "$dir" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const dir = process.argv[2];
 const allowed = new Set((process.env.ALLOWED || "").split(/\s+/).filter(Boolean));
-const known = (process.env.KNOWN || "").split("\n").map((s) => s.trim()).filter(Boolean);
+const reviewed = Number(process.env.REVIEWED || "0");
+const nonLiteral = [];
 const files = [];
 (function walk(d) {
   for (const e of fs.readdirSync(d, { withFileTypes: true })) {
@@ -145,7 +151,7 @@ for (const file of files) {
       if (!allowed.has(lit[2])) problems.push(`${where}: writes the key "${lit[2]}", which is not allow-listed`);
     } else {
       const context = src.slice(Math.max(0, m.index - 60), m.index + 100).replace(/\s+/g, " ");
-      if (!known.some((k) => context.includes(k))) problems.push(`${where}: writes a key that is not a string literal — unreviewed: …${context}…`);
+      nonLiteral.push(`${where}: …${context}…`);
     }
   }
 }
@@ -155,7 +161,11 @@ for (const key of allowed) {
   // writes means the check looked at the wrong bundle or the key was renamed.
   if (!all.includes(key)) problems.push(`the allow-listed key "${key}" does not occur in the client bundle (wrong bundle, or the key was renamed)`);
 }
-console.log(`bundle-hygiene: ${files.length} client file(s), ${sites} Storage write site(s), literal keys: ${[...seen].sort().join(", ") || "(none)"}`);
+console.log(`bundle-hygiene: ${files.length} client file(s), ${sites} Storage write site(s), literal keys: ${[...seen].sort().join(", ") || "(none)"}; ${nonLiteral.length} site(s) with a non-literal key, ${reviewed} reviewed`);
+if (nonLiteral.length !== reviewed) {
+  problems.push(`${nonLiteral.length} Storage write site(s) have a key the scan cannot read, but ${reviewed} were reviewed — read each one below, then set REVIEWED_NONLITERAL_STORAGE_SITES`);
+  for (const site of nonLiteral) problems.push(`  site: ${site}`);
+}
 for (const p of problems) console.log(`bundle-hygiene: ${p}`);
 process.exit(problems.length ? 1 : 0);
 NODE
@@ -264,7 +274,9 @@ self_test() {
   expect fail "the allow-listed key is not in the bundle" eval_storage_keys "$tmp/c-stale"
   expect fail "empty build" eval_storage_keys "$tmp/c-empty"
   expect fail "no build" eval_storage_keys "$tmp/c-absent"
-  KNOWN_DYNAMIC_STORAGE_SITES='localStorage.setItem(k+"-mode",m)' expect pass "a non-literal site that has been reviewed and listed" eval_storage_keys "$tmp/c-dynamic"
+  REVIEWED_NONLITERAL_STORAGE_SITES=1 expect pass "one non-literal site, one reviewed" eval_storage_keys "$tmp/c-dynamic"
+  REVIEWED_NONLITERAL_STORAGE_SITES=2 expect fail "one non-literal site, two reviewed (the bundle changed)" eval_storage_keys "$tmp/c-dynamic"
+  REVIEWED_NONLITERAL_STORAGE_SITES=1 expect fail "no non-literal site, one reviewed (the bundle changed)" eval_storage_keys "$tmp/c-ok"
 
   echo "bundle-hygiene, memory outbox:"
   mkdir -p "$tmp/w-ok" "$tmp/w-ungated" "$tmp/w-none"
@@ -391,7 +403,7 @@ check_migrations() {
   local url
   # The dev branch's DIRECT connection string. Held in a variable, handed over in the
   # environment, never printed.
-  url="$(cd "$root" && npx --yes neonctl connection-string "$NEON_BRANCH" --project-id "$NEON_PROJECT" 2>/dev/null)" || url=""
+  url="$(cd "$root" && npx --yes "neonctl@$NEONCTL_VERSION" connection-string "$NEON_BRANCH" --project-id "$NEON_PROJECT" 2>/dev/null)" || url=""
   [ -n "$url" ] || { echo "could not fetch the Neon $NEON_BRANCH connection string (neonctl login?)" && return 1; }
   DATABASE_URL_DIRECT="$url" bash "$lib" migrate none-pending remote
 }
