@@ -166,9 +166,8 @@ describe("a Google sign-up", () => {
 
     const accounts = await accountsOf(row!.id);
     expect(accounts.map((a) => a.providerId)).toEqual(["google"]);
-    // Google's tokens are stored encrypted, not as received.
-    expect(accounts[0]!.accessToken).not.toBeNull();
-    expect(accounts[0]!.accessToken).not.toContain("test-google-access-token");
+    // None of Google's tokens is stored (they are not used after the sign-in).
+    expect(accounts[0]).toMatchObject({ accessToken: null, refreshToken: null, idToken: null });
     expect(await auditRows({ action: "auth.sign_in", targetId: row!.id })).toMatchObject([
       { meta: { method: "google" } },
     ]);
@@ -413,5 +412,39 @@ describe("a Google sign-in of an existing account", () => {
     expect(await getSession(victim)).toBeNull();
     const row = await userByEmail(unverified.email);
     expect((await accountsOf(row!.id)).map((a) => a.providerId)).toEqual(["credential"]);
+  });
+});
+
+describe("what is kept of Google's tokens, and the ID-token shortcut (A9)", () => {
+  it("no token of Google's is stored — not at the first sign-in and not at a later one", async () => {
+    const client = newClient();
+    expect((await intent(client)).sent.status).toBe(200);
+    const email = freshEmail();
+    const profile = profileFor(email);
+    const first = await googleRoundTrip(client, profile);
+    expect(first.callback.status).toBe(302);
+    const row = (await userByEmail(email))!;
+    const stored = async () => (await accountsOf(row.id)).filter((a) => a.providerId === "google");
+    expect(await stored()).toHaveLength(1);
+    // The ID token is a signed statement of the person's name and address; the access and
+    // refresh tokens are never used after the sign-in. None of them is kept.
+    expect(await stored()).toMatchObject([{ idToken: null, accessToken: null, refreshToken: null }]);
+    await send(client, "/api/auth/sign-out", { json: {} });
+    const again = await googleRoundTrip(client, profile, "/login");
+    expect(again.callback.status).toBe(302);
+    expect((await getSession(client))?.user.id).toBe(row.id);
+    expect(await stored()).toMatchObject([{ idToken: null, accessToken: null, refreshToken: null }]);
+  });
+
+  it("signing in by POSTing an ID token (no redirect, no state) is not available", async () => {
+    const owner = await verifiedUser();
+    const before = (await sessionsOf(owner.user.id)).length;
+    const sent = await send(newClient(), "/api/auth/sign-in/social", {
+      json: { provider: "google", idToken: { token: "eyJhbGciOiJSUzI1NiJ9.e30.sig", nonce: "n" } },
+    });
+    expect(sent.status).toBe(404);
+    expect(sent.body).toMatchObject({ code: "ID_TOKEN_NOT_SUPPORTED" });
+    expect(sent.setCookies.join("\n")).not.toContain("session_token");
+    expect((await sessionsOf(owner.user.id)).length).toBe(before);
   });
 });

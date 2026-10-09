@@ -186,10 +186,17 @@ export function buildAuthOptions(scope: AuthScope) {
         clientId: env.GOOGLE_CLIENT_ID,
         clientSecret: env.GOOGLE_CLIENT_SECRET,
         prompt: "select_account" as const,
+        // Only the redirect flow (state row + signed state cookie + PKCE). The shortcut that
+        // takes an ID token in a POST — no redirect, no state, an optional caller-chosen nonce —
+        // is something the app never uses (api/routes/sign-in.mjs → ID_TOKEN_NOT_SUPPORTED).
+        disableIdTokenSignIn: true,
       },
     },
     account: {
-      // Google's tokens are not used after sign-in; what is stored of them is stored encrypted.
+      // Google's tokens are not used after sign-in, and none is stored: the `account` hooks
+      // (auth/hooks.ts) write null for the ID token — a signed statement of the person's name and
+      // address, which this option would not have encrypted — and for the access and refresh
+      // tokens. The option stays on for anything that might ever be stored.
       encryptOAuthTokens: true,
       // Linking a provider identity to an existing account (see the `account.create` hook in
       // auth/hooks.ts, which is where the policy for an UNVERIFIED local account lives):
