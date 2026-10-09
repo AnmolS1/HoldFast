@@ -9,7 +9,7 @@
 
 import { and, eq, isNull, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
-import { QueryError } from "../errors";
+import { pgError, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import {
   linkAccessLog,
@@ -204,29 +204,43 @@ export async function unpauseLinks(
  * Records a wrong password for (link, IP). The first three failures carry no delay; failure
  * n > 3 locks the pair for min(2^(n-3), 900) seconds. A row idle for 24 hours starts again at
  * one. The link itself is never paused: nobody can lock a link for other people.
+ * Null — and nothing is recorded — when there is no such link (a malformed id included).
  */
 export async function recordPasswordFailure(
   db: Executor,
   linkId: string,
   ipHashStable: string,
-): Promise<{ failures: number; lockedUntil: Date | null }> {
+): Promise<{ failures: number; lockedUntil: Date | null } | null> {
+  if (!isUuid(linkId)) return null;
   const failures = sql`(CASE WHEN ${linkPasswordAttempts.lastFailureAt} < now() - interval '24 hours'
     THEN 1 ELSE ${linkPasswordAttempts.failures} + 1 END)`;
-  const [row] = await db
-    .insert(linkPasswordAttempts)
-    .values({ linkId, ipHashStable, failures: 1, lastFailureAt: sql`now()`, lockedUntil: null })
-    .onConflictDoUpdate({
-      target: [linkPasswordAttempts.linkId, linkPasswordAttempts.ipHashStable],
-      set: {
-        failures,
-        lastFailureAt: sql`now()`,
-        lockedUntil: sql`CASE WHEN ${failures} > ${PASSWORD_FREE_ATTEMPTS}
+  try {
+    // In a savepoint: a link that does not exist fails the foreign key, and that must not abort
+    // the caller's transaction.
+    return await db.transaction(async (sp) => {
+      const [row] = await sp
+        .insert(linkPasswordAttempts)
+        .values({ linkId, ipHashStable, failures: 1, lastFailureAt: sql`now()`, lockedUntil: null })
+        .onConflictDoUpdate({
+          target: [linkPasswordAttempts.linkId, linkPasswordAttempts.ipHashStable],
+          set: {
+            failures,
+            lastFailureAt: sql`now()`,
+            lockedUntil: sql`CASE WHEN ${failures} > ${PASSWORD_FREE_ATTEMPTS}
           THEN now() + make_interval(secs => LEAST(power(2, LEAST(${failures} - ${PASSWORD_FREE_ATTEMPTS}, 30)), ${PASSWORD_LOCK_MAX_SEC}))
           ELSE NULL END`,
-      },
-    })
-    .returning({ failures: linkPasswordAttempts.failures, lockedUntil: linkPasswordAttempts.lockedUntil });
-  return row!;
+          },
+        })
+        .returning({
+          failures: linkPasswordAttempts.failures,
+          lockedUntil: linkPasswordAttempts.lockedUntil,
+        });
+      return row!;
+    });
+  } catch (error) {
+    if (pgError(error)?.code === "23503") return null;
+    throw error;
+  }
 }
 
 /**

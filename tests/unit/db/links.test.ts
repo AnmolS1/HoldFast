@@ -287,6 +287,22 @@ describe("the pause set", () => {
 });
 
 describe("the password throttle", () => {
+  it("a link id that is malformed or does not exist records nothing and does not throw", async () => {
+    const ip = `ip-${rand()}`;
+    expect(await recordPasswordFailure(db, "not-a-uuid", ip)).toBeNull();
+    expect(await recordPasswordFailure(db, "", ip)).toBeNull();
+    expect(await recordPasswordFailure(db, uuidv7(), ip)).toBeNull();
+    // Inside a caller's transaction the refusal leaves the transaction usable.
+    await db.transaction(async (tx) => {
+      expect(await recordPasswordFailure(tx, uuidv7(), ip)).toBeNull();
+      expect(await recordPasswordFailure(tx, "junk", ip)).toBeNull();
+      expect((await tx.execute(sql`SELECT 1 AS one`)).rows).toEqual([{ one: 1 }]);
+    });
+    expect(
+      await db.select().from(linkPasswordAttempts).where(eq(linkPasswordAttempts.ipHashStable, ip)),
+    ).toEqual([]);
+  });
+
   it("three free failures, then min(2^(n-3), 900) seconds; a success clears the pair; the link is never paused", async () => {
     const { link } = await linked();
     const ip = `ip-${rand()}`;
@@ -297,7 +313,7 @@ describe("the password throttle", () => {
     }
     const expected = [2, 4, 8, 16, 32, 64, 128, 256, 512, 900, 900];
     for (let i = 0; i < expected.length; i++) {
-      const result = await recordPasswordFailure(db, link.id, ip);
+      const result = (await recordPasswordFailure(db, link.id, ip))!;
       expect(result.failures).toBe(4 + i);
       const seconds = (result.lockedUntil!.getTime() - Date.now()) / 1000;
       expect(seconds, `failure ${4 + i}`).toBeGreaterThan(expected[i]! - 2);
@@ -326,7 +342,7 @@ describe("the password throttle", () => {
       .set({ lockedUntil: new Date(Date.now() - 1000) })
       .where(where);
     expect(await passwordLock(db, link.id, ip)).toBeNull();
-    expect((await recordPasswordFailure(db, link.id, ip)).failures).toBe(7);
+    expect((await recordPasswordFailure(db, link.id, ip))!.failures).toBe(7);
     await db
       .update(linkPasswordAttempts)
       .set({ lastFailureAt: new Date(Date.now() - 25 * 3_600_000) })
