@@ -342,8 +342,10 @@ test.describe("bootstrap", () => {
     );
     const code = stdout.trim();
     expect(code).toMatch(/^[A-HJKMNP-Z2-9]{5}(-[A-HJKMNP-Z2-9]{5}){3}$/);
-    // The code goes to stdout alone; the summary (with the HOST, never the URL) to stderr.
-    expect(stderr).toMatch(/created 1 invite code\(s\) on (localhost|127\.0\.0\.1)/);
+    // The code goes to stdout alone; the summary — the database's NAME and class, never its host
+    // or URL — to stderr.
+    expect(stderr).toMatch(/created 1 invite code\(s\) on database "holdfast[a-z0-9_]*" \(local\)/);
+    expect(stderr).not.toMatch(/localhost|127\.0\.0\.1/);
     expect(stderr).not.toContain(code);
     expect(stderr).not.toContain("postgres://");
     const signUp = (email: string) =>
