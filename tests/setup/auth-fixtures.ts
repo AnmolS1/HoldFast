@@ -120,6 +120,27 @@ export function totpCode(uriOrSecret: string, at: number = Date.now()): string {
   return String((mac.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 }
 
+// A code works ONCE per account (the Worker claims it: src/worker/auth/second-factor.ts), and a
+// code is valid for its own 30-second step and the one before and after. A test that needs a
+// second code for the same authenticator inside one step takes a neighbouring step's.
+const usedCodes = new Map<string, Set<string>>();
+
+/** A currently valid code for the authenticator that this worker process has not handed out yet. */
+export async function nextTotpCode(uriOrSecret: string): Promise<string> {
+  const used = usedCodes.get(uriOrSecret) ?? new Set<string>();
+  usedCodes.set(uriOrSecret, used);
+  for (;;) {
+    for (const offset of [0, 30_000, -30_000]) {
+      const code = totpCode(uriOrSecret, Date.now() + offset);
+      if (!used.has(code)) {
+        used.add(code);
+        return code;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 /** Sign up with an invite and follow the verification link. Every address needs an invite. */
 async function signUpAndVerify(
   request: APIRequestContext,
@@ -201,7 +222,7 @@ export async function signedInAdmin2fa(
   const { totpURI, backupCodes } = (await enabled.json()) as { totpURI: string; backupCodes: string[] };
   const enrolled = await request.post("/api/auth/two-factor/verify-totp", {
     headers: headersFor(options.clientIp),
-    data: { code: totpCode(totpURI) },
+    data: { code: await nextTotpCode(totpURI) },
   });
   await expectOk(enrolled, "two-factor/verify-totp (enrolment)");
   await expectOk(
@@ -215,7 +236,7 @@ export async function signedInAdmin2fa(
   await expectOk(password, "the admin's password sign-in");
   const code = await request.post("/api/auth/two-factor/verify-totp", {
     headers: headersFor(options.clientIp),
-    data: { code: totpCode(totpURI) },
+    data: { code: await nextTotpCode(totpURI) },
   });
   await expectOk(code, "the admin's TOTP code");
   return { ...user, totpURI, backupCodes };

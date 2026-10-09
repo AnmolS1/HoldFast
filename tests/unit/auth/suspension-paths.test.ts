@@ -29,7 +29,7 @@ import {
   signIn,
   signUp,
   testDb,
-  totp,
+  nextTotp,
   userByEmail,
   userById,
   verifiedUser,
@@ -100,7 +100,9 @@ describe("a suspended account cannot start a session", () => {
       await suspend(row.id);
       const second: Sent =
         factor === "totp"
-          ? await send(browser, "/api/auth/two-factor/verify-totp", { json: { code: await totp(totpURI) } })
+          ? await send(browser, "/api/auth/two-factor/verify-totp", {
+              json: { code: await nextTotp(totpURI) },
+            })
           : await send(browser, "/api/auth/two-factor/verify-backup-code", {
               json: { code: backupCodes[0] },
             });

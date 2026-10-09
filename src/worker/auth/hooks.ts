@@ -27,6 +27,7 @@ import { APIError, createAuthMiddleware } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
 import {
   clearUnprovenAccount,
+  deleteTrustedDevices,
   ensureUserPrefs,
   getAccount,
   getAccountByEmail,
@@ -49,6 +50,13 @@ import {
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
 import { beforeVerifyEmail } from "./mailbox-proof";
+import {
+  afterSecondFactor,
+  beforeSecondFactor,
+  secondFactorOfNewSession,
+  VERIFY_BACKUP_CODE_PATH,
+  VERIFY_TOTP_PATH,
+} from "./second-factor";
 import { countFor, record, reportError } from "./observe";
 import type { AuthScope, ClientFacts } from "./scope";
 import {
@@ -393,7 +401,15 @@ export function buildHooks(scope: AuthScope) {
             return refused(error);
           }
           const client = clientOf(scope, ctx);
-          return { data: { country: client.country, uaFamily: uaFamily(client.userAgent) } };
+          return {
+            data: {
+              country: client.country,
+              uaFamily: uaFamily(client.userAgent),
+              // Always written, null included: a session Better Auth makes by copying another
+              // must not inherit it (auth/second-factor.ts).
+              secondFactorAt: secondFactorOfNewSession(scope),
+            },
+          };
         },
         after: async (session: {
           id: string;
@@ -422,6 +438,15 @@ export function buildHooks(scope: AuthScope) {
     if (typeof path !== "string") return;
     if (path.startsWith("/admin/")) await adminGate(scope, ctx);
     if (path === "/verify-email" && ctx.request) await beforeVerifyEmail(scope, ctx);
+    if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
+      const body = await beforeSecondFactor(scope, ctx);
+      if (body) return { context: { body } };
+    }
+    if (path === "/change-password" && ctx.request) {
+      // A changed password ends every other session, whatever the client asked for
+      // (api/routes/update-user.mjs honours `revokeOtherSessions` only when the body says so).
+      return { context: { body: { ...((ctx.body ?? {}) as object), revokeOtherSessions: true } } };
+    }
     if (path === "/sign-up/email" && ctx.request) {
       // The cheap refusals first — before the password is hashed and looked up in the breach
       // corpus. They depend only on what was submitted, never on whether the address has an
@@ -438,6 +463,21 @@ export function buildHooks(scope: AuthScope) {
 
   const after = createAuthMiddleware(async (ctx) => {
     const path = ctx.path;
+    if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
+      await afterSecondFactor(scope, ctx);
+      return;
+    }
+    if (path === "/change-password" && ctx.request && !(ctx.context.returned instanceof Error)) {
+      // "Remember this device" does not outlive the password it was granted under.
+      const userId = ctx.context.session?.user.id;
+      if (userId)
+        await quietly(
+          env,
+          "trusted_devices",
+          async () => void (await deleteTrustedDevices(scope.db, userId)),
+        );
+      return;
+    }
     if (path === "/get-session") {
       // An account past its deletion date behaves as deleted. The session middleware already
       // treats such a session as absent; this ends it, the first time it is seen.

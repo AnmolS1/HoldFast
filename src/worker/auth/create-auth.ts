@@ -21,6 +21,7 @@ import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
 import { admin, captcha, haveIBeenPwned, twoFactor } from "better-auth/plugins";
 import type { Db } from "../db/client";
+import { deleteTrustedDevices } from "../db/queries/auth-lifecycle";
 import * as schema from "../db/schema";
 import { scheduleDeletion } from "../services/account-state";
 import {
@@ -35,6 +36,7 @@ import { sessionAdditionalFields, userAdditionalFields } from "./fields";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { hashPassword, verifyPassword } from "./password";
+import { passkeyAuthentication } from "./second-factor";
 import { createScope, emptyFacts, type AuthScope } from "./scope";
 import { installTestOutbound } from "./test-outbound";
 import type { Auth } from "./types";
@@ -128,6 +130,8 @@ export function buildAuthOptions(scope: AuthScope) {
       },
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
         scope.facts.passwordResetUserId = user.id;
+        // "Remember this device" does not outlive the password it was granted under.
+        await deleteTrustedDevices(db, user.id);
       },
     },
     emailVerification: {
@@ -241,7 +245,14 @@ export function buildAuthOptions(scope: AuthScope) {
     hooks: { before: hooks.before, after: hooks.after },
     // The same plugins in the same order as auth/config.ts (the schema generator's input).
     plugins: [
-      passkey({ rpID: new URL(env.APP_ORIGIN).hostname, rpName: "Holdfast", origin: env.APP_ORIGIN }),
+      passkey({
+        rpID: new URL(env.APP_ORIGIN).hostname,
+        rpName: "Holdfast",
+        origin: env.APP_ORIGIN,
+        // Lets the assertion's user-verification flag be seen (auth/second-factor.ts): the
+        // plugin itself never requires it.
+        authentication: passkeyAuthentication(scope),
+      }),
       twoFactor({
         issuer: "Holdfast",
         totpOptions: { digits: 6, period: 30 },

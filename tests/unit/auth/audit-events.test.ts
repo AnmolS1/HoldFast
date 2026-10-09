@@ -22,7 +22,7 @@ import {
   signIn,
   signUp,
   testDb,
-  totp,
+  nextTotp,
   userByEmail,
   userById,
   verifiedUser,
@@ -124,7 +124,7 @@ describe("two-factor", () => {
     ).toBeGreaterThan(0);
 
     const good = await send(browser, "/api/auth/two-factor/verify-totp", {
-      json: { code: await totp(totpURI) },
+      json: { code: await nextTotp(totpURI) },
     });
     expect(good.status, good.text).toBe(200);
     expect((await getSession(browser))?.user.id).toBe(row.id);

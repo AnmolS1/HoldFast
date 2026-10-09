@@ -57,6 +57,8 @@ export type SessionInfo = {
   // Additional fields.
   country?: string | null;
   uaFamily?: string | null;
+  /** When this session passed a second factor (auth/second-factor.ts); null when it never did. */
+  secondFactorAt?: Date | null;
 
   /** Admin plugin: set on an impersonated session to the admin's user id. */
   impersonatedBy?: string | null;

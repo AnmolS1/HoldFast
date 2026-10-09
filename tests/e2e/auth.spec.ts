@@ -28,7 +28,7 @@ import {
   localDb,
   signedInAdmin2fa,
   signedInUser,
-  totpCode,
+  nextTotpCode,
   TURNSTILE_TEST_TOKEN,
 } from "../setup/auth-fixtures";
 import { readVars } from "../setup/e2e-preflight";
@@ -215,7 +215,7 @@ test.describe("sign-up", () => {
     const { totpURI, backupCodes } = (await enabled.json()) as { totpURI: string; backupCodes: string[] };
     const verified = await page.request.post("/api/auth/two-factor/verify-totp", {
       headers: api(origins.app, clientIp),
-      data: { code: totpCode(totpURI) },
+      data: { code: await nextTotpCode(totpURI) },
     });
     expect(verified.status()).toBe(200);
     expect(backupCodes).toHaveLength(10);
@@ -229,7 +229,12 @@ test.describe("sign-up", () => {
     expect(await sessionOf(page.request)).toBeNull();
     await page.getByRole("button", { name: "Continue with passkey" }).click();
     await expectSignedIn(page);
-    expect((await sessionOf(page.request))?.user).toMatchObject({ email });
+    const withPasskey = await sessionOf(page.request);
+    expect(withPasskey?.user).toMatchObject({ email });
+    // This authenticator verified the user (as a fingerprint or a PIN does), so the session it
+    // made counts as having passed a second factor — src/worker/auth/second-factor.ts. (A key
+    // that proves presence only does not: tests/unit/auth/passkey-second-factor.test.ts.)
+    expect(typeof withPasskey?.session.secondFactorAt).toBe("string");
 
     // Nothing of the session is in Web Storage, and the auth library wrote nothing there.
     const storage = await page.evaluate(() => ({
@@ -516,7 +521,7 @@ test.describe("sign-in", () => {
       (
         await request.post("/api/auth/two-factor/verify-totp", {
           headers: api(origins.app, clientIp),
-          data: { code: totpCode(totpURI) },
+          data: { code: await nextTotpCode(totpURI) },
         })
       ).status(),
     ).toBe(200);
@@ -530,7 +535,7 @@ test.describe("sign-in", () => {
     await page.getByLabel("Six-digit code").fill("000000");
     await page.getByRole("button", { name: "Continue" }).click();
     await expect(page.getByText("That code didn't work. Check it and try again.")).toBeVisible();
-    await page.getByLabel("Six-digit code").fill(totpCode(totpURI));
+    await page.getByLabel("Six-digit code").fill(await nextTotpCode(totpURI));
     await page.getByRole("button", { name: "Continue" }).click();
     await expectSignedIn(page);
 

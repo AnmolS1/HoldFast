@@ -307,18 +307,27 @@ describe("guards", () => {
     expect((await send("/api/_guard/verified")).status).toBe(200);
   });
 
-  it("requireAdmin → admin role AND two-factor, never an impersonated session", async () => {
+  it("requireAdmin → admin role AND two-factor on the account AND on the session, never an impersonated session", async () => {
     const { fake, send } = setup();
+    const passed = { secondFactorAt: new Date("2026-06-01T00:00:00.000Z") };
     expect((await send("/api/_guard/admin")).status).toBe(401);
-    signIn(fake, { role: "user", twoFactorEnabled: true });
+    signIn(fake, { role: "user", twoFactorEnabled: true }, passed);
     expect((await send("/api/_guard/admin")).body.error).toBe("forbidden");
-    signIn(fake, { role: "admin", twoFactorEnabled: false });
+    signIn(fake, { role: "admin", twoFactorEnabled: false }, passed);
     const no2fa = await send("/api/_guard/admin");
     expect(no2fa.status).toBe(403);
     expect(no2fa.body.error).toBe("admin_requires_2fa");
-    signIn(fake, { role: "admin", twoFactorEnabled: true });
+    // Two-factor on the ACCOUNT, but this session never passed it (Google, a passkey without
+    // user verification, a trusted device, a mailed link): refused the same way.
+    for (const session of [{}, { secondFactorAt: null }, { secondFactorAt: "not a date" as never }]) {
+      signIn(fake, { role: "admin", twoFactorEnabled: true }, session);
+      const unproven = await send("/api/_guard/admin");
+      expect(unproven.status, JSON.stringify(session)).toBe(403);
+      expect(unproven.body.error).toBe("admin_requires_2fa");
+    }
+    signIn(fake, { role: "admin", twoFactorEnabled: true }, passed);
     expect((await send("/api/_guard/admin")).status).toBe(200);
-    signIn(fake, { role: "admin", twoFactorEnabled: true }, { impersonatedBy: "a".repeat(32) });
+    signIn(fake, { role: "admin", twoFactorEnabled: true }, { ...passed, impersonatedBy: "a".repeat(32) });
     expect((await send("/api/_guard/admin")).status).toBe(403);
   });
 });

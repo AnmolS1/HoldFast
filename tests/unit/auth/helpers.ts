@@ -419,13 +419,36 @@ export async function totp(uriOrSecret: string, at: number = Date.now()): Promis
   return String(binary % 1_000_000).padStart(6, "0");
 }
 
+// A code works ONCE per account (auth/second-factor.ts claims it), and a code is valid for its
+// own 30-second step and the one before and after. So a test that needs a second code for the
+// same authenticator inside one step takes a neighbouring step's: `nextTotp` hands out, per
+// authenticator, codes this test file has not used yet.
+const usedCodes = new Map<string, Set<string>>();
+
+/** A currently valid code for the authenticator that this file has not yet handed out. */
+export async function nextTotp(uriOrSecret: string): Promise<string> {
+  const used = usedCodes.get(uriOrSecret) ?? new Set<string>();
+  usedCodes.set(uriOrSecret, used);
+  for (;;) {
+    for (const offset of [0, 30_000, -30_000]) {
+      const code = await totp(uriOrSecret, Date.now() + offset);
+      if (!used.has(code)) {
+        used.add(code);
+        return code;
+      }
+    }
+    // All three codes of the window are spent: wait for the next step.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 /** Enrols TOTP for the signed-in client. Returns the URI and the backup codes. */
 export async function enableTotp(client: Client, password: string = PASSWORD) {
   const enabled = await send(client, "/api/auth/two-factor/enable", { json: { password } });
   if (enabled.status !== 200) throw new Error(`two-factor/enable failed: ${enabled.status} ${enabled.text}`);
   const { totpURI, backupCodes } = enabled.body as { totpURI: string; backupCodes: string[] };
   const verified = await send(client, "/api/auth/two-factor/verify-totp", {
-    json: { code: await totp(totpURI) },
+    json: { code: await nextTotp(totpURI) },
   });
   if (verified.status !== 200)
     throw new Error(`two-factor/verify-totp failed: ${verified.status} ${verified.text}`);
@@ -513,7 +536,17 @@ export function serviceDeps(overrides: Record<string, unknown> = {}) {
   };
 }
 
-/** Makes a signed-in user what `requireAdmin` and the admin gate ask for: the role and two-factor. */
-export async function promoteToAdmin(userId: string, twoFactor = true) {
+/**
+ * Makes a signed-in user what `requireAdmin` and the admin gate ask for — by writing the rows:
+ * the role, two-factor on the account, and (unless `secondFactor: false`) the mark on every
+ * session it has that the session passed a second factor.
+ *
+ * A SHORTCUT, for tests about something else (the allow-list, the audit rows). That each way of
+ * making a session does or does not carry the mark is proven with real sign-ins in
+ * second-factor.test.ts — never with this.
+ */
+export async function promoteToAdmin(userId: string, twoFactor = true, secondFactor = twoFactor) {
   await testDb().update(user).set({ role: "admin", twoFactorEnabled: twoFactor }).where(eq(user.id, userId));
+  if (secondFactor)
+    await testDb().update(session).set({ secondFactorAt: new Date() }).where(eq(session.userId, userId));
 }

@@ -13,7 +13,8 @@
 //
 // WHO MAY REACH AN ALLOWED PATH
 //   ban-user, unban-user, set-role, impersonate-user: the session's user has the `admin` role
-//     AND two-factor enabled, AND the session is not an impersonated one — the same condition
+//     AND two-factor enabled, AND THIS SESSION has passed a second factor (auth/second-factor.ts;
+//     otherwise 403 `admin_requires_2fa`), AND the session is not an impersonated one — the same condition
 //     as `requireAdmin` (middleware/guards.ts), evaluated here because /api/auth/* does not pass
 //     through that guard. Role and two-factor are read from the DATABASE, with the cookie cache
 //     bypassed: a demoted admin stops at once, not within 60 s.
@@ -35,6 +36,7 @@ import { hasAdminRole } from "../../shared/roles";
 import { getAccount } from "../db/queries/auth-lifecycle";
 import type { ServiceDeps } from "../services/request-context";
 import { count, record, sinkPath } from "./observe";
+import { hasSecondFactor } from "./second-factor";
 import type { AuthScope } from "./scope";
 
 /** Relative to Better Auth's `basePath` (/api/auth). The five plugin calls the admin console makes. */
@@ -52,6 +54,8 @@ const ALLOWED: readonly string[] = ADMIN_PLUGIN_ALLOWED;
 
 export const ADMIN_DENIED_CODE = "ADMIN_ENDPOINT_DENIED";
 const DENIED_MESSAGE = "This admin action is not available.";
+export const ADMIN_REQUIRES_2FA_CODE = "ADMIN_REQUIRES_2FA";
+const ADMIN_REQUIRES_2FA_MESSAGE = "Confirm your two-factor code to continue.";
 
 /**
  * Is this path (relative to /api/auth, exactly as it was sent) addressed at the admin plugin?
@@ -131,21 +135,35 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
   const impersonatedBy = (session?.session as { impersonatedBy?: string | null } | undefined)?.impersonatedBy;
 
   let allowed = false;
+  let needsSecondFactor = false;
   if (session && ALLOWED.includes(path)) {
     if (path === ADMIN_STOP_IMPERSONATING) {
       allowed = Boolean(impersonatedBy);
     } else if (!impersonatedBy) {
       const account = await getAccount(scope.db, session.user.id);
-      allowed =
-        account !== null &&
-        hasAdminRole(account.role) &&
+      const isAdmin =
+        account !== null && hasAdminRole(account.role) && !account.banned && account.suspendedAt === null;
+      // Two-factor on the account AND on this session (auth/second-factor.ts): a session made by
+      // Google, a passkey without user verification, a trusted device or a link has not passed it.
+      const passed =
+        isAdmin &&
         account.twoFactorEnabled &&
-        !account.banned &&
-        account.suspendedAt === null;
+        hasSecondFactor(session.session as { secondFactorAt?: unknown });
+      allowed = passed;
+      needsSecondFactor = isAdmin && !passed;
     }
   }
   if (allowed) return;
 
   await recordAdminDenial(scope, sessionUserId, path, method);
+  if (needsSecondFactor) {
+    // An admin who has not passed the second factor on this session: told so, in the words our
+    // own routes use (`error`) and Better Auth's (`code`), so the console can ask for a code.
+    throw new APIError("FORBIDDEN", {
+      message: ADMIN_REQUIRES_2FA_MESSAGE,
+      code: ADMIN_REQUIRES_2FA_CODE,
+      error: "admin_requires_2fa",
+    });
+  }
   throw new APIError("FORBIDDEN", { message: DENIED_MESSAGE, code: ADMIN_DENIED_CODE });
 }

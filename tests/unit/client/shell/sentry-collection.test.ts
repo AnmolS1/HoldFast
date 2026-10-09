@@ -18,7 +18,7 @@ describe("the browser SDK with the app's options", () => {
 
   it("collects no user info, cookies, headers, bodies or query strings; no replay; never asks for the IP", async () => {
     // Nothing may reach the network from a unit test, whatever the SDK decides to send.
-    const network = vi.fn(async (_url: unknown) => new Response("{}", { status: 200 }));
+    const network = vi.fn(async (...args: unknown[]) => (void args, new Response("{}", { status: 200 })));
     vi.stubGlobal("fetch", network);
     resetSentryForTests();
     const real = await import("@sentry/react");
