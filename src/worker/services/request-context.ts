@@ -68,6 +68,9 @@ export type AppEnv = {
   };
 };
 
+/** The only part of an ExecutionContext the auth layer gets, backed by `defer`. */
+export type AuthContext = Pick<ExecutionContext, "waitUntil" | "passThroughOnException">;
+
 /** What a service that can run outside a request takes as its first argument. */
 export type ServiceDeps = {
   db: Db;
@@ -80,7 +83,12 @@ export type CoreDeps = {
   /** Overrides of the drain bounds. For tests only (a 20 s deadline cannot be waited for). */
   limits?: Partial<DeferLimits>;
   createDb: typeof createDb;
-  createAuth: (env: Env, db: Db, ctx: ExecutionContext) => Auth;
+  /**
+   * `ctx` is NOT the Worker's ExecutionContext: its `waitUntil` is this request's `defer`, so
+   * whatever the auth layer hands to it is drained before the pool closes (and is subject to
+   * the same bounds). The raw context is never given out.
+   */
+  createAuth: (env: Env, db: Db, ctx: AuthContext) => Auth;
   getSettings: typeof getSettings;
   termsVersionOf: typeof termsVersionOf;
   insertAudit: typeof insertAudit;
@@ -284,7 +292,6 @@ type RequestState = Lifetime & {
   ip: string;
   colo: string | null;
   auth: Auth | null;
-  executionCtx: ExecutionContext;
 };
 
 const states = new WeakMap<object, RequestState>();
@@ -303,7 +310,7 @@ export function openRequestContext(
 ): void {
   // Hono types its own narrower ExecutionContext; at runtime it is the Worker's.
   const ctx = c.executionCtx as unknown as ExecutionContext;
-  states.set(c, { ...newLifetime(core, c.env, ctx), ...eager, auth: null, executionCtx: ctx });
+  states.set(c, { ...newLifetime(core, c.env, ctx), ...eager, auth: null });
 }
 
 /**
@@ -323,7 +330,11 @@ export function db(c: Context<AppEnv>): Db {
 
 export function auth(c: Context<AppEnv>): Auth {
   const state = stateOf(c);
-  state.auth ??= state.core.createAuth(state.env, lifeDb(state), state.executionCtx);
+  state.auth ??= state.core.createAuth(state.env, lifeDb(state), {
+    waitUntil: (promise) => lifeDefer(state, promise),
+    // Fail-open to the origin makes no sense for this Worker (there is no origin behind it).
+    passThroughOnException: () => {},
+  });
   return state.auth;
 }
 

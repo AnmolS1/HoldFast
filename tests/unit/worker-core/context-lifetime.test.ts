@@ -227,6 +227,56 @@ describe("request context: fetch", () => {
   });
 });
 
+// Better Auth defers work of its own (session refresh, verification mail, hooks) through the
+// context it is given. Handed the Worker's raw ExecutionContext, that work escapes the drain: the
+// pool is closed under it. It gets a context whose waitUntil IS `defer`.
+describe("the context createAuth receives", () => {
+  it("is the draining one: what the auth library hands to waitUntil keeps the pool open", async () => {
+    const fake = fakeCore();
+    let given: { waitUntil(p: Promise<unknown>): void } | undefined;
+    let raw: unknown;
+    const inner = fake.core.createAuth;
+    fake.core.createAuth = (env, handle, ctx) => {
+      given = ctx;
+      const auth = inner(env, handle, ctx);
+      return {
+        ...auth,
+        api: {
+          async getSession(input) {
+            // What a library does: fire-and-forget work through the context it was given.
+            ctx.waitUntil(
+              (async () => {
+                await sleep(15);
+                await query(handle);
+                fake.calls.push("auth:deferred-query");
+              })(),
+            );
+            return auth.api.getSession(input);
+          },
+        },
+      };
+    };
+    const app = probeApp(fake, (r) =>
+      r.get("/_probe/auth-ctx", (c) => {
+        raw = c.executionCtx;
+        return c.json({ ok: true });
+      }),
+    );
+    const { response, ctx } = await call(app, "/api/_probe/auth-ctx");
+    expect(response.status).toBe(200);
+    await response.text();
+    await ctx.settle();
+
+    expect(given).toBeDefined();
+    expect(given).not.toBe(raw);
+    expect(given).not.toBe(ctx);
+    // The deferred query ran on an open pool, and the close came after it.
+    expect(fake.calls).toContain("auth:deferred-query");
+    expect(fake.calls.indexOf("auth:deferred-query")).toBeLessThan(fake.calls.indexOf("close"));
+    expect(fake.calls.filter((entry) => entry === "close")).toHaveLength(1);
+  });
+});
+
 describe("runBackground: queue and scheduled", () => {
   // The same shapes index.ts calls: consumer.queue(batch, env, ctx, bg) and scheduled(event, env, ctx, bg).
   const nested = (fake: FakeCore, results: unknown[]) => async (bg: BackgroundContext) => {

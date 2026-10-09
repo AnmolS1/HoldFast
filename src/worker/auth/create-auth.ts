@@ -3,9 +3,12 @@
 // Until then nobody is ever signed in, and the handler answers 501.
 
 import type { Db } from "../db/client";
+import type { AuthContext } from "../services/request-context";
 import type { Auth } from "./types";
 
-export function createAuth(env: Env, db: Db, ctx: ExecutionContext): Auth {
+// `ctx.waitUntil` is the request's `defer` (services/request-context.ts): deferred auth work is
+// drained before the pool closes. The raw ExecutionContext is deliberately not available here.
+export function createAuth(env: Env, db: Db, ctx: AuthContext): Auth {
   void env;
   void db;
   void ctx;
