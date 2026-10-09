@@ -137,7 +137,7 @@ describe("source rules for the database layer", () => {
     const source = readFileSync(join(ROOT, "src/worker/db/client.ts"), "utf8");
     expect(source.match(/new Pool\(/g)).toHaveLength(1);
     expect(source).toMatch(
-      /export function createDb\(env: Env\)[^]*?new Pool\(\{ connectionString: env\.HYPERDRIVE\.connectionString, max: 5 \}\)/,
+      /export function createDb\(\s*env: Env,[^]*?new Pool\(\{ connectionString: env\.HYPERDRIVE\.connectionString, max: 5 \}\)/,
     );
   });
 });

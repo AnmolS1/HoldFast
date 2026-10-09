@@ -26,10 +26,10 @@
 // - The session time zone is never set, and nothing may depend on it. In SQL, compare a Better
 //   Auth `timestamp` column with `(now() AT TIME ZONE 'UTC')`, never with a bare `now()`.
 
-import type { ExtractTablesWithRelations } from "drizzle-orm";
+import { sql, type ExtractTablesWithRelations } from "drizzle-orm";
 import { drizzle, type NodePgDatabase, type NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
-import { Client, Pool, types, type PoolClient } from "pg";
+import { Pool, types, type PoolClient } from "pg";
 import * as schema from "./schema";
 
 /** OID of `timestamp` WITHOUT time zone. */
@@ -59,6 +59,11 @@ export type Tx = PgTransaction<NodePgQueryResultHKT, Schema, ExtractTablesWithRe
  */
 export type Executor = PgDatabase<NodePgQueryResultHKT, Schema, ExtractTablesWithRelations<Schema>>;
 
+/** The longest one statement inside a transaction may run. */
+export const TX_STATEMENT_TIMEOUT_MS = 30_000;
+/** The longest a transaction may sit idle between two statements. */
+export const TX_IDLE_TIMEOUT_MS = 30_000;
+
 /**
  * Takes no ExecutionContext and schedules nothing. `close()` is idempotent.
  *
@@ -80,47 +85,55 @@ export type Executor = PgDatabase<NodePgQueryResultHKT, Schema, ExtractTablesWit
  *      uses for a timed-out client), so the server-side session ends now, not when the server
  *      next reads from it. `client.end()` has already marked the client as ending, so this
  *      raises no "terminated unexpectedly" error; an error listener is attached regardless.
- * Before that, a query the connection is running is cancelled on the server (see
- * `cancelRunningQuery`). The abandoned owners' next use of their connection fails; nothing waits
- * for them.
+ * The abandoned owners' next use of their connection fails; nothing waits for them.
+ *
+ * NOTHING is sent to the server about the abandoned work: no CancelRequest, no
+ * `pg_cancel_backend` / `pg_terminate_backend`. Those address a backend by process id, and behind
+ * Hyperdrive's transaction pooling the backend an invocation saw may be serving ANOTHER
+ * invocation's statement by the time a cancel lands. The forced close touches only this
+ * invocation's own sockets. What then stops the work on the server:
+ *   - inside a transaction, the two limits every transaction of this handle sets for itself
+ *     (`TX_STATEMENT_TIMEOUT_MS`, `TX_IDLE_TIMEOUT_MS` — `SET LOCAL`, so they end with the
+ *     transaction; a session-level SET is not possible behind transaction pooling);
+ *   - a single auto-commit statement outside a transaction has no such limit: it is bounded only
+ *     by the destroyed socket and by what the server (or Hyperdrive) does about a client that is
+ *     gone — Postgres notices at its next read or write on that connection.
  */
-export function createDb(env: Env): { db: Db; close: (opts?: { force?: boolean }) => Promise<void> } {
+export function createDb(
+  env: Env,
+  limits: { statementTimeoutMs?: number; idleInTransactionTimeoutMs?: number } = {},
+): { db: Db; close: (opts?: { force?: boolean }) => Promise<void> } {
   const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
   const db = drizzle(pool, { schema, casing: "snake_case" });
+
+  // Every top-level transaction bounds itself on the SERVER, first thing: one statement may run
+  // for at most `statementTimeoutMs`, and the transaction may sit idle between statements for at
+  // most `idleInTransactionTimeoutMs`. So a transaction whose client has gone away (a forced
+  // close, an isolate that died) cannot hold its locks and its connection for long. Savepoints
+  // (`tx.transaction`) inherit the limits of the transaction they are in.
+  const statementMs = Math.trunc(limits.statementTimeoutMs ?? TX_STATEMENT_TIMEOUT_MS);
+  const idleMs = Math.trunc(limits.idleInTransactionTimeoutMs ?? TX_IDLE_TIMEOUT_MS);
+  if (!(statementMs > 0) || !(idleMs > 0)) throw new Error("transaction limits must be positive");
+  // `set_config(name, value, is_local => true)` is SET LOCAL as a function: one statement for
+  // both settings, and they end with the transaction.
+  const setLimits = sql`SELECT set_config('statement_timeout', ${String(statementMs)}, true),
+    set_config('idle_in_transaction_session_timeout', ${String(idleMs)}, true)`;
+  const begin = db.transaction.bind(db);
+  db.transaction = ((run, config) =>
+    begin(async (tx) => {
+      await tx.execute(setLimits);
+      return run(tx);
+    }, config)) as typeof db.transaction;
+
   // Connections currently lent out, so a forced close can take them back.
   const lent = new Set<PoolClient>();
   pool.on("acquire", (client) => lent.add(client));
   pool.on("release", (_error, client) => lent.delete(client));
   let ending: Promise<void> | null = null;
 
-  /**
-   * Best effort, before the socket goes: ask the server to cancel the query this connection is
-   * running, with Postgres' own CancelRequest (pg `Client#cancel`: a second, throw-away
-   * connection that sends the target's process id and secret key — it can only ever hit that one
-   * session). Without it the server does not notice a vanished client until the query ends: a
-   * destroyed socket alone leaves a minute-long query running its minute.
-   */
-  const cancelRunningQuery = (client: PoolClient): void => {
-    try {
-      const target = client as unknown as { activeQuery?: unknown; _getActiveQuery?: () => unknown };
-      const running = target._getActiveQuery ? target._getActiveQuery() : target.activeQuery;
-      if (!running) return;
-      const canceller = new Client({ connectionString: env.HYPERDRIVE.connectionString });
-      canceller.on("error", () => {});
-      (canceller as unknown as { connection: { on(event: string, fn: () => void): void } }).connection.on(
-        "error",
-        () => {},
-      );
-      (canceller as unknown as { cancel(client: PoolClient, query: unknown): void }).cancel(client, running);
-    } catch {
-      // The connection could not be made or the driver changed shape: the socket is destroyed anyway.
-    }
-  };
-
   const takeBack = (client: PoolClient): void => {
     lent.delete(client);
     client.on("error", () => {});
-    cancelRunningQuery(client);
     try {
       client.release(true);
     } catch {

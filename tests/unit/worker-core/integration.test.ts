@@ -14,7 +14,13 @@ import { PublicConfig } from "../../../src/shared/public-config";
 import { createApp } from "../../../src/worker/app";
 import { createAuth } from "../../../src/worker/auth/create-auth";
 import type { SessionInfo, SessionUser } from "../../../src/worker/auth/types";
-import { createDb, withDb, type Db } from "../../../src/worker/db/client";
+import {
+  createDb,
+  TX_IDLE_TIMEOUT_MS,
+  TX_STATEMENT_TIMEOUT_MS,
+  withDb,
+  type Db,
+} from "../../../src/worker/db/client";
 import { LegalHoldError, QueryError } from "../../../src/worker/db/errors";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { rename } from "../../../src/worker/db/queries/nodes";
@@ -296,7 +302,11 @@ describe("deferred work on a real pool", () => {
 
   // ── the drain is bounded ──────────────────────────────────────────────────────────────────
   // The real pool, real Postgres; only the deadline is shortened (20 s cannot be waited for).
-  const quick = (limits: CoreDeps["limits"]): CoreDeps => ({ ...realCore, limits });
+  const quick = (limits: CoreDeps["limits"], tx?: Parameters<typeof createDb>[1]): CoreDeps => ({
+    ...realCore,
+    limits,
+    createDb: tx ? (env) => createDb(env, tx) : createDb,
+  });
   const metricsSink = () => {
     const points: Array<{ blobs: string[]; doubles: number[] }> = [];
     const METRICS = {
@@ -357,11 +367,6 @@ describe("deferred work on a real pool", () => {
     };
     return stuck;
   };
-  /** The same minute-long query through the pool's own `query` (no transaction, no explicit client). */
-  const longPoolQuery = (): Stuck => ({
-    release: () => {},
-    task: (handle) => handle.execute(sql`select pg_sleep(60), 'hf-drain-test' as marker`),
-  });
   const poolQueryRunning = () =>
     withDb(workerEnv, async (handle) => {
       const found = await handle.execute(
@@ -370,6 +375,11 @@ describe("deferred work on a real pool", () => {
       return found.rows.map((row) => Number((row as { pid: number }).pid));
     });
 
+  // The server side is checked through pg_stat_activity over this checkout's LOCAL, direct
+  // Postgres connection. Nothing is cancelled by process id: the idle transaction ends because
+  // the server reads end-of-file on the destroyed socket, the running statement because of the
+  // transaction's own statement_timeout (1 s here instead of the default 30 s), after which the
+  // server finds the client gone.
   for (const [label, make] of [
     ["holds a connection in a transaction it never commits", openTransaction],
     ["has a minute-long query in flight inside a transaction", longQuery],
@@ -387,7 +397,9 @@ describe("deferred work on a real pool", () => {
       });
       const started = Date.now();
       const { response, ctx } = await call(
-        createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }), { extraRouters: [router] }),
+        createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }, { statementTimeoutMs: 1_000 }), {
+          extraRouters: [router],
+        }),
         "/api/_it/hung",
         { env: { METRICS: sink.METRICS } },
       );
@@ -418,30 +430,115 @@ describe("deferred work on a real pool", () => {
     });
   }
 
-  it("fetch: a minute-long query through pool.query is abandoned too, with no stray error", async () => {
-    const seen: { db?: Db } = {};
-    const stuck = longPoolQuery();
+  /** Test clean-up only, on the local server: end the marked statements this file left running. */
+  const endMarkedQueries = () =>
+    withDb(workerEnv, (handle) =>
+      handle.execute(
+        sql`select pg_terminate_backend(pid) from pg_stat_activity where query like '%pg_sleep(60), ''hf-drain-test''%' and pid <> pg_backend_pid()`,
+      ),
+    );
+
+  // A forced close must act on this invocation's own sockets only. It must not reach for the
+  // server with a cancel addressed by process id: behind Hyperdrive's transaction pooling that
+  // backend may be serving another invocation by then.
+  it("fetch: invocation A is force-closed while invocation B runs a long query — B completes, and nothing cancels A's statement on the server", async () => {
     const router = new Hono<AppEnv>();
-    router.get("/_it/hung-query", (c) => {
-      seen.db = db(c);
-      defer(c, stuck.task(db(c)));
+    const seen: { a?: Db } = {};
+    router.get("/_it/a", (c) => {
+      seen.a = db(c);
+      // Auto-commit, outside any transaction: no statement_timeout applies to it.
+      defer(c, db(c).execute(sql`select pg_sleep(60), 'hf-drain-test' as marker`));
       return c.json({ ok: true });
     });
-    const { response, ctx } = await call(
-      createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }), { extraRouters: [router] }),
-      "/api/_it/hung-query",
-    );
-    await response.text();
+    router.get("/_it/b", async (c) => {
+      const result = await db(c).transaction(async (tx) => {
+        const pid = await pidOf(tx);
+        const slept = await tx.execute(sql`select pg_sleep(1.5), 42 as answer`);
+        return { pid, answer: (slept.rows[0] as { answer: number }).answer };
+      });
+      return c.json(result);
+    });
+    const app = createApp(quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }), {
+      extraRouters: [router],
+    });
+
+    const b = call(app, "/api/_it/b");
+    const a = await call(app, "/api/_it/a");
+    await a.response.text();
     await sleep(100);
-    const before = await poolQueryRunning();
-    expect(before.length).toBeGreaterThanOrEqual(1);
-    await drainOf(ctx);
-    await expectPoolEnded(seen.db);
-    for (const pid of before) expect(await backendGone(pid)).toBe(true);
-    // pg-pool's own query wrapper releases the client again when the query errors: that second
+    const running = await poolQueryRunning();
+    expect(running.length).toBeGreaterThanOrEqual(1);
+
+    // A's drain deadline passes and its pool is force-closed while B is still inside pg_sleep.
+    await drainOf(a.ctx);
+    await expectPoolEnded(seen.a);
+
+    const answered = await b;
+    expect(answered.response.status).toBe(200);
+    expect(await answered.response.json()).toMatchObject({ answer: 42 });
+    await answered.ctx.settle();
+
+    // No out-of-band cancel reached the server: A's statement is still running there. (It is a
+    // single auto-commit statement — bounded only by the server noticing that its client is gone.)
+    await sleep(500);
+    const still = await poolQueryRunning();
+    expect(still.filter((pid) => running.includes(pid))).toEqual(running);
+    // pg-pool's own query wrapper releases the client again when its query errors: that second
     // release must not throw (it would be an uncaught exception, failing this whole file).
-    await sleep(50);
     await healthy();
+    await endMarkedQueries();
+  });
+
+  it("every transaction of a handle bounds itself on the server; a savepoint inherits it; nothing leaks to the session", async () => {
+    await withDb(workerEnv, async (handle) => {
+      const read = (tx: { execute: Db["execute"] }) =>
+        tx
+          .execute(
+            sql`select current_setting('statement_timeout') as statement, current_setting('idle_in_transaction_session_timeout') as idle`,
+          )
+          .then((result) => result.rows[0]);
+      const inside = await handle.transaction(async (tx) => ({
+        top: await read(tx),
+        nested: await tx.transaction((sp) => read(sp)),
+      }));
+      expect(inside.top).toEqual({ statement: "30s", idle: "30s" });
+      expect(inside.nested).toEqual({ statement: "30s", idle: "30s" });
+      expect(TX_STATEMENT_TIMEOUT_MS).toBe(30_000);
+      expect(TX_IDLE_TIMEOUT_MS).toBe(30_000);
+    });
+    // SET LOCAL: gone with the transaction. One connection, so the session is the same one.
+    const single = createDb({ ...workerEnv, HYPERDRIVE: workerEnv.HYPERDRIVE } as Env, {
+      statementTimeoutMs: 1_234,
+    });
+    try {
+      const during = await single.db.transaction(async (tx) => {
+        const row = (
+          await tx.execute(sql`select current_setting('statement_timeout') as v, pg_backend_pid() as pid`)
+        ).rows[0] as { v: string; pid: number };
+        return row;
+      });
+      expect(during.v).toBe("1234ms");
+      // Find that same backend again and read its session-level value.
+      let after: { v: string; pid: number } | undefined;
+      for (let n = 0; n < 10 && after?.pid !== during.pid; n++) {
+        after = (
+          await single.db.execute(
+            sql`select current_setting('statement_timeout') as v, pg_backend_pid() as pid`,
+          )
+        ).rows[0] as { v: string; pid: number };
+      }
+      expect(after).toEqual({ v: "0", pid: during.pid });
+      // And the limit is real: a statement past it is ended by the server.
+      const tooLong = await single.db
+        .transaction((tx) => tx.execute(sql`select pg_sleep(5)`))
+        .then(
+          () => null,
+          (error: unknown) => messagesOf(error).join(" | "),
+        );
+      expect(tooLong).toContain("statement timeout");
+    } finally {
+      await single.close();
+    }
   });
 
   it("fetch: deferred work that finishes before the deadline is waited for and the close is a plain one", async () => {
@@ -606,7 +703,7 @@ describe("deferred work on a real pool", () => {
           await sleep(100);
           expect(await backendAlive(stuck.pid!)).toBe(true);
         },
-        quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }),
+        quick({ drainDeadlineMs: 300, closeDeadlineMs: 1_000 }, { statementTimeoutMs: 1_000 }),
       );
       expect(Date.now() - started).toBeLessThan(100 + 300 + 1_000 + 1_500);
       await expectPoolEnded(seen.db);
