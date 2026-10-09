@@ -7,10 +7,11 @@
 # when it is green.
 name: ci
 
+# No `push` trigger on purpose. A push to `dev` or `prod` starts deploy-dev.yml / deploy-prod.yml,
+# whose first job calls this file; a push trigger here would run the same commit a second time.
+# "CI for a pushed commit" is therefore the `ci` job of that deploy run.
 on:
   pull_request:
-  push:
-    branches: [dev, prod]
   workflow_call:
 
 # `contents: read`, not `{}`: an empty block removes the right to check out a private repository

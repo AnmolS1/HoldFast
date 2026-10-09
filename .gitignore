@@ -13,6 +13,7 @@ coverage/
 .env
 .env.*
 !.env.example
+!.env.ci.example
 *secret*.json
 *.pem
 # OS / editor / local tool state

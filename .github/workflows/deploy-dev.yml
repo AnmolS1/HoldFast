@@ -27,6 +27,12 @@ jobs:
     if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # The GitHub environment this job's secrets may be scoped to. A secret of the same name set on
+    # the environment wins over the repository-level one, so moving CLOUDFLARE_API_TOKEN and
+    # NEON_DIRECT_URL_DEV there needs no change to this file. (deploy-prod.yml uses `Production`,
+    # where the production database URL and tokens belong, restricted to the `prod` branch — so a
+    # run from `dev` cannot read them.)
+    environment: dev
     # One deploy to dev at a time, shared with scanner-image.yml. Never cancelled mid-flight: a
     # cancelled run could stop between the migration and the deploy.
     concurrency:
