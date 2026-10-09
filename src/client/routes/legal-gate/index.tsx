@@ -9,7 +9,7 @@ import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
 import { EXTERNAL_LINKS } from "../../lib/contracts";
 import { t } from "../../lib/i18n";
-import { purgeUserState, refreshSession, usePublicConfig } from "../../lib/query";
+import { getKnownUserId, purgeUserState, refreshSession, usePublicConfig } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
 import { safeNext } from "../auth/validation";
 
@@ -34,11 +34,13 @@ export function AcceptTermsPage() {
     if (!checked || !config) return;
     setError(null);
     setBusy(true);
+    const before = getKnownUserId();
+    let after: string | null;
     try {
       await api("/api/account/accept-terms", { method: "POST", body: { version: config.termsVersion } });
       // The refreshed session passes the identity guard: if another account is signed in by now,
       // the previous account's state is purged and its waiting requests are discarded, not replayed.
-      await refreshSession();
+      after = (await refreshSession())?.user.id ?? null;
     } catch (cause) {
       setBusy(false);
       setError(t("terms.failed"));
@@ -46,9 +48,10 @@ export function AcceptTermsPage() {
       return;
     }
     setBusy(false);
-    // Requests that were refused with `terms_required` replay now.
+    // Requests that were refused with `terms_required` replay now (none are left if the identity changed).
     completeTermsGate();
-    navigate(next, { replace: true });
+    // `next` belongs to whoever was sent here. A different account starts at the root instead.
+    navigate(before !== null && after === before ? next : "/", { replace: true });
   };
 
   const onSignOut = async () => {

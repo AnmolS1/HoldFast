@@ -236,7 +236,7 @@ describe("2. identity changes purge user-scoped state", () => {
         return undefined;
       },
     });
-    renderRoutes(buildRoutes(), ["/accept-terms"]);
+    const { router } = renderRoutes(buildRoutes(), ["/accept-terms?next=%2Fsearch%3Fq%3Dalice-secret"]);
     fireEvent.click(await screen.findByRole("checkbox"));
     queryClient.setQueryData(["nodes", "root"], [{ id: "alice-file" }]);
     const held = api("/api/nodes/folder", { method: "POST", body: { name: "alice-folder" } });
@@ -246,6 +246,26 @@ describe("2. identity changes purge user-scoped state", () => {
     await expect(held).rejects.toMatchObject({ status: 403 });
     expect(calls.filter((call) => call.path === "/api/nodes/folder").length).toBe(1);
     expect(queryClient.getQueryData(["nodes", "root"])).toBeUndefined();
+    // Bob does not land on Alice's destination (her search query was in `next`).
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(router.state.location.search).toBe("");
+  });
+
+  it("legal gate: the SAME account accepting goes on to its own next", async () => {
+    let current: SessionShape = sessionOf({ ...ALICE!.user, termsVersion: "2025-01" });
+    shellFetch({
+      session: () => current,
+      extra: (call) => {
+        if (call.path !== "/api/account/accept-terms") return undefined;
+        current = ALICE;
+        return json({ ok: true });
+      },
+    });
+    const { router } = renderRoutes(buildRoutes(), ["/accept-terms?next=%2Fsearch%3Fq%3Dmine"]);
+    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "Accept and continue" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/search"));
+    expect(router.state.location.search).toBe("?q=mine");
   });
 });
 
