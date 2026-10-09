@@ -280,6 +280,12 @@ describe("searchNames", () => {
     const outsider = await makeUser(db);
     await makeShare(db, lib.theirs.id, lib.friend, { email: `pending-${rand()}@example.test` });
     expect((await searchNames(db, outsider, lib.token, query)).items).toEqual([]);
+    // A row that names the user but was never activated grants nothing either.
+    const half = await makeUser(db);
+    const inactive = await makeShare(db, lib.theirs.id, lib.friend, { userId: half });
+    expect((await searchNames(db, half, lib.token, query)).items).toHaveLength(1);
+    await db.update(shares).set({ activatedAt: null }).where(eq(shares.id, inactive.id));
+    expect((await searchNames(db, half, lib.token, query)).items).toEqual([]);
 
     await db.update(user).set({ suspendedAt: new Date() }).where(eq(user.id, lib.friend));
     expect((await searchNames(db, lib.me, lib.token, query)).items).toEqual([]);
