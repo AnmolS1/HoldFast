@@ -1,0 +1,178 @@
+# Rebuilds the scanner (ClamAV) image and redeploys, so the virus signatures baked into the image
+# are never more than about a week old even when containers/ is untouched.
+#
+# `schedule` and `workflow_dispatch` only fire from the default branch (`prod`), so this does
+# nothing until the file is on `prod`. It is also a no-op while containers/clamav/Dockerfile is
+# still the placeholder (no scanner in it): the job says so and stops.
+#
+# It redeploys the code that is ALREADY LIVE, with a fresh image, and nothing else: for each
+# environment it checks out that environment's branch and refuses to continue unless the live build
+# stamp is exactly that commit. It never migrates a database and can never ship undeployed code.
+name: scanner-image
+
+on:
+  schedule:
+    # Mondays 05:23 UTC.
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which environment to rebuild
+        type: choice
+        options: [both, dev, production]
+        default: both
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rebuild:
+    if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/prod'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - env: dev
+            branch: dev
+            worker: holdfast-dev
+            app_url: https://holdfast-dev.ponderance.dev
+            files_url: https://dev.holdfastusercontent.com
+          - env: production
+            branch: prod
+            worker: holdfast
+            app_url: https://holdfast.ponderance.dev
+            files_url: https://holdfastusercontent.com
+    # The same groups as deploy-dev.yml / deploy-prod.yml: never two deploys to one environment.
+    concurrency:
+      group: deploy-${{ matrix.env }}
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+      TARGET_ENV: ${{ matrix.env }}
+      TARGET_BRANCH: ${{ matrix.branch }}
+      WORKER: ${{ matrix.worker }}
+      APP_URL: ${{ matrix.app_url }}
+      FILES_URL: ${{ matrix.files_url }}
+    steps:
+      - name: Is this environment selected?
+        id: select
+        env:
+          REQUESTED: ${{ inputs.target || 'both' }}
+        run: |
+          case "$REQUESTED" in
+            both | "$TARGET_ENV") echo "run=true" >>"$GITHUB_OUTPUT" ;;
+            dev | production)
+              echo "run=false" >>"$GITHUB_OUTPUT"
+              echo "::notice::scanner-image: $TARGET_ENV not selected (target=$REQUESTED)"
+              ;;
+            *)
+              echo "::error::unknown target"
+              exit 1
+              ;;
+          esac
+
+      - name: Check out the environment's branch
+        if: steps.select.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          persist-credentials: false
+
+      # The placeholder image has no scanner and no signatures: there is nothing to refresh.
+      - name: Is there a real scanner image to rebuild?
+        if: steps.select.outputs.run == 'true'
+        id: guard
+        run: |
+          dockerfile=containers/clamav/Dockerfile
+          if [ ! -f "$dockerfile" ]; then
+            echo "::error::$dockerfile is missing"
+            exit 1
+          fi
+          if grep -qiE 'freshclam|clamd' "$dockerfile" && ! grep -qi 'placeholder scanner image' "$dockerfile"; then
+            echo "real=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "real=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::scanner-image: $dockerfile is still the placeholder — nothing was rebuilt for $TARGET_ENV"
+          fi
+
+      - name: Set up Node
+        if: steps.guard.outputs.real == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.guard.outputs.real == 'true'
+        run: npm ci
+
+      - name: Resolve the commit to redeploy
+        if: steps.guard.outputs.real == 'true'
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      # Redeploy only what is already live. If the branch head is not the live commit, a deploy is
+      # pending or failed — that is deploy-dev / deploy-prod's business, not this workflow's.
+      - name: The branch head is the commit that is live
+        if: steps.guard.outputs.real == 'true'
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: bash .github/workflows/lib/deploy-lib.sh stamp "$APP_URL" "$SHA" 1 0
+
+      - name: The Worker exists and has its secrets
+        if: steps.guard.outputs.real == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh worker-ready "$WORKER"
+
+      # Not here yet (it arrives with the real scanner image): before the build, restore the
+      # signature cache from b/clamav/ in the DEV bucket (holdfast-files-dev — never the production
+      # bucket) into containers/clamav/cvd/, refreshing it when it is older than 24 h. The
+      # signature CDN rate-limits CI runners.
+
+      # The stamp must keep naming the redeployed commit and branch, not this workflow's ref.
+      - name: Build
+        if: steps.guard.outputs.real == 'true'
+        env:
+          HOLDFAST_GIT_SHA: ${{ steps.commit.outputs.sha }}
+          HOLDFAST_GIT_BRANCH: ${{ matrix.branch }}
+        run: |
+          if [ "$TARGET_ENV" = "production" ]; then export CLOUDFLARE_ENV=production; fi
+          npm run build
+
+      - name: The build is for this environment
+        if: steps.guard.outputs.real == 'true'
+        run: bash .github/workflows/lib/deploy-lib.sh built-env "$TARGET_ENV"
+
+      # A Dockerfile path always builds and pushes: that is the point of this workflow.
+      - name: Deploy with a freshly built image
+        if: steps.guard.outputs.real == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ "$TARGET_ENV" = "production" ]; then
+            npx wrangler deploy --env production
+          else
+            npx wrangler deploy
+          fi
+
+      - name: Build stamp is unchanged
+        if: steps.guard.outputs.real == 'true'
+        env:
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: bash .github/workflows/lib/deploy-lib.sh stamp "$APP_URL" "$SHA" 6 10
+
+      - name: App and files host answer
+        if: steps.guard.outputs.real == 'true'
+        run: |
+          bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
+          bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"

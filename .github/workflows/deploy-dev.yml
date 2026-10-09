@@ -1,0 +1,121 @@
+# Deploys the dev environment (Worker "holdfast-dev") on every push to `dev`, after CI is green
+# for that exact commit. Order: migrate → deploy → build stamp → files host.
+#
+# The FIRST deploy of an environment is done by hand: the CI token cannot attach a custom domain.
+# This workflow redeploys a Worker that already exists and already has its domains and secrets.
+name: deploy-dev
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  deploy:
+    needs: ci
+    if: github.repository == 'AnmolS1/HoldFast' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # One deploy to dev at a time, shared with scanner-image.yml. Never cancelled mid-flight: a
+    # cancelled run could stop between the migration and the deploy.
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+      APP_URL: https://holdfast-dev.ponderance.dev
+      FILES_URL: https://dev.holdfastusercontent.com
+      # "true" = always build and push the scanner image, even when containers/ did not change.
+      SCANNER_ALWAYS_BUILD: "false"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the containers plan diffs against the commit that is live.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # A run that waited in the queue, or a re-run of an old run, must not put old code back.
+      - name: This commit is still the head of dev
+        run: bash .github/workflows/lib/deploy-lib.sh branch-head dev "$GITHUB_SHA"
+
+      - name: Postgres client
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+
+      # CI never creates a Worker: it must exist, with a deployment and its nine secrets.
+      - name: The dev Worker exists and has its secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh worker-ready holdfast-dev
+
+      # Build the scanner image, or leave the running container alone? Decided against the commit
+      # that is live right now, before anything changes.
+      - name: Containers plan
+        id: plan
+        run: bash .github/workflows/lib/deploy-lib.sh containers-plan "$APP_URL" "$GITHUB_SHA"
+
+      # The top level of wrangler.jsonc is dev; the environment is chosen here, at build time.
+      # The build stamp (GET /__meta) takes GITHUB_SHA and GITHUB_REF_NAME from the runner.
+      - name: Build (dev)
+        run: npm run build
+
+      # dist/holdfast_dev/ is the output directory for every environment: only `name` inside the
+      # emitted config says which one was built.
+      - name: The build is a dev build
+        run: bash .github/workflows/lib/deploy-lib.sh built-env dev
+
+      - name: Migrate the dev database
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_DEV }}
+        run: bash .github/workflows/lib/deploy-lib.sh migrate apply remote
+
+      # = the deploy half of `npm run deploy:dev` (the build half ran above so that the name check
+      # sits between them). The log prints every `vars` value — public ones; no secret is a var.
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ROLLOUT: ${{ steps.plan.outputs.rollout }}
+        run: |
+          case "$ROLLOUT" in
+            build) npx wrangler deploy ;;
+            none) npx wrangler deploy --containers-rollout none ;;
+            *)
+              echo "::error::no containers plan (got '$ROLLOUT'); refusing to guess"
+              exit 1
+              ;;
+          esac
+
+      - name: Build stamp is this commit
+        run: bash .github/workflows/lib/deploy-lib.sh stamp "$APP_URL" "$GITHUB_SHA" 6 10
+
+      - name: App answers
+        run: bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
+
+      - name: Files host answers 404 and nothing else
+        run: bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"

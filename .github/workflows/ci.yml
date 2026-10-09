@@ -1,0 +1,141 @@
+# The gate every push goes through: the same five commands that are run by hand before a merge
+#   npm run typecheck && npm run lint && npm test && npm run build && npm run e2e
+# plus the two things a fresh runner needs first (a migrated Postgres and a .dev.vars).
+#
+# This workflow holds NO secret and must stay that way: it runs for pull requests, including ones
+# from forks. Deploying is deploy-dev.yml / deploy-prod.yml, which call this file and deploy only
+# when it is green.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [dev, prod]
+  workflow_call:
+
+# `contents: read`, not `{}`: an empty block removes the right to check out a private repository
+# and reports it as "repository not found".
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # One run per branch or pull request; a newer push cancels the older one. Declared on the JOB,
+    # not the workflow, so that when a deploy workflow calls this file a newer push can only ever
+    # cancel this job — never a deploy that is already migrating or uploading. `github.workflow`
+    # is the caller's name there, so a called run and a direct run do not share a group.
+    concurrency:
+      group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      # Required for the whole job. With no .dev.vars in the tree, wrangler, the Vite plugin and
+      # the vitest plugin fall back to loading a repo-root .env into the Worker's env; the configs
+      # switch that off for themselves, bare CLI steps do not.
+      CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+      # The service container below. A local, well-known value — not a secret.
+      DATABASE_URL_DIRECT: postgres://postgres:postgres@localhost:5432/holdfast
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: holdfast
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: check-migrations compares this push with the commit before it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # `npm ci` only: the npm bundled with Node 24 crashes on a fresh resolve.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Gate scripts fail on bad input (self-tests)
+        run: |
+          bash .github/workflows/lib/deploy-lib.sh self-test
+          node scripts/check-migrations.mjs --self-test
+          bash scripts/verify-gate-a.sh --self-test
+
+      # A contract (destructive) migration ships one deploy after its expand migration.
+      - name: Migration rule
+        env:
+          # Event data goes through the environment, never into the script text.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/check-migrations.mjs --base "$BASE_SHA" --head HEAD
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # scripts/db-reset.sh and Playwright's globalSetup call psql over TCP.
+      - name: Postgres client
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          fi
+          psql --version
+
+      # A fresh runner has no schema. Not guarded with a skip: this step fails until the tree has
+      # migrations, because a migrate step that silently skips would read green forever.
+      - name: Migrate the test database
+        run: |
+          psql "$DATABASE_URL_DIRECT" -X -q -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS pg_trgm' \
+            -c 'CREATE EXTENSION IF NOT EXISTS citext'
+          bash .github/workflows/lib/deploy-lib.sh migrate apply local
+
+      # Needs no .dev.vars: Worker tests get explicit values from tests/setup/test-vars.ts.
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: The build is a dev build
+        run: bash .github/workflows/lib/deploy-lib.sh built-env dev
+
+      - name: Install the Playwright browser
+        run: npx playwright install --with-deps chromium chromium-headless-shell
+
+      # Only the e2e step needs a .dev.vars. Turnstile test keys are published constants; the three
+      # generated secrets are fresh random values per run, written to the file and never printed.
+      - name: Write .dev.vars for e2e
+        run: bash .github/workflows/lib/deploy-lib.sh dev-vars
+
+      # Starts its own `vite dev` on 5173; its globalSetup recreates the database and re-migrates.
+      - name: End-to-end tests
+        run: npm run e2e
+
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: warn
+          retention-days: 7
