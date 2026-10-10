@@ -56,6 +56,11 @@ import {
   type Client,
 } from "./helpers";
 
+// Real work, not a unit of logic: ten or more real sign-ups and requests per test, and mail drained after each. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock("../../../src/worker/db/queries/email-ledger", async (original) => {
   const real = await original<typeof import("../../../src/worker/db/queries/email-ledger")>();
   return { ...real, tryConsume: vi.fn(real.tryConsume), holdAlert: vi.fn(real.holdAlert) };

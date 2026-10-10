@@ -9,11 +9,16 @@
 // that Better Auth would serve and our table would not recognise), and (2) through the app each
 // canonical endpoint reaches the handler, and each variant is our 404.
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAuth } from "../../../src/worker/auth/create-auth";
 import { AUTH_ENDPOINTS, isAuthEndpoint } from "../../../src/worker/auth/endpoint-policy";
 import { canonicalPath } from "../../../src/worker/middleware/canonical";
 import { CAPTCHA, newClient, ORIGIN, send, testDb } from "./helpers";
+
+// Real work, not a unit of logic: some five hundred requests to the real handler. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
 
 const concrete = (path: string) => path.replace(/:[A-Za-z]+/g, "abc123");
 

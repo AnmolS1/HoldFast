@@ -36,6 +36,11 @@ import {
   type Client,
 } from "./helpers";
 
+// Real work, not a unit of logic: dozens of real sign-ins (one scrypt run each) per test. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock("../../../src/worker/auth/password", async (original) => {
   const real = await original<typeof import("../../../src/worker/auth/password")>();
   return { ...real, hashPassword: vi.fn(real.hashPassword), verifyPassword: vi.fn(real.verifyPassword) };

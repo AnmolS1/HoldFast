@@ -32,6 +32,11 @@ import {
   waitForMail,
 } from "./helpers";
 
+// Real work, not a unit of logic: up to twenty-five real sign-ups, verifications and sign-ins per test. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock("../../../src/worker/auth/observe", async (original) => {
   const real = await original<typeof import("../../../src/worker/auth/observe")>();
   return { ...real, reportError: vi.fn(real.reportError), countFor: vi.fn(real.countFor) };

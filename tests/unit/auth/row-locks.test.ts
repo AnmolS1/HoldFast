@@ -11,7 +11,7 @@
 // other tables' rows, their updates of non-key columns take `FOR NO KEY UPDATE`). So the function
 // blocks exactly when it asks for its own lock, and cannot when that request is removed.
 import { eq, sql } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   acceptTotpStep,
   clearForMailboxProof,
@@ -20,6 +20,11 @@ import {
 } from "../../../src/worker/db/queries/auth-lifecycle";
 import { twoFactor, user } from "../../../src/worker/db/schema";
 import { enableTotp, newClient, signUp, testDb, userByEmail, verifiedUser } from "./helpers";
+
+// Real work, not a unit of logic: each case holds a row lock for half a second, twice, around real sign-ups. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
 
 const HELD_MS = 500;
 

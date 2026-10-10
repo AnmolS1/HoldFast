@@ -9,7 +9,7 @@
 //      it was; an allowed one is answered by Better Auth.
 import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAuth } from "../../../src/worker/auth/create-auth";
 import {
   AUTH_ENDPOINTS,
@@ -29,6 +29,11 @@ import {
   waitForMail,
   type Client,
 } from "./helpers";
+
+// Real work, not a unit of logic: every (method, path) of the route table against the real handler, a fresh account for many of them. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
 
 type Endpoint = { path?: string; options?: { method?: string | string[] } };
 const COLUMN: Record<AuthGateState, 2 | 3 | 4> = { deleted: 2, suspended: 3, impersonating: 4 };

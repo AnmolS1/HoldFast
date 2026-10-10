@@ -8,7 +8,7 @@
 // set of backup codes needs the password — second-factor.test.ts; the impersonation audit rows,
 // the 15-minute lifetime and its read-only rule — admin-gate.test.ts.)
 import { eq, sql } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { session, twoFactor } from "../../../src/worker/db/schema";
 import { MAX_DEFERRED_TASKS } from "../../../src/worker/services/request-context";
 import {
@@ -34,6 +34,11 @@ import {
   type Client,
   type SendOptions,
 } from "./helpers";
+
+// Real work, not a unit of logic: a dozen real requests with their deferred work drained, and real two-factor enrolments. The default budget (5 s) is
+// for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
+// assertions are what they are — only the clock is generous.
+vi.setConfig({ testTimeout: 30_000 });
 
 const WRONG = "not the password at all 1!";
 const NEW_PASSWORD = "another perfectly fine password 7!";
