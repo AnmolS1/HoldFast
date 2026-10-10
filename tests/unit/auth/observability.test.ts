@@ -486,5 +486,9 @@ describe("sentinel secrets in a request never reach a sink", () => {
       ),
     ).toBe("/api/auth/reset-password/[redacted]");
     expect(sinkPath(`/api/auth/admin/${S.email}/x?code=${S.code}`)).toBe("/api/auth/admin/[email]/x");
+    // The query goes because it is a QUERY — also one with nothing in it that the scanner would
+    // have recognised as a secret (the scan is the second line of defence, not the first).
+    expect(sinkPath("/api/nodes?view=list&sort=name")).toBe("/api/nodes");
+    expect(sinkPath("https://h.example/api/nodes?x#frag")).toBe("/api/nodes");
   });
 });

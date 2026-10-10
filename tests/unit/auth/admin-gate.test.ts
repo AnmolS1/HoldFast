@@ -294,6 +294,18 @@ describe("the four allowed paths an admin calls", () => {
       expect(asEnrolled.status, "user with 2FA, without the role").toBe(403);
       expect(await deniedRows(path, enrolled.user.id)).toHaveLength(1);
 
+      // … also when that user's SESSION has passed the second factor: everything the gate asks
+      // of an admin except the role itself.
+      const strongUser = await verifiedUser();
+      await promoteToAdmin(strongUser.user.id, true, true);
+      await testDb().update(user).set({ role: "user" }).where(eq(user.id, strongUser.user.id));
+      const asStrongUser = await send(strongUser.client, `/api/auth${path}`, {
+        json: bodyFor(path, target.user.id),
+      });
+      expect(asStrongUser.status, "user with 2FA on account and session, without the role").toBe(403);
+      expect(asStrongUser.body, "refused by OUR gate").toMatchObject({ code: "ADMIN_ENDPOINT_DENIED" });
+      expect(await deniedRows(path, strongUser.user.id)).toHaveLength(1);
+
       const noSecondFactor = await verifiedUser();
       await promoteToAdmin(noSecondFactor.user.id, false);
       const asWeakAdmin = await send(noSecondFactor.client, `/api/auth${path}`, {
