@@ -439,6 +439,35 @@ describe("the role is decided on the bytes that were proven", () => {
     expect(await roleOf(admin)).toBe("user");
     expect(await auditRows({ action: "auth.admin_revoked", targetId: made.user.id })).toHaveLength(1);
 
+    // What matters is that admin ACTIONS stop — from a session that has passed a second factor,
+    // on the very next request after the stored address changed.
+    const acting = `chief@${domain}`;
+    const chief = newClient({ env: { ADMIN_EMAILS: acting } });
+    await verifiedUser({ email: acting });
+    expect((await signIn(chief, acting)).status).toBe(200);
+    const { totpURI } = await enableTotp(chief);
+    const stepped = newClient({ env: { ADMIN_EMAILS: acting } });
+    expect((await signIn(stepped, acting)).body).toMatchObject({ twoFactorRedirect: true });
+    expect(
+      (await send(stepped, "/api/auth/two-factor/verify-totp", { json: { code: await nextTotp(totpURI) } }))
+        .status,
+    ).toBe(200);
+    const victim = await verifiedUser();
+    const other = await verifiedUser();
+    const ban = (userId: string) => send(stepped, "/api/auth/admin/ban-user", { json: { userId } });
+    // The control: while the address is on the list, the action works.
+    expect((await ban(other.user.id)).status).toBe(200);
+    const chiefId = (await userByEmail(acting))!.id;
+    await testDb()
+      .update(user)
+      .set({ email: `chief-moved@${domain}` })
+      .where(eq(user.id, chiefId));
+    const refused = await ban(victim.user.id);
+    expect(refused.status).toBe(403);
+    expect((await userByEmail(victim.email))!.banned).not.toBe(true);
+    expect((await userByEmail(`chief-moved@${domain}`))!.role).toBe("user");
+    expect(await auditRows({ action: "auth.admin_revoked", targetId: chiefId })).toHaveLength(1);
+
     // An admin made by an admin (no bootstrap mark) and not on any list: keeps the role.
     const appointed = await verifiedUser();
     await testDb().update(user).set({ role: "admin" }).where(eq(user.id, appointed.user.id));

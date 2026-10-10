@@ -302,6 +302,18 @@ describe("the four allowed paths an admin calls", () => {
       expect(asWeakAdmin.status, "admin without 2FA").toBe(403);
       expect(await deniedRows(path, noSecondFactor.user.id)).toHaveLength(1);
 
+      // The ACCOUNT must have two-factor on as well as the session having passed it: a session
+      // that still carries the mark while the account's two-factor is off (a state the hooks
+      // prevent — the mark is cleared when two-factor is switched off — but not one the gate may
+      // rely on never existing) is refused.
+      const flagOff = await verifiedUser();
+      await promoteToAdmin(flagOff.user.id, false, true);
+      expect((await sessionsOf(flagOff.user.id))[0]!.secondFactorAt).toBeInstanceOf(Date);
+      const asFlagOff = await send(flagOff.client, `/api/auth${path}`, {
+        json: bodyFor(path, target.user.id),
+      });
+      expect(asFlagOff.status, "admin whose account has two-factor off, session marked").toBe(403);
+
       // An impersonated session: an admin looking through someone else's — who is an admin too.
       const admin = await admin2fa();
       const puppet = await verifiedUser();
