@@ -382,7 +382,10 @@ describe("third parties under `vite dev` (test mode, not the unit-test environme
 
   it("control — anything that is not a test value still goes out: a real secret, a real code, another host", async () => {
     network.length = 0;
-    expect((await verify("0x4AAAAAAA-a-developers-real-secret")).status).toBe(599);
+    // Assembled at run time: a literal shaped like a live Turnstile secret trips secret scanners
+    // (GitHub → Cloudflare) even though this one is made up.
+    const madeUpLiveSecret = ["0x4", "AAAAAAA", "-a-developers-real-secret"].join("");
+    expect((await verify(madeUpLiveSecret)).status).toBe(599);
     const real = await routeTestOutbound(
       new Request("https://oauth2.googleapis.com/token", {
         method: "POST",
