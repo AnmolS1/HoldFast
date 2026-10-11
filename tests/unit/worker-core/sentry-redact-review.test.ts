@@ -24,6 +24,12 @@ describe("S2 — an encoded delimiter inside a named secret's value does not cut
     [`secret&#61;pre%20${TAIL}`, "an entity `=`, a percent space"],
     [`secret%3Dpre&amp;${TAIL}`, "a percent `=`, an entity ampersand"],
     [`secret&#61;pre&amp;&#35;x20;${TAIL}`, "the whole pair written in entities, over an entity"],
+    // A NEWLINE that appears in the same decoding step as the name's own `=` (or `:`): decoded
+    // as itself it would end the line — and the "rest of the line" — before the tail.
+    [`secret%3Dpre&#10;${TAIL}`, "a percent `=`, an entity newline"],
+    [`secret&#61;pre&#10;${TAIL}`, "an entity `=` and an entity newline"],
+    [`password%3D%22a%22%0A${TAIL}`, "a percent `=`, a quoted value, a percent newline"],
+    [`Cookie%3A a=1%0A${TAIL}`, "a header whose colon and newline are both percent-encoded"],
     [`Bearer%20abc%2520${TAIL}`, "a bearer token whose own space is encoded once and its inner space twice"],
     [
       `\\u007b\\u0022password\\u0022:\\u0022ab\\u005c\\u0022 ${TAIL} cd\\u0022\\u007d`,
