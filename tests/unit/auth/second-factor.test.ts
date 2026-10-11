@@ -574,6 +574,34 @@ describe("step-up: a code on a session that exists", () => {
     expect(mailTo(admin.email, "secondFactorLocked")).toHaveLength(1);
   });
 
+  it("a known device's own budget is charged atomically too: forty wrong codes at once with ONE proof — exactly the device's cap are looked at, and none lands on the account's budget", async () => {
+    const admin = await adminWithTotp();
+    const known = newClient();
+    await signInWithCode(known, admin.email, admin.totpURI);
+    await send(known, "/api/auth/sign-out", { json: {} });
+    expect((await signIn(known, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+    const before = await budgets(admin.id);
+    const answers = await Promise.all(
+      Array.from({ length: 40 }, (_, index) =>
+        send({ ...known, ip: freshIp(), cookies: new Map(known.cookies) }, `/api/auth${VERIFY_TOTP_PATH}`, {
+          json: { code: String(650000 + index) },
+        }),
+      ),
+    );
+    const statuses = answers.map((answer) => answer.status);
+    expect(
+      statuses.filter((status) => status === 401),
+      statuses.join(","),
+    ).toHaveLength(SECOND_FACTOR_DEVICE_ATTEMPTS);
+    expect(statuses.filter((status) => status === 429)).toHaveLength(40 - SECOND_FACTOR_DEVICE_ATTEMPTS);
+    const after = await budgets(admin.id);
+    expect(after.account).toBe(before.account);
+    expect(after.devices.filter((count) => count > 0)).toEqual([SECOND_FACTOR_DEVICE_ATTEMPTS]);
+    expect(await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).toHaveLength(
+      SECOND_FACTOR_DEVICE_ATTEMPTS,
+    );
+  });
+
   it("the exhaustion mail is sent at most once per window, whatever number of budgets run out in it", async () => {
     const admin = await adminWithTotp();
     // A known device, in the wrong hands, and fresh clients: two budgets run out in one window.

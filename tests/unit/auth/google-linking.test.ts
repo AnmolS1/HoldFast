@@ -500,7 +500,7 @@ describe("races around the cleanup and the link", () => {
     const remove = await atTheLink(
       owner.user.id,
       "BEFORE",
-      `RAISE EXCEPTION 'duplicate key value violates unique constraint' USING ERRCODE = 'unique_violation';`,
+      `RAISE EXCEPTION 'duplicate key value violates unique constraint' USING ERRCODE = 'unique_violation', CONSTRAINT = 'account_provider_account_uidx';`,
     );
     let landed: Awaited<ReturnType<typeof google>>;
     try {
@@ -515,6 +515,28 @@ describe("races around the cleanup and the link", () => {
     // Nothing half-done: no Google row, and the owner's session is as it was.
     expect((await accountsOf(owner.user.id)).map((a) => a.providerId)).toEqual(["credential"]);
     expect((await getSession(owner.client))?.user.id).toBe(owner.user.id);
+    // The refusal is in the audit log like any failed callback — and nothing was linked.
+    const failed = (await auditRows({ action: "auth.failed", targetId: owner.user.id })).filter(
+      (row) => (row.meta as { code?: string } | null)?.code === "unable_to_link_account",
+    );
+    expect(failed).toHaveLength(1);
+    expect(await auditRows({ action: "auth.provider_linked", targetId: owner.user.id })).toEqual([]);
+    // ONLY that index: any other failure at the same place — another unique violation
+    // included — is still an error, answered 500, never a success-looking redirect.
+    for (const raise of [
+      `RAISE EXCEPTION 'x' USING ERRCODE = 'unique_violation', CONSTRAINT = 'some_other_uidx';`,
+      `RAISE EXCEPTION 'x' USING ERRCODE = 'unique_violation';`,
+      `RAISE EXCEPTION 'x' USING ERRCODE = 'foreign_key_violation';`,
+    ]) {
+      const undo = await atTheLink(owner.user.id, "BEFORE", raise);
+      try {
+        const other = await google(owner.client, profileFor(owner.email), "/api/auth/link-social");
+        expect(other.callback.status, raise).toBe(500);
+      } finally {
+        await undo();
+      }
+      expect((await accountsOf(owner.user.id)).map((a) => a.providerId)).toEqual(["credential"]);
+    }
     // Control: without the collision the same request links.
     const again = await google(owner.client, profileFor(owner.email), "/api/auth/link-social");
     expect(again.error).toBeNull();

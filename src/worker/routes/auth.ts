@@ -41,6 +41,8 @@ import { auth, db, type AppEnv } from "../services/request-context";
 export const router = new Hono<AppEnv>();
 
 const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
+/** The unique index on `account (provider_id, account_id)` (drizzle/0003). */
+const PROVIDER_IDENTITY_INDEX = "account_provider_account_uidx";
 /** Where the loser of two simultaneous provider links is sent (Better Auth's own code for it). */
 export const ALREADY_LINKED = "/login?error=unable_to_link_account";
 /** The one error a verification link answers with (the client has one sentence for it). */
@@ -148,21 +150,27 @@ router.all(
           // link somebody clicked — the same answer as "taken a while ago" (auth/mailbox-proof.ts).
           return c.redirect(`${c.env.APP_ORIGIN}${CHANGE_EMAIL_UNAVAILABLE}`, 302);
         }
-        if (method === "GET" && relativePath.startsWith("/callback/") && isUniqueViolation(error)) {
+        if (
+          method === "GET" &&
+          relativePath.startsWith("/callback/") &&
+          isUniqueViolation(error, [PROVIDER_IDENTITY_INDEX])
+        ) {
           // Two simultaneous first links of one provider identity: the loser's insert met the
-          // unique index on (provider_id, account_id). On its sign-in path Better Auth catches
-          // that itself and answers `unable_to_link_account`; on the explicit-link path it does
-          // not (oauth2/link-account.mjs `linkOAuthAccount`). The same answer here: the identity
-          // IS linked (by the request that won) — sign in. Never an error page on a redirect.
-          count("auth", { outcome: "failed", kind: "google", reason: "already_linked" });
-          return c.redirect(`${c.env.APP_ORIGIN}${ALREADY_LINKED}`, 302);
+          // unique index on (provider_id, account_id) — THAT index and no other; any other
+          // failure, another unique violation included, is the 500 below, reported. On its
+          // sign-in path Better Auth catches this itself and answers `unable_to_link_account`;
+          // on the explicit-link path it does not (oauth2/link-account.mjs `linkOAuthAccount`).
+          // The same answer here — and it goes on through step 4 like any answer of the
+          // handler's, so the refusal is audited (`auth.failed`) and counted.
+          response = c.redirect(`${c.env.APP_ORIGIN}${ALREADY_LINKED}`, 302);
+        } else {
+          count("auth", { outcome: "error" });
+          reportError(error, { kind: "auth_handler" });
+          return c.json(
+            { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
+            500,
+          );
         }
-        count("auth", { outcome: "error" });
-        reportError(error, { kind: "auth_handler" });
-        return c.json(
-          { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
-          500,
-        );
       }
 
       // 3b. One answer, one amount of work (auth/parity.ts) — for a request that REACHED the
