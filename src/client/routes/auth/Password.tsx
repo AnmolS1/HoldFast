@@ -255,6 +255,7 @@ export function SetPasswordPage() {
   const [errors, setErrors] = useState<{ password?: string; birth?: string; assent?: string }>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [invalid, setInvalid] = useState(false);
+  const [unset, setUnset] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const onSubmit = async (event: FormEvent) => {
@@ -292,7 +293,10 @@ export function SetPasswordPage() {
       setBusy(false);
       const reason = cause instanceof ApiError ? cause.details?.reason : undefined;
       if (cause instanceof ApiError && cause.code === "invalid_token") setInvalid(true);
-      else if (reason === "PASSWORD_COMPROMISED") setErrors({ password: t("signup.password.breached") });
+      else if (cause instanceof ApiError && cause.code === "conflict" && reason === "password_not_set") {
+        // The address IS confirmed; only the password was not saved. The way on is a reset link.
+        setUnset(true);
+      } else if (reason === "PASSWORD_COMPROMISED") setErrors({ password: t("signup.password.breached") });
       else if (cause instanceof ApiError && cause.code === "validation" && typeof reason === "string") {
         setFormError(cause.message);
       } else setFormError(t("auth.error.generic"));
@@ -301,11 +305,11 @@ export function SetPasswordPage() {
     navigate("/login?reason=password_set", { replace: true });
   };
 
-  const unusable = !token || invalid;
+  const unusable = !token || invalid || unset;
   return (
     <AuthCard title={t("setPassword.title")} lead={unusable ? undefined : t("setPassword.body")}>
       {unusable ? (
-        <FormNotice tone="danger">{t("setPassword.missing")}</FormNotice>
+        <FormNotice tone="danger">{t(unset ? "setPassword.notSaved" : "setPassword.missing")}</FormNotice>
       ) : (
         <Box
           component="form"

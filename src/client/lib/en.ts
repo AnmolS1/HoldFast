@@ -322,6 +322,9 @@ export const en = {
   "setPassword.missing":
     "This link is no longer valid. If the address is already confirmed, sign in — or ask for a reset link to choose a password.",
 
+  "setPassword.notSaved":
+    "Your email address is confirmed, but the password could not be saved. Ask for a reset link to choose one.",
+
   "confirmChange.title": "Confirm the change of email address",
   "confirmChange.body":
     "Someone signed in to your Holdfast account asked to change its email address. If that was you, confirm it here; we then send a link to the new address to finish the change. If it was not you, close this page and change your password.",

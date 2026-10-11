@@ -613,6 +613,46 @@ describe("password reset", () => {
     );
   });
 
+  it("the address was confirmed but the password was not saved (409 password_not_set): said so, with the way to a reset link", async () => {
+    shellFetch({
+      session: null,
+      extra: (call) =>
+        call.path === "/api/account/confirm-email"
+          ? envelope("conflict", 409, { reason: "password_not_set" })
+          : undefined,
+    });
+    renderRoutes(buildRoutes(), ["/set-password#token=tok456"]);
+    await screen.findByRole("heading", { name: TITLE });
+    fill({ password: "a much longer password", birthMonth: "6", birthYear: "1990" });
+    fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: SUBMIT }));
+    await waitFor(() =>
+      expect(document.querySelector("[data-form-notice]")?.textContent).toBe(en["setPassword.notSaved"]),
+    );
+    expect(field("password")).toBeNull();
+    expect(screen.getByRole("link", { name: "Send reset link" }).getAttribute("href")).toBe(
+      "/forgot-password",
+    );
+  });
+
+  it("the address-change confirmation page: opening it sends nothing; its button sends one POST with the token", async () => {
+    const calls = shellFetch({
+      session: null,
+      extra: (call) => (call.path === "/api/account/confirm-email-change" ? json({ ok: true }) : undefined),
+    });
+    const { router } = renderRoutes(buildRoutes(), ["/confirm-email-change#token=chg789"]);
+    await screen.findByRole("heading", { name: "Confirm the change of email address" });
+    await waitFor(() => expect(router.state.location.hash).toBe(""));
+    const sent = () => calls.filter((call) => call.path === "/api/account/confirm-email-change");
+    expect(sent()).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm the change" }));
+    await waitFor(() =>
+      expect(document.querySelector("[data-form-notice]")?.textContent).toBe(en["confirmChange.sent"]),
+    );
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toMatchObject({ method: "POST", body: { token: "chg789" } });
+  });
+
   it("set password without a token offers the reset-by-mail path instead of a form", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/set-password"]);

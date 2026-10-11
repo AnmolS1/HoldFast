@@ -48,7 +48,9 @@
 // THE ORDER is the same as above: body shape, statement, password length and the token's
 // signature cost nothing; then RL_AUTH; then Turnstile; then the breach look-up; then the
 // database. Every state in which the link cannot do this is one answer: `invalid_token`,
-// "This link is no longer valid."
+// "This link is no longer valid." One more answer exists: `409 conflict`, reason
+// `password_not_set` — the proof committed and the password step failed; the page offers the
+// reset link.
 //
 // Paths are relative to /api. The pipeline applies CSRF; RL_AUTH is applied here.
 
@@ -62,7 +64,6 @@ import { confirmAddressChange, confirmMailbox, readVerifyToken } from "../auth/m
 import { isStoredFormAddress, PASSWORD_MAX, PASSWORD_MIN } from "../auth/preflight";
 import { scopeOf, VERIFICATION_EXPIRES_IN_S } from "../auth/create-auth";
 import { afterAnswer, type AuthScope } from "../auth/scope";
-import { hungAnswer } from "../auth/watchdog";
 import {
   mintPending,
   PENDING_COOKIE,
@@ -77,7 +78,7 @@ import {
   takePendingChange,
 } from "../db/queries/auth-lifecycle";
 import { ipKey } from "../middleware/rate-limit";
-import { countFor, guard, record } from "../auth/observe";
+import { countFor, guard, record, reportError } from "../auth/observe";
 import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
@@ -265,6 +266,9 @@ const ConfirmBody = z.object({
   birthMonth: z.unknown(),
 });
 
+/** `details.reason` when the mailbox proof committed and the password step did not. */
+export const PASSWORD_NOT_SET = "password_not_set";
+
 const linkInvalid = () => new AppError("invalid_token", "This link is no longer valid.");
 
 router.post(
@@ -324,8 +328,25 @@ router.post(
       }
       // The password: Better Auth's own reset step (hash, credential row, `onPasswordReset`),
       // with a token that exists only inside the Worker (auth/create-auth.ts).
-      if (!instance.setFirstPassword) throw new Error("no auth instance");
-      if (!(await instance.setFirstPassword(userId, body.newPassword))) return hungAnswer(c, "handler");
+      // TWO steps, not one: the proof above has committed. If this one fails the link is spent
+      // and the account has no credential — so the answer says what to do next, and the page
+      // turns it into "request a reset link" (which works: the address is verified).
+      let set = false;
+      try {
+        if (!instance.setFirstPassword) throw new Error("no auth instance");
+        set = await instance.setFirstPassword(userId, body.newPassword);
+        if (!set) countFor(c.env, "auth", { outcome: "hang", kind: "handler" });
+      } catch (error) {
+        reportError(error, { kind: "confirm_email_password" });
+      }
+      if (!set) {
+        countFor(c.env, "auth", { outcome: "error", kind: "confirm_email_password" });
+        throw new AppError(
+          "conflict",
+          "Your email address is confirmed, but the password could not be saved. Request a reset link to choose one.",
+          { reason: PASSWORD_NOT_SET },
+        );
+      }
       record(
         c,
         "auth.password_changed",
