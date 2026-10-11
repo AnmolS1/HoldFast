@@ -72,11 +72,13 @@
 // WHOSE BUDGET (unauth_triggered). A per-recipient budget that ANYBODY can spend is a lock on
 // that recipient: ten reset requests from strangers would stop a person's own reset mail for the
 // day. So a mail the address ASKED FOR ITSELF — the request came with the address's own session,
-// or from the browser that signed up with it (the `hf_pending` proof), or is that sign-up — is
-// counted on a budget of its own (`ownBucket`: the same caps, another key), which nothing a
-// stranger sends is ever counted on. `EmailActor.own` says so; only auth/hooks.ts,
-// auth/create-auth.ts and routes/pending-email.ts set it, from the caller's own cookie alone
-// (never from whether an account exists). The per-client budget applies to both alike.
+// or from the browser that signed up with it (an `hf_pending` proof whose user id IS the
+// unverified account at that address), or is the sign-up that creates the account — is counted
+// on a budget of its own (`ownBucket`: the same caps, another key), which nothing a stranger
+// sends is counted on. `EmailActor.own` says so; it is set in ONE place (auth/hooks.ts
+// `ownAddressOf`, read by auth/create-auth.ts) and only on a proof a stranger cannot get for
+// somebody else's address — a cookie's mere presence is not one. A pending sign-up's change of
+// address is NOT such a proof for the new address. The per-client budget applies to both alike.
 // (Consequence: the 50-a-day total per recipient is of mail OTHERS caused; what the address asks
 // for itself adds at most its own buckets' day caps — signup 20, reset 10.)
 // A recipient is counted under its CANONICAL address (`canonicalRecipient`): lower case, NFKC,
@@ -489,7 +491,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `Someone who was already past your password, or already signed in to your Holdfast account, entered several wrong two-factor codes. For up to ${d.minutes} minutes, codes are not accepted from browsers that have not signed in to your account with a code before; a browser you have used before still works.`,
+        text: `Someone who was already past your password, or already signed in to your Holdfast account, entered several wrong two-factor codes. For up to ${d.minutes} minutes, codes are not accepted from the browser they were entered in, nor from browsers that have not signed in to your account with a code before; your other browsers still work.`,
       },
       { text: NOT_YOU },
     ],

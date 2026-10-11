@@ -218,14 +218,21 @@ const UNSENT_KIND: Record<string, "passwordReset" | "verification"> = {
 };
 
 /** The endpoints whose mail goes to the address in the body's `email`. */
-const OWN_MAIL_PATHS = new Set(["/sign-up/email", "/send-verification-email", "/request-password-reset"]);
+const OWN_MAIL_PATHS = new Set(["/send-verification-email", "/request-password-reset"]);
 
 /**
  * Is the address this request asks mail for the CALLER'S OWN (services/email.ts "WHOSE BUDGET")?
- * Decided from what the caller holds — never from whether the address has an account:
- *   - a sign-up is the sign-up browser, for the address it signs up;
- *   - the `hf_pending` proof names the address (the browser that signed up with it);
- *   - the session is the address's own account.
+ * "Own" means the recipient address is ALREADY BOUND to the requester, server-side — never an
+ * address the request merely names:
+ *   - a resend from the browser that signed up: the MAC-verified `hf_pending` proof names the
+ *     address AND its user id is an existing, still-unverified account whose STORED address is
+ *     exactly that address. The cookie's presence is not enough — the look-alike answer to a
+ *     sign-up with a TAKEN address sets one too (naming nobody);
+ *   - the session's account is VERIFIED and its stored address is that address (a reset).
+ * A sign-up is NOT one: its recipient is whatever the body says (the mail it causes is counted
+ * as mail anybody can cause; the resend from that browser, with the proof, is the own one).
+ * The proof decides which BUDGET a mail is counted on, nothing a caller can see: the answer, the
+ * work before it (padded — auth/parity.ts) and the caller's own per-client charge are the same.
  * Returns the address, or null: a stranger's request.
  */
 async function ownAddressOf(
@@ -235,14 +242,20 @@ async function ownAddressOf(
   const asked = (ctx.body as { email?: unknown } | null | undefined)?.email;
   if (typeof asked !== "string" || !ctx.request) return null;
   const email = asked.toLowerCase();
-  if (ctx.path === "/sign-up/email") return email;
   const cookies = ctx.headers?.get("cookie") ?? ctx.request.headers.get("cookie");
   // No cookie at all: nothing to read, and nothing to look up.
   if (!cookies) return null;
-  const pending = await readPending(scope.env, scope.keys, cookies, now());
-  if (pending && pending.email === email) return email;
+  if (ctx.path === "/send-verification-email") {
+    const pending = await readPending(scope.env, scope.keys, cookies, now());
+    if (pending && pending.email === email) {
+      const signedUp = await getAccount(scope.db, pending.userId);
+      if (signedUp && !signedUp.emailVerified && signedUp.email.toLowerCase() === email) return email;
+    }
+  }
   const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
-  return session && session.user.email.toLowerCase() === email ? email : null;
+  return session && session.user.emailVerified === true && session.user.email.toLowerCase() === email
+    ? email
+    : null;
 }
 
 export function buildHooks(scope: AuthScope) {
@@ -645,11 +658,15 @@ export function buildHooks(scope: AuthScope) {
     if (path === "/change-password" && ctx.request && !(ctx.context.returned instanceof Error)) {
       // "Remember this device" does not outlive the password it was granted under.
       const userId = ctx.context.session?.user.id;
-      if (userId)
-        await quietly(env, "trusted_devices", async () => {
-          await deleteTrustedDevices(scope.db, userId);
-          await endStandingProofs(scope.db, userId);
-        });
+      // NOT quietly: this takes trust away (remembered devices, known-device proofs, the keys'
+      // second-factor marks). If it cannot be done the request FAILS — the caller is told, and
+      // tries again — rather than answer "changed" with the old trust still standing. (Better
+      // Auth has written the password by now, outside any transaction of ours: failing loudly
+      // is the most this hook can do; the same holds for `onPasswordReset`, create-auth.ts.)
+      if (userId) {
+        await deleteTrustedDevices(scope.db, userId);
+        await endStandingProofs(scope.db, userId);
+      }
       return;
     }
     if (path === "/get-session") {

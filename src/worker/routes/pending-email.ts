@@ -18,8 +18,9 @@
 // THE NEW ADDRESS PASSES WHAT A SIGN-UP WITH IT WOULD. Everything in the sign-up policy that
 // depends on the address is applied to the new one: allowed domains, disposable domains and the
 // MX check (checks 4 and 5), and the day's velocity counters (check 6) — a change COUNTS as a
-// sign-up on every subject of the new address, the address's domain included, and is refused at
-// a limit. The count is taken before any account is looked at and is never given back, so trying
+// sign-up on every subject a sign-up with the new address would count on (with invites required:
+// the caller's own address; in open mode also the network, the ASN and the address's domain —
+// services/signup-policy.ts `velocitySubjects`), and is refused at a limit. The count is taken before any account is looked at and is never given back, so trying
 // an address costs the same whatever the answer to "does it exist" is. The invite (check 7) is
 // not re-used: the account being moved was created with one, and keeps its `invitedBy`.
 //
@@ -215,8 +216,9 @@ router.patch(
             defer(
               c,
               afterAnswer(scope, () =>
-                // Asked for by the sign-up's own browser (or session): the address's own budget.
-                sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip"), own: true } }),
+                // Counted as mail ANYBODY can cause (not the address's own budget): this browser
+                // has proven its sign-up, not that the NEW address is its own.
+                sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip") } }),
               ),
             );
             record(c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
@@ -232,9 +234,7 @@ router.patch(
       if (newEmail !== claim.email && !mailed) {
         defer(
           c,
-          afterAnswer(scope, () =>
-            chargeUnsent(deps(c), "verification", newEmail, { client: c.get("ip"), own: true }),
-          ),
+          afterAnswer(scope, () => chargeUnsent(deps(c), "verification", newEmail, { client: c.get("ip") })),
         );
       }
 
