@@ -53,6 +53,46 @@ describe("S2 — an encoded delimiter inside a named secret's value does not cut
   });
 });
 
+// R11 — what was left of a value under a sensitive name: an unquoted value ended at the first
+// delimiter written as it is (`,` `;` a space), and a list lost only its opening bracket.
+describe("R11 — the whole of an unquoted or list value under a sensitive name goes, not its first piece", () => {
+  it("the re-review's three strings, exactly", () => {
+    expect(redactText("password=a,b;c d")).toBe("password=[redacted]");
+    expect(redactText('newPassword: ["abc","def"]')).toBe("newPassword: [redacted]");
+    expect(redactText("cookie=a%0Ahf_other TAIL")).toBe("cookie=[redacted]");
+  });
+
+  it.each([
+    [`password=a,${TAIL};c d`, "after a comma"],
+    [`password=a,b;${TAIL} d`, "after a semicolon"],
+    [`password=a,b;c ${TAIL}`, "after a space"],
+    [`newPassword: ["abc","${TAIL}"]`, "the second element of a list"],
+    [`newPassword: ["${TAIL}","def"]`, "the first element of a list"],
+    [`{"newPassword": ["abc", "${TAIL}"], "n": 1}`, "a list inside a JSON object"],
+    [`secrets = [${TAIL}, other]`, "an unquoted list"],
+    [`cookie=a%0Ahf_other ${TAIL}`, "after an encoded newline and a space"],
+    [`sign-in failed: password=correct horse ${TAIL} staple`, "a passphrase with spaces, in a sentence"],
+    [`token=abc <${TAIL}>`, "after an angle bracket"],
+  ])("%s (%s)", (input) => {
+    const out = redactText(input);
+    expect(out, out).not.toContain("TAILSECRET");
+    expect(redactText(out)).toBe(out);
+  });
+
+  it("it is the LINE that goes with the value — the lines around it, and pairs that are not sensitive, stay", () => {
+    expect(redactText("first line\npassword=a,b;c d\nlast line")).toBe(
+      "first line\npassword=[redacted]\nlast line",
+    );
+    expect(redactText("status=failed, again; reason=timeout here")).toBe(
+      "status=failed, again; reason=timeout here",
+    );
+    // A quoted value is still exactly its quotes.
+    expect(redactText('password="a,b;c d" attempt=3')).toBe("password=[redacted] attempt=3");
+    // An error's own code is still readable.
+    expect(redactText("code=INVALID_TOKEN, try again")).toBe("code=INVALID_TOKEN, try again");
+  });
+});
+
 describe("S3 — numbers, names everywhere, and header tuples", () => {
   it("a one-time code sent as a NUMBER is replaced, under any key and in any array", () => {
     const out = redactEvent({

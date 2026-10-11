@@ -106,6 +106,11 @@ const SECRETS: Array<(r: Rng) => Secret> = [
   (r) => ({ text: `{"password":"ab\\" ${MARK} ${r.chars(3)}"}`, url: false }),
   (r) => ({ text: `Bearer ab12%20${MARK}${r.chars(3)}`, url: false }),
   (r) => ({ text: `api_key=%61bc%26x%3D${MARK}${r.chars(2)}`, url: false }),
+  // An unquoted value with delimiters written as they are, a list, and an encoded newline with
+  // more after a space (re-review R11): only the first piece of the value used to go.
+  (r) => ({ text: `password=${r.chars(2)},${MARK}${r.chars(2)};c ${MARK}${r.chars(2)}`, url: false }),
+  (r) => ({ text: `newPassword: ["${MARK}${r.chars(3)}","${MARK}${r.chars(3)}"]`, url: false }),
+  (r) => ({ text: `cookie=a%0Ahf_other ${MARK}${r.chars(3)}`, url: false }),
 ];
 
 // ── encodings ───────────────────────────────────────────────────────────────────────────────

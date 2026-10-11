@@ -467,8 +467,10 @@ const OWN_COOKIE = /\b(?:__(?:Secure|Host)-)?hf[._][A-Za-z0-9_.-]*=[^;\s"'<>]*/g
 // `name=value`, `name: value`, `"name":"value"` — the value goes when the name is sensitive.
 // The quotes around a name need not match (a pair quoted inside a quoted value: `""name":"v""`),
 // and a quoted value need not be closed (a string cut off mid-value): it runs to the end of its line.
-// A name is letters of any script (`ｐａｓｓｗｏｒｄ=…`); an unquoted value runs to a delimiter, and a
-// character ENTITY inside it (`pre&#x20;rest`) is part of it, not the `&` and `;` that end it.
+// A name is letters of any script (`ｐａｓｓｗｏｒｄ=…`); an unquoted value is matched up to a
+// delimiter, and a character ENTITY inside it (`pre&#x20;rest`) is part of it, not the `&` and
+// `;` that end it. Under a SENSITIVE name the match is only where an unquoted value starts:
+// `redactPairs` takes the rest of its line with it (the delimiter may be part of the value).
 const KEY_VALUE =
   /(["']?)([\p{L}][\p{L}\p{N}_.[\]-]{0,63})(["']?)([\s-]*[:=][\s-]*)("(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?|(?:[&]#[xX]?[0-9a-fA-F]{1,7}[;]?|[&][A-Za-z]{2,8}[;]|[^\s&;,"'<>])+)/gu;
 // An error's own code (a constant, a SQLSTATE, an HTTP status) is kept under `code`, and a
@@ -484,6 +486,9 @@ function isReadableCode(name: string, value: unknown): boolean {
   if (typeof value === "number") return Number.isInteger(value) && value >= 100 && value <= 599;
   return typeof value === "string" && (ERROR_CODE.test(value) || PLAIN_WORD.test(value));
 }
+
+/** `&name=` straight after a value: the next pair of a query string. */
+const NEXT_QUERY_PAIR = /^&[\p{L}][\p{L}\p{N}_.[\]-]{0,63}=/u;
 
 /**
  * `name=value` pairs: the value of a sensitive name goes. A pair whose name is not sensitive
@@ -504,6 +509,21 @@ function redactPairs(text: string): string {
     if (isReadableCode(name, bare)) continue;
     out += `${text.slice(last, match.index)}${open}${name}${close}${separator}${REDACTED}`;
     last = match.index + whole.length;
+    // A QUOTED value is its quotes. An unquoted one has no end that can be trusted: what was
+    // typed may hold the very delimiters the pattern stops at (`a,b;c d`), and a list
+    // (`["abc","def"]`) is only its bracket to the pattern. So the rest of the LINE goes with
+    // it — more than the value, never less. Not when the pair is in QUERY syntax (it follows a
+    // `?` or `&`, or `&name=` follows it): there `&` and the end of the URL are the grammar's
+    // own ends, and a delimiter inside a value arrives encoded. And not for a value that is
+    // already the marker (a text redacted a second time reads the same).
+    const inQuery =
+      /[?&]$/.test(text.slice(Math.max(0, match.index - 1), match.index)) ||
+      NEXT_QUERY_PAIR.test(text.slice(last, last + 80));
+    if (!/^["']/.test(value) && !inQuery && !value.startsWith(REDACTED)) {
+      const rest = /[\r\n]/.exec(text.slice(last));
+      last = rest === null ? text.length : last + rest.index;
+      KEY_VALUE.lastIndex = last;
+    }
   }
   return out + text.slice(last);
 }
