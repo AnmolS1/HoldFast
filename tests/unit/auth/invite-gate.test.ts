@@ -687,7 +687,7 @@ describe("a pending-address change is held to what a sign-up with the new addres
     expect(outline(refusals[2]!)).toEqual(outline(refusals[0]!));
   });
 
-  it("the cookie is one sign-up's, for one hour, and worth nothing once the account is verified", async () => {
+  it("the cookie is one sign-up's, for as long as its verification link and a little more, and worth nothing once the account is verified", async () => {
     // Bound to the user id: another sign-up's cookie cannot move this account (its `u` is its own).
     const mine = newClient();
     const { email } = await signUp(mine);
@@ -704,8 +704,9 @@ describe("a pending-address change is held to what a sign-up with the new addres
       };
     expect(payloadOf(mine).u).toBe(row!.id);
     expect(payloadOf(theirs).u).not.toBe(row!.id);
-    expect(payloadOf(mine).e - Math.floor(Date.now() / 1000)).toBeGreaterThan(3500);
-    expect(payloadOf(mine).e - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(3600);
+    // As long as a verification link lives, and ten minutes (auth/signed-cookie.ts — R2).
+    expect(payloadOf(mine).e - Math.floor(Date.now() / 1000)).toBeGreaterThan(4100);
+    expect(payloadOf(mine).e - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(4200);
     expect((await change(theirs, freshEmail())).status).toBe(200);
     expect((await userById(row!.id))!.email).toBe(email);
 

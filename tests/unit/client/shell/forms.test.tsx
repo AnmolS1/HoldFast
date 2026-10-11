@@ -525,34 +525,99 @@ describe("password reset", () => {
     );
   });
 
-  it("set password (after a verification link opened in another browser): token from the fragment, gone from the address bar, sent with the password", async () => {
-    const reset = vi.spyOn(authClient, "resetPassword").mockResolvedValue({ data: {}, error: null });
-    shellFetch({ session: null });
+  const TITLE = "Confirm your email and set a password";
+  const SUBMIT = "Confirm and set password";
+  const confirmCalls = (calls: Array<{ path: string; method: string; body: unknown }>) =>
+    calls.filter((call) => call.path === "/api/account/confirm-email");
+
+  it("a verification link opened in another browser: the page changes nothing by itself; its button sends ONE same-origin POST with the token, the password, the age and the assent", async () => {
+    const reset = vi.spyOn(authClient, "resetPassword");
+    const calls = shellFetch({
+      session: null,
+      extra: (call) => (call.path === "/api/account/confirm-email" ? json({ ok: true }) : undefined),
+    });
     const { router } = renderRoutes(buildRoutes(), ["/set-password#token=tok456"]);
-    await screen.findByRole("heading", { name: "Set your password" });
-    expect(document.body.textContent).toContain("Your email is confirmed.");
+    await screen.findByRole("heading", { name: TITLE });
     await waitFor(() => expect(router.state.location.hash).toBe(""));
+    for (const name of ["password", "birthMonth", "birthYear", "acceptTerms"])
+      expect(field(name), name).not.toBeNull();
+    // Opening the page sent nothing.
+    expect(confirmCalls(calls)).toEqual([]);
+    // Each thing the server will insist on is asked for here first.
     fill({ password: "short" });
-    fireEvent.click(screen.getByRole("button", { name: "Set password" }));
-    expect((await screen.findByRole("alert")).textContent).toBe("Use 12 characters or more.");
-    expect(reset).not.toHaveBeenCalled();
-    fill({ password: "a much longer password" });
-    fireEvent.click(screen.getByRole("button", { name: "Set password" }));
+    fireEvent.click(screen.getByRole("button", { name: SUBMIT }));
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("Enter the month (1–12) and a four-digit year."),
+    );
+    expect(document.body.textContent).toContain("Use 12 characters or more.");
+    expect(document.body.textContent).toContain("You need to accept the Terms and Privacy Policy.");
+    fill({
+      password: "a much longer password",
+      birthMonth: "6",
+      birthYear: String(new Date().getUTCFullYear() - 5),
+    });
+    fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: SUBMIT }));
+    await waitFor(() =>
+      expect(document.body.textContent).toContain("You need to be 13 or older to use Holdfast."),
+    );
+    expect(confirmCalls(calls)).toEqual([]);
+    fill({ birthYear: "1990" });
+    fireEvent.click(screen.getByRole("button", { name: SUBMIT }));
     await screen.findByRole("heading", { name: "Sign in" });
-    expect(reset).toHaveBeenCalledWith({ newPassword: "a much longer password", token: "tok456" });
+    const sent = confirmCalls(calls);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      method: "POST",
+      body: {
+        token: "tok456",
+        newPassword: "a much longer password",
+        birthYear: 1990,
+        birthMonth: 6,
+        acceptTerms: true,
+      },
+    });
+    // Better Auth's reset endpoint is not what this screen calls.
+    expect(reset).not.toHaveBeenCalled();
     expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
       "Password set. Sign in to continue.",
     );
     expect(router.state.location.search).toBe("?reason=password_set");
   });
 
+  it("the page stays where it is in a browser that is signed in to another account (the token must not be lost to a redirect)", async () => {
+    shellFetch({ session: sessionOf() });
+    const { router } = renderRoutes(buildRoutes(), ["/set-password#token=tok456"]);
+    await screen.findByRole("heading", { name: TITLE });
+    expect(router.state.location.pathname).toBe("/set-password");
+    expect(field("password")).not.toBeNull();
+  });
+
+  it("a link the server says is no longer valid: one sentence, and the way to a reset link", async () => {
+    shellFetch({
+      session: null,
+      extra: (call) =>
+        call.path === "/api/account/confirm-email" ? envelope("invalid_token", 403) : undefined,
+    });
+    renderRoutes(buildRoutes(), ["/set-password#token=tok456"]);
+    await screen.findByRole("heading", { name: TITLE });
+    fill({ password: "a much longer password", birthMonth: "6", birthYear: "1990" });
+    fireEvent.click(field("acceptTerms"));
+    fireEvent.click(screen.getByRole("button", { name: SUBMIT }));
+    await waitFor(() =>
+      expect(document.querySelector("[data-form-notice]")?.textContent).toBe(en["setPassword.missing"]),
+    );
+    expect(field("password")).toBeNull();
+    expect(screen.getByRole("link", { name: "Send reset link" }).getAttribute("href")).toBe(
+      "/forgot-password",
+    );
+  });
+
   it("set password without a token offers the reset-by-mail path instead of a form", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/set-password"]);
-    await screen.findByRole("heading", { name: "Set your password" });
-    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(
-      "This link is incomplete or was already used. Ask for a reset link to choose a password.",
-    );
+    await screen.findByRole("heading", { name: TITLE });
+    expect(document.querySelector("[data-form-notice]")?.textContent).toBe(en["setPassword.missing"]);
     expect(field("password")).toBeNull();
     expect(screen.getByRole("link", { name: "Send reset link" }).getAttribute("href")).toBe(
       "/forgot-password",

@@ -74,4 +74,12 @@ export type Auth = {
       query?: { disableCookieCache?: boolean };
     }): Promise<{ session: SessionInfo; user: SessionUser } | null>;
   };
+  /**
+   * Sets the password of an account that has none, through Better Auth's own reset step (hash,
+   * credential row, `onPasswordReset`) with a token that never leaves the Worker. For the one
+   * caller that has just proven the account's mailbox (routes/pending-email.ts). Absent on a
+   * stand-in instance that has no Better Auth behind it. False: Better Auth did not answer in
+   * time (auth/watchdog.ts).
+   */
+  setFirstPassword?(userId: string, password: string): Promise<boolean>;
 };

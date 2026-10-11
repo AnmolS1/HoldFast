@@ -199,7 +199,7 @@ test.describe("shell routes", () => {
     ["/signup", "Create your account"],
     ["/forgot-password", "Reset your password"],
     ["/reset-password?token=abc", "Choose a new password"],
-    ["/set-password#token=abc", "Set your password"],
+    ["/set-password#token=abc", "Confirm your email and set a password"],
     ["/two-factor", "Enter your code"],
     ["/verify-email", "Check your email"],
   ];

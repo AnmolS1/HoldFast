@@ -35,7 +35,7 @@ import type { AuthContext, ServiceDeps } from "../services/request-context";
 import { sessionAdditionalFields, userAdditionalFields } from "./fields";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
-import { VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
+import { setFirstPassword, VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
 import { passkeyAuthentication } from "./second-factor";
 import { asciiLower } from "../../shared/admin-emails";
@@ -379,6 +379,7 @@ export function createAuth(env: Env, db: Db, ctx: AuthContext): Auth {
         if (!scope.answered.held) scope.answered.release();
       }
     },
+    setFirstPassword: (userId, password) => setFirstPassword(instance, userId, password),
   };
   scopes.set(auth, scope);
   return auth;

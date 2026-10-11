@@ -315,12 +315,12 @@ export const en = {
   "reset.missing": "This reset link is incomplete. Request a new one.",
   "reset.failed": "This reset link has expired or was already used. Request a new one.",
 
-  "setPassword.title": "Set your password",
+  "setPassword.title": "Confirm your email and set a password",
   "setPassword.body":
-    "Your email is confirmed. This link was opened in a different browser from the one used to sign up, so choose the password for your account here.",
-  "setPassword.submit": "Set password",
+    "This link was opened in a different browser from the one used to sign up. To confirm the address and make the account yours, choose its password here. Any password chosen when the address was first entered stops working.",
+  "setPassword.submit": "Confirm and set password",
   "setPassword.missing":
-    "This link is incomplete or was already used. Ask for a reset link to choose a password.",
+    "This link is no longer valid. If the address is already confirmed, sign in — or ask for a reset link to choose a password.",
 
   "twoFactor.title": "Enter your code",
   "twoFactor.body": "From your authenticator app.",

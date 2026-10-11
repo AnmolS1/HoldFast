@@ -39,6 +39,7 @@ export const STATEMENT_BUDGET: Readonly<Record<string, number>> = Object.freeze(
   "/send-verification-email": 12,
   "/reset-password": 20,
   "/account/pending-email": 30,
+  "/account/confirm-email": 40,
 });
 // Not here, on purpose: `GET /api/invites/:code` and `POST /api/auth-intent` answer about a CODE
 // the caller holds, and say outright whether it is usable — there is nothing further for the

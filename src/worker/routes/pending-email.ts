@@ -1,4 +1,6 @@
-// PATCH /api/account/pending-email { email } — fix a mistyped address BEFORE it is verified.
+// The two things an account that is not verified yet can have done to it without a session.
+//
+// ── PATCH /api/account/pending-email { email } — fix a mistyped address BEFORE it is verified ──
 //
 // WHO MAY CALL IT. With verification required, Better Auth gives an unverified account no
 // session, so "a session of an unverified user" (what the plan first asked for) cannot exist for
@@ -32,16 +34,34 @@
 // token, verified once (auth/captcha.ts — this is our route, Better Auth's plugin never sees it);
 // and only then anything in the database, the MX lookup, or a mail.
 //
+// ── POST /api/account/confirm-email { token, newPassword, acceptTerms, birthYear, birthMonth } ──
+//
+// The step a verification link takes when it is opened anywhere but the sign-up browser
+// (auth/mailbox-proof.ts). The GET of the link changes nothing and lands on our set-password
+// page; that page's button sends THIS request — same-origin (the pipeline's CSRF step), with
+// the link's own token. It proves the mailbox, and in one go: the account is emptied of what its
+// creator chose and marked verified, the terms / age statement on it becomes this person's
+// (the same rules as at sign-up: `parseStatement` — a JSON `true`, integers, thirteen or older),
+// and the password they typed is set (Better Auth's own reset step, with a token minted and
+// used inside this request — none is ever handed to a browser). No session: they sign in.
+// THE ORDER is the same as above: body shape, statement, password length and the token's
+// signature cost nothing; then RL_AUTH; then Turnstile; then the breach look-up; then the
+// database. Every state in which the link cannot do this is one answer: `invalid_token`,
+// "This link is no longer valid."
+//
 // Paths are relative to /api. The pipeline applies CSRF; RL_AUTH is applied here.
 
 import { generateId } from "@better-auth/core/utils/id";
 import { createEmailVerificationToken } from "better-auth/api";
 import { Hono } from "hono";
 import { z } from "zod";
+import { isBreached, BREACH_CHECK_UNAVAILABLE, PASSWORD_COMPROMISED_MESSAGE } from "../auth/breach-check";
 import { captchaToken, verifyCaptcha } from "../auth/captcha";
-import { isStoredFormAddress } from "../auth/preflight";
+import { confirmMailbox, readVerifyToken } from "../auth/mailbox-proof";
+import { isStoredFormAddress, PASSWORD_MAX, PASSWORD_MIN } from "../auth/preflight";
 import { scopeOf, VERIFICATION_EXPIRES_IN_S } from "../auth/create-auth";
 import { afterAnswer, type AuthScope } from "../auth/scope";
+import { hungAnswer } from "../auth/watchdog";
 import {
   mintPending,
   PENDING_COOKIE,
@@ -56,15 +76,21 @@ import {
   takePendingChange,
 } from "../db/queries/auth-lifecycle";
 import { ipKey } from "../middleware/rate-limit";
-import { guard, record } from "../auth/observe";
-import { padStatements, STATEMENT_BUDGET } from "../auth/parity";
+import { countFor, guard, record } from "../auth/observe";
+import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
 import { chargeUnsent, sendVerification } from "../services/email";
 import { AppError } from "../services/errors";
 import { enforceRateLimit } from "../services/ratelimit";
 import { auth, db, defer, deps, type AppEnv } from "../services/request-context";
-import { emailProblem, SIGNUP_REFUSALS, SignupRefusal, takeAddressChange } from "../services/signup-policy";
+import {
+  emailProblem,
+  parseStatement,
+  SIGNUP_REFUSALS,
+  SignupRefusal,
+  takeAddressChange,
+} from "../services/signup-policy";
 
 export const router = new Hono<AppEnv>();
 
@@ -223,6 +249,88 @@ router.patch(
       await padStatements(db(c), STATEMENT_BUDGET["/account/pending-email"]!);
       const remaining = PENDING_EMAIL_MIN_MS - (Date.now() - started);
       if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+      return c.json({ ok: true });
+    }
+  }),
+);
+
+const ConfirmBody = z.object({
+  token: z.string().min(1).max(2048),
+  newPassword: z.string().min(PASSWORD_MIN).max(PASSWORD_MAX),
+  acceptTerms: z.unknown(),
+  birthYear: z.unknown(),
+  birthMonth: z.unknown(),
+});
+
+const linkInvalid = () => new AppError("invalid_token", "This link is no longer valid.");
+
+router.post(
+  "/account/confirm-email",
+  guard("confirm_email", async (c) => {
+    const instance = auth(c);
+    const scope = scopeOf(instance);
+    if (!scope) throw new Error("no auth scope");
+    scope.answered.held = true;
+    try {
+      return await answer(scope);
+    } finally {
+      scope.answered.release();
+    }
+
+    async function answer(scope: AuthScope): Promise<Response> {
+      // What costs nothing: the captcha header, the body, the statement, the token's signature.
+      const captcha = captchaToken(c.req.raw);
+      const body = ConfirmBody.parse(await jsonBody(c));
+      try {
+        parseStatement(body, now(c));
+      } catch (error) {
+        if (error instanceof SignupRefusal) {
+          throw new AppError("validation", error.message, { reason: error.code });
+        }
+        throw error;
+      }
+      const claims = await readVerifyToken(c.env.BETTER_AUTH_SECRET, body.token);
+      if (!claims || claims.updateTo !== null) throw linkInvalid();
+      // The caller's own budget, then the challenge — and only then anything else.
+      await enforceRateLimit(c.env, "RL_AUTH", ipKey(c.get("ip")));
+      await verifyCaptcha(c.env, captcha, c.get("ip"));
+      // The password is judged before anything is deleted for it (auth/breach-check.ts: fail closed).
+      let breached: boolean;
+      try {
+        breached = await isBreached(body.newPassword);
+      } catch {
+        countFor(c.env, "auth", { outcome: "error", kind: "breach_check" });
+        throw new AppError("feature_disabled", BREACH_CHECK_UNAVAILABLE.message, {
+          reason: BREACH_CHECK_UNAVAILABLE.code,
+        });
+      }
+      if (breached) {
+        throw new AppError("validation", PASSWORD_COMPROMISED_MESSAGE, { reason: "PASSWORD_COMPROMISED" });
+      }
+
+      const at = now(c);
+      const settings = await scope.settings();
+      const userId = await confirmMailbox(scope, claims, {
+        termsAcceptedAt: at,
+        termsVersion: settings.termsVersion,
+        ageVerifiedAt: at,
+      });
+      if (userId === null) {
+        await padStatements(db(c), LINK_ERROR_BUDGET);
+        throw linkInvalid();
+      }
+      // The password: Better Auth's own reset step (hash, credential row, `onPasswordReset`),
+      // with a token that exists only inside the Worker (auth/create-auth.ts).
+      if (!instance.setFirstPassword) throw new Error("no auth instance");
+      if (!(await instance.setFirstPassword(userId, body.newPassword))) return hungAnswer(c, "handler");
+      record(
+        c,
+        "auth.password_changed",
+        { type: "user", id: userId },
+        { via: "mailbox_proof" },
+        { actorUserId: userId, actorType: "user" },
+      );
+      await padStatements(db(c), STATEMENT_BUDGET["/account/confirm-email"]!);
       return c.json({ ok: true });
     }
   }),

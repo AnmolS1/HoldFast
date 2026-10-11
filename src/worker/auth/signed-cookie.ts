@@ -11,7 +11,10 @@
 //                address (PATCH /api/account/pending-email) — an unverified account has no
 //                session — and what lets the verification link keep the password and sign this
 //                browser in (auth/mailbox-proof.ts): opened anywhere else, the link proves the
-//                mailbox only. 1 hour, and it works only while the account is unverified.
+//                mailbox only. It lasts a little longer than a verification link does
+//                (PENDING_COOKIE.maxAge ≥ the link's lifetime: a link is never outlived by the
+//                proof that goes with it), a resend from a browser that holds a valid one renews
+//                it (auth/hooks.ts), and it works only while the account is unverified.
 //   hf_device    set when a second-factor code of an account is ACCEPTED from this browser
 //                (auth/second-factor.ts): "this browser has passed that account's second factor
 //                before". It names the account and a random device id, and counts only while
@@ -51,7 +54,9 @@ export const PENDING_COOKIE: CookieSpec = {
   // (GET /api/auth/verify-email — auth/mailbox-proof.ts), where it is what tells the browser
   // that signed up from any other browser that opens the mailed link.
   path: "/",
-  maxAge: 3600,
+  // The verification link's lifetime (auth/mailbox-proof.ts VERIFY_LINK_EXPIRES_IN_S, one hour)
+  // and ten minutes more; tests/unit/auth/mailbox-proof.test.ts holds the two together.
+  maxAge: 3600 + 600,
   purpose: "account-action",
 };
 

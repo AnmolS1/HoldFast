@@ -2,15 +2,17 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import { useEffect, useState, type FormEvent } from "react";
 import { Link as RouterLink, useLocation, useNavigate, useSearchParams } from "react-router";
+import { api, ApiError } from "../../lib/api";
 import { authClient } from "../../lib/auth-client";
 import { callAuth } from "../../lib/auth-contract";
+import { EXTERNAL_LINKS } from "../../lib/contracts";
 import { t, type MessageKey } from "../../lib/i18n";
 import { usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
 import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
-import { isEmail, PASSWORD_MAX, PASSWORD_MIN, storedForm } from "./validation";
+import { isEmail, isThirteenOrOlder, parseBirth, PASSWORD_MAX, PASSWORD_MIN, storedForm } from "./validation";
 
 const backSx = {
   color: hf.text,
@@ -96,8 +98,8 @@ export function ForgotPasswordPage() {
 
 /**
  * The token of a mailed link, taken out of the address bar. It is read ONCE, when the screen
- * mounts — from `?token=` (Better Auth's reset link) or from `#token=` (the set-password step
- * after a verification link) — and the URL is then replaced by one without it, so the token is
+ * mounts — from `?token=` (Better Auth's reset link) or from `#token=` (a verification link
+ * opened in another browser: the link's own token) — and the URL is then replaced by one without it, so the token is
  * not left in the history, in a copied link or in a bookmark.
  */
 function useLinkToken(): string | null {
@@ -144,17 +146,6 @@ const RESET_COPY: PasswordLinkCopy = {
   missing: "reset.missing",
   failed: "reset.failed",
   done: "reset",
-};
-
-// The verification link was opened in a browser other than the one that signed up: the address
-// is confirmed, the account has no password yet, and this screen is where its owner chooses one.
-const SET_COPY: PasswordLinkCopy = {
-  title: "setPassword.title",
-  lead: "setPassword.body",
-  submit: "setPassword.submit",
-  missing: "setPassword.missing",
-  failed: "setPassword.missing",
-  done: "password_set",
 };
 
 function PasswordLinkPage({ copy }: { copy: PasswordLinkCopy }) {
@@ -244,7 +235,183 @@ export function ResetPasswordPage() {
   return <PasswordLinkPage copy={RESET_COPY} />;
 }
 
-/** Choose the account's first password, after its address was confirmed from another browser. */
+/**
+ * Where a verification link lands when it is opened anywhere but the browser that signed up
+ * (the server's GET changed nothing — a mail scanner fetches links too). Nothing has happened
+ * yet: the address is confirmed, the account made this person's and its password set by the ONE
+ * request this form's button sends (`POST /api/account/confirm-email`), which also carries what
+ * a sign-up states — the age check and the assent to the terms. This person never stated them:
+ * whoever typed the address into the sign-up form did.
+ */
 export function SetPasswordPage() {
-  return <PasswordLinkPage copy={SET_COPY} />;
+  const navigate = useNavigate();
+  const token = useLinkToken();
+  const config = usePublicConfig().data;
+  const turnstile = useTurnstile(config?.turnstileSiteKey);
+  const [password, setPassword] = useState("");
+  const [birthMonth, setBirthMonth] = useState("");
+  const [birthYear, setBirthYear] = useState("");
+  const [acceptTerms, setAcceptTerms] = useState(false);
+  const [errors, setErrors] = useState<{ password?: string; birth?: string; assent?: string }>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const [invalid, setInvalid] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const onSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    setFormError(null);
+    if (!token) return;
+    const found: typeof errors = {};
+    if (password.length < PASSWORD_MIN) found.password = t("signup.error.password");
+    else if (password.length > PASSWORD_MAX) found.password = t("signup.error.passwordLong");
+    const birth = parseBirth({ birthMonth, birthYear });
+    if (!birth) found.birth = t("signup.error.birth");
+    else if (!isThirteenOrOlder(birth.year, birth.month)) found.birth = t("signup.error.age");
+    if (!acceptTerms) found.assent = t("signup.error.assent");
+    setErrors(found);
+    if (Object.keys(found).length > 0 || !birth) return;
+    if (config?.turnstileSiteKey && !turnstile.token) {
+      setFormError(t(turnstile.status === "error" ? "auth.humanFailed" : "auth.humanWait"));
+      return;
+    }
+    setBusy(true);
+    try {
+      await api("/api/account/confirm-email", {
+        method: "POST",
+        body: {
+          token,
+          newPassword: password,
+          birthYear: birth.year,
+          birthMonth: birth.month,
+          acceptTerms: true,
+        },
+        ...captchaOptions(turnstile.token),
+      });
+    } catch (cause) {
+      turnstile.reset();
+      setBusy(false);
+      const reason = cause instanceof ApiError ? cause.details?.reason : undefined;
+      if (cause instanceof ApiError && cause.code === "invalid_token") setInvalid(true);
+      else if (reason === "PASSWORD_COMPROMISED") setErrors({ password: t("signup.password.breached") });
+      else if (cause instanceof ApiError && cause.code === "validation" && typeof reason === "string") {
+        setFormError(cause.message);
+      } else setFormError(t("auth.error.generic"));
+      return;
+    }
+    navigate("/login?reason=password_set", { replace: true });
+  };
+
+  const unusable = !token || invalid;
+  return (
+    <AuthCard title={t("setPassword.title")} lead={unusable ? undefined : t("setPassword.body")}>
+      {unusable ? (
+        <FormNotice tone="danger">{t("setPassword.missing")}</FormNotice>
+      ) : (
+        <Box
+          component="form"
+          noValidate
+          onSubmit={onSubmit}
+          sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+        >
+          <Field
+            label={t("reset.new")}
+            type="password"
+            name="password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            help={t("signup.password.help")}
+            errorText={errors.password}
+          />
+          <Box component="fieldset" sx={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+            <Box
+              component="legend"
+              sx={{
+                padding: 0,
+                marginBottom: "6px",
+                fontSize: 12,
+                lineHeight: "16px",
+                color: hf.textSecondary,
+              }}
+            >
+              {t("signup.birth")}
+            </Box>
+            <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2 }}>
+              <Field
+                label={t("signup.birth.month")}
+                hideLabel
+                name="birthMonth"
+                mono
+                placeholder="MM"
+                autoComplete="bday-month"
+                value={birthMonth}
+                onChange={(e) => setBirthMonth(e.target.value)}
+                slotProps={{ htmlInput: { inputMode: "numeric", maxLength: 2 } }}
+              />
+              <Field
+                label={t("signup.birth.year")}
+                hideLabel
+                name="birthYear"
+                mono
+                placeholder="YYYY"
+                autoComplete="bday-year"
+                value={birthYear}
+                onChange={(e) => setBirthYear(e.target.value)}
+                slotProps={{ htmlInput: { inputMode: "numeric", maxLength: 4 } }}
+              />
+            </Box>
+            <Box sx={{ marginTop: "6px", fontSize: 12, lineHeight: "16px", color: hf.textSecondary }}>
+              {t("signup.birth.note")}
+            </Box>
+            {errors.birth ? <FormError>{errors.birth}</FormError> : null}
+          </Box>
+          <Box>
+            <Box
+              component="label"
+              sx={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 2,
+                fontSize: 12,
+                lineHeight: "16px",
+                color: hf.textSecondary,
+                minHeight: 24,
+                cursor: "pointer",
+                "@media (max-width:1023.95px)": { minHeight: 44, alignItems: "center" },
+              }}
+            >
+              <Box
+                component="input"
+                type="checkbox"
+                name="acceptTerms"
+                checked={acceptTerms}
+                onChange={(e) => setAcceptTerms(e.target.checked)}
+                sx={{ width: 16, height: 16, margin: 0, flex: "none" }}
+              />
+              <span className="prose">
+                {t("signup.assent.before")}
+                <a href={EXTERNAL_LINKS.terms} target="_blank" rel="noopener">
+                  {t("legal.terms")}
+                </a>
+                {t("signup.assent.and")}
+                <a href={EXTERNAL_LINKS.privacy} target="_blank" rel="noopener">
+                  {t("terms.privacyPolicy")}
+                </a>
+                {t("signup.assent.after")}
+              </span>
+            </Box>
+            {errors.assent ? <FormError>{errors.assent}</FormError> : null}
+          </Box>
+          {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
+          <FormError>{formError}</FormError>
+          <Button type="submit" variant="contained" size="large" disabled={busy}>
+            {t("setPassword.submit")}
+          </Button>
+        </Box>
+      )}
+      <Box component={RouterLink} to={unusable ? "/forgot-password" : "/login"} sx={backSx}>
+        {unusable ? t("forgot.submit") : t("forgot.back")}
+      </Box>
+    </AuthCard>
+  );
 }

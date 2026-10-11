@@ -33,12 +33,12 @@ const change = (client: Client, email: unknown, options: Parameters<typeof send>
   });
 
 describe("the pending-sign-up cookie", () => {
-  it("is set by a successful sign-up: signed, HttpOnly, SameSite=Lax, one hour, Path=/ (two routes read it)", async () => {
+  it("is set by a successful sign-up: signed, HttpOnly, SameSite=Lax, the link's lifetime and ten minutes, Path=/ (two routes read it)", async () => {
     const client = newClient();
     const { sent, email } = await signUp(client);
     const cookie = sent.setCookies.find((c) => c.startsWith("hf_pending="))!;
     expect(cookie).toMatch(/^hf_pending=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+; /);
-    expect(cookie).toContain("Max-Age=3600");
+    expect(cookie).toContain("Max-Age=4200");
     // The pending-address route AND the verification link read it (auth/mailbox-proof.ts).
     expect(cookie).toMatch(/; Path=\/(;|$)/);
     expect(cookie).toContain("HttpOnly");
@@ -121,8 +121,8 @@ describe("PATCH /api/account/pending-email", () => {
       ),
       // Signed with another secret.
       await mintPending(createKeys("another-secret-entirely-000000000000000000000"), who, 0, new Date()),
-      // Genuine, but minted more than an hour ago.
-      await mintPending(keys, who, 0, new Date(Date.now() - 3_700_000)),
+      // Genuine, but minted longer ago than it lasts.
+      await mintPending(keys, who, 0, new Date(Date.now() - (PENDING_COOKIE.maxAge + 100) * 1000)),
     ];
     const genuine = await mintPending(keys, who, 0, new Date());
     forgeries.push(genuine.slice(0, -2) + (genuine.endsWith("AA") ? "BB" : "AA"));

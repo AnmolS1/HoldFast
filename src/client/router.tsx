@@ -156,9 +156,11 @@ export function buildRoutes(): RouteObject[] {
               element: <ResetPasswordPage />,
               handle: auth,
             },
-            // Where a verification link opened in ANOTHER browser lands: the address is
-            // confirmed, and its owner chooses the account's password here.
-            { path: "set-password", loader: redirectSignedIn, element: <SetPasswordPage />, handle: auth },
+            // Where a verification link opened in ANOTHER browser lands. Nothing has happened
+            // yet: this page's button confirms the address and sets the account's password.
+            // No `redirectSignedIn`: a browser signed in to some OTHER account must not lose the
+            // link's token to a redirect (it is in the fragment, read once).
+            { path: "set-password", element: <SetPasswordPage />, handle: auth },
             { path: "two-factor", loader: redirectSignedIn, element: <TwoFactorPage />, handle: auth },
           ],
         },

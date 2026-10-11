@@ -14,25 +14,36 @@
 //   SIGN-UP LINK, opened in the browser that signed up — it holds the `hf_pending` proof
 //   (auth/signed-cookie.ts) naming that very account at that very address:
 //       Better Auth proceeds. The password stays, the browser is signed in.
-//   SIGN-UP LINK, opened anywhere else (another browser, another device, another person):
-//       the address is PROVEN, by someone we cannot tie to the password. In one transaction,
-//       under the row lock, while the account is still unverified (and so can hold no session):
-//       every credential is deleted and the address is marked verified. NO session is created.
-//       The person is redirected to "set your password" with a single-use token of Better
-//       Auth's own reset kind — delivered in this very response, to the one who has the mailbox.
+//   SIGN-UP LINK, opened anywhere else (another browser, another device, another person — or
+//   fetched by a mail gateway's link scanner, which GETs every link without cookies before the
+//   mail is even delivered):
+//       THE GET CHANGES NOTHING. Not a row. It answers with a redirect to a page of ours
+//       (`/set-password#token=<the link's own token>` — in the fragment, so a scanner that
+//       follows it fetches the bare shell). There the person states their age, accepts the terms
+//       and chooses a password, and ONE same-origin POST from that page's button
+//       (`POST /api/account/confirm-email`, routes/pending-email.ts → `confirmMailbox` below)
+//       does everything at once: in one transaction, under the row lock, while the account is
+//       still unverified (and so can hold no session): every credential its creator chose is
+//       deleted, the address is marked verified, and the terms / age statement on the row
+//       becomes THIS person's (the invite reference is cleared: they brought none) — and then the
+//       password they typed is set. No session is created; they sign in.
+//       So a scanner's fetch leaves the sign-up browser's own click working, with the password
+//       chosen a minute ago; and nobody is handed a password-setting token by a GET.
 //   ADDRESS-CHANGE LINK (the second step, mailed to the NEW address): Better Auth would create
 //       a session for the account when the clicker has none — so the owner of the new address,
 //       clicking a mail they did not ask for, would be signed in to a stranger's account that
 //       now carries their address. Here it needs that account's own session; otherwise nothing
 //       changes and the browser is sent to sign in.
 //
-// Why "before": afterwards is too late. Once the row is verified its creator can sign in, and
+// Why the GET's decision is made "before": afterwards is too late. Once the row is verified its creator can sign in, and
 // anything deleted after that races a request already in flight (a passkey registration). While
 // it is unverified nothing but its sign-up password can exist (Better Auth gives an unverified
 // account no session), so "delete and mark verified" under the lock is complete.
 //
 // The token is verified HERE first (the same HS256 check Better Auth makes): nothing is deleted
-// on the strength of a link that is forged or expired.
+// on the strength of a link that is forged or expired — and every state in which the POST cannot
+// act (forged, expired, an address-change token, no such account, already verified, moved) is
+// answered with the one generic "this link is no longer valid".
 
 import { generateId } from "@better-auth/core/utils/id";
 import { APIError, createEmailVerificationToken, getSessionFromCtx } from "better-auth/api";
@@ -43,6 +54,7 @@ import { now } from "../services/clock";
 import { record } from "./observe";
 import type { AuthScope } from "./scope";
 import { readPending } from "./signed-cookie";
+import { HANG, watched } from "./watchdog";
 
 /**
  * `hooks.after` for `POST /change-email`. Better Auth answers `{ status: true }` either way, but
@@ -90,12 +102,10 @@ export async function afterChangeEmail(
   await send({ to: user.email, name: user.name, newEmail, url, by: { user: user.id } });
 }
 
-/** The screen that takes the token (src/client/routes/auth/Password.tsx). */
+/** The page of ours a link opened elsewhere lands on (src/client/routes/auth/Password.tsx). */
 export const SET_PASSWORD_PATH = "/set-password";
 /** The lifetime of a verification link (create-auth.ts `emailVerification.expiresIn`). */
 export const VERIFY_LINK_EXPIRES_IN_S = 60 * 60;
-/** How long the set-password token of a cross-browser verification lasts. */
-export const SET_PASSWORD_TOKEN_S = 60 * 60;
 /** Where an address-change link sends a browser that is not signed in to the account. */
 export const CHANGE_EMAIL_SIGN_IN = "/login?reason=change_email";
 /** Where it sends the account's own browser when the new address has been taken meanwhile. */
@@ -119,11 +129,6 @@ export async function readVerifyToken(secret: string, token: string): Promise<Ve
 type VerifyContext = Parameters<typeof getSessionFromCtx>[0] & {
   request?: Request;
   headers?: Headers;
-  context: {
-    internalAdapter: {
-      createVerificationValue(data: { value: string; identifier: string; expiresAt: Date }): Promise<unknown>;
-    };
-  };
 };
 
 const redirect = (env: Pick<Env, "APP_ORIGIN">, path: string) =>
@@ -179,11 +184,31 @@ export async function beforeVerifyEmail(scope: AuthScope, ctx: VerifyContext): P
     return;
   }
 
-  const removed = await clearForMailboxProof(db, account.id, account.email);
-  // It stopped being "unverified at this address" a moment ago (another click, or the address
-  // was moved): Better Auth answers for the state as it is now — verified → no session; moved →
-  // no such user.
-  if (removed === null) return;
+  // Anybody else — the owner on another device, another person, a mail scanner. A GET is not
+  // where anything is deleted: the page behind this redirect asks, and its POST acts.
+  throw redirect(env, `${SET_PASSWORD_PATH}#token=${token}`);
+}
+
+export type MailboxStatement = { termsAcceptedAt: Date; termsVersion: string; ageVerifiedAt: Date };
+
+/**
+ * The destructive step, for `POST /api/account/confirm-email`: the holder of a sign-up
+ * verification link proves the mailbox, and the account becomes theirs — emptied of what its
+ * creator chose, verified, carrying THEIR statement. Returns the account's id, or null when the
+ * link cannot do that (any reason: the caller answers with the one generic sentence).
+ */
+export async function confirmMailbox(
+  scope: AuthScope,
+  claims: VerifyClaims,
+  statement: MailboxStatement,
+): Promise<string | null> {
+  if (claims.updateTo !== null) return null;
+  const account = await getAccountByEmail(scope.db, claims.email);
+  if (!account || account.emailVerified) return null;
+  const removed = await clearForMailboxProof(scope.db, account.id, account.email, statement);
+  // It stopped being "unverified at this address" a moment ago (another confirmation, or the
+  // address was moved).
+  if (removed === null) return null;
   record(
     scope.deps,
     "auth.prehijack_cleanup",
@@ -192,16 +217,42 @@ export async function beforeVerifyEmail(scope: AuthScope, ctx: VerifyContext): P
     { actorUserId: account.id, actorType: "user" },
   );
   try {
-    await activatePendingShares(db, account.id, account.email);
+    await activatePendingShares(scope.db, account.id, account.email);
   } catch {
     // The address is proven and emptied; a share that did not activate now does on first use.
   }
-  const setToken = generateId(24);
-  await ctx.context.internalAdapter.createVerificationValue({
-    value: account.id,
-    identifier: `reset-password:${setToken}`,
-    expiresAt: new Date(Date.now() + SET_PASSWORD_TOKEN_S * 1000),
+  return account.id;
+}
+
+/** The part of a Better Auth instance `setFirstPassword` uses. */
+type PasswordSetter = {
+  $context: Promise<{
+    internalAdapter: {
+      createVerificationValue(data: { value: string; identifier: string; expiresAt: Date }): Promise<unknown>;
+    };
+  }>;
+  api: { resetPassword(input: { body: { newPassword: string; token: string } }): Promise<unknown> };
+};
+
+/**
+ * Sets the password of the account `confirmMailbox` has just emptied, through Better Auth's own
+ * reset step (the hash, the credential row, `onPasswordReset`) — with a reset token minted and
+ * used here, in one call: it is never in a response, a redirect or a mail. Under the watchdog
+ * like every call into Better Auth (auth/watchdog.ts): false when it did not answer in time.
+ */
+export async function setFirstPassword(
+  instance: PasswordSetter,
+  userId: string,
+  password: string,
+): Promise<boolean> {
+  const token = generateId(24);
+  const context = await instance.$context;
+  await context.internalAdapter.createVerificationValue({
+    value: userId,
+    identifier: `reset-password:${token}`,
+    expiresAt: new Date(Date.now() + 60_000),
   });
-  // In the FRAGMENT: it is never sent to a server, so it is in no request log and no Referer.
-  throw redirect(env, `${SET_PASSWORD_PATH}#token=${setToken}`);
+  const body = { newPassword: password, token };
+  const outcome = await watched(instance.api.resetPassword({ body }));
+  return outcome !== HANG;
 }

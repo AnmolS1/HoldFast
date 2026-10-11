@@ -374,7 +374,9 @@ test.describe("the verification link, opened in a browser that did not sign up",
 
   const NEW_PASSWORD = "the owner chose this one 7!";
 
-  test("a stranger signs up with someone's address; the owner's click kills the stranger's password and leads to 'set your password'", async ({
+  const CONFIRM_TITLE = "Confirm your email and set a password";
+
+  test("a stranger signs up with someone's address; the owner's click changes nothing, and the button on our page makes the account the owner's", async ({
     page,
     browser,
     clientIp,
@@ -390,25 +392,28 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
     const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
 
-    // The owner opens the mailed link in THEIR browser.
+    // The owner opens the mailed link in THEIR browser: a page of ours, and nothing has happened.
     const owner = await otherBrowser(browser, origins.app, "10.99.1.1");
     await owner.goto(link);
-    await expect(owner.getByRole("heading", { name: "Set your password" })).toBeVisible();
-    await expect(owner.getByText("Your email is confirmed.", { exact: false })).toBeVisible();
-    // Nobody is signed in, the token is not left in the address bar, and the address is proven.
+    await expect(owner.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
+    // Nobody is signed in, the token is not left in the address bar, and the GET changed nothing.
     expect(await sessionOf(owner.request)).toBeNull();
     await expect.poll(() => owner.url()).toBe(`${origins.app}/set-password`);
+    expect((await userRow(email))?.email_verified).toBe(false);
+
+    // The owner states their age, accepts the terms, chooses the password — one button.
+    await owner.getByLabel("New password").fill(NEW_PASSWORD);
+    await owner.getByLabel("Month").fill("5");
+    await owner.getByLabel("Year").fill("1990");
+    await owner.getByRole("checkbox").check();
+    await owner.getByRole("button", { name: "Confirm and set password" }).click();
+    await expectSignInScreen(owner);
+    await expect(owner.getByText("Password set. Sign in to continue.")).toBeVisible();
     expect((await userRow(email))?.email_verified).toBe(true);
     // The stranger's password opens nothing — from the stranger's own browser or anywhere.
     const outsider = await playwright.request.newContext({ baseURL: origins.app });
     expect(await passwordOpens(outsider, origins.app, "10.99.1.2", email, FIXTURE_PASSWORD)).toBe(401);
     expect(await passwordOpens(page.request, origins.app, clientIp, email, FIXTURE_PASSWORD)).toBe(401);
-
-    // The owner chooses the password and signs in with it.
-    await owner.getByLabel("New password").fill(NEW_PASSWORD);
-    await owner.getByRole("button", { name: "Set password" }).click();
-    await expectSignInScreen(owner);
-    await expect(owner.getByText("Password set. Sign in to continue.")).toBeVisible();
     await fillSignIn(owner, email, NEW_PASSWORD);
     await expectSignedIn(owner);
     expect((await sessionOf(owner.request))?.user).toMatchObject({ email, emailVerified: true });
@@ -423,6 +428,50 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await outsider.dispose();
     await owner.context().close();
     await third.context().close();
+  });
+
+  test("a mail scanner fetches the link first (no cookies), and opens it in a browser of its own; the person's own click then signs them in with the password they chose", async ({
+    page,
+    browser,
+    clientIp,
+    origins,
+    playwright,
+  }) => {
+    // (An address of this test's own: its sign-up must not count on the one every request
+    // without the header shares.)
+    expect(clientIp).toBeTruthy();
+    await stubTurnstile(page);
+    const email = freshEmail();
+    await page.goto(`/signup?invite=${await createInvite()}`);
+    await fillSignUp(page, { email });
+    await page.getByRole("button", { name: "Create account" }).click();
+    await expect(page.getByRole("heading", { name: "Check your email" })).toBeVisible();
+    const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
+
+    // The gateway: a bare GET, redirects not followed and followed; then a headless browser.
+    const scanner = await playwright.request.newContext({ baseURL: origins.app });
+    const fetched = await scanner.get(link, {
+      maxRedirects: 0,
+      headers: { "cf-connecting-ip": "10.99.2.1" },
+    });
+    expect(fetched.status()).toBe(302);
+    expect(fetched.headers()["location"]).toContain("/set-password#token=");
+    expect((await scanner.get(link, { headers: { "cf-connecting-ip": "10.99.2.1" } })).status()).toBe(200);
+    await scanner.dispose();
+    const sandbox = await otherBrowser(browser, origins.app, "10.99.2.2");
+    await sandbox.goto(link);
+    await expect(sandbox.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
+    await sandbox.context().close();
+    expect((await userRow(email))?.email_verified).toBe(false);
+
+    // The person clicks, in the browser they signed up in.
+    await page.goto(link);
+    await expectSignedIn(page);
+    expect((await sessionOf(page.request))?.user).toMatchObject({ email, emailVerified: true });
+    // …and the password they chose at sign-up is the account's password.
+    const elsewhere = await playwright.request.newContext({ baseURL: origins.app });
+    expect(await passwordOpens(elsewhere, origins.app, "10.99.2.3", email, FIXTURE_PASSWORD)).toBe(200);
+    await elsewhere.dispose();
   });
 
   test("an expired link and a tampered one get one answer, sign nobody in and leave the account as it was", async ({
@@ -467,7 +516,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await other.context().close();
   });
 
-  test("an admin address: no admin role from the click, nor from setting the password — only from the sign-in after it", async ({
+  test("an admin address: no admin role from the click, nor from confirming and setting the password — only from the sign-in after it", async ({
     page,
     browser,
     clientIp,
@@ -493,15 +542,19 @@ test.describe("the verification link, opened in a browser that did not sign up",
 
     const admin = await otherBrowser(browser, origins.app, "10.99.3.1");
     await admin.goto(link);
-    await expect(admin.getByRole("heading", { name: "Set your password" })).toBeVisible();
+    await expect(admin.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
+    // The click changed nothing.
+    expect(await userRow(email)).toMatchObject({ email_verified: false, role: "user" });
+
+    await admin.getByLabel("New password").fill(NEW_PASSWORD);
+    await admin.getByLabel("Month").fill("5");
+    await admin.getByLabel("Year").fill("1990");
+    await admin.getByRole("checkbox").check();
+    await admin.getByRole("button", { name: "Confirm and set password" }).click();
+    await expectSignInScreen(admin);
     expect(await userRow(email)).toMatchObject({ email_verified: true, role: "user" });
     // The stranger's password: dead, and it granted nothing on the way.
     expect(await passwordOpens(page.request, origins.app, clientIp, email, FIXTURE_PASSWORD)).toBe(401);
-    expect((await userRow(email))?.role).toBe("user");
-
-    await admin.getByLabel("New password").fill(NEW_PASSWORD);
-    await admin.getByRole("button", { name: "Set password" }).click();
-    await expectSignInScreen(admin);
     expect((await userRow(email))?.role).toBe("user");
     await fillSignIn(admin, email, NEW_PASSWORD);
     await expectSignedIn(admin);

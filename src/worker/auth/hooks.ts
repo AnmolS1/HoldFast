@@ -87,6 +87,7 @@ import {
   mintPending,
   PENDING_COOKIE,
   readIntent,
+  readPending,
 } from "./signed-cookie";
 
 /** Better Auth's own answer to a wrong password (api/routes/sign-in.mjs), reproduced exactly. */
@@ -556,6 +557,18 @@ export function buildHooks(scope: AuthScope) {
       return;
     }
     const uncharged = ctx.request && typeof path === "string" ? UNSENT_KIND[path] : undefined;
+    if (path === "/send-verification-email" && ctx.request && !(ctx.context.returned instanceof Error)) {
+      // A resend from the browser that signed up RENEWS its proof (auth/signed-cookie.ts): the
+      // new link must not outlive the cookie that makes its click keep the password. Decided by
+      // the caller's own cookie alone — nothing about any account is read for it.
+      const asked = (ctx.body as { email?: unknown } | undefined)?.email;
+      const cookies = ctx.headers?.get("cookie") ?? ctx.request.headers.get("cookie");
+      const held = await readPending(env, scope.keys, cookies, now());
+      if (held && typeof asked === "string" && held.email === asked.toLowerCase()) {
+        const value = await mintPending(scope.keys, held, held.changes, now());
+        ctx.setCookie(cookieName(env, PENDING_COOKIE), value, cookieAttributes(env, PENDING_COOKIE));
+      }
+    }
     if (uncharged) {
       // The mail budgets are charged the same whether or not a mail results (services/email.ts
       // `chargeUnsent`) — after the answer, like the mail itself, and never awaited.

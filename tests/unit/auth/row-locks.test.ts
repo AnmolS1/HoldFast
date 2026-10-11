@@ -81,16 +81,19 @@ describe("each function waits for the row it locks — and (the control) for no 
     expect(free.waiting).toBe(false);
   });
 
+  const STATEMENT = { termsAcceptedAt: new Date(), termsVersion: "2026-10", ageVerifiedAt: new Date() };
   it("clearForMailboxProof locks the user row", async () => {
     const row = await unverified();
-    const held = await whileHeld(holdUser(row.id), () => clearForMailboxProof(testDb(), row.id, row.email));
+    const held = await whileHeld(holdUser(row.id), () =>
+      clearForMailboxProof(testDb(), row.id, row.email, STATEMENT),
+    );
     expect(held.waiting).toBe(true);
     expect(held.result).not.toBeNull();
     expect((await testDb().select().from(user).where(eq(user.id, row.id)))[0]!.emailVerified).toBe(true);
     const other = await unverified();
     const bystander = await unverified();
     const free = await whileHeld(holdUser(bystander.id), () =>
-      clearForMailboxProof(testDb(), other.id, other.email),
+      clearForMailboxProof(testDb(), other.id, other.email, STATEMENT),
     );
     expect(free.waiting).toBe(false);
   });

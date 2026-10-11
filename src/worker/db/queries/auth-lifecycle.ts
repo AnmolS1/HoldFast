@@ -586,18 +586,20 @@ export async function clearUnprovenAccount(
 }
 
 /**
- * The same emptying for a MAILBOX proof (auth/mailbox-proof.ts): a verification link opened in a
- * browser that did not create the account. Under the row lock and only while the account is
+ * The same emptying for a MAILBOX proof (auth/mailbox-proof.ts `confirmMailbox`): the holder of
+ * a verification link, in a browser that did not create the account, confirmed it with a POST. Under the row lock and only while the account is
  * still unverified AND still at `email` (the address the link proves): every credential and
  * session, every passkey, two-factor secret and token is deleted, the profile its creator typed
- * is reset, and the address is marked verified — one transaction. The policy fields (terms, age,
- * invite, quota) stay as the sign-up wrote them. Null when the row is not in that state: nothing
- * is touched.
+ * is reset, and the address is marked verified — one transaction. The terms and age statement on
+ * the row becomes `statement` — the PROVER's own, given with the confirmation — and the invite
+ * reference is cleared: what the row's creator stated is not what the owner stated. The quota
+ * stays. Null when the row is not in that state: nothing is touched.
  */
 export async function clearForMailboxProof(
   db: Executor,
   userId: string,
   email: string,
+  statement: { termsAcceptedAt: Date; termsVersion: string; ageVerifiedAt: Date },
 ): Promise<{
   accounts: number;
   sessions: number;
@@ -631,6 +633,10 @@ export async function clearForMailboxProof(
         avatarNodeId: null,
         twoFactorEnabled: false,
         role: "user",
+        termsAcceptedAt: statement.termsAcceptedAt,
+        termsVersion: statement.termsVersion,
+        ageVerifiedAt: statement.ageVerifiedAt,
+        invitedBy: null,
       })
       .where(eq(user.id, userId));
     return {

@@ -168,6 +168,8 @@ describe("every call into Better Auth is under the watchdog (source scan)", () =
       }
     }
     expect(calls.sort()).toEqual([
+      // (the first password after a mailbox proof — POST /api/account/confirm-email)
+      "src/worker/auth/mailbox-proof.ts: watched( instance.api.resetPassword({ body }));",
       "src/worker/middleware/session.ts: watched( auth(c).api.getSession({",
       "src/worker/routes/auth.ts: watched( instance.handler(request));",
     ]);
