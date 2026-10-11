@@ -469,8 +469,9 @@ const OWN_COOKIE = /\b(?:__(?:Secure|Host)-)?hf[._][A-Za-z0-9_.-]*=[^;\s"'<>]*/g
 // and a quoted value need not be closed (a string cut off mid-value): it runs to the end of its line.
 // A name is letters of any script (`ｐａｓｓｗｏｒｄ=…`); an unquoted value is matched up to a
 // delimiter, and a character ENTITY inside it (`pre&#x20;rest`) is part of it, not the `&` and
-// `;` that end it. Under a SENSITIVE name the match is only where an unquoted value starts:
-// `redactPairs` takes the rest of its line with it (the delimiter may be part of the value).
+// `;` that end it. Under a SENSITIVE name the match is only where a value STARTS: `redactPairs`
+// takes an unquoted value's whole line (the delimiter may be part of the value) and follows a
+// quoted one over line breaks to its closing quote.
 const KEY_VALUE =
   /(["']?)([\p{L}][\p{L}\p{N}_.[\]-]{0,63})(["']?)([\s-]*[:=][\s-]*)("(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?|(?:[&]#[xX]?[0-9a-fA-F]{1,7}[;]?|[&][A-Za-z]{2,8}[;]|[^\s&;,"'<>])+)/gu;
 // An error's own code (a constant, a SQLSTATE, an HTTP status) is kept under `code`, and a
@@ -487,6 +488,24 @@ function isReadableCode(name: string, value: unknown): boolean {
   return typeof value === "string" && (ERROR_CODE.test(value) || PLAIN_WORD.test(value));
 }
 
+/** How far past a line break the closing quote of a sensitive value is looked for. */
+const QUOTE_REACH = 8192;
+/** A sensitive pair's quoted value left OPEN at the end of a stretch of text (its line). */
+const OPEN_AT_END = /([\p{L}][\p{L}\p{N}_.[\]-]{0,63})["']?[\s-]*[:=][\s-]*(["'])(?:(?!\2)[^\\\r\n]|\\.)*$/u;
+
+/**
+ * Where the value that `quote` opened ends when it runs on past `from` (a line break): just
+ * after its closing quote — or `from` when none is in reach. A secret typed over two lines, a
+ * JSON string with a raw newline.
+ */
+function pastClosingQuote(text: string, from: number, quote: string): number {
+  const reach = text.slice(from, from + QUOTE_REACH);
+  const close = (quote === '"' ? /^(?:[^"\\]|\\[\s\S])*"/ : /^(?:[^'\\]|\\[\s\S])*'/).exec(reach);
+  return close === null ? from : from + close[0].length;
+}
+
+/** A PEM block, whatever it is under: the armour lines and everything between them. */
+const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]{1,40}-----[\s\S]{0,16384}?(?:-----END [A-Z0-9 ]{1,40}-----|$)/g;
 /** `&name=` straight after a value: the next pair of a query string. */
 const NEXT_QUERY_PAIR = /^&[\p{L}][\p{L}\p{N}_.[\]-]{0,63}=/u;
 
@@ -509,19 +528,29 @@ function redactPairs(text: string): string {
     if (isReadableCode(name, bare)) continue;
     out += `${text.slice(last, match.index)}${open}${name}${close}${separator}${REDACTED}`;
     last = match.index + whole.length;
-    // A QUOTED value is its quotes. An unquoted one has no end that can be trusted: what was
-    // typed may hold the very delimiters the pattern stops at (`a,b;c d`), and a list
-    // (`["abc","def"]`) is only its bracket to the pattern. So the rest of the LINE goes with
-    // it — more than the value, never less. Not when the pair is in QUERY syntax (it follows a
-    // `?` or `&`, or `&name=` follows it): there `&` and the end of the URL are the grammar's
-    // own ends, and a delimiter inside a value arrives encoded. And not for a value that is
-    // already the marker (a text redacted a second time reads the same).
-    const inQuery =
-      /[?&]$/.test(text.slice(Math.max(0, match.index - 1), match.index)) ||
-      NEXT_QUERY_PAIR.test(text.slice(last, last + 80));
-    if (!/^["']/.test(value) && !inQuery && !value.startsWith(REDACTED)) {
+    const quote = /^["']/.exec(value)?.[0];
+    if (quote !== undefined) {
+      // A QUOTED value is its quotes — to the CLOSING one, also when that is on a later line
+      // (the pattern stops at a line break). Bounded; with none in reach, the line is what goes.
+      const closed = value.length > 1 && value.endsWith(quote) && !value.endsWith(`\\${quote}`);
+      if (!closed) {
+        last = pastClosingQuote(text, last, quote);
+        KEY_VALUE.lastIndex = last;
+      }
+    } else if (!NEXT_QUERY_PAIR.test(text.slice(last, last + 80)) && !value.startsWith(REDACTED)) {
+      // An UNQUOTED value has no end that can be trusted: what was typed may hold the very
+      // delimiters the pattern stops at (`a,b;c d`), a list (`["abc","def"]`) is only its
+      // bracket to the pattern, and "query syntax" in a log line or a hand-built body need not
+      // have its spaces encoded (`a=1&password=correct horse`). So the rest of the LINE goes
+      // with it — more than the value, never less. The one end that is believed is the query
+      // grammar's own: `&name=` straight after the value (the next pair is judged by itself).
+      // And a value that is already the marker stays as it is (redacting twice reads the same).
       const rest = /[\r\n]/.exec(text.slice(last));
-      last = rest === null ? text.length : last + rest.index;
+      const end = rest === null ? text.length : last + rest.index;
+      // …and if the line that goes holds the OPENING quote of another sensitive value that
+      // runs on, that value's later lines go too (they would be left with no name in front).
+      const open = OPEN_AT_END.exec(text.slice(last, end));
+      last = open !== null && isSensitiveName(open[1]!) ? pastClosingQuote(text, end, open[2]!) : end;
       KEY_VALUE.lastIndex = last;
     }
   }
@@ -562,6 +591,7 @@ const asItIs = (plain: string) => plain;
 function redactNamed(text: string): string {
   return redactPairs(
     text
+      .replace(PEM_BLOCK, REDACTED)
       .replace(QUERY_PARAMS, "params: [dropped]")
       .replace(HEADER_LINE, `$1: ${REDACTED}`)
       .replace(BEARER, `$1 ${REDACTED}`)

@@ -111,6 +111,13 @@ const SECRETS: Array<(r: Rng) => Secret> = [
   (r) => ({ text: `password=${r.chars(2)},${MARK}${r.chars(2)};c ${MARK}${r.chars(2)}`, url: false }),
   (r) => ({ text: `newPassword: ["${MARK}${r.chars(3)}","${MARK}${r.chars(3)}"]`, url: false }),
   (r) => ({ text: `cookie=a%0Ahf_other ${MARK}${r.chars(3)}`, url: false }),
+  // A quoted value over a line break, a PEM body, and query syntax with a raw space (round 2, N7).
+  (r) => ({ text: `password: "first ${r.chars(2)}\n${MARK}${r.chars(3)}" tail`, url: false }),
+  (r) => ({
+    text: `privateKey=-----BEGIN PRIVATE KEY-----\n${MARK}${r.chars(8)}\n-----END PRIVATE KEY-----`,
+    url: false,
+  }),
+  (r) => ({ text: `a=1&password=correct horse ${MARK}${r.chars(3)}`, url: false }),
 ];
 
 // ── encodings ───────────────────────────────────────────────────────────────────────────────

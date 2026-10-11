@@ -99,6 +99,43 @@ describe("R11 — the whole of an unquoted or list value under a sensitive name 
   });
 });
 
+// N7 — what R11 left: a QUOTED value that goes on over a line break, a PEM block under a name,
+// and a value in query syntax (`&name=value`) written with a raw space.
+describe("N7 — a value that continues on another line, and a query-syntax value with a raw space", () => {
+  it("the round-2 strings, exactly", () => {
+    expect(redactText('password: "first line\nsecond line" tail')).toBe("password: [redacted] tail");
+    expect(redactText("a=1&password=correct horse battery")).toBe("a=1&password=[redacted]");
+    expect(redactText("?token=abc def")).not.toContain("def");
+  });
+
+  it.each([
+    [`password: "first line\n${TAIL}" tail`, "the second line of a quoted value"],
+    [`{"secret": "one\ntwo\n${TAIL}"}`, "the third line of a quoted JSON value"],
+    [`secret='a\n${TAIL}' rest`, "single quotes"],
+    [
+      `privateKey=-----BEGIN PRIVATE KEY-----\nMIIEvQ${TAIL}\nabc\n-----END PRIVATE KEY-----\nafter`,
+      "a PEM body under a name",
+    ],
+    [
+      `-----BEGIN RSA PRIVATE KEY-----\n${TAIL}\n-----END RSA PRIVATE KEY-----`,
+      "a PEM block with no name at all",
+    ],
+    [`a=1&password=correct horse ${TAIL}`, "query syntax, after a raw space"],
+    [`?token=abc ${TAIL}`, "a query, after a raw space"],
+    [`x=1&secret=a b&y=2 ${TAIL}`, "query syntax: a later pair does not end the value's line"],
+  ])("%s (%s)", (input) => {
+    const out = redactText(input);
+    expect(out, out).not.toContain("TAILSECRET");
+    expect(redactText(out)).toBe(out);
+  });
+
+  it("what is around it stays: the line after a closed quote, a real query's other pairs, a URL's sentence", () => {
+    expect(redactText('password: "a\nb"\nnext line stays')).toBe("password: [redacted]\nnext line stays");
+    expect(redactText("token=abc&x=1")).toBe("token=[redacted]&x=1");
+    expect(redactText("GET /cb?state=qZ7&x=ab&name=Zeb#frag failed")).toBe("GET /cb failed");
+  });
+});
+
 describe("S3 — numbers, names everywhere, and header tuples", () => {
   it("a one-time code sent as a NUMBER is replaced, under any key and in any array", () => {
     const out = redactEvent({
