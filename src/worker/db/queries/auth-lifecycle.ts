@@ -887,6 +887,19 @@ export async function forgetTotpStep(db: Executor, userId: string): Promise<void
   await db.delete(verification).where(eq(verification.identifier, totpStepIdentifier(userId)));
 }
 
+/**
+ * No passkey of the account "counts as a second factor" any more (`passkey-2f:<id>` rows): the
+ * keys stay and still sign in — as one factor — until one is registered again by a session
+ * that has passed the factor. Returns how many marks there were.
+ */
+export async function forgetPasskeyMarks(db: Executor, userId: string): Promise<number> {
+  const rows = await db
+    .delete(verification)
+    .where(and(eq(verification.value, userId), like(verification.identifier, "passkey-2f:%")))
+    .returning({ id: verification.id });
+  return rows.length;
+}
+
 /** Marks an existing session of `userId` as having passed a second factor. False when it is gone. */
 export async function stampSecondFactor(
   db: Executor,
@@ -926,6 +939,7 @@ export async function clearSecondFactor(
 // VALUE is the user id (so every "delete what names this user" removes them too):
 //   2fa-enrol:<sessionId>     the password was just proven on this session (two-factor/enable)
 //   passkey-2f:<passkeyId>    this passkey was registered by a session that had passed a second factor
+//                             (all of an account's are deleted by `forgetPasskeyMarks`)
 export async function putAuthMarker(
   db: Executor,
   marker: { id: string; identifier: string; userId: string; expiresAt: Date },

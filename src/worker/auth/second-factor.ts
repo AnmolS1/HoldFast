@@ -37,6 +37,13 @@
 //      condition a stolen one-factor session could register its own key, sign in with it and
 //      come back "two-factor". The assertion's flag is read in `authentication.afterVerification`
 //      (`authenticationInfo.userVerified`, @simplewebauthn/server).
+//      The mark of a key is a fact about the moment it was registered, so it does not outlive
+//      what would end a session's own mark: on a password change or reset, on any two-factor
+//      change (off, new backup codes, a new enrolment) and on a role change of the account,
+//      EVERY key of the account stops counting (`endStandingProofs`). The keys still sign in,
+//      as one factor; a key registered afterwards by a session that has passed the factor
+//      counts again. (Otherwise a key planted during a window in which somebody else held a
+//      marked session would keep producing admin-grade sessions after the owner cleaned up.)
 //
 // ── THE PASSWORD IS THE FIRST FACTOR (`beforeTwoFactorManage`) ───────────────────────────────
 // A password can be reset through the mailbox. So once an account has a CONFIRMED enrolment
@@ -104,7 +111,8 @@
 //   (backup-codes/index.mjs: `where backupCodes = <the value read>`), so one works once.
 //
 // ── WHEN THE MARK IS TAKEN AWAY ───────────────────────────────────────────────────────────────
-// (The known-device proofs go on a password change or reset and on any two-factor change.)
+// (The known-device proofs and the keys' marks go on a password change or reset and on any
+// two-factor change; the keys' marks on a role change too.)
 // By age (SECOND_FACTOR_MAX_AGE_MS), and at once on: a role change of the account, a password
 // change or reset (Better Auth replaces or deletes the sessions), any two-factor change (on,
 // off, new backup codes) for every OTHER session, and the end of an impersonation (the admin's
@@ -121,6 +129,7 @@ import {
   clearSecondFactor,
   deleteAuthMarker,
   forgetKnownDevices,
+  forgetPasskeyMarks,
   forgetTotpStep,
   hasAuthMarker,
   isKnownDevice,
@@ -314,6 +323,16 @@ export async function afterPasskeyRegistered(scope: AuthScope, ctx: SessionConte
   });
 }
 
+/**
+ * What an account's browsers and keys have STANDING — a known-device proof (its own code
+ * budget), a passkey's "counts as a second factor" — ends here: on a password change or reset
+ * and on any two-factor change. (A role change ends the passkey marks only: `afterRoleChange`.)
+ */
+export async function endStandingProofs(db: AuthScope["db"], userId: string): Promise<void> {
+  await forgetKnownDevices(db, userId);
+  await forgetPasskeyMarks(db, userId);
+}
+
 /** After `/passkey/delete-passkey`: the fact about the key goes with the key. */
 export async function afterPasskeyDeleted(scope: AuthScope, ctx: SessionContext): Promise<void> {
   if (!succeeded(ctx)) return;
@@ -345,8 +364,8 @@ export async function afterTwoFactorChange(scope: AuthScope, ctx: SessionContext
   const userId = ctx.context.session?.user.id;
   if (!userId) return;
   await clearSecondFactor(scope.db, userId);
-  // …and no browser is a "known device" of a factor that has changed.
-  await forgetKnownDevices(scope.db, userId);
+  // …and no browser is a "known device", and no key a second factor, of a factor that has changed.
+  await endStandingProofs(scope.db, userId);
 }
 
 /**
@@ -368,7 +387,10 @@ export async function afterTwoFactorDisable(scope: AuthScope, ctx: SessionContex
 export async function afterRoleChange(scope: AuthScope, ctx: SessionContext): Promise<void> {
   if (!succeeded(ctx)) return;
   const userId = (ctx.body as { userId?: unknown } | undefined)?.userId;
-  if (typeof userId === "string" && userId !== "") await revokeSessions(scope.deps, userId);
+  if (typeof userId !== "string" || userId === "") return;
+  await revokeSessions(scope.deps, userId);
+  // …and its keys prove themselves again under the new role (see grant 4 in the header).
+  await forgetPasskeyMarks(scope.db, userId);
 }
 
 /** After `/admin/stop-impersonating`: the admin who was impersonating proves the factor again. */
@@ -643,8 +665,9 @@ export async function afterSecondFactor(scope: AuthScope, ctx: CodeContext): Pro
   // A correct code: its own attempt is given back to the budget it was counted on.
   await returnSecondFactorAttempt(scope.db, attempt.budget.key, SECOND_FACTOR_WINDOW_S);
   if (attempt.mode === "enrolment") {
-    // A new enrolment is a two-factor change: no browser is a known device of the old factor.
-    await forgetKnownDevices(scope.db, attempt.userId);
+    // A new enrolment is a two-factor change: no browser is a known device of the old factor,
+    // and no key registered under it counts.
+    await endStandingProofs(scope.db, attempt.userId);
   }
   // This browser has now passed the account's second factor: it is a known device. (Kept when
   // it already was one. Only ever here — on proof — and never for an impersonated session: one

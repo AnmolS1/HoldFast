@@ -21,7 +21,7 @@ import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
 import { admin, captcha, twoFactor } from "better-auth/plugins";
 import type { Db } from "../db/client";
-import { deleteTrustedDevices, forgetKnownDevices } from "../db/queries/auth-lifecycle";
+import { deleteTrustedDevices } from "../db/queries/auth-lifecycle";
 import * as schema from "../db/schema";
 import { scheduleDeletion } from "../services/account-state";
 import {
@@ -37,7 +37,7 @@ import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { setFirstPassword, VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
-import { passkeyAuthentication } from "./second-factor";
+import { endStandingProofs, passkeyAuthentication } from "./second-factor";
 import { asciiLower } from "../../shared/admin-emails";
 import { isStoredFormAddress } from "./preflight";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
@@ -163,8 +163,9 @@ export function buildAuthOptions(scope: AuthScope) {
         scope.facts.passwordResetUserId = user.id;
         // "Remember this device" does not outlive the password it was granted under.
         await deleteTrustedDevices(db, user.id);
-        // …and neither does a browser's standing as a "known device" (auth/second-factor.ts).
-        await forgetKnownDevices(db, user.id);
+        // …and neither does a browser's standing as a "known device", nor a passkey's as a
+        // second factor (auth/second-factor.ts).
+        await endStandingProofs(db, user.id);
       },
     },
     emailVerification: {

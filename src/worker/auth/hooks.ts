@@ -30,7 +30,6 @@ import {
   clearUnprovenAccount,
   deleteTrustedDevices,
   ensureUserPrefs,
-  forgetKnownDevices,
   getAccount,
   getAccountByEmail,
   releaseSignup,
@@ -73,6 +72,7 @@ import {
   afterTwoFactorRead,
   beforeSecondFactor,
   beforeTwoFactorManage,
+  endStandingProofs,
   secondFactorOfNewSession,
   TWO_FACTOR_MANAGE_PATHS,
   VERIFY_BACKUP_CODE_PATH,
@@ -604,7 +604,7 @@ export function buildHooks(scope: AuthScope) {
       if (userId)
         await quietly(env, "trusted_devices", async () => {
           await deleteTrustedDevices(scope.db, userId);
-          await forgetKnownDevices(scope.db, userId);
+          await endStandingProofs(scope.db, userId);
         });
       return;
     }

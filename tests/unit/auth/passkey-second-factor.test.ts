@@ -17,7 +17,19 @@ import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
 import { user } from "../../../src/worker/db/schema";
-import { enableTotp, newClient, send, sessionsOf, testDb, verifiedUser, type Client } from "./helpers";
+import {
+  CAPTCHA,
+  enableTotp,
+  linkIn,
+  newClient,
+  PASSWORD,
+  send,
+  sessionsOf,
+  testDb,
+  verifiedUser,
+  waitForMail,
+  type Client,
+} from "./helpers";
 
 const RP_ID = "localhost";
 const ORIGIN = "http://localhost";
@@ -273,4 +285,98 @@ describe("a passkey sign-in and the session's second factor", () => {
     expect(refused.status).toBeGreaterThanOrEqual(400);
     expect(await sessionsOf(admin.user.id)).toEqual([]);
   });
+});
+
+// R9 — the "counts as a second factor" mark of a key is a fact about the moment it was
+// registered. A key registered while somebody else held a marked session must not keep producing
+// admin-grade sessions after the owner has cleaned up.
+describe("a key's second-factor mark does not outlive a password reset or change, a two-factor change, or a role change (R9)", () => {
+  type Admin = Awaited<ReturnType<typeof adminWithPasskey>>;
+  /** A session of the admin's that HAS passed the factor (the key, with user verification). */
+  async function marked(admin: Admin): Promise<Client> {
+    const client = newClient();
+    expect((await signInWithPasskey(client, admin.key, admin.user.id, UP | UV)).status).toBe(200);
+    expect((await adminCall(client)).status).toBe(200);
+    return client;
+  }
+  const ok = (sent: Awaited<ReturnType<typeof send>>) => expect(sent.status, sent.text).toBe(200);
+
+  const events: Array<[string, (admin: Admin) => Promise<string>]> = [
+    [
+      "a password reset",
+      async (admin) => {
+        await send(newClient(), "/api/auth/request-password-reset", {
+          json: { email: admin.email, redirectTo: "/reset-password" },
+          headers: CAPTCHA,
+        });
+        const follow = await send(newClient(), linkIn(await waitForMail(admin.email, "passwordReset")));
+        const token = new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!;
+        ok(
+          await send(newClient(), "/api/auth/reset-password", {
+            headers: CAPTCHA,
+            json: { newPassword: "the owner's new passphrase 41!", token },
+          }),
+        );
+        return admin.user.id;
+      },
+    ],
+    [
+      "a password change",
+      async (admin) => {
+        ok(
+          await send(await marked(admin), "/api/auth/change-password", {
+            json: { currentPassword: PASSWORD, newPassword: "the owner's new passphrase 42!" },
+          }),
+        );
+        return admin.user.id;
+      },
+    ],
+    [
+      "new backup codes",
+      async (admin) => {
+        ok(
+          await send(await marked(admin), "/api/auth/two-factor/generate-backup-codes", {
+            json: { password: PASSWORD },
+          }),
+        );
+        return admin.user.id;
+      },
+    ],
+    [
+      "switching two-factor off and enrolling again",
+      async (admin) => {
+        const client = await marked(admin);
+        ok(await send(client, "/api/auth/two-factor/disable", { json: { password: PASSWORD } }));
+        await enableTotp(client);
+        // (The enrolling session carries the new factor; it is not the one in question.)
+        ok(await send(client, "/api/auth/sign-out", { json: {} }));
+        return admin.user.id;
+      },
+    ],
+    [
+      "a role change of the account",
+      async (admin) => {
+        const boss = await marked(await adminWithPasskey());
+        ok(await send(boss, "/api/auth/admin/set-role", { json: { userId: admin.user.id, role: "admin" } }));
+        return admin.user.id;
+      },
+    ],
+  ];
+
+  it.each(events)(
+    "after %s: the key still signs in, with user verification — and the session carries NO second factor",
+    async (_what, event) => {
+      const admin = await adminWithPasskey();
+      const userId = await event(admin);
+      for (const row of await sessionsOf(userId)) expect(row.secondFactorAt).toBeNull();
+      const browser = newClient();
+      const signedIn = await signInWithPasskey(browser, admin.key, userId, UP | UV);
+      expect(signedIn.status, signedIn.text).toBe(200);
+      const mine = (await sessionsOf(userId)).filter((row) => row.secondFactorAt !== null);
+      expect(mine).toEqual([]);
+      const refused = await adminCall(browser);
+      expect(refused.status).toBe(403);
+      expect(refused.body).toMatchObject({ code: "ADMIN_REQUIRES_2FA" });
+    },
+  );
 });
