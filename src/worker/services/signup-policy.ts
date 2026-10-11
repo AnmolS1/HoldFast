@@ -10,7 +10,8 @@
 //                         only `ageVerifiedAt` is stored, nowhere a year, a month or an age
 //   4. allowed domains    when `SIGNUP_ALLOWED_DOMAINS` is set, only those (and 5 is skipped)
 //   5. disposable email   the vendored list, then an MX lookup (a failed lookup does not block)
-//   6. velocity           per address, per network, per ASN, per email domain — a day's counters
+//   6. velocity           per address — and, in OPEN mode only, per network, per ASN and per
+//                         email domain (shared counters: `velocitySubjects`) — a day's counters
 //   7. invite             when sign-up is invite-only — for EVERY address. An `ADMIN_EMAILS`
 //                         address needs one like any other (the first admin's is made with
 //                         scripts/create-invite.ts): an exemption would answer a sign-up without
@@ -287,6 +288,15 @@ function limitOf(
  * The ledger subjects one sign-up counts against, in the fixed order every sign-up takes them.
  * `signup_domain` is left out for the large public mailbox providers; `signup_asn` when the
  * request carries no ASN (local development).
+ *
+ * WITH INVITES REQUIRED, ONLY `signup_ip` — the caller's own address. The other three are
+ * counters that unrelated people SHARE (a /24, an ASN, a company's or university's mail domain):
+ * whoever fills one closes sign-up for everybody else on it, and seventeen addresses spending
+ * their own three a day close a whole domain. In invite mode the invite is the control — every
+ * sign-up has spent one, and whoever issued it is accountable — so the shared counters are
+ * neither counted nor consulted. In OPEN mode they stay as they are (accepted knowingly until
+ * open sign-up is decided). The choice depends on the setting alone — never on the address — so
+ * it is the same for an address that has an account and one that has not.
  */
 export async function velocitySubjects(
   scope: AuthScope,
@@ -294,13 +304,17 @@ export async function velocitySubjects(
   client: ClientFacts,
   day: string,
 ): Promise<VelocitySubject[]> {
-  const ceilings = (await scope.settings()).ceilings;
+  const settings = await scope.settings();
+  const ceilings = settings.ceilings;
+  const own: VelocitySubject = {
+    type: "signup_ip",
+    id: await ipHashDaily(scope.keys, client.ip, day),
+    limit: limitOf(ceilings, "signupIpDay"),
+  };
+  // The invite is the control: no shared counter (see above).
+  if (settings.signupMode === "invite") return [own];
   const subjects: VelocitySubject[] = [
-    {
-      type: "signup_ip",
-      id: await ipHashDaily(scope.keys, client.ip, day),
-      limit: limitOf(ceilings, "signupIpDay"),
-    },
+    own,
     {
       type: "signup_ip24",
       id: await ipHashDaily(scope.keys, ipPrefix(client.ip), day),

@@ -574,8 +574,23 @@ describe("invite mode: no path makes a user row without using an invite", () => 
 });
 
 describe("a pending-address change is held to what a sign-up with the new address would be", () => {
-  it("counts on every velocity subject of the new address, the domain included", async () => {
+  it("invite mode: counts on the caller's own address — and on no shared counter (network, domain): R6", async () => {
     const client = newClient();
+    await signUp(client);
+    expect(await ipCount(client.ip)).toBe(1);
+    const next = freshEmail();
+    const in24 = await ip24Count(client.ip);
+    expect((await change(client, next)).status).toBe(200);
+    expect(await ipCount(client.ip)).toBe(2);
+    expect(await ip24Count(client.ip)).toBe(in24);
+    expect(await domainCount(next)).toBe(0);
+    // The same address again is not a change: nothing is taken.
+    expect((await change(client, next)).status).toBe(200);
+    expect(await ipCount(client.ip)).toBe(2);
+  });
+
+  it("open sign-up: counts on every velocity subject of the new address, the domain included", async () => {
+    const client = newClient({ settings: { signupMode: "open" } });
     await signUp(client);
     expect(await ipCount(client.ip)).toBe(1);
     const next = freshEmail();
@@ -621,9 +636,18 @@ describe("a pending-address change is held to what a sign-up with the new addres
     expect(again.sent.body).toMatchObject({ code: "SIGNUP_LIMIT" });
   });
 
-  it("the new address's DOMAIN is held to its own limit", async () => {
+  it("open sign-up: the new address's DOMAIN is held to its own limit — and with invites required it is not a limit at all", async () => {
+    const guarded = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
+    const invited = { ceilings: { signupDomainDay: 1 } };
+    expect((await signUp(newClient({ settings: invited }), { email: freshEmail(guarded) })).sent.status).toBe(
+      200,
+    );
+    const viaInvite = newClient({ settings: invited });
+    await signUp(viaInvite);
+    expect((await change(viaInvite, freshEmail(guarded))).status).toBe(200);
+
     const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
-    const settings = { ceilings: { signupDomainDay: 1 } };
+    const settings = { signupMode: "open" as const, ceilings: { signupDomainDay: 1 } };
     expect((await signUp(newClient({ settings }), { email: freshEmail(domain) })).sent.status).toBe(200);
     const client = newClient({ settings });
     const { email } = await signUp(client);

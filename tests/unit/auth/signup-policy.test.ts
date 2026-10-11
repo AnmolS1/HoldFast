@@ -391,19 +391,21 @@ describe("velocity: a day's sign-ups per subject", () => {
       `${subscriber.toUpperCase()}:0:0:0:ABCD`,
     ];
     expect(addresses).toHaveLength(SIGNUP_VELOCITY_DEFAULTS.signupIpDay);
-    for (const ip of addresses) expect((await signUp(newClient({ ip }))).sent.status, ip).toBe(200);
+    // (Open sign-up: the network's counter exists only there — R6.)
+    const settings = { signupMode: "open" as const };
+    for (const ip of addresses) expect((await signUp(newClient({ ip, settings }))).sent.status, ip).toBe(200);
     // All three are ONE subject …
     const subject = await ipHashDaily(keys, addresses[0]!, day);
     for (const ip of addresses) expect(await ipHashDaily(keys, ip, day), ip).toBe(subject);
     expect(await ledgerCount("signup_ip", subject)).toBe(3);
     // … so a fourth address of that /64 is refused.
-    await expectRefused("SIGNUP_LIMIT", {}, newClient({ ip: `${subscriber}:1:2:3:4` }));
+    await expectRefused("SIGNUP_LIMIT", {}, newClient({ ip: `${subscriber}:1:2:3:4`, settings }));
     expect(await ledgerCount("signup_ip", subject)).toBe(3);
     // The control: another /64 of the same /48 has its own per-address count — and shares the
     // network's (the /48), which now stands at four.
     const neighbour = `${site}:${(parseInt(subscriber.split(":")[3]!, 16) ^ 1).toString(16)}::1`;
     expect(await ipHashDaily(keys, neighbour, day)).not.toBe(subject);
-    expect((await signUp(newClient({ ip: neighbour }))).sent.status).toBe(200);
+    expect((await signUp(newClient({ ip: neighbour, settings }))).sent.status).toBe(200);
     const network = await ipHashDaily(keys, ipPrefix(neighbour), day);
     expect(await ipHashDaily(keys, ipPrefix(addresses[1]!), day)).toBe(network);
     expect(await ledgerCount("signup_ip24", network)).toBe(4);
@@ -444,13 +446,44 @@ describe("velocity: a day's sign-ups per subject", () => {
     expect(await ledgerCount("ip", hash)).toBe(50);
   });
 
-  it("signup_ip24 counts the /24, across addresses", async () => {
+  // R6 — a counter that many unrelated people share (everybody behind one network, one ISP,
+  // one company's mail domain) is a lever: whoever fills it closes sign-up for the rest. With
+  // invites required, the invite is the control — each sign-up has spent one — so those shared
+  // counters are not taken at all. (Open sign-up keeps them: the three tests below.)
+  it("invite mode: the shared counters (network, ASN, mail domain) neither count nor refuse — an invite and the caller's own address are the limits", async () => {
+    const [a, b] = crypto.getRandomValues(new Uint8Array(2));
+    const net = `10.${a}.${b}`;
+    const asn = 4_100_000_000 + Math.floor(Math.random() * 90_000_000);
+    const domain = `${crypto.randomUUID().slice(0, 8)}.shared.example`;
+    // Limits of 2 on each shared subject — and FIVE sign-ups that share all three.
+    const settings = { ceilings: { signupIp24Day: 2, signupAsnDay: 2, signupDomainDay: 2 } };
+    for (let n = 0; n < 5; n++) {
+      const client = newClient({ ip: `${net}.${10 + n}`, cf: { asn }, settings });
+      const made = await signUp(client, { email: freshEmail(domain) });
+      expect(made.sent.status, `sign-up ${n + 1}: ${made.sent.text}`).toBe(200);
+      expect(await userByEmail(made.email)).not.toBeNull();
+    }
+    const day = dayUTC(new Date());
+    expect(await ledgerCount("signup_ip24", await ipHashDaily(keys, ipPrefix(`${net}.1`), day))).toBe(0);
+    expect(await ledgerCount("signup_asn", String(asn))).toBe(0);
+    expect(await ledgerCount("signup_domain", domain)).toBe(0);
+    // The caller's OWN address is still counted, and still a limit (one client's own key).
+    const one = `${net}.200`;
+    for (let n = 0; n < SIGNUP_VELOCITY_DEFAULTS.signupIpDay; n++) {
+      expect((await signUp(newClient({ ip: one, cf: { asn }, settings }))).sent.status).toBe(200);
+    }
+    await expectRefused("SIGNUP_LIMIT", {}, newClient({ ip: one, cf: { asn }, settings }));
+    // …and so is the invite: without one, nothing.
+    await expectRefused("INVITE_INVALID", { inviteCode: null }, newClient({ ip: `${net}.201`, settings }));
+  });
+
+  it("open sign-up: signup_ip24 counts the /24, across addresses", async () => {
     const [a, b] = crypto.getRandomValues(new Uint8Array(2));
     // A /24 outside the range `freshIp` draws from: the day's counts stay in the database, and
     // every other sign-up of the day (thousands, on a day of many runs) has counted against the
     // /24 of ITS address — with a limit of 2 this test would meet one of them.
     const net = `10.${a}.${b}`;
-    const settings = { ceilings: { signupIp24Day: 2 } };
+    const settings = { signupMode: "open" as const, ceilings: { signupIp24Day: 2 } };
     const first = await signUp(newClient({ ip: `${net}.10`, settings }));
     expect(first.sent.status, first.sent.text).toBe(200);
     const second = await signUp(newClient({ ip: `${net}.11`, settings }));
@@ -460,9 +493,9 @@ describe("velocity: a day's sign-ups per subject", () => {
     expect(await ledgerCount("signup_ip24", subject)).toBe(2);
   });
 
-  it("signup_asn counts Cloudflare's ASN for the request", async () => {
+  it("open sign-up: signup_asn counts Cloudflare's ASN for the request", async () => {
     const asn = 4_200_000_000 + Math.floor(Math.random() * 90_000_000);
-    const settings = { ceilings: { signupAsnDay: 2 } };
+    const settings = { signupMode: "open" as const, ceilings: { signupAsnDay: 2 } };
     expect((await signUp(newClient({ cf: { asn }, settings }))).sent.status).toBe(200);
     expect((await signUp(newClient({ cf: { asn }, settings }))).sent.status).toBe(200);
     await expectRefused("SIGNUP_LIMIT", {}, newClient({ cf: { asn }, settings }));
@@ -471,16 +504,16 @@ describe("velocity: a day's sign-ups per subject", () => {
     expect((await signUp(newClient({ settings }))).sent.status).toBe(200);
   });
 
-  it("signup_domain counts a private domain, and exempts the large public providers", async () => {
+  it("open sign-up: signup_domain counts a private domain, and exempts the large public providers", async () => {
     const domain = `${crypto.randomUUID().slice(0, 8)}.velocity.example`;
-    const settings = { ceilings: { signupDomainDay: 2 } };
+    const settings = { signupMode: "open" as const, ceilings: { signupDomainDay: 2 } };
     expect((await signUp(newClient({ settings }), { email: freshEmail(domain) })).sent.status).toBe(200);
     expect((await signUp(newClient({ settings }), { email: freshEmail(domain) })).sent.status).toBe(200);
     await expectRefused("SIGNUP_LIMIT", { email: freshEmail(domain) }, newClient({ settings }));
     expect(await ledgerCount("signup_domain", domain)).toBe(2);
 
     const before = await ledgerCount("signup_domain", "gmail.com");
-    const zero = { ceilings: { signupDomainDay: 0 } };
+    const zero = { signupMode: "open" as const, ceilings: { signupDomainDay: 0 } };
     expect(
       (await signUp(newClient({ settings: zero }), { email: freshEmail("gmail.com") })).sent.status,
     ).toBe(200);
