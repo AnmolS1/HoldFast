@@ -681,6 +681,16 @@ describe("step-up: a code on a session that exists", () => {
     }
     expect(lookedAt).toBe(maxGuessesPerWindow(STOLEN));
     expect(refused).toBe(2 * maxGuessesPerWindow(STOLEN));
+    // Counted where a code is actually EVALUATED, not only by the answers: one audit row per
+    // code that was looked at (written after the comparison), and none for a refused attempt.
+    expect(await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).toHaveLength(
+      maxGuessesPerWindow(STOLEN),
+    );
+    expect(
+      (await auditRows({ action: "auth.second_factor_refused", targetId: admin.id })).filter(
+        (row) => (row.meta as { reason?: string } | null)?.reason === "throttled",
+      ),
+    ).toHaveLength(2 * maxGuessesPerWindow(STOLEN));
     const spent = await budgets(admin.id);
     expect(spent.account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
     // The owner's third browser has a budget nobody else has touched: no row, or an empty one.
