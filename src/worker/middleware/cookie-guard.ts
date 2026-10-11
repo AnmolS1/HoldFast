@@ -17,7 +17,9 @@
 // when the header holds exactly ONE member of it and that member's name is, byte for byte, the
 // name this origin sets (`__Host-hf.…` on https, `hf.…` on plain http). Otherwise EVERY member
 // of the family is removed from the request — it then has no such cookie at all (fail closed) —
-// and the event is counted and audited (`auth.cookie_ambiguous`: family names only, no values).
+// and the event is COUNTED (the `auth` metric, `kind: cookie_ambiguous`) — a metric only. It is
+// not audited: this runs in front of the limiter, for strangers too, and a row per request there
+// would be a database write anyone could buy without limit. Nothing here touches the database.
 // So: a duplicate (in either order), a case variant, an encoded or padded name, and a
 // prefix-less or `__Secure-` variant on https are never read by anything behind this.
 //
@@ -25,7 +27,7 @@
 // handler — which all then see the same, unambiguous header.
 
 import type { MiddlewareHandler } from "hono";
-import { countFor, record } from "../auth/observe";
+import { countFor } from "../auth/observe";
 import { COOKIE_HOST_PREFIX } from "../auth/signed-cookie";
 import type { AppEnv } from "../services/request-context";
 
@@ -88,9 +90,6 @@ export function guardCookies(header: string | null | undefined, secure: boolean)
   return { header: rest === "" ? null : rest, ambiguous: ambiguous.sort() };
 }
 
-/** A family name as it may be written to a log: the known shape, bounded. */
-const safeFamily = (family: string) => (/^hf[._][a-z0-9._-]{1,48}$/.test(family) ? family : "hf.other");
-
 export const cookieGuard: MiddlewareHandler<AppEnv> = async (c, next) => {
   const secure = c.env.APP_ORIGIN.startsWith("https://");
   const guarded = guardCookies(c.req.raw.headers.get("cookie"), secure);
@@ -100,8 +99,7 @@ export const cookieGuard: MiddlewareHandler<AppEnv> = async (c, next) => {
   else headers.delete("cookie");
   // Everything behind this — the session read, the routes, Better Auth — reads this request.
   c.req.raw = new Request(c.req.raw, { headers });
-  const names = [...new Set(guarded.ambiguous.map(safeFamily))].slice(0, 8);
+  // A metric, and nothing else (see the header): no audit row, no statement.
   countFor(c.env, "auth", { outcome: "denied", kind: "cookie_ambiguous" });
-  record(c, "auth.cookie_ambiguous", { type: "request" }, { cookies: names.join(","), count: names.length });
   return next();
 };

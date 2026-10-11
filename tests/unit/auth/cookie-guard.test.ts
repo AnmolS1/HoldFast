@@ -28,6 +28,7 @@ import {
   freshEmail,
   getSession,
   linkIn,
+  measured,
   newClient,
   nextTotp,
   send,
@@ -127,13 +128,26 @@ describe("a session cookie that is not alone under its exact name is no session"
     }
     expect((await userByEmail(victim.email))!.name).not.toBe("Planted");
     expect((await userByEmail(attacker.email))!.name).not.toBe("Planted");
+  });
+
+  it("an ambiguous cookie buys no audit row and no database statement — it is a metric only", async () => {
+    // The guard runs in front of the limiter: whatever it writes, a stranger can have written
+    // without limit. A family of this test's own, so the audit log can be searched for it.
+    const family = `hf.r3${[...crypto.getRandomValues(new Uint8Array(6))].map((b) => b.toString(16)).join("")}`;
+    const header = `${family}=1; ${family}=2`;
+    // Control: the guard does see this header as ambiguous.
+    expect(guardCookies(header, false).ambiguous).toEqual([family]);
+    const client = newClient();
+    const requests = 6;
+    for (let n = 0; n < requests; n++) {
+      // A path no route answers: nothing behind the guard opens the database for it.
+      const done = await measured(client, "/api/r3-no-such-route", { headers: { cookie: header } });
+      expect(done.sent.status).toBe(404);
+      expect(done.audits, "audit rows written").toBe(0);
+      expect(done.statementsTotal, "statements sent, deferred work included").toBe(0);
+    }
     const audited = await auditRows({ action: "auth.cookie_ambiguous" });
-    expect(audited.length).toBeGreaterThanOrEqual(9);
-    const text = JSON.stringify(audited.slice(-9));
-    expect(text).toContain("hf.session_token");
-    // Names only: no cookie value is in the audit log.
-    expect(text).not.toContain(victim.client.cookies.get(SESSION)!.slice(0, 16));
-    expect(text).not.toContain(attacker.client.cookies.get(SESSION)!.slice(0, 16));
+    expect(audited.filter((row) => JSON.stringify(row).includes(family))).toEqual([]);
   });
 
   it("a shadow under another spelling beside the real cookie: nobody (not the shadow, not the real one)", async () => {
