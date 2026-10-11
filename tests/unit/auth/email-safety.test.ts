@@ -610,8 +610,10 @@ describe("operator alerts", () => {
     const delivered: unknown[] = [];
     outbound.answer("api.resend.com", async (request) => {
       attempts += 1;
-      // The first send (two tries inside the transport) and the first deferred retry (two more) fail.
-      if (attempts <= 4)
+      // The first send (two tries inside the transport) and the first deferred retry fail. (A
+      // retry is ONE try: the whole sequence must end inside the deferred-work budget even when
+      // the transport never answers — services/email.ts RESEND_TIMEOUT_MS.)
+      if (attempts <= 3)
         return Response.json(
           { name: "internal_server_error", message: "boom", statusCode: 500 },
           { status: 500 },
@@ -638,7 +640,7 @@ describe("operator alerts", () => {
       outbound.answer("api.resend.com", null);
     }
     expect(delivered).toEqual(["[dev] Holdfast: CRITICAL — action needed"]);
-    expect(attempts).toBe(5);
+    expect(attempts).toBe(4);
     const outcomes = metrics.map((point) => JSON.stringify(point));
     // Two failures were counted (the first send, the first retry) before the one that got through.
     expect(outcomes.filter((point) => point.includes("critical_failed"))).toHaveLength(2);

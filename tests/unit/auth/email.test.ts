@@ -2,7 +2,7 @@
 // are capped and which are never dropped, and the two transports.
 import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
 import { emailLedger } from "../../../src/worker/db/schema";
 import {
@@ -21,6 +21,8 @@ import {
   sendChangeEmailConfirmation,
   sendDeleteAccountVerification,
   sendNewAddressVerification,
+  sendOperatorCritical,
+  CRITICAL_RETRY_WAITS_MS,
   sendPasswordChanged,
   sendPasswordReset,
   SENDER,
@@ -31,7 +33,9 @@ import {
   SUPPORT_EMAIL,
   templates,
 } from "../../../src/worker/services/email";
+import * as email from "../../../src/worker/services/email";
 import emailSource from "../../../src/worker/services/email.ts?raw";
+import { DRAIN_DEADLINE_MS } from "../../../src/worker/services/request-context";
 import {
   auditRows,
   freshEmail,
@@ -456,6 +460,75 @@ describe("the Resend transport", () => {
       });
       expect(await sendPasswordChanged(deps, { to, name: "Ana" })).toBe("failed");
     } finally {
+      outbound.answer("api.resend.com", null);
+    }
+  });
+});
+
+describe("a transport that never answers", () => {
+  it("each attempt is given up after its timeout: the mail is 'failed' — not a promise that holds the deferred work open for ever", async () => {
+    const outbound = testOutbound()!;
+    const signals: AbortSignal[] = [];
+    // Accepts the request and never answers it.
+    outbound.answer("api.resend.com", (request) => {
+      signals.push(request.signal);
+      return new Promise<Response>(() => {});
+    });
+    // (A unit test cannot sit out the real bound; the real one is asserted below.)
+    const restore = email.setResendTimeoutForTests?.(150);
+    try {
+      const { deps } = serviceDeps({ EMAIL_TRANSPORT: "resend", RESEND_API_KEY: "re_test_key" });
+      const started = Date.now();
+      const outcome = await Promise.race([
+        sendPasswordChanged(deps, { to: freshEmail(), name: "Ana" }),
+        new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 3000)),
+      ]);
+      expect(outcome).toBe("failed");
+      expect(Date.now() - started).toBeLessThan(2000);
+      // Both attempts were made, and both were told to stop.
+      expect(signals).toHaveLength(2);
+      for (const signal of signals) expect(signal.aborted).toBe(true);
+    } finally {
+      restore?.();
+      outbound.answer("api.resend.com", null);
+    }
+  });
+
+  it("the real bounds are well inside the deferred-work budget — for an ordinary mail and for a critical alert with every retry", () => {
+    const ordinary = 2 * email.RESEND_TIMEOUT_MS;
+    expect(email.RESEND_TIMEOUT_MS).toBeGreaterThanOrEqual(2000);
+    expect(ordinary).toBeLessThanOrEqual(DRAIN_DEADLINE_MS / 2);
+    // A critical alert: the first send (two attempts), then each retry (one attempt) after its wait.
+    const critical =
+      ordinary + CRITICAL_RETRY_WAITS_MS.reduce((sum, wait) => sum + wait + email.RESEND_TIMEOUT_MS, 0);
+    expect(critical).toBeLessThan(DRAIN_DEADLINE_MS);
+  });
+
+  it("a critical alert to a transport that never answers ends as 'lost' — counted — instead of hanging", async () => {
+    const outbound = testOutbound()!;
+    let requests = 0;
+    outbound.answer("api.resend.com", () => {
+      requests += 1;
+      return new Promise<Response>(() => {});
+    });
+    const restore = email.setResendTimeoutForTests?.(50);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const deferred: Promise<unknown>[] = [];
+      const { deps } = serviceDeps({ EMAIL_TRANSPORT: "resend", RESEND_API_KEY: "re_test_key" });
+      const running = sendOperatorCritical(
+        { ...deps, defer: (promise) => void deferred.push(promise) },
+        { to: "ops@holdfast-test.example", event: "scanner_down", id: "probe" },
+      );
+      await vi.advanceTimersByTimeAsync(2 * 50 + 10);
+      expect(await running).toBe("retrying");
+      await vi.advanceTimersByTimeAsync(CRITICAL_RETRY_WAITS_MS.reduce((sum, wait) => sum + wait + 60, 0));
+      await Promise.all(deferred);
+      // Two attempts at once, then ONE per retry: 2 + the number of retries.
+      expect(requests).toBe(2 + CRITICAL_RETRY_WAITS_MS.length);
+    } finally {
+      vi.useRealTimers();
+      restore?.();
       outbound.answer("api.resend.com", null);
     }
   });

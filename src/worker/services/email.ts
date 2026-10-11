@@ -89,7 +89,8 @@
 //
 // TRANSPORT. `EMAIL_TRANSPORT=memory` pushes to the in-memory outbox (services/outbox.ts; tests
 // read it at /api/_test/outbox). Anything else sends through Resend with `RESEND_API_KEY`; a
-// failed send is reported and retried once under the same idempotency key.
+// failed send is reported and retried once under the same idempotency key. An attempt that gets
+// no answer in RESEND_TIMEOUT_MS is aborted and is a failed attempt like any other.
 //
 // No `send*` function throws.
 
@@ -871,7 +872,27 @@ export async function recipientHash(env: Pick<Env, "FILES_TOKEN_SECRET">, addres
   return ledgerKey(env, address, "product");
 }
 
-async function viaResend(env: Env, message: { to: string } & RenderedEmail): Promise<void> {
+/**
+ * How long ONE attempt at the Resend API may take. The client sets no timeout of its own
+ * (resend/dist/index.mjs `fetchRequest`: a bare `fetch`), and a send that never answers would
+ * hold the request's deferred work open until the platform cancels it — taking with it whatever
+ * else was waiting there. Two attempts of an ordinary mail are 5 s; a critical alert with every
+ * retry (two attempts, then one per retry after CRITICAL_RETRY_WAITS_MS) is 18 s — both inside
+ * the 20 s the deferred work gets (services/request-context.ts DRAIN_DEADLINE_MS), so the
+ * failure is still reported and counted.
+ */
+export const RESEND_TIMEOUT_MS = 2_500;
+
+let resendTimeoutMs = RESEND_TIMEOUT_MS;
+/** Tests only: a unit test cannot sit out the real bound. Returns the function that restores it. */
+export function setResendTimeoutForTests(ms: number): () => void {
+  resendTimeoutMs = ms;
+  return () => {
+    resendTimeoutMs = RESEND_TIMEOUT_MS;
+  };
+}
+
+async function viaResend(env: Env, message: { to: string } & RenderedEmail, attempts = 2): Promise<void> {
   const resend = new Resend(env.RESEND_API_KEY);
   const payload = {
     from: SENDER,
@@ -880,16 +901,29 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
     html: message.html,
     text: message.text,
   };
-  // One key for both attempts: a retry of a send that did go through is not a second email.
+  // One key for every attempt: a retry of a send that did go through is not a second email.
   const idempotencyKey = crypto.randomUUID();
   let failure: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    // The request is told to stop (the signal reaches `fetch` through the client's options) AND
+    // the wait itself ends: a transport that ignores the signal does not hold this up either.
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("resend: no answer in time"));
+      }, resendTimeoutMs);
+    });
     try {
-      const { error } = await resend.emails.send(payload, { idempotencyKey });
+      const options = { idempotencyKey, signal: controller.signal };
+      const { error } = await Promise.race([resend.emails.send(payload, options), timedOut]);
       if (!error) return;
       failure = new Error(`resend: ${error.name ?? "error"}`);
     } catch (error) {
       failure = error;
+    } finally {
+      clearTimeout(timer);
     }
     // Reported once per failed attempt; the address and the content are never part of it.
     reportError(failure, { kind: "email", attempt: String(attempt + 1) });
@@ -903,7 +937,13 @@ async function viaResend(env: Env, message: { to: string } & RenderedEmail): Pro
  * transport, not production, AND a plain-http origin): asked for anywhere else it is refused —
  * loudly — rather than swallowing real mail into an isolate's memory.
  */
-function transmit(env: Env, name: TemplateName, address: string, rendered: RenderedEmail): Promise<void> {
+function transmit(
+  env: Env,
+  name: TemplateName,
+  address: string,
+  rendered: RenderedEmail,
+  attempts = 2,
+): Promise<void> {
   // Once more, where it matters: one plain address, whatever path brought it here.
   const to = normaliseRecipient(address);
   if (!to) return Promise.reject(new Error("email: the recipient is not a single well-formed address"));
@@ -914,7 +954,7 @@ function transmit(env: Env, name: TemplateName, address: string, rendered: Rende
     outbox.push({ to, ...rendered, template: name, class: KINDS[name].class });
     return Promise.resolve();
   }
-  return viaResend(env, { to, ...rendered });
+  return viaResend(env, { to, ...rendered }, attempts);
 }
 
 /**
@@ -1010,7 +1050,9 @@ async function sendCritical(
       for (const [index, wait] of CRITICAL_RETRY_WAITS_MS.entries()) {
         await sleep(wait);
         try {
-          await transmit(env, name, address, rendered);
+          // One attempt per retry: the retries ARE the repetition, and the whole sequence has
+          // to end inside the deferred-work budget (RESEND_TIMEOUT_MS).
+          await transmit(env, name, address, rendered, 1);
           countFor(env, "email", { outcome: "sent", kind: name, reason: "retry" });
           return;
         } catch (error) {
