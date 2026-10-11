@@ -68,7 +68,11 @@ export const CAPTCHA_ENDPOINTS = [
 ];
 
 /** The client address of the request in hand, for the per-client mail cap (services/email.ts). */
-const byClient = (scope: AuthScope) => ({ client: scope.client?.ip ?? null });
+const byClient = (scope: AuthScope, to?: string) => ({
+  client: scope.client?.ip ?? null,
+  // The address asked for this mail itself (auth/hooks.ts `ownAddressOf`): its own budget.
+  own: to !== undefined && scope.facts.ownAddress === to.toLowerCase(),
+});
 
 /** Does a verification token change an address (rather than verify a new account's)? */
 function isAddressChangeToken(token: string): boolean {
@@ -156,7 +160,9 @@ export function buildAuthOptions(scope: AuthScope) {
         // one, would be slower exactly when the address has an account (auth/parity.ts).
         scope.facts.mailed.push("passwordReset");
         deps.defer(
-          afterAnswer(scope, () => sendPasswordReset(deps, { to: user.email, url, by: byClient(scope) })),
+          afterAnswer(scope, () =>
+            sendPasswordReset(deps, { to: user.email, url, by: byClient(scope, user.email) }),
+          ),
         );
       },
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
@@ -193,7 +199,7 @@ export function buildAuthOptions(scope: AuthScope) {
           scope.facts.mailed.push("verification");
           deps.defer(
             afterAnswer(scope, () =>
-              sendVerification(deps, { to: user.email, url, resend, by: byClient(scope) }),
+              sendVerification(deps, { to: user.email, url, resend, by: byClient(scope, user.email) }),
             ),
           );
         }

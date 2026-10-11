@@ -69,6 +69,16 @@
 //                        Operator mail carries no free text at all: ids, counts, fixed copy.
 //                        (Volume is limited where it starts — reports per reporter, address and
 //                        link, and their de-duplication: T22 — not here.)
+// WHOSE BUDGET (unauth_triggered). A per-recipient budget that ANYBODY can spend is a lock on
+// that recipient: ten reset requests from strangers would stop a person's own reset mail for the
+// day. So a mail the address ASKED FOR ITSELF — the request came with the address's own session,
+// or from the browser that signed up with it (the `hf_pending` proof), or is that sign-up — is
+// counted on a budget of its own (`ownBucket`: the same caps, another key), which nothing a
+// stranger sends is ever counted on. `EmailActor.own` says so; only auth/hooks.ts,
+// auth/create-auth.ts and routes/pending-email.ts set it, from the caller's own cookie alone
+// (never from whether an account exists). The per-client budget applies to both alike.
+// (Consequence: the 50-a-day total per recipient is of mail OTHERS caused; what the address asks
+// for itself adds at most its own buckets' day caps — signup 20, reset 10.)
 // A recipient is counted under its CANONICAL address (`canonicalRecipient`): lower case, NFKC,
 // plus-tag removed, and for Gmail the dots removed — spellings of one mailbox share one budget.
 // Over a cap the send is skipped and counted (`metric("email", { outcome: "capped" })`); the
@@ -147,7 +157,17 @@ export type EmailOutcome = "sent" | "capped" | "coalesced" | "retrying" | "faile
  * the system itself (a job, a moderation action). `client: null` = an address was not known —
  * counted under one shared key, so it is the tightest case, not a free one.
  */
-export type EmailActor = { client: string | null } | { user: string } | { system: true };
+export type EmailActor =
+  | {
+      client: string | null;
+      /** The recipient asked for this mail itself (see "WHOSE BUDGET" in the header). */
+      own?: boolean;
+    }
+  | { user: string }
+  | { system: true };
+
+/** The name of the budget for mail an address asked for itself, beside `bucket`'s. */
+export const ownBucket = (bucket: string) => `${bucket}|own`;
 
 type Block = { text: string } | { link: { label: string; url: string } } | { quote: string };
 type Draft = { subject: string; heading: string; blocks: Block[] };
@@ -781,7 +801,14 @@ const CLASS_CAPS: Record<EmailClass, { recipient: Caps | null; actor: Caps | nul
 };
 
 export const emailClassOf = (name: TemplateName): EmailClass => KINDS[name].class;
-export const EMAIL_BUCKETS: string[] = [...new Set(Object.values(KINDS).map((kind) => kind.bucket))];
+/** Every recipient budget there is: each kind's bucket, and the own-request twin of the unauth ones. */
+export const EMAIL_BUCKETS: string[] = [
+  ...new Set(
+    Object.values(KINDS).flatMap((kind) =>
+      kind.class === "unauth_triggered" ? [kind.bucket, ownBucket(kind.bucket)] : [kind.bucket],
+    ),
+  ),
+];
 
 // ── delivery ────────────────────────────────────────────────────────────────────────────────
 
@@ -912,8 +939,12 @@ async function admit(
   const recipient = caps.recipient ?? (BUCKET_CAPS as Record<string, Caps>)[row.bucket];
   // A bucket with no caps of its own is not sent from: nothing is uncounted by default.
   if (!recipient) throw new Error("email: a bucket without caps was refused");
-  if (!(await tryConsume(deps.db, await ledgerKey(env, address, row.bucket), recipient))) {
-    countFor(env, "email", { outcome: "capped", kind: name, reason: "recipient" });
+  // Mail the address asked for itself is counted apart from mail anybody can cause (the header).
+  const own =
+    row.class === "unauth_triggered" && actor !== undefined && "client" in actor && actor.own === true;
+  const bucket = own ? ownBucket(row.bucket) : row.bucket;
+  if (!(await tryConsume(deps.db, await ledgerKey(env, address, bucket), recipient))) {
+    countFor(env, "email", { outcome: "capped", kind: name, reason: own ? "recipient_own" : "recipient" });
     return false;
   }
   return true;
@@ -1175,7 +1206,7 @@ const appUrl = (env: Pick<Env, "APP_ORIGIN">, path: string) => `${env.APP_ORIGIN
 type To = { to: string; name?: unknown };
 
 /** The client address of the request that caused an unauthenticated mail (null: not known). */
-type ByClient = { by: { client: string | null } };
+type ByClient = { by: { client: string | null; own?: boolean } };
 /** The user whose session caused a mail. */
 type ByUser = { by: { user: string } };
 const SYSTEM: EmailActor = { system: true };

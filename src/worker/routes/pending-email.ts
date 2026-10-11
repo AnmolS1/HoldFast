@@ -215,7 +215,8 @@ router.patch(
             defer(
               c,
               afterAnswer(scope, () =>
-                sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip") } }),
+                // Asked for by the sign-up's own browser (or session): the address's own budget.
+                sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip"), own: true } }),
               ),
             );
             record(c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
@@ -231,7 +232,9 @@ router.patch(
       if (newEmail !== claim.email && !mailed) {
         defer(
           c,
-          afterAnswer(scope, () => chargeUnsent(deps(c), "verification", newEmail, { client: c.get("ip") })),
+          afterAnswer(scope, () =>
+            chargeUnsent(deps(c), "verification", newEmail, { client: c.get("ip"), own: true }),
+          ),
         );
       }
 

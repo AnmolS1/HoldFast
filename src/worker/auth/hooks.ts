@@ -24,7 +24,7 @@
 
 import { hasAdminRole } from "../../shared/roles";
 import { generateId } from "@better-auth/core/utils/id";
-import { APIError, createAuthMiddleware } from "better-auth/api";
+import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
 import { UAParser } from "ua-parser-js";
 import {
   clearUnprovenAccount,
@@ -216,6 +216,34 @@ const UNSENT_KIND: Record<string, "passwordReset" | "verification"> = {
   "/request-password-reset": "passwordReset",
   "/send-verification-email": "verification",
 };
+
+/** The endpoints whose mail goes to the address in the body's `email`. */
+const OWN_MAIL_PATHS = new Set(["/sign-up/email", "/send-verification-email", "/request-password-reset"]);
+
+/**
+ * Is the address this request asks mail for the CALLER'S OWN (services/email.ts "WHOSE BUDGET")?
+ * Decided from what the caller holds — never from whether the address has an account:
+ *   - a sign-up is the sign-up browser, for the address it signs up;
+ *   - the `hf_pending` proof names the address (the browser that signed up with it);
+ *   - the session is the address's own account.
+ * Returns the address, or null: a stranger's request.
+ */
+async function ownAddressOf(
+  scope: AuthScope,
+  ctx: Parameters<typeof getSessionFromCtx>[0] & { path?: string; body?: unknown; request?: Request },
+): Promise<string | null> {
+  const asked = (ctx.body as { email?: unknown } | null | undefined)?.email;
+  if (typeof asked !== "string" || !ctx.request) return null;
+  const email = asked.toLowerCase();
+  if (ctx.path === "/sign-up/email") return email;
+  const cookies = ctx.headers?.get("cookie") ?? ctx.request.headers.get("cookie");
+  // No cookie at all: nothing to read, and nothing to look up.
+  if (!cookies) return null;
+  const pending = await readPending(scope.env, scope.keys, cookies, now());
+  if (pending && pending.email === email) return email;
+  const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+  return session && session.user.email.toLowerCase() === email ? email : null;
+}
 
 export function buildHooks(scope: AuthScope) {
   const env = scope.env;
@@ -514,6 +542,7 @@ export function buildHooks(scope: AuthScope) {
     if (ctx.request) scope.facts.endpointPath = path ?? null;
     if (typeof path !== "string") return;
     if (path.startsWith("/admin/")) await adminGate(scope, ctx);
+    if (OWN_MAIL_PATHS.has(path) && ctx.request) scope.facts.ownAddress = await ownAddressOf(scope, ctx);
     if (path === "/verify-email" && ctx.request) await beforeVerifyEmail(scope, ctx);
     if (TWO_FACTOR_MANAGE_PATHS.has(path)) await beforeTwoFactorManage(scope, ctx);
     if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
@@ -587,7 +616,11 @@ export function buildHooks(scope: AuthScope) {
       scope.deps.defer(
         afterAnswer(scope, async () => {
           if (!scope.facts.mailed.includes(uncharged)) {
-            await chargeUnsent(scope.deps, uncharged, address, { client: scope.client?.ip ?? null });
+            await chargeUnsent(scope.deps, uncharged, address, {
+              client: scope.client?.ip ?? null,
+              // The same budget the mail itself would have been counted on.
+              own: typeof address === "string" && scope.facts.ownAddress === address.toLowerCase(),
+            });
           }
         }),
       );

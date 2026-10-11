@@ -73,6 +73,12 @@ export type AuthFacts = {
   throttled: boolean;
   /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
   signInAttempt: string | null;
+  /**
+   * The address this request has shown to be the CALLER'S OWN — by its session, by the sign-up
+   * browser's proof, or by being that sign-up (auth/hooks.ts): mail to it is counted on the
+   * address's own budget (services/email.ts "WHOSE BUDGET"). Null: a stranger's request.
+   */
+  ownAddress: string | null;
   /** The kinds of unauthenticated mail this request has caused to be sent (services/email.ts). */
   mailed: string[];
   /** This request verified the right password for the account of `signInAttempt`. */
@@ -129,6 +135,7 @@ export function emptyFacts(): AuthFacts {
     throttled: false,
     signInAttempt: null,
     signInProved: false,
+    ownAddress: null,
     mailed: [],
   };
 }
