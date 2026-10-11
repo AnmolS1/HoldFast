@@ -465,11 +465,22 @@ describe("step-up: a code on a session that exists", () => {
     for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS + 3; attempt++) {
       const attacker = newClient();
       expect((await signIn(attacker, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
-      const sent = await send(attacker, `/api/auth${VERIFY_TOTP_PATH}`, {
-        json: { code: String(600000 + attempt) },
-      });
+      // (Wrong codes of BOTH kinds: a backup code is judged by Better Auth's own verifier, whose
+      // own lock — check-then-count, on the account — must stay switched off.)
+      const sent =
+        attempt % 2 === 0
+          ? await send(attacker, `/api/auth${VERIFY_BACKUP_CODE_PATH}`, {
+              json: { code: `nope${attempt}-nope${attempt}` },
+            })
+          : await send(attacker, `/api/auth${VERIFY_TOTP_PATH}`, {
+              json: { code: String(600000 + attempt) },
+            });
       expect(sent.status, `attempt ${attempt + 1}`).toBe(attempt < SECOND_FACTOR_MAX_ATTEMPTS ? 401 : 429);
     }
+    // Nothing is written on the enrolment itself: there is no lock on the account.
+    const [enrolment] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
+    expect(enrolment!.lockedUntil).toBeNull();
+    expect(enrolment!.failedVerificationCount ?? 0).toBe(0);
     // The owner is not refused: password, then the right code, at the known browser.
     expect((await signIn(owner, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
     const right = await send(owner, `/api/auth${VERIFY_TOTP_PATH}`, {

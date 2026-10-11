@@ -416,7 +416,13 @@ describe("a verification link opened in the browser that signed up", () => {
     const other = newClient();
     const second = await strangerSignsUp(freshEmail(), other);
     expect((await resend(newClient(), second.email)).setCookies.join("\n")).not.toContain("hf_pending");
-    expect((await resend(client, second.email)).setCookies.join("\n")).not.toContain("hf_pending");
+    // (`other` holds a valid proof — for ITS address — and no session: the request is answered
+    // 200, so a renewal for an address the proof does not name would show.)
+    const elsewhere = await resend(other, email);
+    expect(elsewhere.status).toBe(200);
+    expect(elsewhere.setCookies.join("\n")).not.toContain("hf_pending");
+    // Control: for its own address the same browser's proof IS renewed.
+    expect((await resend(other, second.email)).setCookies.join("\n")).toContain("hf_pending=");
     await purgeAuthRows(testDb(), id);
   });
 });
