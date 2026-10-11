@@ -99,9 +99,16 @@
 //      session (it is not Better Auth's "trust this device").
 //      When a budget runs out the owner is mailed — at most once per window per account
 //      (`claimOncePerWindow`) — and the event is audited (`auth.second_factor_exhausted`).
-//      RESIDUAL: while the account-wide budget is exhausted, the owner at a browser that has
-//      never passed the factor (a new device) is refused like the guesser, for at most one
-//      window at a time; a browser they have used before is not.
+//      RESIDUAL — ACCEPTED, explicitly (orchestrator, 2026-10-11): the owner is protected only
+//      at a browser that holds a proof. At a browser with NO known-device proof — after a
+//      password or two-factor change (which end every proof), after cleared cookies, after 90
+//      days — the owner shares the account-wide budget, and can be kept out for as long as
+//      someone holding the password or ANY session of the account keeps spending it (five
+//      requests a window). They get one mail per window; the remedy is to reset the password,
+//      which ends the attacker's sessions; if the attacker holds the mailbox, nothing
+//      in-product helps. And online guessing against the bound — five codes a window, three of
+//      a million valid at a time, 96 windows a day — is about 0.14 % a day for someone who
+//      keeps at it.
 //   b. for TOTP, OUR OWN verification against the stored secret (constant-time, the current
 //      30-second step and the one either side), which says WHICH step the code belongs to — and
 //      then REPLAY protection: `acceptTotpStep` records the step under the account's row lock
