@@ -260,6 +260,17 @@ describe("which sessions carry a second factor", () => {
     expect((await send(other, "/api/auth/get-session")).body).toBeNull();
     expectNeedsSecondFactor(await adminCall(client));
 
+    // The re-created session has no mark, so the password alone no longer switches the factor
+    // off (R1) …
+    const refused = await send(client, "/api/auth/two-factor/disable", { json: { password: newPassword } });
+    expect(refused.status, refused.text).toBe(403);
+    expect(refused.body).toMatchObject({ code: "SECOND_FACTOR_REQUIRED" });
+    // … it proves the factor again first; and the session `disable` then re-creates has none.
+    const stepped = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(admin.totpURI) },
+    });
+    expect(stepped.status, stepped.text).toBe(200);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeInstanceOf(Date);
     const off = await send(client, "/api/auth/two-factor/disable", { json: { password: newPassword } });
     expect(off.status, off.text).toBe(200);
     expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
@@ -339,13 +350,26 @@ describe("which sessions carry a second factor", () => {
     });
     expect(regenerated.status, regenerated.text).toBe(200);
     expect((await onlySession(boss.id)).secondFactorAt).toBeNull();
-    // …and re-issuing them needs the password: a session alone cannot mint itself backup codes.
+    // The mark is gone, so the SAME session — right password and all — cannot re-issue them
+    // again: the password is the first factor, not the second (R1). It proves the factor first.
+    const unmarked = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", {
+      json: { password: PASSWORD },
+    });
+    expect(unmarked.status, unmarked.text).toBe(403);
+    expect(unmarked.body).toMatchObject({ code: "SECOND_FACTOR_REQUIRED" });
+    const again = await send(bossClient, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(boss.totpURI) },
+    });
+    expect(again.status, again.text).toBe(200);
+    // …and with the mark it still needs the password too. (Another address: Better Auth's own
+    // per-address rule on this path would answer 429 before the endpoint is reached.)
+    bossClient.ip = freshIp();
     const without = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", { json: {} });
     expect(without.status).toBe(400);
     const wrong = await send(bossClient, "/api/auth/two-factor/generate-backup-codes", {
       json: { password: "not the password at all 1!" },
     });
-    expect(wrong.status).toBeGreaterThanOrEqual(400);
+    expect(wrong.status).toBe(400);
   });
 });
 
@@ -588,8 +612,133 @@ describe("the code endpoints themselves refuse — not only the pipeline in fron
   });
 });
 
+describe("the password is the FIRST factor: it cannot read, re-issue, replace or switch off the second (R1)", () => {
+  const MANAGE = ["get-totp-uri", "generate-backup-codes", "disable", "enable"] as const;
+  const NEW_PASSWORD = "set by whoever reads the mailbox 7!";
+  const factorRow = async (userId: string) =>
+    (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, userId)))[0];
+
+  function expectSecondFactorRequired(sent: Awaited<ReturnType<typeof send>>, what: string) {
+    expect(sent.status, `${what}: ${sent.text}`).toBe(403);
+    expect(sent.body).toMatchObject({ code: "SECOND_FACTOR_REQUIRED", error: "second_factor_required" });
+  }
+
+  it("control of an admin's mailbox is not admin: reset the password, sign in with Google, ask for the TOTP secret — refused", async () => {
+    const admin = await adminWithTotp();
+    const before = (await factorRow(admin.id))!;
+    // 1–2. The attacker controls the mailbox (nothing else): a reset mail, a password of their own.
+    await send(newClient(), "/api/auth/request-password-reset", {
+      json: { email: admin.email, redirectTo: "/reset-password" },
+      headers: CAPTCHA,
+    });
+    const mail = await waitForMail(admin.email, "passwordReset");
+    const follow = await send(newClient(), linkIn(mail));
+    const token = new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!;
+    const reset = await send(newClient(), "/api/auth/reset-password", {
+      headers: CAPTCHA,
+      json: { newPassword: NEW_PASSWORD, token },
+    });
+    expect(reset.status, reset.text).toBe(200);
+    // (A password sign-in stops at the challenge.)
+    expect((await signIn(newClient(), admin.email, NEW_PASSWORD)).body).toMatchObject({
+      twoFactorRedirect: true,
+    });
+    // 3. A Google identity for the address: a session, one factor.
+    const attacker = newClient();
+    await signInWithGoogle(attacker, admin.email);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
+    // 4. The TOTP secret, for the password. REFUSED — this is where the attack ends.
+    const secret = await send(attacker, "/api/auth/two-factor/get-totp-uri", {
+      json: { password: NEW_PASSWORD },
+    });
+    expectSecondFactorRequired(secret, "get-totp-uri");
+    expect(secret.text).not.toContain("otpauth://");
+    // The other three ways the password could have produced a factor.
+    for (const path of MANAGE) {
+      const sent = await send(attacker, `/api/auth/two-factor/${path}`, { json: { password: NEW_PASSWORD } });
+      expectSecondFactorRequired(sent, path);
+      expect(sent.text).not.toContain("otpauth://");
+      expect(sent.text).not.toContain("backupCodes");
+    }
+    // Nothing about the enrolment moved, and the session is still one-factor.
+    const after = (await factorRow(admin.id))!;
+    expect(after.secret).toBe(before.secret);
+    expect(after.backupCodes).toBe(before.backupCodes);
+    expect(after.verified).toBe(true);
+    expect((await userById(admin.id))!.twoFactorEnabled).toBe(true);
+    expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
+    // 5. No admin action.
+    expectNeedsSecondFactor(await adminCall(attacker));
+    // Each refusal is in the audit log.
+    const refusals = (await auditRows({ action: "auth.second_factor_refused", targetId: admin.id })).filter(
+      (row) => (row.meta as { reason?: string } | null)?.reason === "needs_second_factor",
+    );
+    expect(refusals.length).toBe(MANAGE.length + 1);
+  });
+
+  it("control: a session that HAS passed the factor reads the secret and re-issues the codes with the password — each audited", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithCode(client, admin.email, admin.totpURI);
+    const uri = await send(client, "/api/auth/two-factor/get-totp-uri", { json: { password: PASSWORD } });
+    expect(uri.status, uri.text).toBe(200);
+    expect((uri.body as { totpURI: string }).totpURI).toContain("otpauth://");
+    expect(await auditRows({ action: "auth.totp_secret_viewed", targetId: admin.id })).toHaveLength(1);
+    const codes = await send(client, "/api/auth/two-factor/generate-backup-codes", {
+      json: { password: PASSWORD },
+    });
+    expect(codes.status, codes.text).toBe(200);
+    expect(await auditRows({ action: "auth.backup_codes_regenerated", targetId: admin.id })).toHaveLength(1);
+    // A refused call writes neither.
+    const wrong = await send(client, "/api/auth/two-factor/get-totp-uri", {
+      json: { password: "not the password at all 1!" },
+    });
+    expect(wrong.status).toBe(403);
+    expect(await auditRows({ action: "auth.totp_secret_viewed", targetId: admin.id })).toHaveLength(1);
+  });
+
+  it("the first enrolment needs only the password (there is nothing else to prove) — and the owner is told: mail + audit row", async () => {
+    const made = await verifiedUser();
+    expect(await factorRow(made.user.id)).toBeUndefined();
+    await enableTotp(made.client);
+    expect((await factorRow(made.user.id))!.verified).toBe(true);
+    const mail = await waitForMail(made.email, "twoFactorEnabled");
+    expect(mail.class).toBe("account_security");
+    expect(await auditRows({ action: "auth.2fa_enabled", targetId: made.user.id })).toHaveLength(1);
+    // An enrolment that was begun and never confirmed is not a factor yet: the password may
+    // still look at it and start it again.
+    const other = await verifiedUser();
+    const begun = await send(other.client, "/api/auth/two-factor/enable", { json: { password: PASSWORD } });
+    expect(begun.status).toBe(200);
+    const seen = await send(other.client, "/api/auth/two-factor/get-totp-uri", {
+      json: { password: PASSWORD },
+    });
+    expect(seen.status, seen.text).toBe(200);
+    expect(
+      (await send(other.client, "/api/auth/two-factor/enable", { json: { password: PASSWORD } })).status,
+    ).toBe(200);
+  });
+
+  it("a re-enrolment — switch off, then enrol again — is for a session that has passed the factor; the owner is told each time", async () => {
+    const admin = await adminWithTotp();
+    const client = newClient();
+    await signInWithCode(client, admin.email, admin.totpURI);
+    // (Better Auth itself refuses `enable` over a confirmed enrolment: TOTP_ALREADY_ENABLED,
+    // plugins/two-factor/index.mjs — replacing a factor is always "off, then on".)
+    const off = await send(client, "/api/auth/two-factor/disable", { json: { password: PASSWORD } });
+    expect(off.status, off.text).toBe(200);
+    await waitForMail(admin.email, "twoFactorDisabled");
+    expect(await factorRow(admin.id)).toBeUndefined();
+    const { totpURI } = await enableTotp(client);
+    expect(totpURI).not.toBe(admin.totpURI);
+    await waitForMail(admin.email, "twoFactorEnabled", 2);
+    expect(await auditRows({ action: "auth.2fa_enabled", targetId: admin.id })).toHaveLength(2);
+    expect(await auditRows({ action: "auth.2fa_disabled", targetId: admin.id })).toHaveLength(1);
+  });
+});
+
 describe("a session cannot hand itself a second factor", () => {
-  it("a stolen session without the password cannot enrol, switch off or re-issue the factor", async () => {
+  it("a stolen session without the password cannot enrol the factor on an account that has none", async () => {
     // The owner has a password; whoever holds this Google-made session does not know it.
     const made = await verifiedUser();
     await testDb().update(user).set({ role: "admin" }).where(eq(user.id, made.user.id));

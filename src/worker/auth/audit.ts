@@ -7,6 +7,9 @@
 //   auth.sign_out
 //   auth.password_changed        by its owner (change) or through a reset link (meta.via)
 //   auth.2fa_enabled | auth.2fa_disabled
+//   auth.totp_secret_viewed | auth.backup_codes_regenerated   written by auth/second-factor.ts
+//   auth.second_factor_refused   (meta.reason: needs_second_factor, meta.path — the password
+//                                alone was offered where a confirmed second factor is needed)
 //   auth.passkey_added | auth.passkey_removed
 //   auth.email_changed
 //   auth.impersonation_started | auth.impersonation_stopped

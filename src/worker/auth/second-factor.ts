@@ -28,9 +28,8 @@
 //   3. ENROLMENT: the code that confirms a new enrolment marks the session only when that same
 //      session proved the PASSWORD in the last ten minutes (`/two-factor/enable` — Better Auth
 //      always requires the password there: utils/password.mjs `shouldRequirePassword` is true
-//      unless `allowPasswordless` is set, which it is not). A session cannot hand itself a second
-//      factor: enabling, switching off and re-issuing backup codes all need the password, and an
-//      account with no password cannot enrol at all.
+//      unless `allowPasswordless` is set, which it is not). An account with no password cannot
+//      enrol at all. This is the FIRST enrolment only — see the next section.
 //   4. PASSKEY with user verification — and ONLY a passkey that was registered by a session
 //      which had itself passed a second factor. The plugin never requires user verification
 //      (@better-auth/passkey/dist/index.mjs: `requireUserVerification: false`) and lets ANY
@@ -38,6 +37,30 @@
 //      condition a stolen one-factor session could register its own key, sign in with it and
 //      come back "two-factor". The assertion's flag is read in `authentication.afterVerification`
 //      (`authenticationInfo.userVerified`, @simplewebauthn/server).
+//
+// ── THE PASSWORD IS THE FIRST FACTOR (`beforeTwoFactorManage`) ───────────────────────────────
+// A password can be reset through the mailbox. So once an account has a CONFIRMED enrolment
+// (`two_factor.verified`, read from the database), the password alone must not be able to read
+// the factor, re-issue it, replace it or switch it off — or "controls the mailbox" would be
+// "has the second factor" two requests later (reset the password, sign in with Google, ask for
+// the TOTP secret). The four endpoints that do those things:
+//   POST /two-factor/get-totp-uri            returns the TOTP secret
+//   POST /two-factor/generate-backup-codes   returns ten new backup codes
+//   POST /two-factor/disable                 removes the enrolment (after which `enable` is a
+//                                            first enrolment again)
+//   POST /two-factor/enable                  (Better Auth refuses it over a confirmed enrolment
+//                                            anyway — TOTP_ALREADY_ENABLED; gated all the same)
+// are refused `403 SECOND_FACTOR_REQUIRED` — before Better Auth looks at the password — unless
+// THE SESSION ALREADY CARRIES THE MARK (`hasSecondFactor`). With the mark they still need the
+// password as well (Better Auth's own check). Every refusal is audited.
+// While there is no confirmed enrolment there is no second factor to protect: the first
+// enrolment needs the password only, and the owner is told (mail `twoFactorEnabled`, class
+// `account_security`, and the audit row `auth.2fa_enabled` — auth/audit.ts).
+// A lost authenticator is a backup code (`/two-factor/verify-backup-code` steps the session up);
+// both lost is an operator's action. Never the password.
+// The plugin's other endpoints: `/two-factor/send-otp` and `/two-factor/verify-otp` cannot
+// succeed (no `otpOptions.sendOTP` is configured: otp/index.mjs throws before anything is
+// sent or compared), and `viewBackupCodes` is server-only (no route).
 //
 // ── WHAT A CODE HAS TO GET PAST, in this order (`beforeSecondFactor`) ─────────────────────────
 //   a. the ATTEMPT BUDGET — per ACCOUNT, atomic. `admitSecondFactorAttempt` is one UPDATE that
@@ -71,6 +94,7 @@ import {
   admitSecondFactorAttempt,
   clearSecondFactor,
   deleteAuthMarker,
+  forgetTotpStep,
   hasAuthMarker,
   passkeyByCredential,
   putAuthMarker,
@@ -285,6 +309,18 @@ export async function afterTwoFactorChange(scope: AuthScope, ctx: SessionContext
 }
 
 /**
+ * After `/two-factor/disable`: as any two-factor change — and the record of the last TOTP step
+ * goes with the secret it was a step of (a new enrolment's first code must not be refused as a
+ * "replay" of the old authenticator's).
+ */
+export async function afterTwoFactorDisable(scope: AuthScope, ctx: SessionContext): Promise<void> {
+  if (!succeeded(ctx)) return;
+  await afterTwoFactorChange(scope, ctx);
+  const userId = ctx.context.session?.user.id;
+  if (userId) await forgetTotpStep(scope.db, userId);
+}
+
+/**
  * After `/admin/set-role`: a change of privilege ends every session of the account whose role
  * changed — it signs in again, as what it now is (and proves its second factor again).
  */
@@ -300,6 +336,64 @@ export async function afterImpersonationStopped(scope: AuthScope, ctx: SessionCo
   scope.facts.impersonatorId = null;
   if (!succeeded(ctx) || !adminId) return;
   await clearSecondFactor(scope.db, adminId);
+}
+
+// ── the endpoints that read or change the factor ─────────────────────────────────────────────
+
+/** The endpoints a password alone must not reach once an enrolment is confirmed (see the header). */
+export const TWO_FACTOR_MANAGE_PATHS: ReadonlySet<string> = new Set([
+  "/two-factor/get-totp-uri",
+  "/two-factor/generate-backup-codes",
+  "/two-factor/disable",
+  "/two-factor/enable",
+]);
+
+export const SECOND_FACTOR_REQUIRED_CODE = "SECOND_FACTOR_REQUIRED";
+
+/**
+ * `hooks.before` for TWO_FACTOR_MANAGE_PATHS: with a confirmed enrolment, only a session that
+ * has itself passed the second factor goes on to Better Auth's password check. Throws the 403.
+ */
+export async function beforeTwoFactorManage(scope: AuthScope, ctx: CodeContext): Promise<void> {
+  if (!ctx.request || typeof ctx.path !== "string" || !TWO_FACTOR_MANAGE_PATHS.has(ctx.path)) return;
+  // Straight from the database, like the admin gate: the mark is the row's, not a cached copy's.
+  const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+  // No session: Better Auth answers 401.
+  if (!session) return;
+  const state = await secondFactorState(scope.db, session.user.id);
+  // Nothing confirmed: there is no second factor yet — the first enrolment (password only).
+  if (!state || !state.verified) return;
+  if (hasSecondFactor(session.session as { secondFactorAt?: unknown; impersonatedBy?: unknown })) return;
+  record(
+    scope.deps,
+    "auth.second_factor_refused",
+    { type: "user", id: session.user.id },
+    { path: ctx.path, reason: "needs_second_factor" },
+    { actorUserId: session.user.id, actorType: "user" },
+  );
+  throw new APIError("FORBIDDEN", {
+    message: "Confirm your two-factor code to continue.",
+    code: SECOND_FACTOR_REQUIRED_CODE,
+    // In the words our own routes use (`error`) and Better Auth's (`code`), as the admin gate.
+    error: "second_factor_required",
+  });
+}
+
+/** After `/two-factor/get-totp-uri` and `/two-factor/generate-backup-codes`: the audit row. */
+export async function afterTwoFactorRead(
+  scope: AuthScope,
+  ctx: SessionContext & { path?: string },
+): Promise<void> {
+  if (!succeeded(ctx)) return;
+  const userId = ctx.context.session?.user.id;
+  if (!userId) return;
+  record(
+    scope.deps,
+    ctx.path === "/two-factor/get-totp-uri" ? "auth.totp_secret_viewed" : "auth.backup_codes_regenerated",
+    { type: "user", id: userId },
+    null,
+    { actorUserId: userId, actorType: "user" },
+  );
 }
 
 // ── the two code endpoints ───────────────────────────────────────────────────────────────────

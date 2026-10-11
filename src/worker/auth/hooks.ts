@@ -67,9 +67,13 @@ import {
   afterRoleChange,
   afterSecondFactor,
   afterTwoFactorChange,
+  afterTwoFactorDisable,
   afterTwoFactorEnable,
+  afterTwoFactorRead,
   beforeSecondFactor,
+  beforeTwoFactorManage,
   secondFactorOfNewSession,
+  TWO_FACTOR_MANAGE_PATHS,
   VERIFY_BACKUP_CODE_PATH,
   VERIFY_TOTP_PATH,
 } from "./second-factor";
@@ -96,8 +100,15 @@ const OAUTH_SIGNUP_PATHS = new Set(["/callback/:id", "/sign-in/social"]);
 /** What auth/second-factor.ts does after each of these endpoints. */
 const SECOND_FACTOR_AFTER = new Map([
   ["/two-factor/enable", afterTwoFactorEnable],
-  ["/two-factor/disable", afterTwoFactorChange],
-  ["/two-factor/generate-backup-codes", afterTwoFactorChange],
+  ["/two-factor/disable", afterTwoFactorDisable],
+  [
+    "/two-factor/generate-backup-codes",
+    async (scope: AuthScope, ctx: Parameters<typeof afterTwoFactorChange>[1]) => {
+      await afterTwoFactorChange(scope, ctx);
+      await afterTwoFactorRead(scope, ctx);
+    },
+  ],
+  ["/two-factor/get-totp-uri", afterTwoFactorRead],
   ["/passkey/verify-registration", afterPasskeyRegistered],
   ["/passkey/delete-passkey", afterPasskeyDeleted],
   ["/admin/set-role", afterRoleChange],
@@ -496,6 +507,7 @@ export function buildHooks(scope: AuthScope) {
     if (typeof path !== "string") return;
     if (path.startsWith("/admin/")) await adminGate(scope, ctx);
     if (path === "/verify-email" && ctx.request) await beforeVerifyEmail(scope, ctx);
+    if (TWO_FACTOR_MANAGE_PATHS.has(path)) await beforeTwoFactorManage(scope, ctx);
     if (path === VERIFY_TOTP_PATH || path === VERIFY_BACKUP_CODE_PATH) {
       const body = await beforeSecondFactor(scope, ctx);
       if (body) return { context: { body } };

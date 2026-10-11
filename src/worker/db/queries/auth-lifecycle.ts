@@ -811,6 +811,11 @@ export async function acceptTotpStep(
   });
 }
 
+/** The enrolment is gone: so is the record of the last step its secret was used at. */
+export async function forgetTotpStep(db: Executor, userId: string): Promise<void> {
+  await db.delete(verification).where(eq(verification.identifier, totpStepIdentifier(userId)));
+}
+
 /** Marks an existing session of `userId` as having passed a second factor. False when it is gone. */
 export async function stampSecondFactor(
   db: Executor,
