@@ -74,7 +74,8 @@
 // day. So a mail the address ASKED FOR ITSELF — the request came with the address's own session,
 // or from the browser that signed up with it (an `hf_pending` proof whose user id IS the
 // unverified account at that address), or is the sign-up that creates the account — is counted
-// on a budget of its own (`ownBucket`: the same caps, another key), which nothing a stranger
+// on a budget of its own (`ownLedgerKey`: the same caps, keyed on the EXACT address and its
+// account id — never the canonical mailbox), which nothing a stranger
 // sends is counted on. `EmailActor.own` says so; it is set in ONE place (auth/hooks.ts
 // `ownAddressOf`, read by auth/create-auth.ts) and only on a proof a stranger cannot get for
 // somebody else's address — a cookie's mere presence is not one. A pending sign-up's change of
@@ -163,14 +164,14 @@ export type EmailOutcome = "sent" | "capped" | "coalesced" | "retrying" | "faile
 export type EmailActor =
   | {
       client: string | null;
-      /** The recipient asked for this mail itself (see "WHOSE BUDGET" in the header). */
-      own?: boolean;
+      /**
+       * The recipient asked for this mail itself (see "WHOSE BUDGET" in the header): the id of
+       * the account the recipient address is bound to.
+       */
+      own?: string | null;
     }
   | { user: string }
   | { system: true };
-
-/** The name of the budget for mail an address asked for itself, beside `bucket`'s. */
-export const ownBucket = (bucket: string) => `${bucket}|own`;
 
 type Block = { text: string } | { link: { label: string; url: string } } | { quote: string };
 type Draft = { subject: string; heading: string; blocks: Block[] };
@@ -804,14 +805,7 @@ const CLASS_CAPS: Record<EmailClass, { recipient: Caps | null; actor: Caps | nul
 };
 
 export const emailClassOf = (name: TemplateName): EmailClass => KINDS[name].class;
-/** Every recipient budget there is: each kind's bucket, and the own-request twin of the unauth ones. */
-export const EMAIL_BUCKETS: string[] = [
-  ...new Set(
-    Object.values(KINDS).flatMap((kind) =>
-      kind.class === "unauth_triggered" ? [kind.bucket, ownBucket(kind.bucket)] : [kind.bucket],
-    ),
-  ),
-];
+export const EMAIL_BUCKETS: string[] = [...new Set(Object.values(KINDS).map((kind) => kind.bucket))];
 
 // ── delivery ────────────────────────────────────────────────────────────────────────────────
 
@@ -867,6 +861,22 @@ export async function actorKey(
       ? `user|${actor.user}`
       : `client|${actor?.client ? normaliseIp(actor.client) : "unknown"}`;
   return ledgerHash(env, `by|${emailClass}|${who}`);
+}
+
+/**
+ * The ledger key of an address's OWN budget in one bucket (see "WHOSE BUDGET" in the header):
+ * the EXACT stored address and the account it is bound to — never the canonical mailbox. The
+ * proof behind an own request is for that account at that address and for no other spelling of
+ * the mailbox: keyed canonically, a stranger's account at `victim+x@…` would spend the budget of
+ * `victim@…`.
+ */
+export async function ownLedgerKey(
+  env: Pick<Env, "FILES_TOKEN_SECRET">,
+  address: string,
+  bucket: string,
+  accountId: string,
+): Promise<string> {
+  return ledgerHash(env, `own|${bucket}|${address.trim().toLowerCase()}|${accountId}`);
 }
 
 /** The keyed hash of a canonical address (what the ledger stores is never an address). */
@@ -981,12 +991,20 @@ async function admit(
   const recipient = caps.recipient ?? (BUCKET_CAPS as Record<string, Caps>)[row.bucket];
   // A bucket with no caps of its own is not sent from: nothing is uncounted by default.
   if (!recipient) throw new Error("email: a bucket without caps was refused");
-  // Mail the address asked for itself is counted apart from mail anybody can cause (the header).
-  const own =
-    row.class === "unauth_triggered" && actor !== undefined && "client" in actor && actor.own === true;
-  const bucket = own ? ownBucket(row.bucket) : row.bucket;
-  if (!(await tryConsume(deps.db, await ledgerKey(env, address, bucket), recipient))) {
-    countFor(env, "email", { outcome: "capped", kind: name, reason: own ? "recipient_own" : "recipient" });
+  // Mail the address asked for itself is counted apart from mail anybody can cause (the header)
+  // — under the exact address and its account, not the canonical mailbox.
+  const account =
+    row.class === "unauth_triggered" && actor !== undefined && "client" in actor ? (actor.own ?? null) : null;
+  const key =
+    account !== null
+      ? await ownLedgerKey(env, address, row.bucket, account)
+      : await ledgerKey(env, address, row.bucket);
+  if (!(await tryConsume(deps.db, key, recipient))) {
+    countFor(env, "email", {
+      outcome: "capped",
+      kind: name,
+      reason: account !== null ? "recipient_own" : "recipient",
+    });
     return false;
   }
   return true;
@@ -1250,7 +1268,7 @@ const appUrl = (env: Pick<Env, "APP_ORIGIN">, path: string) => `${env.APP_ORIGIN
 type To = { to: string; name?: unknown };
 
 /** The client address of the request that caused an unauthenticated mail (null: not known). */
-type ByClient = { by: { client: string | null; own?: boolean } };
+type ByClient = { by: { client: string | null; own?: string | null } };
 /** The user whose session caused a mail. */
 type ByUser = { by: { user: string } };
 const SYSTEM: EmailActor = { system: true };

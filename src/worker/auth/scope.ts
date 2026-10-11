@@ -78,7 +78,7 @@ export type AuthFacts = {
    * browser's proof, or by being that sign-up (auth/hooks.ts): mail to it is counted on the
    * address's own budget (services/email.ts "WHOSE BUDGET"). Null: a stranger's request.
    */
-  ownAddress: string | null;
+  ownAddress: { email: string; accountId: string } | null;
   /**
    * A cleanup that takes trust away failed twice (auth/second-factor.ts `cleanUpOrFlag`): the
    * route answers 5xx — after the audit row and the notice, never instead of them.

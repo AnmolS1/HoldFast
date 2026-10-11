@@ -234,12 +234,13 @@ const OWN_MAIL_PATHS = new Set(["/send-verification-email", "/request-password-r
  * as mail anybody can cause; the resend from that browser, with the proof, is the own one).
  * The proof decides which BUDGET a mail is counted on, nothing a caller can see: the answer, the
  * work before it (padded — auth/parity.ts) and the caller's own per-client charge are the same.
- * Returns the address, or null: a stranger's request.
+ * Returns the address and the account it is bound to (the own budget is keyed on both —
+ * services/email.ts `ownLedgerKey`), or null: a stranger's request.
  */
 async function ownAddressOf(
   scope: AuthScope,
   ctx: Parameters<typeof getSessionFromCtx>[0] & { path?: string; body?: unknown; request?: Request },
-): Promise<string | null> {
+): Promise<{ email: string; accountId: string } | null> {
   const asked = (ctx.body as { email?: unknown } | null | undefined)?.email;
   if (typeof asked !== "string" || !ctx.request) return null;
   const email = asked.toLowerCase();
@@ -250,12 +251,14 @@ async function ownAddressOf(
     const pending = await readPending(scope.env, scope.keys, cookies, now());
     if (pending && pending.email === email) {
       const signedUp = await getAccount(scope.db, pending.userId);
-      if (signedUp && !signedUp.emailVerified && signedUp.email.toLowerCase() === email) return email;
+      if (signedUp && !signedUp.emailVerified && signedUp.email.toLowerCase() === email) {
+        return { email, accountId: signedUp.id };
+      }
     }
   }
   const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
   return session && session.user.emailVerified === true && session.user.email.toLowerCase() === email
-    ? email
+    ? { email, accountId: session.user.id }
     : null;
 }
 
@@ -645,7 +648,10 @@ export function buildHooks(scope: AuthScope) {
             await chargeUnsent(scope.deps, uncharged, address, {
               client: scope.client?.ip ?? null,
               // The same budget the mail itself would have been counted on.
-              own: typeof address === "string" && scope.facts.ownAddress === address.toLowerCase(),
+              own:
+                typeof address === "string" && scope.facts.ownAddress?.email === address.toLowerCase()
+                  ? scope.facts.ownAddress.accountId
+                  : null,
             });
           }
         }),

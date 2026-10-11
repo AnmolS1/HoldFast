@@ -70,7 +70,10 @@ export const CAPTCHA_ENDPOINTS = [
 const byClient = (scope: AuthScope, to?: string) => ({
   client: scope.client?.ip ?? null,
   // The address asked for this mail itself (auth/hooks.ts `ownAddressOf`): its own budget.
-  own: to !== undefined && scope.facts.ownAddress === to.toLowerCase(),
+  own:
+    to !== undefined && scope.facts.ownAddress?.email === to.toLowerCase()
+      ? scope.facts.ownAddress.accountId
+      : null,
 });
 
 /** Does a verification token change an address (rather than verify a new account's)? */

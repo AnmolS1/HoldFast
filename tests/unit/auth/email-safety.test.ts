@@ -14,7 +14,7 @@ import {
   deliver,
   flushOperatorDigests,
   OPERATOR_CAPS,
-  ownBucket,
+  ownLedgerKey,
   safeId,
   sendAdminAlert,
   sendOperatorCritical,
@@ -55,6 +55,7 @@ import {
   serviceDeps,
   signUp,
   testDb,
+  userByEmail,
   verifiedUser,
   waitForMail,
   type Client,
@@ -840,7 +841,7 @@ describe("the mail budgets are charged the same whether or not the address has a
         // Mail ANYBODY can cause: a pending sign-up has not proven the NEW address is its own
         // (R5), so neither branch touches that address's own budget.
         chargedToRecipient: await counted(await ledgerKey(env, target, "signup")),
-        chargedToItsOwnBudget: await counted(await ledgerKey(env, target, ownBucket("signup"))),
+        chargedToItsOwnBudget: await counted(await ownKey(target, "signup")),
       };
     };
     const moved = await trace(freshEmail());
@@ -860,7 +861,39 @@ describe("the mail budgets are charged the same whether or not the address has a
 // from anybody stop a person's reset mail for the day, five resends stop a new sign-up's
 // verification mail. Mail the address's OWN session or OWN sign-up browser asked for is counted
 // on a budget of its own, which no stranger can spend.
+/** The ledger key of an address's OWN budget: the exact stored address and its account (N5). */
+const ownKey = async (email: string, bucket: string) =>
+  ownLedgerKey(env, email, bucket, (await userByEmail(email))?.id ?? "nobody");
+
 describe("strangers cannot use up the mail an address asks for itself (R5)", () => {
+  it("the own budget belongs to ONE account at ONE exact address: a stranger's account at a plus-tag variant of the mailbox spends its own, not the person's (N5)", async () => {
+    const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
+    const person = quiet();
+    const email = `p${crypto.randomUUID().slice(0, 8)}@${domain}`;
+    expect((await signUp(person, { email })).sent.status).toBe(200);
+    // The stranger's own sign-up at a variant that reaches the same mailbox — a real unverified
+    // account, so a real proof — and its resends.
+    const variant = email.replace("@", "+x@");
+    const strangerBrowser = quiet();
+    expect((await signUp(strangerBrowser, { email: variant })).sent.status).toBe(200);
+    for (let n = 0; n < BUCKET_CAPS.signup.perHour + 2; n++) {
+      await forgetAddressRule(strangerBrowser);
+      strangerBrowser.ip = freshIp();
+      await send(strangerBrowser, "/api/auth/send-verification-email", {
+        json: { email: variant },
+        headers: CAPTCHA,
+      });
+    }
+    expect(await counted(await ownKey(variant, "signup"))).toBe(BUCKET_CAPS.signup.perHour);
+    expect(await counted(await ownKey(email, "signup"))).toBe(0);
+    // The person's own resend arrives.
+    const before = mailTo(email, "verification").length;
+    await forgetAddressRule(person);
+    await send(person, "/api/auth/send-verification-email", { json: { email }, headers: CAPTCHA });
+    await waitForMail(email, "verification", before + 1);
+    expect(await counted(await ownKey(email, "signup"))).toBe(1);
+  });
+
   const stranger = async (path: string, json: Record<string, unknown>) => {
     const client = quiet();
     await forgetAddressRule(client);
@@ -888,14 +921,14 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
     await waitForMail(owner.email, "passwordReset", BUCKET_CAPS.reset.perHour + 1);
     // …counted apart, and capped in its own right.
     expect(await counted(await ledgerKey(env, owner.email, "reset"))).toBe(BUCKET_CAPS.reset.perHour);
-    expect(await counted(await ledgerKey(env, owner.email, ownBucket("reset")))).toBe(1);
+    expect(await counted(await ownKey(owner.email, "reset"))).toBe(1);
     // A session of ANOTHER account asking about this address is a stranger.
     const other = await verifiedUser();
     await forgetAddressRule(other.client);
     await send(other.client, "/api/auth/request-password-reset", { json: reset, headers: CAPTCHA });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mailTo(owner.email, "passwordReset")).toHaveLength(BUCKET_CAPS.reset.perHour + 1);
-    expect(await counted(await ledgerKey(env, owner.email, ownBucket("reset")))).toBe(1);
+    expect(await counted(await ownKey(owner.email, "reset"))).toBe(1);
   });
 
   it("strangers ask for verification mail to an address that has no account yet; the person's own sign-up still gets its mail, and its own resend too", async () => {
@@ -909,18 +942,18 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
     const browser = quiet();
     const { sent } = await signUp(browser, { email });
     expect(sent.status, sent.text).toBe(200);
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(0);
+    expect(await counted(await ownKey(email, "signup"))).toBe(0);
     // But the browser now holds the proof of an account AT that address: its resend ("send it
     // again" on the check-your-email screen) is the address's own request, and arrives.
     await forgetAddressRule(browser);
     await send(browser, "/api/auth/send-verification-email", { json: { email }, headers: CAPTCHA });
     await waitForMail(email, "verification");
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(1);
+    expect(await counted(await ownKey(email, "signup"))).toBe(1);
     // One from anywhere else is not.
     await stranger("/api/auth/send-verification-email", { email });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mailTo(email, "verification")).toHaveLength(1);
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(1);
+    expect(await counted(await ownKey(email, "signup"))).toBe(1);
   });
 
   it("a recipient the request merely NAMES is never its own: sign-ups for somebody's address, and a proof or a session for a DIFFERENT address", async () => {
@@ -937,7 +970,7 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
         headers: CAPTCHA,
       });
     }
-    expect(await counted(await ledgerKey(env, victim, ownBucket("signup")))).toBe(0);
+    expect(await counted(await ownKey(victim, "signup"))).toBe(0);
     expect(await counted(await ledgerKey(env, victim, "signup"))).toBe(3);
     // A stranger with a REAL proof and a REAL session — for their own, different, addresses —
     // asks for mail to the victim: a stranger's request both times.
@@ -958,8 +991,8 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
       headers: CAPTCHA,
     });
     await eventually(async () => (await counted(await ledgerKey(env, target, "reset"))) === 2);
-    expect(await counted(await ledgerKey(env, target, ownBucket("reset")))).toBe(0);
-    expect(await counted(await ledgerKey(env, target, ownBucket("signup")))).toBe(0);
+    expect(await counted(await ownKey(target, "reset"))).toBe(0);
+    expect(await counted(await ownKey(target, "signup"))).toBe(0);
   });
 
   // The proofs must be ones a stranger cannot GET for somebody else's address. Two that a
@@ -981,7 +1014,7 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
         headers: CAPTCHA,
       });
     }
-    expect(await counted(await ledgerKey(env, owner.email, ownBucket("reset")))).toBe(0);
+    expect(await counted(await ownKey(owner.email, "reset"))).toBe(0);
     expect(await counted(await ledgerKey(env, owner.email, "reset"))).toBe(BUCKET_CAPS.reset.perHour);
     // The owner's own-session reset still arrives.
     await forgetAddressRule(owner.client);
@@ -1004,13 +1037,13 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
       });
     }
     // Nothing of it is on the address's own budget; the stranger filled the other.
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(0);
+    expect(await counted(await ownKey(email, "signup"))).toBe(0);
     expect(await counted(await ledgerKey(env, email, "signup"))).toBe(BUCKET_CAPS.signup.perHour);
     // …and the person's own resend, from the browser that really signed up, arrives.
     await forgetAddressRule(person);
     await send(person, "/api/auth/send-verification-email", { json: { email }, headers: CAPTCHA });
     await waitForMail(email, "verification", 2);
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(1);
+    expect(await counted(await ownKey(email, "signup"))).toBe(1);
     // A sign-up cookie — even the real one — opens the VERIFICATION budget only: whoever made
     // an unverified account at an address has not thereby a claim on its reset mail.
     await forgetAddressRule(person);
@@ -1019,7 +1052,7 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
       headers: CAPTCHA,
     });
     await eventually(async () => (await counted(await ledgerKey(env, email, "reset"))) === 1);
-    expect(await counted(await ledgerKey(env, email, ownBucket("reset")))).toBe(0);
+    expect(await counted(await ownKey(email, "reset"))).toBe(0);
   });
 
   it("pending sign-ups moved onto somebody's address do not spend that address's own budget", async () => {
@@ -1038,11 +1071,11 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
       });
       expect(moved.status, moved.text).toBe(200);
     }
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(0);
+    expect(await counted(await ownKey(email, "signup"))).toBe(0);
     await forgetAddressRule(person);
     await send(person, "/api/auth/send-verification-email", { json: { email }, headers: CAPTCHA });
     await waitForMail(email, "verification", 2);
-    expect(await counted(await ledgerKey(env, email, ownBucket("signup")))).toBe(1);
+    expect(await counted(await ownKey(email, "signup"))).toBe(1);
   });
 
   it("which budget a mail is counted on is not something the caller can see: the same answer and the same work before it — with a session, with a sign-up cookie, with nothing — for an address that has an account and one that has not", async () => {
@@ -1106,9 +1139,7 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
     }
     await eventually(async () => mailTo(owner.email, "passwordReset").length >= BUCKET_CAPS.reset.perHour);
     expect(mailTo(owner.email, "passwordReset")).toHaveLength(BUCKET_CAPS.reset.perHour);
-    expect(await counted(await ledgerKey(env, owner.email, ownBucket("reset")))).toBe(
-      BUCKET_CAPS.reset.perHour,
-    );
+    expect(await counted(await ownKey(owner.email, "reset"))).toBe(BUCKET_CAPS.reset.perHour);
     expect(await counted(await ledgerKey(env, owner.email, "reset"))).toBe(0);
   });
 });
