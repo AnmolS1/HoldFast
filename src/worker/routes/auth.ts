@@ -189,6 +189,18 @@ router.all(
 
       // 4. What happened, for the audit log.
       if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
+      // 5. A cleanup that takes trust away failed, twice (auth/second-factor.ts
+      // `cleanUpOrFlag`). The change itself happened and has just been audited and announced:
+      // the caller is told it did not complete — with whatever cookies the handler set (a
+      // changed password's new session), so they are not signed out by the failure.
+      if (scope?.facts.cleanupFailed) {
+        const failed = c.json(
+          { error: INTERNAL_ERROR, message: "Something went wrong.", requestId: c.get("requestId") },
+          500,
+        );
+        for (const cookie of response.headers.getSetCookie()) failed.headers.append("set-cookie", cookie);
+        return failed;
+      }
       return response;
     }
   }),

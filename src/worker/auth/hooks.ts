@@ -28,7 +28,6 @@ import { APIError, createAuthMiddleware, getSessionFromCtx } from "better-auth/a
 import { UAParser } from "ua-parser-js";
 import {
   clearUnprovenAccount,
-  deleteTrustedDevices,
   ensureUserPrefs,
   getAccount,
   getAccountByEmail,
@@ -78,6 +77,7 @@ import {
   afterTwoFactorRead,
   beforeSecondFactor,
   beforeTwoFactorManage,
+  cleanUpOrFlag,
   endStandingProofs,
   hasSecondFactor,
   secondFactorOfNewSession,
@@ -671,15 +671,11 @@ export function buildHooks(scope: AuthScope) {
     if (path === "/change-password" && ctx.request && !(ctx.context.returned instanceof Error)) {
       // "Remember this device" does not outlive the password it was granted under.
       const userId = ctx.context.session?.user.id;
-      // NOT quietly: this takes trust away (remembered devices, known-device proofs, the keys'
-      // second-factor marks). If it cannot be done the request FAILS — the caller is told, and
-      // tries again — rather than answer "changed" with the old trust still standing. (Better
-      // Auth has written the password by now, outside any transaction of ours: failing loudly
-      // is the most this hook can do; the same holds for `onPasswordReset`, create-auth.ts.)
-      if (userId) {
-        await deleteTrustedDevices(scope.db, userId);
-        await endStandingProofs(scope.db, userId);
-      }
+      // What stood on the old password goes (auth/second-factor.ts `endStandingProofs`). Better
+      // Auth has already written the password and ended the other sessions; the cleanup is
+      // tried twice, and if it still fails the request is answered 5xx — by the route, AFTER
+      // the audit row and the notice, and with the caller's new session cookie kept.
+      if (userId) await cleanUpOrFlag(scope, "password_change", () => endStandingProofs(scope.db, userId));
       return;
     }
     if (path === "/get-session") {

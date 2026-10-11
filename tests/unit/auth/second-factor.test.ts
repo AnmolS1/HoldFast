@@ -792,6 +792,45 @@ describe("step-up: a code on a session that exists", () => {
     ).toBe(0);
   });
 
+  it("'remember this device' does not outlive a two-factor change: new backup codes, and a new enrolment, end it (N4)", async () => {
+    const trustRows = async (userId: string) =>
+      (
+        await testDb().select().from(verification).where(like(verification.identifier, "trust-device-%"))
+      ).filter((row) => row.value === userId);
+    for (const change of ["new backup codes", "off and on again"] as const) {
+      // (Not an admin: an admin is never given the cookie.)
+      const made = await verifiedUser();
+      const { totpURI } = await enableTotp(made.client);
+      await send(made.client, "/api/auth/sign-out", { json: {} });
+      const remembered = newClient();
+      await signInWithCode(remembered, made.email, totpURI, { trustDevice: true });
+      expect(await trustRows(made.user.id), change).toHaveLength(1);
+      await send(remembered, "/api/auth/sign-out", { json: {} });
+      // Control: that browser now skips the challenge.
+      expect((await signIn(remembered, made.email)).body, change).not.toMatchObject({
+        twoFactorRedirect: true,
+      });
+      await send(remembered, "/api/auth/sign-out", { json: {} });
+      // The owner changes the factor, from a session that has passed it.
+      const owner = newClient();
+      await signInWithCode(owner, made.email, totpURI);
+      if (change === "new backup codes") {
+        const done = await send(owner, "/api/auth/two-factor/generate-backup-codes", {
+          json: { password: PASSWORD },
+        });
+        expect(done.status, done.text).toBe(200);
+      } else {
+        expect(
+          (await send(owner, "/api/auth/two-factor/disable", { json: { password: PASSWORD } })).status,
+        ).toBe(200);
+        await enableTotp(owner);
+      }
+      expect(await trustRows(made.user.id), change).toEqual([]);
+      // The remembered browser meets the challenge again.
+      expect((await signIn(remembered, made.email)).body, change).toMatchObject({ twoFactorRedirect: true });
+    }
+  });
+
   it("the sign-in challenge spends the same budget, one per attempt — and a correct code gives back its own attempt, not the wrong ones", async () => {
     const admin = await adminWithTotp();
     const browser = newClient();

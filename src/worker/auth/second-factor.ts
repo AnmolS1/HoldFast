@@ -111,8 +111,8 @@
 //   (backup-codes/index.mjs: `where backupCodes = <the value read>`), so one works once.
 //
 // ── WHEN THE MARK IS TAKEN AWAY ───────────────────────────────────────────────────────────────
-// (The known-device proofs and the keys' marks go on a password change or reset and on any
-// two-factor change; the keys' marks on a role change too.)
+// (The known-device proofs, the keys' marks and Better Auth's "remember this device" rows go on a
+// password change or reset and on any two-factor change; the keys' marks on a role change too.)
 // By age (SECOND_FACTOR_MAX_AGE_MS), and at once on: a role change of the account, a password
 // change or reset (Better Auth replaces or deletes the sessions), any two-factor change (on,
 // off, new backup codes) for every OTHER session, and the end of an impersonation (the admin's
@@ -128,6 +128,7 @@ import {
   claimOncePerWindow,
   clearSecondFactor,
   deleteAuthMarker,
+  deleteTrustedDevices,
   forgetKnownDevices,
   forgetPasskeyMarks,
   forgetTotpStep,
@@ -143,7 +144,7 @@ import {
 import { revokeSessions } from "../services/account-state";
 import { now } from "../services/clock";
 import { sendSecondFactorLocked } from "../services/email";
-import { record } from "./observe";
+import { countFor, record, reportError } from "./observe";
 import { afterAnswer, type AuthScope } from "./scope";
 import { cookieAttributes, cookieName, DEVICE_COOKIE, mintDevice, readDevice } from "./signed-cookie";
 
@@ -325,12 +326,40 @@ export async function afterPasskeyRegistered(scope: AuthScope, ctx: SessionConte
 
 /**
  * What an account's browsers and keys have STANDING — a known-device proof (its own code
- * budget), a passkey's "counts as a second factor" — ends here: on a password change or reset
- * and on any two-factor change. (A role change ends the passkey marks only: `afterRoleChange`.)
+ * budget), a passkey's "counts as a second factor", Better Auth's "remember this device" (which
+ * SKIPS the challenge for thirty days) — ends here: on a password change or reset and on any
+ * two-factor change. (A role change ends the passkey marks only: `afterRoleChange`.)
  */
 export async function endStandingProofs(db: AuthScope["db"], userId: string): Promise<void> {
   await forgetKnownDevices(db, userId);
   await forgetPasskeyMarks(db, userId);
+  await deleteTrustedDevices(db, userId);
+}
+
+/**
+ * `cleanup`, tried twice; never throws. False when it failed both times — reported and counted,
+ * and remembered on the scope (`facts.cleanupFailed`), which makes the route answer 5xx AFTER it
+ * has written the audit row and started the notice (routes/auth.ts). Why not simply throw:
+ * Better Auth has written the password (or the role) by the time a cleanup runs, outside any
+ * transaction of ours, and an exception here would also take away what must happen whatever
+ * the cleanup does — the sessions ended, the owner told, the change on record.
+ */
+export async function cleanUpOrFlag(
+  scope: AuthScope,
+  what: string,
+  cleanup: () => Promise<void>,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await cleanup();
+      return true;
+    } catch (error) {
+      reportError(error, { kind: "auth_cleanup", what, attempt: String(attempt) });
+    }
+  }
+  countFor(scope.env, "error", { kind: "auth_cleanup", reason: what });
+  scope.facts.cleanupFailed = true;
+  return false;
 }
 
 /** After `/passkey/delete-passkey`: the fact about the key goes with the key. */
@@ -388,9 +417,10 @@ export async function afterRoleChange(scope: AuthScope, ctx: SessionContext): Pr
   if (!succeeded(ctx)) return;
   const userId = (ctx.body as { userId?: unknown } | undefined)?.userId;
   if (typeof userId !== "string" || userId === "") return;
+  // The sessions FIRST — that is what must not be skipped; then the keys' marks (they prove
+  // themselves again under the new role: grant 4 in the header), tried twice and flagged.
   await revokeSessions(scope.deps, userId);
-  // …and its keys prove themselves again under the new role (see grant 4 in the header).
-  await forgetPasskeyMarks(scope.db, userId);
+  await cleanUpOrFlag(scope, "role_change", async () => void (await forgetPasskeyMarks(scope.db, userId)));
 }
 
 /** After `/admin/stop-impersonating`: the admin who was impersonating proves the factor again. */

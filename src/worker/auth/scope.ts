@@ -79,6 +79,11 @@ export type AuthFacts = {
    * address's own budget (services/email.ts "WHOSE BUDGET"). Null: a stranger's request.
    */
   ownAddress: string | null;
+  /**
+   * A cleanup that takes trust away failed twice (auth/second-factor.ts `cleanUpOrFlag`): the
+   * route answers 5xx — after the audit row and the notice, never instead of them.
+   */
+  cleanupFailed: boolean;
   /** The kinds of unauthenticated mail this request has caused to be sent (services/email.ts). */
   mailed: string[];
   /** This request verified the right password for the account of `signInAttempt`. */
@@ -142,6 +147,7 @@ export function emptyFacts(): AuthFacts {
     signInAttempt: null,
     signInProved: false,
     ownAddress: null,
+    cleanupFailed: false,
     mailed: [],
   };
 }

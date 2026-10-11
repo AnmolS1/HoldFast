@@ -21,9 +21,8 @@ import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
 import { admin, captcha, twoFactor } from "better-auth/plugins";
 import type { Db } from "../db/client";
-import { deleteTrustedDevices } from "../db/queries/auth-lifecycle";
 import * as schema from "../db/schema";
-import { scheduleDeletion } from "../services/account-state";
+import { revokeSessions, scheduleDeletion } from "../services/account-state";
 import {
   sendChangeEmailConfirmation,
   sendDeleteAccountVerification,
@@ -37,7 +36,7 @@ import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { setFirstPassword, VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
-import { endStandingProofs, passkeyAuthentication } from "./second-factor";
+import { cleanUpOrFlag, endStandingProofs, passkeyAuthentication } from "./second-factor";
 import { asciiLower } from "../../shared/admin-emails";
 import { isStoredFormAddress } from "./preflight";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
@@ -167,11 +166,15 @@ export function buildAuthOptions(scope: AuthScope) {
       },
       onPasswordReset: async ({ user }: { user: { id: string } }) => {
         scope.facts.passwordResetUserId = user.id;
-        // "Remember this device" does not outlive the password it was granted under.
-        await deleteTrustedDevices(db, user.id);
-        // …and neither does a browser's standing as a "known device", nor a passkey's as a
-        // second factor (auth/second-factor.ts).
-        await endStandingProofs(db, user.id);
+        // The SESSIONS first, and by our own statement: Better Auth ends them too
+        // (`revokeSessionsOnPasswordReset`), but only after this callback returns
+        // (api/routes/password.mjs:168-169) — and ending them is what a reset after a
+        // compromise is for.
+        await revokeSessions(deps, user.id);
+        // Then what stood on the old password: "remember this device", a browser's standing as
+        // a known device, a passkey's as a second factor (auth/second-factor.ts). Tried twice;
+        // a failure is flagged, not thrown — the route still audits, still mails, then says 5xx.
+        await cleanUpOrFlag(scope, "password_reset", () => endStandingProofs(db, user.id));
       },
     },
     emailVerification: {
