@@ -18,6 +18,9 @@
 //      (middleware/session.ts) is under the same watchdog;
 //   4. the audit rows, the auth metric and the security emails (auth/audit.ts), from the
 //      finished response.
+// And two failures inside the handler that are a lost RACE, not an error, are answered as what
+// they are: a unique violation on a verification link (the address was taken a moment ago) and
+// on an OAuth callback (the identity was linked a moment ago) — a redirect each, never a 500.
 
 import { requestMethod, requestPath } from "../middleware/canonical";
 import { Hono } from "hono";
@@ -38,6 +41,8 @@ import { auth, db, type AppEnv } from "../services/request-context";
 export const router = new Hono<AppEnv>();
 
 const ALLOWED_ADMIN: readonly string[] = ADMIN_PLUGIN_ALLOWED;
+/** Where the loser of two simultaneous provider links is sent (Better Auth's own code for it). */
+export const ALREADY_LINKED = "/login?error=unable_to_link_account";
 /** The one error a verification link answers with (the client has one sentence for it). */
 export const LINK_INVALID = "LINK_INVALID";
 
@@ -142,6 +147,15 @@ router.all(
           // write (two accounts confirming one address at the same moment): not an error page on a
           // link somebody clicked — the same answer as "taken a while ago" (auth/mailbox-proof.ts).
           return c.redirect(`${c.env.APP_ORIGIN}${CHANGE_EMAIL_UNAVAILABLE}`, 302);
+        }
+        if (method === "GET" && relativePath.startsWith("/callback/") && isUniqueViolation(error)) {
+          // Two simultaneous first links of one provider identity: the loser's insert met the
+          // unique index on (provider_id, account_id). On its sign-in path Better Auth catches
+          // that itself and answers `unable_to_link_account`; on the explicit-link path it does
+          // not (oauth2/link-account.mjs `linkOAuthAccount`). The same answer here: the identity
+          // IS linked (by the request that won) — sign in. Never an error page on a redirect.
+          count("auth", { outcome: "failed", kind: "google", reason: "already_linked" });
+          return c.redirect(`${c.env.APP_ORIGIN}${ALREADY_LINKED}`, 302);
         }
         count("auth", { outcome: "error" });
         reportError(error, { kind: "auth_handler" });

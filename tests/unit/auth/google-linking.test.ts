@@ -490,6 +490,40 @@ describe("races around the cleanup and the link", () => {
     };
   }
 
+  // R12 — two simultaneous first links of one Google identity: the loser's INSERT meets the
+  // unique index on (provider_id, account_id). On the explicit-link path Better Auth does not
+  // catch that (oauth2/link-account.mjs `linkOAuthAccount`: `createAccount` is outside any
+  // try), so it reached the route as an unknown failure — a JSON 500 on a page the person was
+  // redirected to. Made deterministic here: the trigger raises exactly what the index raises.
+  it("the loser of two simultaneous links (a unique violation on the callback) is sent to sign-in as 'already linked' — not a 500", async () => {
+    const owner = await verifiedUser();
+    const remove = await atTheLink(
+      owner.user.id,
+      "BEFORE",
+      `RAISE EXCEPTION 'duplicate key value violates unique constraint' USING ERRCODE = 'unique_violation';`,
+    );
+    let landed: Awaited<ReturnType<typeof google>>;
+    try {
+      landed = await google(owner.client, profileFor(owner.email), "/api/auth/link-social");
+    } finally {
+      await remove();
+    }
+    expect(landed.callback.status, landed.callback.text).toBe(302);
+    expect(landed.callback.headers.get("location")).toBe(
+      "http://localhost/login?error=unable_to_link_account",
+    );
+    // Nothing half-done: no Google row, and the owner's session is as it was.
+    expect((await accountsOf(owner.user.id)).map((a) => a.providerId)).toEqual(["credential"]);
+    expect((await getSession(owner.client))?.user.id).toBe(owner.user.id);
+    // Control: without the collision the same request links.
+    const again = await google(owner.client, profileFor(owner.email), "/api/auth/link-social");
+    expect(again.error).toBeNull();
+    expect((await accountsOf(owner.user.id)).map((a) => a.providerId).sort()).toEqual([
+      "credential",
+      "google",
+    ]);
+  });
+
   async function victimArrives(email: string) {
     const victim = newClient();
     expect((await intent(victim, await createInvite())).status).toBe(200);
