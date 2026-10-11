@@ -468,7 +468,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `Someone who was already past your password, or already signed in to your Holdfast account, entered several wrong two-factor codes. Codes are not accepted for the next ${d.minutes} minutes; after that they work again.`,
+        text: `Someone who was already past your password, or already signed in to your Holdfast account, entered several wrong two-factor codes. For up to ${d.minutes} minutes, codes are not accepted from browsers that have not signed in to your account with a code before; a browser you have used before still works.`,
       },
       { text: NOT_YOU },
     ],

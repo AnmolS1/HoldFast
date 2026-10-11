@@ -30,6 +30,7 @@ import {
   clearUnprovenAccount,
   deleteTrustedDevices,
   ensureUserPrefs,
+  forgetKnownDevices,
   getAccount,
   getAccountByEmail,
   releaseSignup,
@@ -588,11 +589,10 @@ export function buildHooks(scope: AuthScope) {
       // "Remember this device" does not outlive the password it was granted under.
       const userId = ctx.context.session?.user.id;
       if (userId)
-        await quietly(
-          env,
-          "trusted_devices",
-          async () => void (await deleteTrustedDevices(scope.db, userId)),
-        );
+        await quietly(env, "trusted_devices", async () => {
+          await deleteTrustedDevices(scope.db, userId);
+          await forgetKnownDevices(scope.db, userId);
+        });
       return;
     }
     if (path === "/get-session") {

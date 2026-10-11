@@ -21,7 +21,7 @@ import { betterAuth } from "better-auth";
 import { APIError } from "better-auth/api";
 import { admin, captcha, twoFactor } from "better-auth/plugins";
 import type { Db } from "../db/client";
-import { deleteTrustedDevices } from "../db/queries/auth-lifecycle";
+import { deleteTrustedDevices, forgetKnownDevices } from "../db/queries/auth-lifecycle";
 import * as schema from "../db/schema";
 import { scheduleDeletion } from "../services/account-state";
 import {
@@ -163,6 +163,8 @@ export function buildAuthOptions(scope: AuthScope) {
         scope.facts.passwordResetUserId = user.id;
         // "Remember this device" does not outlive the password it was granted under.
         await deleteTrustedDevices(db, user.id);
+        // …and neither does a browser's standing as a "known device" (auth/second-factor.ts).
+        await forgetKnownDevices(db, user.id);
       },
     },
     emailVerification: {
@@ -332,8 +334,9 @@ export function buildAuthOptions(scope: AuthScope) {
         totpOptions: { digits: 6, period: 30 },
         backupCodeOptions: { amount: 10, length: 10 },
         // The plugin's own lock reads the counter, checks and then counts — and only for the
-        // sign-in challenge. auth/second-factor.ts keeps the account's attempt budget instead,
-        // in one statement, for every way a code can be offered.
+        // sign-in challenge — and it LOCKS the account. auth/second-factor.ts keeps the attempt
+        // budgets instead (one statement, every way a code can be offered, no lock). Must stay
+        // off: nothing else reads `two_factor.locked_until` any more.
         accountLockout: { enabled: false },
       }),
       admin({

@@ -1,4 +1,4 @@
-// Two small signed cookies of our own, beside Better Auth's:
+// Three small signed cookies of our own, beside Better Auth's:
 //
 //   hf_intent    set by POST /api/auth-intent before a Google sign-up: the person has stated
 //                their age and accepted the terms (and named an invite). Read once by the
@@ -12,8 +12,17 @@
 //                session — and what lets the verification link keep the password and sign this
 //                browser in (auth/mailbox-proof.ts): opened anywhere else, the link proves the
 //                mailbox only. 1 hour, and it works only while the account is unverified.
+//   hf_device    set when a second-factor code of an account is ACCEPTED from this browser
+//                (auth/second-factor.ts): "this browser has passed that account's second factor
+//                before". It names the account and a random device id, and counts only while
+//                the row of that device id exists (deleted on a password change or reset and on
+//                any two-factor change). It buys ONE thing: wrong codes sent with it are counted
+//                on this browser's own small budget instead of the account-wide one for browsers
+//                nobody has seen — so a flood of wrong codes from elsewhere cannot keep the
+//                owner's own browser out. It never skips a factor and never grants a mark.
+//                90 days.
 //
-// Both are `HttpOnly; SameSite=Lax; Path=/`, and on an https origin `Secure` with the `__Host-`
+// All are `HttpOnly; SameSite=Lax; Path=/`, and on an https origin `Secure` with the `__Host-`
 // name prefix (`COOKIE_HOST_PREFIX` below — the same prefix Better Auth's cookies get), and are
 // a base64url JSON payload
 // plus an HMAC-SHA256 under a purpose key of their own (services/keys.ts) — signed, not
@@ -43,6 +52,13 @@ export const PENDING_COOKIE: CookieSpec = {
   // that signed up from any other browser that opens the mailed link.
   path: "/",
   maxAge: 3600,
+  purpose: "account-action",
+};
+
+export const DEVICE_COOKIE: CookieSpec = {
+  base: "hf_device",
+  path: "/",
+  maxAge: 90 * 24 * 60 * 60,
   purpose: "account-action",
 };
 
@@ -250,4 +266,34 @@ export async function readPending(
   if (!payload || typeof payload.m !== "string" || typeof payload.u !== "string") return null;
   if (typeof payload.c !== "number" || !Number.isInteger(payload.c) || payload.c < 0) return null;
   return { email: payload.m, userId: payload.u, changes: payload.c };
+}
+
+// ── the known device ────────────────────────────────────────────────────────────────────────
+
+/** A browser that has passed `userId`'s second factor; `deviceId` names its server-side row. */
+export type KnownDevice = { userId: string; deviceId: string };
+
+export async function mintDevice(keys: Keys, who: KnownDevice, at: Date): Promise<string> {
+  return sign(keys, DEVICE_COOKIE, {
+    e: Math.floor(at.getTime() / 1000) + DEVICE_COOKIE.maxAge,
+    u: who.userId,
+    d: who.deviceId,
+  });
+}
+
+export async function readDevice(
+  env: Pick<Env, "APP_ORIGIN">,
+  keys: Keys,
+  cookieHeader: string | null | undefined,
+  at: Date,
+): Promise<KnownDevice | null> {
+  const payload = await verify(
+    keys,
+    DEVICE_COOKIE,
+    readCookie(cookieHeader, cookieName(env, DEVICE_COOKIE)),
+    at,
+  );
+  if (!payload || typeof payload.u !== "string" || payload.u === "") return null;
+  if (typeof payload.d !== "string" || !/^[A-Za-z0-9_-]{16,64}$/.test(payload.d)) return null;
+  return { userId: payload.u, deviceId: payload.d };
 }

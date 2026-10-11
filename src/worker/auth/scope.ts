@@ -55,7 +55,10 @@ export type AuthFacts = {
     sessionId: string | null;
     mode: "sign_in" | "step_up" | "enrolment";
     method: "totp" | "backup_code";
-    lockedNow: boolean;
+    /** The budget this attempt was counted on, and whether it is a known device's own. */
+    budget: { key: string; known: boolean };
+    /** This attempt used the last one its budget had in the window. */
+    exhaustedNow: boolean;
     grantsNewSession: boolean;
     /** Positive proof that THIS request presented a valid factor (auth/second-factor.ts). */
     proved: boolean;

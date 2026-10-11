@@ -18,20 +18,23 @@ import { createScope } from "../../../src/worker/auth/scope";
 import {
   afterSecondFactor,
   ENROL_PROOF_S,
-  SECOND_FACTOR_LOCK_S,
+  maxGuessesPerWindow,
+  SECOND_FACTOR_DEVICE_ATTEMPTS,
   SECOND_FACTOR_MAX_AGE_MS,
   SECOND_FACTOR_MAX_ATTEMPTS,
+  SECOND_FACTOR_WINDOW_S,
   VERIFY_BACKUP_CODE_PATH,
   VERIFY_TOTP_PATH,
 } from "../../../src/worker/auth/second-factor";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
-import { session, twoFactor, user, verification } from "../../../src/worker/db/schema";
+import { rateLimit, session, twoFactor, user, verification } from "../../../src/worker/db/schema";
 import {
   auditRows,
   CAPTCHA,
   enableTotp,
   freshIp,
   linkIn,
+  mailTo,
   newClient,
   nextTotp,
   PASSWORD,
@@ -64,6 +67,35 @@ async function adminWithTotp() {
   expect(await sessionsOf(made.user.id)).toEqual([]);
   return { ...made, id: made.user.id, totpURI, backupCodes };
 }
+
+const DEVICE = "hf_device";
+const THROTTLED = "SECOND_FACTOR_THROTTLED";
+/** The second-factor budgets of an account (rows of `rate_limit`), by what they are for. */
+async function budgets(userId: string) {
+  const rows = await testDb()
+    .select()
+    .from(rateLimit)
+    .where(like(rateLimit.key, `2fa:${userId}:%`));
+  return {
+    /** Counted attempts from browsers nobody has seen — the account-wide budget. */
+    account: rows.find((row) => row.key === `2fa:${userId}:new`)?.count ?? 0,
+    devices: rows.filter((row) => row.key.startsWith(`2fa:${userId}:dev:`)).map((row) => row.count),
+    rows,
+  };
+}
+/** As if the budgets' window had begun `seconds` earlier. */
+async function ageBudgets(userId: string, seconds: number) {
+  for (const row of (await budgets(userId)).rows) {
+    await testDb()
+      .update(rateLimit)
+      .set({ lastRequest: row.lastRequest - seconds * 1000 })
+      .where(eq(rateLimit.id, row.id));
+  }
+}
+const knownDeviceRows = async (userId: string) =>
+  (await testDb().select().from(verification).where(like(verification.identifier, "known-device:%"))).filter(
+    (row) => row.value === userId,
+  );
 
 /** The one session of `userId`, straight from the table. */
 async function onlySession(userId: string) {
@@ -422,8 +454,34 @@ describe("step-up: a code on a session that exists", () => {
     expect(right.status, right.text).toBe(200);
   });
 
-  it(`after ${SECOND_FACTOR_MAX_ATTEMPTS} wrong codes the account is locked: even the right code is refused — audited, mailed, and bounded`, async () => {
+  it("under pressure from clients it has never seen, the owner at a browser that has passed the factor still gets in (R4)", async () => {
+    const admin = await adminWithTotp();
+    // The owner's own browser: it has passed this account's second factor before.
+    const owner = newClient();
+    await signInWithCode(owner, admin.email, admin.totpURI);
+    await send(owner, "/api/auth/sign-out", { json: {} });
+    // An attacker who knows the password (or holds any session): wrong codes, from fresh clients,
+    // for as long as they like.
+    for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS + 3; attempt++) {
+      const attacker = newClient();
+      expect((await signIn(attacker, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+      const sent = await send(attacker, `/api/auth${VERIFY_TOTP_PATH}`, {
+        json: { code: String(600000 + attempt) },
+      });
+      expect(sent.status, `attempt ${attempt + 1}`).toBe(attempt < SECOND_FACTOR_MAX_ATTEMPTS ? 401 : 429);
+    }
+    // The owner is not refused: password, then the right code, at the known browser.
+    expect((await signIn(owner, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+    const right = await send(owner, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(admin.totpURI) },
+    });
+    expect(right.status, right.text).toBe(200);
+    expect((await adminCall(owner)).status).toBe(200);
+  });
+
+  it(`a browser nobody has seen is bounded: ${SECOND_FACTOR_MAX_ATTEMPTS} wrong codes per window for the whole account, then even the right code is refused from such a browser — audited, mailed once, and over when the window ends`, async () => {
     const { admin, client } = await googleSession();
+    expect(client.cookies.has(DEVICE)).toBe(false);
     for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS; attempt++) {
       // A guesser spreads over addresses; the limit is on the ACCOUNT.
       client.ip = freshIp();
@@ -432,19 +490,20 @@ describe("step-up: a code on a session that exists", () => {
       });
       expect(sent.status, `attempt ${attempt + 1}: ${sent.text}`).toBe(401);
     }
-    const lockRow = async () =>
-      (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id)))[0]!;
-    expect((await lockRow()).failedVerificationCount).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
-    const until = (await lockRow()).lockedUntil!.getTime();
-    expect(until).toBeGreaterThan(Date.now() + (SECOND_FACTOR_LOCK_S - 60) * 1000);
-    expect(until).toBeLessThanOrEqual(Date.now() + (SECOND_FACTOR_LOCK_S + 60) * 1000);
+    expect((await budgets(admin.id)).account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    // Nothing is written on the enrolment: there is no lock on the account.
+    const [enrolment] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
+    expect(enrolment!.lockedUntil).toBeNull();
 
     client.ip = freshIp();
     const right = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, {
       json: { code: await nextTotp(admin.totpURI) },
     });
     expect(right.status).toBe(429);
-    expect(right.body).toMatchObject({ code: "ACCOUNT_TEMPORARILY_LOCKED" });
+    expect(right.body).toMatchObject({ code: THROTTLED });
+    const wait = Number(right.headers.get("retry-after"));
+    expect(wait).toBeGreaterThan(SECOND_FACTOR_WINDOW_S - 60);
+    expect(wait).toBeLessThanOrEqual(SECOND_FACTOR_WINDOW_S);
     expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
     expectNeedsSecondFactor(await adminCall(client));
     // A backup code is refused for as long, on the same budget — and is not used up by it.
@@ -453,7 +512,7 @@ describe("step-up: a code on a session that exists", () => {
       json: { code: admin.backupCodes[2] },
     });
     expect(backup.status).toBe(429);
-    // The lock holds for a NEW session and for the sign-in challenge too (one budget per account).
+    // The same budget for a NEW session and for the sign-in challenge, from another new browser.
     const elsewhere = newClient();
     expect((await signIn(elsewhere, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
     const challenge = await send(elsewhere, `/api/auth${VERIFY_TOTP_PATH}`, {
@@ -461,30 +520,30 @@ describe("step-up: a code on a session that exists", () => {
     });
     expect(challenge.status).toBe(429);
     expect(elsewhere.cookies.has("hf.session_token")).toBe(false);
+    // A refused attempt is not counted, and looks at nothing.
+    expect((await budgets(admin.id)).account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
 
-    // Audited without any code, and the owner is told.
+    // Audited without any code, and the owner is told — once.
     const failed = await auditRows({ action: "auth.second_factor_failed", targetId: admin.id });
     expect(failed).toHaveLength(SECOND_FACTOR_MAX_ATTEMPTS);
     expect(JSON.stringify(failed)).not.toMatch(/10000\d/);
-    expect(await auditRows({ action: "auth.second_factor_locked", targetId: admin.id })).toHaveLength(1);
+    expect(await auditRows({ action: "auth.second_factor_exhausted", targetId: admin.id })).toHaveLength(1);
     const mail = await waitForMail(admin.email, "secondFactorLocked");
     expect(mail.text).toContain("15 minutes");
 
-    // Bounded: once the lock has run out, codes work again and the count starts over.
-    await testDb()
-      .update(twoFactor)
-      .set({ lockedUntil: new Date(Date.now() - 1000) })
-      .where(eq(twoFactor.userId, admin.id));
+    // A real window: once it has ended, codes work again from such a browser, and the count
+    // has started over.
+    await ageBudgets(admin.id, SECOND_FACTOR_WINDOW_S + 1);
     client.ip = freshIp();
     const later = await send(client, `/api/auth${VERIFY_BACKUP_CODE_PATH}`, {
       json: { code: admin.backupCodes[2] },
     });
     expect(later.status, later.text).toBe(200);
-    expect(await lockRow()).toMatchObject({ failedVerificationCount: 0, lockedUntil: null });
+    expect((await budgets(admin.id)).account).toBe(0);
     expect((await adminCall(client)).status).toBe(200);
   });
 
-  it("fifty wrong codes at the same moment: no more than the cap are even looked at, and the right code sent with them is refused once it is spent", async () => {
+  it("fifty wrong codes at the same moment: no more than the cap are even looked at, the right code sent with them from a new browser is refused — and ONE mail", async () => {
     const { admin, client } = await googleSession();
     const from = (code: string) =>
       send({ ...client, ip: freshIp(), cookies: new Map(client.cookies) }, `/api/auth${VERIFY_TOTP_PATH}`, {
@@ -493,14 +552,12 @@ describe("step-up: a code on a session that exists", () => {
     const answers = await Promise.all(Array.from({ length: 50 }, (_, index) => from(String(300000 + index))));
     const statuses = answers.map((answer) => answer.status);
     const lookedAt = statuses.filter((status) => status === 401).length;
-    const locked = answers.filter(
-      (answer) =>
-        answer.status === 429 && (answer.body as { code?: string })?.code === "ACCOUNT_TEMPORARILY_LOCKED",
+    const throttled = answers.filter(
+      (answer) => answer.status === 429 && (answer.body as { code?: string })?.code === THROTTLED,
     ).length;
     expect(lookedAt, statuses.join(",")).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
-    expect(locked).toBe(50 - SECOND_FACTOR_MAX_ATTEMPTS);
-    const [row] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
-    expect(row!.failedVerificationCount).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    expect(throttled).toBe(50 - SECOND_FACTOR_MAX_ATTEMPTS);
+    expect((await budgets(admin.id)).account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
     expect(await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).toHaveLength(
       SECOND_FACTOR_MAX_ATTEMPTS,
     );
@@ -513,15 +570,194 @@ describe("step-up: a code on a session that exists", () => {
     expect(more.every((answer) => answer.status === 429)).toBe(true);
     expect((await onlySession(admin.id)).secondFactorAt).toBeNull();
     expectNeedsSecondFactor(await adminCall(client));
+    await waitForMail(admin.email, "secondFactorLocked");
+    expect(mailTo(admin.email, "secondFactorLocked")).toHaveLength(1);
   });
 
-  it("the sign-in challenge spends the same budget, one per attempt — and its own correct code clears it", async () => {
+  it("the exhaustion mail is sent at most once per window, whatever number of budgets run out in it", async () => {
+    const admin = await adminWithTotp();
+    // A known device, in the wrong hands, and fresh clients: two budgets run out in one window.
+    const known = newClient();
+    await signInWithCode(known, admin.email, admin.totpURI);
+    await send(known, "/api/auth/sign-out", { json: {} });
+    for (const client of [known, newClient()]) {
+      await signIn(client, admin.email);
+      for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS + 1; attempt++) {
+        client.ip = freshIp();
+        await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: String(700000 + attempt) } });
+      }
+    }
+    expect(await auditRows({ action: "auth.second_factor_exhausted", targetId: admin.id })).toHaveLength(2);
+    await waitForMail(admin.email, "secondFactorLocked");
+    expect(mailTo(admin.email, "secondFactorLocked")).toHaveLength(1);
+    // The next window may announce again.
+    await ageBudgets(admin.id, SECOND_FACTOR_WINDOW_S + 1);
+    const again = newClient();
+    await signIn(again, admin.email);
+    for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS; attempt++) {
+      again.ip = freshIp();
+      await send(again, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: String(710000 + attempt) } });
+    }
+    await waitForMail(admin.email, "secondFactorLocked", 2);
+    expect(mailTo(admin.email, "secondFactorLocked")).toHaveLength(2);
+  });
+
+  it("the guess budget of an attacker with K stolen known-device proofs and unlimited fresh clients is bounded per window: 5 + 5K codes looked at", async () => {
+    const admin = await adminWithTotp();
+    const STOLEN = 2;
+    expect(maxGuessesPerWindow(STOLEN)).toBe(15);
+    expect(maxGuessesPerWindow(STOLEN)).toBe(
+      SECOND_FACTOR_MAX_ATTEMPTS + STOLEN * SECOND_FACTOR_DEVICE_ATTEMPTS,
+    );
+    // Three browsers of the owner's have passed the factor; the attacker has copied the proof of two.
+    const browsers: Client[] = [];
+    for (let n = 0; n < STOLEN + 1; n++) {
+      const browser = newClient();
+      await signInWithCode(browser, admin.email, admin.totpURI);
+      expect(browser.cookies.has(DEVICE)).toBe(true);
+      await send(browser, "/api/auth/sign-out", { json: {} });
+      browsers.push(browser);
+    }
+    // (and the browser that enrolled)
+    expect(await knownDeviceRows(admin.id)).toHaveLength(STOLEN + 2);
+    const stolen = browsers.slice(0, STOLEN).map((browser) => browser.cookies.get(DEVICE)!);
+    const ownersOwn = browsers[STOLEN]!;
+    // The attacker: every stolen proof, and no proof at all, in turn — far more than the bound.
+    let lookedAt = 0;
+    let refused = 0;
+    for (let attempt = 0; attempt < 3 * maxGuessesPerWindow(STOLEN); attempt++) {
+      const attacker = newClient();
+      const proof = [...stolen, null][attempt % (STOLEN + 1)];
+      if (proof) attacker.cookies.set(DEVICE, proof);
+      expect((await signIn(attacker, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+      const sent = await send(attacker, `/api/auth${VERIFY_TOTP_PATH}`, {
+        json: { code: String(800000 + attempt) },
+      });
+      if (sent.status === 401) lookedAt += 1;
+      else {
+        expect(sent.status, sent.text).toBe(429);
+        expect(sent.body).toMatchObject({ code: THROTTLED });
+        refused += 1;
+      }
+    }
+    expect(lookedAt).toBe(maxGuessesPerWindow(STOLEN));
+    expect(refused).toBe(2 * maxGuessesPerWindow(STOLEN));
+    const spent = await budgets(admin.id);
+    expect(spent.account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    // The owner's third browser has a budget nobody else has touched: no row, or an empty one.
+    expect(spent.devices.filter((count) => count > 0)).toEqual(
+      Array.from({ length: STOLEN }, () => SECOND_FACTOR_DEVICE_ATTEMPTS),
+    );
+    // …so the owner, there, still gets in.
+    expect((await signIn(ownersOwn, admin.email)).body).toMatchObject({ twoFactorRedirect: true });
+    const right = await send(ownersOwn, `/api/auth${VERIFY_TOTP_PATH}`, {
+      json: { code: await nextTotp(admin.totpURI) },
+    });
+    expect(right.status, right.text).toBe(200);
+  });
+
+  it("a proof is for ITS account, and counts only while its row exists: another account's, a forged one and a deleted one are a browser nobody has seen", async () => {
+    const admin = await adminWithTotp();
+    const other = await adminWithTotp();
+    const otherBrowser = newClient();
+    await signInWithCode(otherBrowser, other.email, other.totpURI);
+    const own = newClient();
+    await signInWithCode(own, admin.email, admin.totpURI);
+    await send(own, "/api/auth/sign-out", { json: {} });
+    const ownProof = own.cookies.get(DEVICE)!;
+    const [body, mac] = ownProof.split(".");
+    const forged = `${body}.${mac!.slice(0, -2)}${mac!.endsWith("AA") ? "BB" : "AA"}`;
+    let expected = 0;
+    for (const proof of [otherBrowser.cookies.get(DEVICE)!, forged]) {
+      const client = newClient();
+      client.cookies.set(DEVICE, proof);
+      await signIn(client, admin.email);
+      expect((await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: "900001" } })).status).toBe(
+        401,
+      );
+      expected += 1;
+      const spent = await budgets(admin.id);
+      expect(spent.account).toBe(expected);
+      expect(spent.devices.filter((count) => count > 0)).toEqual([]);
+    }
+    // Control: the real proof counts on its own budget.
+    const real = newClient();
+    real.cookies.set(DEVICE, ownProof);
+    await signIn(real, admin.email);
+    expect((await send(real, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: "900002" } })).status).toBe(401);
+    expect(await budgets(admin.id)).toMatchObject({ account: expected, devices: [1] });
+    // Its row deleted: the same cookie is a browser nobody has seen.
+    await testDb().delete(verification).where(eq(verification.value, admin.id));
+    const stale = newClient();
+    stale.cookies.set(DEVICE, ownProof);
+    await signIn(stale, admin.email);
+    expect((await send(stale, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: "900003" } })).status).toBe(
+      401,
+    );
+    expect(await budgets(admin.id)).toMatchObject({ account: expected + 1, devices: [1] });
+  });
+
+  it("every proof dies on a password reset, a password change, new backup codes, and switching the factor off", async () => {
+    const proofsAfter = async (
+      change: (admin: Awaited<ReturnType<typeof adminWithTotp>>, client: Client) => Promise<void>,
+    ) => {
+      const admin = await adminWithTotp();
+      const client = newClient();
+      await signInWithCode(client, admin.email, admin.totpURI);
+      // (the enrolling browser and this one)
+      expect((await knownDeviceRows(admin.id)).length).toBeGreaterThanOrEqual(2);
+      await change(admin, client);
+      return (await knownDeviceRows(admin.id)).length;
+    };
+    const ok = (sent: Awaited<ReturnType<typeof send>>) => expect(sent.status, sent.text).toBe(200);
+    expect(
+      await proofsAfter(async (admin) => {
+        await send(newClient(), "/api/auth/request-password-reset", {
+          json: { email: admin.email, redirectTo: "/reset-password" },
+          headers: CAPTCHA,
+        });
+        const follow = await send(newClient(), linkIn(await waitForMail(admin.email, "passwordReset")));
+        const token = new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!;
+        ok(
+          await send(newClient(), "/api/auth/reset-password", {
+            headers: CAPTCHA,
+            json: { newPassword: "a reset long passphrase 61!", token },
+          }),
+        );
+      }),
+      "password reset",
+    ).toBe(0);
+    expect(
+      await proofsAfter(async (_admin, client) =>
+        ok(
+          await send(client, "/api/auth/change-password", {
+            json: { currentPassword: PASSWORD, newPassword: "a changed long passphrase 5!" },
+          }),
+        ),
+      ),
+      "password change",
+    ).toBe(0);
+    expect(
+      await proofsAfter(async (_admin, client) =>
+        ok(
+          await send(client, "/api/auth/two-factor/generate-backup-codes", { json: { password: PASSWORD } }),
+        ),
+      ),
+      "new backup codes",
+    ).toBe(0);
+    expect(
+      await proofsAfter(async (_admin, client) =>
+        ok(await send(client, "/api/auth/two-factor/disable", { json: { password: PASSWORD } })),
+      ),
+      "two-factor off",
+    ).toBe(0);
+  });
+
+  it("the sign-in challenge spends the same budget, one per attempt — and a correct code gives back its own attempt, not the wrong ones", async () => {
     const admin = await adminWithTotp();
     const browser = newClient();
     await signIn(browser, admin.email);
-    const count = async () =>
-      (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id)))[0]!
-        .failedVerificationCount;
+    const count = async () => (await budgets(admin.id)).account;
     for (const code of ["500001", "500002"]) {
       expect((await send(browser, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code } })).status).toBe(401);
     }
@@ -535,20 +771,30 @@ describe("step-up: a code on a session that exists", () => {
       (await send(browser, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } }))
         .status,
     ).toBe(200);
-    expect(await count()).toBe(0);
+    expect(await count()).toBe(3);
+    // …and this browser is now a known device, with a budget of its own.
+    expect(browser.cookies.has(DEVICE)).toBe(true);
   });
 
-  it("a correct code starts the count again", async () => {
+  it("a window is a window: wrong codes do not add up across it (R10)", async () => {
     const { admin, client } = await googleSession();
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < SECOND_FACTOR_MAX_ATTEMPTS - 1; attempt++) {
+      client.ip = freshIp();
       await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: String(200000 + attempt) } });
     }
-    const count = async () =>
-      (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id)))[0]!
-        .failedVerificationCount;
-    expect(await count()).toBe(3);
-    await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: await nextTotp(admin.totpURI) } });
-    expect(await count()).toBe(0);
+    expect((await budgets(admin.id)).account).toBe(SECOND_FACTOR_MAX_ATTEMPTS - 1);
+    // The window began with the FIRST of them; a later attempt does not move its end.
+    await ageBudgets(admin.id, SECOND_FACTOR_WINDOW_S - 5);
+    client.ip = freshIp();
+    await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: "200010" } });
+    expect((await budgets(admin.id)).account).toBe(SECOND_FACTOR_MAX_ATTEMPTS);
+    await ageBudgets(admin.id, 10);
+    // Months later, as it were: one mistake is one mistake — nothing is refused, nobody is mailed.
+    client.ip = freshIp();
+    const sent = await send(client, `/api/auth${VERIFY_TOTP_PATH}`, { json: { code: "200011" } });
+    expect(sent.status).toBe(401);
+    expect((await budgets(admin.id)).account).toBe(1);
+    expect(await auditRows({ action: "auth.second_factor_exhausted", targetId: admin.id })).toHaveLength(1);
   });
 });
 
@@ -1037,9 +1283,14 @@ describe("the only writers of secondFactorAt (source scan)", () => {
   });
 });
 
-describe("fail-closed: the attempt count starts again only on proof of a valid factor", () => {
+describe("fail-closed: an attempt is given back only on proof of a valid factor", () => {
+  const cookiesSet: string[] = [];
   const ctxFor = (path: string, returned: unknown) =>
-    ({ path, context: { returned } }) as unknown as Parameters<typeof afterSecondFactor>[1];
+    ({
+      path,
+      context: { returned },
+      setCookie: (name: string) => void cookiesSet.push(name),
+    }) as unknown as Parameters<typeof afterSecondFactor>[1];
   const attemptOf = (
     account: { id: string; email: string },
     method: "totp" | "backup_code",
@@ -1050,23 +1301,30 @@ describe("fail-closed: the attempt count starts again only on proof of a valid f
     sessionId: null,
     mode: "sign_in" as const,
     method,
-    lockedNow: false,
+    budget: { key: `2fa:${account.id}:new`, known: false },
+    exhaustedNow: false,
     grantsNewSession: false,
     proved,
     backupCodesBefore,
     email: account.email,
     name: "x",
   });
-  const counted = async (userId: string) =>
-    (await testDb().select().from(twoFactor).where(eq(twoFactor.userId, userId)))[0]!;
-
-  it("an answer that is not an error but proves nothing — an unused backup code, an unverified TOTP — is refused, audited, and stays counted", async () => {
-    const admin = await adminWithTotp();
+  /** Three counted attempts on the account's budget, as three wrong codes leave it. */
+  async function threeCounted(userId: string) {
     await testDb()
-      .update(twoFactor)
-      .set({ failedVerificationCount: 3 })
-      .where(eq(twoFactor.userId, admin.id));
-    const stored = (await counted(admin.id)).backupCodes;
+      .delete(rateLimit)
+      .where(like(rateLimit.key, `2fa:${userId}:%`));
+    await testDb()
+      .insert(rateLimit)
+      .values({ id: crypto.randomUUID(), key: `2fa:${userId}:new`, count: 3, lastRequest: Date.now() });
+  }
+
+  it("an answer that is not an error but proves nothing — an unused backup code, an unverified TOTP — is refused, audited, stays counted, and makes no known device", async () => {
+    const admin = await adminWithTotp();
+    await threeCounted(admin.id);
+    const devicesBefore = (await knownDeviceRows(admin.id)).length;
+    const [stored] = await testDb().select().from(twoFactor).where(eq(twoFactor.userId, admin.id));
+    cookiesSet.length = 0;
     for (const [method, path] of [
       ["backup_code", VERIFY_BACKUP_CODE_PATH],
       ["totp", VERIFY_TOTP_PATH],
@@ -1076,7 +1334,12 @@ describe("fail-closed: the attempt count starts again only on proof of a valid f
         waitUntil: (promise) => void pending.push(promise),
         passThroughOnException() {},
       });
-      scope.facts.secondFactor = attemptOf(admin, method, method === "backup_code" ? stored : null, false);
+      scope.facts.secondFactor = attemptOf(
+        admin,
+        method,
+        method === "backup_code" ? stored!.backupCodes : null,
+        false,
+      );
       // The endpoint "succeeded" — and no code of this account was used, no TOTP step was proved.
       const thrown = await afterSecondFactor(scope, ctxFor(path, { token: "t", user: {} })).then(
         () => null,
@@ -1084,8 +1347,10 @@ describe("fail-closed: the attempt count starts again only on proof of a valid f
       );
       await Promise.allSettled(pending);
       expect(thrown, method).toMatchObject({ statusCode: 401 });
-      expect((await counted(admin.id)).failedVerificationCount, method).toBe(3);
+      expect((await budgets(admin.id)).account, method).toBe(3);
     }
+    expect(cookiesSet).toEqual([]);
+    expect((await knownDeviceRows(admin.id)).length).toBe(devicesBefore);
     expect(
       (await auditRows({ action: "auth.second_factor_failed", targetId: admin.id })).filter(
         (row) => (row.meta as { reason?: string }).reason === "unproven",
@@ -1093,20 +1358,21 @@ describe("fail-closed: the attempt count starts again only on proof of a valid f
     ).toHaveLength(2);
   });
 
-  it("the control: with the proof — a TOTP step we verified, or backup codes that changed — the count starts again", async () => {
+  it("the control: with the proof — a TOTP step we verified, or backup codes that changed — that one attempt is given back and the browser becomes a known device", async () => {
     const admin = await adminWithTotp();
     for (const [method, path, before, proved] of [
       ["totp", VERIFY_TOTP_PATH, null, true],
       ["backup_code", VERIFY_BACKUP_CODE_PATH, "what was stored before a code was used", false],
     ] as const) {
-      await testDb()
-        .update(twoFactor)
-        .set({ failedVerificationCount: 3 })
-        .where(eq(twoFactor.userId, admin.id));
+      await threeCounted(admin.id);
+      const devicesBefore = (await knownDeviceRows(admin.id)).length;
+      cookiesSet.length = 0;
       const scope = createScope(env, testDb(), { waitUntil() {}, passThroughOnException() {} });
       scope.facts.secondFactor = attemptOf(admin, method, before, proved);
       await afterSecondFactor(scope, ctxFor(path, { token: "t", user: {} }));
-      expect((await counted(admin.id)).failedVerificationCount, method).toBe(0);
+      expect((await budgets(admin.id)).account, method).toBe(2);
+      expect(cookiesSet, method).toEqual([DEVICE]);
+      expect((await knownDeviceRows(admin.id)).length, method).toBe(devicesBefore + 1);
     }
   });
 });

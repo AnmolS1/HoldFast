@@ -735,44 +735,109 @@ export async function secondFactorState(
 }
 
 /**
- * Admits ONE attempt at the account's second factor, or refuses it — in a single statement, so
- * that any number of simultaneous attempts are admitted at most `cap` times: the attempt is
- * COUNTED HERE, before its code is looked at, and the statement matches no row while the account
- * is locked. The attempt that brings the count to `cap` sets the lock (`lockSeconds` from now).
- * A lock that has run out starts a new count. Returns null when refused (locked, or no enrolment).
- *
- * The columns are the two-factor plugin's own; its own accounting is switched off
- * (create-auth.ts `accountLockout`), so this is the one budget for the sign-in challenge and the
- * step-up, for TOTP and backup codes, across every session and address.
- * (`now() AT TIME ZONE 'UTC'`: Better Auth's timestamp columns carry no zone.)
+ * Admits ONE attempt on a second-factor budget (auth/second-factor.ts), or refuses it — in a
+ * single statement, so that any number of simultaneous attempts are admitted at most `cap` times
+ * in a window. The attempt is COUNTED HERE, before its code is looked at. The budget is a row of
+ * `rate_limit` under `key`: `last_request` is when its window BEGAN (the first counted attempt),
+ * and the count starts again once `windowSeconds` have passed since then — a real window: old
+ * mistakes do not add up for ever. The clock is the database's.
+ * Admitted: the count including this attempt. Refused: how long until the window ends.
  */
 export async function admitSecondFactorAttempt(
   db: Executor,
-  userId: string,
+  key: string,
   cap: number,
-  lockSeconds: number,
-): Promise<{ count: number; lockedNow: boolean } | null> {
-  const result = await db.execute<{ count: number; locked: boolean }>(sql`
-    UPDATE ${twoFactor} SET
-      failed_verification_count =
-        CASE WHEN locked_until IS NOT NULL THEN 1 ELSE coalesce(failed_verification_count, 0) + 1 END,
-      locked_until =
-        CASE WHEN (CASE WHEN locked_until IS NOT NULL THEN 1 ELSE coalesce(failed_verification_count, 0) + 1 END) >= ${cap}
-             THEN (now() AT TIME ZONE 'UTC') + make_interval(secs => ${lockSeconds})
-             ELSE NULL END
-    WHERE user_id = ${userId}
-      AND (locked_until IS NULL OR locked_until <= (now() AT TIME ZONE 'UTC'))
-    RETURNING failed_verification_count AS count, (locked_until IS NOT NULL) AS locked`);
+  windowSeconds: number,
+): Promise<{ ok: true; count: number } | { ok: false; retryAfterSeconds: number }> {
+  const windowMs = windowSeconds * 1000;
+  const result = await db.execute<{ admitted: number | null; wait_ms: string | number | null }>(sql`
+    WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
+    held AS (
+      SELECT r.last_request + ${windowMs} - clock.ms AS wait_ms FROM rate_limit r, clock WHERE r.key = ${key}
+    ),
+    admitted AS (
+      INSERT INTO rate_limit AS r (id, key, count, last_request)
+      SELECT gen_random_uuid()::text, ${key}, 1, clock.ms FROM clock
+      ON CONFLICT (key) DO UPDATE SET
+        count = CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN 1 ELSE r.count + 1 END,
+        last_request =
+          CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN (SELECT ms FROM clock)
+               ELSE r.last_request END
+      WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs} OR r.count < ${cap}
+      RETURNING r.count
+    )
+    SELECT (SELECT count FROM admitted) AS admitted, (SELECT wait_ms FROM held) AS wait_ms`);
   const row = result.rows[0];
-  return row ? { count: Number(row.count), lockedNow: row.locked === true } : null;
+  if (row && row.admitted !== null) return { ok: true, count: Number(row.admitted) };
+  const waitMs = row?.wait_ms != null ? Number(row.wait_ms) : windowMs;
+  return {
+    ok: false,
+    retryAfterSeconds: Math.min(windowSeconds, Math.max(1, Math.ceil(waitMs / 1000))),
+  };
 }
 
-/** A correct code: the count of attempts starts again, and a lock set by this very attempt is lifted. */
-export async function resetSecondFactorAttempts(db: Executor, userId: string): Promise<void> {
-  await db
-    .update(twoFactor)
-    .set({ failedVerificationCount: 0, lockedUntil: null })
-    .where(eq(twoFactor.userId, userId));
+/**
+ * A correct code: THIS attempt is given back to the budget it was counted on — one, never more
+ * (the wrong codes others sent in the same window stay counted).
+ */
+export async function returnSecondFactorAttempt(
+  db: Executor,
+  key: string,
+  windowSeconds: number,
+): Promise<void> {
+  await db.execute(sql`
+    UPDATE rate_limit SET count = greatest(count - 1, 0)
+    WHERE key = ${key}
+      AND last_request > (extract(epoch FROM clock_timestamp()) * 1000)::bigint - ${windowSeconds * 1000}`);
+}
+
+/**
+ * True for exactly ONE caller per `windowSeconds` and `key` (one statement, arbitrated by the
+ * unique key): "has this already been announced in this window?".
+ */
+export async function claimOncePerWindow(db: Executor, key: string, windowSeconds: number): Promise<boolean> {
+  const windowMs = windowSeconds * 1000;
+  const result = await db.execute(sql`
+    WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms)
+    INSERT INTO rate_limit AS r (id, key, count, last_request)
+    SELECT gen_random_uuid()::text, ${key}, 1, clock.ms FROM clock
+    ON CONFLICT (key) DO UPDATE SET count = 1, last_request = (SELECT ms FROM clock)
+    WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs}
+    RETURNING r.key`);
+  return result.rows.length > 0;
+}
+
+// "This browser has passed the account's second factor before" (auth/signed-cookie.ts
+// `hf_device`): a `verification` row `known-device:<deviceId>` whose VALUE is the user id — so
+// every "delete what names this user" removes it, and `forgetKnownDevices` ends them all.
+const knownDeviceIdentifier = (deviceId: string) => `known-device:${deviceId}`;
+
+export async function putKnownDevice(
+  db: Executor,
+  device: { id: string; deviceId: string; userId: string; expiresAt: Date },
+): Promise<void> {
+  const at = new Date();
+  await db.insert(verification).values({
+    id: device.id,
+    identifier: knownDeviceIdentifier(device.deviceId),
+    value: device.userId,
+    expiresAt: device.expiresAt,
+    createdAt: at,
+    updatedAt: at,
+  });
+}
+
+export async function isKnownDevice(db: Executor, deviceId: string, userId: string): Promise<boolean> {
+  return hasAuthMarker(db, knownDeviceIdentifier(deviceId), userId);
+}
+
+/** Every known-device proof of the account stops counting. Returns how many there were. */
+export async function forgetKnownDevices(db: Executor, userId: string): Promise<number> {
+  const rows = await db
+    .delete(verification)
+    .where(and(eq(verification.value, userId), like(verification.identifier, "known-device:%")))
+    .returning({ id: verification.id });
+  return rows.length;
 }
 
 const totpStepIdentifier = (userId: string) => `totp-step:${userId}`;

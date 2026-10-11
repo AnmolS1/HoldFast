@@ -63,14 +63,38 @@
 // sent or compared), and `viewBackupCodes` is server-only (no route).
 //
 // ── WHAT A CODE HAS TO GET PAST, in this order (`beforeSecondFactor`) ─────────────────────────
-//   a. the ATTEMPT BUDGET — per ACCOUNT, atomic. `admitSecondFactorAttempt` is one UPDATE that
-//      counts the attempt and matches no row while the account is locked, so N simultaneous
-//      guesses are admitted at most SECOND_FACTOR_MAX_ATTEMPTS times in a window, whatever
-//      sessions and addresses they come from. The attempt that uses the last one locks the
-//      account for SECOND_FACTOR_LOCK_S; a correct code clears the count. One budget for sign-in
-//      and step-up, TOTP and backup codes. (Better Auth's own lock is check-then-count, applies
-//      to the sign-in challenge only, and is switched off: create-auth.ts `accountLockout`.)
-//      The lock is bounded (it lifts by itself), audited, and the owner is mailed.
+//   a. the ATTEMPT BUDGET — counted before the code is looked at, in one statement
+//      (`admitSecondFactorAttempt`), so N simultaneous guesses are admitted at most the cap. One
+//      accounting for the sign-in challenge, the step-up and the enrolment, for TOTP and backup
+//      codes. (Better Auth's own lock is check-then-count, applies to the sign-in challenge only,
+//      and is switched off: create-auth.ts `accountLockout`.) There are two kinds of budget, and
+//      NO LOCK ON THE ACCOUNT:
+//        - a browser NOBODY HAS SEEN (no valid known-device proof for this account): ONE budget
+//          for the whole account — SECOND_FACTOR_MAX_ATTEMPTS per SECOND_FACTOR_WINDOW_S,
+//          whatever sessions and addresses the attempts come from. It has to be account-wide: a
+//          six-digit code cannot be protected by a per-client limit (fresh clients are free, so
+//          "N per client" is no bound at all).
+//        - a KNOWN DEVICE — a browser from which a code of this account was accepted before. It
+//          holds the signed `hf_device` cookie (auth/signed-cookie.ts: `__Host-`, HttpOnly, bound
+//          to the account and to a device id whose row must still exist) and has a budget OF ITS
+//          OWN: SECOND_FACTOR_DEVICE_ATTEMPTS per window, per device. Nothing anybody else does
+//          is counted on it — so wrong codes from elsewhere, however many, never keep the owner
+//          at a browser they have used before from answering with the right code.
+//      A window is real: it begins with the first counted attempt and ends SECOND_FACTOR_WINDOW_S
+//      later, and the count starts again — mistakes do not add up across days. A correct code
+//      gives back its own attempt, nothing more.
+//      WHAT A GUESSER GETS, per window: with K stolen known-device proofs and any number of
+//      fresh clients, at most SECOND_FACTOR_MAX_ATTEMPTS + K × SECOND_FACTOR_DEVICE_ATTEMPTS
+//      codes are looked at (`maxGuessesPerWindow`). A proof stops counting when its row is
+//      deleted: on a password change or reset and on any two-factor change (off, new backup
+//      codes, a new enrolment) — the browser that then passes the factor gets a new one.
+//      The proof buys the budget and nothing else: it never skips the factor and never marks a
+//      session (it is not Better Auth's "trust this device").
+//      When a budget runs out the owner is mailed — at most once per window per account
+//      (`claimOncePerWindow`) — and the event is audited (`auth.second_factor_exhausted`).
+//      RESIDUAL: while the account-wide budget is exhausted, the owner at a browser that has
+//      never passed the factor (a new device) is refused like the guesser, for at most one
+//      window at a time; a browser they have used before is not.
 //   b. for TOTP, OUR OWN verification against the stored secret (constant-time, the current
 //      30-second step and the one either side), which says WHICH step the code belongs to — and
 //      then REPLAY protection: `acceptTotpStep` records the step under the account's row lock
@@ -80,6 +104,7 @@
 //   (backup-codes/index.mjs: `where backupCodes = <the value read>`), so one works once.
 //
 // ── WHEN THE MARK IS TAKEN AWAY ───────────────────────────────────────────────────────────────
+// (The known-device proofs go on a password change or reset and on any two-factor change.)
 // By age (SECOND_FACTOR_MAX_AGE_MS), and at once on: a role change of the account, a password
 // change or reset (Better Auth replaces or deletes the sessions), any two-factor change (on,
 // off, new backup codes) for every OTHER session, and the end of an impersonation (the admin's
@@ -92,13 +117,17 @@ import { hasAdminRole } from "../../shared/roles";
 import {
   acceptTotpStep,
   admitSecondFactorAttempt,
+  claimOncePerWindow,
   clearSecondFactor,
   deleteAuthMarker,
+  forgetKnownDevices,
   forgetTotpStep,
   hasAuthMarker,
+  isKnownDevice,
   passkeyByCredential,
   putAuthMarker,
-  resetSecondFactorAttempts,
+  putKnownDevice,
+  returnSecondFactorAttempt,
   secondFactorState,
   stampSecondFactor,
 } from "../db/queries/auth-lifecycle";
@@ -107,16 +136,22 @@ import { now } from "../services/clock";
 import { sendSecondFactorLocked } from "../services/email";
 import { record } from "./observe";
 import { afterAnswer, type AuthScope } from "./scope";
+import { cookieAttributes, cookieName, DEVICE_COOKIE, mintDevice, readDevice } from "./signed-cookie";
 
 export const VERIFY_TOTP_PATH = "/two-factor/verify-totp";
 export const VERIFY_BACKUP_CODE_PATH = "/two-factor/verify-backup-code";
 export const PASSKEY_SIGN_IN_PATH = "/passkey/verify-authentication";
 const CODE_PATHS = new Set([VERIFY_TOTP_PATH, VERIFY_BACKUP_CODE_PATH]);
 
-/** Attempts at an account's second factor before it is locked; a correct code starts the count again. */
+/** Codes looked at per window from browsers that hold no known-device proof — for the whole ACCOUNT. */
 export const SECOND_FACTOR_MAX_ATTEMPTS = 5;
-/** How long a locked account refuses codes. Bounded: it lifts by itself. */
-export const SECOND_FACTOR_LOCK_S = 15 * 60;
+/** Codes looked at per window from ONE known device, on its own budget. */
+export const SECOND_FACTOR_DEVICE_ATTEMPTS = 5;
+/** The window of both budgets: it begins with the first counted attempt. */
+export const SECOND_FACTOR_WINDOW_S = 15 * 60;
+/** The most codes looked at in one window for an account of which `stolenProofs` known-device proofs are in other hands. */
+export const maxGuessesPerWindow = (stolenProofs: number) =>
+  SECOND_FACTOR_MAX_ATTEMPTS + stolenProofs * SECOND_FACTOR_DEVICE_ATTEMPTS;
 /** How old a session's second factor may be for an admin action. */
 export const SECOND_FACTOR_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 /** How long after proving the password an enrolment's confirmation still marks the session. */
@@ -128,10 +163,9 @@ const TOTP_WINDOW = 1;
 
 /** Better Auth's own codes and sentences (plugins/two-factor/error-code.mjs). */
 const INVALID_CODE = { code: "INVALID_CODE", message: "Invalid code" } as const;
-const LOCKED = {
-  code: "ACCOUNT_TEMPORARILY_LOCKED",
-  message:
-    "Too many failed verification attempts. Your account is temporarily locked. Please try again later.",
+export const SECOND_FACTOR_THROTTLED = {
+  code: "SECOND_FACTOR_THROTTLED",
+  message: "Too many wrong codes. Wait a while, or use a browser you have signed in from before.",
 } as const;
 const NOT_AVAILABLE = {
   code: "SECOND_FACTOR_NOT_AVAILABLE",
@@ -142,6 +176,10 @@ const NOT_AVAILABLE = {
 const TWO_FACTOR_COOKIE = "two_factor";
 
 const enrolProof = (sessionId: string) => `2fa-enrol:${sessionId}`;
+// The budgets' rows in `rate_limit` (a user id is URL-safe characters: no separator in it).
+const unknownBudget = (userId: string) => `2fa:${userId}:new`;
+const deviceBudget = (userId: string, deviceId: string) => `2fa:${userId}:dev:${deviceId}`;
+const exhaustedNotice = (userId: string) => `2fa:${userId}:mail`;
 const passkeyProof = (passkeyId: string) => `passkey-2f:${passkeyId}`;
 
 /** Does this session carry a second factor that is still fresh enough for an admin action? */
@@ -305,7 +343,10 @@ export async function afterTwoFactorEnable(scope: AuthScope, ctx: SessionContext
 export async function afterTwoFactorChange(scope: AuthScope, ctx: SessionContext): Promise<void> {
   if (!succeeded(ctx)) return;
   const userId = ctx.context.session?.user.id;
-  if (userId) await clearSecondFactor(scope.db, userId);
+  if (!userId) return;
+  await clearSecondFactor(scope.db, userId);
+  // …and no browser is a "known device" of a factor that has changed.
+  await forgetKnownDevices(scope.db, userId);
 }
 
 /**
@@ -402,7 +443,9 @@ type CodeContext = Parameters<typeof getSessionFromCtx>[0] & {
   path?: string;
   request?: Request;
   body?: unknown;
+  headers?: Headers;
   getSignedCookie(name: string, secret: string): Promise<string | null | undefined | false>;
+  setCookie(name: string, value: string, options: ReturnType<typeof cookieAttributes>): unknown;
   context: {
     secret: string;
     secretConfig: Parameters<typeof symmetricDecrypt>[0]["key"];
@@ -463,28 +506,39 @@ export async function beforeSecondFactor(
   // A backup code is for an enrolment that is complete.
   if (mode === "enrolment" && method !== "totp") throw new APIError("FORBIDDEN", { ...NOT_AVAILABLE });
 
-  // a. The budget — counted now, before the code is looked at.
-  const admitted = await admitSecondFactorAttempt(
-    scope.db,
-    who.userId,
-    SECOND_FACTOR_MAX_ATTEMPTS,
-    SECOND_FACTOR_LOCK_S,
-  );
-  if (!admitted) {
+  // a. The budget — counted now, before the code is looked at. A known device's own, or the
+  // account's one budget for every browser nobody has seen (see the header).
+  const cookies = ctx.headers?.get("cookie") ?? ctx.request.headers.get("cookie");
+  const device = await readDevice(scope.env, scope.keys, cookies, now());
+  const known =
+    device !== null &&
+    device.userId === who.userId &&
+    (await isKnownDevice(scope.db, device.deviceId, who.userId));
+  const budget = known
+    ? { key: deviceBudget(who.userId, device.deviceId), known: true }
+    : { key: unknownBudget(who.userId), known: false };
+  const cap = known ? SECOND_FACTOR_DEVICE_ATTEMPTS : SECOND_FACTOR_MAX_ATTEMPTS;
+  const admitted = await admitSecondFactorAttempt(scope.db, budget.key, cap, SECOND_FACTOR_WINDOW_S);
+  if (!admitted.ok) {
     record(
       scope.deps,
       "auth.second_factor_refused",
       { type: "user", id: who.userId },
-      { method, mode, reason: "locked" },
+      { method, mode, reason: "throttled", budget: known ? "device" : "account" },
     );
-    throw new APIError("TOO_MANY_REQUESTS", { ...LOCKED });
+    throw new APIError(
+      "TOO_MANY_REQUESTS",
+      { ...SECOND_FACTOR_THROTTLED },
+      { "Retry-After": String(admitted.retryAfterSeconds) },
+    );
   }
   const attempt = {
     userId: who.userId,
     sessionId: who.sessionId,
     mode,
     method,
-    lockedNow: admitted.lockedNow,
+    budget,
+    exhaustedNow: admitted.count >= cap,
     grantsNewSession: false,
     proved: false,
     backupCodesBefore: method === "backup_code" ? state.backupCodes : null,
@@ -525,7 +579,7 @@ export async function beforeSecondFactor(
   return undefined;
 }
 
-/** A refused or wrong code: audited without the code; the lock, when this attempt set it, is announced. */
+/** A refused or wrong code: audited without the code; a budget this attempt used up is announced. */
 async function afterSecondFactorFailure(scope: AuthScope, reason: string): Promise<void> {
   const attempt = scope.facts.secondFactor;
   scope.facts.secondFactor = null;
@@ -537,24 +591,29 @@ async function afterSecondFactorFailure(scope: AuthScope, reason: string): Promi
     { method: attempt.method, mode: attempt.mode, reason },
     { actorUserId: attempt.userId, actorType: "user" },
   );
-  if (attempt.lockedNow) {
-    record(
-      scope.deps,
-      "auth.second_factor_locked",
-      { type: "user", id: attempt.userId },
-      { attempts: SECOND_FACTOR_MAX_ATTEMPTS, seconds: SECOND_FACTOR_LOCK_S },
-    );
-    // After the answer, like every mail an auth request causes (auth/scope.ts `afterAnswer`).
-    scope.deps.defer(
-      afterAnswer(scope, () =>
-        sendSecondFactorLocked(scope.deps, {
-          to: attempt.email,
-          name: attempt.name,
-          minutes: Math.round(SECOND_FACTOR_LOCK_S / 60),
-        }),
-      ).catch(() => {}),
-    );
-  }
+  if (!attempt.exhaustedNow) return;
+  record(
+    scope.deps,
+    "auth.second_factor_exhausted",
+    { type: "user", id: attempt.userId },
+    {
+      budget: attempt.budget.known ? "device" : "account",
+      attempts: attempt.budget.known ? SECOND_FACTOR_DEVICE_ATTEMPTS : SECOND_FACTOR_MAX_ATTEMPTS,
+      seconds: SECOND_FACTOR_WINDOW_S,
+    },
+  );
+  // The owner is told — once per window, however many budgets run out in it.
+  if (!(await claimOncePerWindow(scope.db, exhaustedNotice(attempt.userId), SECOND_FACTOR_WINDOW_S))) return;
+  // After the answer, like every mail an auth request causes (auth/scope.ts `afterAnswer`).
+  scope.deps.defer(
+    afterAnswer(scope, () =>
+      sendSecondFactorLocked(scope.deps, {
+        to: attempt.email,
+        name: attempt.name,
+        minutes: Math.round(SECOND_FACTOR_WINDOW_S / 60),
+      }),
+    ).catch(() => {}),
+  );
 }
 
 /** `hooks.after` for the two code endpoints: the count, the mark, the audit rows. */
@@ -581,8 +640,30 @@ export async function afterSecondFactor(scope: AuthScope, ctx: CodeContext): Pro
     throw new APIError("UNAUTHORIZED", { ...INVALID_CODE });
   }
   scope.facts.secondFactor = null;
-  // A correct code: the count starts again (and a lock this very attempt set is lifted).
-  await resetSecondFactorAttempts(scope.db, attempt.userId);
+  // A correct code: its own attempt is given back to the budget it was counted on.
+  await returnSecondFactorAttempt(scope.db, attempt.budget.key, SECOND_FACTOR_WINDOW_S);
+  if (attempt.mode === "enrolment") {
+    // A new enrolment is a two-factor change: no browser is a known device of the old factor.
+    await forgetKnownDevices(scope.db, attempt.userId);
+  }
+  // This browser has now passed the account's second factor: it is a known device. (Kept when
+  // it already was one. Only ever here — on proof — and never for an impersonated session: one
+  // does not get this far.)
+  if (attempt.mode === "enrolment" || !attempt.budget.known) {
+    const deviceId = generateId(32);
+    const at = now();
+    await putKnownDevice(scope.db, {
+      id: generateId(),
+      deviceId,
+      userId: attempt.userId,
+      expiresAt: new Date(at.getTime() + DEVICE_COOKIE.maxAge * 1000),
+    });
+    ctx.setCookie(
+      cookieName(scope.env, DEVICE_COOKIE),
+      await mintDevice(scope.keys, { userId: attempt.userId, deviceId }, at),
+      cookieAttributes(scope.env, DEVICE_COOKIE),
+    );
+  }
   if (attempt.mode === "step_up" && attempt.sessionId !== null) {
     if (await stampSecondFactor(scope.db, attempt.sessionId, attempt.userId, now())) {
       record(
