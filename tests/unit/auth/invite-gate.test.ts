@@ -36,6 +36,7 @@ import {
   linkIn,
   mailTo,
   newClient,
+  PASSWORD,
   send,
   signIn,
   signUp,
@@ -553,7 +554,7 @@ describe("invite mode: no path makes a user row without using an invite", () => 
     const member = await verifiedUser({ inviteCode: await from.invite() });
     const next = freshEmail();
     const asked = await send(member.client, "/api/auth/change-email", {
-      json: { newEmail: next, callbackURL: "/" },
+      json: { newEmail: next, callbackURL: "/", password: PASSWORD },
     });
     expect(asked.status, asked.text).toBe(200);
     // Nothing exists at the new address until its owner confirms; the one account is the same row.
@@ -564,7 +565,7 @@ describe("invite mode: no path makes a user row without using an invite", () => 
     await from.expectBalanced(1);
     // An address that belongs to an admin, or to anyone: the same request, still no row made.
     const toAdmin = await send(member.client, "/api/auth/change-email", {
-      json: { newEmail: ADMIN_EMAIL, callbackURL: "/" },
+      json: { newEmail: ADMIN_EMAIL, callbackURL: "/", password: PASSWORD },
     });
     expect(toAdmin.status).toBe(asked.status);
     expect(await userByEmail(ADMIN_EMAIL)).toBeNull();

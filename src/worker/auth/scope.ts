@@ -94,6 +94,12 @@ export type AuthScope = {
   /** Fresh from the table once per request — sign-up gates must not lag a kill switch by 60 s. */
   settings(): Promise<ResolvedSettings>;
   client: ClientFacts | null;
+  /**
+   * `password` of a `POST /change-email` body, as the route read it before the handler ran
+   * (auth/mailbox-proof.ts `beforeChangeEmail`; Better Auth's schema does not know the field).
+   * Beside `client`, not in `facts`: the handler starts each request with fresh facts.
+   */
+  changeEmailPassword?: unknown;
   facts: AuthFacts;
   /** What the sign-up in flight has taken, until its user exists. */
   reservation: { taken: SignupReservation; email: string } | null;

@@ -659,3 +659,12 @@ export async function promoteToAdmin(userId: string, twoFactor = true, secondFac
   if (secondFactor)
     await testDb().update(session).set({ secondFactorAt: new Date() }).where(eq(session.userId, userId));
 }
+
+/**
+ * The button on the page the address-change CONFIRMATION link lands on (auth/mailbox-proof.ts):
+ * the GET of that link does nothing; this same-origin POST is what mails the new address.
+ */
+export async function pressConfirmChange(link: string, client: Client = newClient()) {
+  const token = new URL(link, "http://localhost").searchParams.get("token") ?? "";
+  return send(client, "/api/account/confirm-email-change", { headers: CAPTCHA, json: { token } });
+}

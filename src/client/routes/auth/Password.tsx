@@ -415,3 +415,74 @@ export function SetPasswordPage() {
     </AuthCard>
   );
 }
+
+/**
+ * Where the link in "confirm your change of address" (mailed to the CURRENT address) lands. The
+ * link itself does nothing — a mail scanner opens links too. Pressing the button here is the
+ * owner's consent: one request (`POST /api/account/confirm-email-change`), after which the NEW
+ * address gets the link that completes the change.
+ */
+export function ConfirmEmailChangePage() {
+  const token = useLinkToken();
+  const config = usePublicConfig().data;
+  const turnstile = useTurnstile(config?.turnstileSiteKey);
+  const [error, setError] = useState<string | null>(null);
+  const [state, setState] = useState<"ask" | "sent" | "invalid">("ask");
+  const [busy, setBusy] = useState(false);
+
+  const onSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    if (!token) return;
+    if (config?.turnstileSiteKey && !turnstile.token) {
+      setError(t(turnstile.status === "error" ? "auth.humanFailed" : "auth.humanWait"));
+      return;
+    }
+    setBusy(true);
+    try {
+      await api("/api/account/confirm-email-change", {
+        method: "POST",
+        body: { token },
+        ...captchaOptions(turnstile.token),
+      });
+    } catch (cause) {
+      turnstile.reset();
+      setBusy(false);
+      if (cause instanceof ApiError && cause.code === "invalid_token") setState("invalid");
+      else setError(t("auth.error.generic"));
+      return;
+    }
+    setBusy(false);
+    setState("sent");
+  };
+
+  const unusable = !token || state === "invalid";
+  return (
+    <AuthCard
+      title={t("confirmChange.title")}
+      lead={unusable || state === "sent" ? undefined : t("confirmChange.body")}
+    >
+      {unusable ? (
+        <FormNotice tone="danger">{t("confirmChange.invalid")}</FormNotice>
+      ) : state === "sent" ? (
+        <FormNotice>{t("confirmChange.sent")}</FormNotice>
+      ) : (
+        <Box
+          component="form"
+          noValidate
+          onSubmit={onSubmit}
+          sx={{ display: "flex", flexDirection: "column", gap: 3 }}
+        >
+          {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
+          <FormError>{error}</FormError>
+          <Button type="submit" variant="contained" size="large" disabled={busy}>
+            {t("confirmChange.submit")}
+          </Button>
+        </Box>
+      )}
+      <Box component={RouterLink} to="/" sx={backSx}>
+        {t("confirmChange.back")}
+      </Box>
+    </AuthCard>
+  );
+}

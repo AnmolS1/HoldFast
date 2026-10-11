@@ -246,7 +246,6 @@ describe("an address that has an account, and one that has none: the same answer
 
 describe("a link or a token that does not work: one answer, whatever is wrong with it", () => {
   it("the verification link — garbage, tampered, expired, for an address nobody has, for somebody else's change", async () => {
-    const stranger = await verifiedUser();
     const { email } = await signUp(newClient());
     const good = new URL(
       linkIn(await waitForMail(email, "verification")),
@@ -262,16 +261,8 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
       ["tampered", open(`${good.slice(0, -4)}${good.endsWith("AAAA") ? "BBBB" : "AAAA"}`)],
       ["expired", open(verificationToken(email, -3600))],
       ["an address nobody has", open(verificationToken(freshEmail(), 3600))],
-      [
-        "an address change of another account, opened by somebody signed in as someone else",
-        open(
-          verificationToken(freshEmail(), 3600, {
-            updateTo: freshEmail(),
-            requestType: "change-email-confirmation",
-          }),
-          stranger.client,
-        ),
-      ],
+      // (An address-change CONFIRMATION token is not in this list any more: its GET is inert
+      // and lands on our page whatever the token says — change-email-consent.test.ts.)
     ]);
     expect(outlines[0]![1]).toMatchObject({
       status: 302,

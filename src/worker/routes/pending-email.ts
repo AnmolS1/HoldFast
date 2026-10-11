@@ -58,7 +58,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { isBreached, BREACH_CHECK_UNAVAILABLE, PASSWORD_COMPROMISED_MESSAGE } from "../auth/breach-check";
 import { captchaToken, verifyCaptcha } from "../auth/captcha";
-import { confirmMailbox, readVerifyToken } from "../auth/mailbox-proof";
+import { confirmAddressChange, confirmMailbox, readVerifyToken } from "../auth/mailbox-proof";
 import { isStoredFormAddress, PASSWORD_MAX, PASSWORD_MIN } from "../auth/preflight";
 import { scopeOf, VERIFICATION_EXPIRES_IN_S } from "../auth/create-auth";
 import { afterAnswer, type AuthScope } from "../auth/scope";
@@ -81,7 +81,7 @@ import { countFor, guard, record } from "../auth/observe";
 import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
-import { chargeUnsent, sendVerification } from "../services/email";
+import { chargeUnsent, sendNewAddressVerification, sendVerification } from "../services/email";
 import { AppError } from "../services/errors";
 import { enforceRateLimit } from "../services/ratelimit";
 import { auth, db, defer, deps, type AppEnv } from "../services/request-context";
@@ -335,6 +335,42 @@ router.post(
       );
       await padStatements(db(c), STATEMENT_BUDGET["/account/confirm-email"]!);
       return c.json({ ok: true });
+    }
+  }),
+);
+
+// ── POST /api/account/confirm-email-change { token } ─────────────────────────────────────────
+// The button on the page the address-change CONFIRMATION link lands on (auth/mailbox-proof.ts):
+// the owner's consent to the change. Same-origin (the pipeline's CSRF step); no session is
+// asked for — the link was mailed to the current address, and its owner may open it anywhere.
+// The order as above: body and captcha header free, RL_AUTH, Turnstile, then the database.
+const ChangeBody = z.object({ token: z.string().min(1).max(2048) });
+
+router.post(
+  "/account/confirm-email-change",
+  guard("confirm_email_change", async (c) => {
+    const scope = scopeOf(auth(c));
+    if (!scope) throw new Error("no auth scope");
+    scope.answered.held = true;
+    try {
+      const captcha = captchaToken(c.req.raw);
+      const body = ChangeBody.parse(await jsonBody(c));
+      // A token nobody signed is refused before anything is spent on it.
+      const claims = await readVerifyToken(c.env.BETTER_AUTH_SECRET, body.token);
+      if (!claims || claims.requestType !== "change-email-confirmation") throw linkInvalid();
+      await enforceRateLimit(c.env, "RL_AUTH", ipKey(c.get("ip")));
+      await verifyCaptcha(c.env, captcha, c.get("ip"));
+      const done = await confirmAddressChange(scope, body.token, async (mail) => {
+        defer(
+          c,
+          afterAnswer(scope, () => sendNewAddressVerification(deps(c), mail)),
+        );
+      });
+      await padStatements(db(c), LINK_ERROR_BUDGET);
+      if (!done) throw linkInvalid();
+      return c.json({ ok: true });
+    } finally {
+      scope.answered.release();
     }
   }),
 );

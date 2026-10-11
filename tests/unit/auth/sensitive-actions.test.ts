@@ -137,7 +137,7 @@ describe("a session alone does not authorise a sensitive change", () => {
     // (Following it schedules the deletion — deletion.test.ts.)
     const next = freshEmail();
     const change = await send(owner.client, "/api/auth/change-email", {
-      json: { newEmail: next, callbackURL: "/" },
+      json: { newEmail: next, callbackURL: "/", password: PASSWORD },
     });
     expect(change.status, change.text).toBe(200);
     expect((await userById(owner.user.id))!.email).toBe(owner.email);
@@ -268,7 +268,7 @@ describe("the work an auth request leaves behind stays far inside the deferred-w
         "change of address",
         owner.client,
         "/api/auth/change-email",
-        json({ newEmail: freshEmail(), callbackURL: "/" }, {}),
+        json({ newEmail: freshEmail(), callbackURL: "/", password: PASSWORD }, {}),
       ],
       ["enable two-factor", owner.client, "/api/auth/two-factor/enable", json({ password: PASSWORD }, {})],
       [

@@ -117,7 +117,11 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },
   "/update-user": { fields: { name: optional(personName) } },
-  "/change-email": { fields: { newEmail: email, callbackURL: link } },
+  // `password`: the owner again (auth/mailbox-proof.ts `beforeChangeEmail`); absent for an
+  // account that has none.
+  "/change-email": {
+    fields: { newEmail: email, callbackURL: link, password: optional(text(1, PASSWORD_MAX)) },
+  },
   "/reset-password": {
     captcha: true,
     fields: { newPassword: text(PASSWORD_MIN, PASSWORD_MAX), token: text(1, 128, /^[A-Za-z0-9_-]+$/) },

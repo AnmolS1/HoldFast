@@ -121,6 +121,11 @@ router.all(
     if (checked.refusal) return c.json(checked.refusal.body, checked.refusal.status);
     // The one body the audit step needs (a failed sign-in names the account it tried).
     const body = relativePath === "/sign-in/email" ? checked.body : null;
+    // The password a change of address must come with: Better Auth's schema for that endpoint
+    // does not know the field, so the hook gets it from here (auth/mailbox-proof.ts).
+    if (scope && relativePath === "/change-email") {
+      scope.changeEmailPassword = (checked.body as { password?: unknown } | null)?.password;
+    }
 
     // Mail this request causes waits until it has been answered (auth/scope.ts `afterAnswer`).
     if (scope) scope.answered.held = true;

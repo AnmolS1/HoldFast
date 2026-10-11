@@ -59,7 +59,11 @@ export const routeTable: readonly RouteRow[] = [
   { name: "auth", task: "T06", claims: ["/auth/*"] },
   { name: "signup-intent", task: "T06", claims: ["/auth-intent"] },
   { name: "invites", task: "T06", claims: ["/invites/*"] },
-  { name: "pending-email", task: "T06", claims: ["/account/pending-email", "/account/confirm-email"] },
+  {
+    name: "pending-email",
+    task: "T06",
+    claims: ["/account/pending-email", "/account/confirm-email", "/account/confirm-email-change"],
+  },
   {
     name: "account-lifecycle",
     task: "T06",

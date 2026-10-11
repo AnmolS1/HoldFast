@@ -46,6 +46,8 @@ import {
   makeFolder,
   makePendingShare,
   newClient,
+  PASSWORD,
+  pressConfirmChange,
   send,
   serviceDeps,
   shareById,
@@ -542,7 +544,7 @@ describe("changing the address of a verified account", () => {
     const share = await makePendingShare((await makeFolder(owner.user.id)).id, owner.user.id, newEmail);
 
     const asked = await send(client, "/api/auth/change-email", {
-      json: { newEmail, callbackURL: "/account" },
+      json: { newEmail, callbackURL: "/account", password: PASSWORD },
     });
     expect(asked.status, asked.text).toBe(200);
     // Step 1: only the current address hears about it.
@@ -554,7 +556,7 @@ describe("changing the address of a verified account", () => {
     expect((await userById(row.id))!.email).toBe(email);
 
     // Step 2: confirming there sends the verification to the new address. Still unchanged.
-    expect((await send(client, linkIn(confirm))).status).toBe(302);
+    expect((await pressConfirmChange(linkIn(confirm))).status).toBe(200);
     const verify = await waitForMail(newEmail, "newAddressVerification");
     expect((await userById(row.id))!.email).toBe(email);
     expect((await shareById(share.id))!.granteeUserId).toBeNull();
@@ -577,7 +579,9 @@ describe("changing the address of a verified account", () => {
     const { client, user: row, email } = await verifiedUser();
     const other = await verifiedUser();
     const before = mailTo(other.email).length;
-    const asked = await send(client, "/api/auth/change-email", { json: { newEmail: other.email } });
+    const asked = await send(client, "/api/auth/change-email", {
+      json: { newEmail: other.email, password: PASSWORD },
+    });
     expect(asked.status).toBe(200);
     expect(asked.body).toEqual({ status: true });
     // The caller's own inbox must not say whether the address is taken: it gets the same

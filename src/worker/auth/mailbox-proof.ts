@@ -29,6 +29,11 @@
 //       password they typed is set. No session is created; they sign in.
 //       So a scanner's fetch leaves the sign-up browser's own click working, with the password
 //       chosen a minute ago; and nobody is handed a password-setting token by a GET.
+//   ADDRESS-CHANGE CONFIRMATION (the first step, mailed to the CURRENT address — the owner's
+//       consent): inert on a GET, like the sign-up link opened elsewhere. It lands on our
+//       `/confirm-email-change` page; the page's button sends one same-origin POST, and that is
+//       what mails the new address. (And asking for a change at all needs the owner AGAIN —
+//       `beforeChangeEmail`: the password, or a marked or fresh session when there is none.)
 //   ADDRESS-CHANGE LINK (the second step, mailed to the NEW address): Better Auth would create
 //       a session for the account when the clicker has none — so the owner of the new address,
 //       clicking a mail they did not ask for, would be signed in to a stranger's account that
@@ -106,6 +111,8 @@ export async function afterChangeEmail(
 export const SET_PASSWORD_PATH = "/set-password";
 /** The lifetime of a verification link (create-auth.ts `emailVerification.expiresIn`). */
 export const VERIFY_LINK_EXPIRES_IN_S = 60 * 60;
+/** The page of ours the address-change CONFIRMATION link lands on. */
+export const CONFIRM_CHANGE_PATH = "/confirm-email-change";
 /** Where an address-change link sends a browser that is not signed in to the account. */
 export const CHANGE_EMAIL_SIGN_IN = "/login?reason=change_email";
 /** Where it sends the account's own browser when the new address has been taken meanwhile. */
@@ -148,20 +155,14 @@ export async function beforeVerifyEmail(scope: AuthScope, ctx: VerifyContext): P
   if (!claims) return;
 
   if (claims.updateTo !== null) {
-    // Step one (mailed to the CURRENT address) only sends the second mail — to the new address.
-    // When that address already has an account, the link answers exactly as it would for a free
-    // one and nothing is sent: the address's owner is not mailed on a stranger's say-so, and the
-    // caller cannot tell (`afterChangeEmail` below is why they hold this link at all).
+    // Step one (mailed to the CURRENT address) is the owner's CONSENT to the change — and a GET
+    // is not consent: a mail gateway's scanner fetches every link before a person sees it, so
+    // with a stolen session the scanner's fetch would send the second mail and the thief (who
+    // has the session the second link needs) would own the address. The GET changes nothing and
+    // sends nothing: it lands on a page of ours, whose button sends ONE same-origin POST
+    // (`POST /api/account/confirm-email-change` → `confirmAddressChange` below).
     if (claims.requestType === "change-email-confirmation") {
-      if (await getAccountByEmail(db, claims.updateTo)) {
-        const target = new URL(ctx.request.url).searchParams.get("callbackURL");
-        // The same check Better Auth's own redirect goes through would refuse anything but a
-        // path of this app; a path is all a link of ours ever carries.
-        const path = target && /^\/(?![/\\])[^\s]*$/.test(target) ? target : "/";
-        // Relative, exactly as Better Auth redirects to the `callbackURL` it was given.
-        throw new APIError("FOUND", undefined, { Location: path });
-      }
-      return;
+      throw redirect(env, `${CONFIRM_CHANGE_PATH}#token=${token}`);
     }
     const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
     if (!session || session.user.email.toLowerCase() !== claims.email) {
@@ -255,4 +256,88 @@ export async function setFirstPassword(
   const body = { newPassword: password, token };
   const outcome = await watched(instance.api.resetPassword({ body }));
   return outcome !== HANG;
+}
+
+/**
+ * `POST /api/account/confirm-email-change`: the owner's consent, given by a button. Sends the
+ * second mail — the link that changes the address, to the NEW address — exactly as Better Auth's
+ * own step would have (email-verification.mjs, `change-email-confirmation`), and nothing when the
+ * new address has been taken meanwhile (the answer is the same: the address's owner is not
+ * mailed on a stranger's say-so). False: the token cannot do this (the caller answers with the
+ * one generic sentence).
+ */
+export async function confirmAddressChange(
+  scope: AuthScope,
+  token: string,
+  send: (mail: { to: string; url: string; by: { user: string } }) => Promise<unknown>,
+): Promise<boolean> {
+  const claims = await readVerifyToken(scope.env.BETTER_AUTH_SECRET, token);
+  if (!claims || claims.updateTo === null || claims.requestType !== "change-email-confirmation") return false;
+  const account = await getAccountByEmail(scope.db, claims.email);
+  // The account moved or is gone since the mail was sent.
+  if (!account || !account.emailVerified) return false;
+  if (await getAccountByEmail(scope.db, claims.updateTo)) return true;
+  const next = await createEmailVerificationToken(
+    scope.env.BETTER_AUTH_SECRET,
+    claims.email,
+    claims.updateTo,
+    VERIFY_LINK_EXPIRES_IN_S,
+    { requestType: "change-email-verification" },
+  );
+  const url = `${scope.env.APP_ORIGIN}/api/auth/verify-email?token=${next}&callbackURL=${encodeURIComponent("/account")}`;
+  await send({ to: claims.updateTo, url, by: { user: account.id } });
+  return true;
+}
+
+type ChangeContext = Parameters<typeof getSessionFromCtx>[0] & {
+  body?: unknown;
+  context: {
+    sessionConfig: { freshAge: number };
+    password: { verify(data: { hash: string; password: string }): Promise<boolean> };
+    internalAdapter: {
+      findCredentialAccount(userId: string): Promise<{ password?: string | null } | null | undefined>;
+    };
+  };
+};
+
+/**
+ * `hooks.before` for `POST /change-email`: a session alone may not ask for the account's
+ * address to be changed (Better Auth asks for nothing more — api/routes/update-user.mjs
+ * `changeEmail`: `sensitiveSessionMiddleware` only). The owner proves themselves again:
+ *   - the account has a password → the request carries it (`password`), and it is checked
+ *     through the per-account throttle like every other password a session offers
+ *     (`admit` / `settle` are auth/signin-throttle.ts's — counted before the hash);
+ *   - it has none (made with Google, a passkey) → the session carries the second-factor mark,
+ *     or is FRESH by Better Auth's own rule (`session.freshAge`, api/routes/session.mjs
+ *     `freshSessionMiddleware`: created less than that long ago — a new sign-in).
+ * `password`: what the route read from the request body (Better Auth's schema for this endpoint
+ * does not know the field).
+ */
+export async function beforeChangeEmail(
+  ctx: ChangeContext,
+  password: unknown,
+  throttle: { admit(email: string): Promise<void>; settle(): Promise<void> },
+  hasMark: (session: unknown) => boolean,
+): Promise<void> {
+  const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+  // No session: Better Auth answers 401.
+  if (!session) return;
+  const credential = await ctx.context.internalAdapter.findCredentialAccount(session.user.id);
+  if (credential?.password) {
+    const wrong = new APIError("BAD_REQUEST", { code: "INVALID_PASSWORD", message: "Invalid password" });
+    if (typeof password !== "string" || password === "" || password.length > 128) throw wrong;
+    await throttle.admit(session.user.email);
+    const right = await ctx.context.password.verify({ hash: credential.password, password });
+    await throttle.settle();
+    if (!right) throw wrong;
+    return;
+  }
+  if (hasMark(session.session)) return;
+  const fresh = ctx.context.sessionConfig.freshAge * 1000;
+  const age = Date.now() - new Date(session.session.createdAt).getTime();
+  if (fresh === 0 || age < fresh) return;
+  throw new APIError("FORBIDDEN", {
+    code: "SESSION_NOT_FRESH",
+    message: "Sign in again to change your email address.",
+  });
 }

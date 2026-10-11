@@ -65,7 +65,7 @@ import {
   SESSION_PASSWORD_PATHS,
   SIGN_IN_PATH,
 } from "./signin-throttle";
-import { afterChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
+import { afterChangeEmail, beforeChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
   afterPasskeyDeleted,
@@ -79,6 +79,7 @@ import {
   beforeSecondFactor,
   beforeTwoFactorManage,
   endStandingProofs,
+  hasSecondFactor,
   secondFactorOfNewSession,
   TWO_FACTOR_MANAGE_PATHS,
   VERIFY_BACKUP_CODE_PATH,
@@ -577,6 +578,18 @@ export function buildHooks(scope: AuthScope) {
       } catch (error) {
         refused(error);
       }
+    }
+    if (path === "/change-email" && ctx.request) {
+      // The owner again, not just a session (auth/mailbox-proof.ts `beforeChangeEmail`).
+      await beforeChangeEmail(
+        ctx,
+        scope.changeEmailPassword,
+        {
+          admit: (email) => beforeSignIn(scope, { body: { email } }),
+          settle: () => afterSignIn(scope),
+        },
+        (session) => hasSecondFactor(session as Parameters<typeof hasSecondFactor>[0]),
+      );
     }
     if (BREACH_PATHS.has(path) && ctx.request) {
       // Input first (auth/parity.ts, auth/breach-check.ts): a password of acceptable length is

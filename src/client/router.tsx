@@ -28,6 +28,7 @@ import {
   InvitePage,
   LoginPage,
   ResetPasswordPage,
+  ConfirmEmailChangePage,
   SetPasswordPage,
   safeNext,
   SignupPage,
@@ -161,6 +162,9 @@ export function buildRoutes(): RouteObject[] {
             // No `redirectSignedIn`: a browser signed in to some OTHER account must not lose the
             // link's token to a redirect (it is in the fragment, read once).
             { path: "set-password", element: <SetPasswordPage />, handle: auth },
+            // Where the address-change confirmation link (mailed to the CURRENT address) lands:
+            // its button, not the link, is the consent. Signed in or not.
+            { path: "confirm-email-change", element: <ConfirmEmailChangePage />, handle: auth },
             { path: "two-factor", loader: redirectSignedIn, element: <TwoFactorPage />, handle: auth },
           ],
         },

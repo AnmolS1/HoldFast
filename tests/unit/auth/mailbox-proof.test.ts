@@ -41,6 +41,7 @@ import {
   measured,
   newClient,
   PASSWORD,
+  pressConfirmChange,
   send,
   sessionsOf,
   shareById,
@@ -467,12 +468,12 @@ describe("the link that confirms a NEW address for an existing account", () => {
     const owner = await verifiedUser();
     const target = freshEmail();
     const asked = await send(owner.client, "/api/auth/change-email", {
-      json: { newEmail: target, callbackURL: "/account" },
+      json: { newEmail: target, callbackURL: "/account", password: PASSWORD },
     });
     expect(asked.status, asked.text).toBe(200);
     // Step 1: the confirmation, mailed to the CURRENT address.
     const confirm = linkIn(await waitForMail(owner.email, "changeEmailConfirmation"));
-    expect((await send(owner.client, confirm)).status).toBe(302);
+    expect((await pressConfirmChange(confirm)).status).toBe(200);
     // Step 2: the verification, mailed to the NEW address.
     const verify = linkIn(await waitForMail(target, "newAddressVerification"));
     return { owner, target, verify };
@@ -515,10 +516,11 @@ describe("changing to an address: what the caller can and cannot learn (A7)", ()
   async function askAndConfirm(owner: Awaited<ReturnType<typeof verifiedUser>>, target: string) {
     const before = mailTo(owner.email, "changeEmailConfirmation").length;
     const asked = await send(owner.client, "/api/auth/change-email", {
-      json: { newEmail: target, callbackURL: "/account" },
+      json: { newEmail: target, callbackURL: "/account", password: PASSWORD },
     });
     const mail = await waitForMail(owner.email, "changeEmailConfirmation", before + 1);
-    const confirmed = await send(owner.client, linkIn(mail));
+    // (the link itself is inert; the button on the page it lands on is the consent — N1)
+    const confirmed = await pressConfirmChange(linkIn(mail));
     return { asked, mail, confirmed };
   }
 
@@ -540,8 +542,8 @@ describe("changing to an address: what the caller can and cannot learn (A7)", ()
       forTaken.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(safeLabel(taken.email, 254), "<new>"),
     ).toBe(forFree.mail.text!.replace(/https?:\/\/\S+/g, "<link>").replace(safeLabel(free, 254), "<new>"));
     expect(forFree.mail.text).toContain(safeLabel(free, 254));
-    expect(forTaken.confirmed.status).toBe(302);
-    expect(forTaken.confirmed.headers.get("location")).toBe(forFree.confirmed.headers.get("location"));
+    expect(forTaken.confirmed.status).toBe(200);
+    expect(forTaken.confirmed.body).toEqual(forFree.confirmed.body);
     // What differs is invisible to the caller: the free address gets the second mail, the taken
     // one's owner gets nothing at all, and nothing about either account changes.
     await waitForMail(free, "newAddressVerification");
