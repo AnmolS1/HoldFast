@@ -477,3 +477,93 @@ describe("the throttle's key and Better Auth's look-up normalise an address the 
     }
   });
 });
+
+// R7 — a SESSION can ask "is this the account's password?" too: the endpoints that take the
+// current password. A stolen session must not get more guesses there than a stranger gets at
+// the sign-in form — it is the same question, so it is the same budget.
+describe("the password checks a session can call go through the same per-account throttle", () => {
+  const PASSWORD_PATHS: Array<[string, (password: string) => Record<string, unknown>]> = [
+    ["/api/auth/verify-password", (password) => ({ password })],
+    [
+      "/api/auth/change-password",
+      (password) => ({ currentPassword: password, newPassword: "another long passphrase 77!" }),
+    ],
+    ["/api/auth/delete-user", (password) => ({ password })],
+    ["/api/auth/two-factor/enable", (password) => ({ password })],
+    ["/api/auth/two-factor/disable", (password) => ({ password })],
+    ["/api/auth/two-factor/get-totp-uri", (password) => ({ password })],
+    ["/api/auth/two-factor/generate-backup-codes", (password) => ({ password })],
+  ];
+  /** A stolen session: the owner's cookies, at another address, with the two per-address limits out of the way. */
+  async function stolenSession() {
+    const owner = await verifiedUser();
+    const thief = quiet();
+    thief.cookies = new Map(owner.client.cookies);
+    return { owner, thief };
+  }
+  async function guess(thief: Client, path: string, body: Record<string, unknown>) {
+    await forgetAddressRule(thief);
+    const before = hashes();
+    const sent = await send(thief, path, { json: body });
+    return { sent, hashed: hashes() - before };
+  }
+  const throttled = (sent: Awaited<ReturnType<typeof send>>) =>
+    sent.status === 429 && (sent.body as { code?: string } | null)?.code === "SIGN_IN_THROTTLED";
+
+  it(`every one of them counts on the account's row for that client: ${FREE_ATTEMPTS} wrong passwords across them, then 429 without a hash — on each`, async () => {
+    const { owner, thief } = await stolenSession();
+    // One wrong guess on each of the first five endpoints: all heard, all counted on ONE row.
+    for (const [index, [path, body]] of PASSWORD_PATHS.slice(0, FREE_ATTEMPTS).entries()) {
+      const tried = await guess(thief, path, body(WRONG));
+      expect(throttled(tried.sent), `${path}: ${tried.sent.text}`).toBe(false);
+      expect(tried.sent.status, path).toBeGreaterThanOrEqual(400);
+      expect((await rowOf(owner.email, thief))?.count, path).toBe(index + 1);
+    }
+    // The free guesses are gone — on every endpoint, whichever was used before.
+    for (const [path, body] of PASSWORD_PATHS) {
+      const refused = await guess(thief, path, body(WRONG));
+      expect(throttled(refused.sent), `${path}: ${refused.sent.status} ${refused.sent.text}`).toBe(true);
+      expect(Number(refused.sent.headers.get("retry-after")), path).toBeGreaterThanOrEqual(1);
+      expect(refused.hashed, `${path}: a refused guess costs no hash`).toBe(0);
+    }
+    expect((await rowOf(owner.email, thief))?.count).toBe(FREE_ATTEMPTS);
+    // …and the RIGHT password is not heard either while the client has to wait.
+    const right = await guess(thief, "/api/auth/verify-password", { password: PASSWORD });
+    expect(throttled(right.sent)).toBe(true);
+    // It is the sign-in form's budget: the same client is made to wait there too.
+    expect(throttled((await attempt(thief, owner.email)).sent)).toBe(true);
+    // The owner, at their own address, is not delayed by any of it.
+    const own = await guess(
+      Object.assign(quiet(), { cookies: new Map(owner.client.cookies) }),
+      "/api/auth/verify-password",
+      {
+        password: PASSWORD,
+      },
+    );
+    expect(own.sent.status, own.sent.text).toBe(200);
+  });
+
+  it("a right password gives the client's count back; a request with no password is not a guess", async () => {
+    const { owner, thief } = await stolenSession();
+    for (let n = 1; n <= 3; n++) {
+      await guess(thief, "/api/auth/verify-password", { password: WRONG });
+    }
+    expect((await rowOf(owner.email, thief))?.count).toBe(3);
+    const none = await guess(thief, "/api/auth/two-factor/enable", {});
+    expect(none.sent.status).toBe(400);
+    expect((await rowOf(owner.email, thief))?.count).toBe(3);
+    const right = await guess(thief, "/api/auth/verify-password", { password: PASSWORD });
+    expect(right.sent.status, right.sent.text).toBe(200);
+    expect(await rowOf(owner.email, thief)).toBeNull();
+  });
+
+  it("no session, no count: the endpoints answer 401 and no row is made", async () => {
+    const owner = await verifiedUser();
+    const stranger = quiet();
+    for (const [path, body] of PASSWORD_PATHS) {
+      const sent = (await guess(stranger, path, body(WRONG))).sent;
+      expect(sent.status, path).toBe(401);
+    }
+    expect(await rowOf(owner.email, stranger)).toBeNull();
+  });
+});

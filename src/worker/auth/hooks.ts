@@ -58,7 +58,13 @@ import {
 } from "../services/signup-policy";
 import { adminGate } from "./admin-gate";
 import { BREACH_PATHS, refuseBreachedPassword } from "./breach-check";
-import { afterSignIn, beforeSignIn, SIGN_IN_PATH } from "./signin-throttle";
+import {
+  afterSignIn,
+  beforeSessionPassword,
+  beforeSignIn,
+  SESSION_PASSWORD_PATHS,
+  SIGN_IN_PATH,
+} from "./signin-throttle";
 import { afterChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
@@ -515,6 +521,9 @@ export function buildHooks(scope: AuthScope) {
       if (body) return { context: { body } };
     }
     if (path === SIGN_IN_PATH && ctx.request) await beforeSignIn(scope, ctx);
+    // After the second-factor gate above (a request it refuses tests no password) — and before
+    // the breach look-up and Better Auth's own check.
+    if (SESSION_PASSWORD_PATHS.has(path) && ctx.request) await beforeSessionPassword(scope, ctx);
     if (path === "/sign-up/email" && ctx.request) {
       // The cheap refusals first — before the password is hashed and looked up in the breach
       // corpus. They depend only on what was submitted, never on whether the address has an
@@ -556,6 +565,8 @@ export function buildHooks(scope: AuthScope) {
       await afterSignIn(scope);
       return;
     }
+    // A session's password check: its count is given back on proof, like a sign-in's.
+    if (ctx.request && typeof path === "string" && SESSION_PASSWORD_PATHS.has(path)) await afterSignIn(scope);
     const uncharged = ctx.request && typeof path === "string" ? UNSENT_KIND[path] : undefined;
     if (path === "/send-verification-email" && ctx.request && !(ctx.context.returned instanceof Error)) {
       // A resend from the browser that signed up RENEWS its proof (auth/signed-cookie.ts): the

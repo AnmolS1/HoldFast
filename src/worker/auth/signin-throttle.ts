@@ -1,4 +1,5 @@
-// The password-guess throttle on POST /api/auth/sign-in/email.
+// The password-guess throttle — on POST /api/auth/sign-in/email, and on every endpoint through
+// which a SESSION can test the account's password (SESSION_PASSWORD_PATHS below).
 //
 // WHAT IT IS KEYED ON. One row per (address signed in to, client address) — both as keyed
 // hashes — in the `rate_limit` table (Postgres: this count has to be exact, which the per-location
@@ -47,10 +48,23 @@
 // a string of 1–128 characters and an address Better Auth's own validator accepts — the same
 // `z.email()` it runs (sign-in.mjs:317). Anything else is a 400 there, and no row is touched.
 //
+// THE SAME QUESTION BEHIND A SESSION (`beforeSessionPassword`). `/verify-password`,
+// `/change-password`, `/delete-user` and the four `/two-factor/*` endpoints that take the
+// password all answer "is this the account's password?" to whoever holds a session — a stolen
+// one included, and a right answer there is worth as much as at the sign-in form. So a request
+// to one of them that carries a password is admitted through the SAME statement, under the
+// SAME keys (the session's account, the client's address): its wrong guesses count on the row
+// the sign-in form's would, a refused one is a 429 that costs no hash, and the count is given
+// back only when `provingVerify` saw the right password. A request with no password field is
+// not a guess (Better Auth answers 400 without looking anything up), and one with no session
+// is a 401: neither touches a row. (Read in the installed source: every one of these checks
+// ends in `ctx.context.password.verify` — utils/password.mjs `validatePassword` /
+// `checkPassword`, api/routes/update-user.mjs:168 and :287.)
+//
 // The rows are pruned by Better Auth's own limiter (api/rate-limiter/index.mjs:174 — rows older
 // than its longest window, one hour), which is longer than this window.
 
-import { APIError } from "better-auth/api";
+import { APIError, getSessionFromCtx } from "better-auth/api";
 import { admitSignIn, forgetSignInFailures } from "../db/queries/auth-lifecycle";
 import { ipHashStable } from "../services/ip-hash";
 import { hmacHex } from "../services/keys";
@@ -108,6 +122,34 @@ export async function beforeSignIn(scope: AuthScope, ctx: Ctx): Promise<void> {
   throw new APIError("TOO_MANY_REQUESTS", { ...SIGN_IN_THROTTLED }, { "Retry-After": String(wait) });
 }
 
+/** The endpoints a session can test its account's password on, and the body field that carries it. */
+export const SESSION_PASSWORD_PATHS: ReadonlyMap<string, string> = new Map([
+  ["/verify-password", "password"],
+  ["/change-password", "currentPassword"],
+  ["/delete-user", "password"],
+  ["/two-factor/enable", "password"],
+  ["/two-factor/disable", "password"],
+  ["/two-factor/get-totp-uri", "password"],
+  ["/two-factor/generate-backup-codes", "password"],
+]);
+
+type SessionCtx = Parameters<typeof getSessionFromCtx>[0] & { path?: string; body?: unknown };
+
+/**
+ * `hooks.before` on SESSION_PASSWORD_PATHS: a password offered by a session is a guess at the
+ * account's password — admitted (and counted) as one at the sign-in form is, or answered 429.
+ */
+export async function beforeSessionPassword(scope: AuthScope, ctx: SessionCtx): Promise<void> {
+  const field = typeof ctx.path === "string" ? SESSION_PASSWORD_PATHS.get(ctx.path) : undefined;
+  if (!field || !scope.client) return;
+  const offered = (ctx.body as Record<string, unknown> | null | undefined)?.[field];
+  // No password, no guess: Better Auth refuses the request without looking at the account.
+  if (typeof offered !== "string" || offered === "") return;
+  const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+  if (!session) return;
+  await beforeSignIn(scope, { body: { email: session.user.email } });
+}
+
 /**
  * `emailAndPassword.password.verify`, wrapped (auth/create-auth.ts): the ONE place this request
  * can learn that the password is right. Better Auth's sign-in calls it exactly once, with the
@@ -120,7 +162,7 @@ export function provingVerify(
 ): (data: { hash: string; password: string }) => Promise<boolean> {
   return async (data) => {
     const right = await verify(data);
-    // Only inside a sign-in attempt the throttle admitted — no other endpoint's check counts.
+    // Only inside an attempt the throttle admitted (the sign-in, or a session's password check).
     if (right === true && scope.facts.signInAttempt !== null) scope.facts.signInProved = true;
     return right;
   };
