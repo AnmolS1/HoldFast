@@ -1,5 +1,6 @@
-// Sizes and dates. Sizes are binary multiples labelled KB/MB/GB, so the 5 GB quota
-// (5,368,709,120 bytes) reads "5 GB". Dates use Intl with the account's time zone.
+// Sizes and dates. Sizes are decimal multiples (1 KB = 1,000 bytes) labelled KB/MB/GB, so the
+// 5 GB quota (5,000,000,000 bytes) reads "5 GB" and the 2,000,000,000-byte file cap "2 GB".
+// Dates use Intl with the account's time zone.
 import { getLocale } from "./i18n";
 
 const UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
@@ -8,17 +9,17 @@ export function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—";
   let value = bytes;
   let unit = 0;
-  while (value >= 1024 && unit < UNITS.length - 1) {
-    value /= 1024;
+  while (value >= 1000 && unit < UNITS.length - 1) {
+    value /= 1000;
     unit += 1;
   }
   // Bytes and kilobytes are whole numbers; from MB up one decimal, dropped when it is zero.
   const digits = unit <= 1 ? 0 : 1;
   let text = value.toFixed(digits);
-  // 1023.96 MB must not print as "1024.0 MB".
-  if (Number(text) >= 1024 && unit < UNITS.length - 1) {
+  // 999.96 MB must not print as "1000.0 MB".
+  if (Number(text) >= 1000 && unit < UNITS.length - 1) {
     unit += 1;
-    text = (value / 1024).toFixed(1);
+    text = (value / 1000).toFixed(1);
   }
   if (text.endsWith(".0")) text = text.slice(0, -2);
   return `${text} ${UNITS[unit]}`;

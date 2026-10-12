@@ -25,7 +25,7 @@ import { HoldfastThemeProvider } from "../../../../src/client/theme";
 
 export const CONFIG: PublicConfig = {
   signupMode: "invite",
-  quotaBytes: 5368709120,
+  quotaBytes: 5000000000,
   maxFileBytes: 2000000000,
   partBytes: 67108864,
   turnstileSiteKey: "",

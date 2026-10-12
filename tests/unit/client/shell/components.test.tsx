@@ -88,7 +88,7 @@ describe("FileBadge", () => {
 describe("StorageBar", () => {
   it("shows used of quota in user units, as text and as a named image", () => {
     const { container } = renderShell(
-      <StorageBar usage={{ usedBytes: 1_503_238_553, quotaBytes: 5_368_709_120 }} />,
+      <StorageBar usage={{ usedBytes: 1_400_000_000, quotaBytes: 5_000_000_000 }} />,
     );
     expect(container.textContent).toContain("1.4 GB of 5 GB");
     expect(screen.getByRole("img", { name: "1.4 GB of 5 GB used" })).toBeTruthy();

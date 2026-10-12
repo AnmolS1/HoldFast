@@ -82,7 +82,7 @@ function envelope(error: string, message: string) {
 async function mockShell(page: Page, port: number, options: MockOptions = {}): Promise<void> {
   const config = {
     signupMode: "invite",
-    quotaBytes: 5_368_709_120,
+    quotaBytes: 5_000_000_000,
     maxFileBytes: 2_000_000_000,
     partBytes: 67_108_864,
     turnstileSiteKey: "1x00000000000000000000AA",

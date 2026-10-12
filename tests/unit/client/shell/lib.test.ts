@@ -34,17 +34,27 @@ describe("formatBytes", () => {
   it.each([
     [0, "0 B"],
     [999, "999 B"],
+    [1000, "1 KB"],
     [1024, "1 KB"],
-    [12 * 1024, "12 KB"],
-    [626_688, "612 KB"],
-    [2_516_582, "2.4 MB"],
-    [193_147_699, "184.2 MB"],
-    [1_503_238_553, "1.4 GB"],
-    [5_368_709_120, "5 GB"],
-    [2_000_000_000, "1.9 GB"],
-    [1024 * 1024 * 1024 - 1, "1 GB"],
+    [12_000, "12 KB"],
+    [626_688, "627 KB"],
+    [2_516_582, "2.5 MB"],
+    [193_147_699, "193.1 MB"],
+    [1_503_238_553, "1.5 GB"],
+    [5_368_709_120, "5.4 GB"],
+    // The rounding guard: a value that rounds up to 1000 of its unit is 1 of the next one.
+    [999_499, "999 KB"],
+    [999_500, "1 MB"],
+    [999_949_999, "999.9 MB"],
+    [999_960_000, "1 GB"],
+    [1_000_000_000 - 1, "1 GB"],
   ])("%d → %s", (bytes, text) => {
     expect(formatBytes(bytes)).toBe(text);
+  });
+
+  it("the product's two limits read as round decimal numbers", () => {
+    expect(formatBytes(2_000_000_000)).toBe("2 GB"); // MAX_FILE_BYTES
+    expect(formatBytes(5_000_000_000)).toBe("5 GB"); // QUOTA_BYTES
   });
 
   it("nothing sensible → an em dash", () => {
