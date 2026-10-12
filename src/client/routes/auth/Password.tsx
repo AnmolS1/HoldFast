@@ -460,6 +460,10 @@ export function ConfirmEmailChangePage() {
     setState("sent");
   };
 
+  // The button IS the consent, and its request needs the challenge's token: it stays disabled
+  // until the public config has loaded and, where Turnstile is on, a token exists — a press
+  // before that would be sent without one and refused.
+  const ready = config !== undefined && (!config.turnstileSiteKey || Boolean(turnstile.token));
   const unusable = !token || state === "invalid";
   return (
     <AuthCard
@@ -479,7 +483,7 @@ export function ConfirmEmailChangePage() {
         >
           {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
           <FormError>{error}</FormError>
-          <Button type="submit" variant="contained" size="large" disabled={busy}>
+          <Button type="submit" variant="contained" size="large" disabled={busy || !ready}>
             {t("confirmChange.submit")}
           </Button>
         </Box>
