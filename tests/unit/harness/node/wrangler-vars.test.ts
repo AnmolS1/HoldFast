@@ -13,7 +13,6 @@ describe("wrangler.jsonc byte limits", () => {
     expect(valuesOf("PART_BYTES")).toEqual(["67108864", "67108864"]);
   });
 
-
   it.each([
     ["QUOTA_BYTES", "5000000000"],
     ["MAX_FILE_BYTES", "2000000000"],
