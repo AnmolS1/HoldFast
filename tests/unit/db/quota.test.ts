@@ -65,7 +65,7 @@ describe("reserve", () => {
 
   it("works above 2^32 and rejects a negative or fractional amount", async () => {
     const owner = await makeUser(db);
-    expect((await used(owner)).quotaBytes).toBe(5_368_709_120);
+    expect((await used(owner)).quotaBytes).toBe(5_000_000_000);
     expect(await reserve(db, owner, 5_000_000_000)).toBe(true);
     expect(await reserve(db, owner, 400_000_000)).toBe(false);
     expect((await used(owner)).usedBytes).toBe(5_000_000_000);

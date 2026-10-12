@@ -161,7 +161,7 @@ export function makeUser(overrides: Partial<SessionUser> = {}): SessionUser {
     banned: false,
     banExpires: null,
     twoFactorEnabled: false,
-    quotaBytes: 5_368_709_120,
+    quotaBytes: 5_000_000_000,
     usedBytes: 0,
     termsVersion: "2026-10-01",
     suspendedAt: null,

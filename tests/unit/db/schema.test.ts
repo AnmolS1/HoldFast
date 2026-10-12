@@ -4,6 +4,7 @@
 import { eq, inArray, sql } from "drizzle-orm";
 import { getTableConfig, PgTable, type PgColumn } from "drizzle-orm/pg-core";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { userAdditionalFields } from "../../../src/worker/auth/fields";
 import * as authSchema from "../../../src/worker/db/auth-schema";
 import type { Db } from "../../../src/worker/db/client";
 import { pgError } from "../../../src/worker/db/errors";
@@ -152,6 +153,11 @@ describe("timestamps", () => {
   it("quota and usage are 64-bit columns", () => {
     expect(authSchema.user.quotaBytes.getSQLType()).toBe("bigint");
     expect(authSchema.user.usedBytes.getSQLType()).toBe("bigint");
+  });
+
+  it("the default quota is 5 GB, decimal — in the generated schema and in the field it is generated from", () => {
+    expect(authSchema.user.quotaBytes.default).toBe(5_000_000_000);
+    expect(userAdditionalFields.quotaBytes.defaultValue).toBe(5_000_000_000);
   });
 });
 

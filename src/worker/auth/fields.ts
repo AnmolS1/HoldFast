@@ -17,8 +17,8 @@
 //   invitedBy        another account's id
 //   suspendedReason  an operator's note
 
-/** 5 GiB, the beta quota. The real value is written at sign-up from `QUOTA_BYTES`. */
-const DEFAULT_QUOTA_BYTES = 5_368_709_120;
+/** 5 GB (5,000,000,000 bytes), the beta quota. The real value is written at sign-up from `QUOTA_BYTES`. */
+const DEFAULT_QUOTA_BYTES = 5_000_000_000;
 
 export const userAdditionalFields = {
   quotaBytes: {

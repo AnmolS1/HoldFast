@@ -78,8 +78,8 @@ afterAll(async () => {
 });
 
 describe("migration 0003", () => {
-  it("is in the journal, and is the newest migration", () => {
-    expect(journal.entries.at(-1)!.tag).toBe(TAG);
+  it("is in the journal, right after 0002", () => {
+    expect(journal.entries[3]!.tag).toBe(TAG);
   });
 
   it("refuses — loudly, changing nothing — a database where one provider identity is linked twice", async () => {

@@ -29,6 +29,13 @@
       "when": 1791573197119,
       "tag": "0003_session_second_factor_account_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791847060118,
+      "tag": "0004_quota_default_decimal",
+      "breakpoints": true
     }
   ]
 }

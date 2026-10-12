@@ -26,7 +26,7 @@ export const user = pgTable("user", {
   banReason: text("ban_reason"),
   banExpires: timestamp("ban_expires"),
   quotaBytes: bigint("quota_bytes", { mode: "number" })
-    .default(5368709120)
+    .default(5000000000)
     .notNull(),
   usedBytes: bigint("used_bytes", { mode: "number" }).default(0).notNull(),
   ageVerifiedAt: timestamp("age_verified_at"),
