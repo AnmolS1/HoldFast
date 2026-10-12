@@ -999,3 +999,67 @@ test.describe("scripts/create-session.ts", () => {
     }
   });
 });
+
+// N1 — a change of address: the link mailed to the CURRENT address does nothing by itself (a mail
+// scanner opens links too); the button on the page it lands on is the owner's consent.
+test.describe("changing the address of a verified account", () => {
+  test("ask (with the password) → the mailed link lands on our page and sends nothing → the button sends the second mail → that link, in the signed-in browser, changes the address; the button works once", async ({
+    page,
+    browser,
+    clientIp,
+    origins,
+  }) => {
+    await stubTurnstile(page);
+    const user = await signedInUser(page, { clientIp });
+    const next = freshEmail();
+    // The request (the account screen that sends it is a later task): refused without the password.
+    const bare = await page.request.post("/api/auth/change-email", {
+      headers: api(origins.app, clientIp),
+      data: { newEmail: next, callbackURL: "/" },
+    });
+    expect(bare.status()).toBe(400);
+    const asked = await page.request.post("/api/auth/change-email", {
+      headers: api(origins.app, clientIp),
+      data: { newEmail: next, callbackURL: "/", password: user.password },
+    });
+    expect(asked.status()).toBe(200);
+    const link = await linkFromMail(
+      user.email,
+      "Confirm the change of your email address",
+      "/api/auth/verify-email",
+    );
+
+    // Opened in ANOTHER browser, signed in to nothing (the owner's phone — or a scanner's sandbox).
+    const context = await browser.newContext();
+    await context.route(`${origins.app}/**`, (route) =>
+      route.continue({ headers: { ...route.request().headers(), "cf-connecting-ip": "10.99.7.1" } }),
+    );
+    const other = await context.newPage();
+    await stubTurnstile(other);
+    await other.goto(link);
+    await expect(other.getByRole("heading", { name: "Confirm the change of email address" })).toBeVisible();
+    // The token has left the address bar, and nothing has been sent to the new address.
+    await expect.poll(() => other.url()).toBe(`${origins.app}/confirm-email-change`);
+    expect(await mailCount(page.request, next)).toBe(0);
+
+    await other.getByRole("button", { name: "Confirm the change" }).click();
+    await expect(
+      other.getByText("Confirmed. Open the link we sent to the new address", { exact: false }),
+    ).toBeVisible();
+    const verify = await linkFromMail(next, "Confirm your new email address", "/api/auth/verify-email");
+    expect(await mailCount(page.request, next)).toBe(1);
+    expect((await userRow(user.email))?.id).toBe(user.id);
+
+    // The same link again: the consent was given once.
+    await other.goto(link);
+    await other.getByRole("button", { name: "Confirm the change" }).click();
+    await expect(other.getByText("This link is no longer valid.", { exact: false })).toBeVisible();
+    expect(await mailCount(page.request, next)).toBe(1);
+    await context.close();
+
+    // The second link, in the account's own signed-in browser, changes the address.
+    await page.goto(verify);
+    await expect.poll(async () => (await userRow(next))?.id).toBe(user.id);
+    expect(await userRow(user.email)).toBeNull();
+  });
+});
