@@ -9,11 +9,19 @@ const valuesOf = (name: string) =>
   [...config.matchAll(new RegExp(`"${name}":\\s*"(\\d+)"`, "g"))].map((match) => match[1]);
 
 describe("wrangler.jsonc byte limits", () => {
+  it("the multipart part size is the one binary number: 64 MiB, never shown", () => {
+    expect(valuesOf("PART_BYTES")).toEqual(["67108864", "67108864"]);
+  });
+
+
   it.each([
     ["QUOTA_BYTES", "5000000000"],
     ["MAX_FILE_BYTES", "2000000000"],
-    ["CEIL_UPLOAD_BYTES_DAY", "10000000000"],
+    ["CEIL_USER_BYTES_DAY", "20000000000"],
+    ["CEIL_LINK_BYTES_DAY", "20000000000"],
     ["CEIL_IP_BYTES_DAY", "50000000000"],
+    ["CEIL_UPLOAD_BYTES_DAY", "10000000000"],
+    ["CEIL_EDITOR_UPLOAD_BYTES_DAY", "2000000000"],
   ])("%s is %s at the top level and in env.production", (name, value) => {
     expect(valuesOf(name)).toEqual([value, value]);
   });
