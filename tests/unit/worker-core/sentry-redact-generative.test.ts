@@ -393,6 +393,11 @@ function leak(output: unknown): string | null {
 }
 
 const SEED = 20261009;
+// A time budget for the generated runs, sized from measurement, not a guess: they are CPU-bound and
+// linear in the number of events (no waiting, no I/O). On the M-series laptop the three take about
+// 35 s, 1.5 s and 53 s; on the 2-core CI runner 136 s, 5.5 s and 178 s (3.4 times slower), which the
+// first budgets (180 s and 120 s) did not allow for.
+const GENERATIVE_BUDGET_MS = 600_000;
 
 describe(`generated events (seed ${SEED})`, () => {
   it("6,000 events with secrets in every string position, under hostile keys, in encoded forms: total, clean, idempotent, never the marker", () => {
@@ -419,7 +424,7 @@ describe(`generated events (seed ${SEED})`, () => {
       expect(redactEvent(out), `event ${index}: not idempotent`).toEqual(out);
     }
     expect(strings).toBeGreaterThan(1_000_000);
-  }, 180_000);
+  }, GENERATIVE_BUDGET_MS);
 
   it("20,000 strings: no secret survives, and redacting twice equals redacting once", () => {
     const r = prng(SEED + 1);
@@ -438,7 +443,7 @@ describe(`generated events (seed ${SEED})`, () => {
         );
     }
     expect(failures.join("\n"), "see the list").toBe("");
-  }, 120_000);
+  }, GENERATIVE_BUDGET_MS);
 
   it("1,000 events past a bound: every one is the marker event, counted once, with nothing of the payload", () => {
     const r = prng(SEED + 2);
@@ -489,7 +494,7 @@ describe(`generated events (seed ${SEED})`, () => {
       // And the function underneath says why: it throws rather than returning a part.
       expect(() => redactValue(input)).toThrow();
     }
-  }, 120_000);
+  }, GENERATIVE_BUDGET_MS);
 
   it("oversize and hostile strings: bounded, total, and a string nested too deep in encodings is not guessed at", () => {
     const r = prng(SEED + 3);
