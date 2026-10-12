@@ -22,8 +22,7 @@
 import {
   clearSuspended,
   deleteUserSessions,
-  forgetKnownDevices,
-  forgetPasskeyMarks,
+  revokeAccess,
   getAccount,
   purgeAuthRows as deleteAuthRows,
   setSuspended,
@@ -59,6 +58,15 @@ export async function revokeSessions(deps: ServiceDeps, userId: string): Promise
 }
 
 /**
+ * Ends the account's sessions AND its device proofs and key marks (db/queries/auth-lifecycle.ts
+ * `revokeAccess`) — for a state that locks the account outside the two transactions below: a
+ * deletion date that has passed (auth/hooks.ts, the session read).
+ */
+export async function revokeAllAccess(deps: ServiceDeps, userId: string): Promise<number> {
+  return deps.db.transaction((tx) => revokeAccess(tx, userId));
+}
+
+/**
  * Suspends the account: sets `suspendedAt` / `suspendedReason`, ends every session and pauses
  * the account's links (`owner_suspended`). IDEMPOTENT: for an account that is already suspended
  * (or does not exist) nothing changes, nothing is audited and no second email is sent — returns
@@ -73,11 +81,8 @@ export async function suspendUser(
   const suspended = await deps.db.transaction(async (tx) => {
     // The UPDATE takes the user's row lock first (the estate's lock order: user, then the rest).
     if (!(await setSuspended(tx, userId, now(), reason))) return null;
-    const sessions = await deleteUserSessions(tx, userId);
-    // …and what the account's browsers and keys had standing goes with them, in the same
-    // transaction: known-device proofs and the keys' second-factor marks (auth/second-factor.ts).
-    await forgetKnownDevices(tx, userId);
-    await forgetPasskeyMarks(tx, userId);
+    // Sessions, device proofs and key marks — one function, under the user's row lock.
+    const sessions = await revokeAccess(tx, userId);
     const paused = await pauseLinks(tx, { ownerId: userId }, "owner_suspended");
     return { sessions, links: paused.length, account: await getAccount(tx, userId) };
   });
@@ -102,6 +107,9 @@ export async function suspendUser(
 export async function unsuspendUser(deps: ServiceDeps, userId: string, actor: Actor): Promise<boolean> {
   const lifted = await deps.db.transaction(async (tx) => {
     if (!(await clearSuspended(tx, userId))) return null;
+    // Whatever was minted for the account WHILE it was locked (a sign-in that was already past
+    // its check when the suspension landed) does not come back to life with the unlock.
+    await revokeAccess(tx, userId);
     const state = await userState(tx, userId);
     const restored = state?.banned ? [] : await unpauseLinks(tx, { ownerId: userId }, "owner_suspended");
     return { links: restored.length, stillBanned: state?.banned === true };
@@ -126,14 +134,13 @@ export async function applyBanChange(
 ): Promise<void> {
   const outcome = await deps.db.transaction(async (tx) => {
     if (banned) {
-      const sessions = await deleteUserSessions(tx, userId);
-      // …and what the account's browsers and keys had standing goes with them, in the same
-      // transaction: known-device proofs and the keys' second-factor marks (auth/second-factor.ts).
-      await forgetKnownDevices(tx, userId);
-      await forgetPasskeyMarks(tx, userId);
+      // Sessions, device proofs and key marks — one function, under the user's row lock.
+      const sessions = await revokeAccess(tx, userId);
       const paused = await pauseLinks(tx, { ownerId: userId }, "owner_suspended");
       return { sessions, links: paused.length };
     }
+    // (As for a lifted suspension: nothing minted during the ban outlives it.)
+    await revokeAccess(tx, userId);
     const state = await userState(tx, userId);
     // An expired ban reads as "not banned" too; either way a suspension keeps the pause.
     if (!state || state.banned || state.suspendedAt !== null) return { sessions: 0, links: 0 };

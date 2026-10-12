@@ -346,6 +346,8 @@ type Throttle = { admit(email: string): Promise<void>; settle(): Promise<void> }
  *   - it has none (made with Google, a passkey) → the session carries the second-factor mark,
  *     or is FRESH by Better Auth's own rule (`session.freshAge`, api/routes/session.mjs
  *     `freshSessionMiddleware`: created less than that long ago — a new sign-in).
+ *     `freshAge` is not configured here, so it is Better Auth's default: 86 400 s — ONE DAY
+ *     (dist/context/create-context.mjs:149).
  *     RESIDUAL, ACCEPTED (orchestrator, 2026-10-11): for such an account a stolen session
  *     under a day old passes this gate; the consent step (the button on the mailed link's
  *     page) is what protects its address.

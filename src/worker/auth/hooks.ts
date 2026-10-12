@@ -37,7 +37,7 @@ import {
   sweepAfterLink,
 } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
-import { applyBanChange, revokeSessions, SYSTEM_ACTOR, type Actor } from "../services/account-state";
+import { applyBanChange, revokeAllAccess, SYSTEM_ACTOR, type Actor } from "../services/account-state";
 import { now } from "../services/clock";
 import {
   chargeUnsent,
@@ -748,7 +748,7 @@ export function buildHooks(scope: AuthScope) {
         const at = scheduled instanceof Date ? scheduled : new Date(scheduled as string);
         if (!Number.isNaN(at.getTime()) && at.getTime() <= now().getTime()) {
           scope.deps.defer(
-            quietly(env, "revoke_deleted", async () => void (await revokeSessions(scope.deps, userId))),
+            quietly(env, "revoke_deleted", async () => void (await revokeAllAccess(scope.deps, userId))),
           );
         }
       }

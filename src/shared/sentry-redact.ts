@@ -472,6 +472,10 @@ const OWN_COOKIE = /\b(?:__(?:Secure|Host)-)?hf[._][A-Za-z0-9_.-]*=[^;\s"'<>]*/g
 // `;` that end it. Under a SENSITIVE name the match is only where a value STARTS: `redactPairs`
 // takes an unquoted value's whole line (the delimiter may be part of the value) and follows a
 // quoted one over line breaks to its closing quote.
+// RESIDUAL, ACCEPTED (orchestrator, 2026-10-11): an UNQUOTED value that goes on over a line
+// break (`secret: line one⏎line two`) keeps its later lines — nothing marks where such a value
+// ends, so no rule can take them without taking the rest of the text. (A PEM block is the one
+// multi-line unquoted shape that announces itself, and goes whole.)
 const KEY_VALUE =
   /(["']?)([\p{L}][\p{L}\p{N}_.[\]-]{0,63})(["']?)([\s-]*[:=][\s-]*)("(?:[^"\\\r\n]|\\.)*"?|'(?:[^'\\\r\n]|\\.)*'?|(?:[&]#[xX]?[0-9a-fA-F]{1,7}[;]?|[&][A-Za-z]{2,8}[;]|[^\s&;,"'<>])+)/gu;
 // An error's own code (a constant, a SQLSTATE, an HTTP status) is kept under `code`, and a

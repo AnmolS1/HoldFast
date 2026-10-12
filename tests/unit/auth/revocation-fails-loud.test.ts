@@ -3,15 +3,16 @@
 // has to go. Better Auth writes the password with its own statement, outside any transaction of
 // ours, so the cleanup cannot be made atomic with it; what it can be is LOUD: if it fails, the
 // request fails, and nobody is told "done" while the old trust still stands.
-import { like } from "drizzle-orm";
+import { eq, like } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import * as lifecycle from "../../../src/worker/db/queries/auth-lifecycle";
-import { verification } from "../../../src/worker/db/schema";
-import { suspendUser, SYSTEM_ACTOR } from "../../../src/worker/services/account-state";
+import { session, user, verification } from "../../../src/worker/db/schema";
+import { suspendUser, SYSTEM_ACTOR, unsuspendUser } from "../../../src/worker/services/account-state";
 import {
   auditRows,
   CAPTCHA,
   enableTotp,
+  eventually,
   getSession,
   linkIn,
   newClient,
@@ -280,4 +281,104 @@ describe("what an account's browsers and keys have standing: capped, and gone wi
       expect(await marks(target.user.id)).toEqual([]);
     },
   );
+});
+
+// B2 / B3 — one function ends an account's sessions, device proofs and key marks for EVERY way it
+// is locked or unlocked, under the user's row lock; and nothing minted by a success that races
+// the lock outlives it.
+describe("locking an account and what races it", () => {
+  const device = (userId: string) => ({
+    id: crypto.randomUUID().replace(/-/g, ""),
+    deviceId: crypto.randomUUID().replace(/-/g, ""),
+    userId,
+    expiresAt: new Date(Date.now() + 3_600_000),
+  });
+  const marks = async (userId: string) =>
+    (await testDb().select().from(verification).where(like(verification.identifier, "passkey-2f:%"))).filter(
+      (row) => row.value === userId,
+    );
+  const plantMark = (userId: string) =>
+    lifecycle.putAuthMarker(testDb(), {
+      id: crypto.randomUUID().replace(/-/g, ""),
+      identifier: `passkey-2f:${crypto.randomUUID()}`,
+      userId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+  it("a suspension and forty known-device proofs being made at the same moment: none survives it — and a locked account is given none afterwards", async () => {
+    for (let round = 0; round < 3; round++) {
+      const target = await verifiedUser();
+      const { deps, settle } = serviceDeps();
+      const [suspended] = await Promise.all([
+        suspendUser(deps, target.user.id, "test", SYSTEM_ACTOR),
+        ...Array.from({ length: 40 }, () => lifecycle.putKnownDevice(testDb(), device(target.user.id))),
+      ]);
+      await settle();
+      expect(suspended).toBe(true);
+      expect(await proofsOf(target.user.id), `round ${round}`).toEqual([]);
+      await lifecycle.putKnownDevice(testDb(), device(target.user.id));
+      expect(await proofsOf(target.user.id)).toEqual([]);
+    }
+  });
+
+  it("what was minted WHILE the account was locked does not come back with the unlock: a session, a proof and a key mark planted during a suspension are gone when it is lifted", async () => {
+    const target = await verifiedUser();
+    const { deps, settle } = serviceDeps();
+    expect(await suspendUser(deps, target.user.id, "test", SYSTEM_ACTOR)).toBe(true);
+    // As a sign-in / a passed factor that was already past its check when the lock landed would
+    // have left them (written straight to the tables: no request can do it while suspended).
+    const at = new Date();
+    await testDb()
+      .insert(session)
+      .values({
+        id: crypto.randomUUID().replace(/-/g, ""),
+        token: `raced-${crypto.randomUUID()}`,
+        userId: target.user.id,
+        expiresAt: new Date(Date.now() + 3_600_000),
+        createdAt: at,
+        updatedAt: at,
+      });
+    await testDb()
+      .insert(verification)
+      .values({
+        id: crypto.randomUUID().replace(/-/g, ""),
+        identifier: `known-device:${crypto.randomUUID().replace(/-/g, "")}`,
+        value: target.user.id,
+        expiresAt: new Date(Date.now() + 3_600_000),
+        createdAt: at,
+        updatedAt: at,
+      });
+    await plantMark(target.user.id);
+    expect(await unsuspendUser(deps, target.user.id, SYSTEM_ACTOR)).toBe(true);
+    await settle();
+    expect(await sessionsOf(target.user.id)).toEqual([]);
+    expect(await proofsOf(target.user.id)).toEqual([]);
+    expect(await marks(target.user.id)).toEqual([]);
+  });
+
+  it("an unban, and a deletion date that has passed, use the same function", async () => {
+    const boss = await verifiedUser();
+    await promoteToAdmin(boss.user.id);
+    const banned = await verifiedUser();
+    expect(
+      (await send(boss.client, "/api/auth/admin/ban-user", { json: { userId: banned.user.id } })).status,
+    ).toBe(200);
+    await plantMark(banned.user.id);
+    expect(
+      (await send(boss.client, "/api/auth/admin/unban-user", { json: { userId: banned.user.id } })).status,
+    ).toBe(200);
+    expect(await marks(banned.user.id)).toEqual([]);
+
+    const leaving = await verifiedUser();
+    await lifecycle.putKnownDevice(testDb(), device(leaving.user.id));
+    await plantMark(leaving.user.id);
+    await testDb()
+      .update(user)
+      .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
+      .where(eq(user.id, leaving.user.id));
+    await send(leaving.client, "/api/auth/get-session");
+    await eventually(async () => (await sessionsOf(leaving.user.id)).length === 0);
+    expect(await proofsOf(leaving.user.id)).toEqual([]);
+    expect(await marks(leaving.user.id)).toEqual([]);
+  });
 });

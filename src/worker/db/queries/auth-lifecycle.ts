@@ -335,6 +335,24 @@ export async function deleteUserSessions(db: Executor, userId: string): Promise<
 }
 
 /**
+ * EVERYTHING an account can act with or stand on, ended at once — its sessions, its browsers'
+ * known-device proofs, its keys' second-factor marks. The ONE function for every way an account
+ * is locked or unlocked (services/account-state.ts: suspension — which is also what a strike or
+ * a content lock does — ban, their lifting, and a deletion date that has passed). It takes the
+ * user's ROW LOCK first: whatever mints one of these for the account takes the same row (shared)
+ * before it writes (`putKnownDevice`), so a success racing the lock either lands before this and
+ * is deleted here, or comes after and sees the locked state. Call it INSIDE the transaction that
+ * changes the state. Returns how many sessions there were.
+ */
+export async function revokeAccess(tx: Executor, userId: string): Promise<number> {
+  await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
+  const sessions = await deleteUserSessions(tx, userId);
+  await forgetKnownDevices(tx, userId);
+  await forgetPasskeyMarks(tx, userId);
+  return sessions;
+}
+
+/**
  * The (country, browser family) pairs this account has signed in from since `since`: its
  * `auth.sign_in` audit rows, and its live sessions other than `exceptSessionId`.
  */
@@ -831,6 +849,15 @@ export async function putKnownDevice(
   // sign-ins cannot leave more than the cap behind.
   await db.transaction(async (tx) => {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`known-device:${device.userId}`}))`);
+    // The account's row, shared: a suspension or a ban holds it exclusively while it deletes
+    // (`revokeAccess`), so this either commits before that (and is deleted by it) or waits and
+    // sees the locked state — an account that is locked gets no proof.
+    const [owner] = await tx
+      .select({ banned: user.banned, suspendedAt: user.suspendedAt })
+      .from(user)
+      .where(eq(user.id, device.userId))
+      .for("share");
+    if (!owner || owner.banned === true || owner.suspendedAt !== null) return;
     await tx.insert(verification).values({
       id: device.id,
       identifier: knownDeviceIdentifier(device.deviceId),
