@@ -14,6 +14,8 @@ import {
   deliver,
   flushOperatorDigests,
   OPERATOR_CAPS,
+  MAILBOX_CAPS,
+  mailboxKey,
   ownLedgerKey,
   safeId,
   sendAdminAlert,
@@ -41,6 +43,7 @@ import {
 } from "../../../src/worker/services/email";
 import emailSource from "../../../src/worker/services/email.ts?raw";
 import { testOutbound } from "../../../src/worker/auth/test-outbound";
+import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
 import * as outbox from "../../../src/worker/services/outbox";
 import { STATEMENT_BUDGET } from "../../../src/worker/auth/parity";
 import {
@@ -861,12 +864,58 @@ describe("the mail budgets are charged the same whether or not the address has a
 // from anybody stop a person's reset mail for the day, five resends stop a new sign-up's
 // verification mail. Mail the address's OWN session or OWN sign-up browser asked for is counted
 // on a budget of its own, which no stranger can spend.
-/** The ledger key of an address's OWN budget: the exact stored address and its account (N5). */
-const ownKey = async (email: string, bucket: string) =>
-  ownLedgerKey(env, email, bucket, (await userByEmail(email))?.id ?? "nobody");
+/** The ledger key of an address's OWN budget: the exact stored address — not its account, not the canonical mailbox (N5). */
+const ownKey = async (email: string, bucket: string) => ownLedgerKey(env, email, bucket);
 
 describe("strangers cannot use up the mail an address asks for itself (R5)", () => {
-  it("the own budget belongs to ONE account at ONE exact address: a stranger's account at a plus-tag variant of the mailbox spends its own, not the person's (N5)", async () => {
+  const resendFrom = async (browser: Client, email: string) => {
+    await forgetAddressRule(browser);
+    browser.ip = freshIp();
+    await send(browser, "/api/auth/send-verification-email", { json: { email }, headers: CAPTCHA });
+  };
+
+  it("making the account at an address AGAIN does not mint a fresh own budget: it is the address's, whoever holds the row (N5)", async () => {
+    const email = freshEmail();
+    let sent = 0;
+    for (let round = 0; round < 3; round++) {
+      const browser = quiet();
+      expect((await signUp(browser, { email })).sent.status).toBe(200);
+      for (let n = 0; n < 3; n++) await resendFrom(browser, email);
+      sent += 3;
+      await eventually(
+        async () =>
+          (await counted(await ownKey(email, "signup"))) === Math.min(sent, BUCKET_CAPS.signup.perHour),
+      );
+      // The row is replaced (as a sweep, a purge or an emptied account would): a NEW account id.
+      await purgeAuthRows(testDb(), (await userByEmail(email))!.id);
+    }
+    // Nine own requests over three accounts: five were counted and sent, not nine.
+    expect(await counted(await ownKey(email, "signup"))).toBe(BUCKET_CAPS.signup.perHour);
+    const resends = mailTo(email, "verification").filter((mail) =>
+      /again|another|new link/i.test(mail.text ?? ""),
+    );
+    expect(resends.length).toBeLessThanOrEqual(BUCKET_CAPS.signup.perHour);
+    // In all: the three sign-up mails (anybody's budget) and five resends.
+    expect(mailTo(email, "verification")).toHaveLength(3 + BUCKET_CAPS.signup.perHour);
+  });
+
+  it("K variants of one mailbox, each with a real proof: together they cannot pass the MAILBOX's ceiling (N5)", async () => {
+    const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
+    const local = `m${crypto.randomUUID().slice(0, 8)}`;
+    const variants = Array.from({ length: 6 }, (_, k) => `${local}+v${k}@${domain}`);
+    for (const variant of variants) {
+      const browser = quiet();
+      expect((await signUp(browser, { email: variant })).sent.status).toBe(200);
+      for (let n = 0; n < BUCKET_CAPS.signup.perHour; n++) await resendFrom(browser, variant);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // 6 sign-ups + 30 own resends were asked for; what reached the one mailbox is the ceiling.
+    const arrived = variants.reduce((sum, variant) => sum + mailTo(variant).length, 0);
+    expect(arrived).toBe(MAILBOX_CAPS.perHour);
+    expect(await counted(await mailboxKey(env, `${local}@${domain}`))).toBe(MAILBOX_CAPS.perHour);
+  });
+
+  it("the own budget belongs to ONE exact address: a stranger's account at a plus-tag variant of the mailbox spends its own, not the person's (N5)", async () => {
     const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
     const person = quiet();
     const email = `p${crypto.randomUUID().slice(0, 8)}@${domain}`;

@@ -73,15 +73,20 @@
 // that recipient: ten reset requests from strangers would stop a person's own reset mail for the
 // day. So a mail the address ASKED FOR ITSELF — the request came with the address's own session,
 // or from the browser that signed up with it (an `hf_pending` proof whose user id IS the
-// unverified account at that address), or is the sign-up that creates the account — is counted
-// on a budget of its own (`ownLedgerKey`: the same caps, keyed on the EXACT address and its
-// account id — never the canonical mailbox), which nothing a stranger
+// unverified account at that address) — never a sign-up, whose recipient the body names — is counted
+// on a budget of its own (`ownLedgerKey`: the same caps, keyed on the EXACT stored address — not
+// the canonical mailbox and not the account), which nothing a stranger
 // sends is counted on. `EmailActor.own` says so; it is set in ONE place (auth/hooks.ts
 // `ownAddressOf`, read by auth/create-auth.ts) and only on a proof a stranger cannot get for
 // somebody else's address — a cookie's mere presence is not one. A pending sign-up's change of
 // address is NOT such a proof for the new address. The per-client budget applies to both alike.
-// (Consequence: the 50-a-day total per recipient is of mail OTHERS caused; what the address asks
-// for itself adds at most its own buckets' day caps — signup 20, reset 10.)
+// THE MAILBOX'S CEILING. Whatever bucket a mail is counted on, it is also counted on one
+// ceiling per CANONICAL mailbox (`mailboxKey`, MAILBOX_CAPS: 20 an hour, 50 a day — the sum the
+// buckets allow). Own mail counts toward it too. So: the plus-tag / Gmail-dot variants of one
+// mailbox each have their own small own-budget, but cannot together exceed the ceiling; and a
+// stranger who fills the ceiling can still stop the owner's mail for the window (accepted — the
+// same residual as a signed-out owner's reset mail). Security notices and operator alerts are
+// not counted on it: they have their own caps and never fail closed.
 // A recipient is counted under its CANONICAL address (`canonicalRecipient`): lower case, NFKC,
 // plus-tag removed, and for Gmail the dots removed — spellings of one mailbox share one budget.
 // Over a cap the send is skipped and counted (`metric("email", { outcome: "capped" })`); the
@@ -131,6 +136,12 @@ type Caps = { perHour: number; perDay: number };
  * that no bucket can use up another's day (signup 20, reset 10, session 10, product 10).
  */
 export const EMAIL_CAPS = { perHour: 5, perDay: 50 } as const;
+/**
+ * Per MAILBOX (canonical), over everything `admit` counts — the sum the four buckets allow
+ * (4 × 5 an hour, 20 + 10 + 10 + 10 a day). The buckets alone no longer bound it: an address's
+ * own budget is per exact address, so the variants of one mailbox each have one.
+ */
+export const MAILBOX_CAPS = { perHour: 20, perDay: 50 } as const;
 export const BUCKET_CAPS = {
   signup: { perHour: EMAIL_CAPS.perHour, perDay: 20 },
   reset: { perHour: EMAIL_CAPS.perHour, perDay: 10 },
@@ -865,18 +876,25 @@ export async function actorKey(
 
 /**
  * The ledger key of an address's OWN budget in one bucket (see "WHOSE BUDGET" in the header):
- * the EXACT stored address and the account it is bound to — never the canonical mailbox. The
- * proof behind an own request is for that account at that address and for no other spelling of
- * the mailbox: keyed canonically, a stranger's account at `victim+x@…` would spend the budget of
- * `victim@…`.
+ * the EXACT stored address — not the canonical mailbox (a stranger's account at `victim+x@…`
+ * must not spend the budget of `victim@…`), and not the account either (an address that gets a
+ * new account — swept, purged, emptied and signed up again — must not get a fresh budget each
+ * time). What bounds the variants of one mailbox together is `mailboxKey`'s ceiling.
  */
 export async function ownLedgerKey(
   env: Pick<Env, "FILES_TOKEN_SECRET">,
   address: string,
   bucket: string,
-  accountId: string,
 ): Promise<string> {
-  return ledgerHash(env, `own|${bucket}|${address.trim().toLowerCase()}|${accountId}`);
+  return ledgerHash(env, `own|${bucket}|${address.trim().toLowerCase()}`);
+}
+
+/**
+ * The CEILING of one mailbox: every mail `admit` counts — whichever bucket, own or anybody's —
+ * is also counted here, under the CANONICAL address (plus-tag and Gmail-dot variants folded).
+ */
+export async function mailboxKey(env: Pick<Env, "FILES_TOKEN_SECRET">, address: string): Promise<string> {
+  return ledgerHash(env, `to|all|${canonicalRecipient(address)}`);
 }
 
 /** The keyed hash of a canonical address (what the ledger stores is never an address). */
@@ -997,7 +1015,7 @@ async function admit(
     row.class === "unauth_triggered" && actor !== undefined && "client" in actor ? (actor.own ?? null) : null;
   const key =
     account !== null
-      ? await ownLedgerKey(env, address, row.bucket, account)
+      ? await ownLedgerKey(env, address, row.bucket)
       : await ledgerKey(env, address, row.bucket);
   if (!(await tryConsume(deps.db, key, recipient))) {
     countFor(env, "email", {
@@ -1005,6 +1023,11 @@ async function admit(
       kind: name,
       reason: account !== null ? "recipient_own" : "recipient",
     });
+    return false;
+  }
+  // …and the mailbox's ceiling, whatever the bucket was (MAILBOX_CAPS).
+  if (!(await tryConsume(deps.db, await mailboxKey(env, address), MAILBOX_CAPS))) {
+    countFor(env, "email", { outcome: "capped", kind: name, reason: "mailbox" });
     return false;
   }
   return true;
