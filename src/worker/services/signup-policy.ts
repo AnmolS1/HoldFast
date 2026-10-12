@@ -427,7 +427,7 @@ export async function takeSignup(
     termsVersion: settings.termsVersion,
     ageVerifiedAt: at,
     invitedBy: result.invitedBy,
-    quotaBytes: Number.isSafeInteger(quota) && quota > 0 ? quota : 5_368_709_120,
+    quotaBytes: Number.isSafeInteger(quota) && quota > 0 ? quota : 5_000_000_000,
   };
 }
 

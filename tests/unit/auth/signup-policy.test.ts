@@ -97,7 +97,7 @@ describe("a sign-up that passes every gate", () => {
     expect(row!.termsAcceptedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
     expect(row!.ageVerifiedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
     expect(row!.invitedBy).toBe(inviterRow!.id);
-    expect(row!.quotaBytes).toBe(5_368_709_120);
+    expect(row!.quotaBytes).toBe(5_000_000_000);
     expect(row!.usedBytes).toBe(0);
     expect(row!.legalHold).toBe(false);
     // Ids are Better Auth's own (ruling 3): 32 characters of [A-Za-z0-9].
@@ -114,6 +114,12 @@ describe("a sign-up that passes every gate", () => {
     const client = newClient({ env: { QUOTA_BYTES: "1234567890" } });
     const { email } = await signUp(client);
     expect((await userByEmail(email))!.quotaBytes).toBe(1_234_567_890);
+  });
+
+  it.each(["", "5 GB", "-1", "1.5"])("gives 5,000,000,000 bytes when QUOTA_BYTES is %j", async (value) => {
+    const client = newClient({ env: { QUOTA_BYTES: value } });
+    const { email } = await signUp(client);
+    expect((await userByEmail(email))!.quotaBytes).toBe(5_000_000_000);
   });
 
   it("ignores every protected field a body tries to set", async () => {
@@ -145,7 +151,7 @@ describe("a sign-up that passes every gate", () => {
       const created = await userByEmail(tried.email);
       if (created) {
         expect(created.role, field).toBe("user");
-        expect(created.quotaBytes, field).toBe(5_368_709_120);
+        expect(created.quotaBytes, field).toBe(5_000_000_000);
         expect(created.legalHold, field).toBe(false);
         expect(created.termsVersion, field).toBe("2026-10");
         expect(created.suspendedAt, field).toBeNull();

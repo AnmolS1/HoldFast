@@ -38,6 +38,10 @@ describe("workers project", () => {
   it("keeps the public vars from wrangler.jsonc", () => {
     expect(env.MAX_FILE_BYTES).toBe("2000000000");
     expect(env.PART_BYTES).toBe("67108864");
+    // Decimal, like the units the product shows: 5 GB of storage, 10 GB and 50 GB a day.
+    expect(env.QUOTA_BYTES).toBe("5000000000");
+    expect(env.CEIL_UPLOAD_BYTES_DAY).toBe("10000000000");
+    expect(env.CEIL_IP_BYTES_DAY).toBe("50000000000");
   });
 
   it("points Hyperdrive at this checkout's local database", () => {
