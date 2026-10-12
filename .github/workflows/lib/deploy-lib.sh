@@ -29,6 +29,11 @@ repo_root="$(cd "$lib_dir/../../.." && pwd)"
 REQUIRED_SECRETS="ADMIN_EMAILS BETTER_AUTH_SECRET FILES_TOKEN_SECRET GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET IP_ENC_KEY RESEND_API_KEY SENTRY_DSN TURNSTILE_SECRET"
 # Cloudflare's published always-pass Turnstile test sitekey (not a secret).
 TURNSTILE_TEST_SITEKEY="1x00000000000000000000AA"
+# The Worker registers the Google provider only when it has a client id and secret. The e2e run never
+# reaches Google (auth/test-outbound.ts answers for it in test mode), so CI uses the made-up pair the
+# unit tests use (tests/setup/test-vars.ts). Not secrets.
+GOOGLE_TEST_CLIENT_ID="test-google-client-id"
+GOOGLE_TEST_CLIENT_SECRET="test-google-client-secret"
 # drizzle-kit's default bookkeeping table (drizzle.config.ts sets no `migrations` block).
 MIGRATIONS_TABLE="drizzle.__drizzle_migrations"
 MIGRATIONS_JOURNAL="drizzle/meta/_journal.json"
@@ -75,6 +80,8 @@ cmd_dev_vars() {
     printf 'BETTER_AUTH_SECRET=%s\n' "$(openssl rand -base64 48 | tr -d '\n')"
     printf 'FILES_TOKEN_SECRET=%s\n' "$(openssl rand -base64 48 | tr -d '\n')"
     printf 'IP_ENC_KEY=%s\n' "$(openssl rand -base64 32 | tr -d '\n')"
+    printf 'GOOGLE_CLIENT_ID=%s\n' "$GOOGLE_TEST_CLIENT_ID"
+    printf 'GOOGLE_CLIENT_SECRET=%s\n' "$GOOGLE_TEST_CLIENT_SECRET"
   } >"$src"
 
   "$root/scripts/dev-env.sh" "$port" "$src" >/dev/null
@@ -89,7 +96,8 @@ cmd_dev_vars() {
 
   # Lengths only. awk reads the file; no value reaches argv, the environment or stdout.
   local report
-  report="$(awk -v sitekey="$TURNSTILE_TEST_SITEKEY" -v port="$port" '
+  report="$(awk -v sitekey="$TURNSTILE_TEST_SITEKEY" -v port="$port" \
+    -v gid="$GOOGLE_TEST_CLIENT_ID" -v gsecret="$GOOGLE_TEST_CLIENT_SECRET" '
     function val(line) { return substr(line, index(line, "=") + 1) }
     /^BETTER_AUTH_SECRET=/ { a = val($0) }
     /^FILES_TOKEN_SECRET=/ { b = val($0) }
@@ -98,7 +106,9 @@ cmd_dev_vars() {
     /^EMAIL_TRANSPORT=/    { mail = val($0) }
     /^SCAN_STUB=/          { stub = val($0) }
     /^APP_ORIGIN=/         { origin = val($0) }
-    /^(GOOGLE_CLIENT_ID|GOOGLE_CLIENT_SECRET|RESEND_API_KEY|SENTRY_DSN)=/ { if (val($0) != "") filled++ }
+    /^GOOGLE_CLIENT_ID=/     { google_id = val($0) }
+    /^GOOGLE_CLIENT_SECRET=/ { google_secret = val($0) }
+    /^(RESEND_API_KEY|SENTRY_DSN)=/ { if (val($0) != "") filled++ }
     END {
       printf "BETTER_AUTH_SECRET length=%d\nFILES_TOKEN_SECRET length=%d\nIP_ENC_KEY length=%d\n", length(a), length(b), length(c)
       ok = 1
@@ -109,11 +119,12 @@ cmd_dev_vars() {
       if (stub != "1") { print "BAD SCAN_STUB is not 1"; ok = 0 }
       if (origin != "http://localhost:" port) { print "BAD APP_ORIGIN does not name port " port; ok = 0 }
       if (filled > 0) { print "BAD a third-party secret is filled in (must stay blank in CI)"; ok = 0 }
+      if (google_id != gid || google_secret != gsecret) { print "BAD the Google client pair is not the made-up test pair"; ok = 0 }
       print (ok ? "OK" : "NOT-OK")
     }' "$target")"
   printf '%s\n' "$report" | grep -v '^OK$' || true
   [ "$(printf '%s\n' "$report" | tail -n 1)" = "OK" ] || fail "dev-vars: the written .dev.vars is not what the e2e job needs"
-  echo "dev-vars: wrote .dev.vars for port $port (mode 600; three generated secrets, Turnstile test pair, memory mail, scan stub)"
+  echo "dev-vars: wrote .dev.vars for port $port (mode 600; three generated secrets, Turnstile test pair, made-up Google client pair, memory mail, scan stub)"
 }
 
 # ── built-env ────────────────────────────────────────────────────────────────────────────────────
