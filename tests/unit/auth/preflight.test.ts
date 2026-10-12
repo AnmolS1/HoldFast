@@ -457,9 +457,9 @@ describe("stage (d): a well-formed request about nobody costs the endpoint's con
     for (const [path, options, hashes] of cases) {
       const done = await cost(() => measured(newClient(), `/api/auth${path}`, options));
       expect(done.scrypt, path).toBe(hashes);
-      // The budget, plus at most the route's own audit bookkeeping after it.
-      expect(done.statements, path).toBeGreaterThanOrEqual(STATEMENT_BUDGET[path]!);
-      expect(done.statements, path).toBeLessThanOrEqual(STATEMENT_BUDGET[path]! + 4);
+      // The budget exactly: the padding is the last thing before the answer, and the audit row
+      // is written after it (auth/observe.ts `recordAfterAnswer`).
+      expect(done.statements, path).toBe(STATEMENT_BUDGET[path]!);
     }
   });
 });

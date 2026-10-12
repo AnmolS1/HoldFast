@@ -78,7 +78,7 @@ import {
   takePendingChange,
 } from "../db/queries/auth-lifecycle";
 import { ipKey } from "../middleware/rate-limit";
-import { countFor, guard, record, reportError } from "../auth/observe";
+import { countFor, guard, recordAfterAnswer, reportError } from "../auth/observe";
 import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
@@ -222,7 +222,8 @@ router.patch(
                 sendVerification(deps(c), { to: newEmail, url, by: { client: c.get("ip") } }),
               ),
             );
-            record(c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
+            // The row too: started now, its INSERT would race the padding below (auth/observe.ts).
+            recordAfterAnswer(scope, c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
               actorUserId: account.id,
               actorType: "user",
             });
@@ -347,7 +348,8 @@ router.post(
           { reason: PASSWORD_NOT_SET },
         );
       }
-      record(
+      recordAfterAnswer(
+        scope,
         c,
         "auth.password_changed",
         { type: "user", id: userId },

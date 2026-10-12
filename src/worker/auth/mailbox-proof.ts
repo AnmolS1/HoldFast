@@ -61,7 +61,7 @@ import {
 } from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
 import { now } from "../services/clock";
-import { record } from "./observe";
+import { recordAfterAnswer } from "./observe";
 import type { AuthScope } from "./scope";
 import { readPending } from "./signed-cookie";
 import { HANG, watched } from "./watchdog";
@@ -225,7 +225,9 @@ export async function confirmMailbox(
   // It stopped being "unverified at this address" a moment ago (another confirmation, or the
   // address was moved).
   if (removed === null) return null;
-  record(
+  // Written after the answer, like every row of a padded request (auth/observe.ts).
+  recordAfterAnswer(
+    scope,
     scope.deps,
     "auth.prehijack_cleanup",
     { type: "user", id: account.id },

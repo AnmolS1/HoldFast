@@ -186,10 +186,12 @@ router.all(
       // … and not one the sign-in throttle turned away (its answer depends on the request alone).
       const reached = scope !== null && scope.facts.endpointPath !== null && !scope.facts.throttled;
       const budget = linkFailed(relativePath, response) ? LINK_ERROR_BUDGET : STATEMENT_BUDGET[relativePath];
-      if (reached && budget !== undefined) await padStatements(db(c), budget);
 
-      // 4. What happened, for the audit log.
+      // 4. What happened, for the audit log. Its rows are written after the answer
+      // (auth/observe.ts `recordAfterAnswer`); what it READS for them is part of the request's
+      // own work, so the padding comes after it — the last thing before the answer.
       if (scope) await afterAuthRequest(c, scope, { relativePath, method, response, body });
+      if (reached && budget !== undefined) await padStatements(db(c), budget);
       // 5. A cleanup that takes trust away failed, twice (auth/second-factor.ts
       // `cleanUpOrFlag`). The change itself happened and has just been audited and announced:
       // the caller is told it did not complete — with whatever cookies the handler set (a

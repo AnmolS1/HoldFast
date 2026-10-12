@@ -112,7 +112,11 @@ export const BASE_SETTINGS: Settings = {
 // For the enumeration tests: instead of comparing wall-clock time (which measures the machine),
 // two requests are compared by the WORK they did — SQL statements sent before the response was
 // produced and in total, promises handed to the request's deferred work, audit rows, mails.
-export const probe = { statements: 0, statementsAtResponse: 0, deferred: 0, audits: 0 };
+/**
+ * `auditDelayMs` holds every audit row back by that long before it is written (0: not at all) —
+ * for the tests that put the row on either side of the answer on purpose.
+ */
+export const probe = { statements: 0, statementsAtResponse: 0, deferred: 0, audits: 0, auditDelayMs: 0 };
 
 /** `createDb`, with every statement any of its connections sends counted in `probe`. */
 const countedDb: CoreDeps["createDb"] = (dbEnv, limits) => {
@@ -180,6 +184,7 @@ function appFor(overrides: Settings): ReturnType<typeof createApp> {
       createDb: countedDb,
       insertAudit: async (db, row) => {
         probe.audits += 1;
+        if (probe.auditDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, probe.auditDelayMs));
         return insertAudit(db, row);
       },
       getSettings: overlaid,

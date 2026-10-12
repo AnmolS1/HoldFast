@@ -39,7 +39,7 @@ import {
   sendTwoFactorEnabled,
 } from "../services/email";
 import { db, defer, deps, type AppEnv } from "../services/request-context";
-import { count, record as auditRow } from "./observe";
+import { count, recordAfterAnswer as auditRow } from "./observe";
 import { responseCode } from "./redact";
 import { afterAnswer, type AuthScope } from "./scope";
 import { sessionCookieName } from "./signed-cookie";
@@ -162,6 +162,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     const since = new Date(now(c).getTime() - NEW_DEVICE_WINDOW_DAYS * 86_400_000);
     const known = await knownDevices(db(c), started.userId, since, started.id);
     auditRow(
+      scope,
       c,
       "auth.sign_in",
       userTarget(started.userId),
@@ -198,13 +199,13 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
   // ── impersonation ────────────────────────────────────────────────────────────────────────
   if (path === "/admin/impersonate-user" && ok) {
     const target = facts.newSessions.find((s) => s.impersonatedBy)?.userId ?? null;
-    auditRow(c, "auth.impersonation_started", target ? userTarget(target) : null);
+    auditRow(scope,c, "auth.impersonation_started", target ? userTarget(target) : null);
     count("auth", { outcome: "ok", kind: "impersonate" });
     return;
   }
   if (path === "/admin/stop-impersonating" && ok) {
     // requestActor() names the admin behind an impersonated session.
-    auditRow(c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
+    auditRow(scope,c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
     return;
   }
 
@@ -212,11 +213,11 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     const account = before ? { to: before.email, name: before.name } : null;
     switch (path) {
       case "/sign-out":
-        if (before) auditRow(c, "auth.sign_out", userTarget(before.id));
+        if (before) auditRow(scope,c, "auth.sign_out", userTarget(before.id));
         break;
       case "/change-password":
         if (before && account) {
-          auditRow(c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
+          auditRow(scope,c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasswordChanged(deps(c), account)),
@@ -227,6 +228,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         if (facts.passwordResetUserId) {
           const id = facts.passwordResetUserId;
           auditRow(
+            scope,
             c,
             "auth.password_changed",
             userTarget(id),
@@ -244,7 +246,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       case "/two-factor/verify-totp":
         // With a session and two-factor not yet on, a correct code is what switches it on.
         if (before && account && before.twoFactorEnabled !== true) {
-          auditRow(c, "auth.2fa_enabled", userTarget(before.id), null, self);
+          auditRow(scope,c, "auth.2fa_enabled", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendTwoFactorEnabled(deps(c), account)),
@@ -253,7 +255,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/two-factor/disable":
         if (before && account) {
-          auditRow(c, "auth.2fa_disabled", userTarget(before.id), null, self);
+          auditRow(scope,c, "auth.2fa_disabled", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendTwoFactorDisabled(deps(c), account)),
@@ -262,7 +264,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/passkey/verify-registration":
         if (before && account) {
-          auditRow(c, "auth.passkey_added", userTarget(before.id), null, self);
+          auditRow(scope,c, "auth.passkey_added", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasskeyAdded(deps(c), account)),
@@ -271,7 +273,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/passkey/delete-passkey":
         if (before && account) {
-          auditRow(c, "auth.passkey_removed", userTarget(before.id), null, self);
+          auditRow(scope,c, "auth.passkey_removed", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasskeyRemoved(deps(c), account)),
@@ -281,7 +283,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     }
     if (facts.emailChangedUserId) {
       const id = facts.emailChangedUserId;
-      auditRow(c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
+      auditRow(scope,c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
     }
     return;
   }
@@ -298,6 +300,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       }
     }
     auditRow(
+      scope,
       c,
       "auth.failed",
       target,

@@ -29,8 +29,9 @@ import { captureError } from "../sentry";
 import { audit, type AuditOptions, type AuditTarget } from "../services/audit";
 import { AppError } from "../services/errors";
 import { metric, writeMetric, type MetricName, type MetricTags } from "../services/metrics";
-import type { AppEnv, ServiceDeps } from "../services/request-context";
+import { defer, type AppEnv, type ServiceDeps } from "../services/request-context";
 import { safeError, scrubText } from "./redact";
+import { afterAnswer, type AuthScope } from "./scope";
 
 const TAG = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}$/;
 
@@ -100,6 +101,27 @@ export function record(
   options: AuditOptions = {},
 ): void {
   audit(source, action, target, safeMeta(meta), options);
+}
+
+/**
+ * `record`, written once the request has been answered (auth/scope.ts `afterAnswer`) — for every
+ * row of a request whose answer is brought to a fixed number of round trips (auth/parity.ts).
+ * `record` starts its INSERT at once, beside the request's own work: whether that statement is
+ * sent before the padding has finished, after it, or after the answer is then a matter of
+ * scheduling — one round trip more before the answer, on some runs, exactly when there was
+ * something to record.
+ */
+export function recordAfterAnswer(
+  scope: AuthScope,
+  source: Context<AppEnv> | ServiceDeps,
+  action: string,
+  target: AuditTarget,
+  meta: Record<string, unknown> | null = null,
+  options: AuditOptions = {},
+): void {
+  const later = afterAnswer(scope, async () => record(source, action, target, meta, options));
+  if ("req" in source && "executionCtx" in source) defer(source, later);
+  else source.defer(later);
 }
 
 /**
