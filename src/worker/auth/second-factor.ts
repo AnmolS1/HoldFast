@@ -138,6 +138,7 @@ import {
   deleteTrustedDevices,
   forgetKnownDevices,
   forgetPasskeyMarks,
+  forgetResetTokens,
   forgetTotpStep,
   hasAuthMarker,
   isKnownDevice,
@@ -339,10 +340,21 @@ export async function afterPasskeyRegistered(scope: AuthScope, ctx: SessionConte
  * SKIPS the challenge for thirty days) — ends here: on a password change or reset and on any
  * two-factor change. (A role change ends the passkey marks only: `afterRoleChange`.)
  */
+// (The three statements are the three kinds of db/queries/auth-lifecycle.ts STANDING_KINDS; the
+// registry test holds the two lists together.)
 export async function endStandingProofs(db: AuthScope["db"], userId: string): Promise<void> {
   await forgetKnownDevices(db, userId);
   await forgetPasskeyMarks(db, userId);
   await deleteTrustedDevices(db, userId);
+}
+
+/**
+ * What ends with a PASSWORD change or reset: everything `endStandingProofs` ends, and every other
+ * outstanding reset / set-password link of the account (the one that was used is already gone).
+ */
+export async function endPasswordStanding(db: AuthScope["db"], userId: string): Promise<void> {
+  await endStandingProofs(db, userId);
+  await forgetResetTokens(db, userId);
 }
 
 /**

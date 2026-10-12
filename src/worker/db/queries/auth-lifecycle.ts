@@ -335,8 +335,8 @@ export async function deleteUserSessions(db: Executor, userId: string): Promise<
 }
 
 /**
- * EVERYTHING an account can act with or stand on, ended at once — its sessions, its browsers'
- * known-device proofs, its keys' second-factor marks. The ONE function for every way an account
+ * EVERYTHING an account can act with or stand on, ended at once — its sessions, and every kind
+ * in STANDING_KINDS below (known-device proofs, key marks, remembered devices). The ONE function for every way an account
  * is locked or unlocked (services/account-state.ts: suspension — which is also what a strike or
  * a content lock does — ban, their lifting, and a deletion date that has passed). It takes the
  * user's ROW LOCK first: whatever mints one of these for the account takes the same row (shared)
@@ -347,9 +347,42 @@ export async function deleteUserSessions(db: Executor, userId: string): Promise<
 export async function revokeAccess(tx: Executor, userId: string): Promise<number> {
   await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
   const sessions = await deleteUserSessions(tx, userId);
-  await forgetKnownDevices(tx, userId);
-  await forgetPasskeyMarks(tx, userId);
+  for (const kind of STANDING_KINDS) await kind.forget(tx, userId);
   return sessions;
+}
+
+/**
+ * THE REGISTRY of what an account's browsers and keys can have STANDING beside a session — every
+ * kind, with the statement that ends it. `revokeAccess` ends each of them; so does
+ * auth/second-factor.ts `endStandingProofs` (a password or two-factor change). A new kind of
+ * standing is added HERE, and tests/unit/auth/revocation-fails-loud.test.ts then insists that it
+ * can be planted and that every caller ends it.
+ *   known_device    a browser's own second-factor code budget (`known-device:<id>`)
+ *   passkey_mark    a passkey counts as a second factor (`passkey-2f:<id>`)
+ *   trusted_device  Better Auth's "remember this device": the browser SKIPS the second-factor
+ *                   challenge for thirty days (`trust-device-…`)
+ */
+export const STANDING_KINDS: ReadonlyArray<{
+  name: string;
+  forget(db: Executor, userId: string): Promise<number>;
+}> = [
+  { name: "known_device", forget: (db, userId) => forgetKnownDevices(db, userId) },
+  { name: "passkey_mark", forget: (db, userId) => forgetPasskeyMarks(db, userId) },
+  { name: "trusted_device", forget: (db, userId) => deleteTrustedDevices(db, userId) },
+];
+
+/**
+ * Every OTHER outstanding reset / set-password token of the account (`reset-password:<token>`
+ * rows whose value is the user): a password that has just been changed or reset must not be
+ * reset again by a link mailed before it. (Better Auth consumes only the token that was used —
+ * api/routes/password.mjs.) Returns how many there were.
+ */
+export async function forgetResetTokens(db: Executor, userId: string): Promise<number> {
+  const rows = await db
+    .delete(verification)
+    .where(and(eq(verification.value, userId), like(verification.identifier, "reset-password:%")))
+    .returning({ id: verification.id });
+  return rows.length;
 }
 
 /**

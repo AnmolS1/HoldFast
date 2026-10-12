@@ -36,7 +36,7 @@ import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { setFirstPassword, VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
 import { hashPassword, verifyPassword } from "./password";
-import { cleanUpOrFlag, endStandingProofs, passkeyAuthentication } from "./second-factor";
+import { cleanUpOrFlag, endPasswordStanding, passkeyAuthentication } from "./second-factor";
 import { asciiLower } from "../../shared/admin-emails";
 import { isStoredFormAddress } from "./preflight";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
@@ -177,7 +177,7 @@ export function buildAuthOptions(scope: AuthScope) {
         // Then what stood on the old password: "remember this device", a browser's standing as
         // a known device, a passkey's as a second factor (auth/second-factor.ts). Tried twice;
         // a failure is flagged, not thrown — the route still audits, still mails, then says 5xx.
-        await cleanUpOrFlag(scope, "password_reset", () => endStandingProofs(db, user.id));
+        await cleanUpOrFlag(scope, "password_reset", () => endPasswordStanding(db, user.id));
       },
     },
     emailVerification: {

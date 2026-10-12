@@ -382,3 +382,182 @@ describe("locking an account and what races it", () => {
     expect(await marks(leaving.user.id)).toEqual([]);
   });
 });
+
+// Q1 — every KIND of standing an account's browsers and keys can have is in ONE registry
+// (`STANDING_KINDS`), and every lock, unlock and password / two-factor change ends every kind in
+// it. A kind added to the registry without a planter here fails the first test; a caller that
+// misses a kind fails the second.
+describe("the registry of standing: every kind is ended by every caller", () => {
+  const rowsOf = async (userId: string, prefix: string) =>
+    (
+      await testDb()
+        .select()
+        .from(verification)
+        .where(like(verification.identifier, `${prefix}%`))
+    ).filter((row) => row.value === userId);
+  const plantRow = async (userId: string, identifier: string) => {
+    const at = new Date();
+    await testDb()
+      .insert(verification)
+      .values({
+        id: crypto.randomUUID().replace(/-/g, ""),
+        identifier,
+        value: userId,
+        expiresAt: new Date(Date.now() + 3_600_000),
+        createdAt: at,
+        updatedAt: at,
+      });
+  };
+  /** How a row of each kind comes to exist, and how to count them. */
+  const KINDS: Record<string, { prefix: string; plant(userId: string): Promise<void> }> = {
+    known_device: {
+      prefix: "known-device:",
+      plant: (userId) => plantRow(userId, `known-device:${crypto.randomUUID().replace(/-/g, "")}`),
+    },
+    passkey_mark: {
+      prefix: "passkey-2f:",
+      plant: (userId) => plantRow(userId, `passkey-2f:${crypto.randomUUID()}`),
+    },
+    trusted_device: {
+      prefix: "trust-device-",
+      plant: (userId) => plantRow(userId, `trust-device-${crypto.randomUUID()}`),
+    },
+  };
+  const plantAll = async (userId: string) => {
+    for (const kind of Object.values(KINDS)) await kind.plant(userId);
+  };
+  const left = async (userId: string) =>
+    Object.fromEntries(
+      await Promise.all(
+        Object.entries(KINDS).map(async ([name, kind]) => [name, (await rowsOf(userId, kind.prefix)).length]),
+      ),
+    ) as Record<string, number>;
+  const NONE = Object.fromEntries(Object.keys(KINDS).map((name) => [name, 0]));
+
+  it("this test knows every kind the registry names", () => {
+    expect(lifecycle.STANDING_KINDS.map((kind) => kind.name).sort()).toEqual(Object.keys(KINDS).sort());
+  });
+
+  it("suspension, its lifting, a ban, its lifting, and a passed deletion date each end every kind — a remembered device included", async () => {
+    const boss = await verifiedUser();
+    await promoteToAdmin(boss.user.id);
+    const callers: Array<
+      [string, (userId: string, client: Parameters<typeof send>[0]) => Promise<void>, boolean]
+    > = [
+      [
+        "suspend",
+        async (userId) => {
+          const { deps, settle } = serviceDeps();
+          expect(await suspendUser(deps, userId, "test", SYSTEM_ACTOR)).toBe(true);
+          await settle();
+        },
+        false,
+      ],
+      [
+        "unsuspend",
+        async (userId) => {
+          const { deps, settle } = serviceDeps();
+          expect(await unsuspendUser(deps, userId, SYSTEM_ACTOR)).toBe(true);
+          await settle();
+        },
+        true,
+      ],
+      [
+        "ban",
+        async (userId) => {
+          expect((await send(boss.client, "/api/auth/admin/ban-user", { json: { userId } })).status).toBe(
+            200,
+          );
+        },
+        false,
+      ],
+      [
+        "unban",
+        async (userId) => {
+          expect((await send(boss.client, "/api/auth/admin/unban-user", { json: { userId } })).status).toBe(
+            200,
+          );
+        },
+        true,
+      ],
+    ];
+    for (const [what, call, lockedFirst] of callers) {
+      const target = await verifiedUser();
+      if (lockedFirst) {
+        // (locked first, by the matching call; then the rows are planted DURING the lock)
+        await callers[callers.findIndex(([name]) => name === what) - 1]![1](target.user.id, target.client);
+      }
+      await plantAll(target.user.id);
+      expect(await left(target.user.id), `${what}: planted`).toEqual(
+        Object.fromEntries(Object.keys(KINDS).map((name) => [name, 1])),
+      );
+      await call(target.user.id, target.client);
+      expect(await left(target.user.id), what).toEqual(NONE);
+    }
+    // …and so does a password change (auth/second-factor.ts `endStandingProofs`).
+    const changing = await verifiedUser();
+    await plantAll(changing.user.id);
+    const changed = await send(changing.client, "/api/auth/change-password", {
+      json: { currentPassword: PASSWORD, newPassword: NEW_PASSWORD },
+    });
+    expect(changed.status, changed.text).toBe(200);
+    expect(await left(changing.user.id), "password change").toEqual(NONE);
+    const leaving = await verifiedUser();
+    await plantAll(leaving.user.id);
+    await testDb()
+      .update(user)
+      .set({ deleteScheduledAt: new Date(Date.now() - 60_000) })
+      .where(eq(user.id, leaving.user.id));
+    await send(leaving.client, "/api/auth/get-session");
+    await eventually(async () => (await sessionsOf(leaving.user.id)).length === 0);
+    expect(await left(leaving.user.id), "deletion date passed").toEqual(NONE);
+  });
+});
+
+// Q4 — a password that has just been changed or reset is not to be reset again by a link that
+// was mailed BEFORE it: every other outstanding reset / set-password token of the account dies.
+describe("other outstanding reset links die with a password change or reset", () => {
+  const tokensOf = async (userId: string) =>
+    (
+      await testDb().select().from(verification).where(like(verification.identifier, "reset-password:%"))
+    ).filter((row) => row.value === userId);
+  async function twoResetTokens(email: string) {
+    const tokens: string[] = [];
+    for (let n = 1; n <= 2; n++) {
+      await send(newClient(), "/api/auth/request-password-reset", {
+        json: { email, redirectTo: "/reset-password" },
+        headers: CAPTCHA,
+      });
+      const follow = await send(newClient(), linkIn(await waitForMail(email, "passwordReset", n)));
+      tokens.push(new URL(follow.headers.get("location")!, "http://localhost").searchParams.get("token")!);
+    }
+    expect(tokens[0]).not.toBe(tokens[1]);
+    return tokens as [string, string];
+  }
+  const reset = (token: string, newPassword: string) =>
+    send(newClient(), "/api/auth/reset-password", { headers: CAPTCHA, json: { newPassword, token } });
+
+  it("a reset: the other link no longer takes a password", async () => {
+    const owner = await verifiedUser();
+    const [first, second] = await twoResetTokens(owner.email);
+    expect(await tokensOf(owner.user.id)).toHaveLength(2);
+    expect((await reset(first, NEW_PASSWORD)).status).toBe(200);
+    expect(await tokensOf(owner.user.id)).toEqual([]);
+    const stale = await reset(second, "what the earlier link would have set 9!");
+    expect(stale.status, stale.text).toBe(400);
+    expect(stale.body).toMatchObject({ code: "INVALID_TOKEN" });
+    expect((await signIn(newClient(), owner.email, NEW_PASSWORD)).status).toBe(200);
+  });
+
+  it("a change: an outstanding reset link no longer takes a password", async () => {
+    const owner = await verifiedUser();
+    const [first] = await twoResetTokens(owner.email);
+    const changed = await send(owner.client, "/api/auth/change-password", {
+      json: { currentPassword: PASSWORD, newPassword: NEW_PASSWORD },
+    });
+    expect(changed.status, changed.text).toBe(200);
+    expect(await tokensOf(owner.user.id)).toEqual([]);
+    expect((await reset(first, "what the earlier link would have set 9!")).status).toBe(400);
+    expect((await signIn(newClient(), owner.email, NEW_PASSWORD)).status).toBe(200);
+  });
+});

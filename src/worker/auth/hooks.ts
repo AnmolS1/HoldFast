@@ -86,7 +86,7 @@ import {
   beforeSecondFactor,
   beforeTwoFactorManage,
   cleanUpOrFlag,
-  endStandingProofs,
+  endPasswordStanding,
   hasSecondFactor,
   isSecondFactorKey,
   PASSKEY_MANAGE_PATHS,
@@ -707,7 +707,7 @@ export function buildHooks(scope: AuthScope) {
       // Auth has already written the password and ended the other sessions; the cleanup is
       // tried twice, and if it still fails the request is answered 5xx — by the route, AFTER
       // the audit row and the notice, and with the caller's new session cookie kept.
-      if (userId) await cleanUpOrFlag(scope, "password_change", () => endStandingProofs(scope.db, userId));
+      if (userId) await cleanUpOrFlag(scope, "password_change", () => endPasswordStanding(scope.db, userId));
       return;
     }
     if (path === "/get-session") {
