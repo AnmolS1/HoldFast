@@ -32,6 +32,8 @@ import {
   type Client,
 } from "./helpers";
 
+// Cloudflare's published Turnstile test secret that refuses every token (not a real secret).
+const ALWAYS_FAILS = "2x0000000000000000000000000000000AA";
 const ALLOW = { limit: async () => ({ success: true }) };
 const CONFIRM = "/api/account/confirm-email-change";
 const ask = (client: Client, newEmail: string, extra: Record<string, unknown> = {}) =>
@@ -146,6 +148,13 @@ describe("the confirmation link mailed to the current address is inert on a GET 
       json: { token },
     });
     expect(crossSite.status).toBe(403);
+    // A challenge Turnstile does not accept (Cloudflare's published always-fail test secret).
+    const failedChallenge = await send(newClient({ env: { TURNSTILE_SECRET: ALWAYS_FAILS } }), CONFIRM, {
+      headers: CAPTCHA,
+      json: { token },
+    });
+    expect(failedChallenge.status).toBe(403);
+    await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mailTo(target, "newAddressVerification")).toEqual([]);
     const pressed = await send(newClient(), CONFIRM, { headers: CAPTCHA, json: { token } });
     expect(pressed.status, pressed.text).toBe(200);

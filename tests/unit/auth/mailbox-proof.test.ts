@@ -162,6 +162,15 @@ describe("a verification link opened in a browser that did not sign up", () => {
         400,
       ],
       [
+        "a challenge Turnstile refuses",
+        // (Cloudflare's published always-fail test secret — not a real one.)
+        send(newClient({ env: { TURNSTILE_SECRET: "2x0000000000000000000000000000000AA" } }), CONFIRM, {
+          headers: CAPTCHA,
+          json: { token, newPassword: NEW_PASSWORD, ...STATEMENT },
+        }),
+        403,
+      ],
+      [
         "another site",
         send(victim, CONFIRM, {
           browser: false,
