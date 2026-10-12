@@ -6,10 +6,13 @@
 //   (b) the confirmation link mailed to the CURRENT address is inert on a GET (a mail scanner
 //       fetches every link): it lands on a page of ours, and a same-origin POST from its button
 //       is what sends the second mail.
-import { eq } from "drizzle-orm";
+import { env } from "cloudflare:workers";
+import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
-import { session } from "../../../src/worker/db/schema";
+import { FREE_ATTEMPTS, throttleKeys } from "../../../src/worker/auth/signin-throttle";
+import { rateLimit, session } from "../../../src/worker/db/schema";
+import { createKeys } from "../../../src/worker/services/keys";
 import emailSource from "../../../src/worker/services/email.ts?raw";
 import {
   CAPTCHA,
@@ -29,6 +32,7 @@ import {
   type Client,
 } from "./helpers";
 
+const ALLOW = { limit: async () => ({ success: true }) };
 const CONFIRM = "/api/account/confirm-email-change";
 const ask = (client: Client, newEmail: string, extra: Record<string, unknown> = {}) =>
   send(client, "/api/auth/change-email", { json: { newEmail, callbackURL: "/account", ...extra } });
@@ -49,6 +53,35 @@ describe("POST /change-email needs the owner again (N1a)", () => {
     const asked = await ask(owner.client, target, { password: PASSWORD });
     expect(asked.status, asked.text).toBe(200);
     await waitForMail(owner.email, "changeEmailConfirmation");
+  });
+
+  it("the password offered with a change is a guess like any other: counted on the account's sign-in throttle row, given back when right", async () => {
+    const owner = await verifiedUser();
+    const thief = newClient({ env: { RL_AUTH: ALLOW, RL_API: ALLOW } });
+    thief.cookies = new Map(owner.client.cookies);
+    const row = async () => {
+      const { pair } = await throttleKeys(
+        { keys: createKeys(env.FILES_TOKEN_SECRET) },
+        owner.email,
+        thief.ip,
+      );
+      return (await testDb().select().from(rateLimit).where(eq(rateLimit.key, pair)))[0]?.count ?? 0;
+    };
+    for (let n = 1; n <= FREE_ATTEMPTS; n++) {
+      await testDb().execute(
+        sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${thief.ip}%`}`,
+      );
+      expect((await ask(thief, freshEmail(), { password: `wrong guess number ${n} !!` })).status).toBe(400);
+      expect(await row()).toBe(n);
+    }
+    await testDb().execute(
+      sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${thief.ip}%`}`,
+    );
+    const throttled = await ask(thief, freshEmail(), { password: PASSWORD });
+    expect(throttled.status).toBe(429);
+    expect(throttled.body).toMatchObject({ code: "SIGN_IN_THROTTLED" });
+    // The owner, at their own address, is not delayed — and a right password leaves no row.
+    expect((await ask(owner.client, freshEmail(), { password: PASSWORD })).status).toBe(200);
   });
 
   it("an account with no password (made with Google): a fresh sign-in may ask, an old session may not", async () => {
