@@ -287,6 +287,50 @@ describe("other statuses", () => {
     });
   });
 
+  it("403 second_factor_required and 429 second_factor_throttled (no screen of their own yet): one typed error each, a sentence for the person, no re-auth modal, no redirect, no retry loop", async () => {
+    const calls = mockFetch(() =>
+      json(
+        {
+          error: "second_factor_required",
+          code: "SECOND_FACTOR_REQUIRED",
+          message: "Confirm your two-factor code to continue.",
+        },
+        403,
+      ),
+    );
+    const required = await api("/api/auth/two-factor/disable", { method: "POST", body: {} }).catch(
+      (e: unknown) => e,
+    );
+    expect(required).toBeInstanceOf(ApiError);
+    expect(required).toMatchObject({
+      status: 403,
+      code: "second_factor_required",
+      message: "Confirm your two-factor code to continue.",
+    });
+    expect(calls).toHaveLength(1);
+    expect(isReauthPending()).toBe(false);
+    expect(navigated).toEqual([]);
+
+    const again = mockFetch(() =>
+      json(
+        {
+          error: "second_factor_throttled",
+          code: "SECOND_FACTOR_THROTTLED",
+          message: "Too many wrong codes. Wait a while, or use a browser you have signed in from before.",
+        },
+        429,
+        { "retry-after": "600" },
+      ),
+    );
+    await expect(
+      api("/api/auth/two-factor/verify-totp", { method: "POST", body: { code: "000000" } }),
+    ).rejects.toMatchObject({ status: 429, code: "second_factor_throttled", retryAfter: 600 });
+    expect(again).toHaveLength(1);
+    expect(getToasts().some((toast) => /Try again in 600 s/.test(toast.message))).toBe(true);
+    expect(isReauthPending()).toBe(false);
+    expect(navigated).toEqual([]);
+  });
+
   it("503 read_only → the config flips to read-only (the banner), plus a toast", async () => {
     mockFetch(() => envelope("read_only", 503));
     await expect(api("/api/nodes", { method: "POST" })).rejects.toMatchObject({ status: 503 });

@@ -7,6 +7,7 @@ import { like } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import * as lifecycle from "../../../src/worker/db/queries/auth-lifecycle";
 import { verification } from "../../../src/worker/db/schema";
+import { suspendUser, SYSTEM_ACTOR } from "../../../src/worker/services/account-state";
 import {
   auditRows,
   CAPTCHA,
@@ -18,6 +19,7 @@ import {
   PASSWORD,
   promoteToAdmin,
   send,
+  serviceDeps,
   sessionsOf,
   signIn,
   testDb,
@@ -215,4 +217,67 @@ describe("a two-factor change whose cleanup fails", () => {
     await waitForMail(owner.email, "twoFactorEnabled");
     expect(await auditRows({ action: "auth.2fa_enabled", targetId: owner.user.id })).toHaveLength(1);
   });
+});
+
+describe("what an account's browsers and keys have standing: capped, and gone with a ban or a suspension", () => {
+  const marks = async (userId: string) =>
+    (await testDb().select().from(verification).where(like(verification.identifier, "passkey-2f:%"))).filter(
+      (row) => row.value === userId,
+    );
+  const device = (userId: string) => ({
+    id: crypto.randomUUID().replace(/-/g, ""),
+    deviceId: crypto.randomUUID().replace(/-/g, ""),
+    userId,
+    expiresAt: new Date(Date.now() + 3_600_000),
+  });
+
+  it(`an account keeps at most ${lifecycle.KNOWN_DEVICE_MAX} known-device proofs — the oldest go, also when many are made at once`, async () => {
+    const owner = await verifiedUser();
+    const first = device(owner.user.id);
+    await lifecycle.putKnownDevice(testDb(), first);
+    for (let n = 0; n < lifecycle.KNOWN_DEVICE_MAX + 4; n++) {
+      await lifecycle.putKnownDevice(testDb(), device(owner.user.id));
+    }
+    const kept = await proofsOf(owner.user.id);
+    expect(kept).toHaveLength(lifecycle.KNOWN_DEVICE_MAX);
+    expect(kept.map((row) => row.identifier)).not.toContain(`known-device:${first.deviceId}`);
+    await Promise.all(
+      Array.from({ length: 30 }, () => lifecycle.putKnownDevice(testDb(), device(owner.user.id))),
+    );
+    expect(await proofsOf(owner.user.id)).toHaveLength(lifecycle.KNOWN_DEVICE_MAX);
+    // Another account's are not touched.
+    const other = await verifiedUser();
+    await lifecycle.putKnownDevice(testDb(), device(other.user.id));
+    expect(await proofsOf(other.user.id)).toHaveLength(1);
+  });
+
+  it.each(["ban", "suspension"] as const)(
+    "a %s deletes the account's device proofs and key marks with its sessions",
+    async (how) => {
+      const boss = await verifiedUser();
+      await promoteToAdmin(boss.user.id);
+      const target = await verifiedUser();
+      await lifecycle.putKnownDevice(testDb(), device(target.user.id));
+      await lifecycle.putAuthMarker(testDb(), {
+        id: crypto.randomUUID().replace(/-/g, ""),
+        identifier: `passkey-2f:${crypto.randomUUID()}`,
+        userId: target.user.id,
+        expiresAt: new Date(Date.now() + 3_600_000),
+      });
+      expect([(await proofsOf(target.user.id)).length, (await marks(target.user.id)).length]).toEqual([1, 1]);
+      if (how === "ban") {
+        const banned = await send(boss.client, "/api/auth/admin/ban-user", {
+          json: { userId: target.user.id },
+        });
+        expect(banned.status, banned.text).toBe(200);
+      } else {
+        const { deps, settle } = serviceDeps();
+        expect(await suspendUser(deps, target.user.id, "test", SYSTEM_ACTOR)).toBe(true);
+        await settle();
+      }
+      expect(await sessionsOf(target.user.id)).toEqual([]);
+      expect(await proofsOf(target.user.id)).toEqual([]);
+      expect(await marks(target.user.id)).toEqual([]);
+    },
+  );
 });

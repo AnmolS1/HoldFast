@@ -8,6 +8,8 @@ export type ErrorCode =
   | "forbidden"
   | "terms_required"
   | "admin_requires_2fa"
+  | "second_factor_required"
+  | "second_factor_throttled"
   | "scan_blocked"
   | "not_found"
   | "conflict"
@@ -30,6 +32,10 @@ export const ERROR_STATUS = {
   forbidden: 403,
   terms_required: 403,
   admin_requires_2fa: 403,
+  // auth/second-factor.ts: the session has not passed the account's second factor (managing the
+  // factor), and too many wrong codes in the window (with `Retry-After`).
+  second_factor_required: 403,
+  second_factor_throttled: 429,
   scan_blocked: 403,
   not_found: 404,
   conflict: 409,

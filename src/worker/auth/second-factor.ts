@@ -182,6 +182,8 @@ const TOTP_WINDOW = 1;
 const INVALID_CODE = { code: "INVALID_CODE", message: "Invalid code" } as const;
 export const SECOND_FACTOR_THROTTLED = {
   code: "SECOND_FACTOR_THROTTLED",
+  // In the words our own routes use too (src/shared/errors.ts), as the admin gate does.
+  error: "second_factor_throttled",
   message: "Too many wrong codes. Wait a while, or use a browser you have signed in from before.",
 } as const;
 const NOT_AVAILABLE = {

@@ -37,6 +37,8 @@ const DEFAULT_MESSAGE: Record<ErrorCode, string> = {
   forbidden: "You do not have access to this.",
   terms_required: "Accept the current Terms to continue.",
   admin_requires_2fa: "Admin actions need two-factor authentication.",
+  second_factor_required: "Confirm your two-factor code to continue.",
+  second_factor_throttled: "Too many wrong codes. Wait a while and try again.",
   scan_blocked: "This file is blocked.",
   not_found: "Not found.",
   conflict: "That conflicts with the current state.",

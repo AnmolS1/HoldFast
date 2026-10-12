@@ -22,6 +22,8 @@
 import {
   clearSuspended,
   deleteUserSessions,
+  forgetKnownDevices,
+  forgetPasskeyMarks,
   getAccount,
   purgeAuthRows as deleteAuthRows,
   setSuspended,
@@ -72,6 +74,10 @@ export async function suspendUser(
     // The UPDATE takes the user's row lock first (the estate's lock order: user, then the rest).
     if (!(await setSuspended(tx, userId, now(), reason))) return null;
     const sessions = await deleteUserSessions(tx, userId);
+    // …and what the account's browsers and keys had standing goes with them, in the same
+    // transaction: known-device proofs and the keys' second-factor marks (auth/second-factor.ts).
+    await forgetKnownDevices(tx, userId);
+    await forgetPasskeyMarks(tx, userId);
     const paused = await pauseLinks(tx, { ownerId: userId }, "owner_suspended");
     return { sessions, links: paused.length, account: await getAccount(tx, userId) };
   });
@@ -121,6 +127,10 @@ export async function applyBanChange(
   const outcome = await deps.db.transaction(async (tx) => {
     if (banned) {
       const sessions = await deleteUserSessions(tx, userId);
+      // …and what the account's browsers and keys had standing goes with them, in the same
+      // transaction: known-device proofs and the keys' second-factor marks (auth/second-factor.ts).
+      await forgetKnownDevices(tx, userId);
+      await forgetPasskeyMarks(tx, userId);
       const paused = await pauseLinks(tx, { ownerId: userId }, "owner_suspended");
       return { sessions, links: paused.length };
     }

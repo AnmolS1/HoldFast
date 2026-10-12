@@ -818,18 +818,34 @@ export async function claimOncePerWindow(db: Executor, key: string, windowSecond
 // every "delete what names this user" removes it, and `forgetKnownDevices` ends them all.
 const knownDeviceIdentifier = (deviceId: string) => `known-device:${deviceId}`;
 
+/** How many known-device proofs one account may have; the oldest go when a new one is made. */
+export const KNOWN_DEVICE_MAX = 20;
+
 export async function putKnownDevice(
   db: Executor,
   device: { id: string; deviceId: string; userId: string; expiresAt: Date },
 ): Promise<void> {
   const at = new Date();
-  await db.insert(verification).values({
-    id: device.id,
-    identifier: knownDeviceIdentifier(device.deviceId),
-    value: device.userId,
-    expiresAt: device.expiresAt,
-    createdAt: at,
-    updatedAt: at,
+  // One transaction per account at a time (an advisory lock on the user): the insert and the
+  // eviction of everything past the newest KNOWN_DEVICE_MAX are atomic, so simultaneous
+  // sign-ins cannot leave more than the cap behind.
+  await db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`known-device:${device.userId}`}))`);
+    await tx.insert(verification).values({
+      id: device.id,
+      identifier: knownDeviceIdentifier(device.deviceId),
+      value: device.userId,
+      expiresAt: device.expiresAt,
+      createdAt: at,
+      updatedAt: at,
+    });
+    await tx.execute(sql`
+      DELETE FROM ${verification} WHERE id IN (
+        SELECT id FROM ${verification}
+        WHERE value = ${device.userId} AND identifier LIKE 'known-device:%'
+        ORDER BY created_at DESC, id DESC
+        OFFSET ${KNOWN_DEVICE_MAX}
+      )`);
   });
 }
 
