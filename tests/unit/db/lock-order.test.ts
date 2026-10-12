@@ -48,6 +48,9 @@ async function untilWaitingForLock(pid: number, label: string): Promise<void> {
 }
 
 /** A promise with its resolver, so a transaction can be held open until the test says so. */
+// Each test opens `ownerRowHeld` once the first transaction has its lock and the second waits for it
+// before starting: two transactions begun together otherwise race for the row, and when the second
+// wins it never queues — the first then waits for a lock wait that cannot happen (seen on CI).
 function gate<T = void>() {
   let open!: (value: T) => void;
   const opened = new Promise<T>((resolve) => (open = resolve));
@@ -81,16 +84,19 @@ describe("the CSAM lock beside a purge of the same owner", () => {
   it("never deadlocks: the CSAM lock waits for the purge instead of being aborted by it", async () => {
     const { owner, folder, file } = await evidence();
     const csamPid = gate<number>();
+    const ownerRowHeld = gate();
 
     const purge = settle(
       a.db.transaction(async (tx) => {
         await tx.select({ id: user.id }).from(user).where(eq(user.id, owner)).for("update");
+        ownerRowHeld.open();
         await untilWaitingForLock(await csamPid.opened, "csam lock");
         return deleteSubtreeRows(tx, folder.id);
       }),
     );
     const csam = settle(
       b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
         csamPid.open(await pidOf(tx));
         return lockSuspectedCsam(tx, file.id, { source: "photodna" });
       }),
@@ -156,6 +162,7 @@ describe("Replace beside a legal hold on the account", () => {
     const owner = await makeUser(a.db);
     const file = await makeFile(a.db, owner, null, `r-${rand()}.bin`);
     const replacePid = gate<number>();
+    const ownerRowHeld = gate();
     const next = {
       r2Key: `u/${owner}/${file.id}/v2`,
       versionId: "v2",
@@ -167,11 +174,13 @@ describe("Replace beside a legal hold on the account", () => {
     const hold = settle(
       a.db.transaction(async (tx) => {
         await setUserLegalHold(tx, owner, true);
+        ownerRowHeld.open();
         await untilWaitingForLock(await replacePid.opened, "replace");
       }),
     );
     const replace = settle(
       b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
         replacePid.open(await pidOf(tx));
         return replaceVersion(tx, file.id, next);
       }),
@@ -191,6 +200,7 @@ describe("Replace beside a legal hold on the account", () => {
     const owner = await makeUser(a.db);
     const file = await makeFile(a.db, owner, null, `rp-${rand()}.bin`);
     const replacePid = gate<number>();
+    const ownerRowHeld = gate();
     const next = {
       r2Key: `u/${owner}/${file.id}/v2`,
       versionId: "v2",
@@ -202,12 +212,14 @@ describe("Replace beside a legal hold on the account", () => {
     const purge = settle(
       a.db.transaction(async (tx) => {
         await tx.select({ id: user.id }).from(user).where(eq(user.id, owner)).for("update");
+        ownerRowHeld.open();
         await untilWaitingForLock(await replacePid.opened, "replace");
         return deleteSubtreeRows(tx, file.id);
       }),
     );
     const replace = settle(
       b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
         replacePid.open(await pidOf(tx));
         return replaceVersion(tx, file.id, next);
       }),
@@ -230,16 +242,19 @@ describe("cancelling a scheduled deletion beside re-scheduling it", () => {
     const moved = new Date(Date.now() + 14 * 86_400_000);
     expect(await schedule(a.db, owner, first)).toBe(true);
     const cancelPid = gate<number>();
+    const ownerRowHeld = gate();
 
     const reschedule = settle(
       a.db.transaction(async (tx) => {
         await tx.select({ id: user.id }).from(user).where(eq(user.id, owner)).for("update");
+        ownerRowHeld.open();
         await untilWaitingForLock(await cancelPid.opened, "cancel");
         return schedule(tx, owner, moved);
       }),
     );
     const cancelled = settle(
       b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
         cancelPid.open(await pidOf(tx));
         return cancel(tx, owner);
       }),
