@@ -10,9 +10,11 @@ import { verification } from "../../../src/worker/db/schema";
 import {
   auditRows,
   CAPTCHA,
+  enableTotp,
   getSession,
   linkIn,
   newClient,
+  nextTotp,
   PASSWORD,
   promoteToAdmin,
   send,
@@ -173,5 +175,44 @@ describe("a role change whose cleanup fails", () => {
     });
     expect(done.status, done.text).toBe(200);
     expect(await sessionsOf(other.user.id)).toEqual([]);
+  });
+});
+
+// P2 — the two-factor change paths have the same shape: Better Auth has already switched the
+// factor off (or confirmed the enrolment) and set the new session's cookie when the cleanup runs.
+describe("a two-factor change whose cleanup fails", () => {
+  it("disable, twice: 5xx — with the new session cookie kept, the change audited and the owner mailed; once: 200", async () => {
+    const owner = await verifiedUser();
+    await enableTotp(owner.client);
+    failing(2);
+    const failed = await send(owner.client, "/api/auth/two-factor/disable", { json: { password: PASSWORD } });
+    expect(failed.status, failed.text).toBe(500);
+    expect(failed.setCookies.join("\n")).toContain("hf.session_token=");
+    expect((await getSession(owner.client))?.user.id).toBe(owner.user.id);
+    expect((await userById(owner.user.id))!.twoFactorEnabled).toBe(false);
+    await waitForMail(owner.email, "twoFactorDisabled");
+    expect(await auditRows({ action: "auth.2fa_disabled", targetId: owner.user.id })).toHaveLength(1);
+
+    const other = await verifiedUser();
+    await enableTotp(other.client);
+    const mock = failing(1);
+    const done = await send(other.client, "/api/auth/two-factor/disable", { json: { password: PASSWORD } });
+    expect(done.status, done.text).toBe(200);
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it("the confirming code of an enrolment, twice: 5xx — and two-factor IS on, audited, the owner mailed, the session kept", async () => {
+    const owner = await verifiedUser();
+    const enabled = await send(owner.client, "/api/auth/two-factor/enable", { json: { password: PASSWORD } });
+    const { totpURI } = enabled.body as { totpURI: string };
+    failing(2);
+    const failed = await send(owner.client, "/api/auth/two-factor/verify-totp", {
+      json: { code: await nextTotp(totpURI) },
+    });
+    expect(failed.status, failed.text).toBe(500);
+    expect((await userById(owner.user.id))!.twoFactorEnabled).toBe(true);
+    expect((await getSession(owner.client))?.user.id).toBe(owner.user.id);
+    await waitForMail(owner.email, "twoFactorEnabled");
+    expect(await auditRows({ action: "auth.2fa_enabled", targetId: owner.user.id })).toHaveLength(1);
   });
 });

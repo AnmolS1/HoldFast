@@ -399,9 +399,14 @@ export async function afterTwoFactorChange(scope: AuthScope, ctx: SessionContext
   if (!succeeded(ctx)) return;
   const userId = ctx.context.session?.user.id;
   if (!userId) return;
-  await clearSecondFactor(scope.db, userId);
-  // …and no browser is a "known device", and no key a second factor, of a factor that has changed.
-  await endStandingProofs(scope.db, userId);
+  // Every session proves the factor again; no browser is a "known device", no key a second
+  // factor and no device "remembered" under a factor that has changed. Better Auth has already
+  // made the change (and, for `disable`, the caller's new session): tried twice and flagged,
+  // never thrown — the route audits, mails, keeps the cookie, then says 5xx (`cleanUpOrFlag`).
+  await cleanUpOrFlag(scope, "two_factor_change", async () => {
+    await clearSecondFactor(scope.db, userId);
+    await endStandingProofs(scope.db, userId);
+  });
 }
 
 /**
@@ -704,7 +709,7 @@ export async function afterSecondFactor(scope: AuthScope, ctx: CodeContext): Pro
   if (attempt.mode === "enrolment") {
     // A new enrolment is a two-factor change: no browser is a known device of the old factor,
     // and no key registered under it counts.
-    await endStandingProofs(scope.db, attempt.userId);
+    await cleanUpOrFlag(scope, "enrolment", () => endStandingProofs(scope.db, attempt.userId));
   }
   // This browser has now passed the account's second factor: it is a known device. (Kept when
   // it already was one. Only ever here — on proof — and never for an impersonated session: one
