@@ -3,12 +3,21 @@
 // only when it is used. The nightly cron removes what expired more than a day ago.
 import { env } from "cloudflare:workers";
 import { inArray } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { sweepExpiredVerifications } from "../../../src/worker/db/queries/auth-lifecycle";
 import { verification } from "../../../src/worker/db/schema";
 import { NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
 import type { BackgroundContext } from "../../../src/worker/services/request-context";
 import { testDb } from "./helpers";
+
+// The sweep is table-wide by nature, and other test files sweep too (any nightly cron run): "the
+// hourly cron did NOT sweep" cannot be read off the table — a neighbour's sweep removes this
+// file's row at any moment. It is read off the CALL instead; that the nightly run then removes
+// this file's own row is still read off the table.
+vi.mock("../../../src/worker/db/queries/auth-lifecycle", async (original) => {
+  const real = await original<typeof import("../../../src/worker/db/queries/auth-lifecycle")>();
+  return { ...real, sweepExpiredVerifications: vi.fn(real.sweepExpiredVerifications) };
+});
 
 const HOUR = 3_600_000;
 const id = () => crypto.randomUUID().replace(/-/g, "");
@@ -65,9 +74,12 @@ describe("the sweep of expired verification rows", () => {
         { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext,
         { db: testDb(), env, defer: () => {} } as unknown as BackgroundContext,
       );
+    const sweep = vi.mocked(sweepExpiredVerifications);
+    sweep.mockClear();
     await run("3 * * * *");
-    expect(await left([old])).toEqual([old]);
+    expect(sweep).not.toHaveBeenCalled();
     await run(NIGHTLY_CRON);
+    expect(sweep).toHaveBeenCalledTimes(1);
     expect(await left([old])).toEqual([]);
   });
 });

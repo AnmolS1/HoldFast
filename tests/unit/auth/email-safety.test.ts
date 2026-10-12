@@ -700,8 +700,11 @@ describe("operator alerts", () => {
       "coalesced",
     );
     expect(mailTo(to, "operatorDigest")).toHaveLength(1);
-    // The hourly job, before a digest is due again: nothing is sent, nothing is lost.
-    expect(await flushOperatorDigests(deps)).toBe(0);
+    // The hourly job, before a digest is due again: nothing is sent TO THIS MAILBOX, nothing is
+    // lost. (The job's return value counts every mailbox in the table — other test files hold
+    // alerts of their own — so it is this test's own mailbox that is looked at.)
+    await flushOperatorDigests(deps);
+    expect(mailTo(to, "operatorDigest")).toHaveLength(1);
     // An hour later (the digest's own count has moved on): the job sends them — all of them.
     await testDb().execute(sql`
       DELETE FROM email_ledger WHERE recipient_hash = ${await ledgerKey(env, to, KINDS.operatorDigest.bucket)}`);
