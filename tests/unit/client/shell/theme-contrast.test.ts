@@ -24,6 +24,8 @@ const PAIRS: Pair[] = [
   { fg: "textSecondary", bg: "surface2", min: AA, why: "secondary text on a hovered row or banner" },
   { fg: "textSecondary", bg: "accentTint", min: AA, why: "meta text in a selected row" },
   { fg: "textSecondary", bg: "accentWash", min: AA, why: "Clear / Show details on the wash" },
+  { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control, hovered field outline on the page" },
+  { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control, hovered field outline on a pane" },
   { fg: "accent", bg: "surface", min: UI, why: "bars, dots, rings (UI, not text, in light)" },
   { fg: "accent", bg: "accentTrack", min: 1.5, why: "progress fill against its track" },
   { fg: "accentText", bg: "surface", min: AA, why: "prose links, Scanning" },
@@ -73,22 +75,14 @@ describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
   });
 });
 
-describe("textTertiary (a specification finding, reported — the values are the spec's)", () => {
-  // The token is for 18 px+ text and non-text marks only, which need 3:1. It clears that on one
-  // of the two base surfaces in each scheme and misses it narrowly on the other.
-  it("clears 3:1 on the light content pane and on the dark page", () => {
-    expect(contrast(lightTokens.textTertiary, lightTokens.surface)).toBeGreaterThanOrEqual(UI);
-    expect(contrast(darkTokens.textTertiary, darkTokens.bg)).toBeGreaterThanOrEqual(UI);
-  });
-
-  it("is just below 3:1 on the light page (2.98) and the dark content pane (2.94) — so the shell uses it for nothing", () => {
-    // Pinned on both sides: when the specification's hex changes, this test must be revisited.
-    const lightPage = contrast(lightTokens.textTertiary, lightTokens.bg);
-    const darkPane = contrast(darkTokens.textTertiary, darkTokens.surface);
-    expect(lightPage).toBeGreaterThan(2.9);
-    expect(lightPage).toBeLessThan(UI);
-    expect(darkPane).toBeGreaterThan(2.9);
-    expect(darkPane).toBeLessThan(UI);
+describe("textTertiary (disabled controls and the hovered field outline — never body text)", () => {
+  it.each(Object.entries(tokenSets))("%s: sits between the surface and textSecondary", (_scheme, tokens) => {
+    // The third level stays the faintest of the three text colours: below AA on purpose, and
+    // clearly apart from the second level.
+    expect(contrast(tokens.textTertiary, tokens.surface)).toBeLessThan(AA);
+    expect(contrast(tokens.textSecondary, tokens.surface)).toBeGreaterThan(
+      contrast(tokens.textTertiary, tokens.surface) + 1,
+    );
   });
 });
 

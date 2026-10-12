@@ -73,7 +73,7 @@ describe("index.html", () => {
 });
 
 describe("tokens with restricted use", () => {
-  it("textTertiary is used for no text outside the theme (dark is below 3:1 on the content pane)", () => {
+  it("textTertiary is used for no text outside the theme (it is 3:1, for disabled controls and marks — not AA)", () => {
     const users = Object.entries(sources)
       .filter(([path]) => !path.startsWith("/src/client/theme/"))
       .filter(([, code]) => /textTertiary/.test(code))
