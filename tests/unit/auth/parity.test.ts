@@ -246,29 +246,33 @@ describe("an address that has an account, and one that has none: the same answer
   });
 
   // The audit row is the one statement only SOME answers cause, and its write is not part of the
-  // request's own sequence: held back here so that it falls (a) wherever it falls, (b) after the
-  // padding but inside the answer's minimum time, (c) after the answer. Started beside the
-  // request (as it once was), (b) is one round trip more before the answer than (a) and (c).
+  // request's own sequence: held back here so that it falls (a) wherever it falls, (b) just after
+  // the padding has brought the request to its budget — an event, not a time, so it is "after the
+  // padding" on any machine — (c) after the answer. Started beside the request (as it once was),
+  // (b) is one round trip more before the answer than (a) and (c).
   it("an audit row is never a round trip before the answer, wherever its write falls", async () => {
     const settings = { ceilings: { signupIpDay: 50 } };
+    const pendingBudget = STATEMENT_BUDGET["/account/pending-email"]!;
+    const signInBudget = STATEMENT_BUDGET["/sign-in/email"]!;
     const seen: Record<string, Array<[string, number, number]>> = {};
-    const runs: Array<[string, number]> = [
-      ["at once", 0],
-      ["after the padding, inside the minimum time", PENDING_EMAIL_MIN_MS / 5],
-      ["after the answer", PENDING_EMAIL_MIN_MS * 1.5],
+    const runs: Array<[string, (budget: number) => void]> = [
+      ["at once", () => {}],
+      ["just after the padding", (budget) => void (probe.auditAfterStatements = budget)],
+      ["after the answer", () => void (probe.auditDelayMs = PENDING_EMAIL_MIN_MS * 1.5)],
     ];
-    for (const [when, delay] of runs) {
+    for (const [when, hold] of runs) {
       const moving = newClient({ settings });
       await signUp(moving);
-      probe.auditDelayMs = delay;
       try {
+        hold(pendingBudget);
         const moved = await measured(moving, "/api/account/pending-email", {
           headers: CAPTCHA,
           method: "PATCH",
           json: { email: freshEmail() },
         });
         (seen["a pending address that moves"] ??= []).push([when, moved.statements, moved.audits]);
-        // The row routes/auth.ts writes for a refused sign-in (auth/audit.ts), after ITS padding.
+        // The row routes/auth.ts writes for a refused sign-in (auth/audit.ts).
+        hold(signInBudget);
         const refused = await measured(
           newClient(),
           "/api/auth/sign-in/email",
@@ -276,13 +280,12 @@ describe("an address that has an account, and one that has none: the same answer
         );
         (seen["a refused sign-in"] ??= []).push([when, refused.statements, refused.audits]);
       } finally {
+        probe.auditAfterStatements = 0;
         probe.auditDelayMs = 0;
       }
     }
-    const budget = STATEMENT_BUDGET["/account/pending-email"]!;
-    expect(seen["a pending address that moves"]).toEqual(runs.map(([when]) => [when, budget, 1]));
-    const refusedCost = seen["a refused sign-in"]![0]![1];
-    expect(seen["a refused sign-in"]).toEqual(runs.map(([when]) => [when, refusedCost, 1]));
+    expect(seen["a pending address that moves"]).toEqual(runs.map(([when]) => [when, pendingBudget, 1]));
+    expect(seen["a refused sign-in"]).toEqual(runs.map(([when]) => [when, signInBudget, 1]));
   });
 });
 

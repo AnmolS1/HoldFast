@@ -113,10 +113,18 @@ export const BASE_SETTINGS: Settings = {
 // two requests are compared by the WORK they did — SQL statements sent before the response was
 // produced and in total, promises handed to the request's deferred work, audit rows, mails.
 /**
- * `auditDelayMs` holds every audit row back by that long before it is written (0: not at all) —
- * for the tests that put the row on either side of the answer on purpose.
+ * For the tests that put an audit row on either side of the answer on purpose, every row is held
+ * back before it is written: until the request has sent `auditAfterStatements` statements (an
+ * event, not a time — "after the padding" on any machine), then for `auditDelayMs`. 0: not held.
  */
-export const probe = { statements: 0, statementsAtResponse: 0, deferred: 0, audits: 0, auditDelayMs: 0 };
+export const probe = {
+  statements: 0,
+  statementsAtResponse: 0,
+  deferred: 0,
+  audits: 0,
+  auditAfterStatements: 0,
+  auditDelayMs: 0,
+};
 
 /** `createDb`, with every statement any of its connections sends counted in `probe`. */
 const countedDb: CoreDeps["createDb"] = (dbEnv, limits) => {
@@ -184,7 +192,10 @@ function appFor(overrides: Settings): ReturnType<typeof createApp> {
       createDb: countedDb,
       insertAudit: async (db, row) => {
         probe.audits += 1;
-        if (probe.auditDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, probe.auditDelayMs));
+        const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+        // Bounded: a request that never sends that many is not waited for.
+        for (let i = 0; i < 2000 && probe.statements < probe.auditAfterStatements; i++) await sleep(1);
+        if (probe.auditDelayMs > 0) await sleep(probe.auditDelayMs);
         return insertAudit(db, row);
       },
       getSettings: overlaid,
