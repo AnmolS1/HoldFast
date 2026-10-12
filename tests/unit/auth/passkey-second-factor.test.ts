@@ -16,7 +16,7 @@
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
-import { user } from "../../../src/worker/db/schema";
+import { passkey, user } from "../../../src/worker/db/schema";
 import {
   CAPTCHA,
   enableTotp,
@@ -379,4 +379,60 @@ describe("a key's second-factor mark does not outlive a password reset or change
       expect(refused.body).toMatchObject({ code: "ADMIN_REQUIRES_2FA" });
     },
   );
+});
+
+// P3 — a key that COUNTS as the account's second factor is not managed by a session alone.
+describe("deleting or renaming a passkey that counts as a second factor needs the mark or the password (P3)", () => {
+  async function oneFactorSession(email: string) {
+    const client = newClient();
+    const start = await send(client, "/api/auth/sign-in/social", {
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login" },
+    });
+    const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
+    const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email, name: "G" });
+    await send(
+      client,
+      `/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      { browser: false },
+    );
+    return client;
+  }
+  const keysOf = async (userId: string) => testDb().select().from(passkey).where(eq(passkey.userId, userId));
+
+  it("a one-factor session cannot take the owner's second factor away; with the password, or from a marked session, it can be managed", async () => {
+    const admin = await adminWithPasskey();
+    const [row] = await keysOf(admin.user.id);
+    const stolen = await oneFactorSession(admin.email);
+    for (const [path, body] of [
+      ["/api/auth/passkey/delete-passkey", { id: row!.id }],
+      ["/api/auth/passkey/update-passkey", { id: row!.id, name: "renamed" }],
+      ["/api/auth/passkey/delete-passkey", { id: row!.id, password: "a guess at the password 1!" }],
+    ] as const) {
+      const refused = await send(stolen, path, { json: body });
+      expect(refused.status, `${path}: ${refused.text}`).toBe(400);
+      expect(refused.body).toMatchObject({ code: "INVALID_PASSWORD" });
+    }
+    expect(await keysOf(admin.user.id)).toHaveLength(1);
+    // A session that carries the mark manages it without the password…
+    const marked = newClient();
+    expect((await signInWithPasskey(marked, admin.key, admin.user.id, UP | UV)).status).toBe(200);
+    const renamed = await send(marked, "/api/auth/passkey/update-passkey", {
+      json: { id: row!.id, name: "my key" },
+    });
+    expect(renamed.status, renamed.text).toBe(200);
+    // …and a one-factor session with the password may too.
+    const deleted = await send(stolen, "/api/auth/passkey/delete-passkey", {
+      json: { id: row!.id, password: PASSWORD },
+    });
+    expect(deleted.status, deleted.text).toBe(200);
+    expect(await keysOf(admin.user.id)).toEqual([]);
+  });
+
+  it("a key that does NOT count keeps today's rule: its owner's session deletes it", async () => {
+    const made = await verifiedUser();
+    await registerPasskey(made.client);
+    const [row] = await keysOf(made.user.id);
+    const deleted = await send(made.client, "/api/auth/passkey/delete-passkey", { json: { id: row!.id } });
+    expect(deleted.status, deleted.text).toBe(200);
+  });
 });

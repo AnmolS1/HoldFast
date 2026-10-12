@@ -369,6 +369,30 @@ export async function cleanUpOrFlag(
   return false;
 }
 
+/** The passkey endpoints that change or remove a key (it is named by `id` in the body). */
+export const PASSKEY_MANAGE_PATHS: ReadonlySet<string> = new Set([
+  "/passkey/delete-passkey",
+  "/passkey/update-passkey",
+]);
+
+/**
+ * Does this key of `userId` count as a second factor (grant 4 in the header)? Such a key is not
+ * managed by a session alone — the plugin asks for nothing but a session and ownership
+ * (@better-auth/passkey/dist/index.mjs: `sessionMiddleware` + `requireResourceOwnership`), so
+ * a one-factor session could take the owner's second factor away. hooks.ts asks for the owner
+ * again first (auth/mailbox-proof.ts `ownerAgain`: the session's mark, or the password through
+ * the per-account throttle). A key that does not count keeps the plugin's rule.
+ */
+export async function isSecondFactorKey(
+  scope: AuthScope,
+  passkeyId: unknown,
+  userId: string,
+): Promise<boolean> {
+  return typeof passkeyId === "string" && passkeyId !== ""
+    ? hasAuthMarker(scope.db, passkeyProof(passkeyId), userId)
+    : false;
+}
+
 /** After `/passkey/delete-passkey`: the fact about the key goes with the key. */
 export async function afterPasskeyDeleted(scope: AuthScope, ctx: SessionContext): Promise<void> {
   if (!succeeded(ctx)) return;

@@ -65,7 +65,14 @@ import {
   SESSION_PASSWORD_PATHS,
   SIGN_IN_PATH,
 } from "./signin-throttle";
-import { afterChangeEmail, beforeChangeEmail, beforeUnlinkAccount, beforeVerifyEmail } from "./mailbox-proof";
+import {
+  afterChangeEmail,
+  beforeChangeEmail,
+  beforeUnlinkAccount,
+  beforeVerifyEmail,
+  ownerAgain,
+  REAUTH_PATHS,
+} from "./mailbox-proof";
 import {
   afterImpersonationStopped,
   afterPasskeyDeleted,
@@ -81,6 +88,8 @@ import {
   cleanUpOrFlag,
   endStandingProofs,
   hasSecondFactor,
+  isSecondFactorKey,
+  PASSKEY_MANAGE_PATHS,
   secondFactorOfNewSession,
   TWO_FACTOR_MANAGE_PATHS,
   VERIFY_BACKUP_CODE_PATH,
@@ -583,15 +592,23 @@ export function buildHooks(scope: AuthScope) {
         refused(error);
       }
     }
-    if (ctx.request && (path === "/change-email" || path === "/unlink-account")) {
+    if (ctx.request && REAUTH_PATHS.has(path)) {
       // The owner again, not just a session (auth/mailbox-proof.ts `ownerAgain`).
       const throttle = {
         admit: (email: string) => beforeSignIn(scope, { body: { email } }),
         settle: () => afterSignIn(scope),
       };
       const marked = (session: unknown) => hasSecondFactor(session as Parameters<typeof hasSecondFactor>[0]);
-      if (path === "/change-email") await beforeChangeEmail(ctx, scope.reauthPassword, throttle, marked);
-      else {
+      if (PASSKEY_MANAGE_PATHS.has(path)) {
+        // Only for a key that counts as a second factor; there the mark suffices.
+        const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+        const id = (ctx.body as { id?: unknown } | null | undefined)?.id;
+        if (session && (await isSecondFactorKey(scope, id, session.user.id))) {
+          await ownerAgain(ctx, scope.reauthPassword, throttle, marked, true);
+        }
+      } else if (path === "/change-email") {
+        await beforeChangeEmail(ctx, scope.reauthPassword, throttle, marked);
+      } else {
         await beforeUnlinkAccount(
           ctx,
           (id, userId) => linkedProvider(scope.db, id, userId),
