@@ -80,13 +80,18 @@
 // `ownAddressOf`, read by auth/create-auth.ts) and only on a proof a stranger cannot get for
 // somebody else's address — a cookie's mere presence is not one. A pending sign-up's change of
 // address is NOT such a proof for the new address. The per-client budget applies to both alike.
-// THE MAILBOX'S CEILING. Whatever bucket a mail is counted on, it is also counted on one
-// ceiling per CANONICAL mailbox (`mailboxKey`, MAILBOX_CAPS: 20 an hour, 50 a day — the sum the
-// buckets allow). Own mail counts toward it too. So: the plus-tag / Gmail-dot variants of one
-// mailbox each have their own small own-budget, but cannot together exceed the ceiling; and a
-// stranger who fills the ceiling can still stop the owner's mail for the window (accepted — the
-// same residual as a signed-out owner's reset mail). Security notices and operator alerts are
-// not counted on it: they have their own caps and never fail closed.
+// THE MAILBOX'S CEILING — for the `unauth_triggered` class ONLY (verification, sign-up notice,
+// password reset: the mail an unauthenticated request can cause, and the own budgets beside
+// it). Each such mail is counted on its bucket (or the address's own budget) AND on one ceiling
+// per CANONICAL mailbox (`mailboxKey`, MAILBOX_CAPS: 20 an hour, 50 a day), in one transaction
+// (db/queries/email-ledger.ts `tryConsumeAll`): on both or on neither. So the plus-tag /
+// Gmail-dot variants of one mailbox each have their own small own-budget but cannot together
+// pass the ceiling; and a stranger who fills it can stop the owner's OWN verification / reset
+// mail for the window (accepted — the same residual as a signed-out owner's reset mail).
+// What does NOT count toward it and cannot be blocked by it — exactly as before it existed:
+// `session_action` (address change, delete confirmation: their own bucket), `transactional_user`
+// (their own bucket), `account_security` (its own cap; over it a digest; fails OPEN) and
+// `operator_alert` (own cap / digest; critical ones never touch the ledger).
 // A recipient is counted under its CANONICAL address (`canonicalRecipient`): lower case, NFKC,
 // plus-tag removed, and for Gmail the dots removed — spellings of one mailbox share one budget.
 // Over a cap the send is skipped and counted (`metric("email", { outcome: "capped" })`); the
@@ -109,6 +114,7 @@ import {
   refund,
   takeHeldAlerts,
   tryConsume,
+  tryConsumeAll,
 } from "../db/queries/email-ledger";
 import { isTestMode } from "./clock";
 import { countFor, reportError } from "../auth/observe";
@@ -137,9 +143,9 @@ type Caps = { perHour: number; perDay: number };
  */
 export const EMAIL_CAPS = { perHour: 5, perDay: 50 } as const;
 /**
- * Per MAILBOX (canonical), over everything `admit` counts — the sum the four buckets allow
- * (4 × 5 an hour, 20 + 10 + 10 + 10 a day). The buckets alone no longer bound it: an address's
- * own budget is per exact address, so the variants of one mailbox each have one.
+ * Per MAILBOX (canonical), over the `unauth_triggered` class — the file's existing totals. The
+ * buckets alone no longer bound that class: an address's own budget is per exact address, so
+ * the variants of one mailbox each have one.
  */
 export const MAILBOX_CAPS = { perHour: 20, perDay: 50 } as const;
 export const BUCKET_CAPS = {
@@ -1010,24 +1016,36 @@ async function admit(
   // A bucket with no caps of its own is not sent from: nothing is uncounted by default.
   if (!recipient) throw new Error("email: a bucket without caps was refused");
   // Mail the address asked for itself is counted apart from mail anybody can cause (the header)
-  // — under the exact address and its account, not the canonical mailbox.
+  // — under the exact address, not the canonical mailbox and not the account.
   const account =
     row.class === "unauth_triggered" && actor !== undefined && "client" in actor ? (actor.own ?? null) : null;
   const key =
     account !== null
       ? await ownLedgerKey(env, address, row.bucket)
       : await ledgerKey(env, address, row.bucket);
-  if (!(await tryConsume(deps.db, key, recipient))) {
+  if (row.class !== "unauth_triggered") {
+    // Mail a session or a sender caused: its bucket, as before. NOT on the mailbox ceiling —
+    // nothing an unauthenticated stranger sends may use up, or be used to block, this mail.
+    if (!(await tryConsume(deps.db, key, recipient))) {
+      countFor(env, "email", { outcome: "capped", kind: name, reason: "recipient" });
+      return false;
+    }
+    return true;
+  }
+  // Mail anybody can cause, and the own budgets beside it: the bucket (or the address's own
+  // budget) AND the mailbox's ceiling, counted in ONE transaction — on both or on neither, so a
+  // refusal by one never spends the other, and simultaneous sends cannot pass either figure.
+  const ceiling = await mailboxKey(env, address);
+  const reached = await tryConsumeAll(deps.db, [
+    { key, caps: recipient },
+    { key: ceiling, caps: MAILBOX_CAPS },
+  ]);
+  if (reached !== null) {
     countFor(env, "email", {
       outcome: "capped",
       kind: name,
-      reason: account !== null ? "recipient_own" : "recipient",
+      reason: reached === ceiling ? "mailbox" : account !== null ? "recipient_own" : "recipient",
     });
-    return false;
-  }
-  // …and the mailbox's ceiling, whatever the bucket was (MAILBOX_CAPS).
-  if (!(await tryConsume(deps.db, await mailboxKey(env, address), MAILBOX_CAPS))) {
-    countFor(env, "email", { outcome: "capped", kind: name, reason: "mailbox" });
     return false;
   }
   return true;

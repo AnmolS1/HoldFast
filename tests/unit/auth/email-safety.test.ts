@@ -30,6 +30,7 @@ import {
   safeLabel,
   SECURITY_CAPS,
   SENDER_CAPS,
+  sendChangeEmailConfirmation,
   sendNewDeviceSignIn,
   sendPasswordChanged,
   sendPasswordReset,
@@ -916,6 +917,75 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
     const arrived = variants.reduce((sum, variant) => sum + mailTo(variant).length, 0);
     expect(arrived).toBe(MAILBOX_CAPS.perHour);
     expect(await counted(await mailboxKey(env, `${local}@${domain}`))).toBe(MAILBOX_CAPS.perHour);
+  });
+
+  /** Own verification mails to `variants` (each with a proof, from addresses of their own), all at once. */
+  const ownMails = (deps: ReturnType<typeof serviceDeps>["deps"], variants: string[], each: number) =>
+    Promise.all(
+      variants.flatMap((to) =>
+        Array.from({ length: each }, () =>
+          sendVerification(deps, {
+            to,
+            url: `${APP}/api/auth/verify-email?token=t`,
+            by: { client: freshIp(), own: "a" },
+          }),
+        ),
+      ),
+    );
+
+  it("the address's budget and the mailbox's ceiling are counted TOGETHER or not at all: 48 own mails at once to 6 variants of one mailbox — exactly the ceiling are sent, and no budget is spent on a mail that was refused (A2)", async () => {
+    const { deps } = serviceDeps();
+    const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
+    const local = `c${crypto.randomUUID().slice(0, 8)}`;
+    const variants = Array.from({ length: 6 }, (_, k) => `${local}+w${k}@${domain}`);
+    const outcomes = await ownMails(deps, variants, 8);
+    expect(outcomes.filter((outcome) => outcome === "sent")).toHaveLength(MAILBOX_CAPS.perHour);
+    expect(outcomes.filter((outcome) => outcome === "capped")).toHaveLength(48 - MAILBOX_CAPS.perHour);
+    expect(variants.reduce((sum, to) => sum + mailTo(to).length, 0)).toBe(MAILBOX_CAPS.perHour);
+    expect(await counted(await mailboxKey(env, `${local}@${domain}`))).toBe(MAILBOX_CAPS.perHour);
+    // No drift: what the six own budgets hold is what was sent — none was charged for a mail the
+    // ceiling refused, and none passed its own cap.
+    const own = await Promise.all(variants.map(async (to) => counted(await ownKey(to, "signup"))));
+    expect(own.reduce((sum, count) => sum + count, 0)).toBe(MAILBOX_CAPS.perHour);
+    for (const count of own) expect(count).toBeLessThanOrEqual(BUCKET_CAPS.signup.perHour);
+  });
+
+  it("the ceiling is for mail an unauthenticated request can cause — a full one stops NOTHING else: a session's mail, a share, a security notice, a critical alert (A3)", async () => {
+    const { deps } = serviceDeps();
+    const domain = `${crypto.randomUUID().slice(0, 8)}.holdfast-test.example`;
+    const local = `f${crypto.randomUUID().slice(0, 8)}`;
+    const mailbox = `${local}@${domain}`;
+    await ownMails(
+      deps,
+      Array.from({ length: 5 }, (_, k) => `${local}+z${k}@${domain}`),
+      5,
+    );
+    expect(await counted(await mailboxKey(env, mailbox))).toBe(MAILBOX_CAPS.perHour);
+    // Control: the ceiling IS full — one more mail of the class is refused.
+    expect(
+      await sendVerification(deps, {
+        to: mailbox,
+        url: `${APP}/api/auth/verify-email?token=t`,
+        by: { client: freshIp() },
+      }),
+    ).toBe("capped");
+    // Everything a stranger could not block before the ceiling existed still goes out.
+    expect(
+      await sendChangeEmailConfirmation(deps, {
+        to: mailbox,
+        name: "Ana",
+        newEmail: freshEmail(),
+        url: `${APP}/api/auth/verify-email?token=t`,
+        by: { user: "user-a3" },
+      }),
+    ).toBe("sent");
+    expect(await sendPasswordChanged(deps, { to: mailbox, name: "Ana" })).toBe("sent");
+    expect(await sendTwoFactorDisabled(deps, { to: mailbox, name: "Ana" })).toBe("sent");
+    expect(await sendOperatorCritical(deps, { to: mailbox, event: "scanner_down", id: "probe" })).toBe(
+      "sent",
+    );
+    // …and none of it moved the ceiling.
+    expect(await counted(await mailboxKey(env, mailbox))).toBe(MAILBOX_CAPS.perHour);
   });
 
   it("the own budget belongs to ONE exact address: a stranger's account at a plus-tag variant of the mailbox spends its own, not the person's (N5)", async () => {

@@ -48,6 +48,38 @@ export async function tryConsume(
   }
 }
 
+/**
+ * Counts ONE send on SEVERAL keys, or on none: one transaction, the keys taken in one fixed
+ * order (so two sends that share a key cannot deadlock), and the first cap that is reached rolls
+ * everything back. Returns the key whose cap was reached, or null: counted on all.
+ */
+export async function tryConsumeAll(
+  db: Executor,
+  budgets: ReadonlyArray<{ key: string; caps: { perHour: number; perDay: number } }>,
+): Promise<string | null> {
+  const ordered = [...budgets].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const empty = ordered.find((budget) => budget.caps.perHour < 1 || budget.caps.perDay < 1);
+  if (empty) return empty.key;
+  let reached: string | null = null;
+  try {
+    await db.transaction(async (tx) => {
+      for (const budget of ordered) {
+        if (
+          !(await consumeWindow(tx, "day", budget.key, budget.caps.perDay)) ||
+          !(await consumeWindow(tx, "hour", budget.key, budget.caps.perHour))
+        ) {
+          reached = budget.key;
+          throw new CapReached();
+        }
+      }
+    });
+    return null;
+  } catch (error) {
+    if (error instanceof CapReached) return reached;
+    throw error;
+  }
+}
+
 /** Gives one send back to this hour's and this day's count of a key (a send that did not happen). */
 export async function refund(db: Executor, recipientHash: string): Promise<void> {
   await db.execute(sql`
