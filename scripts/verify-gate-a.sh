@@ -33,9 +33,11 @@ ALLOWED_STORAGE_KEYS="hf.prefs.v1"
 # Storage writes whose key is NOT a string literal in the built bundle (a constant the minifier
 # did not inline, or third-party code such as the UI library's colour-mode store). The scan cannot
 # read those keys, so a person does: the gate prints every such site, and this is the number of
-# sites that have been read and found to store no token, cookie value or session id. Any other
+# sites that have been read and found to store no token, cookie value or auth session id. Any other
 # number — more OR fewer — fails until they are read again. 0 = none reviewed yet.
-REVIEWED_NONLITERAL_STORAGE_SITES=0
+# 7 = the sites of the build at 8145d5d, read on 2026-10-12: theme and UI preferences are the only
+# live writes; the Sentry, router and auth-client sites are unreachable with the current configuration.
+REVIEWED_NONLITERAL_STORAGE_SITES=7
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
 ADMIN_MATCHER="src/shared/admin-emails.ts"
@@ -328,12 +330,12 @@ self_test() {
   echo 'function p(v){localStorage.setItem("hf.prefs.v1",v);localStorage.setItem("hf.session",t)}' >"$tmp/c-token/assets/index.js"
   echo 'function p(v){localStorage.setItem("hf.prefs.v1",v);window.localStorage.setItem(k+"-mode",m)}' >"$tmp/c-dynamic/assets/index.js"
   echo 'function p(v){localStorage.setItem("hf.prefs.v2",v)}' >"$tmp/c-stale/assets/index.js"
-  expect pass "only the allow-listed key" eval_storage_keys "$tmp/c-ok"
-  expect fail "a second, unlisted key" eval_storage_keys "$tmp/c-token"
-  expect fail "a key that is not a string literal" eval_storage_keys "$tmp/c-dynamic"
-  expect fail "the allow-listed key is not in the bundle" eval_storage_keys "$tmp/c-stale"
-  expect fail "empty build" eval_storage_keys "$tmp/c-empty"
-  expect fail "no build" eval_storage_keys "$tmp/c-absent"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect pass "only the allow-listed key" eval_storage_keys "$tmp/c-ok"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect fail "a second, unlisted key" eval_storage_keys "$tmp/c-token"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect fail "a key that is not a string literal" eval_storage_keys "$tmp/c-dynamic"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect fail "the allow-listed key is not in the bundle" eval_storage_keys "$tmp/c-stale"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect fail "empty build" eval_storage_keys "$tmp/c-empty"
+  REVIEWED_NONLITERAL_STORAGE_SITES=0 expect fail "no build" eval_storage_keys "$tmp/c-absent"
   REVIEWED_NONLITERAL_STORAGE_SITES=1 expect pass "one non-literal site, one reviewed" eval_storage_keys "$tmp/c-dynamic"
   REVIEWED_NONLITERAL_STORAGE_SITES=2 expect fail "one non-literal site, two reviewed (the bundle changed)" eval_storage_keys "$tmp/c-dynamic"
   REVIEWED_NONLITERAL_STORAGE_SITES=1 expect fail "no non-literal site, one reviewed (the bundle changed)" eval_storage_keys "$tmp/c-ok"
