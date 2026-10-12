@@ -15,6 +15,7 @@ import { rateLimit, session } from "../../../src/worker/db/schema";
 import { createKeys } from "../../../src/worker/services/keys";
 import emailSource from "../../../src/worker/services/email.ts?raw";
 import {
+  accountsOf,
   CAPTCHA,
   createInvite,
   freshEmail,
@@ -261,5 +262,64 @@ describe("every mailed link is inert on a GET, or bound to a proof the scanner d
     await send(other.client, link);
     expect((await userById(owner.user.id))!.deleteScheduledAt).toBeNull();
     expect((await userById(other.user.id))!.deleteScheduledAt).toBeNull();
+  });
+});
+
+// P1 — `/unlink-account` must not be a way round the gate: with the password row gone, the
+// change-of-address gate would no longer ask for a password.
+describe("unlinking a sign-in method (P1)", () => {
+  /** A verified account with a password AND Google linked; its session. */
+  async function withGoogle() {
+    const owner = await verifiedUser();
+    const start = await send(owner.client, "/api/auth/link-social", {
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login" },
+    });
+    const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
+    const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email: owner.email, name: "G" });
+    await send(
+      owner.client,
+      `/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      { browser: false },
+    );
+    const rows = await accountsOf(owner.user.id);
+    expect(rows.map((row) => row.providerId).sort()).toEqual(["credential", "google"]);
+    return {
+      owner,
+      credential: rows.find((row) => row.providerId === "credential")!.id,
+      google: rows.find((row) => row.providerId === "google")!.id,
+    };
+  }
+  const unlink = (client: Client, accountId: string, extra: Record<string, unknown> = {}) =>
+    send(client, "/api/auth/unlink-account", { json: { accountId, ...extra } });
+  const providers = async (userId: string) => (await accountsOf(userId)).map((row) => row.providerId).sort();
+
+  it("a stolen session cannot remove the password row — with or without the password — so the change-of-address gate still asks for it", async () => {
+    const { owner, credential } = await withGoogle();
+    const thief = newClient();
+    thief.cookies = new Map(owner.client.cookies);
+    for (const extra of [{}, { password: PASSWORD }]) {
+      const refused = await unlink(thief, credential, extra);
+      expect(refused.status, refused.text).toBe(403);
+      expect(refused.body).toMatchObject({ code: "UNLINK_NOT_AVAILABLE" });
+    }
+    expect(await providers(owner.user.id)).toEqual(["credential", "google"]);
+    const asked = await ask(thief, freshEmail());
+    expect(asked.status).toBe(400);
+    expect(asked.body).toMatchObject({ code: "INVALID_PASSWORD" });
+  });
+
+  it("unlinking Google needs the owner again (the password), like a change of address — and works with it", async () => {
+    const { owner, google } = await withGoogle();
+    const thief = newClient();
+    thief.cookies = new Map(owner.client.cookies);
+    for (const extra of [{}, { password: "a guess at the password 1!" }]) {
+      const refused = await unlink(thief, google, extra);
+      expect(refused.status, refused.text).toBe(400);
+      expect(refused.body).toMatchObject({ code: "INVALID_PASSWORD" });
+    }
+    expect(await providers(owner.user.id)).toEqual(["credential", "google"]);
+    const done = await unlink(owner.client, google, { password: PASSWORD });
+    expect(done.status, done.text).toBe(200);
+    expect(await providers(owner.user.id)).toEqual(["credential"]);
   });
 });

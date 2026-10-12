@@ -29,7 +29,7 @@ import { ADMIN_PLUGIN_ALLOWED, isAdminPluginPath, recordAdminDenial } from "../a
 import { afterAuthRequest } from "../auth/audit";
 import { scopeOf } from "../auth/create-auth";
 import { AUTH_PREFIX, isAuthEndpoint } from "../auth/endpoint-policy";
-import { CHANGE_EMAIL_UNAVAILABLE } from "../auth/mailbox-proof";
+import { CHANGE_EMAIL_UNAVAILABLE, REAUTH_PATHS } from "../auth/mailbox-proof";
 import { count, guard, isAnswer, reportError } from "../auth/observe";
 import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/parity";
 import { preflight } from "../auth/preflight";
@@ -121,10 +121,11 @@ router.all(
     if (checked.refusal) return c.json(checked.refusal.body, checked.refusal.status);
     // The one body the audit step needs (a failed sign-in names the account it tried).
     const body = relativePath === "/sign-in/email" ? checked.body : null;
-    // The password a change of address must come with: Better Auth's schema for that endpoint
-    // does not know the field, so the hook gets it from here (auth/mailbox-proof.ts).
-    if (scope && relativePath === "/change-email") {
-      scope.changeEmailPassword = (checked.body as { password?: unknown } | null)?.password;
+    // The password some requests must come with (the owner again — auth/mailbox-proof.ts
+    // `REAUTH_PATHS`): Better Auth's schemas for those endpoints do not know the field, so the
+    // hooks get it from here.
+    if (scope && REAUTH_PATHS.has(relativePath)) {
+      scope.reauthPassword = (checked.body as { password?: unknown } | null)?.password;
     }
 
     // Mail this request causes waits until it has been answered (auth/scope.ts `afterAnswer`).

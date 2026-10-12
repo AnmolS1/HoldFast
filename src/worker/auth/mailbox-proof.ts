@@ -300,28 +300,45 @@ type ChangeContext = Parameters<typeof getSessionFromCtx>[0] & {
   };
 };
 
+/** The endpoints whose body may carry `password` for `ownerAgain` (routes/auth.ts hands it over). */
+export const REAUTH_PATHS: ReadonlySet<string> = new Set([
+  "/change-email",
+  "/unlink-account",
+  "/passkey/delete-passkey",
+  "/passkey/update-passkey",
+]);
+
+type Throttle = { admit(email: string): Promise<void>; settle(): Promise<void> };
+
 /**
- * `hooks.before` for `POST /change-email`: a session alone may not ask for the account's
- * address to be changed (Better Auth asks for nothing more — api/routes/update-user.mjs
- * `changeEmail`: `sensitiveSessionMiddleware` only). The owner proves themselves again:
+ * THE OWNER AGAIN — a session alone is not enough for what follows. Used by `POST /change-email`
+ * (Better Auth asks for nothing more than a session there — api/routes/update-user.mjs
+ * `changeEmail`), by `POST /unlink-account` and by the management of a passkey that counts as a
+ * second factor (auth/second-factor.ts):
  *   - the account has a password → the request carries it (`password`), and it is checked
- *     through the per-account throttle like every other password a session offers
- *     (`admit` / `settle` are auth/signin-throttle.ts's — counted before the hash);
+ *     through the per-account throttle like every other password a session offers (`admit` /
+ *     `settle` are auth/signin-throttle.ts's — counted before the hash). `markSuffices`: where
+ *     the thing protected IS second-factor standing, a session that carries the mark has
+ *     already shown more than the password, and passes without it;
  *   - it has none (made with Google, a passkey) → the session carries the second-factor mark,
  *     or is FRESH by Better Auth's own rule (`session.freshAge`, api/routes/session.mjs
  *     `freshSessionMiddleware`: created less than that long ago — a new sign-in).
- * `password`: what the route read from the request body (Better Auth's schema for this endpoint
- * does not know the field).
+ *     RESIDUAL, ACCEPTED (orchestrator, 2026-10-11): for such an account a stolen session
+ *     under a day old passes this gate; the consent step (the button on the mailed link's
+ *     page) is what protects its address.
+ * Returns silently with no session (Better Auth answers 401). `password`: what the route read
+ * from the request body.
  */
-export async function beforeChangeEmail(
+export async function ownerAgain(
   ctx: ChangeContext,
   password: unknown,
-  throttle: { admit(email: string): Promise<void>; settle(): Promise<void> },
+  throttle: Throttle,
   hasMark: (session: unknown) => boolean,
+  markSuffices = false,
 ): Promise<void> {
   const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
-  // No session: Better Auth answers 401.
   if (!session) return;
+  if (markSuffices && hasMark(session.session)) return;
   const credential = await ctx.context.internalAdapter.findCredentialAccount(session.user.id);
   if (credential?.password) {
     const wrong = new APIError("BAD_REQUEST", { code: "INVALID_PASSWORD", message: "Invalid password" });
@@ -338,6 +355,45 @@ export async function beforeChangeEmail(
   if (fresh === 0 || age < fresh) return;
   throw new APIError("FORBIDDEN", {
     code: "SESSION_NOT_FRESH",
-    message: "Sign in again to change your email address.",
+    message: "Sign in again to continue.",
   });
+}
+
+/** `hooks.before` for `POST /change-email`: the owner again (see `ownerAgain`). */
+export const beforeChangeEmail = (
+  ctx: ChangeContext,
+  password: unknown,
+  throttle: Throttle,
+  hasMark: (session: unknown) => boolean,
+): Promise<void> => ownerAgain(ctx, password, throttle, hasMark);
+
+export const UNLINK_NOT_AVAILABLE = {
+  code: "UNLINK_NOT_AVAILABLE",
+  message: "A password cannot be removed from an account.",
+} as const;
+
+/**
+ * `hooks.before` for `POST /unlink-account` (Better Auth: a fresh session, nothing else —
+ * api/routes/account.mjs `unlinkAccount`). Removing the PASSWORD row is refused outright: it is
+ * not a product feature, and with the row gone `ownerAgain` would stop asking for a password.
+ * Removing a provider link needs the owner again, like a change of address. (The account's last
+ * sign-in method can never go: Better Auth refuses `FAILED_TO_UNLINK_LAST_ACCOUNT`, and the
+ * password row — which every account that reaches the second branch with a password has —
+ * stays.)
+ */
+export async function beforeUnlinkAccount(
+  ctx: ChangeContext,
+  linked: (accountRowId: string, userId: string) => Promise<string | null>,
+  password: unknown,
+  throttle: Throttle,
+  hasMark: (session: unknown) => boolean,
+): Promise<void> {
+  const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+  if (!session) return;
+  const id = (ctx.body as { accountId?: unknown } | null | undefined)?.accountId;
+  const provider = typeof id === "string" ? await linked(id, session.user.id) : null;
+  // Not a row of this account: Better Auth answers ACCOUNT_NOT_FOUND.
+  if (provider === null) return;
+  if (provider === "credential") throw new APIError("FORBIDDEN", { ...UNLINK_NOT_AVAILABLE });
+  await ownerAgain(ctx, password, throttle, hasMark);
 }

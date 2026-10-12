@@ -31,6 +31,7 @@ import {
   ensureUserPrefs,
   getAccount,
   getAccountByEmail,
+  linkedProvider,
   releaseSignup,
   revokeBootstrapAdmin,
   sweepAfterLink,
@@ -64,7 +65,7 @@ import {
   SESSION_PASSWORD_PATHS,
   SIGN_IN_PATH,
 } from "./signin-throttle";
-import { afterChangeEmail, beforeChangeEmail, beforeVerifyEmail } from "./mailbox-proof";
+import { afterChangeEmail, beforeChangeEmail, beforeUnlinkAccount, beforeVerifyEmail } from "./mailbox-proof";
 import {
   afterImpersonationStopped,
   afterPasskeyDeleted,
@@ -582,17 +583,23 @@ export function buildHooks(scope: AuthScope) {
         refused(error);
       }
     }
-    if (path === "/change-email" && ctx.request) {
-      // The owner again, not just a session (auth/mailbox-proof.ts `beforeChangeEmail`).
-      await beforeChangeEmail(
-        ctx,
-        scope.changeEmailPassword,
-        {
-          admit: (email) => beforeSignIn(scope, { body: { email } }),
-          settle: () => afterSignIn(scope),
-        },
-        (session) => hasSecondFactor(session as Parameters<typeof hasSecondFactor>[0]),
-      );
+    if (ctx.request && (path === "/change-email" || path === "/unlink-account")) {
+      // The owner again, not just a session (auth/mailbox-proof.ts `ownerAgain`).
+      const throttle = {
+        admit: (email: string) => beforeSignIn(scope, { body: { email } }),
+        settle: () => afterSignIn(scope),
+      };
+      const marked = (session: unknown) => hasSecondFactor(session as Parameters<typeof hasSecondFactor>[0]);
+      if (path === "/change-email") await beforeChangeEmail(ctx, scope.reauthPassword, throttle, marked);
+      else {
+        await beforeUnlinkAccount(
+          ctx,
+          (id, userId) => linkedProvider(scope.db, id, userId),
+          scope.reauthPassword,
+          throttle,
+          marked,
+        );
+      }
     }
     if (BREACH_PATHS.has(path) && ctx.request) {
       // Input first (auth/parity.ts, auth/breach-check.ts): a password of acceptable length is

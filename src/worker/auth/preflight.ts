@@ -122,6 +122,12 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   "/change-email": {
     fields: { newEmail: email, callbackURL: link, password: optional(text(1, PASSWORD_MAX)) },
   },
+  // The owner again (auth/mailbox-proof.ts `ownerAgain`): `password` where the account has one.
+  "/unlink-account": { fields: { accountId: text(1, 128), password: optional(text(1, PASSWORD_MAX)) } },
+  "/passkey/delete-passkey": { fields: { id: text(1, 128), password: optional(text(1, PASSWORD_MAX)) } },
+  "/passkey/update-passkey": {
+    fields: { id: text(1, 128), name: text(1, 200), password: optional(text(1, PASSWORD_MAX)) },
+  },
   "/reset-password": {
     captcha: true,
     fields: { newPassword: text(PASSWORD_MIN, PASSWORD_MAX), token: text(1, 128, /^[A-Za-z0-9_-]+$/) },

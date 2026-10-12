@@ -99,6 +99,7 @@ export const AUTH_ENDPOINTS: readonly Row[] = [
   ["POST", "/two-factor/verify-backup-code", "deny", "deny", "deny"],
   ["POST", "/two-factor/verify-otp", "deny", "deny", "deny"],
   ["POST", "/two-factor/verify-totp", "deny", "deny", "deny"],
+  // (the password row cannot be unlinked at all, a provider only by the owner again — auth/mailbox-proof.ts)
   ["POST", "/unlink-account", "deny", "deny", "deny"],
   ["POST", "/update-session", "deny", "deny", "deny"],
   ["POST", "/update-user", "deny", "deny", "deny"],
