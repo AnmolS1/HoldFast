@@ -26,6 +26,7 @@ const PAIRS: Pair[] = [
   { fg: "textSecondary", bg: "accentWash", min: AA, why: "Clear / Show details on the wash" },
   { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control, hovered field outline on the page" },
   { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control, hovered field outline on a pane" },
+  { fg: "textTertiary", bg: "surface2", min: UI, why: "disabled control on its disabled fill" },
   { fg: "accent", bg: "surface", min: UI, why: "bars, dots, rings (UI, not text, in light)" },
   { fg: "accent", bg: "accentTrack", min: 1.5, why: "progress fill against its track" },
   { fg: "accentText", bg: "surface", min: AA, why: "prose links, Scanning" },
