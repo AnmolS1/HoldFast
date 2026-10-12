@@ -53,7 +53,12 @@
 import { generateId } from "@better-auth/core/utils/id";
 import { APIError, createEmailVerificationToken, getSessionFromCtx } from "better-auth/api";
 import { verifyJWT } from "better-auth/crypto";
-import { clearForMailboxProof, getAccountByEmail } from "../db/queries/auth-lifecycle";
+import {
+  clearForMailboxProof,
+  getAccountByEmail,
+  putAuthMarker,
+  takeAuthMarker,
+} from "../db/queries/auth-lifecycle";
 import { activatePendingShares } from "../db/queries/shares";
 import { now } from "../services/clock";
 import { record } from "./observe";
@@ -93,6 +98,14 @@ export async function afterChangeEmail(
   if (!user || !user.emailVerified || typeof body.newEmail !== "string") return;
   const newEmail = body.newEmail.toLowerCase();
   if (newEmail === user.email.toLowerCase()) return;
+  // What the confirmation will take (`confirmAddressChange`): this account, that address, for
+  // as long as the link lives. Written whether the address is free or taken.
+  await putAuthMarker(scope.db, {
+    id: generateId(),
+    identifier: changeMarker(user.id, newEmail),
+    userId: user.id,
+    expiresAt: new Date(Date.now() + VERIFY_LINK_EXPIRES_IN_S * 1000),
+  });
   const holder = await getAccountByEmail(scope.db, newEmail);
   if (!holder || holder.id === user.id) return;
   const token = await createEmailVerificationToken(
@@ -111,6 +124,8 @@ export async function afterChangeEmail(
 export const SET_PASSWORD_PATH = "/set-password";
 /** The lifetime of a verification link (create-auth.ts `emailVerification.expiresIn`). */
 export const VERIFY_LINK_EXPIRES_IN_S = 60 * 60;
+const changeMarker = (userId: string, newEmail: string) => `email-change:${userId}:${newEmail}`;
+
 /** The page of ours the address-change CONFIRMATION link lands on. */
 export const CONFIRM_CHANGE_PATH = "/confirm-email-change";
 /** Where an address-change link sends a browser that is not signed in to the account. */
@@ -276,6 +291,11 @@ export async function confirmAddressChange(
   const account = await getAccountByEmail(scope.db, claims.email);
   // The account moved or is gone since the mail was sent.
   if (!account || !account.emailVerified) return false;
+  // ONCE, and for the account that ASKED: the request left a marker naming the account and the
+  // new address (`afterChangeEmail`), and the confirmation takes it — one statement. A second
+  // POST finds none; so does a token whose current address has since passed to another account
+  // (the token names two addresses, the marker names the account).
+  if (!(await takeAuthMarker(scope.db, changeMarker(account.id, claims.updateTo), account.id))) return false;
   if (await getAccountByEmail(scope.db, claims.updateTo)) return true;
   const next = await createEmailVerificationToken(
     scope.env.BETTER_AUTH_SECRET,

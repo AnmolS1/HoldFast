@@ -938,6 +938,8 @@ export async function clearSecondFactor(
 // Small facts about an account that have no column of their own, kept as `verification` rows whose
 // VALUE is the user id (so every "delete what names this user" removes them too):
 //   2fa-enrol:<sessionId>     the password was just proven on this session (two-factor/enable)
+//   email-change:<userId>:<newEmail>   this account asked to move to that address and has not
+//                             confirmed yet (auth/mailbox-proof.ts; taken by the confirmation)
 //   passkey-2f:<passkeyId>    this passkey was registered by a session that had passed a second factor
 //                             (all of an account's are deleted by `forgetPasskeyMarks`)
 export async function putAuthMarker(
@@ -961,6 +963,18 @@ export async function hasAuthMarker(db: Executor, identifier: string, userId: st
     .select({ expiresAt: verification.expiresAt })
     .from(verification)
     .where(and(eq(verification.identifier, identifier), eq(verification.value, userId)));
+  return rows.some((row) => row.expiresAt.getTime() > Date.now());
+}
+
+/**
+ * Takes a marker: deletes it and says whether it was there (and live) — ONE statement, so of
+ * any number of simultaneous takers exactly one gets it.
+ */
+export async function takeAuthMarker(db: Executor, identifier: string, userId: string): Promise<boolean> {
+  const rows = await db
+    .delete(verification)
+    .where(and(eq(verification.identifier, identifier), eq(verification.value, userId)))
+    .returning({ expiresAt: verification.expiresAt });
   return rows.some((row) => row.expiresAt.getTime() > Date.now());
 }
 

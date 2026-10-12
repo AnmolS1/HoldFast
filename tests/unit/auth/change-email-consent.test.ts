@@ -11,7 +11,7 @@ import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
 import { FREE_ATTEMPTS, throttleKeys } from "../../../src/worker/auth/signin-throttle";
-import { rateLimit, session } from "../../../src/worker/db/schema";
+import { rateLimit, session, user } from "../../../src/worker/db/schema";
 import { createKeys } from "../../../src/worker/services/keys";
 import emailSource from "../../../src/worker/services/email.ts?raw";
 import {
@@ -166,6 +166,40 @@ describe("the confirmation link mailed to the current address is inert on a GET 
     expect((await userById(owner.user.id))!.email).toBe(owner.email);
     expect((await send(owner.client, verify)).status).toBe(302);
     expect((await userById(owner.user.id))!.email).toBe(target);
+  });
+
+  it("the confirmation works ONCE and for the account that asked: a second POST, and a token whose address has passed to another account, are 'no longer valid' (P4)", async () => {
+    const owner = await verifiedUser();
+    const target = freshEmail();
+    expect((await ask(owner.client, target, { password: PASSWORD })).status).toBe(200);
+    const link = linkIn(await waitForMail(owner.email, "changeEmailConfirmation"));
+    const token = new URL(link, "http://localhost").searchParams.get("token")!;
+    const press = () => send(newClient(), CONFIRM, { headers: CAPTCHA, json: { token } });
+    expect((await press()).status).toBe(200);
+    await waitForMail(target, "newAddressVerification");
+    for (let n = 0; n < 2; n++) {
+      const again = await press();
+      expect(again.status, again.text).toBe(403);
+      expect(again.body).toMatchObject({ error: "invalid_token" });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mailTo(target, "newAddressVerification")).toHaveLength(1);
+
+    // Bound to the ACCOUNT: the asker's address passes to somebody else before the button is
+    // pressed — the token still names that address, but not that account.
+    const first = await verifiedUser();
+    const wanted = freshEmail();
+    expect((await ask(first.client, wanted, { password: PASSWORD })).status).toBe(200);
+    const stale = new URL(
+      linkIn(await waitForMail(first.email, "changeEmailConfirmation")),
+      "http://localhost",
+    ).searchParams.get("token")!;
+    const other = await verifiedUser();
+    await testDb().update(user).set({ email: freshEmail() }).where(eq(user.id, first.user.id));
+    await testDb().update(user).set({ email: first.email }).where(eq(user.id, other.user.id));
+    const refused = await send(newClient(), CONFIRM, { headers: CAPTCHA, json: { token: stale } });
+    expect(refused.status, refused.text).toBe(403);
+    expect(mailTo(wanted, "newAddressVerification")).toEqual([]);
   });
 
   it("a token that is not a confirmation, or not ours: one answer, nothing sent", async () => {
