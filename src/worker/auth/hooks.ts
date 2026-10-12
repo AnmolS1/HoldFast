@@ -608,6 +608,8 @@ export function buildHooks(scope: AuthScope) {
         }
       } else if (path === "/change-email") {
         await beforeChangeEmail(ctx, scope.reauthPassword, throttle, marked);
+      } else if (path === "/link-social") {
+        await ownerAgain(ctx, scope.reauthPassword, throttle, marked);
       } else {
         await beforeUnlinkAccount(
           ctx,

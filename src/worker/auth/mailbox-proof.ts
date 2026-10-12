@@ -324,6 +324,9 @@ type ChangeContext = Parameters<typeof getSessionFromCtx>[0] & {
 export const REAUTH_PATHS: ReadonlySet<string> = new Set([
   "/change-email",
   "/unlink-account",
+  // ADDING a sign-in method is the sibling of removing one: a session alone may not start a
+  // link (Better Auth: `sessionMiddleware` only — api/routes/account.mjs `linkSocialAccount`).
+  "/link-social",
   "/passkey/delete-passkey",
   "/passkey/update-passkey",
 ]);
@@ -403,7 +406,10 @@ export const UNLINK_NOT_AVAILABLE = {
  */
 export async function beforeUnlinkAccount(
   ctx: ChangeContext,
-  linked: (accountRowId: string, userId: string) => Promise<string | null>,
+  linked: (
+    accountRowId: string,
+    userId: string,
+  ) => Promise<{ providerId: string; hasPassword: boolean } | null>,
   password: unknown,
   throttle: Throttle,
   hasMark: (session: unknown) => boolean,
@@ -411,9 +417,14 @@ export async function beforeUnlinkAccount(
   const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
   if (!session) return;
   const id = (ctx.body as { accountId?: unknown } | null | undefined)?.accountId;
-  const provider = typeof id === "string" ? await linked(id, session.user.id) : null;
-  // Not a row of this account: Better Auth answers ACCOUNT_NOT_FOUND.
-  if (provider === null) return;
-  if (provider === "credential") throw new APIError("FORBIDDEN", { ...UNLINK_NOT_AVAILABLE });
+  const row = typeof id === "string" ? await linked(id, session.user.id) : null;
+  // The password row — by its provider id, or by simply HOLDING a password — never goes.
+  if (row !== null && (row.providerId === "credential" || row.hasPassword)) {
+    throw new APIError("FORBIDDEN", { ...UNLINK_NOT_AVAILABLE });
+  }
+  // EVERY other unlink needs the owner again — whatever the body names (a row of this account,
+  // of another account, of nobody, a provider's name): the gate does not depend on what the
+  // look-up found. Only then does Better Auth judge the request (ACCOUNT_NOT_FOUND, the last
+  // method).
   await ownerAgain(ctx, password, throttle, hasMark);
 }

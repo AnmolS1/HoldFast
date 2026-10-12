@@ -123,6 +123,7 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
     fields: { newEmail: email, callbackURL: link, password: optional(text(1, PASSWORD_MAX)) },
   },
   // The owner again (auth/mailbox-proof.ts `ownerAgain`): `password` where the account has one.
+  "/link-social": { fields: { password: optional(text(1, PASSWORD_MAX)) } },
   "/unlink-account": { fields: { accountId: text(1, 128), password: optional(text(1, PASSWORD_MAX)) } },
   "/passkey/delete-passkey": { fields: { id: text(1, 128), password: optional(text(1, PASSWORD_MAX)) } },
   "/passkey/update-passkey": {

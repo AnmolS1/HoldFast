@@ -306,8 +306,9 @@ describe("unlinking a sign-in method (P1)", () => {
   async function withGoogle() {
     const owner = await verifiedUser();
     const start = await send(owner.client, "/api/auth/link-social", {
-      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login" },
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login", password: PASSWORD },
     });
+    expect(start.status, start.text).toBe(200);
     const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
     const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email: owner.email, name: "G" });
     await send(
@@ -355,5 +356,148 @@ describe("unlinking a sign-in method (P1)", () => {
     const done = await unlink(owner.client, google, { password: PASSWORD });
     expect(done.status, done.text).toBe(200);
     expect(await providers(owner.user.id)).toEqual(["credential"]);
+  });
+});
+
+// P1b / SP — the gate over EVERY state of an account and EVERY shape of the request, and over the
+// sibling that ADDS a sign-in method. The rule: `credential` is never unlinkable; every other
+// unlink needs the owner again (password through the throttle when the account has one, else a
+// marked or fresh session) BEFORE anything is looked up for it; the last method never goes.
+describe("unlink and link: account states × request shapes (P1b, SP)", () => {
+  const unlink = (client: Client, accountId: unknown, extra: Record<string, unknown> = {}) =>
+    send(client, "/api/auth/unlink-account", { json: { accountId, ...extra } });
+  const rowsOf = async (userId: string) =>
+    (await accountsOf(userId)).map((row) => `${row.providerId}:${row.id}`).sort();
+  async function googleOnly() {
+    const email = freshEmail();
+    const client = newClient();
+    await send(client, "/api/auth-intent", {
+      json: { inviteCode: await createInvite(), birthYear: 1990, birthMonth: 5, acceptTerms: true },
+    });
+    const start = await send(client, "/api/auth/sign-in/social", {
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/signup" },
+    });
+    const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
+    const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email, name: "G" });
+    await send(
+      client,
+      `/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      { browser: false },
+    );
+    const row = (await userByEmail(email))!;
+    return { client, id: row.id, google: (await accountsOf(row.id))[0]!.id };
+  }
+  async function passwordAndGoogle() {
+    const owner = await verifiedUser();
+    const start = await send(owner.client, "/api/auth/link-social", {
+      json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login", password: PASSWORD },
+    });
+    const state = new URL((start.body as { url: string }).url).searchParams.get("state")!;
+    const code = testGoogleCode({ sub: `g-${crypto.randomUUID()}`, email: owner.email, name: "G" });
+    await send(
+      owner.client,
+      `/api/auth/callback/google?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      { browser: false },
+    );
+    const rows = await accountsOf(owner.user.id);
+    return {
+      client: owner.client,
+      id: owner.user.id,
+      credential: rows.find((row) => row.providerId === "credential")!.id,
+      google: rows.find((row) => row.providerId === "google")!.id,
+    };
+  }
+
+  it("an account with a password and Google: every shape without the right password changes nothing", async () => {
+    const mine = await passwordAndGoogle();
+    const someoneElse = await passwordAndGoogle();
+    const before = await rowsOf(mine.id);
+    const thief = () => {
+      const client = newClient();
+      client.cookies = new Map(mine.client.cookies);
+      return client;
+    };
+    const cases: Array<[string, unknown, Record<string, unknown>, number, string]> = [
+      ["the password row, no password", mine.credential, {}, 403, "UNLINK_NOT_AVAILABLE"],
+      [
+        "the password row, WITH the password",
+        mine.credential,
+        { password: PASSWORD },
+        403,
+        "UNLINK_NOT_AVAILABLE",
+      ],
+      ["Google, no password", mine.google, {}, 400, "INVALID_PASSWORD"],
+      [
+        "Google, a wrong password",
+        mine.google,
+        { password: "a guess at the password 1!" },
+        400,
+        "INVALID_PASSWORD",
+      ],
+      ["an id that is no row, no password", "no-such-row", {}, 400, "INVALID_PASSWORD"],
+      ["another account's Google row, no password", someoneElse.google, {}, 400, "INVALID_PASSWORD"],
+      ["another account's password row, no password", someoneElse.credential, {}, 400, "INVALID_PASSWORD"],
+      ["a provider NAME where a row id belongs", "google", {}, 400, "INVALID_PASSWORD"],
+      ["the word credential where a row id belongs", "credential", {}, 400, "INVALID_PASSWORD"],
+      ["the row id in upper case", mine.google.toUpperCase(), {}, 400, "INVALID_PASSWORD"],
+      ["the row id padded with a space", ` ${mine.google}`, {}, 400, "INVALID_PASSWORD"],
+    ];
+    for (const [what, accountId, extra, status, code] of cases) {
+      const answer = await unlink(thief(), accountId, extra);
+      expect(answer.status, `${what}: ${answer.text}`).toBe(status);
+      expect(answer.body, what).toMatchObject({ code });
+      expect(await rowsOf(mine.id), what).toEqual(before);
+    }
+    expect(await rowsOf(someoneElse.id)).toHaveLength(2);
+    // With the password: another account's rows and unknown ids are still nobody's to remove…
+    for (const accountId of ["no-such-row", someoneElse.google, someoneElse.credential]) {
+      const answer = await unlink(mine.client, accountId, { password: PASSWORD });
+      expect(answer.status, String(accountId)).toBe(400);
+      expect(await rowsOf(mine.id)).toEqual(before);
+    }
+    expect(await rowsOf(someoneElse.id)).toHaveLength(2);
+    // …and the owner's own Google link goes; the password row stays, and is then the last method.
+    expect((await unlink(mine.client, mine.google, { password: PASSWORD })).status).toBe(200);
+    expect(await rowsOf(mine.id)).toEqual([`credential:${mine.credential}`]);
+    expect((await unlink(mine.client, mine.credential, { password: PASSWORD })).status).toBe(403);
+    expect(await rowsOf(mine.id)).toEqual([`credential:${mine.credential}`]);
+  });
+
+  it("an account with NO password (Google only): its one method can never go; a session that is neither marked nor fresh is refused before that is even looked at", async () => {
+    const mine = await googleOnly();
+    const before = await rowsOf(mine.id);
+    const last = await unlink(mine.client, mine.google);
+    expect(last.status, last.text).toBe(400);
+    expect(last.body).toMatchObject({ code: "FAILED_TO_UNLINK_LAST_ACCOUNT" });
+    expect(await rowsOf(mine.id)).toEqual(before);
+    await testDb()
+      .update(session)
+      .set({ createdAt: new Date(Date.now() - 2 * 86_400_000) })
+      .where(eq(session.userId, mine.id));
+    for (const accountId of [mine.google, "no-such-row"]) {
+      const stale = await unlink(mine.client, accountId);
+      expect(stale.status, stale.text).toBe(403);
+      expect(stale.body).toMatchObject({ code: "SESSION_NOT_FRESH" });
+    }
+    expect(await rowsOf(mine.id)).toEqual(before);
+  });
+
+  it("ADDING a sign-in method (`/link-social`) needs the owner again too: a stolen session cannot start a link", async () => {
+    const owner = await verifiedUser();
+    const thief = newClient();
+    thief.cookies = new Map(owner.client.cookies);
+    const link = (client: Client, extra: Record<string, unknown> = {}) =>
+      send(client, "/api/auth/link-social", {
+        json: { provider: "google", callbackURL: "/", errorCallbackURL: "/login", ...extra },
+      });
+    for (const extra of [{}, { password: "a guess at the password 1!" }]) {
+      const refused = await link(thief, extra);
+      expect(refused.status, refused.text).toBe(400);
+      expect(refused.body).toMatchObject({ code: "INVALID_PASSWORD" });
+      expect(refused.text).not.toContain("accounts.google.com");
+    }
+    const started = await link(owner.client, { password: PASSWORD });
+    expect(started.status, started.text).toBe(200);
+    expect((started.body as { url: string }).url).toContain("accounts.google.com");
   });
 });

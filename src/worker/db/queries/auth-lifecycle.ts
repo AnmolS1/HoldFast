@@ -998,18 +998,18 @@ export async function deleteAuthMarker(db: Executor, identifier: string): Promis
   await db.delete(verification).where(eq(verification.identifier, identifier));
 }
 
-/** The provider of one `account` row of `userId` (`credential`, `google`), or null: not theirs. */
+/** One `account` row of `userId` — its provider and whether it holds a password — or null: not theirs. */
 export async function linkedProvider(
   db: Executor,
   accountRowId: string,
   userId: string,
-): Promise<string | null> {
+): Promise<{ providerId: string; hasPassword: boolean } | null> {
   const [row] = await db
-    .select({ providerId: account.providerId })
+    .select({ providerId: account.providerId, password: account.password })
     .from(account)
     .where(and(eq(account.id, accountRowId), eq(account.userId, userId)))
     .limit(1);
-  return row?.providerId ?? null;
+  return row ? { providerId: row.providerId, hasPassword: row.password !== null } : null;
 }
 
 /** The passkey row behind a WebAuthn credential id. */

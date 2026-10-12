@@ -55,7 +55,13 @@ const intent = (client: Client, inviteCode: string | null) =>
 
 async function google(client: Client, profile: TestGoogleProfile, start = "/api/auth/sign-in/social") {
   const begun = await send(client, start, {
-    json: { provider: "google", callbackURL: "/", errorCallbackURL: "/signup" },
+    // (An explicit link needs the owner again — the password: auth/mailbox-proof.ts `ownerAgain`.)
+    json: {
+      provider: "google",
+      callbackURL: "/",
+      errorCallbackURL: "/signup",
+      ...(start === "/api/auth/link-social" ? { password: PASSWORD } : {}),
+    },
   });
   expect(begun.status, begun.text).toBe(200);
   const state = new URL((begun.body as { url: string }).url).searchParams.get("state")!;
