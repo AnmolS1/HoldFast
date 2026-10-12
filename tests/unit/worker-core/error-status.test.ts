@@ -21,12 +21,15 @@ const expected: Record<string, number> = {
   link_paused: 423,
   password_required: 403,
   admin_requires_2fa: 403,
+  // (added with the session-level second factor: auth/second-factor.ts)
+  second_factor_required: 403,
+  second_factor_throttled: 429,
   read_only: 503,
   feature_disabled: 503,
 };
 
 describe("error status table", () => {
-  it("maps exactly the 19 codes to their statuses", () => {
+  it("maps exactly the 21 codes to their statuses", () => {
     expect(ERROR_STATUS).toEqual(expected);
   });
 
