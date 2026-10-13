@@ -9,6 +9,7 @@ import { nodes, shareLinks, user } from "../../../src/worker/db/schema";
 import {
   toNodeDto,
   toNodeDtos,
+  toOwnAvatarDto,
   toSearchResultDtos,
   toTrashItemDto,
   toTrashItemDtos,
@@ -416,5 +417,46 @@ describe("toSearchResultDtos", () => {
       toNodeDto(testDb(), { ...file, ownerId: baId() }, { viewerId: owner.id, role: "viewer" }),
     ).rejects.toThrow(/no user row/);
     expect((await testDb().select({ id: user.id }).from(user).where(eq(user.id, owner.id))).length).toBe(1);
+  });
+});
+
+describe("toOwnAvatarDto", () => {
+  it("maps the viewer's own avatar, and nothing else", async () => {
+    const me = await makeUser();
+    const other = await makeUser();
+    const db = testDb();
+    const png = { mimeSniffed: "image/png", scanStatus: "clean", system: "avatar" } as const;
+    const mine = await makeFile(me.id, null, png);
+    const theirs = await makeFile(other.id, null, png);
+    const plain = await makeFile(me.id, null, { mimeSniffed: "image/png", scanStatus: "clean" });
+
+    const dto = Strict.node.parse(await toOwnAvatarDto(db, mine, { viewerId: me.id }));
+    expect(dto).toMatchObject({
+      id: mine.id,
+      role: "owner",
+      owner: { id: me.id, displayName: me.name },
+      etag: mine.versionId,
+      thumb: true,
+      sharing: { people: 0, link: "none", summary: "none" },
+    });
+    expect(JSON.stringify(dto)).not.toContain(mine.r2Key);
+    expect(JSON.stringify(dto)).not.toContain("@");
+
+    // Another user's avatar; a system node of another kind; a plain node.
+    await expect(toOwnAvatarDto(db, theirs, { viewerId: me.id })).rejects.toThrow(/role/);
+    await expect(toOwnAvatarDto(db, { ...mine, system: "banner" }, { viewerId: me.id })).rejects.toThrow(
+      /system/,
+    );
+    await expect(toOwnAvatarDto(db, plain, { viewerId: me.id })).rejects.toThrow(/system/);
+    // A hidden avatar is hidden like anything else.
+    await expect(
+      toOwnAvatarDto(db, { ...mine, takedownAt: new Date() }, { viewerId: me.id }),
+    ).rejects.toThrow(/hidden/);
+    await expect(
+      toOwnAvatarDto(db, { ...mine, scanStatus: "suspected_csam" }, { viewerId: me.id }),
+    ).rejects.toThrow(/hidden/);
+    // And the avatar stays out of every other variant.
+    await expect(toNodeDto(db, mine, { viewerId: me.id, role: "owner" })).rejects.toThrow(/system/);
+    await expect(toNodeDtos(db, [plain, mine], { viewerId: me.id, role: "owner" })).rejects.toThrow(/system/);
   });
 });
