@@ -133,6 +133,7 @@ function draftsWith(value: string) {
     uploadNotIntact: templates.uploadNotIntact({ name: value, fileName: value }),
     linkPaused: templates.linkPaused({ name: value, itemName: value }),
     linkCapReached: templates.linkCapReached({ name: value }),
+    linkLimitReached: templates.linkLimitReached({ name: value, itemName: value }),
     linkAvailableAgain: templates.linkAvailableAgain({ name: value, itemName: value }),
     adminDigest: templates.adminDigest({ lines: [{ label: value, value }], adminUrl: `${APP}/admin` }),
     adminAlert: templates.adminAlert({
@@ -200,6 +201,7 @@ describe("templates", () => {
         "uploadNotIntact",
         "linkPaused",
         "linkCapReached",
+        "linkLimitReached",
         "linkAvailableAgain",
         "adminDigest",
         "adminAlert",
@@ -220,6 +222,8 @@ describe("templates", () => {
   it("the owner-cap mail never says a link was paused — nothing is, and nothing has to be resumed", () => {
     const message = render(renderEnv, templates.linkCapReached({ name: "Ada" }));
     expect(`${message.subject}\n${message.text}\n${message.html}`).not.toMatch(/paus|resum/i);
+    const one = render(renderEnv, templates.linkLimitReached({ name: "Ada", itemName: "report.pdf" }));
+    expect(`${one.subject}\n${one.text}\n${one.html}`).not.toMatch(/paus|resum/i);
     expect(message.text).toContain("midnight UTC");
   });
 
