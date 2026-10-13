@@ -26,6 +26,7 @@ import {
   auditLog,
   downloadLedger,
   emailLedger,
+  hashBlocklist,
   session,
   settings,
   uploadIps as uploadIpsTable,
@@ -283,7 +284,65 @@ describe("blocklist", () => {
     await blocklist.upsert(db, { sha256: sha, reason: "csam", sourceNodeId: source });
     await blocklist.upsert(db, { sha256: sha, reason: "malware", sourceNodeId: uuidv7() });
     await blocklist.upsert(db, { sha256: sha, reason: "admin" });
-    expect(await blocklist.lookup(db, sha)).toEqual({ reason: "csam", sourceNodeId: source });
+    // Still `csam`. (An explicit csam `upsert` is a confirmed listing and stores no source: a
+    // clear of a suspected-CSAM lock must never take it for a lock's own entry.)
+    expect(await blocklist.lookup(db, sha)).toEqual({ reason: "csam", sourceNodeId: null });
+    expect(source).not.toBeNull();
+  });
+
+  it("an explicit csam upsert and confirmCsam leave a detached entry: no source, nothing raised, author and note of a csam entry kept", async () => {
+    const admin = await makeUser(db);
+    const entry = async (sha: string) =>
+      (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha)))[0]!;
+    const detached = { reason: "csam", sourceNodeId: null, raisedFrom: null, raisedByNodeId: null };
+
+    // Over an entry of another reason: rewritten to csam, with the new author and note.
+    const sha = rand(32);
+    await blocklist.upsert(db, { sha256: sha, reason: "malware", sourceNodeId: uuidv7(), note: "old" });
+    await blocklist.upsert(db, {
+      sha256: sha,
+      reason: "csam",
+      sourceNodeId: uuidv7(),
+      addedBy: admin,
+      note: "new",
+    });
+    expect(await entry(sha)).toMatchObject({ ...detached, addedBy: admin, note: "new" });
+    // Over a csam entry: only detached — its author and note are not rewritten.
+    await blocklist.upsert(db, { sha256: sha, reason: "csam", note: "later" });
+    expect(await entry(sha)).toMatchObject({ ...detached, addedBy: admin, note: "new" });
+
+    // confirmCsam: creates, detaches, and says whether it wrote.
+    const other = rand(32);
+    expect(await blocklist.confirmCsam(db, other)).toBe(true);
+    expect(await entry(other)).toMatchObject({ ...detached, addedBy: null, note: null });
+    expect(await blocklist.confirmCsam(db, other)).toBe(false);
+    const raised = rand(32);
+    await db
+      .insert(hashBlocklist)
+      .values({
+        sha256: raised,
+        reason: "csam",
+        sourceNodeId: uuidv7(),
+        raisedFrom: "dmca",
+        raisedByNodeId: uuidv7(),
+        note: "n",
+      });
+    expect(await blocklist.confirmCsam(db, raised)).toBe(true);
+    expect(await entry(raised)).toMatchObject({ ...detached, note: "n" });
+
+    // The control: a write of another reason still stores its source, and clears stale raise marks.
+    const plain = rand(32);
+    const source = uuidv7();
+    await db
+      .insert(hashBlocklist)
+      .values({ sha256: plain, reason: "admin", raisedFrom: "dmca", raisedByNodeId: uuidv7() });
+    await blocklist.upsert(db, { sha256: plain, reason: "malware", sourceNodeId: source });
+    expect(await entry(plain)).toMatchObject({
+      reason: "malware",
+      sourceNodeId: source,
+      raisedFrom: null,
+      raisedByNodeId: null,
+    });
   });
 });
 

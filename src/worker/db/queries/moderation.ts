@@ -349,12 +349,14 @@ export type CsamClearResult = {
   /** The entry a lock RAISED to `csam` was put back to this reason: still blocklisted, as before. */
   blocklistRestoredTo: BlocklistReason | null;
   /**
-   * Why the entry was left exactly as it is: it is no lock's (an admin's, an unknown source's);
-   * another node with the same hash is still locked; a `csam` report on a node with that hash
-   * was filed; or it was this lock's and someone has changed its reason since (`edited`).
+   * Why the entry was left exactly as it is: it is a CONFIRMED `csam` listing (`confirmed`: its
+   * provenance is detached — a report was filed for the content, or an admin listed it on
+   * purpose; permanent to every clear); it is no lock's (an unknown source's); another node
+   * with the same hash is still locked; a `csam` report on a node with that hash was filed; or
+   * it was this lock's and someone has changed its reason since (`edited`).
    * Null when it was removed or restored, or there is none.
    */
-  blocklistKept: "not_this_locks" | "other_node_locked" | "reported" | "edited" | null;
+  blocklistKept: "confirmed" | "not_this_locks" | "other_node_locked" | "reported" | "edited" | null;
   /** The `csam` reports dismissed, ascending. */
   reportIds: string[];
 };
@@ -389,7 +391,10 @@ export type CsamClearResult = {
  *     node with the same hash is `suspected_csam`; and no `csam` report on any node with that
  *     hash was filed. So of two locked twins the FIRST clear leaves the entry and the SECOND
  *     undoes it, whichever of the two created or raised it. Otherwise the entry stays exactly
- *     as it is and `blocklistKept` says why — also when someone changed its reason in between;
+ *     as it is and `blocklistKept` says why — also when someone changed its reason in between,
+ *     and ALWAYS when it is a confirmed listing (`blocklist.confirmCsam`, or an explicit `csam`
+ *     `upsert`: no source, nothing raised it). That a hash was reported lives on the entry —
+ *     the report and the node may be gone by the time a twin is cleared;
  *   - every `csam` report on the node that is `open` or `reviewing` becomes `dismissed`
  *     (`resolvedAt` now, `resolution` `false_positive`; `assignedTo` as it was). Their ids are
  *     returned.
@@ -522,7 +527,13 @@ async function releaseBlocklistEntry(
   },
   filed: boolean,
 ): Promise<
-  "removed" | { restoredTo: BlocklistReason } | "not_this_locks" | "other_node_locked" | "reported" | "edited"
+  | "removed"
+  | { restoredTo: BlocklistReason }
+  | "confirmed"
+  | "not_this_locks"
+  | "other_node_locked"
+  | "reported"
+  | "edited"
 > {
   // RAISED is tested before CREATED: an entry a lock raised keeps its own `sourceNodeId` —
   // which may be this very node (its earlier verdict listed the hash) — and must be put back,
@@ -530,6 +541,12 @@ async function releaseBlocklistEntry(
   const lockedBy = entry.raisedFrom !== null ? entry.raisedByNodeId : entry.sourceNodeId;
   // Not `csam` any more: no lock's entry now. If it was this lock's, somebody edited it.
   if (entry.reason !== "csam") return lockedBy === nodeId ? "edited" : "not_this_locks";
+  // DETACHED — no source, nothing raised it: a confirmed listing (`blocklist.confirmCsam`: a
+  // report was filed for this content, or an admin listed it on purpose). Permanent here,
+  // whatever has happened since to the report or the node that led to it.
+  if (entry.sourceNodeId === null && entry.raisedFrom === null && entry.raisedByNodeId === null) {
+    return "confirmed";
+  }
   if (lockedBy === null) return "not_this_locks";
 
   const [alsoLocked] = await sp
