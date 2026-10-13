@@ -66,7 +66,7 @@ export interface Server {
   onInit?: (body: InitUploadBody, nth: number) => JsonAnswer;
   onComplete?: (body: CompleteUploadBody, nth: number) => JsonAnswer;
   onPut?: (call: PutCall, nth: number) => ApiError | undefined;
-  onJson?: (call: MockCall) => JsonAnswer;
+  onJson?: (call: MockCall) => JsonAnswer | Promise<Response>;
   /** In-flight body requests right now, and the most there ever were. */
   inFlight: number;
   peak: number;
@@ -153,7 +153,11 @@ export function installServer(): Server {
     if (call.method === "GET" && node) {
       if (node[1] === FOLDER_ID) return json(nodeDetail({ id: FOLDER_ID, kind: "folder", name: "Projects" }));
       return json(
-        nodeDetail({ id: node[1]!, name: landed.get(node[1]!) ?? "notes.txt", scanStatus: server.scanStatus }),
+        nodeDetail({
+          id: node[1]!,
+          name: landed.get(node[1]!) ?? "notes.txt",
+          scanStatus: server.scanStatus,
+        }),
       );
     }
     return undefined;

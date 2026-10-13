@@ -947,6 +947,22 @@ function rejoin(file: File): boolean {
   return true;
 }
 
+/**
+ * A file that was refused and is still on the list is not sent a second time by dropping it
+ * again: the answer would be the same refusal.
+ */
+function refusedBefore(file: File): boolean {
+  const again = currentItems().some(
+    (item) =>
+      item.state === "refused" &&
+      item.name === file.name &&
+      item.size === file.size &&
+      item.lastModified === file.lastModified,
+  );
+  if (again) announce(t("live.refused", { name: file.name }));
+  return again;
+}
+
 /** Is the target the caller's own tree? Only then is the caller's free space the one that counts. */
 async function ownTree(parentId: string | null): Promise<boolean> {
   if (parentId === null) return true;
@@ -980,7 +996,7 @@ export async function addFiles(
   folders: readonly string[] = [],
 ): Promise<void> {
   const addEpoch = epoch;
-  const fresh = incoming.filter((entry) => !rejoin(entry.file));
+  const fresh = incoming.filter((entry) => !rejoin(entry.file) && !refusedBefore(entry.file));
   pump();
   if (fresh.length === 0 && folders.length === 0) return;
 
@@ -1202,11 +1218,8 @@ export async function restoreUploads(options: { server?: boolean } = {}): Promis
 // ---------------------------------------------------------------------------------------------
 // The account's state ends here.
 
-/**
- * Abort what is in flight, empty the queue and empty the resume list. Run by the shell on
- * sign-out and whenever the signed-in identity changes.
- */
-export async function purgeUploads(): Promise<void> {
+/** Everything in memory: abort what is in flight and empty the queue. */
+function dropQueue(): void {
   epoch += 1;
   for (const work of works.values()) {
     work.controller?.abort();
@@ -1223,7 +1236,20 @@ export async function purgeUploads(): Promise<void> {
   reconciled = false;
   authProbe = null;
   resetStore();
+}
+
+/**
+ * Abort what is in flight, empty the queue and empty the resume list. Run by the shell on
+ * sign-out and whenever the signed-in identity changes.
+ */
+export async function purgeUploads(): Promise<void> {
+  dropQueue();
   await clearResumeRows();
+}
+
+/** Tests only: what a reload does to the page — memory is gone, the device's list is not. */
+export function forgetUploadsForTests(): void {
+  dropQueue();
 }
 
 registerUserStatePurger(purgeUploads);
