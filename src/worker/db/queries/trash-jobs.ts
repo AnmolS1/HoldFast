@@ -1,0 +1,342 @@
+// Queries only the trash routes and the scheduled jobs make: the purge-request marker, the
+// retention deletes, and the reads the account purge and the reconcile job need.
+//
+// WHAT A RETENTION DELETE KEEPS is not decided here. Every delete below asks queries/holds.ts —
+// `userHeld` and `nodeProtected`, the record the purge gate is generated from — in the deleting
+// statement itself, so a row that concerns a held account or a protected node is never listed
+// first and deleted later. Each is ONE statement over many owners and takes no tree lock: a hold
+// placed while it runs protects from the next run on (accepted residual, H1 X2.3).
+//
+// Nothing here writes a `legalHold` column: no job sets or releases a hold.
+
+import { and, eq, gt, inArray, isNotNull, isNull, lt, lte, not, or, sql } from "drizzle-orm";
+import { UUID_PARAM } from "../../../shared/ids";
+import type { Executor } from "../client";
+import { isUuid } from "../ids";
+import {
+  auditLog,
+  linkAccessLog,
+  nodes,
+  nodeVersions,
+  pendingUserPurges,
+  type Upload,
+  uploads,
+  user,
+} from "../schema";
+import { nodeProtected, userHeld } from "./holds";
+import { notEffectivelyHidden } from "./tree";
+import { COMPLETING_STALE_MINUTES } from "./uploads";
+
+// ── the trash routes ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The owner asked for these trashed roots to be deleted for good while the gate refused: the
+ * marker hides them from the trash listing and keeps them in the purge queue until the hold is
+ * gone. The first request's time is kept. Returns how many rows carry the marker now.
+ */
+export async function requestPurge(db: Executor, rootIds: readonly string[]): Promise<number> {
+  const ids = [...new Set(rootIds.filter(isUuid))];
+  if (ids.length === 0) return 0;
+  const rows = await db
+    .update(nodes)
+    .set({ purgeRequestedAt: sql`COALESCE(${nodes.purgeRequestedAt}, now())` })
+    .where(and(inArray(nodes.id, ids), eq(nodes.trashedRoot, true), isNotNull(nodes.deletedAt)))
+    .returning({ id: nodes.id });
+  return rows.length;
+}
+
+/**
+ * True when the node, or a folder above it, is a root whose purge was requested. To its owner
+ * such a node is gone — it answers as a purged one does. False for an id that does not exist.
+ * One statement, whatever the answer.
+ */
+export async function purgeWasRequested(db: Executor, nodeId: string): Promise<boolean> {
+  if (!isUuid(nodeId)) return false;
+  const result = await db.execute<{ requested: boolean }>(sql`
+    WITH RECURSIVE up(id, parent_id, purge_requested_at) AS (
+      SELECT n.id, n.parent_id, n.purge_requested_at FROM nodes n WHERE n.id = ${nodeId}
+      UNION ALL
+      SELECT p.id, p.parent_id, p.purge_requested_at FROM nodes p JOIN up ON p.id = up.parent_id
+    ) CYCLE id SET is_cycle USING path
+    SELECT EXISTS (SELECT 1 FROM up WHERE purge_requested_at IS NOT NULL) AS requested`);
+  return result.rows[0]?.requested === true;
+}
+
+/** How many roots `trash.listTrash` would list for the owner — the same rows, counted. */
+export async function countTrash(db: Executor, ownerId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)`.mapWith(Number) })
+    .from(nodes)
+    .where(
+      and(
+        eq(nodes.ownerId, ownerId),
+        eq(nodes.trashedRoot, true),
+        isNotNull(nodes.deletedAt),
+        isNull(nodes.purgeRequestedAt),
+        isNull(nodes.system),
+        notEffectivelyHidden(),
+        sql`${nodes.scanStatus} <> 'suspected_csam'`,
+      ),
+    );
+  return row?.n ?? 0;
+}
+
+// ── retention ───────────────────────────────────────────────────────────────────────────────
+
+export const LINK_ACCESS_LOG_RETENTION_DAYS = 180;
+export const AUDIT_LOG_RETENTION_DAYS = 180;
+export const DOWNLOAD_LEDGER_RETENTION_DAYS = 90;
+export const PASSWORD_ATTEMPT_IDLE_HOURS = 24;
+export const EMAIL_LEDGER_RETENTION_HOURS = 48;
+
+/** The link aliased `kept_link` is one whose records are kept: its creator or its node is held. */
+const LINK_KEPT = sql`(${userHeld(sql`kept_link.created_by`)} OR ${nodeProtected(sql`kept_link.node_id`)})`;
+
+/**
+ * Public-link access rows older than the period — except those of a link a held account created
+ * or that points at a protected node, and those about a protected file inside such a link.
+ */
+export async function deleteOldLinkAccess(
+  db: Executor,
+  limit: number,
+  olderThanDays: number = LINK_ACCESS_LOG_RETENTION_DAYS,
+): Promise<number> {
+  const doomed = db
+    .select({ id: linkAccessLog.id })
+    .from(linkAccessLog)
+    .where(
+      and(
+        lt(linkAccessLog.at, sql`now() - make_interval(days => ${olderThanDays})`),
+        sql`NOT EXISTS (SELECT 1 FROM share_links kept_link
+                        WHERE kept_link.id = ${linkAccessLog.linkId} AND ${LINK_KEPT})`,
+        not(nodeProtected(sql`${linkAccessLog.nodeId}`)),
+      ),
+    )
+    .orderBy(linkAccessLog.id)
+    .limit(limit);
+  const rows = await db
+    .delete(linkAccessLog)
+    .where(inArray(linkAccessLog.id, doomed))
+    .returning({ id: linkAccessLog.id });
+  return rows.length;
+}
+
+/**
+ * `audit_log.target_id` is text and holds either id family — or anything else. It is read as a
+ * node id only where it has the shape of one: a bare `::uuid` cast would throw on the first
+ * malformed row and end the whole delete, every night. Null for every other row.
+ */
+const AUDIT_TARGET_NODE = sql`(CASE WHEN ${auditLog.targetType} = 'node'
+  AND ${auditLog.targetId} ~* ${sql.raw(`'^${UUID_PARAM}$'`)} THEN ${auditLog.targetId}::uuid END)`;
+
+/**
+ * Audit rows older than the period — except a row marked `meta.legalHold`, a row a held account
+ * made, a row about a held account, and a row about a protected node or about a node a held
+ * account uploaded.
+ */
+export async function deleteOldAudit(
+  db: Executor,
+  limit: number,
+  olderThanDays: number = AUDIT_LOG_RETENTION_DAYS,
+): Promise<number> {
+  const doomed = db
+    .select({ id: auditLog.id })
+    .from(auditLog)
+    .where(
+      and(
+        lt(auditLog.at, sql`now() - make_interval(days => ${olderThanDays})`),
+        sql`COALESCE(${auditLog.meta} ->> 'legalHold', '') <> 'true'`,
+        not(userHeld(sql`${auditLog.actorUserId}`)),
+        sql`NOT (COALESCE(${auditLog.targetType}, '') = 'user' AND ${userHeld(sql`${auditLog.targetId}`)})`,
+        not(nodeProtected(AUDIT_TARGET_NODE)),
+        sql`NOT EXISTS (SELECT 1 FROM nodes target_node
+                        WHERE target_node.id = ${AUDIT_TARGET_NODE}
+                          AND ${userHeld(sql`target_node.created_by`)})`,
+      ),
+    )
+    .orderBy(auditLog.id)
+    .limit(limit);
+  const rows = await db.delete(auditLog).where(inArray(auditLog.id, doomed)).returning({ id: auditLog.id });
+  return rows.length;
+}
+
+/** The ledger subjects whose `subject_id` is a user id. */
+const USER_SUBJECTS = [
+  "user",
+  "upload_user",
+  "upload_editor",
+  "transform_user",
+  "share_user",
+  "link_user",
+  "link_owner",
+] as const;
+const userSubjects = sql.join(
+  USER_SUBJECTS.map((subject) => sql.raw(`'${subject}'`)),
+  sql`, `,
+);
+
+/**
+ * Daily ledger rows older than the period — except a held account's, and those of a link a held
+ * account created or that points at a protected node. Rows keyed by an IP hash, a sign-up
+ * counter or a once-a-day marker cannot be tied to an account: they go with their age.
+ */
+export async function deleteOldLedger(
+  db: Executor,
+  limit: number,
+  olderThanDays: number = DOWNLOAD_LEDGER_RETENTION_DAYS,
+): Promise<number> {
+  const result = await db.execute(sql`
+    DELETE FROM download_ledger WHERE (day, subject_type, subject_id) IN (
+      SELECT dl.day, dl.subject_type, dl.subject_id FROM download_ledger dl
+      WHERE dl.day < (now() AT TIME ZONE 'UTC')::date - ${olderThanDays}::int
+        AND NOT (dl.subject_type IN (${userSubjects}) AND ${userHeld(sql`dl.subject_id`)})
+        AND NOT (dl.subject_type = 'link' AND EXISTS (
+          SELECT 1 FROM share_links kept_link WHERE kept_link.id::text = dl.subject_id AND ${LINK_KEPT}))
+      ORDER BY dl.day, dl.subject_type, dl.subject_id
+      LIMIT ${limit})
+    RETURNING 1`);
+  return result.rows.length;
+}
+
+/**
+ * Password-attempt counters nobody has added to for the period and that lock nothing now —
+ * except those on a link a held account created or that points at a protected node.
+ */
+export async function deleteIdlePasswordAttempts(
+  db: Executor,
+  limit: number,
+  idleHours: number = PASSWORD_ATTEMPT_IDLE_HOURS,
+): Promise<number> {
+  const result = await db.execute(sql`
+    DELETE FROM link_password_attempts WHERE (link_id, ip_hash_stable) IN (
+      SELECT a.link_id, a.ip_hash_stable FROM link_password_attempts a
+      WHERE a.last_failure_at < now() - make_interval(hours => ${idleHours})
+        AND (a.locked_until IS NULL OR a.locked_until <= now())
+        AND NOT EXISTS (SELECT 1 FROM share_links kept_link WHERE kept_link.id = a.link_id AND ${LINK_KEPT})
+      ORDER BY a.link_id, a.ip_hash_stable
+      LIMIT ${limit})
+    RETURNING 1`);
+  return result.rows.length;
+}
+
+/**
+ * Mail-cap windows older than the period. Keyed by a hash of the recipient: they cannot be tied
+ * to an account, so no hold keeps them.
+ */
+export async function deleteOldEmailWindows(
+  db: Executor,
+  limit: number,
+  olderThanHours: number = EMAIL_LEDGER_RETENTION_HOURS,
+): Promise<number> {
+  const result = await db.execute(sql`
+    DELETE FROM email_ledger WHERE (window_kind, window_start, recipient_hash) IN (
+      SELECT e.window_kind, e.window_start, e.recipient_hash FROM email_ledger e
+      WHERE e.window_start < now() - make_interval(hours => ${olderThanHours})
+      ORDER BY e.window_kind, e.window_start, e.recipient_hash
+      LIMIT ${limit})
+    RETURNING 1`);
+  return result.rows.length;
+}
+
+// ── stale uploads ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Locks one session `uploads.expired` listed and returns it — if it is STILL stale: `open` past
+ * its `expiresAt`, or `completing` for longer than the grace. Null when it moved on meanwhile (a
+ * client claimed it, it finished). The list is advice; this row, under its lock, decides.
+ * Call it after the owner's `user` row is locked (queries/tree.ts, lock order).
+ */
+export async function lockStaleUpload(tx: Executor, uploadId: string): Promise<Upload | null> {
+  const [row] = await tx
+    .select()
+    .from(uploads)
+    .where(
+      and(
+        eq(uploads.id, uploadId),
+        or(
+          and(eq(uploads.status, "open"), lte(uploads.expiresAt, sql`now()`)),
+          and(
+            eq(uploads.status, "completing"),
+            sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) < now() - make_interval(mins => ${COMPLETING_STALE_MINUTES})`,
+          ),
+        ),
+      ),
+    )
+    .for("update");
+  return row ?? null;
+}
+
+// ── the account purge ───────────────────────────────────────────────────────────────────────
+
+/** What the purge job needs of the account. Null when the `user` row is gone. */
+export async function purgeSubject(
+  db: Executor,
+  userId: string,
+): Promise<{ deleteScheduledAt: Date | null } | null> {
+  const [row] = await db
+    .select({ deleteScheduledAt: user.deleteScheduledAt })
+    .from(user)
+    .where(eq(user.id, userId));
+  return row ?? null;
+}
+
+/** Removes a pending purge that has nothing left to do (the account is gone, or it was cancelled). */
+export async function dropPendingPurge(db: Executor, userId: string): Promise<void> {
+  await db
+    .delete(pendingUserPurges)
+    .where(and(eq(pendingUserPurges.userId, userId), isNull(pendingUserPurges.finishedAt)));
+}
+
+// ── reconcile ───────────────────────────────────────────────────────────────────────────────
+
+/** Account ids in id order, after `after` (null = from the start). */
+export async function userIdsAfter(db: Executor, after: string | null, limit: number): Promise<string[]> {
+  const rows = await db
+    .select({ id: user.id })
+    .from(user)
+    .where(after === null ? undefined : gt(user.id, after))
+    .orderBy(user.id)
+    .limit(limit);
+  return rows.map((row) => row.id);
+}
+
+const UNFINISHED = ["open", "completing"] as const;
+
+/**
+ * Which of these object keys a row still references: a node's current version, a kept old
+ * version, or an upload session that is not finished (its object may be on its way).
+ */
+export async function referencedKeys(db: Executor, keys: readonly string[]): Promise<Set<string>> {
+  const found = new Set<string>();
+  if (keys.length === 0) return found;
+  const list = [...keys];
+  const current = await db.select({ key: nodes.r2Key }).from(nodes).where(inArray(nodes.r2Key, list));
+  const old = await db
+    .select({ key: nodeVersions.r2Key })
+    .from(nodeVersions)
+    .where(inArray(nodeVersions.r2Key, list));
+  const arriving = await db
+    .select({ key: uploads.r2Key })
+    .from(uploads)
+    .where(and(inArray(uploads.r2Key, list), inArray(uploads.status, [...UNFINISHED])));
+  for (const row of [...current, ...old, ...arriving]) if (row.key !== null) found.add(row.key);
+  return found;
+}
+
+/** `<nodeId>/<versionId>` for every version of these nodes that exists, current or kept. */
+export async function knownVersions(db: Executor, nodeIds: readonly string[]): Promise<Set<string>> {
+  const found = new Set<string>();
+  const ids = [...new Set(nodeIds.filter(isUuid))];
+  if (ids.length === 0) return found;
+  const current = await db
+    .select({ nodeId: nodes.id, versionId: nodes.versionId })
+    .from(nodes)
+    .where(inArray(nodes.id, ids));
+  const old = await db
+    .select({ nodeId: nodeVersions.nodeId, versionId: nodeVersions.versionId })
+    .from(nodeVersions)
+    .where(inArray(nodeVersions.nodeId, ids));
+  for (const row of [...current, ...old])
+    if (row.versionId !== null) found.add(`${row.nodeId}/${row.versionId}`);
+  return found;
+}
