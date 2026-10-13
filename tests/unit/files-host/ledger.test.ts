@@ -273,10 +273,24 @@ describe("a link's own ceiling: a 429 while its ledger is full, one mail that da
     expect(row.bytesServed).toBe(SIZE);
     expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
     expect(mailTo(owner.email, "linkPaused")).toEqual([]);
-    // The two refused requests each left the owner's cap charged (it is consumed before the
-    // link's): that reservation of bytes never sent is what the task's rule keeps.
-    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 3);
+    // The two refused requests took nothing from the owner's cap: what was charged there before
+    // the link refused went straight back.
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE);
     expect((await accessLog(link.id)).map((entry) => entry.outcome)).toEqual(["denied_cap", "denied_cap"]);
+  });
+
+  it("fifty requests refused at a full link take nothing from the owner's cap — only from the asking address", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    const url = await urlFor("download", node, { link });
+    const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE + 100 });
+    expect((await ask(url, limits)).status).toBe(200);
+    for (let i = 0; i < 50; i++) expect((await ask(url, { ...limits, ip })).status).toBe(429);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE);
+    expect(await ledgerBytes("link", link.id)).toBe(SIZE);
+    // Every refused request cost the address its size: fifty of them, none given back.
+    expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(SIZE * 50);
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
   });
 
   it("a link really used up answers 429 until the day rolls over, without a pause; a link paused for another reason still answers 423 and is not touched", async () => {
@@ -344,11 +358,12 @@ describe("a link's own ceiling: a 429 while its ledger is full, one mail that da
     // The link takes one file a day; the owner's links together two.
     const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE + 100, CEIL_OWNER_LINK_BYTES_DAY: SIZE * 2 + 100 });
     expect((await ask(url, limits)).status).toBe(200);
-    // Refused by the LINK: the owner's cap had room (and was charged for it).
+    // Refused by the LINK: the owner's cap had room, and keeps it.
     expect((await ask(url, limits)).status).toBe(429);
     expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
     expect(mailTo(owner.email, "linkCapReached")).toEqual([]);
-    // Now the owner's cap is full: every link of theirs is refused by it, the other one too.
+    // The owner's other link fills the cap; from then on every link of theirs is refused by it.
+    expect((await ask(await urlFor("download", other.node, { link: otherLink }), limits)).status).toBe(200);
     for (let i = 0; i < 3; i++) {
       expect((await ask(url, limits)).status).toBe(429);
       expect((await ask(await urlFor("download", other.node, { link: otherLink }), limits)).status).toBe(429);

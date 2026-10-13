@@ -13,9 +13,10 @@
 // service's atomic add-if-under, in this order, and the first refusal decides:
 //   a signed-in subject   download_ip → download_user
 //   a link subject        download_ip → download_owner → download_link
-// A charge that was made stays when a later one refuses: the address pays for a request the
+// THE ADDRESS'S CHARGE STAYS when a later ledger refuses: the requester pays for a request the
 // owner's cap or the link's ceiling then refuses, and an address over its own ceiling writes
-// nothing at all — so it cannot spend a link's or an owner's day.
+// nothing at all — so it cannot spend a link's or an owner's day. The OWNER's charge does not
+// stay when the link then refuses: it is given back at once (see below).
 // BYTES ONLY. No count is consumed here (the per-link download count belongs to the mint), and a
 // response without a body — 304, 412, 416, HEAD — is not charged and writes no row.
 //
@@ -101,6 +102,10 @@ export async function recordServe(c: Context<AppEnv>, serve: Serve): Promise<Ser
     { bytes },
   );
   if (!linked.ok) {
+    // The owner's cap was charged a moment ago for bytes this request will never send. With no
+    // pause to end them, refusals at a full link would otherwise each take that much of the
+    // owner's day — at no cost in transfer. It goes back now; the address keeps its charge.
+    await told(() => refundUsage(deps(c), "download_owner", serve.owner.id, { bytes }, { day: owned.day }));
     await told(() => notifyLinkLimitOnce(deps(c), serve.sub, now(c)));
     throw ceilingExceeded(linked);
   }
