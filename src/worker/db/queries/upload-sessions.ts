@@ -2,7 +2,7 @@
 // part bookkeeping, the node a finished upload becomes. What two or more tasks share (the resume
 // lookup, the claim, the terminal states) is in queries/uploads.ts.
 //
-// Nothing here locks a `user` row. A caller that changes `used_bytes` in the same transaction
+// Nothing here locks a `user` row — the one row lock taken here is a session's own (`beginSinglePut`). A caller that changes `used_bytes` in the same transaction
 // does that FIRST (queries/quota.ts), then calls in here: `user` rows before everything else.
 
 import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
@@ -81,6 +81,80 @@ export async function upsertPart(db: Executor, uploadId: string, part: SessionPa
   return (result.rowCount ?? 0) > 0;
 }
 
+// ── the one PUT of a single session ──────────────────────────────────────────────────────────
+//
+// A single session writes its object with one PUT to a key that never changes, and the store
+// has no "only if absent": a PUT that is still running when the session is completed would
+// replace the object AFTER it was looked at. So a PUT may only FINISH through a gate — one row,
+// `upload_parts (uploadId, 1)`:
+//   committing:<token>:<epoch ms>    a PUT has received its last byte and the store is finishing
+//                                    the object; set by `beginSinglePut`, and only while the
+//                                    session is `open` and no other PUT is committing
+//   <the object's etag>              that PUT is done (`finishSinglePut`)
+// The gate takes the session's row (`FOR UPDATE`, one statement), so it and the claim of
+// `complete` happen one after the other: a claim that comes second sees the marker, a gate that
+// comes second sees `completing` and stores nothing.
+
+const COMMITTING = "committing:";
+/** A `committing` marker older than this was left by an invocation that died: it is taken over. */
+export const SINGLE_PUT_STALE_MINUTES = 10;
+
+/** True while a single PUT is between its gate and its end. */
+export const isCommitting = (etag: string) => etag.startsWith(COMMITTING);
+
+/**
+ * The gate. True when this PUT may finish: the session is `open` and no other PUT is committing
+ * (or the one that was has been silent for `SINGLE_PUT_STALE_MINUTES`). False: store nothing.
+ */
+export async function beginSinglePut(db: Executor, uploadId: string, token: string): Promise<boolean> {
+  const marker = sql`${COMMITTING + token + ":"} || (extract(epoch FROM clock_timestamp()) * 1000)::bigint`;
+  const result = await db.execute(sql`
+    WITH session AS (
+      SELECT u.id FROM uploads u WHERE u.id = ${uploadId}::uuid AND u.status = 'open' FOR UPDATE
+    )
+    INSERT INTO upload_parts (upload_id, part_number, etag, size)
+    SELECT session.id, 1, ${marker}, 0 FROM session
+    ON CONFLICT (upload_id, part_number) DO UPDATE SET etag = EXCLUDED.etag, size = 0
+    WHERE upload_parts.etag NOT LIKE ${COMMITTING + "%"}
+       OR split_part(upload_parts.etag, ':', 3)::bigint
+          < (extract(epoch FROM clock_timestamp()) * 1000)::bigint - ${SINGLE_PUT_STALE_MINUTES * 60_000}`);
+  return (result.rowCount ?? 0) > 0;
+}
+
+/** The PUT that passed the gate is stored: its marker becomes the object's etag. False when the marker is no longer its own. */
+export async function finishSinglePut(
+  db: Executor,
+  uploadId: string,
+  token: string,
+  stored: { etag: string; size: number },
+): Promise<boolean> {
+  const rows = await db
+    .update(uploadParts)
+    .set({ etag: stored.etag, size: stored.size })
+    .where(
+      and(
+        eq(uploadParts.uploadId, uploadId),
+        eq(uploadParts.partNumber, 1),
+        sql`${uploadParts.etag} LIKE ${COMMITTING + token + ":%"}`,
+      ),
+    )
+    .returning({ n: uploadParts.partNumber });
+  return rows.length > 0;
+}
+
+/** The PUT that passed the gate failed in the store: its marker goes, and another PUT may try. */
+export async function clearSinglePut(db: Executor, uploadId: string, token: string): Promise<void> {
+  await db
+    .delete(uploadParts)
+    .where(
+      and(
+        eq(uploadParts.uploadId, uploadId),
+        eq(uploadParts.partNumber, 1),
+        sql`${uploadParts.etag} LIKE ${COMMITTING + token + ":%"}`,
+      ),
+    );
+}
+
 /** The recorded parts, lowest number first. */
 export async function listParts(db: Executor, uploadId: string): Promise<SessionPart[]> {
   return db
@@ -90,7 +164,10 @@ export async function listParts(db: Executor, uploadId: string): Promise<Session
     .orderBy(uploadParts.partNumber);
 }
 
-/** The uploader's `open`, unexpired sessions, newest first, each with how many parts it has. */
+/**
+ * The uploader's `open`, unexpired sessions, newest first, each with how many parts the store
+ * has (for a single session: 1 once its PUT is done).
+ */
 export async function listOpen(
   db: Executor,
   uploaderId: string,
@@ -107,9 +184,12 @@ export async function listOpen(
     .select({ uploadId: uploadParts.uploadId, n: sql<number>`count(*)`.mapWith(Number) })
     .from(uploadParts)
     .where(
-      inArray(
-        uploadParts.uploadId,
-        rows.map((row) => row.id),
+      and(
+        inArray(
+          uploadParts.uploadId,
+          rows.map((row) => row.id),
+        ),
+        sql`${uploadParts.etag} NOT LIKE ${COMMITTING + "%"}`,
       ),
     )
     .groupBy(uploadParts.uploadId);

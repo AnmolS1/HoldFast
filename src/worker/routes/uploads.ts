@@ -55,13 +55,12 @@ import {
   type PartResponse,
   type SinglePutResponse,
 } from "../../shared/schemas/upload";
-import type { NodeDto } from "../../shared/schemas/node";
 import type { SessionUser } from "../auth/types";
 import type { Db } from "../db/client";
 import { LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
-import { findByR2Key, getNode, replaceVersion, resetToPending } from "../db/queries/nodes";
+import { getNode, replaceVersion } from "../db/queries/nodes";
 import { assertPurgeable } from "../db/queries/trash";
 import * as uploadIps from "../db/queries/upload-ips";
 import * as sessions from "../db/queries/upload-sessions";
@@ -79,19 +78,12 @@ import { AppError } from "../services/errors";
 import { extOf, nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
 import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
+import { toNodeDto } from "../services/node-dto";
 import { assertNotTrashed, requireRole, requireUpload, type Role } from "../services/permissions";
 import * as quota from "../services/quota";
 import { db, deps, settings, type AppEnv } from "../services/request-context";
 import { enqueueScan, lockSuspectedCsam, scanSmallObject, type ScanVerdict } from "../services/scanning";
-import {
-  avatarKey,
-  keyFor,
-  storage,
-  thumbKey,
-  UPLOAD_PREFIX,
-  type Storage,
-  type UploadedPart,
-} from "../services/storage";
+import { avatarKey, keyFor, storage, thumbKey, type Storage, type UploadedPart } from "../services/storage";
 import { addStrike } from "../services/strikes";
 import { sealIp } from "../services/tokens";
 
@@ -207,7 +199,7 @@ function assertOpen(c: Ctx, session: Upload): void {
 
 // ── where a file may go ─────────────────────────────────────────────────────────────────────
 
-type Place = { ownerId: string; role: Role };
+type Place = { ownerId: string; role: Role; shareRootId: string | null };
 
 /**
  * The init check on the parent, run again at complete: the caller may upload there (an editor or
@@ -216,12 +208,15 @@ type Place = { ownerId: string; role: Role };
  */
 async function placeFor(c: Ctx, user: SessionUser, parentId: string | null): Promise<Place> {
   const access = await requireUpload(c, parentId);
-  if (parentId === null) return { ownerId: user.id, role: "owner" };
+  if (parentId === null) return OWN_ROOT(user);
   const parent = await getNode(db(c), parentId);
   if (!parent || parent.kind !== "folder" || parent.system !== null) throw new AppError("not_found");
   await assertNotTrashed(c, parentId);
-  return { ownerId: parent.ownerId, role: access.role };
+  return { ownerId: parent.ownerId, role: access.role, shareRootId: access.shareRootId };
 }
+
+/** The caller's own top level — also where an avatar "is". */
+const OWN_ROOT = (user: SessionUser): Place => ({ ownerId: user.id, role: "owner", shareRootId: null });
 
 const replaceRefused = () => new AppError("conflict", REPLACE_REFUSED_MESSAGE);
 
@@ -366,7 +361,7 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
   const partCount = body.size <= SINGLE_PUT_MAX ? 1 : Math.ceil(body.size / partBytes);
   if (partCount > MAX_PARTS) throw new AppError("file_too_large");
 
-  const place: Place = avatar ? { ownerId: user.id, role: "owner" } : await placeFor(c, user, body.parentId);
+  const place: Place = avatar ? OWN_ROOT(user) : await placeFor(c, user, body.parentId);
   const uploaderIsOwner = place.ownerId === user.id;
 
   // Resume first: an open session for the same local file is answered as it is. Nothing is
@@ -519,26 +514,8 @@ router.put(`/uploads/${ID}/parts/${PART_NUMBER}`, verified, uploadsOn, async (c)
   return c.json(answer);
 });
 
-/**
- * A single PUT that was still streaming when its session left `open` has written the key AFTER
- * complete looked at the object — the store has no "only if absent" for this write. The node
- * that holds the key (if one does) must not keep a verdict about other bytes: it goes back to
- * `pending` and is scanned again. A taken-down or locked node is left exactly as it is.
- */
-async function afterLatePut(c: Ctx, session: Upload): Promise<void> {
-  const reset = await db(c).transaction(async (tx) => {
-    const node = await findByR2Key(tx, session.r2Key, { forUpdate: true });
-    if (!node || node.takedownAt !== null || node.scanStatus === "suspected_csam") return null;
-    if (node.scanStatus !== "under_review") await resetToPending(tx, node.id);
-    return node;
-  });
-  metric("upload", { outcome: "late_put", kind: "single" });
-  if (!reset) return;
-  audit(c, "node.upload_late_put", { type: "node", id: reset.id }, { uploadId: session.id });
-  if (session.r2Key.startsWith(UPLOAD_PREFIX)) {
-    await enqueueScan(deps(c), { nodeId: reset.id, key: session.r2Key, force: true });
-  }
-}
+/** Thrown inside the body stream when the gate is closed: the store then keeps nothing. */
+class GateClosed extends Error {}
 
 router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
   const session = await loadSession(c);
@@ -546,14 +523,51 @@ router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
   if (!isSingle(session)) throw new AppError("validation", "This upload takes parts, not one PUT.");
   const length = contentLength(c);
   if (length !== session.size) throw new AppError("validation", "The body is not the size of this upload.");
-  const body = c.req.raw.body ?? (session.size === 0 ? new Uint8Array(0) : null);
-  if (!body) throw new AppError("validation", "The body is empty.");
+  const source = c.req.raw.body;
+  if (!source && session.size > 0) throw new AppError("validation", "The body is empty.");
 
-  // No hash in the object's metadata: it is not verified yet.
-  const stored = await storage(c.env).put(session.r2Key, body, { size: session.size });
-  const current = await sessions.get(db(c), session.id);
-  if (current?.status !== "open") {
-    if (current && current.status !== "aborted") await afterLatePut(c, session);
+  // THE GATE. The key of a session never changes and the store cannot be told "only if absent",
+  // so a PUT may FINISH only while the session is open and no other PUT is finishing. The store
+  // has the whole object once it has `size` bytes, so the gate stands in front of the LAST CHUNK:
+  // closed, the stream is errored one chunk short and nothing is stored. After `complete` has
+  // claimed the session no PUT gets through — what it looked at is what is scanned.
+  const token = uuidv7();
+  const gate: { state: "untried" | "passed" | "closed" } = { state: "untried" };
+  const passGate = async () => {
+    gate.state = (await sessions.beginSinglePut(db(c), session.id, token)) ? "passed" : "closed";
+    if (gate.state === "closed") throw new GateClosed();
+  };
+  const store = storage(c.env);
+  let stored: { etag: string };
+  try {
+    if (source && session.size > 0) {
+      let seen = 0;
+      const gated = source.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          async transform(chunk, controller) {
+            seen += chunk.byteLength;
+            if (seen >= session.size && gate.state === "untried") await passGate();
+            controller.enqueue(chunk);
+          },
+        }),
+      );
+      // No hash in the object's metadata: it is not verified yet.
+      stored = await store.put(session.r2Key, gated, { size: session.size });
+    } else {
+      await passGate();
+      stored = await store.put(session.r2Key, new Uint8Array(0), { size: 0 });
+    }
+  } catch (error) {
+    // The store failed after the gate: the marker goes, so that the client can try again.
+    if (gate.state === "passed") await sessions.clearSinglePut(db(c), session.id, token);
+    if (gate.state === "closed") {
+      throw new AppError("conflict", "This upload is no longer open, or is being written.");
+    }
+    throw error;
+  }
+  if (!(await sessions.finishSinglePut(db(c), session.id, token, { etag: stored.etag, size: length }))) {
+    // Aborted while the store was finishing the object: nothing references what was just written.
+    if ((await sessions.get(db(c), session.id))?.status === "aborted") await discardStored(c, session, true);
     throw new AppError("conflict", "This upload is no longer open.");
   }
   const answer: SinglePutResponse = { etag: stored.etag };
@@ -561,11 +575,6 @@ router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
 });
 
 // ── complete ────────────────────────────────────────────────────────────────────────────────
-
-// TODO(node-dto): the shared mapper (services/node-dto.ts, Common addendum 1) replaces this stub.
-async function toNodeDto(_db: Db, _row: Node, _view: { viewerId: string; role: Role }): Promise<NodeDto> {
-  throw new Error("node-dto: the shared mapper has not landed");
-}
 
 const blocked = () => new AppError("forbidden", BLOCKED_MESSAGE, { reason: "blocked_content" });
 
@@ -731,14 +740,19 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   if (single ? body.parts.length > 0 : body.parts.length === 0) {
     throw new AppError("validation", single ? "This upload has no parts." : "The parts are missing.");
   }
-  const recorded = single ? [] : await sessions.listParts(db(c), open.id);
-  if (!single) {
+  const before = await sessions.listParts(db(c), open.id);
+  if (single) {
+    // The one PUT must be done — not absent, and not still on its way into the store.
+    if (!before.some((part) => part.n === 1 && !sessions.isCommitting(part.etag))) {
+      throw new AppError("validation", "The file has not been uploaded.");
+    }
+  } else {
     const claimedEtags = new Map(body.parts.map((part) => [part.n, part.etag]));
     const complete =
-      recorded.length === (open.partCount ?? 0) &&
+      before.length === (open.partCount ?? 0) &&
       claimedEtags.size === body.parts.length &&
-      body.parts.length === recorded.length &&
-      recorded.every((part) => claimedEtags.get(part.n) === part.etag);
+      body.parts.length === before.length &&
+      before.every((part) => claimedEtags.get(part.n) === part.etag);
     if (!complete) throw new AppError("validation", "The parts do not match what was uploaded.");
     if (!open.r2UploadId) throw new AppError("conflict", "This upload is not ready yet.");
   }
@@ -747,21 +761,23 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   if (!session) throw new AppError("conflict", "This upload is already being completed.");
   const avatar = session.purpose === "avatar";
   const replacing = session.replaceNodeId !== null;
+  // What the store holds for this session, read again now that nothing can add to it: a part or
+  // a PUT is recorded only while the session is `open`.
+  const recorded = await sessions.listParts(db(c), session.id);
 
   // Looked up now, acted on below: with a CSAM hit nothing this request does removes the object.
   const hit = await blocklist.lookup(db(c), body.sha256);
   const keepStored = hit?.reason === "csam";
 
   // Everything init checked, against the state of now.
-  let role: Role = "owner";
+  let place = OWN_ROOT(user);
   try {
     if (!(await settings(c)).uploadsEnabled) {
       throw new AppError("feature_disabled", UPLOADS_OFF_MESSAGE, { reason: SWITCH_REASON.uploadsEnabled });
     }
     if (!avatar) {
-      const place = await placeFor(c, user, session.parentId);
+      place = await placeFor(c, user, session.parentId);
       if (place.ownerId !== session.ownerId) throw new AppError("not_found");
-      role = place.role;
     }
     if (session.replaceNodeId !== null) {
       await replaceGuard(c, {
@@ -790,7 +806,14 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     }
   }
   const head = await store.head(session.r2Key);
-  if (!head || head.size !== session.size) {
+  // A single PUT that passed its gate just before the claim is still being stored: this is not
+  // the object to look at, and there is no way back from `completing`.
+  const marker = single ? recorded.find((part) => part.n === 1) : undefined;
+  if (single && (!marker || sessions.isCommitting(marker.etag))) {
+    await abandonClaimed(c, session, { assembled: true, keepStored, reason: "put_racing" });
+    throw new AppError("conflict", "This upload was still being written.");
+  }
+  if (!head || head.size !== session.size || (marker && head.etag !== marker.etag)) {
     await abandonClaimed(c, session, { assembled: true, keepStored, reason: "size" });
     throw new AppError("validation", "What was uploaded is not the size of this upload.");
   }
@@ -872,7 +895,12 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
       captureError(error, { kind: "upload_thumbs" });
     }
   }
-  const dto = await toNodeDto(db(c), node, { viewerId: user.id, role });
+  // The mapper refuses a system node; an avatar is the caller's own file and is answered like one.
+  const dto = await toNodeDto(db(c), avatar ? { ...node, system: null } : node, {
+    viewerId: user.id,
+    role: place.role,
+    shareRootId: place.shareRootId,
+  });
   return c.json(dto, replacing ? 200 : 201);
 });
 

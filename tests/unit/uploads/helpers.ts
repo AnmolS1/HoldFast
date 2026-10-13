@@ -67,7 +67,11 @@ export const sessionsOf = (uploaderId: string) =>
   testDb().select().from(uploads).where(eq(uploads.uploaderId, uploaderId));
 
 export const partRows = (uploadId: string) =>
-  testDb().select().from(uploadParts).where(eq(uploadParts.uploadId, uploadId));
+  testDb()
+    .select()
+    .from(uploadParts)
+    .where(eq(uploadParts.uploadId, uploadId))
+    .orderBy(uploadParts.partNumber);
 
 export const strikesOf = (userId: string) =>
   testDb().select().from(strikes).where(eq(strikes.userId, userId));
