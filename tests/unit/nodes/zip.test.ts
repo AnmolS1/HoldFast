@@ -353,6 +353,11 @@ describe("POST /nodes/zip-manifest", () => {
       expect(Math.max(...produced)).toBeLessThanOrEqual(251);
       expect(Math.max(...produced)).toBeGreaterThan(100);
 
+      // And the walk is lookups — a root by its id, a folder's children by their parent — not a
+      // join the planner is free to run as "every row against every row".
+      expect(plan.filter((node) => "Join Filter" in node)).toEqual([]);
+      expect(plan.map((node) => node["Node Type"])).not.toContain("Seq Scan");
+
       // The control: with room for the whole tree, the same call reads all of it.
       const whole = await zipManifest(testDb(), roots, { maxFiles: 5_000, maxWalked: 5_000 });
       expect(whole.truncated).toBe(false);

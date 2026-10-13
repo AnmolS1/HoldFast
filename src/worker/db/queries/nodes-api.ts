@@ -123,6 +123,13 @@ export type ZipLimits = {
  * costs. Everything that does need a whole set — one row per file, the order — works on those
  * rows only. A tree that is larger is answered from its upper levels, with `truncated`.
  *
+ * ONE LOOKUP PER ROOT AND PER FOLDER, whatever the planner believes about the table: each step
+ * is a LATERAL subquery (kept as one by `OFFSET 0`) that is run for its outer row — a root by
+ * its id, a folder's children by `parent_id` — and only a FOLDER is asked for children. Written
+ * as plain joins the same walk was left to the planner, which on a table without statistics (a
+ * fresh database) compared every row of the tree with every other: 10,000 files took over five
+ * seconds.
+ *
  * At most `maxFiles` ENTRIES are answered; `truncated` says there were more clean files, or that
  * the walk was cut. Skipped files do not count against the cap (their number is bounded by the
  * walk). A file reached through two roots (a folder and something
@@ -154,12 +161,22 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
     ),
     down(id, kind, path, depth, owner, ord) AS (
       SELECT n.id, n.kind, r.label, 0, r.owner, r.ord
-      FROM roots r JOIN nodes n ON n.id = r.id
-      WHERE n.system IS NULL AND ${notEffectivelyTrashedOrHidden("n")}
+      FROM roots r
+      CROSS JOIN LATERAL (
+        SELECT n.id, n.kind FROM nodes n
+        WHERE n.id = r.id AND n.system IS NULL AND ${notEffectivelyTrashedOrHidden("n")}
+        OFFSET 0
+      ) n
       UNION ALL
       SELECT c.id, c.kind, down.path || '/' || c.name, down.depth + 1, down.owner, down.ord
-      FROM nodes c JOIN down ON c.parent_id = down.id
-      WHERE c.deleted_at IS NULL AND c.takedown_at IS NULL AND c.system IS NULL
+      FROM down
+      CROSS JOIN LATERAL (
+        SELECT c.id, c.kind, c.name FROM nodes c
+        WHERE c.parent_id = down.id
+          AND c.deleted_at IS NULL AND c.takedown_at IS NULL AND c.system IS NULL
+        OFFSET 0
+      ) c
+      WHERE down.kind = 'folder'
     ) CYCLE id SET is_cycle USING seen,
     -- The cut. Nothing may come between this LIMIT and the recursion.
     walked AS MATERIALIZED (
