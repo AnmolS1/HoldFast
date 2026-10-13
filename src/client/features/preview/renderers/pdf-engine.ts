@@ -14,6 +14,7 @@ import {
   type PDFDocumentProxy,
   type PDFPageProxy,
 } from "pdfjs-dist";
+import type { TextContent } from "pdfjs-dist/types/src/display/api";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { PAGE_MAX_LINKS, PDF_MAX_IMAGE_PIXELS, TEXT_LAYER_MAX_ITEMS } from "./pdf-limits";
 import { safeExternalUrl } from "./pdf-links";
@@ -66,6 +67,27 @@ interface RawAnnotation {
 
 function wrapPage(page: PDFPageProxy): PdfPage {
   const base = page.getViewport({ scale: 1 });
+  // The page's text, read once (a zoom draws again but does not read again) and counted AS IT
+  // ARRIVES: past the limit the rest is never built. null = too many runs for a text layer.
+  let text: Promise<TextContent | null> | null = null;
+  const readText = (): Promise<TextContent | null> => {
+    text ??= (async () => {
+      const reader = (page.streamTextContent() as ReadableStream<TextContent>).getReader();
+      const all: TextContent = { items: [], styles: {}, lang: null };
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return all;
+        if (all.items.length + value.items.length > TEXT_LAYER_MAX_ITEMS) {
+          void reader.cancel().catch(() => {});
+          return null;
+        }
+        all.items.push(...value.items);
+        Object.assign(all.styles, value.styles);
+        all.lang ??= value.lang;
+      }
+    })();
+    return text;
+  };
   return {
     width: base.width,
     height: base.height,
@@ -83,10 +105,10 @@ function wrapPage(page: PDFPageProxy): PdfPage {
       textLayer.replaceChildren();
       let cancelled = false;
       let text: TextLayer | null = null;
-      const layer = page.getTextContent().then((content) => {
+      const layer = readText().then((content) => {
         // A page of a hundred thousand text runs would be a hundred thousand elements: such a
         // page is shown as its picture only.
-        if (cancelled || content.items.length > TEXT_LAYER_MAX_ITEMS) return undefined;
+        if (cancelled || content === null) return undefined;
         text = new TextLayer({ textContentSource: content, container: textLayer, viewport });
         return text.render();
       });

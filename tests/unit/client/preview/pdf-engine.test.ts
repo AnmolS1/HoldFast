@@ -10,6 +10,8 @@ const pdfjs = vi.hoisted(() => {
     textLayers: [] as Array<{ source: unknown }>,
     annotations: [] as Array<Record<string, unknown>>,
     textItems: 3,
+    textChunks: 0,
+    textCancelled: 0,
     fail: null as Error | null,
     destroyed: 0,
   };
@@ -29,9 +31,31 @@ vi.mock("pdfjs-dist", () => {
       state.renderCalls.push(params);
       return { promise: Promise.resolve(), cancel: () => {} };
     },
-    getTextContent: async () => ({ items: Array.from({ length: state.textItems }, () => ({ str: "x" })) }),
+    getTextContent: async () => {
+      throw new Error("the text is read as a stream, so that it can be counted as it arrives");
+    },
+    // The text arrives in chunks of 1,000 runs.
     streamTextContent: () => {
-      throw new Error("the text is read whole, so that it can be counted first");
+      let sent = 0;
+      return new ReadableStream(
+        {
+          pull(controller) {
+            if (sent >= state.textItems) return controller.close();
+            const size = Math.min(1000, state.textItems - sent);
+            sent += size;
+            state.textChunks += 1;
+            controller.enqueue({
+              items: Array.from({ length: size }, () => ({ str: "x" })),
+              styles: {},
+              lang: "en",
+            });
+          },
+          cancel() {
+            state.textCancelled += 1;
+          },
+        },
+        { highWaterMark: 0 },
+      );
     },
     getAnnotations: async () => state.annotations,
     cleanup: () => {},
@@ -83,6 +107,8 @@ beforeEach(() => {
   state.textLayers.length = 0;
   state.annotations = [];
   state.textItems = 3;
+  state.textChunks = 0;
+  state.textCancelled = 0;
   state.fail = null;
   state.destroyed = 0;
 });
@@ -115,7 +141,7 @@ describe("the PDF engine", () => {
     }
   });
 
-  it("a page is painted with its annotations as a picture, and its text read whole before a layer is built", async () => {
+  it("a page is painted with its annotations as a picture, with a text layer of its runs", async () => {
     const doc = await openPdf(bytes);
     const page = await doc.page(1);
     expect([page.width, page.height]).toEqual([612, 792]);
@@ -133,15 +159,30 @@ describe("the PDF engine", () => {
     expect(pdfjs.state.textLayers.length).toBe(1);
   });
 
-  it(`a page with more than ${TEXT_LAYER_MAX_ITEMS} text runs gets no text layer; control: one at the limit does`, async () => {
+  it(`a page with more than ${TEXT_LAYER_MAX_ITEMS} text runs gets no text layer — and the rest of its text is never built`, async () => {
     const doc = await openPdf(bytes);
+    pdfjs.state.textItems = 500_000;
     const page = await doc.page(1);
-    pdfjs.state.textItems = TEXT_LAYER_MAX_ITEMS + 1;
     await page.render(document.createElement("canvas"), document.createElement("div"), 1, 1).done;
     expect(pdfjs.state.textLayers.length).toBe(0);
+    // Counted as it arrived: the chunk that passed the limit was the last one taken.
+    expect(pdfjs.state.textChunks).toBe(TEXT_LAYER_MAX_ITEMS / 1000 + 1);
+    expect(pdfjs.state.textCancelled).toBe(1);
+    // A zoom draws again but does not read the text again.
+    await page.render(document.createElement("canvas"), document.createElement("div"), 2, 1).done;
+    expect(pdfjs.state.textChunks).toBe(TEXT_LAYER_MAX_ITEMS / 1000 + 1);
+  });
+
+  it("control: a page with exactly the limit gets its text layer, with every run", async () => {
+    const doc = await openPdf(bytes);
     pdfjs.state.textItems = TEXT_LAYER_MAX_ITEMS;
+    const page = await doc.page(1);
     await page.render(document.createElement("canvas"), document.createElement("div"), 1, 1).done;
     expect(pdfjs.state.textLayers.length).toBe(1);
+    expect((pdfjs.state.textLayers[0]!.source as { items: unknown[] }).items.length).toBe(
+      TEXT_LAYER_MAX_ITEMS,
+    );
+    expect(pdfjs.state.textCancelled).toBe(0);
   });
 
   it("links are read as data: http(s) and mailto addresses and in-document places; everything else is dropped", async () => {

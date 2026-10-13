@@ -9,15 +9,22 @@ import Typography from "@mui/material/Typography";
 import { ChevronDown, ChevronUp, Minus, Plus } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { hf } from "../../../theme/tokens";
+import { hf, layout } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
 import { fetchLimitFor } from "../renderer-map";
 import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import { NoPreview } from "./NoPreview";
-import { PDF_MAX_PAGES, pixelRatioFor } from "./pdf-limits";
+import { createRenderBudget, PDF_MAX_PAGES, pixelRatioFor, type RenderBudget } from "./pdf-limits";
 import { safeExternalUrl } from "./pdf-links";
-import { openPdf, PdfLockedError, type PdfDocument, type PdfLink, type PdfPage } from "./pdf-engine";
+import {
+  openPdf,
+  PdfLockedError,
+  type PdfDocument,
+  type PdfLink,
+  type PdfPage,
+  type PdfRender,
+} from "./pdf-engine";
 import type { RendererProps } from "./types";
 
 const PAGE_GAP = 12;
@@ -84,11 +91,14 @@ interface PageViewProps {
   baseHeight: number;
   onExternalLink(url: string): void;
   onInternalLink(dest: unknown): void;
+  /** The document's: who may draw now. */
+  budget: RenderBudget;
   register(number: number, element: HTMLDivElement | null): void;
 }
 
 function PageView(props: PageViewProps) {
-  const { doc, number, scale, baseWidth, baseHeight, onExternalLink, onInternalLink, register } = props;
+  const { doc, number, scale, baseWidth, baseHeight, onExternalLink, onInternalLink, budget, register } =
+    props;
   const box = useRef<HTMLDivElement | null>(null);
   const canvas = useRef<HTMLCanvasElement | null>(null);
   const textLayer = useRef<HTMLDivElement | null>(null);
@@ -134,23 +144,38 @@ function PageView(props: PageViewProps) {
   }, [doc, number, near]);
 
   useEffect(() => {
-    if (!page || !canvas.current || !textLayer.current) return;
+    const surface = canvas.current;
+    const layer = textLayer.current;
+    if (!page || !surface || !layer) return;
     let cancelled = false;
+    let render: PdfRender | null = null;
     const ratio = pixelRatioFor(page.width * scale, page.height * scale, window.devicePixelRatio);
-    const render = page.render(canvas.current, textLayer.current, scale, ratio);
-    // A cancelled render rejects; that is not a failure.
-    render.done.catch(() => {});
-    page.links(scale).then(
-      (found) => {
-        if (!cancelled) setLinks(found);
-      },
-      () => {},
+    // Drawn when the document's budget allows: two pages at a time, and only while the canvases
+    // already alive leave room for this one.
+    const slot = budget.request(
+      Math.floor(page.width * scale * ratio) * Math.floor(page.height * scale * ratio),
     );
+    void slot.granted.then((ok) => {
+      if (!ok || cancelled) return;
+      render = page.render(surface, layer, scale, ratio);
+      // A cancelled render rejects; that is not a failure.
+      render.done.then(slot.finished, slot.finished);
+      page.links(scale).then(
+        (found) => {
+          if (!cancelled) setLinks(found);
+        },
+        () => {},
+      );
+    });
     return () => {
       cancelled = true;
-      render.cancel();
+      render?.cancel();
+      // The canvas gives its pixels back now, not when it is collected.
+      surface.width = 0;
+      surface.height = 0;
+      slot.release();
     };
-  }, [page, scale]);
+  }, [page, scale, budget]);
 
   const width = Math.floor((page?.width ?? baseWidth) * scale);
   const height = Math.floor((page?.height ?? baseHeight) * scale);
@@ -186,7 +211,7 @@ function PageView(props: PageViewProps) {
               type="button"
               key={index}
               data-pdf-link={link.url ? "external" : "internal"}
-              aria-label={link.url ?? t("pdf.pageLabel", { page: number })}
+              aria-label={link.url ?? t("pdf.internalLink")}
               title={link.url}
               onClick={() => (link.url ? onExternalLink(link.url) : onInternalLink(link.dest))}
               style={{ left: link.left, top: link.top, width: link.width, height: link.height }}
@@ -224,6 +249,7 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
   const [current, setCurrent] = useState(1);
   const [typed, setTyped] = useState<string | null>(null);
   const [leaving, setLeaving] = useState<string | null>(null);
+  const [budget] = useState(() => createRenderBudget());
 
   useEffect(() => {
     const element = scroller.current;
@@ -338,7 +364,7 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
             width: 56,
             padding: "0 8px",
             border: `1px solid ${hf.hairline}`,
-            borderRadius: "6px",
+            borderRadius: `${layout.radius.control}px`,
             "& input": { textAlign: "right", padding: "4px 0" },
           }}
         />
@@ -410,6 +436,7 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
             baseHeight={baseHeight}
             onExternalLink={setLeaving}
             onInternalLink={onInternalLink}
+            budget={budget}
             register={register}
           />
         ))}
@@ -438,7 +465,7 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
   );
 }
 
-export default function PdfPreview({ source, item, download }: RendererProps) {
+export default function PdfPreview({ source, item }: RendererProps) {
   const preview = usePreviewUrl(source, item.id, "inline");
   const [opened, setOpened] = useState<Opened | null>(null);
   const [locked, setLocked] = useState(false);
@@ -488,9 +515,9 @@ export default function PdfPreview({ source, item, download }: RendererProps) {
     };
   }, [firstUrl, reportFailure, fail, settle]);
 
-  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} download={download} />;
-  if (locked) return <NoPreview item={item} message={t("pdf.locked")} download={download} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} actions={download} />;
+  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} />;
+  if (locked) return <NoPreview item={item} message={t("pdf.locked")} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} />;
   if (!opened) return <PreviewSkeleton />;
   return <Pages opened={opened} name={item.name} />;
 }
