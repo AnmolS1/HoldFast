@@ -967,6 +967,8 @@ describe("constants", () => {
       THUMB_SIZES: [160, 320, 1280],
       THUMB_INPUT_MAX_BYTES: 20_000_000,
       PREVIEW_TEXT_MAX_BYTES: 2_000_000,
+      PDF_PREVIEW_MAX_BYTES: 50_000_000,
+      IMAGE_PREVIEW_MAX_BYTES: 50_000_000,
       ZIP_URL_BATCH: 50,
       ZIP_MAX_ENTRIES: 10_000,
       TOKEN_TTL: { download: 300, inline: 900, thumb: 600, zip: 900 },
