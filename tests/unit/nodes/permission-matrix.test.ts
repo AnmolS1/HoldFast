@@ -2,7 +2,22 @@
 // stranger — against every endpoint of the nodes API. `404` for the last two on every route that
 // names a node: no access and no such node are one answer.
 import { describe, expect, it } from "vitest";
-import { api, scanQueueSpy, sharedTree, type Answer, type Caller, type SharedTree } from "./helpers";
+import { BY_ID } from "./by-id-routes";
+import {
+  api,
+  comparable,
+  makeFile,
+  makeFolder,
+  makeShare,
+  nodeById,
+  person,
+  scanQueueSpy,
+  setStatus,
+  sharedTree,
+  type Answer,
+  type Caller,
+  type SharedTree,
+} from "./helpers";
 
 const CALLERS = ["owner", "editor", "viewer", "invited", "stranger"] as const;
 type Who = (typeof CALLERS)[number];
@@ -84,7 +99,8 @@ const ROWS: Row[] = [
     endpoint: "POST /nodes/:id/rescan",
     // The queue is a stand-in: no object is stored for the fixture, so nothing could scan it.
     call: (t, caller) => api(caller, "POST", `/nodes/${t.broken.id}/rescan`, { env: scanQueueSpy().env }),
-    expected: ["202", "403", "403", "404", "404"],
+    // The file is in scan `error`: among the partners only its uploader (the editor) still sees it.
+    expected: ["202", "403", "404", "404", "404"],
   },
   {
     endpoint: "GET /account/usage",
@@ -160,5 +176,133 @@ describe("permission matrix", () => {
       body: { parentId: t.privateFolder.id },
     });
     expect([out.status, out.body.error]).toEqual([404, "not_found"]);
+  });
+});
+
+// What a share partner may see of a file BY ID: what their listing would show them — a clean
+// file — and, the one exception, a file they uploaded themselves while the scanner has not passed
+// it. Never a file under review. Everything else answers as an id that was never issued, on
+// every route, and is in neither list of a zip manifest.
+describe("a share partner and files that are not clean", () => {
+  const STATES = ["clean", "pending", "infected", "under_review"] as const;
+  type State = (typeof STATES)[number];
+  const VIEWERS = ["owner", "uploader", "otherEditor", "viewer"] as const;
+  type Viewer = (typeof VIEWERS)[number];
+
+  /** Is the file there for them at all? */
+  const SEES: Record<Viewer, Record<State, boolean>> = {
+    owner: { clean: true, pending: true, infected: true, under_review: true },
+    uploader: { clean: true, pending: true, infected: true, under_review: false },
+    otherEditor: { clean: true, pending: false, infected: false, under_review: false },
+    viewer: { clean: true, pending: false, infected: false, under_review: false },
+  };
+  /** For those who see it: what its download answers, and where a manifest puts it. */
+  const DOWNLOAD: Record<State, string> = {
+    clean: "200",
+    pending: "409 scan_pending",
+    infected: "403 scan_blocked",
+    under_review: "403 scan_blocked",
+  };
+  const IN_MANIFEST: Record<State, string> = {
+    clean: "entry",
+    pending: "skipped scan_pending",
+    infected: "skipped scan_blocked",
+    under_review: "skipped scan_blocked",
+  };
+
+  /** The shared tree, a second editor, and one image per state that the FIRST editor uploaded. */
+  async function withUploads() {
+    const t = await sharedTree();
+    const otherEditor = await person();
+    await makeShare(t.shared.id, t.owner.id, otherEditor.id, { role: "editor", canUpload: true });
+    const folder = await makeFolder(t.owner.id, t.shared.id);
+    const files = {} as Record<State, Awaited<ReturnType<typeof makeFile>>>;
+    for (const state of STATES) {
+      files[state] = await makeFile(t.owner.id, folder.id, {
+        name: `upload-${state}.png`,
+        mimeSniffed: "image/png",
+        scanStatus: state,
+        createdBy: t.editor.id,
+      });
+    }
+    const callers: Record<Viewer, Caller> = {
+      owner: t.owner.as,
+      uploader: t.editor.as,
+      otherEditor: otherEditor.as,
+      viewer: t.viewer.as,
+    };
+    return { t, folder, files, callers };
+  }
+
+  it.each(VIEWERS.flatMap((viewer) => STATES.map((state) => ({ viewer, state }))))(
+    "$viewer × $state",
+    async ({ viewer, state }) => {
+      const { t, folder, files, callers } = await withUploads();
+      const caller = callers[viewer];
+      const file = files[state];
+      const detail = await api(caller, "GET", `/nodes/${file.id}`);
+      const download = await api(caller, "POST", `/nodes/${file.id}/download-url`, {
+        body: { kind: "download" },
+      });
+      const zip = await api(caller, "POST", "/nodes/zip-manifest", { body: { nodeIds: [folder.id] } });
+      expect(zip.status).toBe(200);
+      const entry = zip.body.entries.find((item: { nodeId: string }) => item.nodeId === file.id);
+      const skipped = zip.body.skipped.find((item: { nodeId: string }) => item.nodeId === file.id);
+      const inManifest = entry ? "entry" : skipped ? `skipped ${skipped.reason}` : "absent";
+
+      if (SEES[viewer][state]) {
+        expect(detail.status).toBe(200);
+        expect(detail.body.node.scanStatus).toBe(state);
+        expect(download.status === 200 ? "200" : `${download.status} ${download.body.error}`).toBe(
+          DOWNLOAD[state],
+        );
+        expect(inManifest).toBe(IN_MANIFEST[state]);
+        return;
+      }
+
+      // Not there: every by-id route answers exactly what it answers for an id nobody was issued.
+      expect(inManifest).toBe("absent");
+      expect(JSON.stringify(zip.body)).not.toContain(file.name);
+      for (const route of BY_ID) {
+        const unknownId = crypto.randomUUID();
+        const unknown = await route.call(caller, unknownId, t);
+        const answer = await route.call(caller, file.id, t);
+        expect(comparable(answer, { [file.id]: "ID" }), route.name).toEqual(
+          comparable(unknown, { [unknownId]: "ID" }),
+        );
+      }
+      const row = (await nodeById(file.id))!;
+      expect([row.name, row.parentId, row.starred, row.scanStatus]).toEqual([
+        file.name,
+        folder.id,
+        false,
+        state,
+      ]);
+    },
+  );
+
+  it("the uploader sees their own skipped / error upload as blocked; the listings stay clean-only for every partner", async () => {
+    const { folder, files, callers } = await withUploads();
+    await setStatus(files.pending.id, "error");
+    const own = await api(callers.uploader, "POST", `/nodes/${files.pending.id}/download-url`, {
+      body: { kind: "download" },
+    });
+    expect([own.status, own.body.error]).toEqual([403, "scan_blocked"]);
+    expect((await api(callers.viewer, "GET", `/nodes/${files.pending.id}`)).status).toBe(404);
+    for (const viewer of ["uploader", "otherEditor", "viewer"] as const) {
+      const listed = await api(callers[viewer], "GET", `/nodes/${folder.id}/children`);
+      expect(listed.body.items.map((item: { id: string }) => item.id)).toEqual([files.clean.id]);
+    }
+    const mine = await api(callers.owner, "GET", `/nodes/${folder.id}/children`);
+    expect(mine.body.items).toHaveLength(4);
+  });
+
+  it("folders are unaffected, and so is a partner's clean file that someone else uploaded", async () => {
+    const { t, folder, files, callers } = await withUploads();
+    for (const viewer of ["uploader", "otherEditor", "viewer"] as const) {
+      expect((await api(callers[viewer], "GET", `/nodes/${folder.id}`)).status).toBe(200);
+      expect((await api(callers[viewer], "GET", `/nodes/${files.clean.id}`)).status).toBe(200);
+      expect((await api(callers[viewer], "GET", `/nodes/${t.notes.id}`)).status).toBe(200);
+    }
   });
 });

@@ -116,12 +116,13 @@ describe("POST /nodes/:id/rescan", () => {
     // A REFUSAL keeps it too (the file was hidden while the request ran: see the next block).
   });
 
-  it("the owner's alone: an editor and a viewer are 403, a stranger 404; nothing is queued", async () => {
+  it("the owner's alone: a partner who can see the file (its uploader) is 403, anyone else 404; nothing is queued", async () => {
     const t = await sharedTree();
     const spy = scanQueueSpy();
     for (const [who, expected] of [
       [t.editor, [403, "forbidden"]],
-      [t.viewer, [403, "forbidden"]],
+      // An `error` file the viewer did not upload does not exist for them.
+      [t.viewer, [404, "not_found"]],
       [t.stranger, [404, "not_found"]],
       [t.invited, [404, "not_found"]],
     ] as const) {

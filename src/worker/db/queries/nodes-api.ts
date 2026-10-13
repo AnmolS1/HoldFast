@@ -93,6 +93,13 @@ export type ZipLimits = {
   maxFiles: number;
   /** At most this many rows of the tree (folders and files) are read. Default: 3 × `maxFiles`. */
   maxWalked?: number;
+  /**
+   * Under a root the caller does NOT own, a file that is not `clean` exists for them only when
+   * they uploaded it (`created_by`) and it is in one of these states; every other such file is
+   * in neither list. The rule is the route's (`partnerSees`); it hands its two terms in here.
+   * Absent: nothing but `clean` under such a root.
+   */
+  partner?: { viewerId: string; uploaderSees: readonly ScanStatus[] };
 };
 
 /**
@@ -103,7 +110,9 @@ export type ZipLimits = {
  * LEFT OUT ENTIRELY — from `entries` and from `skipped`, because naming them would disclose
  * them: a root that is hidden or in the trash (itself or by an ancestor), every taken-down or
  * trashed node below a root with everything under it, system nodes, `suspected_csam` files, and
- * a file without a current version (no download URL would be minted for it either).
+ * a file without a current version (no download URL would be minted for it either) — and, under
+ * a root the caller does not own, every file that is not `clean`, except the caller's own upload
+ * in a state `limits.partner` names (which is `skipped`, as for the owner).
  * The roots get the inherited test (`notEffectivelyTrashedOrHidden`); below a root that passed
  * it the walk stops at the first trashed or taken-down row, which is the same test, inherited by
  * the walk itself.
@@ -122,6 +131,9 @@ export type ZipLimits = {
 export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLimits): Promise<ZipManifest> {
   const { maxFiles } = limits;
   const maxWalked = limits.maxWalked ?? maxFiles * WALK_FACTOR;
+  // An id no account has, and no status: nothing matches the uploader's exception.
+  const viewerId = limits.partner?.viewerId ?? "";
+  const uploaderSees = (limits.partner?.uploaderSees ?? []).join(",");
   const given = roots.filter((root) => isUuid(root.id));
   if (given.length === 0) return { entries: [], totalBytes: 0, skipped: [], truncated: false };
   // One parameter, whatever the number of roots.
@@ -166,6 +178,8 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
              to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS modified_at
       FROM files f JOIN nodes n ON n.id = f.id
       WHERE n.scan_status <> 'suspected_csam' AND n.version_id IS NOT NULL
+        AND (f.owner OR n.scan_status = 'clean'
+             OR (n.created_by = ${viewerId} AND n.scan_status::text = ANY (string_to_array(${uploaderSees}, ','))))
     )
     SELECT t.walked, l.id, l.path, l.owner, l.size, l.version_id, l.scan_status, l.modified_at
     FROM (SELECT count(*)::int AS walked FROM walked) t

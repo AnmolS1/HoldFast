@@ -107,16 +107,36 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
 }
 
 /**
+ * The scan states in which a file is still there, by id, for the share partner who UPLOADED it:
+ * they must be able to watch their own upload become "Blocked". Never a file under review —
+ * that somebody reported a file is nobody's to learn but the owner's.
+ */
+const UPLOADER_SEES: readonly ScanStatus[] = ["pending", "infected", "skipped", "error"];
+
+/**
+ * What a share partner may see of a node BY ID: what their listing would show them — a folder,
+ * a `clean` file — and, the one exception, their own upload while the scanner has not passed it.
+ * Everything else does not exist for them. THE ONE PLACE this is decided for the by-id routes
+ * (`visibleNode`); the zip manifest's query is handed the same two terms.
+ */
+function partnerSees(node: Node, viewerId: string | undefined): boolean {
+  if (node.kind !== "file" || node.scanStatus === "clean") return true;
+  return node.createdBy === viewerId && UPLOADER_SEES.includes(node.scanStatus);
+}
+
+/**
  * The node behind an id of the request, for a caller who has at least `min` on it.
  * `404 not_found` — never anything else — when the caller has no access at all, when the node is
- * hidden (both decided by `requireRole`), in the trash, or a system node; `403 forbidden` only
+ * hidden (both decided by `requireRole`), in the trash, a system node, or — for anyone but the
+ * owner — a file their listing would not show them (`partnerSees`); `403 forbidden` only
  * once all of that is settled and the role is too low.
  */
 async function visibleNode(c: Ctx, nodeId: string, min: Role): Promise<{ node: Node; access: Access }> {
-  await requireRole(c, nodeId, "viewer");
+  const reach = await requireRole(c, nodeId, "viewer");
   await assertNotTrashed(c, nodeId);
   const node = await getNode(db(c), nodeId);
   if (!node || node.system !== null) throw new AppError("not_found");
+  if (reach.role !== "owner" && !partnerSees(node, c.get("user")?.id)) throw new AppError("not_found");
   // Answered from the request's cache: no second question is sent.
   return { node, access: await requireRole(c, nodeId, min) };
 }
@@ -306,7 +326,12 @@ router.post("/nodes/zip-manifest", async (c) => {
     const owned = await ownedRoots(db(c), user.id);
     roots = owned.map((node) => ({ id: node.id, label: node.name, owner: true }));
   }
-  return c.json(await zipManifest(db(c), roots, { maxFiles: ZIP_MAX_ENTRIES }));
+  return c.json(
+    await zipManifest(db(c), roots, {
+      maxFiles: ZIP_MAX_ENTRIES,
+      partner: { viewerId: user.id, uploaderSees: UPLOADER_SEES },
+    }),
+  );
 });
 
 router.post("/nodes/download-urls", async (c) => {

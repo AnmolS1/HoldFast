@@ -161,7 +161,7 @@ export const impersonated = (who: { as: NonNullable<Caller> }): Caller => ({
  *                   inner/
  *                     notes.txt      clean text
  *                     photo.png      clean image
- *                     broken.bin     scan `error`
+ *                     broken.bin     scan `error`, uploaded by the editor (so they still see it)
  *                   dest/
  *                 private/           ← shared with nobody
  *                   secret.txt
@@ -189,7 +189,11 @@ export async function sharedTree() {
     scanStatus: "clean",
     mimeSniffed: "image/png",
   });
-  const broken = await makeFile(owner.id, inner.id, { scanStatus: "error", scanReason: "engine" });
+  const broken = await makeFile(owner.id, inner.id, {
+    scanStatus: "error",
+    scanReason: "engine",
+    createdBy: editor.id,
+  });
   const privateFolder = await makeFolder(owner.id);
   const secret = await makeFile(owner.id, privateFolder.id, { scanStatus: "clean" });
   await makeShare(shared.id, owner.id, editor.id, { role: "editor", canUpload: true });
@@ -223,6 +227,11 @@ export async function takeDown(nodeId: string): Promise<void> {
 
 export async function setStatus(nodeId: string, scanStatus: ScanStatus): Promise<void> {
   await testDb().update(nodes).set({ scanStatus }).where(eq(nodes.id, nodeId));
+}
+
+/** Makes `userId` the uploader of the node's current version (what an upload into a share does). */
+export async function uploadedBy(nodeId: string, userId: string): Promise<void> {
+  await testDb().update(nodes).set({ createdBy: userId }).where(eq(nodes.id, nodeId));
 }
 
 export async function setLegalHold(nodeId: string, held: boolean): Promise<void> {

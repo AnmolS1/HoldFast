@@ -27,6 +27,7 @@ import {
   sharedTree,
   takeDown,
   testDb,
+  uploadedBy,
   type Caller,
 } from "./helpers";
 
@@ -121,32 +122,41 @@ describe("the download-url matrix", () => {
     }
   });
 
-  it("row 4 — pending: 409 scan_pending", async () => {
+  it("row 4 — pending: 409 scan_pending — for the owner and for the partner who uploaded it; nobody else has such a file", async () => {
     const t = await sharedTree();
     await setStatus(t.notes.id, "pending");
-    for (const caller of [t.owner.as, t.viewer.as]) {
+    await uploadedBy(t.notes.id, t.editor.id);
+    for (const caller of [t.owner.as, t.editor.as]) {
       for (const kind of ["download", "inline"] as const) {
         const answer = await mint(caller, t.notes.id, kind);
         expect([answer.status, answer.body.error]).toEqual([409, "scan_pending"]);
       }
     }
+    const other = await mint(t.viewer.as, t.notes.id, "download");
+    expect([other.status, other.body.error]).toEqual([404, "not_found"]);
   });
 
-  it("row 5 — infected / under_review: 403 scan_blocked", async () => {
+  it("row 5 — infected / under_review: 403 scan_blocked (a partner: only the uploader, and only for infected)", async () => {
     const t = await sharedTree();
+    await uploadedBy(t.notes.id, t.editor.id);
     for (const status of ["infected", "under_review"] as const) {
       await setStatus(t.notes.id, status);
-      for (const caller of [t.owner.as, t.viewer.as]) {
-        for (const kind of ["download", "inline"] as const) {
-          const answer = await mint(caller, t.notes.id, kind);
-          expect([answer.status, answer.body.error], status).toEqual([403, "scan_blocked"]);
-        }
+      for (const kind of ["download", "inline"] as const) {
+        const mine = await mint(t.owner.as, t.notes.id, kind);
+        expect([mine.status, mine.body.error], status).toEqual([403, "scan_blocked"]);
+        const uploaders = await mint(t.editor.as, t.notes.id, kind);
+        expect([uploaders.status, uploaders.body.error], status).toEqual(
+          status === "infected" ? [403, "scan_blocked"] : [404, "not_found"],
+        );
+        const others = await mint(t.viewer.as, t.notes.id, kind);
+        expect([others.status, others.body.error], status).toEqual([404, "not_found"]);
       }
     }
   });
 
-  it("row 6 — skipped / error: the owner's download is minted with warning 'unscanned'; inline and anyone else: 403 scan_blocked", async () => {
+  it("row 6 — skipped / error: the owner's download is minted with warning 'unscanned'; the owner's inline and the uploader's anything: 403 scan_blocked", async () => {
     const t = await sharedTree();
+    await uploadedBy(t.notes.id, t.editor.id);
     for (const status of ["skipped", "error"] as const) {
       await setStatus(t.notes.id, status);
       const mine = await mint(t.owner.as, t.notes.id, "download");
@@ -156,11 +166,15 @@ describe("the download-url matrix", () => {
       for (const [caller, kind] of [
         [t.owner.as, "inline"],
         [t.editor.as, "download"],
-        [t.viewer.as, "download"],
-        [t.viewer.as, "inline"],
+        [t.editor.as, "inline"],
       ] as const) {
         const answer = await mint(caller, t.notes.id, kind);
         expect([answer.status, answer.body.error], `${status} ${kind}`).toEqual([403, "scan_blocked"]);
+      }
+      // A partner who did not upload it has no such file.
+      for (const kind of ["download", "inline"] as const) {
+        const answer = await mint(t.viewer.as, t.notes.id, kind);
+        expect([answer.status, answer.body.error], `${status} ${kind}`).toEqual([404, "not_found"]);
       }
     }
   });
@@ -218,28 +232,34 @@ describe("the download-url matrix", () => {
     }
   });
 
-  it.each(["owner", "viewer"] as const)("all seven statuses × both kinds, as the %s", async (who) => {
-    const t = await sharedTree();
-    const expected = (status: ScanStatus, kind: "download" | "inline") => {
-      if (status === "suspected_csam") return "404 not_found";
-      if (status === "pending") return "409 scan_pending";
-      if (status === "clean") return "200";
-      if ((status === "skipped" || status === "error") && who === "owner" && kind === "download")
-        return "200 unscanned";
-      return "403 scan_blocked";
-    };
-    for (const status of STATUSES) {
-      await setStatus(t.notes.id, status);
-      for (const kind of ["download", "inline"] as const) {
-        const answer = await mint(t[who].as, t.notes.id, kind);
-        const got =
-          answer.status === 200
-            ? ["200", answer.body.warning].filter(Boolean).join(" ")
-            : `${answer.status} ${answer.body.error}`;
-        expect(got, `${status} ${kind}`).toBe(expected(status, kind));
+  it.each(["owner", "editor", "viewer"] as const)(
+    "all seven statuses × both kinds, as the %s (the editor uploaded the file)",
+    async (who) => {
+      const t = await sharedTree();
+      await uploadedBy(t.notes.id, t.editor.id);
+      const expected = (status: ScanStatus, kind: "download" | "inline") => {
+        if (status === "suspected_csam") return "404 not_found";
+        if (status === "clean") return "200";
+        // A partner sees a file that is not clean only when they uploaded it, never one under review.
+        if (who === "viewer" || (who === "editor" && status === "under_review")) return "404 not_found";
+        if (status === "pending") return "409 scan_pending";
+        if ((status === "skipped" || status === "error") && who === "owner" && kind === "download")
+          return "200 unscanned";
+        return "403 scan_blocked";
+      };
+      for (const status of STATUSES) {
+        await setStatus(t.notes.id, status);
+        for (const kind of ["download", "inline"] as const) {
+          const answer = await mint(t[who].as, t.notes.id, kind);
+          const got =
+            answer.status === 200
+              ? ["200", answer.body.warning].filter(Boolean).join(" ")
+              : `${answer.status} ${answer.body.error}`;
+          expect(got, `${status} ${kind}`).toBe(expected(status, kind));
+        }
       }
-    }
-  });
+    },
+  );
 
   it("refuses a body it does not know", async () => {
     const t = await sharedTree();
@@ -394,12 +414,18 @@ describe("download-urls (the zip batch)", () => {
     const theirs = await api(t.viewer.as, "POST", "/nodes/download-urls", { body: { nodeIds: ids } });
     expect(summary(theirs.body.items)).toEqual([
       [t.notes.id, "url"],
-      [pending.id, "scan_pending"],
+      // Not clean and not theirs: these do not exist for a partner.
+      [pending.id, "not_found"],
       [t.inner.id, "not_found"],
       [unknown, "not_found"],
-      [t.broken.id, "scan_blocked"],
+      [t.broken.id, "not_found"],
       [t.secret.id, "not_found"],
     ]);
+    // The editor uploaded `broken`: for them it is there, and blocked.
+    const uploaders = await api(t.editor.as, "POST", "/nodes/download-urls", {
+      body: { nodeIds: [t.broken.id] },
+    });
+    expect(summary(uploaders.body.items)).toEqual([[t.broken.id, "scan_blocked"]]);
     for (const item of [...mine.body.items, ...theirs.body.items]) {
       if (!item.url) continue;
       expect(new URL(item.url).pathname.startsWith(`/d/${item.nodeId}/`)).toBe(true);

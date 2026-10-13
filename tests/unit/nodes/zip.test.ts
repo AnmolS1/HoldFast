@@ -20,6 +20,7 @@ import {
   setStatus,
   takeDown,
   testDb,
+  uploadedBy,
   type Caller,
 } from "./helpers";
 
@@ -106,16 +107,47 @@ describe("POST /nodes/zip-manifest", () => {
     expect(text).not.toContain(t.a.r2Key!);
   });
 
-  it("a share partner: the same entries; what they could not download is blocked, not 'unscanned'", async () => {
+  it("a share partner: the same entries; files that are not clean are in neither list — except their own upload", async () => {
     const t = await album();
     const body = ZipManifest.parse((await manifest(t.viewer.as, { nodeIds: [t.folder.id] })).body);
     expect(body.entries.map((entry) => entry.path)).toEqual(["album/a.txt", "album/sub/b.txt"]);
-    expect(body.skipped.map((entry) => [entry.path, entry.reason])).toEqual([
+    expect(body.skipped).toEqual([]);
+    const text = JSON.stringify(body);
+    for (const node of [t.pending, t.infected, t.review, t.skipped, t.error]) {
+      expect(text, node.name).not.toContain(node.id);
+      expect(text, node.name).not.toContain(node.name);
+    }
+
+    // What the partner uploaded themselves is listed as skipped, with why — never a file under review.
+    for (const node of [t.pending, t.infected, t.review, t.error]) await uploadedBy(node.id, t.viewer.id);
+    const own = ZipManifest.parse((await manifest(t.viewer.as, { nodeIds: [t.folder.id] })).body);
+    expect(own.entries.map((entry) => entry.path)).toEqual(["album/a.txt", "album/sub/b.txt"]);
+    expect(own.skipped.map((entry) => [entry.path, entry.reason])).toEqual([
       ["album/c-pending.bin", "scan_pending"],
       ["album/d-infected.bin", "scan_blocked"],
-      ["album/e-review.bin", "scan_blocked"],
-      ["album/f-skipped.bin", "scan_blocked"],
       ["album/g-error.bin", "scan_blocked"],
+    ]);
+    // The owner's manifest is what it was.
+    const owners = ZipManifest.parse((await manifest(t.owner.as, { nodeIds: [t.folder.id] })).body);
+    expect(owners.skipped).toHaveLength(5);
+  });
+
+  it("files a partner cannot see do not count: neither against the cap nor towards truncated", async () => {
+    const owner = await person();
+    const partner = await person();
+    const folder = await makeFolder(owner.id, null, { name: "counted" });
+    for (let i = 0; i < 5; i++)
+      await makeFile(owner.id, folder.id, { name: `a-${i}.bin`, scanStatus: "pending" });
+    for (let i = 0; i < 4; i++)
+      await makeFile(owner.id, folder.id, { name: `b-${i}.bin`, scanStatus: "clean" });
+    const partnerView = await zipManifest(testDb(), [{ id: folder.id, label: "counted", owner: false }], {
+      maxFiles: 4,
+      partner: { viewerId: partner.id, uploaderSees: ["pending", "infected", "skipped", "error"] },
+    });
+    expect([partnerView.entries.length, partnerView.skipped.length, partnerView.truncated]).toEqual([
+      4,
+      0,
+      false,
     ]);
   });
 
