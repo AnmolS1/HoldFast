@@ -8,6 +8,7 @@ import { getToasts } from "../../../../src/client/components/Toaster";
 import { PreviewDialog, routes as previewRoutes } from "../../../../src/client/features/preview";
 import ImagePreview from "../../../../src/client/features/preview/renderers/ImagePreview";
 import MediaPreview from "../../../../src/client/features/preview/renderers/MediaPreview";
+import TextPreview from "../../../../src/client/features/preview/renderers/TextPreview";
 import { openScope, openScopeCount } from "../../../../src/client/features/preview/scope";
 import { SCAN_POLL_MS } from "../../../../src/client/features/preview/useItem";
 import { usePreviewUrl } from "../../../../src/client/features/preview/usePreviewUrl";
@@ -72,6 +73,13 @@ describe("the scope every late continuation goes through", () => {
     expect(second.alive()).toBe(false);
     expect(second.signal.aborted).toBe(true);
     expect(openScopeCount()).toBe(0);
+    // Between the purge STARTING and this feature's purger running, the scope is already dead:
+    // it reads the account epoch itself.
+    const during = openScope();
+    const purging = purgeUserState();
+    expect(during.signal.aborted).toBe(false);
+    expect(during.alive()).toBe(false);
+    await purging;
     // A scope opened afterwards belongs to whoever is signed in now.
     const third = openScope();
     expect(third.alive()).toBe(true);
@@ -319,6 +327,52 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
 });
 
 describe("an element's own handlers after a purge (a renderer that is still mounted)", () => {
+  it("text: bytes that arrive after the purge are not drawn (the renderer alone, nothing remounts it)", async () => {
+    const gate = held<Response>();
+    const api = ownerApi([NODES.ts]);
+    installFetch({ api: api.handler, files: () => gate.promise });
+    const view = renderPreview(<TextPreview source="owner" item={loadedOf(NODES.ts)} />);
+    await waitFor(() => expect(api.minted.length).toBe(1));
+    await settle(10);
+    await purge();
+    // The mock hands the body over although the request was aborted: the check after the read
+    // is what keeps it off the screen.
+    gate.release(new Response("const secret = 1;\n"));
+    await settle(30);
+    expect(view.container.querySelector("pre")).toBeNull();
+    expect(view.container.textContent).not.toContain("secret");
+  });
+
+  it("text: colours that arrive after the purge are not applied", async () => {
+    const module = await import("../../../../src/client/features/preview/renderers/highlight");
+    const gate = held<null>();
+    vi.spyOn(module, "highlight").mockImplementation(async () => {
+      await gate.promise;
+      return [[{ text: "const secret = 1;", token: "keyword" }]];
+    });
+    const api = ownerApi([NODES.ts]);
+    installFetch({ api: api.handler, files: () => new Response("const secret = 1;\n") });
+    const view = renderPreview(<TextPreview source="owner" item={loadedOf(NODES.ts)} />);
+    const shown = () => view.container.querySelector('[data-preview-renderer="text"]');
+    await waitFor(() => expect(shown()?.getAttribute("data-highlight")).toBe("running"));
+    await purge();
+    gate.release(null);
+    await settle(30);
+    expect(shown()!.getAttribute("data-highlighted")).toBe("false");
+    expect(view.container.querySelector("[data-token]")).toBeNull();
+  });
+
+  it("control: without a purge the same colours are applied", async () => {
+    const module = await import("../../../../src/client/features/preview/renderers/highlight");
+    vi.spyOn(module, "highlight").mockImplementation(async () => [
+      [{ text: "const secret = 1;", token: "keyword" }],
+    ]);
+    const api = ownerApi([NODES.ts]);
+    installFetch({ api: api.handler, files: () => new Response("const secret = 1;\n") });
+    const view = renderPreview(<TextPreview source="owner" item={loadedOf(NODES.ts)} />);
+    await waitFor(() => expect(view.container.querySelector("[data-token]")).not.toBeNull());
+  });
+
   it("an image that finishes loading after the purge is not shown", async () => {
     const api = ownerApi([nodeOf({ thumb: false })]);
     installFetch({ api: api.handler });

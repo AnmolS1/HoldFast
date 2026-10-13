@@ -206,9 +206,6 @@ function PageView(props: PageViewProps) {
         () => {},
       );
     });
-    // A purge of the account ends the scope without an unmount: the drawing stops with it.
-    const stop = () => render?.cancel();
-    scope.signal.addEventListener("abort", stop, { once: true });
     return () => {
       scope.close();
       render?.cancel();
