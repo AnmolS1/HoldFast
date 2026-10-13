@@ -56,7 +56,8 @@ export function fileNode(n: number, patch: Partial<NodeDto> = {}): NodeDto {
     size: 1000 * n,
     mimeCategory: "pdf",
     mimeSniffed: "application/pdf",
-    sha256: n.toString(16).padStart(64, "0"),
+    // While a scan is pending the API shows no hash (the scanner has not computed it yet).
+    sha256: patch.scanStatus === "pending" ? null : n.toString(16).padStart(64, "0"),
     ...patch,
   });
 }
