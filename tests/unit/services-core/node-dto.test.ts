@@ -169,6 +169,18 @@ describe("toNodeDto", () => {
     });
   });
 
+  it("the hash is shown only once the scanner has computed it — never while the scan is pending", async () => {
+    const t = await library();
+    const pending = { ...t.image, scanStatus: "pending" as const };
+    const [waiting, scanned] = await toNodeDtos(testDb(), [pending, t.image], asOwner(t.owner.id));
+    // The owner, their own file: still null while pending (the value on the row is then the
+    // client's claim, or the server's after a blocklisted claim was checked — telling them
+    // apart would tell the uploader whether the claim was on a list).
+    expect(waiting!.scanStatus).toBe("pending");
+    expect(waiting!.sha256).toBeNull();
+    expect(scanned!.sha256).toBe(SHA);
+  });
+
   it("a grantee's share root goes out without its parent; rows inside the share keep theirs", async () => {
     const t = await library();
     // The shared folder sits inside a folder of the owner's that is not shared.
