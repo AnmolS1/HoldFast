@@ -21,12 +21,20 @@
 -- until the pooler recycles them. A setting stored on a ROLE would override this one.
 --
 -- The name is not written down: every environment's database is called something else.
--- Running it again stores the same value. There is deliberately no exception handler: only the
--- database's owner (or a superuser) may store a setting on it, and a migration that quietly did
--- nothing would leave that database compiling and the deploy green. If it fails with "must be
--- owner of database", the owner runs the one statement by hand and the deploy is run again.
+--
+-- Only the database's owner (or a superuser) may store a setting on it, and there is deliberately
+-- no exception handler: a migration that quietly did nothing would leave that database compiling
+-- and the deploy green. If it fails with "must be owner of database", the owner runs
+-- `ALTER DATABASE <name> SET jit = off;` by hand and the deploy is run again — which is why the
+-- statement is skipped when exactly that is already stored (for every role, on this database):
+-- the migrating role could otherwise never get past this file. Running it again changes nothing.
 DO $$
 BEGIN
-  EXECUTE format('ALTER DATABASE %I SET jit = off', current_database());
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_db_role_setting s JOIN pg_database d ON d.oid = s.setdatabase
+    WHERE d.datname = current_database() AND s.setrole = 0 AND 'jit=off' = ANY (s.setconfig)
+  ) THEN
+    EXECUTE format('ALTER DATABASE %I SET jit = off', current_database());
+  END IF;
 END
 $$;

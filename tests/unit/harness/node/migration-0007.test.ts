@@ -3,7 +3,8 @@
 //   - the setting is stored on the database (`pg_db_role_setting`), under whatever name it has;
 //   - the session that ran the migration keeps its value; a session opened afterwards has `off`;
 //   - applying it again changes nothing; a role that does not own the database is REFUSED (the
-//     migration fails, it does not pass without having stored anything).
+//     migration fails, it does not pass without having stored anything) — until the owner has
+//     stored the setting by hand, after which the same role gets past it.
 // The statements are run exactly as drizzle's migrator runs them: split on its breakpoint
 // marker, inside one transaction per migration file.
 import { randomBytes } from "node:crypto";
@@ -140,6 +141,25 @@ describe("migration 0007", () => {
   });
 
   it("applied again, stores the same single setting", async () => {
+    await apply(TAG);
+    expect(await stored()).toEqual([{ role: 0, config: ["jit=off"] }]);
+  });
+
+  it("once the owner has stored it by hand, a role that does not own the database gets past the migration", async () => {
+    // The recovery path of a refused deploy: the owner runs the statement, the deploy runs again.
+    const other = new Client({
+      connectionString: `postgres://${stranger}:${STRANGER_PASSWORD}@localhost:5432/${scratch}`,
+    });
+    await other.connect();
+    try {
+      await apply(TAG, other);
+      // Any other stored value is not "already done": the statement runs, and is refused.
+      await client.query(`ALTER DATABASE "${scratch}" SET jit = on`);
+      await expect(apply(TAG, other)).rejects.toThrow(`must be owner of database ${scratch}`);
+    } finally {
+      await other.end();
+    }
+    expect(await stored()).toEqual([{ role: 0, config: ["jit=on"] }]);
     await apply(TAG);
     expect(await stored()).toEqual([{ role: 0, config: ["jit=off"] }]);
   });
