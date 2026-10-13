@@ -430,6 +430,77 @@ test.describe("review fixes", () => {
     expect(pageTwo).toBe(2);
   });
 
+  test("a failed page stays failed through every refresh: events, returns to the tab, reconnects and a whole Empty trash run request it ONCE", async ({
+    page,
+    context,
+    origins,
+  }) => {
+    let pageTwo = 0;
+    let firstPage = 0;
+    let batches = 0;
+    await mockShell(page, origins.port, { api: (route, path) => viewsApi().api(route, path) });
+    await page.route("**/api/trash**", (route) => {
+      const request = route.request();
+      if (request.method() === "DELETE") {
+        batches += 1;
+        return batches <= 8
+          ? route.fulfill({ status: 202, json: remaining(90 - batches * 10) })
+          : route.fulfill({ status: 204 });
+      }
+      if (new URL(request.url()).searchParams.get("cursor") !== "c2") {
+        firstPage += 1;
+        return route.fulfill({ json: trashPage(TRASH.items, "c2") });
+      }
+      pageTwo += 1;
+      return route.fulfill({
+        status: 429,
+        headers: { "retry-after": "30" },
+        json: mockEnvelope("rate_limited", "Too many requests."),
+      });
+    });
+    await page.goto("/trash");
+    const notice = page.locator('[data-list-notice="trash"]');
+    await expect(notice).toContainText("Couldn't load more of this list.");
+    await expect(notice.getByRole("button", { name: "Try again" })).toBeDisabled();
+    expect(pageTwo).toBe(1);
+    const readsBefore = firstPage;
+
+    // 8 tree-changed events (what a star toggle or a finished upload sends), each given longer
+    // than the views take to turn it into a round of reads. Absences are measured from here on:
+    // there is no event to wait for when the point is that nothing happens.
+    for (let index = 0; index < 8; index++) {
+      await page.evaluate(() =>
+        window.dispatchEvent(new CustomEvent("holdfast:nodes-changed", { detail: { parentIds: [null] } })),
+      );
+      await page.waitForTimeout(350);
+    }
+    // 4 returns to the tab.
+    for (let index = 0; index < 4; index++) {
+      await page.evaluate(() => window.dispatchEvent(new Event("visibilitychange")));
+      await page.waitForTimeout(100);
+    }
+    // 3 reconnects.
+    for (let index = 0; index < 3; index++) {
+      await context.setOffline(true);
+      await context.setOffline(false);
+      await page.waitForTimeout(100);
+    }
+    expect(pageTwo, "the failed cursor, after events, focus and reconnects").toBe(1);
+    expect(firstPage, "reads of a list inside its Retry-After").toBe(readsBefore);
+
+    // An Empty trash run of 8 batches. The list may not be read (the API named a wait), so the
+    // confirmation does not know the size and asks for the word.
+    await page.getByRole("button", { name: "Empty trash" }).click();
+    const dialog = page.getByRole("dialog", { name: "Empty the trash?" });
+    await dialog.getByLabel("Type DELETE to confirm").fill("DELETE");
+    await dialog.getByRole("button", { name: "Empty trash" }).click();
+    await expect(page.getByText("Trash emptied")).toBeVisible();
+    expect(batches).toBe(9);
+    await page.waitForTimeout(500);
+    expect(pageTwo, "the failed cursor, in total").toBe(1);
+    await expect(notice).toContainText("Couldn't load more of this list.");
+  });
+
   test("Empty trash goes on when the user leaves the page: the trash shows the same run, then what the server has", async ({
     page,
     origins,

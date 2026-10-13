@@ -61,9 +61,12 @@ beforeEach(() => {
   Object.assign(window, { IntersectionObserver: EagerObserver });
   Object.assign(globalThis, { IntersectionObserver: EagerObserver });
 });
-afterEach(() => {
+afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // A request of this test may still be out: the purge moves the account epoch, so whatever
+  // it would remember (a failed page) or say when it lands is dropped — as for a real sign-out.
+  await purgeUserState({ keepSession: true });
   onlineManager.setOnline(true);
   focusManager.setFocused(undefined);
   resetEmptyRun();
@@ -185,6 +188,26 @@ describe("A2: a failed next page is not asked for again by a refresh of the list
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(9);
     expect(cursorCalls(calls, "/api/trash", null)).toBeGreaterThan(reads);
     expect(cursorCalls(calls, "/api/trash", "c2")).toBe(1);
+    expect(notice("trash")).not.toBeNull();
+  });
+
+  it("the wait belongs to the failed page too: when the query's own error is cleared (a restore patches the list), events still read nothing during it", async () => {
+    const report = TRASH.items[0]!;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": (call) =>
+        queryOf(call).get("cursor") === "c2" ? limited("30") : json(trashPage(TRASH.items, "c2")),
+      [`POST /api/nodes/${report.id}/restore`]: restored(report),
+    });
+    await waitFor(() => expect(notice("trash")).not.toBeNull());
+    const reads = requests(calls, "GET", "/api/trash").length;
+    fireEvent.click(screen.getByRole("button", { name: "More actions for report.pdf" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    await waitFor(() => expect(rowNames()).not.toContain(report.id));
+    // The patch made the query "successful" again; the failed page and its wait are still remembered.
+    expect(queryClient.getQueryState(viewKeys.trash)?.status).toBe("success");
+    expect(pageFailureOf(viewKeys.trash)).not.toBeNull();
+    await refreshEveryWay();
+    expect(requests(calls, "GET", "/api/trash").length).toBe(reads);
     expect(notice("trash")).not.toBeNull();
   });
 
