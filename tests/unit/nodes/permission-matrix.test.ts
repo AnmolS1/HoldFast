@@ -94,8 +94,6 @@ const ROWS: Row[] = [
 ];
 
 describe("permission matrix", () => {
-  const printed: string[] = [];
-
   it.each(ROWS)("$endpoint", async (row) => {
     const t = await sharedTree();
     const cells: string[] = [];
@@ -106,13 +104,7 @@ describe("permission matrix", () => {
       if (answer.status === 404) expect(answer.body.error, `${row.endpoint} as ${who}`).toBe("not_found");
       if (answer.status === 403) expect(answer.body.error, `${row.endpoint} as ${who}`).toBe("forbidden");
     }
-    printed.push(`| ${row.endpoint} | ${cells.join(" | ")} |`);
     expect(cells, row.endpoint).toEqual(row.expected);
-  });
-
-  it("prints the matrix", () => {
-    console.log(["| endpoint | " + CALLERS.join(" | ") + " |", ...printed].join("\n"));
-    expect(printed).toHaveLength(ROWS.length);
   });
 
   it("signed out: 401 on every route, whatever the id", async () => {

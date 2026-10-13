@@ -20,7 +20,15 @@ import { makeFile, makeFolder, makeShare, makeUser, rand } from "../services-cor
 import type { Caller } from "../services-core/request";
 
 export { auditRows, testDb } from "../auth/helpers";
-export { makeFile, makeFolder, makeShare, makeUser, nodeById, rand } from "../services-core/helpers";
+export {
+  makeFile,
+  makeFolder,
+  makeShare,
+  makeUpload,
+  makeUser,
+  nodeById,
+  rand,
+} from "../services-core/helpers";
 export type { Caller } from "../services-core/request";
 
 export type Answer = {
@@ -217,7 +225,10 @@ export async function openNoticeOn(nodeId: string): Promise<string> {
   return notice!.id;
 }
 
-/** Many files under one folder in ONE statement. Names are `<prefix>-00001.bin`, …; all `clean`. */
+/**
+ * Many files under one folder in ONE statement: `<prefix>-00001.e1`, … — seven extensions, sizes
+ * and modification times that differ from row to row; all `clean`.
+ */
 export async function manyFiles(
   ownerId: string,
   parentId: string,
@@ -225,11 +236,13 @@ export async function manyFiles(
   prefix = `bulk-${rand()}`,
 ): Promise<void> {
   await testDb().execute(sql`
-    INSERT INTO nodes (id, owner_id, created_by, parent_id, kind, name, name_key, ext, size, r2_key, version_id, scan_status)
+    INSERT INTO nodes (id, owner_id, created_by, parent_id, kind, name, name_key, ext, size, r2_key,
+                       version_id, scan_status, updated_at)
     SELECT gen_random_uuid(), ${ownerId}, ${ownerId}, ${parentId}::uuid, 'file',
-           ${prefix} || '-' || lpad(i::text, 5, '0') || '.bin',
-           ${prefix.toLowerCase()} || '-' || lpad(i::text, 5, '0') || '.bin',
-           'bin', (i * 7) % 1000, 'u/' || gen_random_uuid(), gen_random_uuid()::text, 'clean'
+           ${prefix} || '-' || lpad(i::text, 5, '0') || '.e' || (i % 7),
+           ${prefix.toLowerCase()} || '-' || lpad(i::text, 5, '0') || '.e' || (i % 7),
+           'e' || (i % 7), (i * 7919) % 100000, 'u/' || gen_random_uuid(), gen_random_uuid()::text,
+           'clean', now() - make_interval(secs => i)
     FROM generate_series(1, ${count}) AS i`);
 }
 
