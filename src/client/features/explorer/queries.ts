@@ -36,6 +36,9 @@ export function useListing(folderId: string | null, sort: SortKey, dir: SortDir)
     queryFn: ({ pageParam, signal }) => listChildren(folderId, { sort, dir, cursor: pageParam, signal }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
+    // A refetch reads every loaded page again, one request each: only a short list does that by
+    // itself. A long one is marked as changed and read again when the user asks (see below).
+    refetchOnWindowFocus: (query) => (query.state.data?.pages.length ?? 0) <= MAX_REFETCH_PAGES,
   });
 }
 
@@ -47,29 +50,37 @@ export function useFolderDetail(folderId: string | null) {
   });
 }
 
-/** Every sub-folder of a parent, all pages (the move picker shows the whole level). */
-export async function fetchFolders(folderId: string | null, signal?: AbortSignal): Promise<NodeDto[]> {
-  const out: NodeDto[] = [];
+/** Pages of sub-folders the move picker reads for one level: 5 × 200 = 1,000 folders. */
+export const MAX_FOLDER_PAGES = 5;
+
+export interface FolderLevel {
+  folders: NodeDto[];
+  /** The level holds more folders than were read. */
+  more: boolean;
+}
+
+/** The sub-folders of a parent for the move picker — a bounded number of pages, never a loop without end. */
+export async function fetchFolders(folderId: string | null, signal?: AbortSignal): Promise<FolderLevel> {
+  const folders: NodeDto[] = [];
+  const seen = new Set<string>();
   let cursor: string | undefined;
-  do {
-    const page = await listChildren(folderId, { sort: "name", dir: "asc", kind: "folder", cursor, signal });
-    out.push(...page.items);
-    cursor = page.nextCursor ?? undefined;
-  } while (cursor);
-  return out;
+  for (let page = 0; page < MAX_FOLDER_PAGES; page += 1) {
+    const answer = await listChildren(folderId, { sort: "name", dir: "asc", kind: "folder", cursor, signal });
+    folders.push(...answer.items);
+    cursor = answer.nextCursor ?? undefined;
+    // A cursor that comes back a second time would never end.
+    if (!cursor || seen.has(cursor)) return { folders, more: false };
+    seen.add(cursor);
+  }
+  return { folders, more: true };
 }
 
 // ---------------------------------------------------------------------------------------------
 // Cache edits. Each returns what is needed to put things back when the request fails.
 
-export type ListingSnapshot = Array<[QueryKey, Listing | undefined]>;
-
-export function snapshotListings(client: QueryClient, parentId: string | null): ListingSnapshot {
-  return client.getQueriesData<Listing>({ queryKey: explorerKeys.children(parentId) });
-}
-
-export function restoreListings(client: QueryClient, snapshot: ListingSnapshot): void {
-  for (const [key, data] of snapshot) client.setQueryData(key, data);
+/** Stop any read of this parent's listings that is under way: its answer would overwrite an optimistic edit. */
+export function cancelListings(client: QueryClient, parentId: string | null): Promise<void> {
+  return client.cancelQueries({ queryKey: explorerKeys.children(parentId) });
 }
 
 function editListings(
@@ -91,15 +102,99 @@ export function patchInListings(
   editListings(client, parentId, (items) => items.map((item) => (item.id === id ? patch(item) : item)));
 }
 
-export function removeFromListings(client: QueryClient, parentId: string | null, ids: readonly string[]) {
+/**
+ * Take rows out of every listing of a parent. Returns the function that puts some of them back —
+ * each where it was, in whatever the cache holds by then: only into a listing that still exists
+ * (never re-creating one), and never a row that is there already. A rollback undoes ITS change;
+ * it does not restore an old copy of the list.
+ */
+export function removeFromListings(
+  client: QueryClient,
+  parentId: string | null,
+  ids: readonly string[],
+): (putBack: readonly string[]) => void {
   const gone = new Set(ids);
+  const places: Array<{ key: QueryKey; page: number; index: number; node: NodeDto }> = [];
+  for (const [key, data] of client.getQueriesData<Listing>({ queryKey: explorerKeys.children(parentId) })) {
+    data?.pages.forEach((page, pageIndex) =>
+      page.items.forEach((node, index) => {
+        if (gone.has(node.id)) places.push({ key, page: pageIndex, index, node });
+      }),
+    );
+  }
   editListings(client, parentId, (items) => items.filter((item) => !gone.has(item.id)));
+  return (putBack) => {
+    const wanted = new Set(putBack);
+    for (const place of places) {
+      if (!wanted.has(place.node.id)) continue;
+      client.setQueriesData<Listing>({ queryKey: place.key, exact: true }, (data) => {
+        if (!data || data.pages.some((page) => page.items.some((item) => item.id === place.node.id)))
+          return data;
+        const at = Math.min(place.page, data.pages.length - 1);
+        return {
+          ...data,
+          pages: data.pages.map((page, pageIndex) => {
+            if (pageIndex !== at) return page;
+            const items = [...page.items];
+            items.splice(Math.min(place.index, items.length), 0, place.node);
+            return { ...page, items };
+          }),
+        };
+      });
+    }
+  };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Reading again after a change. A refetch of an infinite listing is one request per loaded page;
+// in a long folder that is dozens for one star. So: a listing of up to MAX_REFETCH_PAGES pages is
+// read again at once; a longer one is marked stale and named in `changedParents`, and the page
+// offers to reload it (from its first page).
+
+export const MAX_REFETCH_PAGES = 3;
+
+let changed: ReadonlySet<string> = new Set();
+const changedListeners = new Set<() => void>();
+const setChanged = (next: ReadonlySet<string>) => {
+  changed = next;
+  for (const listener of changedListeners) listener();
+};
+const subscribeChanged = (listener: () => void) => {
+  changedListeners.add(listener);
+  return () => changedListeners.delete(listener);
+};
+const getChanged = () => changed;
+
+/** Whether this parent's long listing changed on the server since it was read. */
+export function useListingChanged(folderId: string | null): boolean {
+  return useSyncExternalStore(subscribeChanged, getChanged, getChanged).has(scope(folderId));
+}
+
+/** Read a parent's listings again from their first page (the "Reload" of a long, changed list). */
+export function reloadListing(client: QueryClient, folderId: string | null): void {
+  if (changed.has(scope(folderId)))
+    setChanged(new Set(Array.from(changed).filter((key) => key !== scope(folderId))));
+  void client.resetQueries({ queryKey: explorerKeys.children(folderId) });
+}
+
+/** Back to nothing: run by `purgeUserState()` and by tests (the keys are folder ids). */
+export function resetChangedForTests(): void {
+  if (changed.size > 0) setChanged(new Set());
+}
+
+registerUserStatePurger(resetChangedForTests);
 
 /** The tree changed under these parents: their listings, picker levels and details are stale. */
 export function invalidateParents(client: QueryClient, parentIds: readonly (string | null)[]): void {
   for (const parentId of new Set(parentIds)) {
-    void client.invalidateQueries({ queryKey: explorerKeys.children(parentId) });
+    const long = client
+      .getQueriesData<Listing>({ queryKey: explorerKeys.children(parentId), type: "active" })
+      .some(([, data]) => (data?.pages.length ?? 0) > MAX_REFETCH_PAGES);
+    void client.invalidateQueries({
+      queryKey: explorerKeys.children(parentId),
+      refetchType: long ? "none" : "active",
+    });
+    if (long && !changed.has(scope(parentId))) setChanged(new Set(changed).add(scope(parentId)));
     void client.invalidateQueries({ queryKey: explorerKeys.folders(parentId) });
     if (parentId !== null) void client.invalidateQueries({ queryKey: explorerKeys.node(parentId) });
   }

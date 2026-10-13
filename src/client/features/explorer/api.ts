@@ -13,14 +13,16 @@ import {
   type BatchDownloadUrlsBody,
   type CreateFolderBody,
   type DownloadUrlBody,
+  type ListChildrenQuery,
   type MoveBody,
   type RenameBody,
   type ZipManifestBody,
 } from "../../../shared/schemas/node";
 import { api, ApiError } from "../../lib/api";
 
-export type SortKey = "name" | "size" | "updated" | "kind";
-export type SortDir = "asc" | "desc";
+// The contract's own enums: they cannot drift from `ListChildrenQuery`.
+export type SortKey = ListChildrenQuery["sort"];
+export type SortDir = ListChildrenQuery["dir"];
 
 export interface ListOptions {
   sort: SortKey;
@@ -77,7 +79,11 @@ export function thumbUrl(id: string, size: number): Promise<ThumbUrlResponse> {
   return api(`${node(id)}/thumb-url?size=${size}`, { schema: ThumbUrlResponse });
 }
 
-/** `202` with no body: an empty answer to an accepted request is the success case. */
+/**
+ * `202` with no body. The shared client has no way to declare an empty answer (it reads every 2xx
+ * but `204` as JSON), so the accepted-and-empty case arrives as `invalid_response` at status 202
+ * and is recognised here — and nowhere else. (Seam request in the report: an `empty` option.)
+ */
 export async function rescanNode(id: string): Promise<void> {
   try {
     await api(`${node(id)}/rescan`, { method: "POST" });

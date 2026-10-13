@@ -116,11 +116,25 @@ export const messages = {
   "explorer.error.missing.body": "It may have been moved or deleted, or it is no longer shared with you.",
   "explorer.error.load.body": "This folder didn't load. Your files are fine. Try again.",
   "explorer.error.more": "The rest of this folder didn't load.",
+  "explorer.error.refresh": "This folder couldn't be refreshed. What you see may be out of date.",
+  "explorer.error.partial": "{done} of {total} done. The rest were left as they were. Try them again.",
+  "explorer.error.top.body": "Your files didn't load. They are fine. Try again.",
+  "explorer.changed": "This folder has changed since it was loaded.",
+  "explorer.reload": "Reload",
+
+  "explorer.progress.trash": "Moving to trash · {done} of {total}",
+  "explorer.progress.restore": "Restoring · {done} of {total}",
+  "explorer.progress.move": "Moving · {done} of {total}",
+  "explorer.progress.star": "Starring · {done} of {total}",
+  "explorer.progress.unstar": "Removing stars · {done} of {total}",
+
+  "explorer.move.more": "Only the first {count} folders are shown.",
 
   "explorer.download.unscanned":
     "This file couldn't be scanned. Open it only if you trust where it came from.",
   "explorer.download.pending": "Still scanning. Try again in a moment.",
   "explorer.download.blocked": "This file is blocked and can't be downloaded.",
+  "explorer.download.refused": "The download link wasn't one of ours, so it wasn't opened. Try again.",
 
   "explorer.empty.first": "Upload files or make a folder. Everything is scanned before it can be shared.",
   "explorer.empty.folder.title": "This folder is empty",
@@ -147,7 +161,13 @@ export const messages = {
   "explorer.zip.reason.pending": "still scanning",
   "explorer.zip.reason.blocked": "blocked",
   "explorer.zip.reason.unscanned": "couldn't be scanned",
-  "explorer.zip.reason.unavailable": "couldn't be fetched",
+  "explorer.zip.missing.one":
+    "The zip is saved, but 1 file is missing from it: {list}. Download it on its own.",
+  "explorer.zip.missing.many":
+    "The zip is saved, but {count} files are missing from it: {list}. Download them one by one.",
+  "explorer.zip.busy": "Another zip is still being made. Wait for it to finish.",
+  "explorer.zip.limited": "The download limit was reached, so the zip was stopped. Try again later.",
+  "explorer.zip.emptyFile": "An empty file may be left where you chose to save it.",
 } as const;
 
 export const t = defineMessages(messages);

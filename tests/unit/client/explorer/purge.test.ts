@@ -1,10 +1,19 @@
 // Account state: what this feature keeps outside the query cache is emptied when the account
 // signs out or changes — the registered purgers do it, through the shell's one routine.
+import { InfiniteQueryObserver } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot } from "../../../../src/client/components/TransferRibbon";
 import { announce, getAnnouncement } from "../../../../src/client/features/explorer/actions";
-import { explorerKeys, getSort, setSort } from "../../../../src/client/features/explorer/queries";
+import {
+  explorerKeys,
+  getSort,
+  invalidateParents,
+  MAX_REFETCH_PAGES,
+  setSort,
+  useListingChanged,
+} from "../../../../src/client/features/explorer/queries";
 import { getZipJobs, startZip } from "../../../../src/client/features/explorer/zip";
 import { runUserStatePurgers } from "../../../../src/client/lib/contracts";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
@@ -52,12 +61,28 @@ describe("the explorer's purgers", () => {
     expect(getAnnouncement()).toBe("");
   });
 
-  it("listings live in the query cache, which the same routine empties", async () => {
-    queryClient.setQueryData(explorerKeys.listing(null, "name", "asc"), {
-      pages: [pageOf([FILE])],
+  it("the note that a long folder changed (it is keyed by the folder's id) is dropped", async () => {
+    const key = explorerKeys.listing(FOLDER.id, "name", "asc");
+    queryClient.setQueryData(key, {
+      pages: Array.from({ length: MAX_REFETCH_PAGES + 1 }, () => pageOf([FILE])),
       pageParams: [undefined],
     });
-    await purgeUserState();
-    expect(queryClient.getQueriesData({ queryKey: explorerKeys.all })).toEqual([]);
+    // An observer makes the listing "active": a long active listing is marked, not refetched.
+    const observer = new InfiniteQueryObserver(queryClient, {
+      queryKey: key,
+      queryFn: () => pageOf([FILE]),
+      initialPageParam: undefined,
+      getNextPageParam: () => undefined,
+      staleTime: Infinity,
+    });
+    const stop = observer.subscribe(() => {});
+    const { result } = renderHook(() => useListingChanged(FOLDER.id));
+    act(() => invalidateParents(queryClient, [FOLDER.id]));
+    expect(result.current).toBe(true);
+    stop();
+    await act(async () => {
+      await runUserStatePurgers();
+    });
+    expect(result.current).toBe(false);
   });
 });

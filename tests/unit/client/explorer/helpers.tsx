@@ -8,10 +8,12 @@ import { DetailsPanel } from "../../../../src/client/components/DetailsPanel";
 import { getToasts, Toaster } from "../../../../src/client/components/Toaster";
 import { routes } from "../../../../src/client/features/explorer";
 import { announce } from "../../../../src/client/features/explorer/actions";
-import { resetSortForTests } from "../../../../src/client/features/explorer/queries";
-import { resetZipForTests } from "../../../../src/client/features/explorer/zip";
+import { resetChangedForTests, resetSortForTests } from "../../../../src/client/features/explorer/queries";
+import { resetZipForTests, setZipSleepForTests } from "../../../../src/client/features/explorer/zip";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
+import { buildRoutes } from "../../../../src/client/router";
 import {
+  envelope,
   json,
   mockFetch,
   renderRoutes,
@@ -19,6 +21,7 @@ import {
   seedSession,
   sessionOf,
   setupShell,
+  shellFetch,
   type MockCall,
   type MockHandler,
 } from "../shell/helpers";
@@ -30,17 +33,26 @@ export function setupExplorer(): void {
   beforeEach(() => {
     resetSortForTests();
     resetZipForTests();
+    resetChangedForTests();
+    setZipSleepForTests(null);
     announce("");
+    // The files origin a minted URL is checked against.
+    seedConfig();
   });
 }
 
 /** Route `fetch` to the fake drive; `extra` answers first (the files host, a held request). */
-export function serveDrive(drive: FakeDrive, extra?: MockHandler): MockCall[] {
-  return mockFetch((call) => {
-    const own = extra?.(call);
+/** A handler of a test's own: it may be `async` and answer nothing (the drive then answers). */
+export type DriveHandler = (call: MockCall) => Response | undefined | Promise<Response | undefined>;
+
+export function serveDrive(drive: FakeDrive, extra?: DriveHandler): MockCall[] {
+  return mockFetch(async (call) => {
+    // Awaited: an `async` handler that answers nothing must fall through to the drive.
+    const own = await extra?.(call);
     if (own) return own;
     const answer = drive.handle({ method: call.method, path: call.path, body: call.body });
-    if (!answer) return undefined;
+    // Nobody's: the same 404 envelope the shell's helper answers an unknown path with.
+    if (!answer) return envelope("not_found", 404);
     return answer.body === undefined
       ? new Response(null, { status: answer.status })
       : json(answer.body, answer.status);
@@ -74,6 +86,23 @@ export function renderExplorer(path = "/") {
     },
   ];
   return renderRoutes(tree, [path]);
+}
+
+/** The whole app — the real frame, its key handler and route tree — over the fake drive. */
+export function renderApp(drive: FakeDrive, path = "/", extra?: MockHandler) {
+  shellFetch({
+    session: sessionOf(),
+    extra: (call) => {
+      const own = extra?.(call);
+      if (own) return own;
+      const answer = drive.handle({ method: call.method, path: call.path, body: call.body });
+      if (!answer) return undefined;
+      return answer.body === undefined
+        ? new Response(null, { status: answer.status })
+        : json(answer.body, answer.status);
+    },
+  });
+  return renderRoutes(buildRoutes(), [path]);
 }
 
 export const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-item-id]"));
