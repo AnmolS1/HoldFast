@@ -530,7 +530,7 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
   try {
     await enqueueRescan(deps(c), id, { by: "owner" });
   } catch (error) {
-    // Not a refusal: the rescan could not be queued. The hour it took is given back, so that
+    // Not a refusal: the message could not be sent. The hour it took is given back, so that
     // the failure is not also a throttle.
     if (!(error instanceof AppError)) await releaseRescan(db(c), id, node.rescanRequestedAt);
     throw error;
