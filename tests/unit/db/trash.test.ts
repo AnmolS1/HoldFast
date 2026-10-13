@@ -1,9 +1,9 @@
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Db } from "../../../src/worker/db/client";
+import { type Db, statementsSent } from "../../../src/worker/db/client";
 import { LegalHoldError, QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import { holdCauses, nodeProtected } from "../../../src/worker/db/queries/holds";
+import { holdCauses, lostByLeaving, nodeProtected } from "../../../src/worker/db/queries/holds";
 import {
   closeNotice,
   restoreTakedown,
@@ -698,6 +698,135 @@ describe("a hold reaches down from a folder", () => {
     // In place it is restored, and stays protected.
     expect(await restore(db, inHeld.id)).toMatchObject({ parentId: heldFolder.id, deletedAt: null });
     expect(await isProtected(inHeld.id)).toBe(true);
+  });
+
+  it("the move check compares the FOLDERS that protect, not the kind of protection: from one held folder into another is refused", async () => {
+    const owner = await makeUser(db);
+    const f1 = await makeFolder(db, owner, null, `matter-a-${rand()}`, { legalHold: true });
+    const f2 = await makeFolder(db, owner, null, `matter-b-${rand()}`, { legalHold: true });
+    const x = await makeFile(db, owner, f1.id, "x.bin", {
+      ...trashedDue,
+      deletedAt: null,
+      trashedRoot: false,
+    });
+    const refused = async (attempt: Promise<unknown>, id: string) => (await held(attempt)).causes[id];
+
+    // Same KIND of protection before and after — and still a loss: F2's hold is another matter.
+    expect(await refused(move(db, x.id, f2.id), x.id)).toEqual(["node_legal_hold"]);
+    expect((await getNode(db, x.id))!.parentId).toBe(f1.id);
+    // What the refusal prevents: F2 released later, F1 still held — X must still be protected.
+    await setNodeLegalHold(db, f2.id, false);
+    expect(await isProtected(x.id)).toBe(true);
+    // Within F1 it moves.
+    const inF1 = await makeFolder(db, owner, f1.id, "inner");
+    expect((await move(db, x.id, inF1.id)).parentId).toBe(inF1.id);
+
+    // The same with two open notices.
+    const n1 = await makeFolder(db, owner, null, `notice-a-${rand()}`);
+    const n2 = await makeFolder(db, owner, null, `notice-b-${rand()}`);
+    for (const folder of [n1, n2]) {
+      const [notice] = await db
+        .insert(dmcaNotices)
+        .values({ receivedVia: "form", status: "received" })
+        .returning();
+      await db
+        .insert(dmcaNoticeNodes)
+        .values({ noticeId: notice!.id, nodeId: folder.id, nodeName: folder.name });
+    }
+    const y = await makeFile(db, owner, n1.id, "y.bin");
+    expect(await refused(move(db, y.id, n2.id), y.id)).toEqual(["open_notice"]);
+  });
+
+  it("nested protecting folders: the node stays under the deepest one; mixed hold and notice; a folder that protects nothing is free to leave", async () => {
+    const owner = await makeUser(db);
+    // f1 (held) ⊃ g (under an open notice) ⊃ deep/ ;  f1 ⊃ side/ ;  x under g.
+    const f1 = await makeFolder(db, owner, null, `f1-${rand()}`, { legalHold: true });
+    const g = await makeFolder(db, owner, f1.id, "g");
+    const [notice] = await db
+      .insert(dmcaNotices)
+      .values({ receivedVia: "form", status: "actioned" })
+      .returning();
+    await db.insert(dmcaNoticeNodes).values({ noticeId: notice!.id, nodeId: g.id, nodeName: g.name });
+    const deep = await makeFolder(db, owner, g.id, "deep");
+    const side = await makeFolder(db, owner, f1.id, "side");
+    const x = await makeFile(db, owner, g.id, "x.bin");
+    const refused = async (attempt: Promise<unknown>, id: string) => (await held(attempt)).causes[id];
+
+    // To another child of f1, outside g: it keeps f1's hold and loses g's notice — refused, and
+    // the cause named is the one it would lose.
+    expect(await refused(move(db, x.id, side.id), x.id)).toEqual(["open_notice"]);
+    expect(await refused(move(db, x.id, f1.id), x.id)).toEqual(["open_notice"]);
+    // Out of both: both causes.
+    expect(await refused(move(db, x.id, null), x.id)).toEqual(["node_legal_hold", "open_notice"]);
+    // Within g, deeper: allowed.
+    expect((await move(db, x.id, deep.id)).parentId).toBe(deep.id);
+    // g itself is under f1's hold only (its own notice travels with it): not out of f1.
+    expect(await refused(move(db, g.id, null), g.id)).toEqual(["node_legal_hold"]);
+    // The control: `side` protects nothing, and a file in it is under f1 only — within f1 it moves.
+    const z = await makeFile(db, owner, side.id, "z.bin");
+    expect((await move(db, z.id, g.id)).parentId).toBe(g.id);
+    // …and having gone under g it has g's notice too, and may not go back to `side`.
+    expect(await refused(move(db, z.id, side.id), z.id)).toEqual(["open_notice"]);
+  });
+
+  it("restore: in place always (also after its folder was moved within the protection); to the top level only when no protecting folder is left behind", async () => {
+    const owner = await makeUser(db);
+    const f1 = await makeFolder(db, owner, null, `f1-${rand()}`, { legalHold: true });
+    const sub = await makeFolder(db, owner, f1.id, "sub");
+    const other = await makeFolder(db, owner, f1.id, "other");
+    const t1 = await makeFile(db, owner, sub.id, "t1.bin", { deletedAt: past, trashedRoot: true });
+    const t2 = await makeFile(db, owner, sub.id, "t2.bin", { deletedAt: past, trashedRoot: true });
+    // Its folder moves within f1 while it sits in the trash: restoring in place re-parents nothing.
+    await move(db, sub.id, other.id);
+    expect(await restore(db, t1.id)).toMatchObject({ parentId: sub.id, deletedAt: null });
+    expect(await isProtected(t1.id)).toBe(true);
+    expect((await held(restore(db, t2.id, { toRoot: true }))).causes[t2.id]).toEqual(["node_legal_hold"]);
+    expect(await getNode(db, t2.id)).toMatchObject({ parentId: sub.id, trashedRoot: true });
+    // The control: the hold released, the same restore goes to the top level.
+    await setNodeLegalHold(db, f1.id, false);
+    expect(await restore(db, t2.id, { toRoot: true })).toMatchObject({ parentId: null, deletedAt: null });
+  });
+
+  it("the check is ONE statement whatever it finds: a protected node, an unprotected one, a destination that does not exist", async () => {
+    const owner = await makeUser(db);
+    const heldFolder = await makeFolder(db, owner, null, `held-${rand()}`, { legalHold: true });
+    const plainFolder = await makeFolder(db, owner, null, `plain-${rand()}`);
+    const protectedFile = await makeFile(db, owner, heldFolder.id, "p.bin");
+    const freeFile = await makeFile(db, owner, plainFolder.id, "f.bin");
+    const cost = async (nodeId: string, to: string | null) => {
+      const before = statementsSent(db);
+      const lost = await lostByLeaving(db, nodeId, to);
+      return { statements: statementsSent(db) - before, lost };
+    };
+    expect(await cost(protectedFile.id, plainFolder.id)).toEqual({
+      statements: 1,
+      lost: ["node_legal_hold"],
+    });
+    expect(await cost(protectedFile.id, null)).toEqual({ statements: 1, lost: ["node_legal_hold"] });
+    expect(await cost(protectedFile.id, heldFolder.id)).toEqual({ statements: 1, lost: [] });
+    expect(await cost(freeFile.id, heldFolder.id)).toEqual({ statements: 1, lost: [] });
+    expect(await cost(freeFile.id, null)).toEqual({ statements: 1, lost: [] });
+    expect(await cost(freeFile.id, uuidv7())).toEqual({ statements: 1, lost: [] });
+    expect(await cost(protectedFile.id, uuidv7())).toEqual({ statements: 1, lost: ["node_legal_hold"] });
+    expect(await cost(uuidv7(), null)).toEqual({ statements: 1, lost: [] });
+
+    // And the move as a whole: refused or carried out, it differs only by the UPDATE it did not make.
+    const moveCost = async (nodeId: string, to: string | null) => {
+      const before = statementsSent(db);
+      const outcome = await move(db, nodeId, to).then(
+        () => "moved",
+        (error: unknown) => (error instanceof LegalHoldError ? "refused" : "other"),
+      );
+      return { statements: statementsSent(db) - before, outcome };
+    };
+    // Like with like: both into a folder of the same kind (a move to the top level has no target
+    // to check and costs less for everybody).
+    const anotherPlain = await makeFolder(db, owner, null, `plain2-${rand()}`);
+    const refusedMove = await moveCost(protectedFile.id, plainFolder.id);
+    const plainMove = await moveCost(freeFile.id, anotherPlain.id);
+    expect(refusedMove.outcome).toBe("refused");
+    expect(plainMove.outcome).toBe("moved");
+    expect(plainMove.statements - refusedMove.statements).toBe(1);
   });
 
   it("the gate and the retention predicate agree about what is inherited", async () => {

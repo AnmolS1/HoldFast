@@ -122,44 +122,43 @@ export function nodeProtected(nodeId: SQL): SQL {
 }
 
 /**
- * Which inheritable causes protect the node THROUGH A FOLDER ABOVE where it stands now — what it
- * would lose by being taken out. Empty for a top-level node and for an id that does not exist.
- * Call it under the owner's tree lock (queries/tree.ts): the answer is about the tree's shape.
- */
-export async function inheritedHoldCauses(tx: Executor, nodeId: string): Promise<InheritedCause[]> {
-  const inherited = inheritedCauses(sql`n`);
-  const result = await tx.execute<Record<InheritedCause, boolean>>(sql`
-    SELECT ${inherited.node_legal_hold} AS node_legal_hold, ${inherited.open_notice} AS open_notice
-    FROM nodes n WHERE n.id = ${nodeId}`);
-  const row = result.rows[0];
-  return row ? INHERITED_CAUSES.filter((cause) => row[cause] === true) : [];
-}
-
-/**
- * Which inheritable causes a folder GIVES to whatever is put into it: its own, or those of a
- * folder above it. Empty for the top level (`null`) and for an id that does not exist.
- */
-export async function causesGivenBy(tx: Executor, folderId: string | null): Promise<InheritedCause[]> {
-  if (folderId === null) return [];
-  const all = holdCauses(sql`n`, sql`u`);
-  const result = await tx.execute<Record<InheritedCause, boolean>>(sql`
-    SELECT ${all.node_legal_hold} AS node_legal_hold, ${all.open_notice} AS open_notice
-    FROM nodes n JOIN "user" u ON u.id = n.owner_id WHERE n.id = ${folderId}`);
-  const row = result.rows[0];
-  return row ? INHERITED_CAUSES.filter((cause) => row[cause] === true) : [];
-}
-
-/**
- * The inherited causes the node has where it stands and would NOT have under `newParentId`
- * (null = the top level): what a re-parenting would strip from it. Empty = the move is safe.
+ * What a re-parenting would strip from the node: the causes of every folder above it that
+ * PROTECTS it where it stands (is on legal hold, or named by an open notice) and would no
+ * longer be above it under `newParentId` (null = the top level). Empty = the move is safe.
+ *
+ * It compares the FOLDERS, not the kinds of protection: from under one held folder into
+ * another held folder is a loss — the second hold may be released tomorrow while the first
+ * still stands. So a node stays inside the subtree of every folder that protects it (with
+ * nested ones, under the deepest); moving within it, or deeper into further protection, is free.
+ *
+ * ONE statement, whatever the answer — protected or not, known destination or not — so the
+ * refusal cannot be told from an ordinary move by the work done here. Call it under the owner's
+ * tree lock (queries/tree.ts): the answer is about the tree's shape. Empty for an unknown node.
  */
 export async function lostByLeaving(
   tx: Executor,
   nodeId: string,
   newParentId: string | null,
 ): Promise<InheritedCause[]> {
-  const now = await inheritedHoldCauses(tx, nodeId);
-  if (now.length === 0) return [];
-  const then = await causesGivenBy(tx, newParentId);
-  return now.filter((cause) => !then.includes(cause));
+  const result = await tx.execute<Record<InheritedCause, boolean>>(sql`
+    WITH RECURSIVE held_up(id, parent_id, legal_hold) AS (
+      SELECT ha.id, ha.parent_id, ha.legal_hold FROM nodes ha
+      WHERE ha.id = (SELECT moved.parent_id FROM nodes moved WHERE moved.id = ${nodeId})
+      UNION ALL
+      SELECT hp.id, hp.parent_id, hp.legal_hold FROM nodes hp JOIN held_up ON hp.id = held_up.parent_id
+    ) CYCLE id SET is_cycle USING path,
+    dest(id, parent_id) AS (
+      SELECT da.id, da.parent_id FROM nodes da WHERE da.id = ${newParentId}::uuid
+      UNION ALL
+      SELECT dp.id, dp.parent_id FROM nodes dp JOIN dest ON dp.id = dest.parent_id
+    ) CYCLE id SET dest_cycle USING dest_path,
+    left_behind AS (
+      SELECT held_up.legal_hold AS node_legal_hold, ${openNoticeOn(sql`held_up.id`)} AS open_notice
+      FROM held_up WHERE held_up.id NOT IN (SELECT id FROM dest)
+    )
+    SELECT COALESCE(bool_or(node_legal_hold), false) AS node_legal_hold,
+           COALESCE(bool_or(open_notice), false) AS open_notice
+    FROM left_behind`);
+  const row = result.rows[0];
+  return row ? INHERITED_CAUSES.filter((cause) => row[cause] === true) : [];
 }
