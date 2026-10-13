@@ -128,25 +128,44 @@ describe("reconcile: the quota half", () => {
     expect(await audits("system.reconcile", owner.id)).toEqual([]);
   });
 
-  it("corrects planted drift, counts it and records it — after that account's transaction", async () => {
+  it("corrects planted drift and counts it, too low as well as too high", async () => {
     const owner = await consistent();
     await setUsedBytes(owner.id, 5000);
     const ctx = jobContext();
     const pass = await one(ctx, owner.id);
-    expect(pass).toMatchObject({ accounts: 1, drifted: 1 });
+    expect(pass).toMatchObject({ accounts: 1, drifted: 1, delta: -3800 });
     expect(await usedBytes(owner.id)).toBe(1200);
     expect(ctx.outcomes("reconcile")).toEqual(["drift"]);
-    // Deferred, as every `audit()` row is: it lands once the deferred work has run.
-    expect(ctx.bg.deferred).toHaveLength(1);
-    await ctx.settle();
-    const rows = await audits("system.reconcile", owner.id);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ actorType: "system", actorUserId: null, targetType: "user" });
-    expect(rows[0]!.meta).toEqual({ delta: -3800 });
-    // Too low is drift as well.
+    // Nothing is deferred by the pass: its record is the run's one row (below).
+    expect(ctx.bg.deferred).toHaveLength(0);
     await setUsedBytes(owner.id, 0);
-    await one(jobContext(), owner.id);
+    expect(await one(jobContext(), owner.id)).toMatchObject({ drifted: 1, delta: 1200 });
     expect(await usedBytes(owner.id)).toBe(1200);
+  });
+
+  it("a run leaves ONE record of its quota pass — counts — however many accounts were off, and whatever the defer limit", async () => {
+    const owners = [await consistent(), await consistent(), await consistent()];
+    for (const owner of owners) await setUsedBytes(owner.id, 1000);
+    await generations(3, 3);
+    // An invocation that can defer nothing more: what `defer` does past its hundredth task.
+    const ctx = jobContext();
+    ctx.bg.defer = (promise) => {
+      promise.catch(() => {});
+      throw new Error("too much deferred work in one invocation");
+    };
+    const since = new Date(Date.now() - 1000);
+    await runReconcile(ctx.bg, { softDeadlineMs: 120_000 });
+    for (const owner of owners) expect(await usedBytes(owner.id)).toBe(1200);
+    const rows = (await audits("system.reconcile", "reconcile")).filter((row) => row.at >= since);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ actorType: "system", actorUserId: null, targetType: "job" });
+    const meta = rows[0]!.meta as { accounts: number; drifted: number; delta: number };
+    expect(Object.keys(meta).sort()).toEqual(["accounts", "delta", "drifted"]);
+    // The whole walk: this file's three and whatever else was off — never fewer.
+    expect(meta.drifted).toBeGreaterThanOrEqual(3);
+    expect(meta.accounts).toBeGreaterThanOrEqual(meta.drifted);
+    // No row per account.
+    for (const owner of owners) expect(await audits("system.reconcile", owner.id)).toEqual([]);
   });
 
   it("the job resumes where its cursor says, and keeps its place", async () => {

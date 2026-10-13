@@ -4,7 +4,8 @@
 // row is locked, and the value is written only when it differs). The formula counts trashed,
 // hidden and held files, kept versions and the reservations of unfinished uploads — a formula
 // without the reservations would wipe every upload in flight each night. A difference is drift:
-// counted, and recorded as `system.reconcile`. This half is never gated.
+// counted per account (the metric), and recorded once a run as `system.reconcile` (how many
+// accounts, how many were off, the bytes corrected). This half is never gated.
 //
 // ORPHANS. Objects under `u/`, `t/` and `a/` that no row references and that are older than 48
 // hours are deleted. That is the one place where a database that is OLDER than the bucket —
@@ -38,7 +39,7 @@ import { getSettings, setSetting } from "../db/queries/settings";
 import { reconcileUsedBytes } from "../db/queries/quota";
 import { knownVersions, referencedKeys, userIdsAfter } from "../db/queries/trash-jobs";
 import { captureError } from "../sentry";
-import { audit } from "../services/audit";
+import { auditInTx } from "../services/audit";
 import type { BackgroundContext } from "../services/request-context";
 import { AVATAR_PREFIX, type ListedObject, storage, THUMB_PREFIX, UPLOAD_PREFIX } from "../services/storage";
 import type { Job } from "./index";
@@ -135,7 +136,14 @@ function alertRollback(): void {
 
 // ── quota ───────────────────────────────────────────────────────────────────────────────────
 
-export type QuotaPass = { next: string | null; done: boolean; accounts: number; drifted: number };
+export type QuotaPass = {
+  next: string | null;
+  done: boolean;
+  /** Accounts looked at, how many were off, and the sum of what was corrected (bytes, signed). */
+  accounts: number;
+  drifted: number;
+  delta: number;
+};
 
 /** Accounts after `after`, in id order, until the end (`done`) or `stopAt`. */
 export async function reconcileQuotas(
@@ -145,26 +153,44 @@ export async function reconcileQuotas(
   let after = opts.after;
   let accounts = 0;
   let drifted = 0;
+  let delta = 0;
   for (;;) {
     const ids = await userIdsAfter(bg.db, after, USER_BATCH);
-    if (ids.length === 0) return { next: null, done: true, accounts, drifted };
+    if (ids.length === 0) return { next: null, done: true, accounts, drifted, delta };
     for (const id of ids) {
       const result = await reconcileUsedBytes(bg.db, id);
       after = id;
       accounts += 1;
       if (result && result.delta !== 0) {
         drifted += 1;
+        delta += result.delta;
         bg.metric("job", { kind: "reconcile", outcome: "drift" });
-        try {
-          // After that account's transaction has returned — never inside it.
-          audit(bg, "system.reconcile", { type: "user", id }, { delta: result.delta });
-        } catch (error) {
-          // An invocation defers a bounded number of follow-ups; the correction itself stands.
-          captureError(error, { kind: "job", job: "reconcile" });
-        }
       }
-      if (Date.now() >= opts.stopAt) return { next: after, done: false, accounts, drifted };
+      if (Date.now() >= opts.stopAt) return { next: after, done: false, accounts, drifted, delta };
     }
+  }
+}
+
+/**
+ * The record of one quota pass: ONE row a run, counts only — not a row per account. A night
+ * after a restore can correct thousands of accounts, and an invocation defers at most a hundred
+ * follow-ups (shared with the other jobs of the slot): a row per account through `audit()` was
+ * dropped from the 101st on. This one is awaited, after the pass's own transactions.
+ */
+async function recordQuotaPass(bg: BackgroundContext, pass: QuotaPass): Promise<void> {
+  try {
+    await bg.db.transaction((tx) =>
+      auditInTx(
+        tx,
+        bg,
+        "system.reconcile",
+        { type: "job", id: "reconcile" },
+        { accounts: pass.accounts, drifted: pass.drifted, delta: pass.delta },
+      ),
+    );
+  } catch (error) {
+    // The corrections stand, and the sweep must still run.
+    captureError(error, { kind: "job", job: "reconcile" });
   }
 }
 
@@ -312,6 +338,7 @@ export async function runReconcile(
     after: cursor.user,
     stopAt: startedAt + opts.softDeadlineMs / 2,
   });
+  await recordQuotaPass(bg, quota);
   let sweep: OrphanSweep | null = null;
   let completed = false;
   try {
