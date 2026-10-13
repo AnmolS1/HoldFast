@@ -310,7 +310,7 @@ describe("the dialog's chrome", () => {
       return null;
     }
     installFetch({ api: ownerApi([NODES.svg]).handler });
-    renderPreview(
+    const view = renderPreview(
       <>
         <Underneath />
         <PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />
@@ -319,9 +319,18 @@ describe("the dialog's chrome", () => {
     await screen.findByText("sample.svg");
     const close = screen.getByRole("button", { name: "Close preview" });
     for (const key of ["Delete", "Backspace", "/"]) fireEvent.keyDown(close, { key });
+    // Nor when the key lands on the page itself while the preview is open.
+    fireEvent.keyDown(document.body, { key: "Delete" });
     expect(trash).not.toHaveBeenCalled();
     expect(search).not.toHaveBeenCalled();
-    // Control: the same keys outside the dialog do reach the page's shortcuts.
+    // Control: once the preview is closed the same keys are the page's again.
+    view.rerender(
+      <>
+        <Underneath />
+        <PreviewDialog open={false} nodeId={ID.svg} onClose={noop} source="owner" />
+      </>,
+    );
+    await waitFor(() => expect(dialog()).toBeNull());
     fireEvent.keyDown(document.body, { key: "Delete" });
     fireEvent.keyDown(document.body, { key: "/" });
     expect(trash).toHaveBeenCalledTimes(1);

@@ -9,6 +9,7 @@ import Typography from "@mui/material/Typography";
 import { ChevronDown, ChevronUp, Minus, Plus } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
+import { accountEpoch, sameAccount } from "../../../lib/query";
 import { hf, layout } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
@@ -478,6 +479,8 @@ export default function PdfPreview({ source, item }: RendererProps) {
   useEffect(() => {
     if (firstUrl === null) return;
     const abort = new AbortController();
+    // Bytes of the account that asked: after a purge they are dropped, not opened.
+    const account = accountEpoch();
     let doc: PdfDocument | null = null;
     void (async () => {
       // A mount that is undone at once (development's double mount) fetches nothing.
@@ -489,6 +492,7 @@ export default function PdfPreview({ source, item }: RendererProps) {
         // Counted as it arrives: a file larger than the viewer takes is dropped mid-transfer.
         const bytes = await readLimited(response, fetchLimitFor("pdf"));
         if (abort.signal.aborted) return;
+        if (!sameAccount(account)) return abort.abort();
         if (bytes === TOO_LARGE) {
           abort.abort();
           settle();

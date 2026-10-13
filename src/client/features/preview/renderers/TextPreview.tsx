@@ -6,6 +6,7 @@ import Checkbox from "@mui/material/Checkbox";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import Typography from "@mui/material/Typography";
 import { useEffect, useMemo, useState } from "react";
+import { accountEpoch, sameAccount } from "../../../lib/query";
 import { fontMono, hf } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
@@ -13,7 +14,7 @@ import { fetchLimitFor } from "../renderer-map";
 import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import type { Line } from "./highlight";
 import { NoPreview } from "./NoPreview";
-import { decodeText, HIGHLIGHT_MAX_CHARS, HIGHLIGHT_MAX_LINE, TEXT_MAX_LINES } from "./text";
+import { canHighlight, decodeText, fewEnoughPieces, TEXT_MAX_LINES } from "./text";
 import type { RendererProps } from "./types";
 
 // One weight and two neutrals: the design has no colour that means "keyword".
@@ -39,6 +40,8 @@ export default function TextPreview({ source, item }: RendererProps) {
   useEffect(() => {
     if (firstUrl === null) return;
     const abort = new AbortController();
+    // Bytes of the account that asked: after a purge they are dropped, not shown.
+    const account = accountEpoch();
     void (async () => {
       // A mount that is undone at once (development's double mount) fetches nothing.
       await Promise.resolve();
@@ -49,6 +52,7 @@ export default function TextPreview({ source, item }: RendererProps) {
         // The server refuses a URL for a larger file; the count here is of what really arrives.
         const bytes = await readLimited(response, fetchLimitFor("text"));
         if (abort.signal.aborted) return;
+        if (!sameAccount(account)) return abort.abort();
         if (bytes === TOO_LARGE) {
           abort.abort();
           settle();
@@ -73,23 +77,26 @@ export default function TextPreview({ source, item }: RendererProps) {
   );
 
   useEffect(() => {
-    if (text === null || text.length > HIGHLIGHT_MAX_CHARS) return;
-    // One very long line is where a grammar can stall the page: such a file stays plain.
-    if (all.some((line) => line.length > HIGHLIGHT_MAX_LINE)) return;
-    let cancelled = false;
+    // Decided BEFORE any highlighting starts, on what the work grows with: characters, lines and
+    // the longest line. Above any of them the text stays as it is — plain text nodes.
+    if (text === null || !canHighlight(all, text.length)) return;
+    const abort = new AbortController();
+    const account = accountEpoch();
     // The highlighter is its own chunk and is asked for only when there is something to colour.
     void import("./highlight")
       .then(async ({ highlight, languageFor }) => {
         const lang = languageFor(item.ext);
-        if (!lang) return;
-        const lines = await highlight(text, lang);
-        if (!cancelled) setHighlighted(lines.slice(0, TEXT_MAX_LINES));
+        if (!lang || abort.signal.aborted) return;
+        // In slices, each of which checks the signal: closing the preview or moving on stops it.
+        const lines = await highlight(text, lang, abort.signal);
+        if (lines === null || abort.signal.aborted || !sameAccount(account)) return;
+        // A grammar that cuts the text into very many pieces would be as many elements.
+        if (!fewEnoughPieces(lines)) return;
+        setHighlighted(lines.slice(0, TEXT_MAX_LINES));
       })
       // No grammar, no colours: the plain text is already showing.
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    return () => abort.abort();
   }, [text, all, item.ext]);
 
   if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} />;

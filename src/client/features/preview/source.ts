@@ -12,6 +12,7 @@ import {
 import type { PreviewItem, PublicPreviewSource } from "../../components/slots";
 import type { ScanStatus } from "../../components/types";
 import { api } from "../../lib/api";
+import { accountEpoch, sameAccount } from "../../lib/query";
 
 export type PreviewSource = "owner" | PublicPreviewSource;
 
@@ -99,11 +100,14 @@ const SIBLING_PAGE = 200;
 
 /** The files next to a node, in the folder's default order — for prev/next on a cold link. */
 export async function listSiblingIds(parentId: string | null, signal?: AbortSignal): Promise<string[]> {
+  const account = accountEpoch();
   const base = parentId === null ? "/api/nodes/root" : `${nodePath(parentId)}/children`;
   const ids: string[] = [];
   let cursor: string | null = null;
   let pages = 0;
   do {
+    // The next page belongs to the account that asked for the first.
+    if (!sameAccount(account)) return [];
     const query = new URLSearchParams({ kind: "file", limit: String(SIBLING_PAGE) });
     if (cursor) query.set("cursor", cursor);
     const page: NodePage = await api(`${base}?${query.toString()}`, { schema: NodePage, signal });

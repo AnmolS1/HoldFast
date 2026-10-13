@@ -19,7 +19,7 @@ export interface Call {
   signal: AbortSignal | undefined;
 }
 
-export type Handler = (call: Call) => Response | Promise<Response> | undefined;
+export type Handler = (call: Call) => Response | undefined | Promise<Response | undefined>;
 
 export interface Network {
   calls: Call[];

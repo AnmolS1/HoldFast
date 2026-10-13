@@ -1,5 +1,6 @@
 // The file a preview is about, from either source, re-read every 5 s while its scan is pending.
 import { useCallback, useEffect, useRef, useState } from "react";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { listSiblingIds, loadItem, type LoadedItem, type PreviewSource } from "./source";
 import { failureOf, type PreviewFailure } from "./usePreviewUrl";
 
@@ -28,16 +29,20 @@ export function useItem(source: PreviewSource, nodeId: string): { state: ItemSta
   useEffect(() => {
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // After a purge of the account (sign-out, another identity) the poll asks nothing more and
+    // an answer still on its way is dropped.
+    const account = accountEpoch();
     const read = () => {
+      if (!sameAccount(account)) return;
       loadItem(latestSource.current, nodeId, abort.signal).then(
         (item) => {
-          if (abort.signal.aborted) return;
+          if (abort.signal.aborted || !sameAccount(account)) return;
           setHeld({ key, state: { status: "ready", item } });
           // The preview opens by itself once the status leaves `pending`.
           if (item.scanStatus === "pending") timer = setTimeout(read, SCAN_POLL_MS);
         },
         (error: unknown) => {
-          if (abort.signal.aborted) return;
+          if (abort.signal.aborted || !sameAccount(account)) return;
           setHeld({ key, state: { status: "error", failure: failureOf(error) } });
         },
       );
@@ -81,15 +86,17 @@ export function useSiblingIds(
   useEffect(() => {
     if (wanted === null || wanted === have) return;
     const abort = new AbortController();
+    const account = accountEpoch();
+    const current = () => !abort.signal.aborted && sameAccount(account);
     queueMicrotask(() => {
-      if (abort.signal.aborted) return;
+      if (!current()) return;
       listSiblingIds(parentId, abort.signal).then(
         (ids) => {
-          if (!abort.signal.aborted) setListed({ parentKey: wanted, ids });
+          if (current()) setListed({ parentKey: wanted, ids });
         },
         () => {
           // No list: the preview still works, without prev/next.
-          if (!abort.signal.aborted) setListed({ parentKey: wanted, ids: [] });
+          if (current()) setListed({ parentKey: wanted, ids: [] });
         },
       );
     });

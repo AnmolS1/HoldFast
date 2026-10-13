@@ -14,6 +14,7 @@ import { FileBadge } from "../../components/FileBadge";
 import { ProgressUnderline } from "../../components/ProgressUnderline";
 import type { PreviewDialogProps } from "../../components/slots";
 import { toastApiError } from "../../lib/api";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ReportLink } from "../report";
@@ -50,13 +51,16 @@ function DownloadButton({ nodeId }: { nodeId: string }) {
   const [busy, setBusy] = useState(false);
   const onClick = async () => {
     setBusy(true);
+    // The account that pressed the button: an answer that arrives after it has gone (sign-out,
+    // another identity) starts no download and says nothing.
+    const account = accountEpoch();
     try {
       // The only `download`-kind mint in the preview: every renderer uses `inline`.
       const minted = await mintUrl("owner", nodeId, "download");
       // Only ever a files-host address over http(s): nothing else is opened.
-      if (/^https?:\/\//i.test(minted.url)) startDownload(minted.url);
+      if (sameAccount(account) && /^https?:\/\//i.test(minted.url)) startDownload(minted.url);
     } catch (error) {
-      toastApiError(error);
+      if (sameAccount(account)) toastApiError(error);
     } finally {
       setBusy(false);
     }
@@ -310,10 +314,9 @@ export function PreviewDialogView(props: ViewProps) {
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     // Keys of a dialog opened from inside this one (share, a confirm) are that dialog's.
     if (!(event.target instanceof Node) || !event.currentTarget.contains(event.target)) return;
-    // Escape is left to the dialog, which closes on it.
+    // Escape is left to the dialog, which closes on it. (The page's own shortcuts — Delete, "/" —
+    // are ignored by the shell while a dialog is open; nothing here has to stop them.)
     if (event.key === "Escape") return;
-    // Nothing typed in the preview is a shortcut of the page underneath (Delete, "/", …).
-    event.stopPropagation();
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     if (event.target instanceof Element && event.target.closest(OWN_KEYS)) return;

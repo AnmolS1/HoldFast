@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TOKEN_TTL } from "../../../shared/constants";
 import { ApiError } from "../../lib/api";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { mintUrl, type MintedUrl, type PreviewSource } from "./source";
 
 /** Why a preview could not be shown. `requestId` only when the app API answered. */
@@ -100,6 +101,17 @@ export function usePreviewUrl(
   useEffect(() => {
     let cancelled = false;
     let dead = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // The account this view belongs to. After a purge (sign-out, another identity) nothing here
+    // asks, publishes or re-arms a timer: a URL is a bearer token of the account that minted it.
+    const account = accountEpoch();
+    const live = () => {
+      if (cancelled || dead) return false;
+      if (sameAccount(account)) return true;
+      dead = true;
+      clearTimeout(timer);
+      return false;
+    };
     // The one re-mint after a failure. Spent once per view of this file and never given back:
     // a file that fails at the same place every time must not mint for ever.
     let retried = false;
@@ -107,7 +119,6 @@ export function usePreviewUrl(
     let inUse: string | null = null;
     // Only the latest mint may publish: an older one answering late is dropped.
     let latest = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
 
     const publish = (url: string | null, failure: PreviewFailure | null) => {
       inUse = url;
@@ -126,10 +137,11 @@ export function usePreviewUrl(
     /** The first URL, and the one after a failure: a refusal is final. */
     const mint = (failed: string | null): Promise<string | null> => {
       clearTimeout(timer);
+      if (!live()) return Promise.resolve(null);
       const mine = (latest += 1);
       return mintUrl(latestSource.current, nodeId, kind, size).then(
         (minted) => {
-          if (cancelled || dead || mine !== latest) return null;
+          if (!live() || mine !== latest) return null;
           // The same URL again would load nothing new and report nothing: it IS the second failure.
           if (failed !== null && minted.url === failed) {
             stop(HOST_FAILURE);
@@ -138,20 +150,21 @@ export function usePreviewUrl(
           return adopt(minted);
         },
         (error: unknown) => {
-          if (!cancelled && !dead && mine === latest) stop(failureOf(error));
+          if (live() && mine === latest) stop(failureOf(error));
           return null;
         },
       );
     };
     /** The proactive refresh: a failure leaves what is on screen alone and is tried again. */
     const refresh = (attempt: number): void => {
+      if (!live()) return;
       const mine = (latest += 1);
       mintUrl(latestSource.current, nodeId, kind, size).then(
         (minted) => {
-          if (!cancelled && !dead && !settled && mine === latest) adopt(minted);
+          if (live() && !settled && mine === latest) adopt(minted);
         },
         () => {
-          if (cancelled || dead || settled || mine !== latest) return;
+          if (!live() || settled || mine !== latest) return;
           const wait = REFRESH_RETRY_MS[attempt];
           if (wait !== undefined) timer = setTimeout(() => refresh(attempt + 1), wait);
         },
@@ -160,7 +173,7 @@ export function usePreviewUrl(
 
     const own: Controller = {
       reportFailure() {
-        if (cancelled || dead) return Promise.resolve(null);
+        if (!live()) return Promise.resolve(null);
         if (retried) {
           stop(HOST_FAILURE);
           return Promise.resolve(null);
@@ -173,14 +186,14 @@ export function usePreviewUrl(
         clearTimeout(timer);
       },
       fail() {
-        if (!cancelled && !dead) stop(HOST_FAILURE);
+        if (live()) stop(HOST_FAILURE);
       },
     };
     controller.current = own;
     // Asked a moment later: a mount that is undone at once (development's double mount) mints
     // nothing, so one view of a file is one URL.
     queueMicrotask(() => {
-      if (!cancelled) void mint(null);
+      if (live()) void mint(null);
     });
     return () => {
       cancelled = true;
