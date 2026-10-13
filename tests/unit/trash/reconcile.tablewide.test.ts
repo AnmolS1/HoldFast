@@ -10,7 +10,7 @@
 // from now everything planted is still young, 49 hours from now it is old.
 import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import { trash as trashQuery } from "../../../src/worker/db/queries/trash";
@@ -18,12 +18,15 @@ import { nodes, settings as settingsTable } from "../../../src/worker/db/schema"
 import { purgeRoot } from "../../../src/worker/jobs/purge";
 import {
   job as reconcileJob,
+  GENERATION_KEY,
   ORPHAN_AREAS,
   readCursor,
   reconcileQuotas,
+  runReconcile,
   sweepOrphans,
 } from "../../../src/worker/jobs/reconcile";
 import { nameKeyOf } from "../../../src/worker/services/filename";
+import { captureError } from "../../../src/worker/sentry";
 import { avatarKey, keyFor, thumbKey } from "../../../src/worker/services/storage";
 import {
   audits,
@@ -46,6 +49,12 @@ import {
   uploadRow,
   usedBytes,
 } from "./helpers";
+
+// What the job reports to the operator, counted (the report itself is the real one).
+vi.mock("../../../src/worker/sentry", async (original) => {
+  const real = await original<typeof import("../../../src/worker/sentry")>();
+  return { ...real, captureError: vi.fn(real.captureError) };
+});
 
 const HOUR = 3_600_000;
 const FAR = Date.now() + 600_000;
@@ -84,6 +93,24 @@ async function consistent() {
   await setUsedBytes(owner.id, 1200);
   return owner;
 }
+
+/**
+ * The two generation numbers as a test wants them: the database's (inside the cursor) and the
+ * object's (`null` = no object). Everything else of the cursor is the start, or `user`.
+ */
+async function generations(database: number, object: number | string | null, at: { user?: string } = {}) {
+  await setSetting(
+    testDb(),
+    "reconcileCursor",
+    { user: at.user ?? null, area: 0, object: null, generation: database },
+    null,
+  );
+  if (object === null) await env.FILES.delete(GENERATION_KEY);
+  else await env.FILES.put(GENERATION_KEY, String(object));
+}
+const databaseGeneration = async () =>
+  readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor).generation;
+const objectGeneration = async () => (await (await env.FILES.get(GENERATION_KEY))?.text()) ?? null;
 
 /** The walk, for exactly one account: the first after `after`, with the deadline already past. */
 const one = (ctx: ReturnType<typeof jobContext>, id: string) =>
@@ -125,12 +152,7 @@ describe("reconcile: the quota half", () => {
   it("the job resumes where its cursor says, and keeps its place", async () => {
     const owner = await consistent();
     await setUsedBytes(owner.id, 7);
-    await setSetting(
-      testDb(),
-      "reconcileCursor",
-      { user: justBefore(owner.id), area: 0, object: null },
-      null,
-    );
+    await generations(3, 3, { user: justBefore(owner.id) });
     const ctx = jobContext();
     await reconcileJob.run(ctx.bg, env, cronEvent(reconcileJob.cron), { softDeadlineMs: 400 });
     await ctx.settle();
@@ -149,9 +171,16 @@ describe("reconcile: the quota half", () => {
 
   it("anything that is not a cursor reads as the start", () => {
     for (const stored of [undefined, null, "x", 7, [], { user: 5, area: -1 }, { area: 99, object: "c" }]) {
-      expect(readCursor(stored)).toEqual({ user: null, area: 0, object: null });
+      expect(readCursor(stored)).toEqual({ user: null, area: 0, object: null, generation: 0 });
     }
-    expect(readCursor({ user: "u", area: 2, object: "c" })).toEqual({ user: "u", area: 2, object: "c" });
+    expect(readCursor({ user: "u", area: 2, object: "c", generation: 4 })).toEqual({
+      user: "u",
+      area: 2,
+      object: "c",
+      generation: 4,
+    });
+    expect(readCursor({ generation: -1 }).generation).toBe(0);
+    expect(readCursor({ generation: "7" }).generation).toBe(0);
   });
 });
 
@@ -224,7 +253,7 @@ describe("reconcile: the orphan sweep", () => {
     expect(await present(p.orphans)).toEqual(p.orphans);
     expect(off.outcomes("reconcile")).toEqual(["orphan_disabled"]);
     // The job as a whole, with the switch off: the quota half still runs, the sweep does not.
-    await setSetting(testDb(), "reconcileCursor", { user: null, area: 0, object: null }, null);
+    await generations(3, 3);
     const viaJob = jobContext({ settings: { orphanDeleteEnabled: false } });
     await reconcileJob.run(viaJob.bg, env, cronEvent(reconcileJob.cron), { softDeadlineMs: 200 });
     expect(await present(p.orphans)).toEqual(p.orphans);
@@ -271,6 +300,87 @@ describe("reconcile: the orphan sweep", () => {
     expect(await objectExists(session.r2Key)).toBe(true);
     await sweepOrphans(jobContext().bg, { from: START, stopAt: FAR, now: inHours(49) });
     expect(await objectExists(session.r2Key)).toBe(false);
+  });
+
+  describe("the rollback detector: a generation number in the database and in the object store", () => {
+    const alerts = () =>
+      vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "rollback_detected");
+    beforeEach(() => vi.mocked(captureError).mockClear());
+    const run = (ctx = jobContext()) => runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+
+    it("a database that has gone back in time: no orphan is deleted, by this run or the next; an alert each run; until an operator moves the number", async () => {
+      const p = await planted();
+      const owner = await consistent();
+      await setUsedBytes(owner.id, 9);
+      // The object store saw run 7 complete; the restored database remembers run 5.
+      await generations(5, 7, { user: justBefore(owner.id) });
+      const ctx = jobContext();
+      const first = await run(ctx);
+      expect(first).toMatchObject({ generation: "rollback", sweep: null, done: false });
+      expect(await present(p.orphans)).toEqual(p.orphans);
+      expect(ctx.outcomes("reconcile")).toContain("rollback_detected");
+      expect(ctx.outcomes("reconcile")).not.toContain("orphans");
+      expect(alerts()).toHaveLength(1);
+      // The job never counts a rolled-back database up by itself.
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "7"]);
+      // The quota half is not gated.
+      expect(await usedBytes(owner.id)).toBe(1200);
+
+      await run();
+      expect(await present(p.orphans)).toEqual(p.orphans);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "7"]);
+      expect(alerts()).toHaveLength(2);
+
+      // The operator has looked, and moves the database's number up to the object's.
+      await generations(7, 7);
+      vi.mocked(captureError).mockClear();
+      const after = await run();
+      expect(after.generation).toBe("ok");
+      expect(await present(p.orphans)).toEqual([]);
+      expect(await present(p.referenced)).toEqual(p.referenced);
+      expect(alerts()).toHaveLength(0);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([8, "8"]);
+      await env.FILES.delete(p.odd);
+    });
+
+    it("no object yet — the first run: it is written, and nothing is deleted that run", async () => {
+      const p = await planted();
+      await generations(0, null);
+      const first = await run();
+      expect(first).toMatchObject({ generation: "first", sweep: null });
+      expect(await present(p.orphans)).toEqual(p.orphans);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([1, "1"]);
+      expect(alerts()).toHaveLength(0);
+      // Control: the next run, with both numbers in step, deletes the same orphans.
+      expect((await run()).generation).toBe("ok");
+      expect(await present(p.orphans)).toEqual([]);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([2, "2"]);
+      await env.FILES.delete(p.odd);
+    });
+
+    it("the database ahead of the object (an object write failed): normal, and the object is brought up", async () => {
+      const p = await planted();
+      await generations(9, 7);
+      expect((await run()).generation).toBe("ok");
+      expect(await present(p.orphans)).toEqual([]);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([10, "10"]);
+      expect(alerts()).toHaveLength(0);
+      await env.FILES.delete(p.odd);
+    });
+
+    it("an object that is not a number proves nothing: treated as a rollback", async () => {
+      const p = await planted();
+      await generations(4, "not a number");
+      expect((await run()).generation).toBe("rollback");
+      expect(await present(p.orphans)).toEqual(p.orphans);
+      expect(alerts()).toHaveLength(1);
+      await generations(4, 4);
+      await env.FILES.delete([...p.orphans, p.odd]);
+    });
+
+    it("the generation object is outside every swept area", () => {
+      for (const area of ORPHAN_AREAS) expect(GENERATION_KEY.startsWith(area)).toBe(false);
+    });
   });
 
   it("guard (b): 600 orphans among 1,000 objects — nothing is deleted, and it alerts", async () => {

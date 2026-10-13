@@ -17,6 +17,20 @@
 //       max(500, 1 % of the objects it listed): it alerts (`orphan_threshold`) and keeps its
 //       place, so it alerts again every night until someone has looked.
 //   (c) the 48-hour floor, on the object's own upload time.
+// AND A FOURTH THAT DOES NOT LIVE IN THE DATABASE. Guard (a) is a row of the very database a
+// restore puts back (with the value it had then), and guard (b) only sees one run's window. So
+// every run that completes counts a GENERATION up — in the database (inside the cursor value)
+// and then in one small object, `sys/reconcile-generation`, outside the swept areas. A run
+// starts by reading both, before any orphan decision:
+//   object  >  database    the database has gone back in time. No orphan is deleted, by this
+//                          run or any later one; the operator is alerted and it is counted
+//                          (`rollback_detected`). It stays that way until an operator moves the
+//                          database's number up to the object's — deliberately, after looking.
+//   no object              the first run: the object is written and nothing is deleted.
+//   object  <= database    normal (the database ahead means an object write failed: it is
+//                          written again at the end of the run).
+// What it cannot see: a restore to a point AFTER the last run that completed (the numbers are
+// equal). The quota half is unaffected by any of this.
 // Rows first, objects second everywhere else is what makes an unreferenced old object garbage:
 // a purge deletes its rows and then its objects, an upload writes its session row first.
 
@@ -46,9 +60,14 @@ export type ReconcileCursor = {
   /** Index into `ORPHAN_AREAS`, and the store's list cursor inside that area (null = its start). */
   area: number;
   object: string | null;
+  /** How many runs have completed. Its twin is the object `GENERATION_KEY`. */
+  generation: number;
 };
 
-const START: ReconcileCursor = { user: null, area: 0, object: null };
+const START: ReconcileCursor = { user: null, area: 0, object: null, generation: 0 };
+
+/** Where the generation is kept outside the database: no swept area, and no upload prefix. */
+export const GENERATION_KEY = "sys/reconcile-generation";
 
 /** The stored cursor, or the start for anything that is not one (it is `unknown` in the table). */
 export function readCursor(stored: unknown): ReconcileCursor {
@@ -61,7 +80,57 @@ export function readCursor(stored: unknown): ReconcileCursor {
     user: typeof value.user === "string" && value.user !== "" ? value.user : null,
     area: inRange ? area : 0,
     object: inRange && typeof value.object === "string" && value.object !== "" ? value.object : null,
+    generation:
+      typeof value.generation === "number" && Number.isSafeInteger(value.generation) && value.generation >= 0
+        ? value.generation
+        : 0,
   };
+}
+
+// ── the rollback detector ───────────────────────────────────────────────────────────────────
+
+/** `ok` — sweep as usual; `first` — no object yet: nothing is deleted this run; `rollback`. */
+export type GenerationState = "ok" | "first" | "rollback";
+
+/** The object's number; null when there is no object; NaN when it holds anything but a number. */
+async function storedGeneration(env: Env): Promise<number | null> {
+  const found = await storage(env).get(GENERATION_KEY);
+  if (found === null || found.kind !== "body") return null;
+  const text = (await found.object.text()).trim();
+  return /^\d{1,15}$/.test(text) ? Number(text) : Number.NaN;
+}
+
+async function writeGeneration(env: Env, generation: number): Promise<void> {
+  const body = new TextEncoder().encode(String(generation));
+  await storage(env).put(GENERATION_KEY, body, { size: body.byteLength, contentType: "text/plain" });
+}
+
+/**
+ * Compares the database's generation with the object's, before any orphan decision. An object
+ * that cannot be read as a number proves nothing either way: that is `rollback` too.
+ */
+export async function checkGeneration(bg: BackgroundContext, database: number): Promise<GenerationState> {
+  const object = await storedGeneration(bg.env);
+  if (object === null) {
+    await writeGeneration(bg.env, database);
+    return "first";
+  }
+  if (object <= database) return "ok";
+  bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
+  alertRollback();
+  return "rollback";
+}
+
+/** The operator's alert for a database that is older than the object store. ONE call site. */
+function alertRollback(): void {
+  captureError(
+    new Error("reconcile: the database is older than the object store; orphan deletion is stopped"),
+    {
+      kind: "job",
+      job: "reconcile",
+      reason: "rollback_detected",
+    },
+  );
 }
 
 // ── quota ───────────────────────────────────────────────────────────────────────────────────
@@ -225,28 +294,64 @@ export async function sweepOrphans(
 
 // ── the job ─────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * One run. `now` is the sweep's (an object's age cannot be set: see `sweepOrphans`).
+ * `completed`: the run got to its end — only then is the generation counted up.
+ */
+export async function runReconcile(
+  bg: BackgroundContext,
+  opts: { softDeadlineMs: number; now?: Date },
+): Promise<{ done: boolean; generation: GenerationState; sweep: OrphanSweep | null }> {
+  const startedAt = Date.now();
+  const cursor = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor);
+  // Before any orphan decision: is this database older than the object store?
+  const generation = await checkGeneration(bg, cursor.generation);
+
+  // Half the budget each, so a long quota pass never starves the sweep (and the reverse).
+  const quota = await reconcileQuotas(bg, {
+    after: cursor.user,
+    stopAt: startedAt + opts.softDeadlineMs / 2,
+  });
+  let sweep: OrphanSweep | null = null;
+  let completed = false;
+  try {
+    if (generation === "ok") {
+      sweep = await sweepOrphans(bg, {
+        from: cursor,
+        stopAt: startedAt + opts.softDeadlineMs,
+        now: opts.now,
+      });
+    }
+    completed = true;
+  } finally {
+    // Whatever the sweep did, the quota pass keeps its place. A rolled-back database's number is
+    // never counted up by the job: only an operator moves it.
+    const counted = completed && generation !== "rollback";
+    const next: ReconcileCursor = {
+      user: quota.next,
+      area: sweep ? sweep.area : cursor.area,
+      object: sweep ? sweep.object : cursor.object,
+      generation: counted ? cursor.generation + 1 : cursor.generation,
+    };
+    await setSetting(bg.db, "reconcileCursor", next, null);
+    // The database first, then the object: a failure in between leaves the database ahead,
+    // which the next run reads as normal and repairs.
+    if (counted) await writeGeneration(bg.env, next.generation);
+  }
+  return {
+    done: quota.done && sweep !== null && sweep.outcome === "swept" && sweep.done,
+    generation,
+    sweep,
+  };
+}
+
 export const job: Job = {
   name: "reconcile",
   cron: "0 2 * * *",
   async run(bg, _env, _event, opts) {
-    const budget = opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS;
-    const startedAt = Date.now();
-    const cursor = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor);
-
-    // Half the budget each, so a long quota pass never starves the sweep (and the reverse).
-    const quota = await reconcileQuotas(bg, { after: cursor.user, stopAt: startedAt + budget / 2 });
-    let sweep: OrphanSweep | null = null;
-    try {
-      sweep = await sweepOrphans(bg, { from: cursor, stopAt: startedAt + budget });
-    } finally {
-      // Whatever the sweep did, the quota pass keeps its place.
-      const next: ReconcileCursor = {
-        user: quota.next,
-        area: sweep ? sweep.area : cursor.area,
-        object: sweep ? sweep.object : cursor.object,
-      };
-      await setSetting(bg.db, "reconcileCursor", next, null);
-    }
-    return { done: quota.done && sweep.outcome === "swept" && sweep.done };
+    const { done } = await runReconcile(bg, {
+      softDeadlineMs: opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS,
+    });
+    return { done };
   },
 };
