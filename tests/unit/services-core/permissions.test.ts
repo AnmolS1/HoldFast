@@ -490,6 +490,10 @@ describe("a node that listings hide does not exist here either", () => {
     expect(await cost(t.stranger)).toEqual(same(2, false));
     // Through a link over the owner's private folder.
     expect(await cost(null, t.privateFolder.id)).toEqual(same(2, true));
+    // NOT COVERED HERE — A GRANTEE: the access query reads the owner's state in a second
+    // statement whenever the caller has a grant on the chain, so for a sharee a hidden shared
+    // node costs one statement more than an unknown id. Equalised by seam pass H1 (in the access
+    // query itself), which adds the grantee rows to this test.
     // Signed out and no link: nothing is asked at all, for any id.
     expect(await cost(null)).toEqual(same(0, false));
   });
