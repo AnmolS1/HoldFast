@@ -13,6 +13,8 @@
 //    `view.viewerId`, and the role the caller passes must agree with that (it throws otherwise).
 //    Only the owner receives `sharing`, `starred`, `lastAccessedAt`, `sha256`, `scanReason` and
 //    `pua`; anyone else gets the zero value of each.
+//  - `sha256` is null for everyone while the scan is `pending`: only a hash the scanner has
+//    computed is shown.
 //  - A grantee's share root does not say where it sits in the owner's tree: for anyone but the
 //    owner the row that is `view.shareRootId` goes out with `parentId: null` (rows deeper in the
 //    share keep theirs — it is inside the share), and so does a search hit without a path hint.
@@ -127,7 +129,10 @@ function mapRow(row: NodeRow, viewer: Viewer, lookups: Lookups): NodeDto {
     mimeCategory: isFile ? categoryOf(row.mimeSniffed, row.ext) : "other",
     mimeSniffed: row.mimeSniffed,
     etag: row.versionId ?? "",
-    sha256: isOwner ? row.sha256 : null,
+    // Not while the scan is pending: until the scanner has hashed the object the value is what
+    // the client declared (or, after a blocklisted declaration was checked, the server's) — and
+    // showing which of the two it is would tell the uploader whether their value was on a list.
+    sha256: isOwner && scanStatus !== "pending" ? row.sha256 : null,
     scanStatus,
     scanReason: isOwner ? row.scanReason : null,
     pua: isOwner ? [...(row.scanDetail?.pua ?? [])] : [],
