@@ -17,8 +17,9 @@ import { t } from "./strings";
 
 const hidden = {
   position: "absolute",
-  width: 1,
-  height: 1,
+  // "1px", not 1: a bare 1 in `sx` is 100 %.
+  width: "1px",
+  height: "1px",
   overflow: "hidden",
   clip: "rect(0 0 0 0)",
   whiteSpace: "nowrap",
