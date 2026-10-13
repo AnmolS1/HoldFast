@@ -201,7 +201,8 @@ export async function enqueueScan(
   await deps.env.SCAN_QUEUE.send(message);
 }
 
-export type RescanResult = { queued: boolean; reason?: "taken_down" | "locked" };
+/** What an ADMIN's rescan answers. An owner's either queues or is a `404` — never a reason. */
+export type RescanResult = { queued: true } | { queued: false; reason: "taken_down" | "locked" };
 
 /**
  * Rescan. What happens depends on the node's state — read from its LOCKED row, in the
@@ -221,8 +222,22 @@ export type RescanResult = { queued: boolean; reason?: "taken_down" | "locked" }
  * earlier scan is only taken over by a forced claim. The message and the audit row follow the
  * commit, and only when something was queued.
  *
+ * AN OWNER NEVER LEARNS WHY. "Taken down" and "locked" are states an account holder must not be
+ * able to observe, so for `by: "owner"` both are the same `404 not_found` — the very error an id
+ * that is not a file gets — and no reason is produced at all. Only `by: "admin"` is told.
+ *
  * `404 not_found` for an id that is not a file. The one-per-hour owner throttle is the route's.
  */
+export async function enqueueRescan(
+  deps: ServiceDeps,
+  nodeId: string,
+  opts: { force?: boolean; by: "owner" },
+): Promise<{ queued: true }>;
+export async function enqueueRescan(
+  deps: ServiceDeps,
+  nodeId: string,
+  opts: { force?: boolean; by: "admin" },
+): Promise<RescanResult>;
 export async function enqueueRescan(
   deps: ServiceDeps,
   nodeId: string,
@@ -252,7 +267,11 @@ export async function enqueueRescan(
   });
   // Gone, or replaced faster than it could be locked: there is no such file to rescan.
   if (decision === null) throw new AppError("not_found");
-  if ("reason" in decision) return { queued: false, reason: decision.reason };
+  if ("reason" in decision) {
+    // Anyone but an admin gets exactly what an unknown id gets.
+    if (opts.by !== "admin") throw new AppError("not_found");
+    return { queued: false, reason: decision.reason };
+  }
 
   const force = opts.force ?? true;
   await enqueueScan(deps, { nodeId, key: decision.key, force });

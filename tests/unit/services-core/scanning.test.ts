@@ -377,6 +377,53 @@ describe("enqueueRescan", () => {
     expect(await auditRows({ action: "scan.rescan_requested", targetId: before.id })).toEqual([]);
   });
 
+  it("an owner never learns why: taken down, suspected_csam and an unknown id are the same 404", async () => {
+    const owner = await makeUser();
+    const down = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(owner.id, null, { scanStatus: "suspected_csam", legalHold: true });
+    const folder = await makeFolder(owner.id);
+    const errors: AppError[] = [];
+    for (const id of [down.id, locked.id, crypto.randomUUID(), folder.id]) {
+      const { deps, sent, settle } = recordingDeps();
+      const error = await enqueueRescan(deps, id, { by: "owner", force: true }).catch(
+        (thrown: unknown) => thrown,
+      );
+      await settle();
+      expect(error).toBeInstanceOf(AppError);
+      errors.push(error as AppError);
+      expect(sent).toEqual([]);
+      expect(await auditRows({ action: "scan.rescan_requested", targetId: id })).toEqual([]);
+    }
+    // Identical in everything a route could pass on.
+    const shape = (error: AppError) => ({
+      code: error.code,
+      status: error.status,
+      message: error.message,
+      details: error.details,
+      headers: error.headers,
+      name: error.name,
+    });
+    for (const error of errors) expect(shape(error)).toEqual(shape(errors[2]!));
+    expect(shape(errors[0]!)).toMatchObject({ code: "not_found", status: 404, message: "Not found." });
+    // Nothing was reset.
+    expect(await nodeById(down.id)).toEqual(down);
+    expect(await nodeById(locked.id)).toEqual(locked);
+    // The control: an admin asking about the same two nodes IS told, and tells them apart.
+    expect(await enqueueRescan(recordingDeps().deps, down.id, { by: "admin" })).toEqual({
+      queued: false,
+      reason: "taken_down",
+    });
+    expect(await enqueueRescan(recordingDeps().deps, locked.id, { by: "admin" })).toEqual({
+      queued: false,
+      reason: "locked",
+    });
+  });
+
   it("under_review: every column kept, and a message IS sent, { queued: true }", async () => {
     const owner = await makeUser();
     const before = await makeFile(owner.id, null, {
@@ -417,7 +464,7 @@ describe("enqueueRescan", () => {
       await untilBlockedBy(pid);
     });
     await lockHeld.opened;
-    const rescan = enqueueRescan(deps, file.id, { by: "owner" });
+    const rescan = enqueueRescan(deps, file.id, { by: "admin" });
     const [, result] = await Promise.all([takedown, rescan]);
     await settle();
     expect(result).toEqual({ queued: false, reason: "taken_down" });
