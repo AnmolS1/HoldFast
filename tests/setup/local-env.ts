@@ -23,6 +23,13 @@ function intFromEnv(names: string[], fallback: number): number {
 
 /** The local database name. Throws on anything that is not `holdfast` or `holdfast_<name>`. */
 export function localDbName(): string {
+  // A worktree without its exports would quietly run its code against the MAIN checkout's
+  // database. Fail instead: the exports come from `eval "$(scripts/dev-worktree.sh <task>)"`.
+  if (!process.env.HOLDFAST_DB && /[\\/]\.claude[\\/]worktrees[\\/]/.test(process.cwd())) {
+    throw new Error(
+      'HOLDFAST_DB is not set in a worktree checkout: run `eval "$(scripts/dev-worktree.sh <task>)"` in the same command',
+    );
+  }
   const name = process.env.HOLDFAST_DB || "holdfast";
   if (!DB_NAME.test(name)) {
     throw new Error(`HOLDFAST_DB must be "holdfast" or "holdfast_<name>" (a-z, 0-9, _), got "${name}"`);
