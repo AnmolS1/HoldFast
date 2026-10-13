@@ -6,7 +6,14 @@ import { NodeDto, NodeKind } from "./node";
 
 /** `category` is one of the eight category keys — the only category vocabulary there is. */
 export const SearchQuery = z.strictObject({
-  q: z.string().min(2).max(100),
+  // Trimmed before it is measured; no control character (a NUL would reach Postgres as a bind
+  // value and fail there — a 500 where a 400 belongs).
+  q: z
+    .string()
+    .trim()
+    .min(2)
+    .max(100)
+    .regex(/^\P{Cc}*$/u),
   kind: NodeKind.optional(),
   category: MimeCategory.optional(),
   scope: z.enum(["mine", "shared", "all"]).default("all"),
