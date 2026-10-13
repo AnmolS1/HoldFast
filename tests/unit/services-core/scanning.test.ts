@@ -597,20 +597,22 @@ describe("lockSuspectedCsam", () => {
   const sentRowsOf = (nodeId: string) => auditRows({ action: "scan.csam_alert_sent", targetId: nodeId });
   const viaOf = async (nodeId: string) =>
     (await sentRowsOf(nodeId)).map((row) => (row.meta as { via: string }).via).sort();
-  // THE SWEEP IS TABLE-WIDE: it settles every open csam report in the database, oldest first, and
-  // this database is shared with every other test file and with every earlier run. A test that
-  // sweeps and then looks for its OWN report — the newest — therefore depended on how many
-  // reports others had left waiting (it went red at a few hundred). `alone` removes that:
-  //   - the body runs in ONE transaction that is rolled back, and `deps.db` IS that transaction;
-  //   - first thing in it, every csam report that is open at that moment is set aside
-  //     (`reviewing`: not listed). Nobody else ever sees that — it is never committed — so
-  //     nothing is mailed, claimed or recorded on behalf of another file's report;
-  //   - the test's own reports, markers and audit rows are written in the same transaction:
-  //     no neighbour's sweep can see them, let alone announce them first.
-  // What a neighbour running at the same moment can still do: commit a NEW open csam report
-  // while the body runs. The sweep here then settles that one too (a handful, never a backlog),
-  // which is rolled back with the rest; and a neighbour that updates one of the reports set
-  // aside waits until this transaction ends.
+  // THE SWEEP IS TABLE-WIDE: it settles the open csam reports of the whole database, oldest
+  // first, up to its limit — and this database is shared with every other test file and every
+  // earlier run. A test that swept with a large limit and then counted its OWN report's mails
+  // depended on how many reports others had left waiting: past 200 the in-memory outbox
+  // (OUTBOX_CAPACITY) had dropped the lock's mail, past 1,000 the sweep would not reach it.
+  // `alone` and `oldestFirst` remove that without touching anybody else's rows:
+  //   - the body runs in ONE transaction that is rolled back, and `deps.db` IS that transaction:
+  //     the test's reports, markers and audit rows are never visible to a neighbour (no other
+  //     sweep can announce them first) and never join the backlog;
+  //   - the test's own reports are dated before every other (`oldestFirst`), and the sweep is
+  //     given a limit of exactly as many: it reads the queue's head — this test's rows — and
+  //     nothing else. No row of another file is read for update, locked or written.
+  // What a neighbour running at the same moment can still do: nothing to these reports (it
+  // cannot see them). Where a test sweeps once more than it has due reports (to show nothing is
+  // announced twice), that sweep takes the ONE oldest waiting report of the shared database:
+  // its mail goes to this isolate's outbox and its marker and audit row are rolled back.
   // Read through `db` inside the body: nothing written there is visible on another connection.
   const ROLLBACK = new Error("rollback");
   async function alone(
@@ -619,10 +621,6 @@ describe("lockSuspectedCsam", () => {
     await testDb()
       .transaction(async (tx) => {
         const db = tx as unknown as Db;
-        await tx
-          .update(reports)
-          .set({ status: "reviewing" })
-          .where(and(eq(reports.category, "csam"), eq(reports.status, "open")));
         const depsOn = () => {
           const made = serviceDeps();
           made.deps.db = db;
@@ -634,6 +632,15 @@ describe("lockSuspectedCsam", () => {
       .catch((error: unknown) => {
         if (error !== ROLLBACK) throw error;
       });
+  }
+  /** Dates these reports before every other in the database, in the order given. */
+  async function oldestFirst(db: Db, reportIds: string[]): Promise<void> {
+    for (const [index, id] of reportIds.entries()) {
+      await db
+        .update(reports)
+        .set({ createdAt: new Date(Date.UTC(1990, 0, 1, 0, 0, index)) })
+        .where(eq(reports.id, id));
+    }
   }
   const auditIn = (db: Db, action: string, targetId: string) =>
     db
@@ -754,11 +761,12 @@ describe("lockSuspectedCsam", () => {
       expect(await viaIn(db, file.id)).toEqual(["lock"]);
 
       await ageAlertMarker(reportId, db);
+      await oldestFirst(db, [reportId]);
       const next = depsOn();
-      const swept = await sweepCsamAlerts(next.deps, { limit: 1000 });
+      const swept = await sweepCsamAlerts(next.deps, { limit: 1 });
       await next.settle();
-      // The control that the sweep worked on this report and not on a backlog.
-      expect(swept.alerted).toBeGreaterThanOrEqual(1);
+      // Exactly this report: announced again, its lock (recorded yesterday) not recorded twice.
+      expect(swept).toEqual({ checked: 1, alerted: 1, recorded: 0 });
       expect(alertsFor(reportId)).toHaveLength(2);
       // The re-announcement is not a second lock: the lock's row keeps its real source, alone.
       expect(await auditIn(db, "scan.suspected_csam", file.id)).toMatchObject([
@@ -946,14 +954,14 @@ describe("lockSuspectedCsam", () => {
       await db.update(reports).set({ status: "reviewing" }).where(eq(reports.id, handled.reportId));
       const closed = await lockedButSilent(db);
       await db.update(reports).set({ status: "dismissed" }).where(eq(reports.id, closed.reportId));
-      // Exactly this test's one: everything else that was open is set aside (`alone`).
-      expect((await csamReportsToAnnounce(db, 1000)).map((row) => row.reportId)).toContain(silent.reportId);
+      // All three at the head of the queue; only the open one is due.
+      await oldestFirst(db, [handled.reportId, closed.reportId, silent.reportId]);
+      expect((await csamReportsToAnnounce(db, 1)).map((row) => row.reportId)).toEqual([silent.reportId]);
 
       const sweep = depsOn();
-      const swept = await sweepCsamAlerts(sweep.deps, { limit: 1000 });
+      const swept = await sweepCsamAlerts(sweep.deps, { limit: 1 });
       await sweep.settle();
-      expect(swept.checked).toBeGreaterThanOrEqual(1);
-      expect(swept.alerted).toBeGreaterThanOrEqual(1);
+      expect(swept).toEqual({ checked: 1, alerted: 1, recorded: 1 });
       expect(alertsFor(silent.reportId)).toHaveLength(1);
       // The lock's deferred work was lost with its invocation: the sweep records BOTH facts — the
       // lock, with the source the report carries, marked as recovered; and the alert.
@@ -963,7 +971,6 @@ describe("lockSuspectedCsam", () => {
           meta: { source: "photodna", reportId: silent.reportId, recoveredBy: "sweep" },
         },
       ]);
-      expect(swept.recorded).toBeGreaterThanOrEqual(1);
       expect(await auditIn(db, "scan.csam_alert_sent", silent.file.id)).toMatchObject([
         { meta: { reportId: silent.reportId, via: "sweep", recipients: 1 } },
       ]);
@@ -975,7 +982,7 @@ describe("lockSuspectedCsam", () => {
       expect(due).not.toContain(silent.reportId);
       expect(due).not.toContain(handled.reportId);
       const again = depsOn();
-      await sweepCsamAlerts(again.deps, { limit: 1000 });
+      await sweepCsamAlerts(again.deps, { limit: 1 });
       await again.settle();
       expect(alertsFor(silent.reportId)).toHaveLength(1);
       expect(await auditIn(db, "scan.suspected_csam", silent.file.id)).toHaveLength(1);
