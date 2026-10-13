@@ -2,7 +2,9 @@
 // OWN error state (not the frame's error boundary), and the sidebar's bar stays a skeleton.
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { viewKeys } from "../../../../src/client/features/starred/view-queries";
 import { useUsageSummary } from "../../../../src/client/features/usage";
+import { queryClient } from "../../../../src/client/lib/query";
 import { renderShell, setupShell, shellFetch } from "../shell/helpers";
 import { RECENT, SEARCH, STARRED, TRASH, USAGE } from "./fixtures";
 import { envelope, json, openView, requests, rowNames, viewError } from "./helpers";
@@ -94,8 +96,9 @@ describe("the storage slot", () => {
       });
       const values: unknown[] = [];
       renderShell(<Probe onValue={(value) => values.push(value)} />);
-      await waitFor(() => expect(requests(calls, "GET", "/api/account/usage")).toHaveLength(1));
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // Until the query has settled as failed — then every value it ever gave is on the list.
+      await waitFor(() => expect(queryClient.getQueryState(viewKeys.usage)?.status).toBe("error"));
+      expect(requests(calls, "GET", "/api/account/usage")).toHaveLength(1);
       expect(values.length).toBeGreaterThan(0);
       expect(values.every((value) => value === null)).toBe(true);
     },

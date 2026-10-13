@@ -1,7 +1,8 @@
 // Storage: the bar's thresholds, the breakdown's arithmetic, the page, and that nothing of an
 // account outlives its sign-out.
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { resetEmptyRun } from "../../../../src/client/features/trash/empty-run";
 import { usageBreakdown } from "../../../../src/client/features/usage/queries";
 import { viewKeys, VIEWS_KEY } from "../../../../src/client/features/starred/view-queries";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
@@ -11,6 +12,7 @@ import { remaining, TRASH, trashPage, usage, USAGE, USAGE_AFTER_EMPTY } from "./
 import { json, openView, requests, rowNames } from "./helpers";
 
 setupShell();
+afterEach(() => resetEmptyRun());
 
 const main = () => within(document.querySelector<HTMLElement>("[data-main]")!);
 const part = (name: string) => document.querySelector(`[data-usage-part="${name}"]`)!.textContent;

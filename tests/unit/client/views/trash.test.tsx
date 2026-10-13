@@ -1,7 +1,7 @@
 // The trash: restore, delete forever, empty trash — what each asks of the API, what it tells the
 // other features, and what it shows when the API refuses.
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import {
   CONFIRM_WORD,
@@ -11,9 +11,10 @@ import {
   STALLED_ROUNDS,
   TYPED_CONFIRM_ABOVE,
 } from "../../../../src/client/features/trash/queries";
+import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
 import { ApiError } from "../../../../src/client/lib/api";
-import { purgeUserState } from "../../../../src/client/lib/query";
-import { mockFetch, setupShell } from "../shell/helpers";
+import { purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
+import { mockFetch, sessionOf, setupShell } from "../shell/helpers";
 import {
   FOLDER_ID,
   nodeId,
@@ -40,6 +41,10 @@ import {
 } from "./helpers";
 
 setupShell();
+afterEach(() => {
+  vi.useRealTimers();
+  resetEmptyRun();
+});
 const events = recordNodesChanged();
 
 const [REPORT, NOTES, FOLDER] = TRASH.items as [
@@ -408,7 +413,8 @@ describe("empty trash, from the page", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: "Trash is empty" })).toBeTruthy());
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(3);
     expect(events).toEqual([[]]);
-    expect(usageCalls(calls)).toBe(usageBefore + 1);
+    // Read again after each batch and once more at the end — and what is shown is the last answer.
+    await waitFor(() => expect(usageCalls(calls)).toBeGreaterThan(usageBefore + 1));
     expect(progress.textContent).toBe("");
     expect(getToasts().map((toast) => toast.message)).toContain("Trash emptied");
   });
@@ -431,6 +437,218 @@ describe("empty trash, from the page", () => {
   });
 });
 
+describe("leaving the page while the trash is being emptied", () => {
+  it("the run goes on to its 204: the next page shows the same progress, and the list ends as the server has it", async () => {
+    const second = deferred<Response>();
+    let left = [...TRASH.items];
+    let deletes = 0;
+    const { calls, router } = await openView("/storage", {
+      "GET /api/trash": () => json(trashPage(left)),
+      "GET /api/account/usage": () => json(left.length === 0 ? USAGE_AFTER_EMPTY : USAGE),
+      "DELETE /api/trash": () => {
+        deletes += 1;
+        if (deletes === 1) {
+          left = left.slice(2);
+          return json(remaining(1), 202);
+        }
+        if (deletes === 2) return second.promise;
+        return NO_CONTENT();
+      },
+    });
+    const storage = within(document.querySelector<HTMLElement>("[data-view-page='usage']")!);
+    await waitFor(() =>
+      expect((storage.getByRole("button", { name: "Empty trash" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(storage.getByRole("button", { name: "Empty trash" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Empty the trash?" })).getByRole("button", {
+        name: "Empty trash",
+      }),
+    );
+    await waitFor(() =>
+      expect(document.querySelector("[data-empty-trash-progress]")!.textContent).toBe("Deleting… 1 left"),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    // The user walks off mid-run, through the link next to the button.
+    fireEvent.click(storage.getByRole("link", { name: "Open the trash" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/trash"));
+    await waitFor(() => expect(document.querySelector("[data-view-page='trash']")).not.toBeNull());
+    // Same run, same words, and the button cannot start a second one.
+    expect(document.querySelector("[data-empty-trash-progress]")!.textContent).toBe("Deleting… 1 left");
+    expect((screen.getByRole("button", { name: "Empty trash" }) as HTMLButtonElement).disabled).toBe(true);
+    // What is listed is what the server has: one of three.
+    await waitFor(() => expect(rowNames()).toEqual([FOLDER.id]));
+    expect(events).toEqual([]);
+
+    left = [];
+    second.resolve(json(remaining(0), 202));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Trash is empty" })).toBeTruthy());
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(3);
+    expect(events).toEqual([[]]);
+    expect(getEmptyRun()).toEqual({ state: "idle" });
+    expect(document.querySelector("[data-empty-trash-progress]")!.textContent).toBe("");
+    expect(getToasts().map((toast) => toast.message)).toContain("Trash emptied");
+  });
+
+  it("a run that stops while nobody is on its page still says so, and the numbers are read again", async () => {
+    const second = deferred<Response>();
+    let deletes = 0;
+    const { calls, router } = await openTrash({
+      "DELETE /api/trash": () => (++deletes === 1 ? json(remaining(240), 202) : second.promise),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Empty trash" }));
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "running", remaining: 240 }));
+    await act(() => router.navigate("/starred"));
+    const usageBefore = usageCalls(calls);
+    second.resolve(envelope("internal", 500));
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240 }));
+    expect(getToasts().map((toast) => toast.message)).toContain(
+      "Couldn't finish emptying the trash. 240 left. Try again.",
+    );
+    expect(events).toEqual([[]]);
+    await waitFor(() => expect(usageCalls(calls)).toBeGreaterThan(usageBefore));
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(2);
+  });
+
+  it("a second start while one runs is ignored", async () => {
+    const first = deferred<Response>();
+    const calls = mockFetch((call) =>
+      call.method === "DELETE" && pathOf(call) === "/api/trash" ? first.promise : undefined,
+    );
+    startEmptyTrash();
+    startEmptyTrash();
+    await waitFor(() => expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1));
+    first.resolve(NO_CONTENT());
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
+  });
+});
+
+describe("an account switch that leaves the page mounted", () => {
+  it("the run is stopped AND forgotten: no 'Deleting…' of the previous account, the button works again", async () => {
+    const first = deferred<Response>();
+    const { calls } = await openTrash({ "DELETE /api/trash": () => first.promise });
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Empty trash" }));
+    const progress = () => document.querySelector("[data-empty-trash-progress]")!.textContent;
+    await waitFor(() => expect(progress()).toBe("Deleting…"));
+    await act(() => purgeUserState({ keepSession: true }));
+    expect(getEmptyRun()).toEqual({ state: "idle" });
+    await waitFor(() => expect(progress()).toBe(""));
+    first.resolve(json(remaining(5), 202));
+    await waitFor(() => expect(rowNames().length).toBeGreaterThan(0));
+    expect(getEmptyRun()).toEqual({ state: "idle" });
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
+    expect(events).toEqual([]);
+    expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
+  });
+
+  it("an open confirmation, the selection and the conflict notice of the first account are gone", async () => {
+    await openTrash({ [`POST /api/nodes/${NOTES.id}/restore`]: () => envelope("conflict", 409) });
+    openMenu("notes.txt");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    await waitFor(() => expect(document.querySelector("[data-trash-conflict]")).not.toBeNull());
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select report.pdf" }));
+    openMenu("report.pdf");
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Delete forever/ }));
+    expect(await screen.findByRole("dialog", { name: "Delete report.pdf forever?" })).toBeTruthy();
+    // Another tab signed a different account in; this tab re-read the session.
+    act(() => {
+      queryClient.setQueryData(sessionQuery.queryKey, sessionOf({ id: "b".repeat(32), name: "Bo" }));
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(document.querySelector("[data-trash-conflict]")).toBeNull();
+    expect(document.querySelector("[data-selection-bar]")).toBeNull();
+  });
+});
+
+describe("review fixes on the trash page", () => {
+  it("m1: a restore refused with anything but 409 reads the trash again — a row purged elsewhere goes", async () => {
+    let purgedElsewhere = false;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": () =>
+        json(trashPage(purgedElsewhere ? TRASH.items.filter((item) => item.id !== REPORT.id) : TRASH.items)),
+      [`POST /api/nodes/${REPORT.id}/restore`]: () => envelope("not_found", 404),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    const before = requests(calls, "GET", "/api/trash").length;
+    purgedElsewhere = true;
+    openMenu("report.pdf");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    await waitFor(() => expect(rowNames()).toEqual([NOTES.id, FOLDER.id]));
+    expect(requests(calls, "GET", "/api/trash").length).toBe(before + 1);
+    expect(getToasts().map((toast) => toast.requestId)).toContain("req-1234");
+    expect(document.querySelector("[data-trash-conflict]")).toBeNull();
+    expect(events).toEqual([]);
+  });
+
+  it("m3: the confirmation is opened with the trash as the server has it NOW, not as it was listed", async () => {
+    let now = TRASH.items;
+    const { calls } = await openView("/trash", { "GET /api/trash": () => json(trashPage(now)) });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    const before = requests(calls, "GET", "/api/trash").length;
+    // Meanwhile, on another device, the trash grew past the threshold.
+    now = trashItems(101);
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    const dialog = await screen.findByRole("dialog", { name: "Empty the trash?" });
+    expect(requests(calls, "GET", "/api/trash").length).toBe(before + 1);
+    expect(within(dialog).getByText(/^This can't be undone\. 101 items\./)).toBeTruthy();
+    expect(within(dialog).getByLabelText(`Type ${CONFIRM_WORD} to confirm`)).toBeTruthy();
+    expect((within(dialog).getByRole("button", { name: "Empty trash" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it("m3: when that read fails the size is unknown — the word is asked for", async () => {
+    let fail = false;
+    await openView("/trash", {
+      "GET /api/trash": () => (fail ? envelope("internal", 500) : json(TRASH)),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    fail = true;
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    const dialog = await screen.findByRole("dialog", { name: "Empty the trash?" });
+    expect(within(dialog).getByText(/Everything in the trash is deleted\./)).toBeTruthy();
+    expect(within(dialog).getByLabelText(`Type ${CONFIRM_WORD} to confirm`)).toBeTruthy();
+  });
+
+  it("m4: Delete does not open a second dialog over 'Empty the trash?', nor over the row menu", async () => {
+    await openTrash();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select notes.txt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    await screen.findByRole("dialog", { name: "Empty the trash?" });
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    fireEvent.keyDown(document.body, { key: "Backspace" });
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
+
+    openMenu("report.pdf");
+    await screen.findByRole("menu");
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    // With nothing open the key works as before.
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    expect(await screen.findByRole("dialog", { name: "Delete notes.txt forever?" })).toBeTruthy();
+  });
+
+  it("m6: one row loaded and more to come is 'More than 1 item', in the count and in the confirmation", async () => {
+    await openView("/trash", { "GET /api/trash": trashPage([REPORT], "next") });
+    await waitFor(() => expect(rowNames()).toHaveLength(1));
+    expect(document.querySelector("[data-trash-count]")!.textContent).toBe("More than 1 item");
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    const dialog = await screen.findByRole("dialog", { name: "Empty the trash?" });
+    expect(within(dialog).getByText(/^This can't be undone\. More than 1 item\. /)).toBeTruthy();
+    expect(dialog.textContent).not.toContain("1 items");
+  });
+});
+
 describe("mobile", () => {
   it("row actions open in a bottom sheet", async () => {
     await openTrash({ [`POST /api/nodes/${REPORT.id}/restore`]: restored(REPORT) }, 390);
@@ -445,10 +663,14 @@ describe("mobile", () => {
   it("a long press selects, and the selection bar offers the two actions", async () => {
     await openTrash({}, 390);
     const row = document.querySelector<HTMLElement>(`[data-item-id="${NOTES.id}"]`)!;
-    const realSetTimeout = globalThis.setTimeout;
+    vi.useFakeTimers();
     fireEvent.pointerDown(row, { pointerType: "touch" });
-    await new Promise((resolve) => realSetTimeout(resolve, 600));
-    await waitFor(() => expect(row.getAttribute("aria-selected")).toBe("true"));
+    // Shorter than a long press: nothing yet.
+    act(() => vi.advanceTimersByTime(400));
+    expect(row.getAttribute("aria-selected")).not.toBe("true");
+    act(() => vi.advanceTimersByTime(200));
+    vi.useRealTimers();
+    expect(row.getAttribute("aria-selected")).toBe("true");
     const bar = document.querySelector<HTMLElement>("[data-selection-bar]")!;
     expect(within(bar).getByRole("button", { name: "Restore" })).toBeTruthy();
     expect(within(bar).getByRole("button", { name: "Delete forever" })).toBeTruthy();

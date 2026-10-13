@@ -2,6 +2,7 @@
 // refresh when another feature says the tree changed.
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { INVALIDATE_WAIT_MS } from "../../../../src/client/features/starred/view-queries";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import { setupShell } from "../shell/helpers";
 import { node, nodeId, RECENT, RECENT_NOW, SEARCH, STARRED, TRASH } from "./fixtures";
@@ -137,10 +138,34 @@ describe("staying fresh: the tree-changed event", () => {
   it("an event of that name without the contract's detail is ignored", async () => {
     const { calls } = await openView("/starred", { "GET /api/starred": STARRED });
     await waitFor(() => expect(rowNames()).toHaveLength(2));
+    vi.useFakeTimers();
     act(() => {
       window.dispatchEvent(new CustomEvent("holdfast:nodes-changed", { detail: { parentIds: "all" } }));
     });
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    // Far past the wait after which a real event is acted on.
+    await act(() => vi.advanceTimersByTimeAsync(INVALIDATE_WAIT_MS * 8));
     expect(requests(calls, "GET", "/api/starred")).toHaveLength(1);
+  });
+
+  it("many events are one round of reads: the wait starts at the first and later ones do not push it back", async () => {
+    const { calls } = await openView("/starred", { "GET /api/starred": STARRED });
+    await waitFor(() => expect(rowNames()).toHaveLength(2));
+    const lists = () => requests(calls, "GET", "/api/starred").length;
+    const usages = () => requests(calls, "GET", "/api/account/usage").length;
+    const before = [lists(), usages()];
+    vi.useFakeTimers();
+    // What an upload of many files does: one event per finished file.
+    for (let index = 0; index < 500; index++) emitNodesChanged([nodeId(21)]);
+    await act(() => vi.advanceTimersByTimeAsync(INVALIDATE_WAIT_MS - 1));
+    for (let index = 0; index < 500; index++) emitNodesChanged([nodeId(21)]);
+    expect([lists(), usages()]).toEqual(before);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect([lists(), usages()]).toEqual([before[0]! + 1, before[1]! + 1]);
+    await act(() => vi.advanceTimersByTimeAsync(INVALIDATE_WAIT_MS * 8));
+    expect([lists(), usages()]).toEqual([before[0]! + 1, before[1]! + 1]);
+    // A later event starts a new round.
+    emitNodesChanged([null]);
+    await act(() => vi.advanceTimersByTimeAsync(INVALIDATE_WAIT_MS));
+    expect([lists(), usages()]).toEqual([before[0]! + 2, before[1]! + 2]);
   });
 });

@@ -8,6 +8,7 @@
 import type { Locator, Page, Route } from "@playwright/test";
 import { signedInUser } from "../setup/auth-fixtures";
 import {
+  node,
   nodeId,
   RECENT,
   RECENT_NOW,
@@ -23,7 +24,15 @@ import {
   USAGE,
   USAGE_AFTER_EMPTY,
 } from "../unit/client/views/fixtures";
-import { expect, expectNoA11yViolations, mockedOnly, mockShell, realOnly, test } from "./fixtures";
+import {
+  expect,
+  expectNoA11yViolations,
+  mockedOnly,
+  mockEnvelope,
+  mockShell,
+  realOnly,
+  test,
+} from "./fixtures";
 
 const DESKTOP_MIN = 1024;
 const TOUCH_ROW = 48;
@@ -367,6 +376,81 @@ test.describe("recent, starred, search, storage", () => {
     await expect(suggestions.getByRole("button")).toHaveText(["report.pdfWork", "reported-bugs.txt"]);
     await suggestions.getByRole("button").first().click();
     await expect(page).toHaveURL(new RegExp(`/preview/${nodeId(31)}$`));
+  });
+});
+
+test.describe("review fixes", () => {
+  test.beforeEach(() => mockedOnly());
+
+  test("a failed next page is asked for ONCE: the rows stay, the list says so, and it waits for 'Try again'", async ({
+    page,
+    origins,
+  }) => {
+    let pageTwo = 0;
+    let fail = true;
+    await mockShell(page, origins.port, { api: (route, path) => viewsApi().api(route, path) });
+    await page.route("**/api/starred**", (route) => {
+      if (new URL(route.request().url()).searchParams.get("cursor") !== "c2") {
+        return route.fulfill({ json: { ...STARRED, nextCursor: "c2" } });
+      }
+      pageTwo += 1;
+      return fail
+        ? route.fulfill({
+            status: 429,
+            headers: { "retry-after": "30" },
+            json: mockEnvelope("rate_limited", "Too many requests."),
+          })
+        : route.fulfill({
+            json: { items: [node(23, { name: "third.pdf", starred: true })], nextCursor: null },
+          });
+    });
+    await page.goto("/starred");
+    const notice = page.locator('[data-list-notice="starred"]');
+    await expect(notice).toContainText("Couldn't load more of this list.");
+    await expect(notice).toContainText("req req-e2e");
+    await expect(rows(page)).toHaveCount(2);
+    // Two seconds with nobody touching the page. It is an ABSENCE that is measured — requests
+    // that must not be made — so there is no event to wait for instead.
+    await page.waitForTimeout(2000);
+    expect(pageTwo, "requests for the page that failed").toBe(1);
+    await expect(rows(page)).toHaveCount(2);
+
+    // The retry is a full-size target and nothing floats over it (on the phone layout the "New"
+    // button sits in that corner).
+    const retry = notice.getByRole("button", { name: "Try again" });
+    if (isMobile(page)) expect(await height(retry)).toBeGreaterThanOrEqual(TOUCH_TARGET);
+    fail = false;
+    await retry.click();
+    await expect(rows(page)).toHaveCount(3);
+    await expect(notice).toHaveCount(0);
+    expect(pageTwo).toBe(2);
+  });
+
+  test("Empty trash goes on when the user leaves the page: the trash shows the same run, then what the server has", async ({
+    page,
+    origins,
+  }) => {
+    const mock = await open(page, origins.port, "/storage", viewsApi({ emptyAnswers: [60, 20], hold: true }));
+    const storage = view(page, "usage");
+    await storage.getByRole("button", { name: "Empty trash" }).click();
+    await page
+      .getByRole("dialog", { name: "Empty the trash?" })
+      .getByRole("button", { name: "Empty trash" })
+      .click();
+    const progress = page.locator("[data-empty-trash-progress]");
+    await expect(progress).toHaveText("Deleting… 60 left");
+
+    await storage.getByRole("link", { name: "Open the trash" }).click();
+    await expect(page).toHaveURL(/\/trash$/);
+    await expect(view(page, "trash")).toBeVisible();
+    await expect(progress).toHaveText("Deleting… 60 left");
+    await expect(page.getByRole("button", { name: "Empty trash" })).toBeDisabled();
+
+    mock.release();
+    await expect(page.getByRole("heading", { name: "Trash is empty" })).toBeVisible();
+    await expect(progress).toHaveText("");
+    await expect(page.getByText("Trash emptied")).toBeVisible();
+    expect(mock.seen.filter((entry) => entry === "DELETE /api/trash")).toHaveLength(3);
   });
 });
 

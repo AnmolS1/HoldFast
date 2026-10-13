@@ -1,16 +1,29 @@
 // The search page and the header's suggestions.
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SearchSuggestions } from "../../../../src/client/features/search";
 import { DEBOUNCE_MS } from "../../../../src/client/features/search/queries";
 import { redactCrumbOrDrop, redactOrDrop } from "../../../../src/client/lib/sentry";
 import { MIME_CATEGORIES } from "../../../../src/shared/constants";
 import { SearchResponse } from "../../../../src/shared/schemas/search";
-import { renderShell, setupShell, shellFetch } from "../shell/helpers";
+import { viewKeys } from "../../../../src/client/features/starred/view-queries";
+import { queryClient, sessionQuery } from "../../../../src/client/lib/query";
+import { renderShell, sessionOf, setupShell, shellFetch, type MockHandler } from "../shell/helpers";
 import { nodeId, result, SEARCH, SEARCH_NONE, SEARCH_PDF } from "./fixtures";
-import { answering, json, openView, queryOf, requests, rowNames } from "./helpers";
+import {
+  answering,
+  deferred,
+  envelope,
+  json,
+  openView,
+  pathOf,
+  queryOf,
+  requests,
+  rowNames,
+} from "./helpers";
 
 setupShell();
+afterEach(() => vi.useRealTimers());
 
 const input = () => document.querySelector<HTMLInputElement>("[data-search-input]")!;
 const typeMenu = () => document.querySelector<HTMLSelectElement>("[data-search-type]")!;
@@ -119,6 +132,54 @@ describe("/search", () => {
     expect(input().value).toBe("repo");
   });
 
+  it("keys typed while the address is still catching up are kept (a slow session re-check on the way)", async () => {
+    const session = deferred<Response>();
+    let hold = false;
+    const { calls, router } = await openView("/search", {
+      "GET /api/search": SEARCH,
+      "GET /api/auth/get-session": () => (hold ? session.promise : undefined),
+    });
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Search your files" })).toBeTruthy());
+    // The frame's guard reads the session again on every address change once it is stale.
+    await queryClient.invalidateQueries({ queryKey: sessionQuery.queryKey, refetchType: "none" });
+    hold = true;
+    fireEvent.change(input(), { target: { value: "rep" } });
+    // The pause has passed and the page's write is on its way — not landed.
+    await waitFor(() => expect(router.state.navigation.state).toBe("loading"));
+    expect(router.state.location.search).toBe("");
+    fireEvent.change(input(), { target: { value: "repo" } });
+    fireEvent.change(input(), { target: { value: "repor" } });
+    session.resolve(json(sessionOf({ timezone: "UTC" })));
+    await waitFor(() => expect(router.state.location.search).toBe("?q=repor"));
+    expect(input().value).toBe("repor");
+    await waitFor(() => expect(searches(calls).at(-1)).toEqual({ q: "repor", scope: "all" }));
+    expect(input().value).toBe("repor");
+  });
+
+  it("an address somebody else changed still wins over the box: the header's search, back", async () => {
+    const { router } = await openView("/search?q=report", { "GET /api/search": SEARCH });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    fireEvent.change(input(), { target: { value: "report 2026" } });
+    await waitFor(() => expect(router.state.location.search).toBe("?q=report+2026"));
+    // The header submits another search while the box holds text.
+    fireEvent.change(input(), { target: { value: "report 2026 draft" } });
+    await act(() => router.navigate("/search?q=tax"));
+    await waitFor(() => expect(input().value).toBe("tax"));
+    expect(router.state.location.search).toBe("?q=tax");
+    // Back: the address of that entry, not what the box last held.
+    fireEvent.change(input(), { target: { value: "taxes" } });
+    await act(() => router.navigate(-1));
+    await waitFor(() => expect(input().value).toBe("report 2026"));
+  });
+
+  it("one result loaded and more to come is 'More than 1 result'", async () => {
+    await openView("/search?q=report", {
+      "GET /api/search": { items: [SEARCH.items[0]], nextCursor: "next" },
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(1));
+    expect(document.querySelector("[data-search-count]")!.textContent).toBe("More than 1 result");
+  });
+
   it("fewer than two characters asks nothing and shows the prompt", async () => {
     const { calls } = await openView("/search?q=t", { "GET /api/search": SEARCH });
     await waitFor(() => expect(screen.getByRole("heading", { name: "Search your files" })).toBeTruthy());
@@ -163,7 +224,10 @@ describe("/search", () => {
       for (const call of spy.mock.calls) expect(JSON.stringify(call)).not.toContain("secretword");
   });
 
-  it("q never reaches an error report: the address and the request lose their query in a breadcrumb or an event", () => {
+  // A pin of the SHELL's redaction, which this page relies on: nothing in this feature can make
+  // it fail. It is here so that a change to the redaction that lets a query string through is
+  // seen where the query that matters is typed.
+  it("the shell's redaction, relied on here: the address and the request lose their query in a breadcrumb or an event", () => {
     // What the SDK records for the page's own navigation and for its request, passed through the
     // same function `beforeBreadcrumb` / `beforeSend` use.
     const crumbs = [
@@ -218,21 +282,39 @@ describe("SearchSuggestions (the header's slot)", () => {
     expect(onPick).toHaveBeenCalledWith(nodeId(41));
   });
 
-  it.each([
-    ["one character", "t", SEARCH],
-    ["no match", "zzzz", SEARCH_NONE],
-  ])("renders nothing: %s", async (_name, query, answer) => {
-    shellFetch({ extra: answering({ "GET /api/search": answer }) });
-    const { container } = renderShell(<SearchSuggestions query={query} onPick={() => {}} />);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+  it("one character: asks nothing and renders nothing", async () => {
+    const calls = shellFetch({ extra: answering({ "GET /api/search": SEARCH }) });
+    vi.useFakeTimers();
+    const { container } = renderShell(<SearchSuggestions query="t" onPick={() => {}} />);
+    await act(() => vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 8));
+    expect(requests(calls, "GET", "/api/search")).toEqual([]);
     expect(container.innerHTML).toBe("");
   });
 
-  it("renders nothing, and throws nothing, when the request fails", async () => {
-    const calls = shellFetch({ extra: () => undefined });
-    const { container } = renderShell(<SearchSuggestions query="tax" onPick={() => {}} />);
-    await waitFor(() => expect(requests(calls, "GET", "/api/search")).toHaveLength(1));
-    await new Promise((resolve) => setTimeout(resolve, 20));
+  it("no match: renders nothing once the answer is in", async () => {
+    const calls = shellFetch({ extra: answering({ "GET /api/search": SEARCH_NONE }) });
+    const { container } = renderShell(<SearchSuggestions query="zzzz" onPick={() => {}} />);
+    await waitFor(() =>
+      expect(queryClient.getQueryState(viewKeys.suggestions("zzzz"))?.status).toBe("success"),
+    );
+    expect(requests(calls, "GET", "/api/search")).toHaveLength(1);
     expect(container.innerHTML).toBe("");
+  });
+
+  it.each([
+    ["404", () => undefined],
+    ["429", () => envelope("rate_limited", 429)],
+    ["no answer", () => Promise.reject(new TypeError("offline"))],
+  ])("the request fails (%s): renders nothing, throws nothing, and is asked ONCE", async (_name, failure) => {
+    const calls = shellFetch({
+      extra: (call) => (pathOf(call) === "/api/search" ? (failure() as ReturnType<MockHandler>) : undefined),
+    });
+    const view = renderShell(<SearchSuggestions query="tax" onPick={() => {}} />);
+    await waitFor(() => expect(queryClient.getQueryState(viewKeys.suggestions("tax"))?.status).toBe("error"));
+    expect(view.container.innerHTML).toBe("");
+    // Re-rendering asks nothing again: no scroll trigger, no retry of an answered request.
+    view.rerender(<SearchSuggestions query="tax" onPick={() => {}} />);
+    view.rerender(<SearchSuggestions query="tax" onPick={() => {}} />);
+    expect(requests(calls, "GET", "/api/search")).toHaveLength(1);
   });
 });
