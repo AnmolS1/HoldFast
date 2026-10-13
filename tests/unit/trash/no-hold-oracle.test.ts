@@ -6,6 +6,7 @@
 // and the number of SQL statements sent before the answer existed.
 import { afterEach, describe, expect, it } from "vitest";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
+import { countTrash } from "../../../src/worker/db/queries/trash-jobs";
 import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
@@ -124,6 +125,90 @@ describe.each(CAUSES)("%s", (_name, hold) => {
     expect(shape(lists[0]!)).toEqual(shape(lists[1]!));
     expect(lists[0]!.body).toEqual({ items: [], nextCursor: null });
   });
+});
+
+describe("a file trashed on its own inside a folder that is then deleted for good", () => {
+  let restoreClock: Record<string, string> | undefined;
+  afterEach(() => {
+    restoreClock = undefined;
+  });
+
+  // The everyday sequence: trash a file, then the folder it was in, then "delete forever" the
+  // folder. Un-held, the folder's whole subtree goes — the file with it. Held, nothing goes; the
+  // file must then be as gone to its owner as the folder is: in the listing and in the count,
+  // not only by id.
+  it.each([
+    ["a legal hold on the folder", (t: Tree) => setNodeLegalHold(testDb(), t.folder.id, true)],
+    [
+      "a sibling under review",
+      async (t: Tree) => {
+        const sibling = await makeFile(t.owner.id, t.folder.id, { scanStatus: "clean" });
+        await setNode(sibling.id, { scanStatus: "under_review" });
+      },
+    ],
+    [
+      "an open notice on a sibling",
+      async (t: Tree) => {
+        const sibling = await makeFile(t.owner.id, t.folder.id, { scanStatus: "clean" });
+        await openNoticeOn(sibling.id);
+      },
+    ],
+  ] as const)(
+    "held by %s: the listing, the count and every by-id answer are an un-held twin's",
+    async (_n, hold) => {
+      const run = async (protect: ((t: Tree) => Promise<unknown>) | null) => {
+        const t = await tree();
+        const other = await makeFile(t.owner.id, null, { scanStatus: "clean" });
+        if (protect) await protect(t);
+        await api(t.caller, `/nodes/${t.file.id}/trash`, POST);
+        await api(t.caller, `/nodes/${t.folder.id}/trash`, POST);
+        await api(t.caller, `/nodes/${other.id}/trash`, POST);
+        const before = await api(t.caller, "/trash");
+        const deleted = await api(t.caller, `/nodes/${t.folder.id}`, DELETE);
+        const after = await api(t.caller, "/trash");
+        const ids = (answer: Answer) =>
+          (answer.body as { items: { id: string }[] }).items.map((item) =>
+            item.id === t.file.id
+              ? "file"
+              : item.id === t.folder.id
+                ? "folder"
+                : item.id === other.id
+                  ? "other"
+                  : item.id,
+          );
+        return {
+          t,
+          seen: {
+            before: ids(before),
+            deleted: [deleted.status, deleted.body],
+            after: ids(after),
+            count: await countTrash(testDb(), t.owner.id),
+            restoreFile: shape(await api(t.caller, `/nodes/${t.file.id}/restore`, POST)),
+            deleteFile: shape(await api(t.caller, `/nodes/${t.file.id}`, DELETE)),
+            listing: [after.status, after.headers, after.statements],
+          },
+        };
+      };
+      const held = await run(hold);
+      const free = await run(null);
+      expect(free.seen.before).toEqual(["other", "folder", "file"]);
+      expect(free.seen.after).toEqual(["other"]);
+      expect(free.seen.count).toBe(1);
+      expect(held.seen).toEqual(free.seen);
+      // The held folder and the file in it are all still there; the twin's are not.
+      expect(await nodeById(held.t.folder.id)).not.toBeNull();
+      expect(await nodeById(held.t.file.id)).not.toBeNull();
+      expect(await nodeById(free.t.file.id)).toBeNull();
+
+      // Emptying the trash afterwards, one root a request: the same countdown for both.
+      restoreClock = { "x-holdfast-test-now": new Date(Date.now() - 60_000).toISOString() };
+      const empty = async (t: Tree) => {
+        const answer = await api(t.caller, "/trash", { ...DELETE, headers: restoreClock });
+        return [answer.status, answer.body];
+      };
+      expect(await empty(held.t)).toEqual(await empty(free.t));
+    },
+  );
 });
 
 describe("a restore out of a trashed folder that protects the file", () => {

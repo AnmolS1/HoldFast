@@ -24,6 +24,7 @@ import {
   user,
 } from "../schema";
 import { nodeProtected, userHeld } from "./holds";
+import { notPurgeRequested } from "./trash";
 import { lockOwnerTree, notEffectivelyHidden } from "./tree";
 import { COMPLETING_STALE_MINUTES } from "./uploads";
 import { markStarted } from "./user-purge";
@@ -50,17 +51,13 @@ export async function requestPurge(db: Executor, rootIds: readonly string[]): Pr
 /**
  * True when the node, or a folder above it, is a root whose purge was requested. To its owner
  * such a node is gone — it answers as a purged one does. False for an id that does not exist.
- * One statement, whatever the answer.
+ * One statement, whatever the answer; the test is `trash.notPurgeRequested`, the listing's own.
  */
 export async function purgeWasRequested(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
   const result = await db.execute<{ requested: boolean }>(sql`
-    WITH RECURSIVE up(id, parent_id, purge_requested_at) AS (
-      SELECT n.id, n.parent_id, n.purge_requested_at FROM nodes n WHERE n.id = ${nodeId}
-      UNION ALL
-      SELECT p.id, p.parent_id, p.purge_requested_at FROM nodes p JOIN up ON p.id = up.parent_id
-    ) CYCLE id SET is_cycle USING path
-    SELECT EXISTS (SELECT 1 FROM up WHERE purge_requested_at IS NOT NULL) AS requested`);
+    SELECT EXISTS (
+      SELECT 1 FROM nodes n WHERE n.id = ${nodeId} AND NOT ${notPurgeRequested("n")}) AS requested`);
   return result.rows[0]?.requested === true;
 }
 
@@ -112,7 +109,7 @@ export async function countTrash(db: Executor, ownerId: string): Promise<number>
         eq(nodes.ownerId, ownerId),
         eq(nodes.trashedRoot, true),
         isNotNull(nodes.deletedAt),
-        isNull(nodes.purgeRequestedAt),
+        notPurgeRequested(),
         isNull(nodes.system),
         notEffectivelyHidden(),
         sql`${nodes.scanStatus} <> 'suspected_csam'`,

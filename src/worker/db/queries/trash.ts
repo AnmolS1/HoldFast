@@ -138,14 +138,34 @@ export async function restore(
   });
 }
 
+/**
+ * A predicate for a query over `nodes`: neither the row nor any folder above it is a root whose
+ * purge was requested. Such a root is gone as far as its owner can tell — and so is everything
+ * under it, a file that was trashed on its own inside it included: the ONE definition the trash
+ * listing, its count and the by-id routes share, so that they cannot disagree about it.
+ * `alias` is the SQL name the outer query gives the table (inside, `pr`, `prp` and `asked_up`
+ * are taken). One walk up `parent_id` by primary key per row it is asked about.
+ */
+export function notPurgeRequested(alias: string = "nodes"): SQL {
+  const t = sql.identifier(alias);
+  return sql`(${t}.purge_requested_at IS NULL AND NOT EXISTS (
+    WITH RECURSIVE asked_up(id, parent_id, purge_requested_at) AS (
+      SELECT pr.id, pr.parent_id, pr.purge_requested_at FROM nodes pr WHERE pr.id = ${t}.parent_id
+      UNION ALL
+      SELECT prp.id, prp.parent_id, prp.purge_requested_at
+      FROM nodes prp JOIN asked_up ON prp.id = asked_up.parent_id
+    ) CYCLE id SET is_cycle USING path
+    SELECT 1 FROM asked_up WHERE purge_requested_at IS NOT NULL))`;
+}
+
 type TrashCursor = { at: string; id: string };
 const isTrashCursor = (v: unknown): v is TrashCursor =>
   !!v && typeof v === "object" && isCursorTimestamp((v as TrashCursor).at) && isUuid((v as TrashCursor).id);
 
 /**
  * The owner's trashed roots, most recently trashed first. Never a root whose purge was
- * requested (it is hidden until the hold lifts), a system node, a node that is taken down —
- * itself or by an ancestor — or `suspected_csam`.
+ * requested (it is hidden until the hold lifts) or one that lies under such a root, a system
+ * node, a node that is taken down — itself or by an ancestor — or `suspected_csam`.
  */
 export async function listTrash(
   db: Executor,
@@ -158,7 +178,7 @@ export async function listTrash(
     eq(nodes.ownerId, ownerId),
     eq(nodes.trashedRoot, true),
     isNotNull(nodes.deletedAt),
-    isNull(nodes.purgeRequestedAt),
+    notPurgeRequested(),
     isNull(nodes.system),
     notEffectivelyHidden(),
     sql`${nodes.scanStatus} <> 'suspected_csam'`,
