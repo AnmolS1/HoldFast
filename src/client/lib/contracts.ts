@@ -74,3 +74,35 @@ export function registerUserStatePurger(purger: UserStatePurger): () => void {
 export async function runUserStatePurgers(): Promise<void> {
   await Promise.allSettled(Array.from(userStatePurgers, async (purger) => purger()));
 }
+
+// ---------------------------------------------------------------------------------------------
+// "The tree changed" — the one event features use to tell each other, since no feature imports
+// another. Whoever creates, renames, moves, trashes, restores, deletes or uploads emits it after
+// the change is saved; every feature that shows nodes listens and invalidates its OWN queries.
+
+export const NODES_CHANGED_EVENT = "holdfast:nodes-changed";
+
+/** The folders whose direct children changed; `null` is the top level. */
+export interface NodesChangedDetail {
+  parentIds: (string | null)[];
+}
+
+// The browser's `window`, named through `globalThis`: this module is also type-checked for the
+// Workers runtime (a contract test imports it), whose types have no `window`.
+const bus = (): EventTarget => globalThis as unknown as EventTarget;
+
+/** Tell every listener that the children of these folders changed. */
+export function emitNodesChanged(parentIds: (string | null)[]): void {
+  bus().dispatchEvent(new CustomEvent<NodesChangedDetail>(NODES_CHANGED_EVENT, { detail: { parentIds } }));
+}
+
+/** Listen for tree changes; returns the function that stops listening. */
+export function onNodesChanged(handler: (detail: NodesChangedDetail) => void): () => void {
+  const listener = (event: Event) => {
+    const detail = (event as CustomEvent<NodesChangedDetail | undefined>).detail;
+    // An event of this name that does not carry the contract's detail is not one of ours.
+    if (Array.isArray(detail?.parentIds)) handler(detail);
+  };
+  bus().addEventListener(NODES_CHANGED_EVENT, listener);
+  return () => bus().removeEventListener(NODES_CHANGED_EVENT, listener);
+}
