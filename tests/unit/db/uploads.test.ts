@@ -13,9 +13,9 @@ import {
   openBytes,
   trimFinished,
 } from "../../../src/worker/db/queries/uploads";
-import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
+import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { uploadParts, uploads } from "../../../src/worker/db/schema";
-import { makeFile, makeFolder, makeUpload, makeUser, openDb, rand } from "./_helpers";
+import { makeFile, makeFolder, makeUpload, makeUser, openDb, protectedFiles, rand } from "./_helpers";
 
 let db: Db;
 let close: () => Promise<void>;
@@ -241,43 +241,46 @@ describe("expired and trimFinished", () => {
     expect(await db.select().from(uploads).where(inArray(uploads.id, batch))).toHaveLength(1);
   });
 
-  it("trimFinished keeps the finished sessions of a held owner, a held uploader and a held node; the count is of rows actually deleted", async () => {
-    // An age no other row in the (shared) database has, so the count below is exact.
+  it("trimFinished keeps a finished session while its owner or uploader is held or its node is one the purge gate protects; the count is of rows actually deleted", async () => {
+    // An age no other row in the (shared) database has, so the counts below are exact.
     const days = 10_000 + Math.floor(Math.random() * 100_000);
     const ended = new Date(Date.now() - days * 86_400_000 - 43_200_000);
-    const held = await makeUser(db);
+    const held = await makeUser(db, { legalHold: true });
     const free = await makeUser(db);
     const other = await makeUser(db);
-    await setUserLegalHold(db, held, true);
-    const heldFile = await makeFile(db, free, null, `held-${rand()}.bin`, { legalHold: true });
-    const done = (ownerId: string, uploaderId: string, nodeId?: string) =>
-      makeUpload(db, ownerId, uploaderId, {
-        status: "done",
-        completedAt: ended,
-        ...(nodeId ? { nodeId } : {}),
-      });
-    const ofHeldOwner = await done(held, held);
-    const byHeldUploader = await done(free, held);
-    const intoHeldOwner = await done(held, other);
-    const ofHeldNode = await done(free, free, heldFile.id);
-    // The control: the same row for a user who is not held.
-    const ofFree = await done(free, free);
-    const ids = [ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id, ofHeldNode.id, ofFree.id];
-    const left = async () =>
-      (await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids)))
-        .map((u) => u.id)
-        .sort();
+    const { files } = await protectedFiles(db);
+    const done = async (ownerId: string, uploaderId: string, nodeId?: string) =>
+      (
+        await makeUpload(db, ownerId, uploaderId, {
+          status: "done",
+          completedAt: ended,
+          ...(nodeId ? { nodeId } : {}),
+        })
+      ).id;
+    // Per cause of the gate: a session of un-held people that wrote the protected file.
+    const kept: Record<string, string> = {};
+    for (const [cause, { node }] of Object.entries(files)) kept[cause] = await done(free, other, node.id);
+    kept.owner_held = await done(held, other);
+    kept.uploader_held = await done(free, held);
+    // The control: the same row with nobody and nothing held.
+    const control = await done(free, other);
+    const present = async (id: string) =>
+      (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
 
     expect(await trimFinished(db, days)).toBe(1);
-    expect(await left()).toEqual([ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id, ofHeldNode.id].sort());
+    expect(await present(control)).toBe(false);
+    for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
     expect(await trimFinished(db, days)).toBe(0);
 
-    // Released one at a time, each goes on the next call.
-    await setNodeLegalHold(db, heldFile.id, false);
-    expect(await trimFinished(db, days)).toBe(1);
-    expect(await left()).toEqual([ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id].sort());
+    // Each cause lifted, exactly its session goes on the next call.
+    for (const [cause, { release }] of Object.entries(files)) {
+      await release();
+      expect(await trimFinished(db, days), cause).toBe(1);
+      expect(await present(kept[cause]!), cause).toBe(false);
+    }
     await setUserLegalHold(db, held, false);
-    expect(await trimFinished(db, days)).toBe(3);
-    expect(await left()).toEqual([]);
+    expect(await trimFinished(db, days)).toBe(2);
+    expect(await present(kept.owner_held!)).toBe(false);
+    expect(await present(kept.uploader_held!)).toBe(false);
   });
 });

@@ -10,7 +10,7 @@ import { and, eq, gt, inArray, isNull, lt, lte, ne, not, or, sql, type SQL } fro
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Upload, uploadParts, uploads, user } from "../schema";
-import { nodeHeld, userHeld } from "./holds";
+import { nodeProtected, userHeld } from "./holds";
 
 /** A `completing` session older than this is considered abandoned by its request. */
 export const COMPLETING_STALE_MINUTES = 60;
@@ -162,7 +162,9 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
 /**
  * Deletes finished (`done` / `aborted`) sessions that ended more than `olderThanDays` ago, at
  * most `limit` per call. Returns how many were deleted.
- * A session is kept while its owner or its uploader is on legal hold, or the node it wrote is.
+ * A session is kept while its owner or its uploader is on legal hold, or while the node it wrote
+ * is one the purge gate protects (queries/holds.ts: a hold, `under_review`, `suspected_csam`, an
+ * open notice).
  */
 export async function trimFinished(
   db: Executor,
@@ -181,7 +183,7 @@ export async function trimFinished(
         ),
         not(userHeld(sql`${uploads.ownerId}`)),
         not(userHeld(sql`${uploads.uploaderId}`)),
-        not(nodeHeld(sql`${uploads.nodeId}`)),
+        not(nodeProtected(sql`${uploads.nodeId}`)),
       ),
     )
     .limit(limit);

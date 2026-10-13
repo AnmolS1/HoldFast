@@ -4,9 +4,13 @@
 // counts a whole table.
 
 import { randomBytes } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { type Db, createDb } from "../../../src/worker/db/client";
+import type { HoldCause } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import {
+  dmcaNoticeNodes,
+  dmcaNotices,
   type Node,
   nodes,
   type PauseReason,
@@ -190,4 +194,56 @@ export async function rejection(promise: Promise<unknown>): Promise<unknown> {
     return error;
   }
   throw new Error("expected the promise to reject, but it resolved");
+}
+
+/**
+ * One file per cause of the purge gate (`HoldCause`), each protected for that cause ALONE, with
+ * the way to lift it. The record is keyed by the cause type: a new cause does not compile until
+ * it has its fixture here — and with it a row in every test that walks this record.
+ * `owner` owns all of them except the `owner_legal_hold` file, whose owner is the held account.
+ */
+export async function protectedFiles(
+  db: Db,
+): Promise<{ owner: string; files: Record<HoldCause, { node: Node; release: () => Promise<void> }> }> {
+  const owner = await makeUser(db);
+  const heldOwner = await makeUser(db, { legalHold: true });
+  const file = (ownerId: string, cause: string, overrides: Partial<typeof nodes.$inferInsert> = {}) =>
+    makeFile(db, ownerId, null, `${cause}-${rand()}.bin`, overrides);
+  const setNode = (id: string, values: Partial<typeof nodes.$inferInsert>) => async () => {
+    await db.update(nodes).set(values).where(eq(nodes.id, id));
+  };
+
+  const nodeHold = await file(owner, "node_legal_hold", { legalHold: true });
+  const ownerHold = await file(heldOwner, "owner_legal_hold");
+  const underReview = await file(owner, "under_review", { scanStatus: "under_review" });
+  const suspected = await file(owner, "suspected_csam", { scanStatus: "suspected_csam" });
+  const noticed = await file(owner, "open_notice");
+  const [notice] = await db
+    .insert(dmcaNotices)
+    .values({ receivedVia: "form", status: "actioned" })
+    .returning();
+  await db
+    .insert(dmcaNoticeNodes)
+    .values({ noticeId: notice!.id, nodeId: noticed.id, nodeName: noticed.name });
+
+  return {
+    owner,
+    files: {
+      node_legal_hold: { node: nodeHold, release: setNode(nodeHold.id, { legalHold: false }) },
+      owner_legal_hold: {
+        node: ownerHold,
+        release: async () => {
+          await db.update(user).set({ legalHold: false }).where(eq(user.id, heldOwner));
+        },
+      },
+      under_review: { node: underReview, release: setNode(underReview.id, { scanStatus: "clean" }) },
+      suspected_csam: { node: suspected, release: setNode(suspected.id, { scanStatus: "clean" }) },
+      open_notice: {
+        node: noticed,
+        release: async () => {
+          await db.update(dmcaNotices).set({ status: "closed" }).where(eq(dmcaNotices.id, notice!.id));
+        },
+      },
+    },
+  };
 }

@@ -16,6 +16,7 @@ import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { type HoldCause, isUniqueViolation, LegalHoldError, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import { type Node, nodes, nodeVersions, uploads, user } from "../schema";
+import { anyHoldCause, holdCauses } from "./holds";
 import { effectiveTrashed, notEffectivelyHidden } from "./tree";
 
 export { LegalHoldError };
@@ -162,18 +163,13 @@ export async function listTrash(
   };
 }
 
-/** An open DMCA notice names the node aliased `n` (the same test as `assertPurgeable`). */
-const OPEN_NOTICE_ON_N = sql`EXISTS (
-  SELECT 1 FROM dmca_notice_nodes dn JOIN dmca_notices d ON d.id = dn.notice_id
-  WHERE dn.node_id = n.id AND d.status IN ('received', 'incomplete', 'actioned', 'counter_received'))`;
-
 /**
- * What `assertPurgeable` would refuse because of the node aliased `n` ITSELF or its owner `u`.
+ * What `assertPurgeable` would refuse because of the node aliased `n` ITSELF or its owner `u` —
+ * the gate's own causes (queries/holds.ts), not a copy of them.
  * The gate stays the authority (it also looks inside the subtree, under locks); this only keeps
  * rows that cannot be purged now out of the queues, so they cannot fill a batch.
  */
-const HELD_AT_N = sql`(u.legal_hold OR n.legal_hold
-  OR n.scan_status IN ('under_review', 'suspected_csam') OR ${OPEN_NOTICE_ON_N})`;
+const HELD_AT_N = anyHoldCause(sql`n`, sql`u`);
 
 /**
  * Roots the purge job should try now: trashed roots past `purgeAfter`, and every root whose
@@ -238,6 +234,9 @@ export async function versionsDue(
 
 // ── the purge gate ──────────────────────────────────────────────────────────────────────────
 
+/** The causes in the order a `LegalHoldError` lists them. */
+const HOLD_CAUSES = Object.keys(holdCauses(sql`n`, sql`u`)) as HoldCause[];
+
 /**
  * The single gate for permanent deletion. A root is HELD when any node in its subtree
  *   - has `legalHold`,
@@ -250,28 +249,20 @@ export async function versionsDue(
 export async function assertPurgeable(tx: Executor, rootIds: readonly string[]): Promise<void> {
   const ids = [...new Set(rootIds.filter(isUuid))];
   if (ids.length === 0) return;
-  const result = await tx.execute<{
-    root_id: string;
-    node_hold: boolean;
-    owner_hold: boolean;
-    under_review: boolean;
-    suspected_csam: boolean;
-    open_notice: boolean;
-  }>(sql`
+  // The causes are the shared definition (queries/holds.ts): one column per cause, by its name.
+  const causeColumns = sql.join(
+    Object.entries(holdCauses(sql`n`, sql`u`)).map(
+      ([cause, test]) => sql`bool_or(${test}) AS ${sql.identifier(cause)}`,
+    ),
+    sql`, `,
+  );
+  const result = await tx.execute<{ root_id: string } & Record<HoldCause, boolean>>(sql`
     WITH RECURSIVE sub(root_id, id) AS (
       SELECT n.id, n.id FROM nodes n WHERE n.id = ANY(${uuidArray(ids)})
       UNION ALL
       SELECT sub.root_id, c.id FROM nodes c JOIN sub ON c.parent_id = sub.id
     ) CYCLE root_id, id SET is_cycle USING path
-    SELECT sub.root_id,
-           bool_or(n.legal_hold) AS node_hold,
-           bool_or(u.legal_hold) AS owner_hold,
-           bool_or(n.scan_status = 'under_review') AS under_review,
-           bool_or(n.scan_status = 'suspected_csam') AS suspected_csam,
-           bool_or(EXISTS (
-             SELECT 1 FROM dmca_notice_nodes dn JOIN dmca_notices d ON d.id = dn.notice_id
-             WHERE dn.node_id = n.id AND d.status IN ('received', 'incomplete', 'actioned', 'counter_received')
-           )) AS open_notice
+    SELECT sub.root_id, ${causeColumns}
     FROM sub
     JOIN nodes n ON n.id = sub.id
     JOIN "user" u ON u.id = n.owner_id
@@ -279,12 +270,7 @@ export async function assertPurgeable(tx: Executor, rootIds: readonly string[]):
     GROUP BY sub.root_id`);
   const causes: Record<string, HoldCause[]> = {};
   for (const row of result.rows) {
-    const found: HoldCause[] = [];
-    if (row.node_hold) found.push("node_legal_hold");
-    if (row.owner_hold) found.push("owner_legal_hold");
-    if (row.under_review) found.push("under_review");
-    if (row.suspected_csam) found.push("suspected_csam");
-    if (row.open_notice) found.push("open_notice");
+    const found = HOLD_CAUSES.filter((cause) => row[cause] === true);
     if (found.length > 0) causes[row.root_id] = found;
   }
   if (Object.keys(causes).length > 0) throw new LegalHoldError(causes);

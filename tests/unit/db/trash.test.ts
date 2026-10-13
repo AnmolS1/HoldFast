@@ -1,8 +1,9 @@
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { LegalHoldError, QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
+import { holdCauses, nodeProtected } from "../../../src/worker/db/queries/holds";
 import { closeNotice, restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
 import { getNode, OWNER_VISIBLE_STATUSES, listChildren } from "../../../src/worker/db/queries/nodes";
 import { release } from "../../../src/worker/db/queries/quota";
@@ -39,6 +40,7 @@ import {
   makeUpload,
   makeUser,
   openDb,
+  protectedFiles,
   rand,
   rejection,
 } from "./_helpers";
@@ -455,6 +457,31 @@ describe("assertPurgeable: each hold cause", () => {
       const [notice] = await db.insert(dmcaNotices).values({ receivedVia: "form", status }).returning();
       await db.insert(dmcaNoticeNodes).values({ noticeId: notice!.id, nodeId: t.deep.id });
       await expect(assertPurgeable(db, [t.root.id]), status).resolves.toBeUndefined();
+    }
+  });
+
+  it("the gate and the retention predicate are ONE definition: for each cause a file the gate refuses is `nodeProtected`, and one with no cause is neither", async () => {
+    const isProtected = async (nodeId: string) =>
+      (await db.execute<{ kept: boolean }>(sql`SELECT ${nodeProtected(sql`${nodeId}::uuid`)} AS kept`))
+        .rows[0]!.kept;
+    const { owner, files } = await protectedFiles(db);
+    // Every cause the definition knows has a fixture (a sixth cannot be added to one side only).
+    expect(Object.keys(files).sort()).toEqual(Object.keys(holdCauses(sql`n`, sql`u`)).sort());
+    expect(Object.keys(files)).toHaveLength(5);
+
+    const plain = await makeFile(db, owner, null, `plain-${rand()}.bin`);
+    await expect(assertPurgeable(db, [plain.id])).resolves.toBeUndefined();
+    expect(await isProtected(plain.id)).toBe(false);
+    expect(await isProtected(uuidv7())).toBe(false);
+
+    for (const [cause, { node, release }] of Object.entries(files)) {
+      const error = await held(assertPurgeable(db, [node.id]));
+      expect(error.causes[node.id], cause).toEqual([cause]);
+      expect(await isProtected(node.id), cause).toBe(true);
+      // The cause lifted: neither refuses.
+      await release();
+      await expect(assertPurgeable(db, [node.id]), cause).resolves.toBeUndefined();
+      expect(await isProtected(node.id), cause).toBe(false);
     }
   });
 
