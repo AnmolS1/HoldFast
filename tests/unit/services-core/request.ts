@@ -10,28 +10,10 @@ import { env } from "cloudflare:workers";
 import { Hono, type Context } from "hono";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo, SessionUser } from "../../../src/worker/auth/types";
-import type { Tx } from "../../../src/worker/db/client";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import type { AppEnv, CoreDeps } from "../../../src/worker/services/request-context";
-import {
-  ceilingExceeded,
-  consumeCeiling,
-  type Amount,
-  type CeilingResult,
-  type CeilingSubject,
-  type LedgerOnlyKind,
-} from "../../../src/worker/services/ceilings";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 import { realCore } from "../auth/helpers";
-
-// Both forms of `consumeCeiling` as one signature, for the helper at the end of this file.
-const consumeAny = consumeCeiling as (
-  c: Context<AppEnv>,
-  kind: LedgerOnlyKind | "link_user",
-  subject: CeilingSubject,
-  amount: Amount,
-  opts?: { tx: Tx },
-) => Promise<CeilingResult>;
 
 export type Caller = { user: SessionUser; impersonatedBy?: string } | null;
 
@@ -155,13 +137,4 @@ export async function value<T>(
   const invoked = await invoke(caller, work, options);
   if (!invoked.ok) throw new Error(`the request failed: ${invoked.status} ${invoked.error}`);
   return invoked.value;
-}
-
-/**
- * `consumeCeiling` the way a route uses it: look at the answer, and throw the 429 on a refusal.
- * (`consumeCeiling` itself ANSWERS; a caller that did not look would have enforced nothing.)
- */
-export async function consumeOrThrow(...args: Parameters<typeof consumeAny>): Promise<void> {
-  const result = await consumeAny(...args);
-  if (!result.ok) throw ceilingExceeded(result);
 }

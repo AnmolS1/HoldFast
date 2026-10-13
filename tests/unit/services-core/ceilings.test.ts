@@ -10,6 +10,7 @@ import { shareLinks } from "../../../src/worker/db/schema";
 import {
   CEILING_KINDS,
   checkCeiling,
+  consumeCeiling,
   effectiveLimits,
   recordUsage,
   type CeilingKind,
@@ -17,7 +18,7 @@ import {
 } from "../../../src/worker/services/ceilings";
 import { makeLink } from "../auth/helpers";
 import { makeFolder, makeUpload, makeUser, rand, testDb } from "./helpers";
-import { consumeOrThrow, invoke, value, type InvokeOptions } from "./request";
+import { invoke, value, type InvokeOptions } from "./request";
 
 const NOW = new Date("2026-10-12T12:00:00.000Z");
 const OLD = { quotaBytes: 5_000_000_000, createdAt: new Date("2025-01-01T00:00:00.000Z") };
@@ -217,7 +218,8 @@ describe("checkCeiling at the boundary", () => {
       id,
       ...(kase.kind === "download_ip" ? {} : { account: oldAccount }),
     };
-    const amount = (n: number) => ({ [kase.dimension]: n });
+    // The kind is a variable here, so the amount is too: the per-kind types are tested elsewhere.
+    const amount = (n: number) => ({ [kase.dimension]: n }) as never;
     const used = kase.limit - 1;
 
     const seen = await value(
@@ -231,7 +233,7 @@ describe("checkCeiling at the boundary", () => {
           overEmpty,
           exact: await checkCeiling(c, kase.kind, subject, amount(1)),
           over: await checkCeiling(c, kase.kind, subject, amount(2)),
-          nothing: await checkCeiling(c, kase.kind, subject, {}),
+          zero: await checkCeiling(c, kase.kind, subject, amount(0)),
         };
       },
       small,
@@ -251,7 +253,7 @@ describe("checkCeiling at the boundary", () => {
       limit: kase.limit,
       used,
     });
-    expect(seen.nothing).toEqual({ ok: true });
+    expect(seen.zero).toEqual({ ok: true });
   });
 
   it("the ledger subjects are separate: one kind's usage is not another's", async () => {
@@ -260,9 +262,9 @@ describe("checkCeiling at the boundary", () => {
     const seen = await value(
       null,
       async (c) => {
-        for (const kind of ["download_user", "upload_editor", "share_user"] as const) {
-          await recordUsage(c, kind, id, { bytes: 1000, count: 3 });
-        }
+        await recordUsage(c, "download_user", id, { bytes: 1000 });
+        await recordUsage(c, "upload_editor", id, { bytes: 1000 });
+        await recordUsage(c, "share_user", id, { count: 3 });
         return {
           transform: await checkCeiling(c, "transform_user", subject, { count: 3 }),
           link: await checkCeiling(c, "link_user", subject, { count: 3 }),
@@ -306,7 +308,7 @@ describe("checkCeiling at the boundary", () => {
 
   it("a negative or fractional amount is a validation error, never a pass", async () => {
     const subject = { id: subjectId(), account: oldAccount };
-    for (const amount of [{ bytes: -1 }, { count: 1.5 }, { bytes: Number.NaN }, { count: Infinity }]) {
+    for (const amount of [{ bytes: -1 }, { bytes: 1.5 }, { bytes: Number.NaN }, { bytes: Infinity }]) {
       expect(
         await invoke(null, (c) => checkCeiling(c, "download_user", subject, amount), small),
       ).toMatchObject({
@@ -323,7 +325,7 @@ describe("open uploads count", () => {
     const owner = await makeUser();
     const editor = await makeUser();
     const subject = { id: owner.id, account: oldAccount };
-    const check = (amount: { bytes?: number; count?: number }) =>
+    const check = (amount: { bytes: number; count?: number } | { count: number }) =>
       value(null, (c) => checkCeiling(c, "upload_user", subject, amount), small);
 
     // The control: with nothing open the whole limit is free.
@@ -421,7 +423,7 @@ describe("refusals", () => {
     const at = (iso: string): InvokeOptions => ({ ...small, headers: { "x-holdfast-test-now": iso } });
     const refused = await invoke(
       null,
-      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T23:59:30.000Z"),
     );
     expect(refused).toMatchObject({
@@ -433,19 +435,19 @@ describe("refusals", () => {
     expect(refused.headers.get("retry-after")).toBe("30");
     const midday = await invoke(
       null,
-      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T12:00:00.000Z"),
     );
     expect(midday.headers.get("retry-after")).toBe("43200");
     const midnight = await invoke(
       null,
-      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T00:00:00.000Z"),
     );
     expect(midnight.headers.get("retry-after")).toBe("86400");
     // The control: within the limit nothing is thrown.
     expect(
-      await invoke(null, (c) => consumeOrThrow(c, "transform_user", subject, { count: 3 }), small),
+      await invoke(null, (c) => consumeCeiling(c, "transform_user", subject, { count: 3 }), small),
     ).toMatchObject({
       ok: true,
     });
@@ -469,12 +471,12 @@ describe("recordUsage and consumeCeiling", () => {
     const subject = { id: subjectId(), account: oldAccount };
     for (let i = 0; i < 3; i++) {
       expect(
-        await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
+        await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
       ).toMatchObject({
         ok: true,
       });
     }
-    const refused = await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small);
+    const refused = await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small);
     expect(refused).toMatchObject({
       status: 429,
       error: "ceiling_exceeded",
@@ -488,7 +490,7 @@ describe("recordUsage and consumeCeiling", () => {
     const subject = { id: subjectId(), account: oldAccount };
     const results = await Promise.all(
       Array.from({ length: 8 }, () =>
-        invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
+        invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
       ),
     );
     expect(results.filter((result) => result.ok)).toHaveLength(3);

@@ -1,7 +1,7 @@
 // A limit that is read in one statement and acted on in another is not a limit. These tests run
 // requests TOGETHER — real transactions on separate connections, interleaved with gates and the
 // server's own view of who waits for whom, never with a sleep — and hold the ceilings to it.
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import type { Tx } from "../../../src/worker/db/client";
@@ -9,7 +9,7 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import { todayTotals } from "../../../src/worker/db/queries/ledger";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import { lockUser } from "../../../src/worker/db/queries/users";
-import { shareLinks, uploads } from "../../../src/worker/db/schema";
+import { downloadLedger, shareLinks, uploads } from "../../../src/worker/db/schema";
 import * as ceilings from "../../../src/worker/services/ceilings";
 import {
   ceilingExceeded,
@@ -17,13 +17,15 @@ import {
   consumeCeiling,
   enforceUploadCeilings,
   recordUsage,
+  refundUsage,
+  tryConsumeCeiling,
   type CeilingLedgerSubject,
   type CeilingSubject,
 } from "../../../src/worker/services/ceilings";
 import { db, type AppEnv } from "../../../src/worker/services/request-context";
 import { keyFor } from "../../../src/worker/services/storage";
-import { backendPid, gate, makeFolder, makeUser, rand, testDb, untilBlockedBy } from "./helpers";
-import { consumeOrThrow, invoke, value, type InvokeOptions } from "./request";
+import { backendPid, gate, makeFolder, makeUser, rand, serviceDeps, testDb, untilBlockedBy } from "./helpers";
+import { invoke, value, type InvokeOptions } from "./request";
 
 /** Small limits, so that "fits alone, not together" is a handful of units. Quota 0: no scaling. */
 const SMALL: Settings = {
@@ -78,7 +80,7 @@ const linkRow = (nodeId: string, userId: string) => ({
  * have decided before either wrote, and both are admitted.
  */
 async function race(
-  admit: (c: Context<AppEnv>, tx: Tx) => Promise<void>,
+  admit: (c: Context<AppEnv>, tx: Tx) => Promise<unknown>,
   write: (tx: Tx) => Promise<unknown>,
   options: InvokeOptions,
 ) {
@@ -149,20 +151,20 @@ function afterFirstRowLock(tx: Tx, pause: () => Promise<void>): Tx {
   });
 }
 
-describe("consumeCeiling answers; the caller looks", () => {
+describe("tryConsumeCeiling answers; the caller MUST refuse on ok: false", () => {
   it("ok: true means CHARGED; a refusal says what was refused and writes nothing", async () => {
     const subject = { id: subjectId(), account: oldAccount };
     const answers = await value(
       null,
       async (c) => [
-        await consumeCeiling(c, "share_user", subject, { count: 2 }),
-        await consumeCeiling(c, "share_user", subject, { count: 2 }),
-        await consumeCeiling(c, "share_user", subject, { count: 1 }),
-        await consumeCeiling(c, "share_user", subject, { count: 1 }),
+        await tryConsumeCeiling(c, "share_user", subject, { count: 2 }),
+        await tryConsumeCeiling(c, "share_user", subject, { count: 2 }),
+        await tryConsumeCeiling(c, "share_user", subject, { count: 1 }),
+        await tryConsumeCeiling(c, "share_user", subject, { count: 1 }),
       ],
       small,
     );
-    expect(answers[0]).toEqual({ ok: true });
+    expect(answers[0]).toEqual({ ok: true, day: new Date().toISOString().slice(0, 10) });
     expect(answers[1]).toMatchObject({
       ok: false,
       kind: "share_user",
@@ -171,7 +173,7 @@ describe("consumeCeiling answers; the caller looks", () => {
       used: 2,
     });
     expect(answers[1]!.ok === false && answers[1]!.retryAfterSec).toBeGreaterThan(0);
-    expect(answers[2]).toEqual({ ok: true });
+    expect(answers[2]).toMatchObject({ ok: true });
     expect(answers[3]).toMatchObject({ ok: false, used: 3 });
     expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 3 });
   });
@@ -181,7 +183,7 @@ describe("consumeCeiling answers; the caller looks", () => {
     const thrown = await invoke(
       null,
       async (c) => {
-        const result = await consumeCeiling(c, "transform_user", subject, { count: 4 });
+        const result = await tryConsumeCeiling(c, "transform_user", subject, { count: 4 });
         if (!result.ok) throw ceilingExceeded(result);
       },
       { ...small, headers: { "x-holdfast-test-now": "2026-10-12T23:59:30.000Z" } },
@@ -197,10 +199,10 @@ describe("consumeCeiling answers; the caller looks", () => {
 
   it("a bytes-only consume adds no count, and a count-only consume no bytes", async () => {
     const subject = { id: subjectId(), account: oldAccount };
-    await value(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
-    await value(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
+    await value(null, (c) => tryConsumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
+    await value(null, (c) => tryConsumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
     expect(await todayTotals(testDb(), "link", subject.id)).toEqual({ bytes: 200, count: 0 });
-    await value(null, (c) => consumeCeiling(c, "download_link", subject, { count: 1 }), small);
+    await value(null, (c) => tryConsumeCeiling(c, "download_link", subject, { count: 1 }), small);
     expect(await todayTotals(testDb(), "link", subject.id)).toEqual({ bytes: 200, count: 1 });
   });
 
@@ -219,9 +221,9 @@ describe("consumeCeiling answers; the caller looks", () => {
     expect(preview).toMatchObject({ ok: false, dimension: "count" });
     expect(ceilingPoints()).toEqual([]);
 
-    await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 4 }), options);
+    await value(null, (c) => tryConsumeCeiling(c, "share_user", subject, { count: 4 }), options);
     expect(ceilingPoints()).toEqual([["refused", "share_user", "count"]]);
-    await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 3 }), options);
+    await value(null, (c) => tryConsumeCeiling(c, "share_user", subject, { count: 3 }), options);
     expect(ceilingPoints(), "a charge is not a refusal").toHaveLength(1);
 
     await invoke(
@@ -236,6 +238,417 @@ describe("consumeCeiling answers; the caller looks", () => {
       ["refused", "share_user", "count"],
       ["refused", "upload_user", "bytes"],
     ]);
+  });
+});
+
+describe("consumeCeiling throws: a refusal cannot be ignored", () => {
+  it("within the limit it charges and returns the receipt; beyond it, it throws the 429 and charges nothing", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const today = new Date().toISOString().slice(0, 10);
+    expect(await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 2 }), small)).toEqual({
+      day: today,
+    });
+    const refused = await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 2 }), small);
+    expect(refused).toMatchObject({
+      ok: false,
+      status: 429,
+      error: "ceiling_exceeded",
+      details: { kind: "share_user", dimension: "count" },
+    });
+    expect(refused.headers.get("retry-after")).toMatch(/^[1-9]\d*$/);
+    expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 2 });
+  });
+
+  it("a caller that does not look at anything still serves nothing on a refusal", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    let served = 0;
+    // The careless route: consume, then serve. It never inspects a result.
+    const route = (bytes: number) =>
+      invoke(
+        null,
+        async (c) => {
+          await consumeCeiling(c, "download_user", subject, { bytes });
+          served += bytes;
+        },
+        small,
+      );
+    expect(await route(600)).toMatchObject({ ok: true });
+    expect(await route(600)).toMatchObject({ ok: false, status: 429 });
+    expect(served, "the second request did not reach its serve").toBe(600);
+    // The control: the same careless shape over the ANSWERING form serves what was refused.
+    let leaked = 0;
+    await invoke(
+      null,
+      async (c) => {
+        await tryConsumeCeiling(c, "download_user", subject, { bytes: 600 });
+        leaked += 600;
+      },
+      small,
+    );
+    expect(leaked, "which is why the answering form is a separate, named export").toBe(600);
+    expect(await todayTotals(testDb(), "user", subject.id)).toEqual({ bytes: 600, count: 0 });
+  });
+
+  it("the link_user form throws inside the caller's transaction, which then leaves nothing behind", async () => {
+    const user = await makeUser();
+    const folder = await makeFolder(user.id);
+    const subject = { id: user.id, account: oldAccount };
+    const create = () =>
+      invoke(
+        null,
+        (c) =>
+          db(c).transaction(async (tx) => {
+            await tx.insert(shareLinks).values(linkRow(folder.id, user.id));
+            await consumeCeiling(c, "link_user", subject, { count: 1 }, { tx });
+          }),
+        small,
+      );
+    for (let i = 0; i < 3; i++) expect(await create()).toMatchObject({ ok: true });
+    expect(await create()).toMatchObject({ ok: false, status: 429 });
+    expect(await testDb().select().from(shareLinks).where(eq(shareLinks.createdBy, user.id))).toHaveLength(3);
+  });
+});
+
+describe("the amount is typed per kind", () => {
+  it("type level: the wrong dimension does not compile", () => {
+    const neverRun = async (c: Context<AppEnv>, tx: Tx) => {
+      const subject = { id: "x", account: oldAccount };
+      // @ts-expect-error a count-only kind takes no bytes
+      await consumeCeiling(c, "transform_user", subject, { bytes: 1 });
+      // @ts-expect-error nor bytes beside the count
+      await consumeCeiling(c, "share_user", subject, { count: 1, bytes: 1 });
+      // @ts-expect-error a bytes-only kind takes no count
+      await consumeCeiling(c, "download_user", subject, { count: 1 });
+      // @ts-expect-error nor a count beside the bytes
+      await consumeCeiling(c, "download_owner", subject, { bytes: 1, count: 1 });
+      // @ts-expect-error an empty amount is no amount
+      await consumeCeiling(c, "download_ip", subject, {});
+      // @ts-expect-error not for the two-dimension kind either
+      await consumeCeiling(c, "download_link", subject, {});
+      // @ts-expect-error the link form counts links
+      await consumeCeiling(c, "link_user", subject, { bytes: 1 }, { tx });
+      // @ts-expect-error the same types on the answering form
+      await tryConsumeCeiling(c, "transform_user", subject, { bytes: 1 });
+      // @ts-expect-error and on the preview
+      await checkCeiling(c, "share_user", subject, { bytes: 1 });
+      // @ts-expect-error and on a plain record
+      await recordUsage(c, "download_user", subject.id, { count: 1 });
+      // @ts-expect-error an upload names its bytes
+      await enforceUploadCeilings(c, { owner: subject }, { count: 1 }, { tx });
+      // What exists: bytes, a count, or — for the two kinds with both — either or both.
+      await consumeCeiling(c, "download_link", subject, { bytes: 1 });
+      await consumeCeiling(c, "download_link", subject, { count: 1 });
+      await consumeCeiling(c, "download_link", subject, { bytes: 1, count: 1 });
+      await checkCeiling(c, "upload_user", subject, { bytes: 1, count: 1 });
+    };
+    expect(typeof neverRun).toBe("function");
+  });
+
+  it("run time: an empty amount, and a dimension the kind does not have, are validation errors — never a pass", async () => {
+    const user = await makeUser();
+    const subject = { id: user.id, account: oldAccount };
+    const loose = {
+      consume: consumeCeiling,
+      tryConsume: tryConsumeCeiling,
+      check: checkCeiling,
+      record: recordUsage,
+    } as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+    const outcome = async (work: Parameters<typeof invoke>[1]) => {
+      const invoked = await invoke(null, work, small);
+      return invoked.ok ? "ok" : `${invoked.status} ${invoked.error}`;
+    };
+    const bad: [string, unknown][] = [
+      ["transform_user", { bytes: 5 }],
+      ["transform_user", {}],
+      ["share_user", { bytes: 1, count: 1 }],
+      ["download_user", { count: 1 }],
+      ["download_user", {}],
+      ["download_ip", { bytes: 1, count: 1 }],
+      ["download_link", {}],
+      ["download_owner", undefined],
+      ["download_owner", null],
+    ];
+    for (const [kind, amount] of bad) {
+      const label = `${kind} ${JSON.stringify(amount)}`;
+      expect(await outcome((c) => loose.consume!(c, kind, subject, amount)), label).toBe("400 validation");
+      expect(await outcome((c) => loose.tryConsume!(c, kind, subject, amount)), label).toBe("400 validation");
+      expect(await outcome((c) => loose.check!(c, kind, subject, amount)), label).toBe("400 validation");
+      expect(await outcome((c) => loose.record!(c, kind, subject.id, amount)), label).toBe("400 validation");
+    }
+    expect(
+      await outcome((c) => db(c).transaction((tx) => loose.consume!(c, "link_user", subject, {}, { tx }))),
+    ).toBe("400 validation");
+    expect(
+      await outcome((c) =>
+        db(c).transaction((tx) =>
+          (enforceUploadCeilings as unknown as (...args: unknown[]) => Promise<void>)(
+            c,
+            { owner: subject },
+            {},
+            { tx },
+          ),
+        ),
+      ),
+    ).toBe("400 validation");
+    // Nothing was written by any of them.
+    for (const ledger of ["transform_user", "share_user", "user", "ip", "link", "link_owner"] as const) {
+      expect(await todayTotals(testDb(), ledger, user.id), ledger).toEqual({ bytes: 0, count: 0 });
+    }
+    // The control: zero is an amount (it names the dimension), and it passes.
+    expect(await outcome((c) => consumeCeiling(c, "transform_user", subject, { count: 0 }))).toBe("ok");
+  });
+});
+
+describe("one clock per decision", () => {
+  const at = (iso: string): InvokeOptions => ({ ...small, headers: { "x-holdfast-test-now": iso } });
+  const dayTotals = async (day: string, id: string) => {
+    const [row] = await testDb()
+      .select()
+      .from(downloadLedger)
+      .where(
+        and(
+          eq(downloadLedger.day, day),
+          eq(downloadLedger.subjectType, "share_user"),
+          eq(downloadLedger.subjectId, id),
+        ),
+      );
+    return row ? { bytes: row.bytes, count: row.count } : null;
+  };
+
+  it("a consume at 23:59:59.999 UTC and one at 00:00:00.000 land on different days, each with its own total", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const lastMs = at("2031-03-04T23:59:59.999Z");
+    const firstMs = at("2031-03-05T00:00:00.000Z");
+    expect(await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 3 }), lastMs)).toEqual({
+      day: "2031-03-04",
+    });
+    expect(await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 2 }), firstMs)).toEqual(
+      {
+        day: "2031-03-05",
+      },
+    );
+    expect(await dayTotals("2031-03-04", subject.id)).toEqual({ bytes: 0, count: 3 });
+    expect(await dayTotals("2031-03-05", subject.id)).toEqual({ bytes: 0, count: 2 });
+
+    // Each refusal reports ITS day's total, and the distance to ITS midnight.
+    const late = await value(null, (c) => tryConsumeCeiling(c, "share_user", subject, { count: 1 }), lastMs);
+    expect(late).toEqual({
+      ok: false,
+      kind: "share_user",
+      dimension: "count",
+      limit: 3,
+      used: 3,
+      retryAfterSec: 1,
+    });
+    const early = await value(
+      null,
+      (c) => tryConsumeCeiling(c, "share_user", subject, { count: 2 }),
+      firstMs,
+    );
+    expect(early).toEqual({
+      ok: false,
+      kind: "share_user",
+      dimension: "count",
+      limit: 3,
+      used: 2,
+      retryAfterSec: 86_400,
+    });
+    // The preview and a plain record use the same day.
+    expect(
+      await value(null, (c) => checkCeiling(c, "share_user", subject, { count: 1 }), lastMs),
+    ).toMatchObject({
+      ok: false,
+      used: 3,
+    });
+    expect(await value(null, (c) => checkCeiling(c, "share_user", subject, { count: 1 }), firstMs)).toEqual({
+      ok: true,
+    });
+    await value(null, (c) => recordUsage(c, "share_user", subject.id, { count: 5 }), lastMs);
+    expect(await dayTotals("2031-03-04", subject.id)).toEqual({ bytes: 0, count: 8 });
+    expect(await dayTotals("2031-03-05", subject.id)).toEqual({ bytes: 0, count: 2 });
+  });
+
+  it("a refusal never names a dimension the kind is not limited on", async () => {
+    // Count-only kinds: always count, with the real limit — also when the limit is 0.
+    const zero: InvokeOptions = {
+      settings: { ceilings: { ...SMALL.ceilings, CEIL_SHARES_DAY: 0, CEIL_IP_BYTES_DAY: 0 } },
+    };
+    const share = await value(
+      null,
+      (c) => tryConsumeCeiling(c, "share_user", { id: subjectId(), account: oldAccount }, { count: 1 }),
+      zero,
+    );
+    expect(share).toMatchObject({ ok: false, dimension: "count", limit: 0, used: 0 });
+    const ip = await value(
+      null,
+      (c) => tryConsumeCeiling(c, "download_ip", { id: subjectId() }, { bytes: 1 }),
+      zero,
+    );
+    expect(ip).toMatchObject({ ok: false, dimension: "bytes", limit: 0, used: 0 });
+    for (const kind of ["transform_user", "share_user"] as const) {
+      const subject = { id: subjectId(), account: oldAccount };
+      const refused = await value(null, (c) => tryConsumeCeiling(c, kind, subject, { count: 4 }), small);
+      expect(refused, kind).toMatchObject({ ok: false, dimension: "count", limit: 3 });
+    }
+  });
+});
+
+describe("a refusal lost to a race still names a dimension the kind has", () => {
+  it("the statement refuses, the re-read shows room: a count-only kind is refused on its count, with its limit", async () => {
+    const user = await makeUser();
+    const subject = { id: user.id, account: oldAccount };
+    // The conditional insert answers "not added" (as when another request took the room and gave
+    // it back in between); every other statement goes to the database.
+    const result = await value(
+      null,
+      (c) =>
+        db(c).transaction((tx) => {
+          const refusing = new Proxy(tx, {
+            get(target, property, receiver) {
+              if (property === "execute") return async () => ({ rows: [] });
+              const member: unknown = Reflect.get(target, property, receiver);
+              return typeof member === "function"
+                ? (member as (...a: unknown[]) => unknown).bind(target)
+                : member;
+            },
+          });
+          return tryConsumeCeiling(c, "link_user", subject, { count: 1 }, { tx: refusing });
+        }),
+      small,
+    );
+    expect(result).toMatchObject({ ok: false, kind: "link_user", dimension: "count", limit: 3, used: 0 });
+  });
+});
+
+describe("refundUsage: unsent bytes are given back", () => {
+  const deps = () => serviceDeps().deps;
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  it("consume 100, refund 60 → 40; a refund larger than what is there stops at 0", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const charge = await value(
+      null,
+      (c) => consumeCeiling(c, "download_owner", subject, { bytes: 100 }),
+      small,
+    );
+    expect(charge).toEqual({ day: today() });
+    await refundUsage(deps(), "download_owner", subject.id, { bytes: 60 }, charge);
+    expect(await todayTotals(testDb(), "link_owner", subject.id)).toEqual({ bytes: 40, count: 0 });
+    // What was given back can be used again — and no more than that.
+    expect(
+      await invoke(null, (c) => consumeCeiling(c, "download_owner", subject, { bytes: 960 }), small),
+    ).toMatchObject({ ok: true });
+    expect(
+      await invoke(null, (c) => consumeCeiling(c, "download_owner", subject, { bytes: 1 }), small),
+    ).toMatchObject({ status: 429 });
+    await refundUsage(deps(), "download_owner", subject.id, { bytes: 5000 }, charge);
+    expect(await todayTotals(testDb(), "link_owner", subject.id)).toEqual({ bytes: 0, count: 0 });
+    // A refund of nothing, and one for a subject with no row, change nothing and create no row.
+    await refundUsage(deps(), "download_owner", subject.id, { bytes: 0 }, charge);
+    const other = subjectId();
+    await refundUsage(deps(), "download_owner", other, { bytes: 10 }, charge);
+    expect(await todayTotals(testDb(), "link_owner", other)).toEqual({ bytes: 0, count: 0 });
+  });
+
+  it("a count is never refunded, and each kind's refund touches only its own ledger", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const charge = await value(
+      null,
+      (c) => consumeCeiling(c, "download_link", subject, { bytes: 100, count: 1 }),
+      small,
+    );
+    await value(null, (c) => consumeCeiling(c, "download_user", subject, { bytes: 100 }), small);
+    await refundUsage(deps(), "download_link", subject.id, { bytes: 30 }, charge);
+    expect(await todayTotals(testDb(), "link", subject.id)).toEqual({ bytes: 70, count: 1 });
+    expect(await todayTotals(testDb(), "user", subject.id)).toEqual({ bytes: 100, count: 0 });
+  });
+
+  it("a refund for a charge booked on another UTC day is dropped, never applied to today", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const yesterday = new Date(Date.now() - 86_400_000);
+    // Charged yesterday (the request's clock), and something else charged today.
+    const old = await value(
+      null,
+      (c) => consumeCeiling(c, "download_ip", { id: subject.id }, { bytes: 500 }),
+      {
+        ...small,
+        headers: { "x-holdfast-test-now": yesterday.toISOString() },
+      },
+    );
+    expect(old.day).toBe(yesterday.toISOString().slice(0, 10));
+    await value(null, (c) => consumeCeiling(c, "download_ip", { id: subject.id }, { bytes: 300 }), small);
+
+    await refundUsage(deps(), "download_ip", subject.id, { bytes: 200 }, old);
+    expect(await todayTotals(testDb(), "ip", subject.id), "today's row is untouched").toEqual({
+      bytes: 300,
+      count: 0,
+    });
+    const [stale] = await testDb()
+      .select()
+      .from(downloadLedger)
+      .where(
+        and(
+          eq(downloadLedger.day, old.day),
+          eq(downloadLedger.subjectType, "ip"),
+          eq(downloadLedger.subjectId, subject.id),
+        ),
+      );
+    expect(stale!.bytes, "and yesterday's row is history").toBe(500);
+    // The control: the same refund with today's receipt is applied.
+    await refundUsage(deps(), "download_ip", subject.id, { bytes: 200 }, { day: today() });
+    expect(await todayTotals(testDb(), "ip", subject.id)).toEqual({ bytes: 100, count: 0 });
+  });
+
+  it("concurrent consumes and refunds keep the row consistent", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const roomy: InvokeOptions = {
+      settings: { ceilings: { ...SMALL.ceilings, CEIL_USER_BYTES_DAY: 1_000_000 } },
+    };
+    const charge = await value(
+      null,
+      (c) => consumeCeiling(c, "download_user", subject, { bytes: 10_000 }),
+      roomy,
+    );
+    const work: Promise<unknown>[] = [];
+    for (let i = 0; i < 10; i++) {
+      work.push(value(null, (c) => consumeCeiling(c, "download_user", subject, { bytes: 1000 }), roomy));
+      work.push(refundUsage(deps(), "download_user", subject.id, { bytes: 300 }, charge));
+    }
+    await Promise.all(work);
+    expect(await todayTotals(testDb(), "user", subject.id)).toEqual({
+      bytes: 10_000 + 10 * 1000 - 10 * 300,
+      count: 0,
+    });
+  });
+
+  it("it cannot raise a limit or be pointed at a count: bad input throws and writes nothing", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const charge = await value(
+      null,
+      (c) => consumeCeiling(c, "download_user", subject, { bytes: 100 }),
+      small,
+    );
+    const loose = refundUsage as unknown as (...args: unknown[]) => Promise<void>;
+    for (const amount of [{ bytes: -50 }, { bytes: 1.5 }, { bytes: Number.NaN }, { count: 1 }, {}, null]) {
+      await expect(
+        loose(deps(), "download_user", subject.id, amount, charge),
+        JSON.stringify(amount),
+      ).rejects.toThrow();
+    }
+    for (const kind of [
+      "share_user",
+      "transform_user",
+      "link_user",
+      "upload_user",
+      "upload_editor",
+      "nope",
+    ]) {
+      await expect(loose(deps(), kind, subject.id, { bytes: 1 }, charge), kind).rejects.toThrow();
+    }
+    await expect(
+      loose(deps(), "download_user", subject.id, { bytes: 1 }, { day: "not-a-day" }),
+    ).rejects.toThrow();
+    expect(await todayTotals(testDb(), "user", subject.id)).toEqual({ bytes: 100, count: 0 });
   });
 });
 
@@ -258,8 +671,8 @@ describe("consumeCeiling: the ledger-only kinds", () => {
       // 600 of 1000 bytes, or 2 of 3: one fits, two do not.
       const amount = byBytes ? { bytes: 600 } : { count: 2 };
       const [a, b] = await Promise.all([
-        invoke(null, (c) => consumeOrThrow(c, kind, subject, amount), small),
-        invoke(null, (c) => consumeOrThrow(c, kind, subject, amount), small),
+        invoke(null, (c) => consumeCeiling(c, kind, subject, amount), small),
+        invoke(null, (c) => consumeCeiling(c, kind, subject, amount), small),
       ]);
       expect([a.ok, b.ok].sort(), kind).toEqual([false, true]);
       expect(
@@ -275,7 +688,7 @@ describe("consumeCeiling: the ledger-only kinds", () => {
   it("a link's download count and its bytes are one consume: both dimensions or neither", async () => {
     const subject = { id: subjectId(), account: oldAccount };
     const consume = (bytes: number, count: number) =>
-      invoke(null, (c) => consumeOrThrow(c, "download_link", subject, { bytes, count }), small);
+      invoke(null, (c) => consumeCeiling(c, "download_link", subject, { bytes, count }), small);
     expect(await consume(400, 1)).toMatchObject({ ok: true });
     // The bytes would fit, the count would not after two more.
     expect(await consume(100, 2)).toMatchObject({ ok: true });
@@ -292,7 +705,7 @@ describe("consumeCeiling: the ledger-only kinds", () => {
     expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 50 });
     // …after which the enforcing call refuses, as it should.
     expect(
-      await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
+      await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
     ).toMatchObject({
       status: 429,
     });
@@ -339,6 +752,8 @@ describe("what cannot be written", () => {
       "effectiveLimits",
       "enforceUploadCeilings",
       "recordUsage",
+      "refundUsage",
+      "tryConsumeCeiling",
     ]);
   });
 
@@ -648,8 +1063,8 @@ describe("download_owner: everything one owner's public links serve in a day", (
       null,
       async (c) => {
         // What the files host does for a link download: the link's own ceiling, and the owner's.
-        await consumeOrThrow(c, "download_owner", { id: ownerId, account: oldAccount }, { bytes });
-        await consumeOrThrow(c, "download_link", { id: linkId, account: oldAccount }, { bytes });
+        await consumeCeiling(c, "download_owner", { id: ownerId, account: oldAccount }, { bytes });
+        await consumeCeiling(c, "download_link", { id: linkId, account: oldAccount }, { bytes });
       },
       owned,
     );
@@ -689,7 +1104,7 @@ describe("download_owner: everything one owner's public links serve in a day", (
   it("a refusal is counted in the metric under its own kind", async () => {
     const points: { blobs: string[] }[] = [];
     const subject = { id: (await makeUser()).id, account: oldAccount };
-    await invoke(null, (c) => consumeOrThrow(c, "download_owner", subject, { bytes: 1001 }), {
+    await invoke(null, (c) => consumeCeiling(c, "download_owner", subject, { bytes: 1001 }), {
       ...owned,
       env: { METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) } },
     });
@@ -715,7 +1130,7 @@ describe("link_user inside the caller's transaction", () => {
         null,
         (c) =>
           db(c).transaction(async (tx) => {
-            await consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx });
+            await consumeCeiling(c, "link_user", subject, { count: 1 }, { tx });
             await tx.insert(shareLinks).values(linkRow(folder.id, young.id));
             if (fail) throw new Error("the creation failed after the ceiling was consumed");
           }),
@@ -745,7 +1160,7 @@ describe("link_user inside the caller's transaction", () => {
         null,
         (c) =>
           db(c).transaction(async (tx) => {
-            await consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx });
+            await consumeCeiling(c, "link_user", subject, { count: 1 }, { tx });
             await tx.insert(shareLinks).values(linkRow(folder.id, user.id));
           }),
         small,
@@ -761,7 +1176,7 @@ describe("link_user inside the caller's transaction", () => {
     // NEW_ACCOUNT_MAX_LINKS - 1 live links already.
     for (let i = 0; i < 2; i++) await testDb().insert(shareLinks).values(linkRow(folder.id, young.id));
     const [a, b] = await race(
-      (c, tx) => consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx }),
+      (c, tx) => consumeCeiling(c, "link_user", subject, { count: 1 }, { tx }),
       (tx) => tx.insert(shareLinks).values(linkRow(folder.id, young.id)),
       capped,
     );

@@ -10,7 +10,14 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { tryConsume } from "../../../src/worker/db/queries/email-ledger";
-import { addUsage, addUsageIfUnder, todayTotals, utcDay } from "../../../src/worker/db/queries/ledger";
+import {
+  addUsage,
+  addUsageIfUnder,
+  subtractUsage,
+  todayTotals,
+  totalsOn,
+  utcDay,
+} from "../../../src/worker/db/queries/ledger";
 import { clearSettingsCache, getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import * as uploadIps from "../../../src/worker/db/queries/upload-ips";
 import { isActive, revokeAllSessions, termsVersionOf, userState } from "../../../src/worker/db/queries/users";
@@ -119,6 +126,50 @@ describe("ledger", () => {
     expect(await todayTotals(db, "link", subject)).toEqual({ bytes: 1275, count: 50 });
     const rows = await db.select().from(downloadLedger).where(eq(downloadLedger.subjectId, subject));
     expect(rows).toHaveLength(1);
+  });
+
+  it("totalsOn reads the given day and no other", async () => {
+    const subject = `on-${rand()}`;
+    await addUsage(db, "2031-03-04", "link", subject, 300, 2);
+    await addUsage(db, "2031-03-05", "link", subject, 40, 1);
+    expect(await totalsOn(db, "2031-03-04", "link", subject)).toEqual({ bytes: 300, count: 2 });
+    expect(await totalsOn(db, "2031-03-05", "link", subject)).toEqual({ bytes: 40, count: 1 });
+    expect(await totalsOn(db, "2031-03-06", "link", subject)).toEqual({ bytes: 0, count: 0 });
+    expect(await totalsOn(db, "2031-03-04", "ip", subject)).toEqual({ bytes: 0, count: 0 });
+    await expect(totalsOn(db, "yesterday", "link", subject)).rejects.toThrow("invalid ledger day");
+  });
+
+  it("subtractUsage gives bytes back to today's row only, never below zero, never the count", async () => {
+    const subject = `sub-${rand()}`;
+    const today = utcDay();
+    await addUsage(db, today, "user", subject, 100, 2);
+    expect(await subtractUsage(db, today, "user", subject, 60)).toBe(true);
+    expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 40, count: 2 });
+    // More than is there: zero, not negative.
+    expect(await subtractUsage(db, today, "user", subject, 5000)).toBe(true);
+    expect(await todayTotals(db, "user", subject)).toEqual({ bytes: 0, count: 2 });
+    // No row, another subject type, nothing to give back: nothing changes and no row appears.
+    expect(await subtractUsage(db, today, "user", `none-${rand()}`, 10)).toBe(false);
+    expect(await subtractUsage(db, today, "link", subject, 10)).toBe(false);
+    expect(await subtractUsage(db, today, "user", subject, 0)).toBe(false);
+    for (const bad of [-1, 1.5, Number.NaN]) {
+      await expect(subtractUsage(db, today, "user", subject, bad)).rejects.toThrow("invalid ledger amount");
+    }
+    await expect(subtractUsage(db, "today", "user", subject, 1)).rejects.toThrow("invalid ledger day");
+  });
+
+  it("subtractUsage drops a refund whose day is not today: neither that day's row nor today's changes", async () => {
+    const subject = `day-${rand()}`;
+    const today = utcDay();
+    const yesterday = utcDay(new Date(Date.now() - 86_400_000));
+    await addUsage(db, yesterday, "ip", subject, 500, 0);
+    await addUsage(db, today, "ip", subject, 300, 0);
+    expect(await subtractUsage(db, yesterday, "ip", subject, 200)).toBe(false);
+    expect(await totalsOn(db, yesterday, "ip", subject)).toEqual({ bytes: 500, count: 0 });
+    expect(await totalsOn(db, today, "ip", subject)).toEqual({ bytes: 300, count: 0 });
+    // The control: the same amount against today's row is applied.
+    expect(await subtractUsage(db, today, "ip", subject, 200)).toBe(true);
+    expect(await totalsOn(db, today, "ip", subject)).toEqual({ bytes: 100, count: 0 });
   });
 
   it("accepts every declared subject type", async () => {

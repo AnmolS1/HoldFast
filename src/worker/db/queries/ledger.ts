@@ -95,3 +95,60 @@ export async function todayTotals(
     .limit(1);
   return { bytes: row?.bytes ?? 0, count: row?.count ?? 0 };
 }
+
+/**
+ * Gives bytes back to ONE day's row: `bytes` is reduced by `bytes`, never below zero. The count is
+ * never touched. Only the row of `day` is written, and only while `day` is still today (the
+ * database's UTC day): a refund for a charge made on an earlier day is dropped — it is never
+ * applied to the new day's row. It enforces nothing and creates no row.
+ * True = a row was reduced. False = no row for that day and subject, or the day is over.
+ */
+export async function subtractUsage(
+  db: Executor,
+  day: string,
+  subjectType: LedgerSubject,
+  subjectId: string,
+  bytes: number,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new QueryError("validation", "invalid ledger amount");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new QueryError("validation", "invalid ledger day");
+  if (bytes === 0) return false;
+  const rows = await db
+    .update(downloadLedger)
+    .set({ bytes: sql`GREATEST(${downloadLedger.bytes} - ${bytes}::bigint, 0)` })
+    .where(
+      and(
+        eq(downloadLedger.day, day),
+        eq(downloadLedger.day, sql`(now() AT TIME ZONE 'UTC')::date`),
+        eq(downloadLedger.subjectType, subjectType),
+        eq(downloadLedger.subjectId, subjectId),
+      ),
+    )
+    .returning({ day: downloadLedger.day });
+  return rows.length > 0;
+}
+
+/**
+ * The totals of ONE given day (`YYYY-MM-DD`) — for a caller that decided which day it is itself
+ * and must read that same day. Zeros when there is no row. (`todayTotals` asks the database.)
+ */
+export async function totalsOn(
+  db: Executor,
+  day: string,
+  subjectType: LedgerSubject,
+  subjectId: string,
+): Promise<{ bytes: number; count: number }> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new QueryError("validation", "invalid ledger day");
+  const [row] = await db
+    .select({ bytes: downloadLedger.bytes, count: downloadLedger.count })
+    .from(downloadLedger)
+    .where(
+      and(
+        eq(downloadLedger.day, day),
+        eq(downloadLedger.subjectType, subjectType),
+        eq(downloadLedger.subjectId, subjectId),
+      ),
+    )
+    .limit(1);
+  return { bytes: row?.bytes ?? 0, count: row?.count ?? 0 };
+}
