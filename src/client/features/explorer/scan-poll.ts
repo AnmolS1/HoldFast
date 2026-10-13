@@ -1,26 +1,48 @@
-// Watching files that are still being scanned. Each pending file is asked for every 5 s for two
+// Watching files that are still being scanned. A pending file is asked for every 5 s for two
 // minutes, then every 30 s and the row says "Still scanning". The answer is a `NodeDetailDto`:
 // the status is `.node.scanStatus`.
+//
+// ONE loop for the whole listing, and it is bounded every way round:
+//  - at most POLL_PER_TICK requests a tick, one after another (the files take turns, the one
+//    asked longest ago first) — 48 requests a minute at most, however many files are pending;
+//  - `404` ends the watch of that file (it is gone), `403` too (it is no longer ours to read);
+//  - `429` makes the whole loop wait `Retry-After`; `5xx` and a dead network back it off,
+//    doubling up to a minute — never the same rate against a server that is refusing;
+//  - nothing is asked while the tab is hidden or the page is not the one in front;
+//  - after POLL_MAX_MS the loop ends (the row keeps saying "Still scanning"; opening the folder
+//    again starts a new watch);
+//  - an answer that arrives after the account changed is dropped.
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeDto } from "../../../shared/schemas/node";
 import { ApiError } from "../../lib/api";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { getNode } from "./api";
 
 export const POLL_FAST_MS = 5_000;
 export const POLL_FAST_FOR_MS = 120_000;
 export const POLL_SLOW_MS = 30_000;
-/** Files watched at once; the rest take their turn as these settle. */
-export const MAX_POLLED = 25;
+/** Files asked for in one tick. */
+export const POLL_PER_TICK = 4;
+/** How long one visit of a folder keeps watching. */
+export const POLL_MAX_MS = 30 * 60_000;
+/** The longest back-off after repeated `5xx` / network failures. */
+export const POLL_BACKOFF_MAX_MS = 60_000;
+/** The longest a `Retry-After` is honoured for; the wait when a `429` names none. */
+export const POLL_RETRY_AFTER_MAX_MS = 5 * 60_000;
+export const POLL_RETRY_AFTER_DEFAULT_MS = 30_000;
 
-/** The wait before the next question, given how long the file has been watched. */
+/** The wait before a file is asked for again, given how long it has been watched. */
 export function pollDelay(elapsedMs: number): number {
   return elapsedMs < POLL_FAST_FOR_MS ? POLL_FAST_MS : POLL_SLOW_MS;
 }
 
-interface Watch {
-  since: number;
-  timer: ReturnType<typeof setTimeout> | undefined;
-  stopped: boolean;
+/** How long the loop stays quiet after a failed request. `failures` counts them in a row. */
+export function penaltyAfter(cause: unknown, failures: number): number {
+  if (cause instanceof ApiError && cause.status === 429) {
+    const asked = cause.retryAfter === undefined ? POLL_RETRY_AFTER_DEFAULT_MS : cause.retryAfter * 1000;
+    return Math.min(POLL_RETRY_AFTER_MAX_MS, Math.max(POLL_FAST_MS, asked));
+  }
+  return Math.min(POLL_BACKOFF_MAX_MS, POLL_FAST_MS * 2 ** Math.max(0, failures - 1));
 }
 
 export interface ScanPollHandlers {
@@ -30,75 +52,145 @@ export interface ScanPollHandlers {
   onGone(id: string): void;
 }
 
-/** Polls the given pending ids; returns the ones that have been pending for over two minutes. */
+interface LoopState {
+  /** When each pending file was first seen. */
+  since: Map<string, number>;
+  /** When each was last asked for. */
+  asked: Map<string, number>;
+  /** Files the server refused to show (`403`): not asked again. */
+  refused: Set<string>;
+  started: number;
+  lastTick: number;
+  /** Failures in a row, and the time before which nothing is asked. */
+  failures: number;
+  notBefore: number;
+}
+
+const subscribeVisibility = (set: (visible: boolean) => void) => {
+  const listener = () => set(!document.hidden);
+  document.addEventListener("visibilitychange", listener);
+  return () => document.removeEventListener("visibilitychange", listener);
+};
+
+/**
+ * Polls the given pending ids while `active`; returns the ones that have been pending for over
+ * two minutes.
+ */
 export function useScanPolling(
   pendingIds: readonly string[],
   handlers: ScanPollHandlers,
+  active = true,
 ): ReadonlySet<string> {
-  const watches = useRef(new Map<string, Watch>());
+  const loop = useRef<LoopState>({
+    since: new Map(),
+    asked: new Map(),
+    refused: new Set(),
+    started: 0,
+    lastTick: 0,
+    failures: 0,
+    notBefore: 0,
+  });
   const latest = useRef(handlers);
   const [slow, setSlow] = useState<ReadonlySet<string>>(new Set());
+  const [visible, setVisible] = useState(() => !document.hidden);
   useEffect(() => {
     latest.current = handlers;
   });
+  useEffect(() => subscribeVisibility(setVisible), []);
 
-  const wanted = pendingIds.slice(0, MAX_POLLED).join(",");
+  const key = pendingIds.join(",");
   useEffect(() => {
-    const map = watches.current;
-    const ids = new Set(wanted === "" ? [] : wanted.split(","));
-    const stop = (id: string) => {
-      const watch = map.get(id);
-      if (!watch) return;
-      watch.stopped = true;
-      clearTimeout(watch.timer);
-      map.delete(id);
-    };
-    for (const id of Array.from(map.keys())) if (!ids.has(id)) stop(id);
-
-    const schedule = (id: string, watch: Watch) => {
-      watch.timer = setTimeout(
-        () => {
-          if (Date.now() - watch.since >= POLL_FAST_FOR_MS)
-            setSlow((current) => (current.has(id) ? current : new Set(current).add(id)));
-          getNode(id).then(
-            (detail) => {
-              if (watch.stopped) return;
-              if (detail.node.scanStatus === "pending") schedule(id, watch);
-              else {
-                stop(id);
-                latest.current.onSettled(detail.node);
-              }
-            },
-            (cause: unknown) => {
-              if (watch.stopped) return;
-              if (cause instanceof ApiError && cause.status === 404) {
-                stop(id);
-                latest.current.onGone(id);
-              } else schedule(id, watch);
-            },
-          );
-        },
-        pollDelay(Date.now() - watch.since),
-      );
-    };
-    for (const id of ids) {
-      if (map.has(id)) continue;
-      const watch: Watch = { since: Date.now(), timer: undefined, stopped: false };
-      map.set(id, watch);
-      schedule(id, watch);
+    const state = loop.current;
+    const ids = key === "" ? [] : key.split(",");
+    const listed = new Set(ids);
+    const now = Date.now();
+    for (const id of ids) if (!state.since.has(id)) state.since.set(id, now);
+    for (const id of Array.from(state.since.keys())) {
+      if (listed.has(id)) continue;
+      state.since.delete(id);
+      state.asked.delete(id);
+      state.refused.delete(id);
     }
-  }, [wanted]);
+    if (ids.length === 0 || !active || !visible) return;
+    if (state.started === 0) {
+      state.started = now;
+      state.lastTick = now;
+    }
 
-  useEffect(() => {
-    const map = watches.current;
-    return () => {
-      for (const watch of map.values()) {
-        watch.stopped = true;
-        clearTimeout(watch.timer);
-      }
-      map.clear();
+    const then = accountEpoch();
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const live = () => !stopped && sameAccount(then);
+    const watched = () => ids.filter((id) => state.since.has(id) && !state.refused.has(id));
+    const last = (id: string) => state.asked.get(id) ?? state.since.get(id)!;
+    // The wait after a question is decided by how long the file had been watched when it was asked.
+    const waitOf = (id: string) => pollDelay(last(id) - state.since.get(id)!);
+    const forget = (id: string) => {
+      state.since.delete(id);
+      state.asked.delete(id);
     };
-  }, []);
+
+    const plan = () => {
+      if (!live()) return;
+      const files = watched();
+      if (files.length === 0 || Date.now() - state.started >= POLL_MAX_MS) return;
+      const wait = Math.min(...files.map(waitOf));
+      const at = Math.max(state.lastTick + wait, state.notBefore);
+      timer = setTimeout(() => void tick(), Math.max(0, at - Date.now()));
+    };
+
+    const tick = async () => {
+      if (!live()) return;
+      const at = Date.now();
+      state.lastTick = at;
+      const files = watched();
+      const overdue = files.filter((id) => at - state.since.get(id)! >= POLL_FAST_FOR_MS);
+      if (overdue.length > 0) {
+        setSlow((current) =>
+          overdue.every((id) => current.has(id)) ? current : new Set([...current, ...overdue]),
+        );
+      }
+      const due = files
+        // 50 ms of grace: a timer may fire a little early or late against the file's own clock.
+        .filter((id) => at - last(id) >= waitOf(id) - 50)
+        .sort((a, b) => last(a) - last(b))
+        .slice(0, POLL_PER_TICK);
+      for (const id of due) {
+        state.asked.set(id, at);
+        try {
+          const detail = await getNode(id);
+          if (!live()) return;
+          state.failures = 0;
+          if (detail.node.scanStatus !== "pending") {
+            forget(id);
+            latest.current.onSettled(detail.node);
+          }
+        } catch (cause) {
+          if (!live()) return;
+          if (cause instanceof ApiError && cause.status === 404) {
+            forget(id);
+            latest.current.onGone(id);
+            continue;
+          }
+          if (cause instanceof ApiError && cause.status === 403) {
+            state.refused.add(id);
+            continue;
+          }
+          // Too many requests, a failing server, no network: the whole loop goes quiet for a while.
+          state.failures += 1;
+          state.notBefore = Date.now() + penaltyAfter(cause, state.failures);
+          break;
+        }
+      }
+      plan();
+    };
+
+    plan();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [key, active, visible]);
 
   // An id that settled or left the folder is no longer "still scanning".
   return useMemo(() => {
