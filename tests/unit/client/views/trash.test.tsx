@@ -432,8 +432,15 @@ describe("empty trash, from the page", () => {
       return found;
     });
     expect(stopped.textContent).toBe("Couldn't finish emptying the trash. 240 left. Try again.");
-    expect(stopped.getAttribute("role")).toBe("alert");
+    // Said once, by the toast; the line by the button is not a second live region.
+    expect(stopped.getAttribute("role")).toBeNull();
+    expect(getToasts().map((toast) => toast.message)).toEqual([
+      "Couldn't finish emptying the trash. 240 left. Try again.",
+    ]);
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(2);
+    // The line can be closed.
+    fireEvent.click(stopped.querySelector<HTMLElement>('button[aria-label="Dismiss"]')!);
+    expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
     // Part of it is gone: the numbers are read again.
     expect(events).toEqual([[]]);
   });
@@ -507,7 +514,9 @@ describe("leaving the page while the trash is being emptied", () => {
     await act(() => router.navigate("/starred"));
     const usageBefore = usageCalls(calls);
     second.resolve(envelope("internal", 500));
-    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240, retryAt: 0 }));
+    await waitFor(() =>
+      expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240, retryAt: 0, dismissed: false }),
+    );
     expect(getToasts().map((toast) => toast.message)).toContain(
       "Couldn't finish emptying the trash. 240 left. Try again.",
     );
@@ -666,10 +675,9 @@ describe("nothing of one account reaches the next through late work", () => {
     await waitFor(() => expect(rowNames()).toHaveLength(3));
     hold = true;
     fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
-    await act(() => purgeUserState({ keepSession: true }));
     hold = false;
+    await switchAccount();
     pending.resolve(json(TRASH));
-    await waitFor(() => expect(rowNames()).toHaveLength(3));
     await act(async () => {
       for (let turn = 0; turn < 20; turn++) await Promise.resolve();
     });
@@ -754,6 +762,12 @@ describe("review fixes on the trash page", () => {
     await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
     expect(button().disabled).toBe(true);
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
+    // a4: one announcement — the API client's own for a 429; no second toast, no alert.
+    expect(getToasts().map((toast) => toast.message)).toEqual(["Too many requests. Try again in 1 s."]);
+    expect(document.querySelector("[data-empty-trash-stopped]")!.getAttribute("role")).toBeNull();
+    // Closing the line does not lift the wait.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(button().disabled).toBe(true);
     // Enabled again when that second has passed — the wait is the API's, awaited as an event.
     await waitFor(() => expect(button().disabled).toBe(false), { timeout: 4000 });
   });

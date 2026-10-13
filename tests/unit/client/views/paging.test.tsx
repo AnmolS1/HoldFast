@@ -3,12 +3,14 @@
 // target as soon as it is observed — because that is what turns "ask again when in view" into a
 // loop when the list is re-armed after a failure.
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { clearPageFailures } from "../../../../src/client/features/starred/view-state";
 import { setupShell, type MockHandler } from "../shell/helpers";
 import { node, result, SEARCH, STARRED, TRASH, trashItem, trashPage } from "./fixtures";
 import { envelope, json, openView, queryOf, requests, rowNames, type AnswerFn } from "./helpers";
 
 setupShell();
+afterEach(() => clearPageFailures());
 
 beforeEach(() => {
   class EagerObserver {
