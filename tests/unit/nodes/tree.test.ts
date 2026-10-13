@@ -292,6 +292,38 @@ describe("GET /nodes/:id", () => {
     expect(listed.body.items.map((item: { parentId: string }) => item.parentId)).toEqual([shared.id]);
   });
 
+  it("a listing gives each child its own role: a share on the child itself can raise it above the folder's", async () => {
+    const owner = await person();
+    const partner = await person();
+    const folder = await makeFolder(owner.id);
+    const raised = await makeFolder(owner.id, folder.id, { name: "a raised" });
+    const plain = await makeFolder(owner.id, folder.id, { name: "b plain" });
+    const invitedOnly = await makeFile(owner.id, folder.id, { name: "c.txt", scanStatus: "clean" });
+    await makeShare(folder.id, owner.id, partner.id, { role: "viewer" });
+    await makeShare(raised.id, owner.id, partner.id, { role: "editor", canUpload: true });
+    // An editor share that was never activated raises nothing.
+    await makeShare(invitedOnly.id, owner.id, partner.id, { role: "editor", activatedAt: null });
+
+    const listed = await api(partner.as, "GET", `/nodes/${folder.id}/children`);
+    expect(listed.body.items.map((item: { id: string; role: string }) => [item.id, item.role])).toEqual([
+      [raised.id, "editor"],
+      [plain.id, "viewer"],
+      [invitedOnly.id, "viewer"],
+    ]);
+    // The listing says what the node's own answer says.
+    for (const node of [raised, plain, invitedOnly]) {
+      const own = (await api(partner.as, "GET", `/nodes/${node.id}`)).body.node.role;
+      expect(own, node.name).toBe(node === raised ? "editor" : "viewer");
+    }
+    // And it is true: the raised folder can be written to, the plain one cannot.
+    const into = (parentId: string) =>
+      api(partner.as, "POST", "/nodes/folder", { body: { parentId, name: "new" } });
+    expect([(await into(raised.id)).status, (await into(plain.id)).status]).toEqual([200, 403]);
+    // The owner's own listing is all "owner".
+    const mine = await api(owner.as, "GET", `/nodes/${folder.id}/children`);
+    expect(new Set(mine.body.items.map((item: { role: string }) => item.role))).toEqual(new Set(["owner"]));
+  });
+
   it("sharing is the owner's to see: people (pending ones too) and the link; zero for anyone else", async () => {
     const t = await sharedTree();
     await makeLink(t.shared.id, t.owner.id);

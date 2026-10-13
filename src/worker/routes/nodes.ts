@@ -57,7 +57,7 @@ import {
   setStar,
   touchAccessed,
 } from "../db/queries/nodes";
-import { liveNameHolder, zipManifest, type ZipRoot } from "../db/queries/nodes-api";
+import { liveNameHolder, ownEditorShares, zipManifest, type ZipRoot } from "../db/queries/nodes-api";
 import { usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
@@ -346,8 +346,20 @@ router.get(`/nodes/${ID}/children`, async (c) => {
     ...query,
     visibleStatuses: statusesFor(access),
   });
-  // A child has the role of the folder it is listed in.
-  const items = await toNodeDtos(db(c), page.items, viewOf(user, access));
+  // A child has the role of the folder it is listed in — unless a share on the child itself gives
+  // more, which for a viewer of the folder can only be an editor share. One read for the page.
+  const raised =
+    access.role === "viewer"
+      ? await ownEditorShares(
+          db(c),
+          user.id,
+          page.items.map((row) => row.id),
+        )
+      : new Set<string>();
+  const items = await toNodeDtos(db(c), page.items, {
+    ...viewOf(user, access),
+    role: (row) => (raised.has(row.id) ? "editor" : access.role),
+  });
   return c.json({ items, nextCursor: page.nextCursor } satisfies NodePage);
 });
 

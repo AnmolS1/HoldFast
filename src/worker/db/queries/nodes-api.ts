@@ -1,11 +1,11 @@
-// Reads only the nodes routes make (routes/nodes.ts): who holds a name in a folder, and the
-// files of a zip manifest.
+// Reads only the nodes routes make (routes/nodes.ts): who holds a name in a folder, the caller's
+// own shares on the rows of a listing, and the files of a zip manifest.
 
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { ZipManifest } from "../../../shared/schemas/node";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { nodes, type ScanStatus } from "../schema";
+import { nodes, type ScanStatus, shares } from "../schema";
 import { notEffectivelyTrashedOrHidden } from "./tree";
 
 /**
@@ -33,6 +33,29 @@ export async function liveNameHolder(
     )
     .limit(1);
   return row ?? null;
+}
+
+/**
+ * The nodes among `nodeIds` that `userId` has an ACTIVATED editor share on — a share row on the
+ * node itself. For a listing's `role` field only: a child with a share of its own can have a
+ * higher role than the folder it is listed in. What the caller may DO is never decided from
+ * this; every action asks the permission service.
+ */
+export async function ownEditorShares(db: Executor, userId: string, nodeIds: string[]): Promise<Set<string>> {
+  const ids = nodeIds.filter(isUuid);
+  if (ids.length === 0) return new Set();
+  const rows = await db
+    .select({ nodeId: shares.nodeId })
+    .from(shares)
+    .where(
+      and(
+        inArray(shares.nodeId, ids),
+        eq(shares.granteeUserId, userId),
+        isNotNull(shares.activatedAt),
+        eq(shares.role, "editor"),
+      ),
+    );
+  return new Set(rows.map((row) => row.nodeId));
 }
 
 export type ZipRoot = {
