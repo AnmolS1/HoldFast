@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SearchResponse } from "../../../src/shared/schemas/search";
 import { encodeCursor } from "../../../src/worker/db/cursor";
 import { auditRows } from "../auth/helpers";
-import { makeFile, makeUser } from "../services-core/helpers";
+import { makeFile, makeFolder, makeShare, makeUser } from "../services-core/helpers";
 import { get, searchPath, type Answer, type Caller } from "./helpers";
 
 const captured = vi.hoisted(() => ({ errors: [] as unknown[] }));
@@ -125,6 +125,82 @@ describe("the other text the three routes pass on", () => {
       "/starred?limit=5%00",
     ]) {
       expectRefused(await get(as(me), path), path);
+    }
+  });
+});
+
+describe("a search cursor written by the caller", () => {
+  // The cursor is not signed: it is base64 of `{ t: tag, v: { offset } }`, and the tag is made of
+  // things the caller knows (their own id, the scope, the query). So a caller can write one.
+  const forged = (userId: string, scope: string, q: string, offset: unknown) =>
+    encodeCursor(`search:${userId}:${scope}:${q}`, { offset });
+
+  it("windows the caller's own visible results and nothing else; past the last offset it is an empty page", async () => {
+    const me = await makeUser();
+    const other = await makeUser();
+    const q = "forgedoffset";
+    const mine: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      mine.push((await makeFile(me.id, null, { name: `${q} ${i}.txt`, ...clean })).id);
+    }
+    const shared = await makeFolder(other.id);
+    const theirs = await makeFile(other.id, shared.id, { name: `${q} shared.txt`, ...clean });
+    const hidden = await makeFile(other.id, shared.id, { name: `${q} pending.txt` });
+    const unshared = await makeFile(other.id, null, { name: `${q} private.txt`, ...clean });
+    await makeShare(shared.id, other.id, me.id);
+    const ids = async (scope: string, offset: unknown, limit = 50) => {
+      const answer = await get(
+        as(me),
+        searchPath({ q, scope, limit, cursor: forged(me.id, scope, q, offset) }),
+      );
+      expect(answer.status, `${scope} ${String(offset)}`).toBe(200);
+      return SearchResponse.parse(answer.body);
+    };
+
+    // An offset the server never handed out: the rest of the caller's own list, in its order.
+    const whole = SearchResponse.parse((await get(as(me), searchPath({ q, scope: "mine" }))).body);
+    expect(whole.items.map((item) => item.id).sort()).toEqual([...mine].sort());
+    expect((await ids("mine", 2)).items.map((item) => item.id)).toEqual(
+      whole.items.slice(2).map((item) => item.id),
+    );
+    // In `all` the window is over the same visible set as an honest search: the shared clean
+    // file is in it, the pending shared file and the unshared one never are.
+    const honest = SearchResponse.parse((await get(as(me), searchPath({ q, scope: "all" }))).body);
+    const visible = honest.items.map((item) => item.id);
+    expect([...visible].sort()).toEqual([...mine, theirs.id].sort());
+    for (const offset of [1, 3, 5]) {
+      const window = (await ids("all", offset)).items.map((item) => item.id);
+      expect(window, `all ${offset}`).toEqual(visible.slice(offset));
+      expect(window).not.toContain(hidden.id);
+      expect(window).not.toContain(unshared.id);
+    }
+
+    // The last offset there is, and everything past it: an empty page with no cursor.
+    for (const offset of [1000, 1001, 5000, 2 ** 31, Number.MAX_SAFE_INTEGER]) {
+      for (const scope of ["mine", "shared", "all"]) {
+        expect(await ids(scope, offset), `${scope} ${offset}`).toEqual({ items: [], nextCursor: null });
+      }
+    }
+  });
+
+  it("is refused when its offset is not a whole positive number, or its tag is another scope's, query's or user's", async () => {
+    const me = await makeUser();
+    const other = await makeUser();
+    const q = "forgedoffset";
+    for (const offset of [0, -1, 1.5, "2", null, [2], { n: 2 }]) {
+      const cursor = forged(me.id, "mine", q, offset);
+      expectRefused(await get(as(me), searchPath({ q, scope: "mine", cursor })), JSON.stringify(offset));
+    }
+    const cases: Array<[string, string, string]> = [
+      [forged(me.id, "mine", q, 1), "shared", q], // a cursor of `mine` does not page `shared`
+      [forged(me.id, "mine", q, 1), "all", q],
+      [forged(me.id, "shared", q, 1), "all", q],
+      [forged(me.id, "mine", "anotherquery", 1), "mine", q],
+      [forged(other.id, "mine", q, 1), "mine", q], // another user's tag
+      [forged(other.id, "all", q, 1), "all", q],
+    ];
+    for (const [cursor, scope, query] of cases) {
+      expectRefused(await get(as(me), searchPath({ q: query, scope, cursor })), `${scope} ${query}`);
     }
   });
 });
