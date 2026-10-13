@@ -3,7 +3,8 @@
 // queries/trash.ts, which takes the owner's tree lock itself — so the gate's call is the first
 // statement of the transaction here, and nothing is locked before it.
 //
-//   purgeRoot(c, id, "user")        DELETE /nodes/:id, DELETE /trash     audit `node.purge`
+//   purgeRoot(c, id, "user")        DELETE /nodes/:id, DELETE /trash     audit `node.purge_requested`
+//                                                                        and `node.purge`
 //   purgeRoot(bg, id, "cron")       the purge job                        audit `system.purge`
 //   purgeRoot(bg, id, "account")    the account purge's roots            audit `system.purge`
 //
@@ -143,9 +144,11 @@ export async function purgeRoot(
     source,
     async (tx) =>
       (await lockTreeForPurge(tx, rootId, RULES[reason])) ? deleteSubtreeRows(tx, rootId) : null,
-    (tx, gone) =>
+    async (tx, gone) => {
+      // A user's delete is two facts: they asked, and it happened. Both rows, with the deletes.
+      if (reason === "user") await recordPurgeRequest(tx, source, rootId);
       // Short facts only: how much went. No name, no key.
-      auditInTx(
+      await auditInTx(
         tx,
         source,
         action,
@@ -155,8 +158,20 @@ export async function purgeRoot(
           objects: gone.r2Keys.length,
           bytes: gone.freedBytes,
         },
-      ),
+      );
+    },
   );
+}
+
+/**
+ * The record that an account holder asked for a root to be deleted for good: `node.purge_requested`,
+ * written on the transaction that acts on the request — the deletes, or, for a root the gate
+ * refused, the purge-request marker — so that the request and its record commit or fail together.
+ * THE SAME ROW EITHER WAY: the node, who asked, and nothing that says whether it was held. For a
+ * held root it is the only trace that its owner tried to destroy it.
+ */
+export async function recordPurgeRequest(tx: Tx, source: PurgeSource, rootId: string): Promise<void> {
+  await auditInTx(tx, source, "node.purge_requested", { type: "node", id: rootId });
 }
 
 /** Deletes kept old versions of one file, behind the same gate: a held file keeps its history. */

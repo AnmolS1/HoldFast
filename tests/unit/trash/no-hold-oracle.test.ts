@@ -9,6 +9,7 @@ import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queri
 import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
+  auditRows,
   audits,
   closeNotice,
   makeFile,
@@ -193,15 +194,17 @@ describe("DELETE /trash with a held root in it", () => {
       [204, null],
     ]);
     for (const caller of withHeld) expect(await countdown(caller)).toEqual(expected);
-    // One request row per request, counting the roots it took — a held one counts like any other.
+    // One request row per root taken — a held one leaves the row any other does.
     const requestRows = async (caller: Caller) =>
-      (await audits("node.purge_requested", caller!.user.id)).map((row) => [row.targetType, row.meta]);
+      (await auditRows({ action: "node.purge_requested", actorUserId: caller!.user.id })).map((row) => [
+        row.actorType,
+        row.targetType,
+        row.meta,
+        typeof row.requestId,
+        typeof row.ipHashDaily,
+      ]);
     const expectedRows = await requestRows(free);
-    expect(expectedRows).toEqual([
-      ["user", { roots: 1 }],
-      ["user", { roots: 1 }],
-      ["user", { roots: 1 }],
-    ]);
+    expect(expectedRows).toEqual(Array.from({ length: 3 }, () => ["user", "node", null, "string", "string"]));
     for (const caller of withHeld) expect(await requestRows(caller)).toEqual(expectedRows);
   });
 });

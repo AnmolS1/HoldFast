@@ -198,10 +198,12 @@ describe("DELETE /nodes/:id", () => {
     expect(await t.thumbs()).toHaveLength(3);
     expect(await usedBytes(t.id)).toBe(240);
     expect(await audits("node.purge", t.folder.id)).toEqual([]);
+    expect(await audits("node.purge_requested", t.folder.id)).toEqual([]);
     // Still in the trash, still deletable: the same request with a working insert.
     expect(await listed(t.owner)).toEqual([t.folder.id]);
     expect((await purge(t.owner, t.folder.id)).status).toBe(204);
     expect(await audits("node.purge", t.folder.id)).toHaveLength(1);
+    expect(await audits("node.purge_requested", t.folder.id)).toHaveLength(1);
   });
 
   it("runs through the deadlock retry", async () => {
@@ -287,6 +289,34 @@ describe("DELETE /nodes/:id", () => {
     expect(envelope(await trash(t.owner, t.file.id))).toEqual(envelope(await trash(t.owner, unknown)));
     const again = (await nodeById(t.file.id))!;
     expect(again.purgeRequestedAt).toEqual(row.purgeRequestedAt);
+  });
+
+  it("no request is acted on without its record: a held root, the request row's insert fails → not marked, still listed", async () => {
+    const t = await library();
+    await setNodeLegalHold(testDb(), t.file.id, true);
+    await trash(t.owner, t.folder.id);
+    const failing = {
+      insertAudit: async () => {
+        throw new Error("the audit insert failed");
+      },
+    };
+    expect((await purge(t.owner, t.folder.id, { core: failing })).status).toBe(500);
+    // The marker and its record go together: neither is there, and the owner still sees the root.
+    expect((await nodeById(t.folder.id))!.purgeRequestedAt).toBeNull();
+    expect(await audits("node.purge_requested", t.folder.id)).toEqual([]);
+    expect(await listed(t.owner)).toEqual([t.folder.id]);
+
+    // With a working insert: the marker, and the one trace that the owner asked — who, when, which.
+    expect((await purge(t.owner, t.folder.id)).status).toBe(204);
+    expect((await nodeById(t.folder.id))!.purgeRequestedAt).toBeInstanceOf(Date);
+    const rows = await audits("node.purge_requested", t.folder.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ actorUserId: t.id, actorType: "user", targetType: "node", meta: null });
+    expect(rows[0]!.at).toBeInstanceOf(Date);
+    // Asked once: the root is gone to its owner, and a repeat records nothing more.
+    expect((await purge(t.owner, t.folder.id)).status).toBe(404);
+    expect(await audits("node.purge_requested", t.folder.id)).toHaveLength(1);
+    expect(await audits("node.purge", t.folder.id)).toEqual([]);
   });
 
   it("everything under a root whose purge was requested is gone to its owner as well", async () => {

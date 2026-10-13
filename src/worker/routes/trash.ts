@@ -16,7 +16,7 @@
 // listing, and `not_found` by id here, for itself and for everything under it, as a purged id
 // is: the same answer for the same number of statements (`requireKnown`). The purge job
 // finishes the delete by itself once the hold is released. The request leaves the same audit
-// row either way (`node.purge_requested`).
+// row either way (`node.purge_requested`), written in the transaction that acts on it.
 //
 // A RESTORE THAT CANNOT HAPPEN NOW has one answer, `409 conflict` with no detail — whether the
 // folder it was in is in the trash and the caller is not the owner, or the node would leave a
@@ -35,7 +35,7 @@ import { countTrash, purgeWasRequested, requestPurge } from "../db/queries/trash
 import { effectiveTrashed } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node } from "../db/schema";
-import { purgeRoot } from "../jobs/purge";
+import { purgeRoot, recordPurgeRequest } from "../jobs/purge";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { AppError } from "../services/errors";
@@ -60,13 +60,6 @@ export function setEmptyTrashDeadlineForTests(ms: number): () => void {
     emptyTrashDeadlineMs = EMPTY_TRASH_DEADLINE_MS;
   };
 }
-
-/**
- * What a "delete forever" REQUEST is recorded as — written after its transaction, the same row
- * whether the root was purged or is held (nothing in it says which). The purge itself is
- * recorded as `node.purge`, with its deletes, when it happens: at once, or once a hold is gone.
- */
-const PURGE_REQUESTED = "node.purge_requested";
 
 /** The one "cannot do that now" of this file: no message of its own, no detail, no cause. */
 const refused = () => new AppError("conflict");
@@ -98,14 +91,22 @@ async function knownNode(c: Context<AppEnv>, id: string): Promise<Node> {
 const isTrashedRoot = (node: Node) => node.trashedRoot && node.deletedAt !== null;
 
 /**
- * Deletes one trashed root for good — or, when it is held, records that its owner asked.
- * False when it was no trashed root any more by the time the purge held its lock (restored in
- * this instant): nothing was deleted.
+ * Deletes one trashed root for good — or, when it is held, records that its owner asked: the
+ * marker on the root and the `node.purge_requested` row, in ONE transaction (the same row an
+ * un-held delete writes beside its deletes — `purgeRoot`). So no request is acted on without its
+ * record, and a held root's request leaves the trace an un-held one does.
+ * False when it was no trashed root any more by the time a transaction held it (restored in this
+ * instant): nothing was deleted, nothing recorded.
  */
 async function purgeOne(c: Context<AppEnv>, rootId: string): Promise<boolean> {
   const result = await purgeRoot(c, rootId, "user");
-  if (result.outcome === "held") await requestPurge(db(c), [rootId]);
-  return result.outcome !== "skipped";
+  if (result.outcome === "skipped") return false;
+  if (result.outcome !== "held") return true;
+  return retryOnDeadlock(db(c), async (tx) => {
+    if ((await requestPurge(tx, [rootId])) === 0) return false;
+    await recordPurgeRequest(tx, c, rootId);
+    return true;
+  });
 }
 
 router.get("/trash", async (c) => {
@@ -122,22 +123,14 @@ router.get("/trash", async (c) => {
 router.delete("/trash", async (c) => {
   const user = requireVerified(c);
   const stopAt = Date.now() + emptyTrashDeadlineMs;
-  // One request row for the whole request (it may take hundreds of roots), counting every root it
-  // took — purged or held alike.
-  let roots = 0;
-  const requested = () => audit(c, PURGE_REQUESTED, { type: "user", id: user.id }, { roots });
   for (;;) {
     // Always the first page: a root that was purged, or marked as requested, has left the listing.
     const page = await listTrash(db(c), user.id, { limit: EMPTY_TRASH_BATCH });
-    if (page.items.length === 0) {
-      requested();
-      return c.body(null, 204);
-    }
+    if (page.items.length === 0) return c.body(null, 204);
     for (const root of page.items) {
-      if (await purgeOne(c, root.id)) roots += 1;
+      await purgeOne(c, root.id);
       if (Date.now() < stopAt) continue;
       const remaining = await countTrash(db(c), user.id);
-      requested();
       if (remaining === 0) return c.body(null, 204);
       const body: EmptyTrashResponse = { remaining };
       return c.json(body, 202);
@@ -204,6 +197,5 @@ router.delete(`/nodes/${ID}`, async (c) => {
   const node = await knownNode(c, id);
   if (!isTrashedRoot(node)) throw refused();
   if (!(await purgeOne(c, id))) throw refused();
-  audit(c, PURGE_REQUESTED, { type: "node", id });
   return c.body(null, 204);
 });
