@@ -15,7 +15,6 @@ import { SearchResponse } from "../../../src/shared/schemas/search";
 import type { Executor } from "../../../src/worker/db/client";
 import { OWNER_VISIBLE_STATUSES } from "../../../src/worker/db/queries/nodes";
 import { searchNames } from "../../../src/worker/db/queries/search";
-import { SIMILARITY_THRESHOLD } from "../../../src/worker/routes/search";
 import { makeUser, testDb } from "../services-core/helpers";
 import { get, searchPath, type Caller } from "./helpers";
 
@@ -95,32 +94,45 @@ afterAll(async () => {
   await db.execute(sql`DELETE FROM nodes WHERE owner_id IN (${me.id}, ${owner.id})`);
 }, SETUP_TIMEOUT_MS);
 
-/** The statements one `searchNames` call sends through `execute`, in order. */
+/**
+ * The statements one `searchNames` call — the route's own call, with no threshold — sends through
+ * `execute`, in order, inside its transaction as well: the setting it makes first, then the read.
+ */
 async function statementsOf(q: string, scope: "mine" | "shared"): Promise<SQL[]> {
   const sent: SQL[] = [];
-  const recording = new Proxy(testDb(), {
-    get(target, property, receiver) {
-      if (property !== "execute") return Reflect.get(target, property, receiver) as unknown;
-      return (query: SQL) => {
-        sent.push(query);
-        return target.execute(query);
-      };
-    },
-  }) as Executor;
-  await searchNames(recording, me.id, q, {
+  const recording = (executor: Executor): Executor =>
+    new Proxy(executor, {
+      get(target, property, receiver) {
+        if (property === "execute") {
+          return (query: SQL) => {
+            sent.push(query);
+            return target.execute(query);
+          };
+        }
+        if (property === "transaction") {
+          return (run: (tx: Executor) => Promise<unknown>) =>
+            target.transaction((tx) => run(recording(tx as unknown as Executor)));
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+  await searchNames(recording(testDb()), me.id, q, {
     scope,
     visibleStatuses: scope === "mine" ? OWNER_VISIBLE_STATUSES : ["clean"],
     limit: 20,
-    threshold: SIMILARITY_THRESHOLD,
   });
   return sent;
 }
 
-async function explain(statement: SQL): Promise<string> {
-  const result = await testDb().execute<{ "QUERY PLAN": string }>(
-    sql`EXPLAIN (ANALYZE, BUFFERS) ${statement}`,
-  );
-  return result.rows.map((row) => row["QUERY PLAN"]).join("\n");
+/** The plan of the last statement, after the ones before it have run in the same transaction. */
+async function explain(statements: SQL[]): Promise<string> {
+  const before = statements.slice(0, -1);
+  const read = statements[statements.length - 1]!;
+  return testDb().transaction(async (tx) => {
+    for (const statement of before) await tx.execute(statement);
+    const result = await tx.execute<{ "QUERY PLAN": string }>(sql`EXPLAIN (ANALYZE, BUFFERS) ${read}`);
+    return result.rows.map((row) => row["QUERY PLAN"]).join("\n");
+  });
 }
 
 const percentile = (sorted: number[], p: number) =>
@@ -149,9 +161,8 @@ describe("search over 50,000 nodes", () => {
   });
 
   it("the caller's own side is answered from the trigram index", async () => {
-    for (const q of ["itinerary september", "itinerery", "catalogue 0123"]) {
-      const [statement] = await statementsOf(q, "mine");
-      const plan = await explain(statement!);
+    for (const q of ["itinerary september", "itinerery", "catalogue 0123", "itin"]) {
+      const plan = await explain(await statementsOf(q, "mine"));
       console.log(`EXPLAIN (ANALYZE, BUFFERS) — scope mine, q = "${q}"\n${plan}\n`);
       expect(plan, q).toContain("nodes_name_trgm_idx");
       expect(plan, q).not.toMatch(/Seq Scan on nodes n\b/);
@@ -159,8 +170,7 @@ describe("search over 50,000 nodes", () => {
   });
 
   it("the shared side walks the 20 shared roots — the plan, for the record", async () => {
-    const [statement] = await statementsOf("itinerary september", "shared");
-    const plan = await explain(statement!);
+    const plan = await explain(await statementsOf("itinerary september", "shared"));
     console.log(`EXPLAIN (ANALYZE, BUFFERS) — scope shared, q = "itinerary september"\n${plan}\n`);
     expect(plan).toContain("Recursive Union");
   });

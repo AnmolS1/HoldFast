@@ -7,6 +7,10 @@
 // extensions, and that `inFolder` is a folder the caller has a role on (`requireRole` — a hidden
 // folder is the same 404 as an unknown id).
 //
+// How close a name must be to count as a typo of the query is T05's (`searchNames` without a
+// `threshold`: its default matching, by whole name and by word). A threshold passed from here
+// could only raise the bar, and would switch the word matching off.
+//
 // The query text is the caller's own words: it goes to the database and nowhere else. The audit
 // row carries its length and the scope.
 //
@@ -23,9 +27,6 @@ import { audit } from "../services/audit";
 import { toSearchResultDtos } from "../services/node-dto";
 import { requireRole } from "../services/permissions";
 import { db, type AppEnv } from "../services/request-context";
-
-/** The similarity a name that does not contain the query needs to be a hit (pg_trgm's default). */
-export const SIMILARITY_THRESHOLD = 0.3;
 
 /** What a grantee sees of a shared tree: scanned and clean, nothing else. */
 const SHARED_VISIBLE_STATUSES: readonly ScanStatus[] = ["clean"];
@@ -66,7 +67,6 @@ router.get("/search", async (c) => {
     inFolder: query.inFolder,
     cursor: query.cursor,
     limit: query.limit,
-    threshold: SIMILARITY_THRESHOLD,
   });
 
   const body: SearchResponse = {
