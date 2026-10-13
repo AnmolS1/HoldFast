@@ -1,9 +1,20 @@
 // Name search over what a user may see: their own tree (`mine`), what is shared with them
 // through activated shares (`shared`), or both (`all`).
 //
-// Matching: `name ILIKE '%q%'` or trigram similarity (`name % q`, pg_trgm's default threshold
-// 0.3). Both are served by the GIN trigram index on `nodes.name`. Ranking: a name that starts
-// with the query, then a word that starts with it, then the rest by similarity.
+// Matching: `name ILIKE '%q%'`, or fuzzily — trigram similarity of the whole name (`name % q`,
+// pg_trgm's default threshold 0.3), or, for a query of `WORD_MATCH_MIN_CHARS` or more, WORD
+// similarity (`q <% name`: the query against the best-matching stretch of the name, so a typo in
+// one word of a long name, or a name with an extension, is still found — "reprot" finds
+// report.pdf). All three are served by the GIN trigram index on `nodes.name`. Ranking: a name
+// that starts with the query, then a word that starts with it, then a name that contains it,
+// then the fuzzy matches; within each by similarity.
+//
+// THE WORD THRESHOLD IS A SETTING, NOT AN ARGUMENT. `<%` compares with the server setting
+// `pg_trgm.word_similarity_threshold` (default 0.6), and the index is asked with that same
+// setting, so the search sets it — `set_config(…, is_local => true)`, i.e. SET LOCAL — in a
+// transaction of its own around the ranked reads. It ends with that transaction: the connection
+// goes back to the pool with the server's default. (Called inside a caller's transaction, it
+// lasts until THAT transaction ends; nothing else in this code base uses `<%`.)
 // Exclusions are the listings' own: system nodes, and anything in the trash or taken down —
 // directly or by ancestry (a file inside a taken-down folder is not found) — for the owner as well.
 
@@ -38,7 +49,11 @@ export type SearchOptions = {
   cursor?: string | null;
   /** 1–50. */
   limit: number;
-  /** Raises the similarity a fuzzy (non-substring) match needs. Default 0.3, the index's own. */
+  /**
+   * Raises the WHOLE-NAME similarity a fuzzy (non-substring) match needs. Default 0.3, the
+   * index's own. Given, every fuzzy match must reach it and there is no word matching; leave it
+   * unset for the default search.
+   */
   threshold?: number;
 };
 
@@ -60,6 +75,17 @@ type Ranked = {
   sim: number;
   name_key: string;
 };
+
+/**
+ * What `pg_trgm.word_similarity_threshold` is set to for a search (the server's default is 0.6).
+ * 0.4 is what a swapped pair of letters in a six-letter word still reaches (3 of 7 trigrams).
+ */
+export const WORD_SIMILARITY_THRESHOLD = 0.4;
+/**
+ * Queries shorter than this are not matched by word: at four letters and fewer the threshold is
+ * reached by any word that merely begins with the same two letters.
+ */
+export const WORD_MATCH_MIN_CHARS = 5;
 
 const MAX_LIMIT = 50;
 /** How far a search can be paged. Search is ranked, not keyset-ordered. */
@@ -89,11 +115,13 @@ function matchAndRank(
   q: string,
   opts: SearchOptions,
   statuses: readonly ScanStatus[],
+  byWord: boolean,
 ): { where: SQL; rank: SQL; sim: SQL } {
   const escaped = escapeLike(q);
   const threshold = opts.threshold ?? 0.3;
+  const wholeName = sql`(n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real)`;
   const conditions: SQL[] = [
-    sql`(n.name ILIKE ${"%" + escaped + "%"} OR (n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real))`,
+    sql`(n.name ILIKE ${"%" + escaped + "%"} OR ${wholeName}${byWord ? sql` OR ${q} <% n.name` : sql``})`,
     sql`n.system IS NULL`,
     notEffectivelyTrashedOrHidden("n"),
     sql`n.scan_status IN (${statusList(statuses)})`,
@@ -127,7 +155,8 @@ function matchAndRank(
     WHEN n.name ILIKE ${escaped + "%"} THEN 3
     WHEN n.name ILIKE ${"% " + escaped + "%"} OR n.name ILIKE ${"%\\_" + escaped + "%"}
       OR n.name ILIKE ${"%-" + escaped + "%"} OR n.name ILIKE ${"%." + escaped + "%"} THEN 2
-    ELSE 1 END`;
+    WHEN n.name ILIKE ${"%" + escaped + "%"} THEN 1
+    ELSE 0 END`;
   return { where: sql.join(conditions, sql` AND `), rank, sim: sql`similarity(n.name, ${q})` };
 }
 
@@ -140,9 +169,10 @@ async function searchMine(
   opts: SearchOptions,
   statuses: readonly ScanStatus[],
   take: number,
+  byWord: boolean,
 ) {
   if (statuses.length === 0) return [];
-  const m = matchAndRank(q, opts, statuses);
+  const m = matchAndRank(q, opts, statuses, byWord);
   const result = await db.execute<Ranked>(sql`
     SELECT n.id, 'owner' AS role, p.name AS path_hint, ${m.rank} AS rank, ${m.sim} AS sim, n.name_key
     FROM nodes n LEFT JOIN nodes p ON p.id = n.parent_id
@@ -158,9 +188,10 @@ async function searchShared(
   opts: SearchOptions,
   statuses: readonly ScanStatus[],
   take: number,
+  byWord: boolean,
 ) {
   if (statuses.length === 0) return [];
-  const m = matchAndRank(q, opts, statuses);
+  const m = matchAndRank(q, opts, statuses, byWord);
   // Everything under an activated share of a live owner; the highest role over all paths.
   const result = await db.execute<Ranked>(sql`
     WITH RECURSIVE reach(id, role) AS (
@@ -226,11 +257,24 @@ export async function searchNames(
   if (offset > MAX_OFFSET) return { items: [], nextCursor: null };
   const take = offset + limit + 1;
 
+  const byWord = opts.threshold === undefined && [...query].length >= WORD_MATCH_MIN_CHARS;
   const ranked: Ranked[] = [];
-  if (opts.scope !== "shared")
-    ranked.push(...(await searchMine(db, userId, query, opts, mineStatuses, take)));
-  if (opts.scope !== "mine")
-    ranked.push(...(await searchShared(db, userId, query, opts, sharedStatuses, take)));
+  const rankedReads = async (ex: Executor) => {
+    if (opts.scope !== "shared")
+      ranked.push(...(await searchMine(ex, userId, query, opts, mineStatuses, take, byWord)));
+    if (opts.scope !== "mine")
+      ranked.push(...(await searchShared(ex, userId, query, opts, sharedStatuses, take, byWord)));
+  };
+  if (byWord) {
+    await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT set_config('pg_trgm.word_similarity_threshold', ${String(WORD_SIMILARITY_THRESHOLD)}, true)`,
+      );
+      await rankedReads(tx);
+    });
+  } else {
+    await rankedReads(db);
+  }
   ranked.sort(compareRanked);
 
   const window = ranked.slice(offset, offset + limit);
