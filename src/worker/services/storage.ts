@@ -35,7 +35,9 @@ export const DELETE_BATCH = 1_000;
 
 // A version id, or any other single key segment: no slash, no dot-only names, nothing odd.
 const SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
-// A prefix that may be deleted or listed wholesale: a known area and at least one id below it.
+// A whole area (`u/`, `t/`, `a/`, `b/`): may be LISTED (the orphan sweep walks them), never deleted.
+const AREA_PREFIX = /^[utab]\/$/;
+// A prefix that may be DELETED wholesale: a known area and at least one id below it.
 const SCOPED_PREFIX = /^[utab]\/[A-Za-z0-9_-]{1,64}\/([A-Za-z0-9_.-]{1,64}\/)*$/;
 
 function segment(value: string, pattern: RegExp, what: string): string {
@@ -116,12 +118,21 @@ export type Storage = {
    * Never throws for what a client can cause: a range outside the object is
    * `unsatisfiable_range` (the store itself THROWS for it), and a malformed ETag in `onlyIf` is
    * dropped — treated as no condition — before the store sees it (it would throw too).
+   * An ETag of `*` is treated as NO CONDITION as well: the caller handles `If-Match: *` and
+   * `If-None-Match: *` itself.
    */
   get(key: string, options?: GetOptions): Promise<GetResult>;
   /** Deletes in batches of 1,000. Missing keys are not an error. */
   delete(keys: string[]): Promise<void>;
-  /** Deletes everything under a SCOPED prefix (an area and at least one id). Returns the count. */
+  /**
+   * Deletes everything under a SCOPED prefix — an area AND at least one id (`t/<nodeId>/`).
+   * A bare area (`u/`) or anything wider is refused: nothing here can empty the bucket.
+   */
   deletePrefix(prefix: string): Promise<number>;
+  /**
+   * One page (at most 1,000 keys) under a scoped prefix or a whole area (`u/`, `t/`, `a/`, `b/`).
+   * Pass the returned `cursor` back for the next page; null on the last.
+   */
   list(prefix: string, cursor?: string): Promise<{ objects: ListedObject[]; cursor: string | null }>;
   createMultipart(key: string): Promise<R2MultipartUpload>;
   /** No request is made: an unknown upload id fails at the first call on the handle. */
@@ -134,7 +145,11 @@ export type Storage = {
    * errors are passed on as they are.
    */
   complete(mpu: R2MultipartUpload, parts: UploadedPart[]): Promise<R2Object>;
-  /** Idempotent: aborting an upload that is already gone is not an error. */
+  /**
+   * Idempotent: aborting an upload that no longer exists is not an error. Only that one case is
+   * swallowed — the binding's errors carry no code property, so it is recognised by the whole
+   * message of this operation: `abortMultipartUpload: … (10024)`.
+   */
   abort(mpu: R2MultipartUpload): Promise<void>;
 };
 
@@ -187,7 +202,9 @@ function cleanEtag(value: unknown): string | null {
     .trim()
     .replace(/^W\//, "")
     .replace(/^"(.*)"$/, "$1");
-  return bare === "*" || ETAG.test(bare) ? bare : null;
+  // `*` is NOT forwarded: how the store reads it in this form (a wildcard, or a literal that
+  // never matches) is not established. It is dropped like a malformed value.
+  return ETAG.test(bare) ? bare : null;
 }
 
 function cleanEtags(value: unknown): string | string[] | undefined {
@@ -204,7 +221,8 @@ const validDate = (value: unknown): Date | undefined =>
 /**
  * The condition with every part the store could choke on removed: an ETag is bare (no quotes, no
  * `W/`), a malformed one is DROPPED — which means "no such condition", never an error — and a date
- * that is not a date is dropped too. Undefined when nothing is left.
+ * that is not a date is dropped too. `*` is dropped as well: `If-Match: *` and `If-None-Match: *`
+ * are the files host's to answer. Undefined when nothing is left.
  */
 function cleanCondition(onlyIf: R2Conditional | undefined): R2Conditional | undefined {
   if (!onlyIf || typeof onlyIf !== "object") return undefined;
@@ -222,6 +240,16 @@ function cleanCondition(onlyIf: R2Conditional | undefined): R2Conditional | unde
   return out;
 }
 
+function listable(prefix: string): string {
+  if (typeof prefix !== "string" || !(AREA_PREFIX.test(prefix) || SCOPED_PREFIX.test(prefix))) {
+    throw new Error("storage: prefix is not an area or a scoped prefix");
+  }
+  return prefix;
+}
+
+// The binding throws a plain Error: `<operation>: <text> (<code>)`. 10024 = no such upload.
+const NO_SUCH_UPLOAD = /^abortMultipartUpload: .+ \(10024\)$/;
+
 function scoped(prefix: string): string {
   if (typeof prefix !== "string" || !SCOPED_PREFIX.test(prefix))
     throw new Error("storage: prefix is not scoped");
@@ -233,7 +261,7 @@ export function storage(env: Pick<Env, "FILES">): Storage {
   const bucket = env.FILES;
 
   async function list(prefix: string, cursor?: string) {
-    const page = await bucket.list({ prefix: scoped(prefix), cursor, limit: DELETE_BATCH });
+    const page = await bucket.list({ prefix: listable(prefix), cursor, limit: DELETE_BATCH });
     return {
       objects: page.objects.map((o) => ({ key: o.key, size: o.size, etag: o.etag, uploaded: o.uploaded })),
       cursor: page.truncated ? page.cursor : null,
@@ -288,6 +316,7 @@ export function storage(env: Pick<Env, "FILES">): Storage {
     async deletePrefix(prefix) {
       let deleted = 0;
       // Always from the start: what was listed is gone by the next pass.
+      scoped(prefix);
       for (;;) {
         const page = await list(prefix);
         if (page.objects.length === 0) return deleted;
@@ -311,9 +340,9 @@ export function storage(env: Pick<Env, "FILES">): Storage {
       try {
         await mpu.abort();
       } catch (error) {
-        // 10024: the upload does not exist — already aborted, completed or expired.
-        if (!/10024|does not exist|NoSuchUpload/i.test(error instanceof Error ? error.message : ""))
-          throw error;
+        // The upload does not exist: already aborted, completed or expired. Anything else — also
+        // an unrelated "… does not exist" — is a real failure.
+        if (!(error instanceof Error) || !NO_SUCH_UPLOAD.test(error.message)) throw error;
       }
     },
   };

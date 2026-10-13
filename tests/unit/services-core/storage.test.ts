@@ -351,6 +351,32 @@ describe("get: ranges and conditions", () => {
     expect((await store.get(key, { onlyIf: null as unknown as R2Conditional }))?.kind).toBe("body");
   });
 
+  it("an ETag of * is not forwarded: it is no condition, whichever way round", async () => {
+    const { key } = await stored();
+    const asked: unknown[] = [];
+    const counting = storage({
+      FILES: {
+        get: async (_key: string, options: unknown) => {
+          asked.push(options);
+          return null;
+        },
+      } as unknown as R2Bucket,
+    });
+    for (const star of ["*", '"*"', 'W/"*"', ["*"], ["*", "*"]]) {
+      // On the real bucket: the body, both ways (a literal `*` would fail one of them).
+      expect((await store.get(key, { onlyIf: { etagMatches: star as string } }))?.kind).toBe("body");
+      expect((await store.get(key, { onlyIf: { etagDoesNotMatch: star as string } }))?.kind).toBe("body");
+      await counting.get("t/x/y", { onlyIf: { etagMatches: star as string } });
+      await counting.get("t/x/y", { onlyIf: { etagDoesNotMatch: star as string } });
+    }
+    // Nothing reached the store as a condition.
+    expect(asked).toHaveLength(10);
+    expect(asked).toEqual(asked.map(() => ({})));
+    // A list that holds a real ETag beside * keeps the real one.
+    await counting.get("t/x/y", { onlyIf: { etagMatches: ["*", "abc123"] as unknown as string } });
+    expect(asked.at(-1)).toEqual({ onlyIf: { etagMatches: ["abc123"] } });
+  });
+
   it("request headers are not an option: the parsed forms are the only ones the type takes", async () => {
     const { key } = await stored();
     const headers = new Headers({ range: "bytes=0-9" });
@@ -486,11 +512,49 @@ describe("delete, deletePrefix, list", () => {
     expect(await store.head(upload)).not.toBeNull();
   });
 
-  it("refuses a prefix that is not scoped to an id", async () => {
+  it("deletePrefix refuses a whole area and anything wider; list refuses what is neither an area nor scoped", async () => {
     for (const prefix of ["", "/", "u/", "t/", "a/", "b/", "u", `t/${uuidv7()}`, "x/abc/", "t//", "t/../"]) {
       await expect(store.deletePrefix(prefix), prefix).rejects.toThrow("not scoped");
-      await expect(store.list(prefix), prefix).rejects.toThrow("not scoped");
     }
+    for (const prefix of ["", "/", "u", "x/", "x/abc/", "ut/", `t/${uuidv7()}`, "t//", "t/../", "u/../t/"]) {
+      await expect(store.list(prefix), prefix).rejects.toThrow("not an area or a scoped prefix");
+    }
+  });
+
+  it("list pages through a whole area — and deletePrefix on that same area still throws, deleting nothing", async () => {
+    const nodeIds = Array.from({ length: 6 }, () => uuidv7());
+    const version = uuidv7();
+    const mine: string[] = [];
+    for (const nodeId of nodeIds) {
+      for (const size of THUMB_SIZES) mine.push(thumbKey(nodeId, version, size));
+    }
+    for (const key of mine) await store.put(key, encoder.encode("t"), { size: 1, contentType: "image/webp" });
+
+    // The wrapper's own page size is 1,000; a small-page stand-in over the real bucket shows the cursor.
+    const paged = storage({
+      FILES: {
+        list: (options: R2ListOptions) => env.FILES.list({ ...options, limit: 7 }),
+      } as unknown as R2Bucket,
+    });
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      const page = await paged.list("t/", cursor);
+      seen.push(...page.objects.map((object) => object.key));
+      cursor = page.cursor ?? undefined;
+      pages += 1;
+    } while (cursor !== undefined && pages < 50);
+    expect(pages).toBeGreaterThan(2);
+    expect(seen.filter((key) => mine.includes(key)).sort()).toEqual([...mine].sort());
+    expect(new Set(seen).size, "no key twice").toBe(seen.length);
+    expect(seen.every((key) => key.startsWith("t/"))).toBe(true);
+    // The real wrapper answers the same area in one call, and the other areas list too.
+    expect((await store.list("t/")).objects.length).toBeGreaterThanOrEqual(mine.length);
+    for (const area of ["u/", "a/", "b/"]) expect(Array.isArray((await store.list(area)).objects)).toBe(true);
+
+    await expect(store.deletePrefix("t/")).rejects.toThrow("not scoped");
+    for (const key of mine) expect(await store.head(key), key).not.toBeNull();
   });
 });
 
@@ -553,6 +617,31 @@ describe("multipart", () => {
     const single = await store.createMultipart(small);
     const only = await store.uploadPart(single, 1, filled(1024, 1));
     expect((await store.complete(single, [only])).size).toBe(1024);
+  });
+
+  it("abort swallows exactly 'no such upload' (10024) and nothing that merely sounds like it", async () => {
+    const throwing = (message: string) =>
+      ({ abort: async () => Promise.reject(new Error(message)) }) as unknown as R2MultipartUpload;
+    // What the store says for an upload that is gone.
+    await expect(
+      store.abort(throwing("abortMultipartUpload: The specified multipart upload does not exist. (10024)")),
+    ).resolves.toBeUndefined();
+    for (const message of [
+      "abortMultipartUpload: The specified bucket does not exist. (10006)",
+      "abortMultipartUpload: We encountered an internal error. Please try again. (10001)",
+      "completeMultipartUpload: The specified multipart upload does not exist. (10024)",
+      "The specified multipart upload does not exist.",
+      "abortMultipartUpload: something about 10024 in the middle (10001)",
+      "NoSuchUpload",
+      "Network connection lost.",
+    ]) {
+      await expect(store.abort(throwing(message)), message).rejects.toThrow(message);
+    }
+    await expect(
+      store.abort({
+        abort: async () => Promise.reject("a string, not an Error (10024)"),
+      } as unknown as R2MultipartUpload),
+    ).rejects.toBe("a string, not an Error (10024)");
   });
 
   it("abort discards the parts and is safe to repeat", async () => {
