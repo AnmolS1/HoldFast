@@ -298,3 +298,28 @@ export async function insertFileNode(tx: Executor, node: NewNode): Promise<Node 
 export async function setAvatarNode(tx: Executor, userId: string, nodeId: string): Promise<void> {
   await tx.update(user).set({ avatarNodeId: nodeId }).where(eq(user.id, userId));
 }
+
+/**
+ * The user's avatar nodes other than the one being written — every `system = 'avatar'` node they
+ * own; with `keepCurrent`, all but the one `user.avatarNodeId` points at. Lowest id first.
+ */
+export async function otherAvatarNodes(
+  db: Executor,
+  userId: string,
+  opts: { keepCurrent: boolean },
+): Promise<string[]> {
+  const rows = await db
+    .select({ id: nodes.id })
+    .from(nodes)
+    .where(
+      and(
+        eq(nodes.ownerId, userId),
+        eq(nodes.system, "avatar"),
+        opts.keepCurrent
+          ? sql`${nodes.id}::text IS DISTINCT FROM (SELECT u.avatar_node_id FROM "user" u WHERE u.id = ${userId})`
+          : undefined,
+      ),
+    )
+    .orderBy(nodes.id);
+  return rows.map((row) => row.id);
+}

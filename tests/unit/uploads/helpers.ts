@@ -109,8 +109,6 @@ export type CallOptions = {
    * has run and before it commits: throw from it to make that attempt fail.
    */
   beforeCommit?: (attempt: number) => void;
-  /** Deferred work is dropped instead of awaited — what a dead invocation does. */
-  dropDeferred?: boolean;
 };
 
 export type Answer<T = Record<string, unknown>> = {
@@ -170,7 +168,7 @@ export function deadlockError(): Error {
 
 /**
  * One request to the app as `caller` (a `user` row; null = signed out), same-origin. The
- * request's deferred work has settled when this returns (unless `dropDeferred`).
+ * request's deferred work has settled when this returns.
  */
 export async function call<T = Record<string, unknown>>(
   caller: UserRow | null,
@@ -230,12 +228,7 @@ export async function call<T = Record<string, unknown>>(
     requestEnv,
     ctx,
   );
-  if (options.dropDeferred) {
-    // Their rejections are nobody's: the invocation is gone.
-    for (const promise of pending.splice(0)) promise.catch(() => {});
-  } else {
-    while (pending.length) await Promise.allSettled(pending.splice(0));
-  }
+  while (pending.length) await Promise.allSettled(pending.splice(0));
 
   const text = await response.text();
   let parsed: unknown = null;
@@ -354,3 +347,53 @@ export async function putParts(
 
 /** The smallest multipart upload: one full part and one byte. */
 export const TWO_PARTS = PART_BYTES + 1;
+
+/** The SHA-256 of the bytes, lower-case hex — what the server computes of a stored object. */
+export async function sha256Of(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Bytes nobody else has: a made-up file whose hash is this test's alone. */
+export function uniqueBytes(size = 1000): Uint8Array {
+  const bytes = new Uint8Array(size);
+  // The runtime fills at most 65,536 bytes a call.
+  for (let at = 0; at < size; at += 65_536) crypto.getRandomValues(bytes.subarray(at, at + 65_536));
+  return bytes;
+}
+
+/**
+ * The object store, with every call of the named methods counted — and, for the methods in
+ * `fail`, refused. Hand it to a request as `env: { FILES: bucket }`.
+ */
+export function watchedBucket(fail: string[] = []) {
+  const calls: Record<string, number> = {};
+  const count = (name: string) => {
+    calls[name] = (calls[name] ?? 0) + 1;
+    if (fail.includes(name)) throw new Error(`test: the store refused ${name}`);
+  };
+  const wrapUpload = (upload: R2MultipartUpload): R2MultipartUpload =>
+    new Proxy(upload, {
+      get(target, property) {
+        const value = Reflect.get(target, property) as unknown;
+        if (typeof value !== "function") return value;
+        return (...args: unknown[]) => {
+          count(`upload.${String(property)}`);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    });
+  const bucket = new Proxy(env.FILES, {
+    get(target, property) {
+      const value = Reflect.get(target, property) as unknown;
+      if (typeof value !== "function") return value;
+      return (...args: unknown[]) => {
+        count(String(property));
+        const result = (value as (...a: unknown[]) => unknown).apply(target, args);
+        if (property === "resumeMultipartUpload") return wrapUpload(result as R2MultipartUpload);
+        return result;
+      };
+    },
+  });
+  return { bucket, calls };
+}

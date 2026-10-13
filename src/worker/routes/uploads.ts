@@ -31,10 +31,16 @@
 // AN ABORT is one transaction: the reservation is released FIRST (the owner's `user` row), then
 // the session leaves `open` / `completing`; when it did not, the release is rolled back.
 //
+// THE BLOCKLIST IS ACTED ON ONLY FOR BYTES THIS SERVER HASHED. `sha256` in the body is the
+// client's word: a hit on it makes `complete` read the stored object back and hash it, and what
+// happens next is decided by that hash — nobody is struck or locked on a declared one.
 // A HASH ON THE BLOCKLIST AS CSAM IS NEVER DELETED — by no path of `complete`: the lookup is made
-// right after the claim, and with such a hit the paths that give an upload up remove nothing
-// from the store. The hit itself writes the node and hands it to `lockSuspectedCsam`; the caller
-// gets the same `403` as for any other blocked content.
+// right after the claim, and while the declared hash says so the paths that give an upload up
+// remove nothing from the store. A real hit writes the node and hands it to `lockSuspectedCsam`;
+// the caller gets the same `403` as for any other blocked content.
+//
+// ONE AVATAR PER USER: the transaction that makes an avatar current removes the others (a held
+// one stays), so avatars — which never count against the quota — cannot pile up.
 
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import {
@@ -61,7 +67,7 @@ import { LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
 import { getNode, replaceVersion } from "../db/queries/nodes";
-import { assertPurgeable } from "../db/queries/trash";
+import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/queries/trash";
 import * as uploadIps from "../db/queries/upload-ips";
 import * as sessions from "../db/queries/upload-sessions";
 import { claimCompleting, countOpen, findResumable, markAborted, markDone } from "../db/queries/uploads";
@@ -77,8 +83,8 @@ import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { extOf, nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
-import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
-import { toNodeDto } from "../services/node-dto";
+import { sniff, SNIFF_PREFIX_BYTES, thumbEligible } from "../services/mime";
+import { toNodeDto, toOwnAvatarDto } from "../services/node-dto";
 import { assertNotTrashed, requireRole, requireUpload, type Role } from "../services/permissions";
 import * as quota from "../services/quota";
 import { db, deps, settings, type AppEnv } from "../services/request-context";
@@ -577,6 +583,8 @@ router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
 // ── complete ────────────────────────────────────────────────────────────────────────────────
 
 const blocked = () => new AppError("forbidden", BLOCKED_MESSAGE, { reason: "blocked_content" });
+/** One answer for "what is stored is not what this upload declared" — a size, or a hash. */
+const notAsDeclared = () => new AppError("validation", "What was uploaded is not what this upload declared.");
 
 type NodeValues = sessions.NewNode;
 
@@ -600,33 +608,53 @@ async function insertNamed(
   throw new AppError("conflict", "A file with that name already exists here.");
 }
 
-type Finished = { node: Node; previousVersionId: string | null };
+/**
+ * What the upload becomes:
+ *   replace   a new version of the session's replace target;
+ *   new       a row with these values;
+ *   avatar    a row with these values; `current`: it becomes the user's avatar and every other
+ *             avatar node of theirs goes — otherwise only the ones that are not their avatar.
+ */
+type Becomes =
+  | { as: "replace"; sha256: string }
+  | { as: "new"; values: NodeValues }
+  | { as: "avatar"; values: NodeValues; current: boolean };
+
+type Finished = {
+  node: Node;
+  previousVersionId: string | null;
+  /** Avatar nodes removed in the transaction: their objects are deleted after it. */
+  removed: DeletedRows[];
+  /** Avatar nodes a hold kept. */
+  keptHeld: number;
+};
 
 class ReplaceRefused extends Error {}
 
 /**
  * The one database transaction of a completion. DATABASE STATEMENTS ONLY: it runs through
- * `retryOnDeadlock` and may run several times. `as`: the node this upload becomes — the replace
- * target, or a new row with these values.
+ * `retryOnDeadlock` and may run several times.
  */
 async function finish(
   c: Ctx,
   session: Upload,
   uploader: SessionUser,
-  as: { replace: true; sha256: string } | { replace: false; values: NodeValues; avatar: boolean },
+  becomes: Becomes,
   sealed: Awaited<ReturnType<typeof sealIp>>,
 ): Promise<Finished> {
   return retryOnDeadlock(db(c), async (tx) => {
     let node: Node;
     let previousVersionId: string | null = null;
-    if (as.replace) {
+    const removed: DeletedRows[] = [];
+    let keptHeld = 0;
+    if (becomes.as === "replace") {
       // First: it takes the owner's `user` row, then the node.
       try {
         ({ previousVersionId } = await replaceVersion(tx, session.nodeId, {
           r2Key: session.r2Key,
           versionId: session.versionId,
           size: session.size,
-          sha256: as.sha256,
+          sha256: becomes.sha256,
           createdBy: uploader.id,
         }));
       } catch (error) {
@@ -637,11 +665,21 @@ async function finish(
       if (!replaced) throw new ReplaceRefused();
       node = replaced;
     } else {
-      // The `user` row before the node.
-      if (as.avatar && as.values.scanStatus === "clean") {
-        await sessions.setAvatarNode(tx, uploader.id, as.values.id!);
+      if (becomes.as === "avatar") {
+        // ONE AVATAR PER USER. First in the transaction: the delete takes the owner's tree lock,
+        // then the `user` row, then the nodes. A held one stays — row and object.
+        const others = await sessions.otherAvatarNodes(tx, uploader.id, { keepCurrent: !becomes.current });
+        for (const id of others) {
+          try {
+            removed.push(await deleteSubtreeRows(tx, id));
+          } catch (error) {
+            if (!(error instanceof LegalHoldError)) throw error;
+            keptHeld += 1;
+          }
+        }
+        if (becomes.current) await sessions.setAvatarNode(tx, uploader.id, becomes.values.id!);
       }
-      node = await insertNamed(tx, as.values);
+      node = await insertNamed(tx, becomes.values);
     }
     if (session.purpose === "file") await quota.commit(tx, session.ownerId, session.size);
     // Not `completing` any more: the stale-upload job gave this session up. Nothing is kept.
@@ -659,7 +697,7 @@ async function finish(
       iv: sealed.iv,
       keyVersion: sealed.keyVersion,
     });
-    return { node, previousVersionId };
+    return { node, previousVersionId, removed, keptHeld };
   });
 }
 
@@ -679,6 +717,7 @@ function nodeValues(session: Upload, uploader: SessionUser, sha256: string, id =
     versionId: session.versionId,
     sha256,
     scanStatus: "pending",
+    ...(session.purpose === "avatar" ? { system: "avatar" } : {}),
   };
 }
 
@@ -699,9 +738,24 @@ async function avatarVerdict(
 }
 
 /**
+ * The SHA-256 of the object as it is stored, lower-case hex — streamed through the runtime's
+ * digest, never held in memory. Null when there is no such object.
+ */
+export async function storedSha256(store: Storage, key: string): Promise<string | null> {
+  const read = await store.get(key);
+  if (read?.kind !== "body") return null;
+  const digest = new crypto.DigestStream("SHA-256");
+  await read.object.body.pipeTo(digest);
+  return Array.from(new Uint8Array(await digest.digest), (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+
+/**
  * Blocked content that is not CSAM: the object is deleted, the reservation released, the session
  * aborted, and the UPLOADER gets a strike — one per content, however often it is tried. Always
- * answers the same `403`. Exported for the test that runs it twice for one session.
+ * answers the same `403`. `sha256` is the hash of the stored bytes, computed here — never the
+ * client's word. Exported for the test that runs it twice for one session.
  */
 export async function refuseBlocked(
   c: Ctx,
@@ -727,6 +781,18 @@ export async function refuseBlocked(
     metric("error", { kind: "upload_strike" });
   }
   throw blocked();
+}
+
+/** After the commit: what the removed avatar nodes left in the store. Best effort. */
+async function discardRemoved(store: Storage, removed: DeletedRows[]): Promise<void> {
+  try {
+    await store.delete(removed.flatMap((rows) => rows.r2Keys));
+    for (const prefix of removed.flatMap((rows) => rows.thumbPrefixes)) await store.deletePrefix(prefix);
+  } catch (error) {
+    // Unreferenced from here on: the orphan sweep's.
+    captureError(error, { kind: "upload_discard" });
+    metric("error", { kind: "upload_discard" });
+  }
 }
 
 router.post(`/uploads/${ID}/complete`, verified, async (c) => {
@@ -765,9 +831,10 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   // a PUT is recorded only while the session is `open`.
   const recorded = await sessions.listParts(db(c), session.id);
 
-  // Looked up now, acted on below: with a CSAM hit nothing this request does removes the object.
-  const hit = await blocklist.lookup(db(c), body.sha256);
-  const keepStored = hit?.reason === "csam";
+  // Looked up now, acted on below. While the DECLARED hash says CSAM nothing this request does
+  // removes the object — the paths below that give the upload up come before the bytes are hashed.
+  const declared = await blocklist.lookup(db(c), body.sha256);
+  const keepStored = declared?.reason === "csam";
 
   // Everything init checked, against the state of now.
   let place = OWN_ROOT(user);
@@ -815,10 +882,31 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   }
   if (!head || head.size !== session.size || (marker && head.etag !== marker.etag)) {
     await abandonClaimed(c, session, { assembled: true, keepStored, reason: "size" });
-    throw new AppError("validation", "What was uploaded is not the size of this upload.");
+    throw notAsDeclared();
   }
 
-  if (hit && hit.reason !== "csam") return refuseBlocked(c, session, hit.reason, body.sha256);
+  // THE BLOCKLIST. A hit on the declared hash is acted on only after THIS SERVER has hashed the
+  // stored bytes: nobody is struck, and nothing is locked, on a string a client sent. From the
+  // claim on nothing can change the object (no part and no PUT is accepted), so the hash is of
+  // what is acted on. It costs a read of the object, and only when the declared hash is listed.
+  let hit = declared;
+  let sha256 = body.sha256;
+  if (declared) {
+    const actual = await storedSha256(store, session.r2Key);
+    if (actual !== body.sha256) {
+      // The declaration was false. What the bytes really are decides.
+      hit = actual === null ? null : await blocklist.lookup(db(c), actual);
+      if (!hit || actual === null) {
+        await abandonClaimed(c, session, { assembled: true, keepStored: false, reason: "hash" });
+        audit(c, "upload.hash_mismatch", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+        metric("upload", { outcome: "hash_mismatch", kind: modeOf(session) });
+        throw notAsDeclared();
+      }
+      sha256 = actual;
+    }
+  }
+
+  if (hit && hit.reason !== "csam") return refuseBlocked(c, session, hit.reason, sha256);
 
   const sealed = await sealIp(c.env, c.get("ip"));
 
@@ -827,28 +915,29 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     // own, the existing file untouched — and the one shared handler locks it. Called on the
     // database handle, after this route's transaction: it retries its own deadlocks, and its
     // record and alert run through the request's `defer`.
-    const values = nodeValues(session, user, body.sha256, replacing ? uuidv7() : session.nodeId);
-    const { node } = await finish(
-      c,
-      session,
-      user,
-      { replace: false, values: avatar ? { ...values, system: "avatar" } : values, avatar: false },
-      sealed,
-    );
+    const values = nodeValues(session, user, sha256, replacing ? uuidv7() : session.nodeId);
+    const { node } = await finish(c, session, user, { as: "new", values }, sealed);
     audit(c, "node.upload", { type: "node", id: node.id }, { uploadId: session.id, size: session.size });
     await lockSuspectedCsam(deps(c), node.id, { source: "system" });
     throw blocked();
   }
 
-  let finished: Finished;
-  try {
-    if (replacing) {
-      finished = await finish(c, session, user, { replace: true, sha256: body.sha256 }, sealed);
-    } else if (avatar) {
-      const { verdict, mimeSniffed } = await avatarVerdict(store, c.env, session);
-      const values: NodeValues = {
-        ...nodeValues(session, user, body.sha256),
-        system: "avatar",
+  let becomes: Becomes;
+  if (replacing) {
+    becomes = { as: "replace", sha256 };
+  } else if (avatar) {
+    const { verdict, mimeSniffed } = await avatarVerdict(store, c.env, session);
+    // An avatar is a picture the image service takes — decided from the bytes, not the declared
+    // type. Anything else is not stored at all.
+    if (!thumbEligible({ mimeSniffed, size: session.size, scanStatus: "clean" })) {
+      await abandonClaimed(c, session, { assembled: true, keepStored: false, reason: "not_image" });
+      throw new AppError("validation", "An avatar is an image.");
+    }
+    becomes = {
+      as: "avatar",
+      current: verdict.status === "clean",
+      values: {
+        ...nodeValues(session, user, sha256),
         scanStatus: verdict.status,
         scanReason: verdict.reason ?? null,
         scanDetail: {
@@ -857,12 +946,15 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
         },
         scannedAt: now(c),
         mimeSniffed,
-      };
-      finished = await finish(c, session, user, { replace: false, values, avatar: true }, sealed);
-    } else {
-      const values = nodeValues(session, user, body.sha256);
-      finished = await finish(c, session, user, { replace: false, values, avatar: false }, sealed);
-    }
+      },
+    };
+  } else {
+    becomes = { as: "new", values: nodeValues(session, user, sha256) };
+  }
+
+  let finished: Finished;
+  try {
+    finished = await finish(c, session, user, becomes, sealed);
   } catch (error) {
     if (!(error instanceof ReplaceRefused)) throw error;
     // The target changed under the upload (a scan, a hold, a takedown): the same answer for all.
@@ -879,14 +971,25 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     { uploadId: session.id, size: session.size, ...(avatar ? { purpose: "avatar" } : {}) },
   );
   metric("upload", { outcome: "ok", kind: modeOf(session) });
-  if (!avatar) {
-    try {
-      await enqueueScan(deps(c), { nodeId: node.id, key: session.r2Key });
-    } catch (error) {
-      // The node exists and stays `pending`; the store's own event for the key scans it too.
-      captureError(error, { kind: "upload_enqueue" });
-      metric("error", { kind: "upload_enqueue" });
+  if (becomes.as === "avatar") {
+    if (becomes.current) {
+      audit(
+        c,
+        "account.avatar_replaced",
+        { type: "user", id: user.id },
+        { nodeId: node.id, removed: finished.removed.length, keptHeld: finished.keptHeld },
+      );
     }
+    if (finished.keptHeld > 0) metric("upload", { outcome: "avatar_kept_held" }, finished.keptHeld);
+    await discardRemoved(store, finished.removed);
+    return c.json(await toOwnAvatarDto(db(c), node, { viewerId: user.id }), 201);
+  }
+  try {
+    await enqueueScan(deps(c), { nodeId: node.id, key: session.r2Key });
+  } catch (error) {
+    // The node exists and stays `pending`; the store's own event for the key scans it too.
+    captureError(error, { kind: "upload_enqueue" });
+    metric("error", { kind: "upload_enqueue" });
   }
   if (replacing && previousVersionId !== null) {
     try {
@@ -895,8 +998,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
       captureError(error, { kind: "upload_thumbs" });
     }
   }
-  // The mapper refuses a system node; an avatar is the caller's own file and is answered like one.
-  const dto = await toNodeDto(db(c), avatar ? { ...node, system: null } : node, {
+  const dto = await toNodeDto(db(c), node, {
     viewerId: user.id,
     role: place.role,
     shareRootId: place.shareRootId,
