@@ -579,6 +579,7 @@ describe("operator alerts", () => {
       "admin_lockout",
       "storage_budget",
       "scanner_down",
+      "database_rollback",
     ] as const) {
       const message = render(renderEnv, templates.operatorCritical({ event, adminUrl: `${APP}/admin` }));
       expect(message.subject, event).toBe("[dev] Holdfast: CRITICAL — action needed");
