@@ -51,7 +51,7 @@ const DESTINATIONS: Destination[] = [
   { path: "/", title: "Files", nav: "files", placeholder: true },
   { path: "/folder/abc", title: "Files", placeholder: true },
   { path: "/shared", title: "Shared with me", nav: "shared", placeholder: true },
-  { path: "/uploads", title: "Uploads", placeholder: true },
+  { path: "/uploads", title: "Uploads", placeholder: false },
   { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: true },
   { path: "/recent", title: "Recent", nav: "recent", placeholder: true },
   { path: "/starred", title: "Starred", nav: "starred", placeholder: true },
