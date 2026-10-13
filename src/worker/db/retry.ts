@@ -3,7 +3,7 @@
 // Nothing of a transaction that failed this way was written, so it can simply be run again.
 
 import { PgTransaction } from "drizzle-orm/pg-core";
-import type { Executor } from "./client";
+import type { Executor, Tx } from "./client";
 import { pgError } from "./errors";
 
 /** How often a transaction is run in all, unless the caller says otherwise. */
@@ -38,7 +38,7 @@ export function isTransaction(db: Executor): boolean {
  */
 export async function retryOnDeadlock<T>(
   db: Executor,
-  run: (tx: Executor) => Promise<T>,
+  run: (tx: Tx) => Promise<T>,
   opts: { attempts?: number } = {},
 ): Promise<T> {
   if (isTransaction(db)) return db.transaction(run);

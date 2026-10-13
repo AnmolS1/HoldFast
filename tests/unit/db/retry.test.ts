@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Db } from "../../../src/worker/db/client";
+import { afterAll, beforeAll, describe, expect, expectTypeOf, it } from "vitest";
+import type { Db, Executor, Tx } from "../../../src/worker/db/client";
 import { DEADLOCK_ATTEMPTS, isTransaction, retryOnDeadlock } from "../../../src/worker/db/retry";
 import { user } from "../../../src/worker/db/schema";
 import { makeUser, openDb, rejection } from "./_helpers";
@@ -104,5 +104,17 @@ describe("retryOnDeadlock", () => {
       }),
     );
     expect(await nameOf(id)).toBe("before");
+  });
+
+  it("hands its callback a Tx, and a callback written for any Executor is still accepted (checked by tsc)", () => {
+    type Callback = Parameters<typeof retryOnDeadlock<void>>[1];
+    expectTypeOf<Parameters<Callback>[0]>().toEqualTypeOf<Tx>();
+    expectTypeOf<(tx: Executor) => Promise<void>>().toExtend<Callback>();
+    // A Tx is an Executor, never the other way round: that is what the narrower type adds.
+    expectTypeOf<Tx>().toExtend<Executor>();
+    expectTypeOf<Executor>().not.toExtend<Tx>();
+    // That the services which insist on a real transaction take it as `{ tx }` is checked where
+    // they compile: tests/unit/services-core/retry-tx.test.ts (the Workers project).
+    expect(isTransaction(db)).toBe(false);
   });
 });
