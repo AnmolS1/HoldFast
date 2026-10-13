@@ -103,27 +103,33 @@ export async function confirmCsam(tx: Executor, sha256: string): Promise<boolean
 }
 
 /**
- * Removes an entry. With `onlyIfSourceNodeId`, only when that node's verdict added it AND the
- * entry is still what that verdict made it: an entry a suspected-CSAM lock RAISED (it has its
- * own way back, `raisedFrom`) and a confirmed `csam` listing (no source at all) are refused.
+ * Removes an entry. Without options: an admin's outright delete, whatever the entry is.
+ * With `onlyIfReason` — only when the entry's reason is STILL that one ("remove what I listed
+ * as malware" must not delete an entry a lock has since raised to `csam`); with
+ * `onlyIfSourceNodeId` — only when that node's verdict added it. Through either option an
+ * entry a suspected-CSAM lock RAISED (it has its own way back, `raisedFrom`) and a CONFIRMED
+ * `csam` listing (no source, nothing raised) are never removed.
  * This is not how a cleared CSAM lock undoes its entry — that is `moderation.clearSuspectedCsam`,
  * which knows the entry's whole state. True when a row went.
  */
 export async function remove(
   db: Executor,
   sha256: string,
-  opts: { onlyIfSourceNodeId?: string } = {},
+  opts: { onlyIfReason?: BlocklistReason; onlyIfSourceNodeId?: string } = {},
 ): Promise<boolean> {
+  const conditional = opts.onlyIfReason !== undefined || opts.onlyIfSourceNodeId !== undefined;
   const rows = await db
     .delete(hashBlocklist)
     .where(
       and(
         eq(hashBlocklist.sha256, sha256),
+        opts.onlyIfReason !== undefined ? eq(hashBlocklist.reason, opts.onlyIfReason) : undefined,
         opts.onlyIfSourceNodeId !== undefined
-          ? and(
-              eq(hashBlocklist.sourceNodeId, opts.onlyIfSourceNodeId),
-              sql`${hashBlocklist.raisedFrom} IS NULL`,
-            )
+          ? eq(hashBlocklist.sourceNodeId, opts.onlyIfSourceNodeId)
+          : undefined,
+        conditional
+          ? sql`(${hashBlocklist.raisedFrom} IS NULL AND NOT (${hashBlocklist.reason} = 'csam'
+              AND ${hashBlocklist.sourceNodeId} IS NULL AND ${hashBlocklist.raisedByNodeId} IS NULL))`
           : undefined,
       ),
     )

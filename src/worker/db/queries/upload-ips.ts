@@ -91,3 +91,19 @@ export async function deleteExpired(
     .returning({ id: uploadIps.id });
   return rows.length;
 }
+
+/**
+ * Clears the rows' own `legalHold` flag for one node — the flag the suspected-CSAM lock set on
+ * them. For "Release holds" only: it does not look at the uploader's or the node's hold (the
+ * caller decided), and a row whose uploader or node is still held stays kept by that
+ * (`expired` / `deleteExpired`). Returns how many rows it released.
+ */
+export async function releaseForNode(tx: Executor, nodeId: string): Promise<number> {
+  if (!isUuid(nodeId)) return 0;
+  const rows = await tx
+    .update(uploadIps)
+    .set({ legalHold: false })
+    .where(and(eq(uploadIps.nodeId, nodeId), eq(uploadIps.legalHold, true)))
+    .returning({ id: uploadIps.id });
+  return rows.length;
+}

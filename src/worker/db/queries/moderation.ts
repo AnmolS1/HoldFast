@@ -19,8 +19,8 @@
 // reports of the node's twins): a writer that holds any report of that node and then asks for
 // the node row deadlocks with it — every change of a report's status takes the NODE row first.
 //
-// Helpers that take the tree lock (`takedownNode`, `restoreTakedown`, `setNodeLegalHold`) take it
-// first in THEIR transaction; in a caller's transaction that is only "first" if the caller took
+// Helpers that take the tree lock (`takedownNode`, `restoreTakedown`, `setNodeLegalHold`,
+// `closeNotice`) take it first in THEIR transaction; in a caller's transaction that is only "first" if the caller took
 // no row lock before. In one transaction they therefore come BEFORE: `lockSuspectedCsam` and
 // `clearSuspectedCsam` (user rows, the node), `setUnderReview` / `dismissReview` (the node),
 // `pauseLinks` / `unpauseLinks` (link rows). The natural orders are the right ones — take down,
@@ -29,11 +29,19 @@
 // the restore goes first, or into a transaction of its own.
 
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Executor } from "../client";
-import { pgError } from "../errors";
 import { isUuid } from "../ids";
-import { dmcaNotices, hashBlocklist, nodes, reports, type ScanStatus, uploadIps, user } from "../schema";
+import { retryOnDeadlock } from "../retry";
+import {
+  dmcaNoticeNodes,
+  dmcaNotices,
+  hashBlocklist,
+  nodes,
+  reports,
+  type ScanStatus,
+  uploadIps,
+  user,
+} from "../schema";
 import { pauseLinks, unpauseLinks } from "./links";
 import { lockOwnerTree } from "./tree";
 
@@ -190,9 +198,6 @@ export async function csamSubjects(db: Executor, nodeId: string): Promise<CsamSu
  * (40P01) or a serialization failure (40001): this many times in all, then the error is thrown.
  */
 export const CSAM_LOCK_ATTEMPTS = 4;
-/** The pause before attempt n + 1: up to n × this many milliseconds, at random. */
-const CSAM_LOCK_BACKOFF_MS = 15;
-const RETRYABLE = new Set(["40P01", "40001"]);
 
 export type CsamLockResult = {
   reportId: string;
@@ -243,62 +248,48 @@ export async function lockSuspectedCsam(
   opts: { source: "photodna" | "system" | "admin" },
 ): Promise<CsamLockResult | null> {
   if (!isUuid(nodeId)) return null;
-  if (isTransaction(db)) return lockInOneTransaction(db, nodeId, opts.source);
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await lockInOneTransaction(db, nodeId, opts.source);
-    } catch (error) {
-      if (attempt >= CSAM_LOCK_ATTEMPTS || !RETRYABLE.has(pgError(error)?.code ?? "")) throw error;
-      const pause = Math.random() * CSAM_LOCK_BACKOFF_MS * attempt;
-      await new Promise((resolve) => setTimeout(resolve, pause));
-    }
-  }
+  return retryOnDeadlock(db, (tx) => lockInOneTransaction(tx, nodeId, opts.source), {
+    attempts: CSAM_LOCK_ATTEMPTS,
+  });
 }
 
-/** Is this executor a transaction (a `Tx`), not the database handle? */
-function isTransaction(db: Executor): boolean {
-  return db instanceof PgTransaction;
-}
-
-function lockInOneTransaction(
-  db: Executor,
+async function lockInOneTransaction(
+  tx: Executor,
   nodeId: string,
   source: "photodna" | "system" | "admin",
 ): Promise<CsamLockResult | null> {
-  return db.transaction(async (tx) => {
-    // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
-    // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
-    // (`deleteSubtreeRows`), the reconcile and the quota writers. Taking the node first and a
-    // user second is the opposite order: run beside a purge of the same owner the two deadlock,
-    // and when Postgres picks THIS transaction as the victim it rolls back whole (no
-    // `suspected_csam`, no hold) and the purge goes on to delete the evidence. Owner-first
-    // instead of lowest-first deadlocks the same way against a lock on a file whose owner and
-    // uploader are the other way round.
-    //
-    // Whose rows to lock is only known from the node's rows, so the set is read WITHOUT a lock
-    // first, and read again once the node is locked. If it grew in between (a Replace by a new
-    // uploader committed), the locks are released — the savepoint is rolled back — and taken
-    // again for the larger set: once. A set that grows a second time fails the transaction,
-    // nothing written; the caller's redelivery tries again.
-    //
-    // The user rows are locked FOR NO KEY UPDATE — what the hold's own UPDATE takes — not FOR
-    // UPDATE: it excludes every other writer and locker of the row just the same, but not the
-    // KEY SHARE lock a foreign-key check takes. A Replace or a trash that already holds the node
-    // and then names one of these users in a row it writes (`created_by`, `trashed_by`) would
-    // otherwise wait for this transaction while this one waits for its node: a deadlock.
-    const first = await csamSubjects(tx, nodeId);
-    if (!first) return null;
-    let userIds = subjectUserIds(first);
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, source));
-      } catch (error) {
-        if (!(error instanceof SubjectsGrew)) throw error;
-        if (attempt >= 2) throw new Error("csam lock: the node's uploader set grew twice while locking");
-        userIds = error.userIds;
-      }
+  // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
+  // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
+  // (`deleteSubtreeRows`), the reconcile and the quota writers. Taking the node first and a
+  // user second is the opposite order: run beside a purge of the same owner the two deadlock,
+  // and when Postgres picks THIS transaction as the victim it rolls back whole (no
+  // `suspected_csam`, no hold) and the purge goes on to delete the evidence. Owner-first
+  // instead of lowest-first deadlocks the same way against a lock on a file whose owner and
+  // uploader are the other way round.
+  //
+  // Whose rows to lock is only known from the node's rows, so the set is read WITHOUT a lock
+  // first, and read again once the node is locked. If it grew in between (a Replace by a new
+  // uploader committed), the locks are released — the savepoint is rolled back — and taken
+  // again for the larger set: once. A set that grows a second time fails the transaction,
+  // nothing written; the caller's redelivery tries again.
+  //
+  // The user rows are locked FOR NO KEY UPDATE — what the hold's own UPDATE takes — not FOR
+  // UPDATE: it excludes every other writer and locker of the row just the same, but not the
+  // KEY SHARE lock a foreign-key check takes. A Replace or a trash that already holds the node
+  // and then names one of these users in a row it writes (`created_by`, `trashed_by`) would
+  // otherwise wait for this transaction while this one waits for its node: a deadlock.
+  const first = await csamSubjects(tx, nodeId);
+  if (!first) return null;
+  let userIds = subjectUserIds(first);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, source));
+    } catch (error) {
+      if (!(error instanceof SubjectsGrew)) throw error;
+      if (attempt >= 2) throw new Error("csam lock: the node's uploader set grew twice while locking");
+      userIds = error.userIds;
     }
-  });
+  }
 }
 
 /** The owner and the uploaders, each once, in the order their rows are locked: ascending. */
@@ -710,8 +701,12 @@ export async function restoreTakedown(db: Executor, nodeId: string): Promise<boo
 
 /**
  * Moves an open notice to a terminal status. Its nodes stay hidden while they are taken down,
- * but stop being protected from purge. An admin closes a notice by hand; nothing closes one
- * automatically in v1. False when the notice does not exist or is already terminal.
+ * but stop being protected from purge — and so does everything UNDER a folder it names: closing
+ * a notice ends a cause that reaches down, so it takes the TREE LOCK of every owner whose nodes
+ * the notice names (lowest owner id first; first in the transaction — queries/tree.ts), and a
+ * purge or a move deciding on one of those trees has either finished or sees it closed.
+ * An admin closes a notice by hand; nothing closes one automatically in v1. False when the
+ * notice does not exist or is already terminal.
  */
 export async function closeNotice(
   db: Executor,
@@ -719,12 +714,20 @@ export async function closeNotice(
   status: TerminalNoticeStatus,
 ): Promise<boolean> {
   if (!isUuid(noticeId)) return false;
-  const rows = await db
-    .update(dmcaNotices)
-    .set({ status, updatedAt: sql`now()` })
-    .where(and(eq(dmcaNotices.id, noticeId), inArray(dmcaNotices.status, [...OPEN_NOTICE_STATUSES])))
-    .returning({ id: dmcaNotices.id });
-  return rows.length > 0;
+  return db.transaction(async (tx) => {
+    const owners = await tx
+      .selectDistinct({ ownerId: nodes.ownerId })
+      .from(dmcaNoticeNodes)
+      .innerJoin(nodes, eq(nodes.id, dmcaNoticeNodes.nodeId))
+      .where(eq(dmcaNoticeNodes.noticeId, noticeId));
+    for (const ownerId of owners.map((o) => o.ownerId).sort()) await lockOwnerTree(tx, ownerId);
+    const rows = await tx
+      .update(dmcaNotices)
+      .set({ status, updatedAt: sql`now()` })
+      .where(and(eq(dmcaNotices.id, noticeId), inArray(dmcaNotices.status, [...OPEN_NOTICE_STATUSES])))
+      .returning({ id: dmcaNotices.id });
+    return rows.length > 0;
+  });
 }
 
 /**

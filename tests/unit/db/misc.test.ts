@@ -1,7 +1,7 @@
 // The small modules: ledger, email ledger, blocklist, settings, audit, upload IPs, users, and
 // the filename stub.
 
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { decodeCursor, encodeCursor } from "../../../src/worker/db/cursor";
@@ -319,6 +319,44 @@ describe("blocklist", () => {
     expect(await blocklist.remove(db, raised)).toBe(true);
   });
 
+  it("remove with onlyIfReason deletes only an entry that still has that reason — never one a lock has since raised, never a confirmed one", async () => {
+    const entry = async (sha: string) =>
+      (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha)))[0] ?? null;
+    // "Remove what I listed as malware" — and a lock has raised it to csam meanwhile.
+    const raised = rand(32);
+    await db
+      .insert(hashBlocklist)
+      .values({ sha256: raised, reason: "csam", raisedFrom: "malware", raisedByNodeId: uuidv7() });
+    expect(await blocklist.remove(db, raised, { onlyIfReason: "malware" })).toBe(false);
+    // Not through its current reason either: a raised entry goes back by the clear, not by this.
+    expect(await blocklist.remove(db, raised, { onlyIfReason: "csam" })).toBe(false);
+    expect(await entry(raised)).toMatchObject({ reason: "csam", raisedFrom: "malware" });
+    // A confirmed listing is not removed through an option.
+    const confirmed = rand(32);
+    await blocklist.confirmCsam(db, confirmed);
+    expect(await blocklist.remove(db, confirmed, { onlyIfReason: "csam" })).toBe(false);
+    expect(await entry(confirmed)).not.toBeNull();
+    // Another reason than the entry has: nothing goes.
+    const dmca = rand(32);
+    await blocklist.upsert(db, { sha256: dmca, reason: "dmca" });
+    expect(await blocklist.remove(db, dmca, { onlyIfReason: "malware" })).toBe(false);
+    // The controls: the reason it has; both options together; a lock-created csam entry by reason.
+    expect(await blocklist.remove(db, dmca, { onlyIfReason: "dmca" })).toBe(true);
+    const node = uuidv7();
+    const both = rand(32);
+    await blocklist.upsert(db, { sha256: both, reason: "malware", sourceNodeId: node });
+    expect(await blocklist.remove(db, both, { onlyIfReason: "dmca", onlyIfSourceNodeId: node })).toBe(false);
+    expect(await blocklist.remove(db, both, { onlyIfReason: "malware", onlyIfSourceNodeId: uuidv7() })).toBe(
+      false,
+    );
+    expect(await blocklist.remove(db, both, { onlyIfReason: "malware", onlyIfSourceNodeId: node })).toBe(
+      true,
+    );
+    const created = rand(32);
+    await db.insert(hashBlocklist).values({ sha256: created, reason: "csam", sourceNodeId: node });
+    expect(await blocklist.remove(db, created, { onlyIfReason: "csam" })).toBe(true);
+  });
+
   it("an explicit csam upsert and confirmCsam leave a detached entry: no source, nothing raised, author and note of a csam entry kept", async () => {
     const admin = await makeUser(db);
     const entry = async (sha: string) =>
@@ -566,6 +604,60 @@ describe("upload-ips", () => {
       "v1",
       "v2",
     ]);
+  });
+
+  it("releaseForNode clears the row flag of that node's rows only, and says how many; what else holds a row still keeps it", async () => {
+    const cipher = new Uint8Array([1, 2, 3]);
+    const iv = new Uint8Array(12);
+    const old = new Date(Date.now() - 91 * 86_400_000);
+    const heldUploader = await makeUser(db, { legalHold: true });
+    const free = await makeUser(db);
+    const [nodeId, otherNode] = [uuidv7(), uuidv7()];
+    const row = (node: string, uploaderId: string, legalHold: boolean) => ({
+      nodeId: node,
+      versionId: "v",
+      uploaderId,
+      ipEncrypted: cipher,
+      iv,
+      keyVersion: 1,
+      at: old,
+      legalHold,
+    });
+    const [a, b, unflagged, elsewhere] = await db
+      .insert(uploadIpsTable)
+      .values([
+        row(nodeId, free, true),
+        row(nodeId, heldUploader, true),
+        row(nodeId, free, false),
+        row(otherNode, free, true),
+      ])
+      .returning({ id: uploadIpsTable.id });
+    const flags = async () =>
+      Object.fromEntries(
+        (
+          await db
+            .select({ id: uploadIpsTable.id, held: uploadIpsTable.legalHold })
+            .from(uploadIpsTable)
+            .where(inArray(uploadIpsTable.id, [a!.id, b!.id, unflagged!.id, elsewhere!.id]))
+        ).map((r) => [r.id, r.held]),
+      );
+
+    expect(await uploadIps.releaseForNode(db, nodeId)).toBe(2);
+    expect(await flags()).toEqual({
+      [a!.id]: false,
+      [b!.id]: false,
+      [unflagged!.id]: false,
+      [elsewhere!.id]: true,
+    });
+    // Idempotent; unknown and malformed ids release nothing.
+    expect(await uploadIps.releaseForNode(db, nodeId)).toBe(0);
+    expect(await uploadIps.releaseForNode(db, uuidv7())).toBe(0);
+    expect(await uploadIps.releaseForNode(db, "nope")).toBe(0);
+    // Released rows are due — except the one whose UPLOADER is still held: that is another hold.
+    const due = await uploadIps.expired(db, 100_000);
+    expect(due).toContain(a!.id);
+    expect(due).not.toContain(b!.id);
+    expect(due).not.toContain(elsewhere!.id);
   });
 
   it("expired / deleteExpired keep a row while its uploader is held or its node is one the purge gate protects — whatever the row's own flag says", async () => {

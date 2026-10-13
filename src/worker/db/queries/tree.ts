@@ -224,8 +224,8 @@ export function notEffectivelyTrashedOrHidden(alias: string = "nodes"): SQL {
  *   - every purge path that runs the gate (`trash.deleteSubtreeRows`, `deleteVersionRows`): a
  *     hold or a notice on a folder ABOVE the root protects it (queries/holds.ts);
  *   - every writer that sets or clears such a cause on a node: `moderation.takedownNode`,
- *     `restoreTakedown`, `setNodeLegalHold` — and the admin console's attach / detach of a DMCA
- *     notice, when it is built.
+ *     `restoreTakedown`, `setNodeLegalHold`, `closeNotice` (for every owner the notice names) —
+ *     and the admin console's attach / detach of a DMCA notice, when it is built.
  *
  * LOCK ORDER: the tree lock FIRST — before any row lock of the transaction — then `user` rows
  * (lowest id first), then `nodes`, then the rest. It ends with the (outermost) transaction.
@@ -239,11 +239,11 @@ export function notEffectivelyTrashedOrHidden(alias: string = "nodes"): SQL {
  *   - `nodes.move`, `trash.restore`, the purge paths BEFORE `quota.reserve` / `release` /
  *     `reconcileUsedBytes` and `ceilings.enforceUploadCeilings` (`user` rows) and
  *     `nodes.replaceVersion` (the owner's `user` row, the node);
- *   - `moderation.takedownNode` / `restoreTakedown` / `setNodeLegalHold` BEFORE
+ *   - `moderation.takedownNode` / `restoreTakedown` / `setNodeLegalHold` / `closeNotice` BEFORE
  *     `lockSuspectedCsam`, `clearSuspectedCsam`, `setUnderReview`, `dismissReview` (user rows,
  *     the node) and `links.pauseLinks` / `unpauseLinks` (link rows) — see queries/moderation.ts.
- * Two transactions that each take the tree lock of TWO owners take them lowest owner id first
- * (nothing built does).
+ * A transaction that takes the tree lock of SEVERAL owners takes them lowest owner id first
+ * (`closeNotice` does, for a notice that names nodes of more than one owner).
  */
 export async function lockOwnerTree(tx: Executor, ownerId: string): Promise<void> {
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"tree:" + ownerId}, 0))`);

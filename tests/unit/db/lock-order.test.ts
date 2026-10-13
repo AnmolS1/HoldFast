@@ -15,6 +15,7 @@ import { LegalHoldError, pgError, QueryError } from "../../../src/worker/db/erro
 import { lookup } from "../../../src/worker/db/queries/blocklist";
 import {
   clearSuspectedCsam,
+  closeNotice,
   lockSuspectedCsam,
   setNodeLegalHold,
   setUserLegalHold,
@@ -26,6 +27,8 @@ import { lockOwnerTree } from "../../../src/worker/db/queries/tree";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
 import {
+  dmcaNoticeNodes,
+  dmcaNotices,
   nodes,
   nodeVersions,
   pendingUserPurges,
@@ -672,7 +675,13 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
     const movable = await makeFile(a.db, owner, folder.id, "movable.bin");
     const flagged = await makeFile(a.db, owner, folder.id, "flagged.jpg");
     const elsewhere = await makeFolder(a.db, owner, null, `elsewhere-${rand()}`);
-    return { owner, folder, trashed, movable, flagged, elsewhere };
+    // An open notice that names `elsewhere` (it protects nothing the other operations touch).
+    const [notice] = await a.db
+      .insert(dmcaNotices)
+      .values({ receivedVia: "form", status: "received" })
+      .returning();
+    await a.db.insert(dmcaNoticeNodes).values({ noticeId: notice!.id, nodeId: elsewhere.id, nodeName: "x" });
+    return { owner, folder, trashed, movable, flagged, elsewhere, noticeId: notice!.id };
   }
   const isHeldError = (outcome: Outcome<unknown>) => !outcome.ok && outcome.error instanceof LegalHoldError;
 
@@ -736,6 +745,52 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
     expect(await getNode(a.db, f.movable.id)).toMatchObject({ parentId: f.folder.id });
   });
 
+  // Closing a notice ends a cause that reaches down. The close is written and not committed; a
+  // purge of a file under the noticed folder starts. It waits for the tree lock, then finds the
+  // notice closed and deletes. Without the lock in `closeNotice` the purge would not wait, would
+  // read the notice as still open and refuse — an answer about a tree that is changing.
+  it("a purge beside a notice being closed on the folder above: the purge waits, then goes through", async () => {
+    const owner = await makeUser(a.db);
+    const noticed = await makeFolder(a.db, owner, null, `noticed-${rand()}`);
+    const file = await makeFile(a.db, owner, noticed.id, `under-${rand()}.bin`, {
+      deletedAt: new Date(Date.now() - 1000),
+      trashedRoot: true,
+    });
+    // The notice names folders of TWO owners: both trees are locked, lowest owner id first.
+    const other = await makeUser(a.db);
+    const theirs = await makeFolder(a.db, other, null, `theirs-${rand()}`);
+    const [notice] = await a.db
+      .insert(dmcaNotices)
+      .values({ receivedVia: "form", status: "actioned" })
+      .returning();
+    await a.db.insert(dmcaNoticeNodes).values([
+      { noticeId: notice!.id, nodeId: noticed.id, nodeName: "a" },
+      { noticeId: notice!.id, nodeId: theirs.id, nodeName: "b" },
+    ]);
+    const purgePid = gate<number>();
+    const closeWritten = gate();
+
+    const closing = settle(
+      a.db.transaction(async (tx) => {
+        const closed = await closeNotice(tx, notice!.id, "closed");
+        closeWritten.open();
+        await untilWaitingForLock(await purgePid.opened, "the purge");
+        return closed;
+      }),
+    );
+    const purge = settle(
+      b.db.transaction(async (tx) => {
+        await closeWritten.opened;
+        purgePid.open(await pidOf(tx));
+        return deleteSubtreeRows(tx, file.id);
+      }),
+    );
+    const [closed, purged] = await Promise.all([closing, purge]);
+    expect(closed).toEqual({ ok: true, value: true });
+    expect(purged).toMatchObject({ ok: true, value: { ownerId: owner } });
+    expect(await getNode(a.db, file.id)).toBeNull();
+  });
+
   // Pairwise, in both orders: the first has taken ITS first lock and stops; the second runs until
   // it waits or is done; then the first goes on. Nobody is ended as a deadlock victim, and the
   // only refusal there can be is the hold's own (a purge or a move after the takedown).
@@ -760,6 +815,10 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
       first: (tx, f) =>
         tx.select({ id: user.id }).from(user).where(eq(user.id, f.owner)).for("no key update"),
       run: (tx, f) => lockSuspectedCsam(tx, f.flagged.id, { source: "photodna" }),
+    },
+    closeNotice: {
+      first: (tx, f) => lockOwnerTree(tx, f.owner),
+      run: (tx, f) => closeNotice(tx, f.noticeId, "closed"),
     },
   };
   const names = Object.keys(ops);
