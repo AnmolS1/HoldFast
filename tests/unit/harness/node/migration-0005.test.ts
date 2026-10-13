@@ -111,7 +111,7 @@ afterAll(async () => {
 });
 
 describe("migration 0005", () => {
-  it("is in the journal, sixth", () => {
+  it("is in the journal, right after 0004", () => {
     expect(journal.entries[5]!.tag).toBe(TAG);
   });
 

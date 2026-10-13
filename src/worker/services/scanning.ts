@@ -25,7 +25,7 @@
 import { parseAdminList } from "../../shared/admin-emails";
 import { UUID } from "../../shared/ids";
 import { lockSuspectedCsam as lockRows } from "../db/queries/moderation";
-import { getNode, resetToPending } from "../db/queries/nodes";
+import { findByR2Key, getNode, resetToPending } from "../db/queries/nodes";
 import type { ScanReason } from "../db/schema";
 import { audit } from "./audit";
 import { sendOperatorCritical } from "./email";
@@ -206,8 +206,13 @@ export async function enqueueScan(
  * says otherwise, because the finished job of the earlier scan is only taken over by a forced
  * claim.
  *
- * A node that is `under_review`, `suspected_csam` or taken down KEEPS ITS STATUS and nothing is
- * sent: a rescan must never be a way to launder a locked file back to `pending` and then `clean`.
+ * A node that is `under_review`, `suspected_csam` or taken down KEEPS ITS STATUS — and its
+ * verdict — and nothing is sent: a rescan must never be a way to launder a locked file back to
+ * `pending` and then `clean`. That is decided on the node's LOCKED row, in the transaction that
+ * resets it: a takedown that lands while this runs is either seen (nothing happens) or comes
+ * after the reset has committed. The message and the audit row follow the commit, and only when
+ * the reset happened.
+ *
  * `404 not_found` for an id that is not a file. The one-per-hour owner throttle is the route's.
  */
 export async function enqueueRescan(
@@ -215,13 +220,28 @@ export async function enqueueRescan(
   nodeId: string,
   opts: { force?: boolean; by: "owner" | "admin" },
 ): Promise<void> {
-  const node = await getNode(deps.db, nodeId);
-  if (!node || node.kind !== "file" || !node.r2Key) throw new AppError("not_found");
-  if (node.takedownAt !== null) return;
-  // False for `under_review` and `suspected_csam` (the guard is in the statement itself).
-  if (!(await resetToPending(deps.db, nodeId))) return;
+  const seen = await getNode(deps.db, nodeId);
+  if (!seen || seen.kind !== "file" || !seen.r2Key) throw new AppError("not_found");
+
+  const key = await deps.db.transaction(async (tx) => {
+    // The row is locked through its object key. A replace that landed since the read above gave
+    // the node a new key: then the node is read again and locked through that one.
+    let r2Key: string | null = seen.r2Key;
+    for (let attempt = 0; attempt < 3 && r2Key; attempt++) {
+      const locked = await findByR2Key(tx, r2Key, { forUpdate: true });
+      if (locked?.id === nodeId) {
+        if (locked.kind !== "file" || locked.takedownAt !== null) return null;
+        // False for `under_review` and `suspected_csam` (the guard is in the statement itself).
+        return (await resetToPending(tx, nodeId)) ? r2Key : null;
+      }
+      r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
+    }
+    return null;
+  });
+  if (key === null) return;
+
   const force = opts.force ?? true;
-  await enqueueScan(deps, { nodeId, key: node.r2Key, force });
+  await enqueueScan(deps, { nodeId, key, force });
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by, force });
 }
 

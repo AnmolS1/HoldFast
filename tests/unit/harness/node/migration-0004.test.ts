@@ -94,8 +94,8 @@ afterAll(async () => {
 });
 
 describe("migration 0004", () => {
-  it("is in the journal, and is the newest migration", () => {
-    expect(journal.entries.at(-1)!.tag).toBe(TAG);
+  it("is in the journal, right after 0003", () => {
+    expect(journal.entries[4]!.tag).toBe(TAG);
   });
 
   it("before it, a new row is given 5 GiB", async () => {

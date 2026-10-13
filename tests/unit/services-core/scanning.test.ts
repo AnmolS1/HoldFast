@@ -1,9 +1,9 @@
 // The scanning interface: message shapes, the stub scanner, sending, rescans and the
 // suspected-CSAM handler. The consumer has its own file.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { hashBlocklist, reports, shareLinks, uploadIps, user } from "../../../src/worker/db/schema";
+import { hashBlocklist, nodes, reports, shareLinks, uploadIps, user } from "../../../src/worker/db/schema";
 import { AppError } from "../../../src/worker/services/errors";
 import {
   enqueueRescan,
@@ -47,6 +47,62 @@ function streamOf(bytes: Uint8Array, chunk = 65_536): ReadableStream<Uint8Array>
       if (at >= bytes.length) return controller.close();
       controller.enqueue(bytes.subarray(at, at + chunk));
       at += chunk;
+    },
+  });
+}
+
+/** A promise with its resolver, so one side of a race can be held until the other is in place. */
+function gate<T = void>() {
+  let open!: (value: T) => void;
+  const opened = new Promise<T>((resolve) => (open = resolve));
+  return { opened, open };
+}
+
+/** Resolves once some backend of this database is blocked on a lock that `pid` holds. */
+async function untilBlockedBy(pid: number): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const result = await testDb().execute<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND ${pid} = ANY(pg_blocking_pids(pid))`,
+    );
+    if (Number(result.rows[0]?.n) > 0) return;
+    if (Date.now() > deadline) throw new Error("nothing ever waited for the lock: the rescan did not block");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
+/** A database handle that runs `after` once, right after the first plain read made through it. */
+function staleFirstRead<T extends object>(db: T, after: () => PromiseLike<unknown>): T {
+  let pending = true;
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      const value: unknown = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      const bound = (value as (...args: unknown[]) => unknown).bind(target);
+      if (property !== "select" || !pending) return bound;
+      return (...args: unknown[]) => {
+        const builder = bound(...args) as { from: (...a: unknown[]) => unknown };
+        return {
+          from: (...fromArgs: unknown[]) => {
+            const query = builder.from(...fromArgs) as {
+              where: (...a: unknown[]) => { limit: (n: number) => Promise<unknown> };
+            };
+            return {
+              where: (...whereArgs: unknown[]) => ({
+                limit: async (n: number) => {
+                  const rows = await query.where(...whereArgs).limit(n);
+                  if (pending) {
+                    pending = false;
+                    await after();
+                  }
+                  return rows;
+                },
+              }),
+            };
+          },
+        };
+      };
     },
   });
 }
@@ -319,6 +375,63 @@ describe("enqueueRescan", () => {
       expect(sent, before.scanStatus).toEqual([]);
       expect(await auditRows({ action: "scan.rescan_requested", targetId: before.id })).toEqual([]);
     }
+  });
+
+  it("a takedown that lands while the rescan runs is seen: verdict kept, not pending, nothing sent", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, {
+      scanStatus: "infected",
+      scanReason: null,
+      scanDetail: { engine: "clamav", signatures: ["Made.Up.Signature"] },
+      scannedAt: new Date("2026-10-01T00:00:00.000Z"),
+    });
+    const { deps, sent, settle } = recordingDeps();
+    const lockHeld = gate<number>();
+
+    // Transaction A takes the node down and holds the row's lock until the rescan is waiting for it.
+    const takedown = testDb().transaction(async (tx) => {
+      await tx
+        .update(nodes)
+        .set({ takedownAt: new Date(), takedownReason: "abuse" })
+        .where(eq(nodes.id, file.id));
+      const pid = Number(
+        (await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`)).rows[0]!.pid,
+      );
+      lockHeld.open(pid);
+      await untilBlockedBy(pid);
+    });
+    await lockHeld.opened;
+    const rescan = enqueueRescan(deps, file.id, { by: "owner" });
+    await Promise.all([takedown, rescan]);
+    await settle();
+
+    const after = await nodeById(file.id);
+    expect(after!.takedownAt).toBeInstanceOf(Date);
+    expect(after).toMatchObject({
+      scanStatus: "infected",
+      scanDetail: { engine: "clamav", signatures: ["Made.Up.Signature"] },
+      scannedAt: new Date("2026-10-01T00:00:00.000Z"),
+    });
+    expect(sent).toEqual([]);
+    expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toEqual([]);
+  });
+
+  it("a replace that lands before the rescan locks the row: the NEW version is the one enqueued", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const newVersion = crypto.randomUUID();
+    const newKey = `u/${owner.id}/${file.id}/${newVersion}`;
+    const { deps, sent } = recordingDeps();
+    // The read inside enqueueRescan sees the old key; the row has the new one by the time it locks.
+    const stale = {
+      ...deps,
+      db: staleFirstRead(deps.db, () =>
+        testDb().update(nodes).set({ r2Key: newKey, versionId: newVersion }).where(eq(nodes.id, file.id)),
+      ),
+    };
+    await enqueueRescan(stale, file.id, { by: "admin" });
+    expect(sent).toEqual([{ v: 1, nodeId: file.id, key: newKey, force: true }]);
+    expect((await nodeById(file.id))!.scanStatus).toBe("pending");
   });
 
   it("is a 404 for a folder and for an id that does not exist", async () => {
