@@ -2,11 +2,17 @@
 // suspendUser, after the commit, exactly once.
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { uuidv7 } from "../../../src/worker/db/ids";
 import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../../src/shared/constants";
-import { countActive } from "../../../src/worker/db/queries/strikes";
+import { countActive, insert, usersAtThreshold } from "../../../src/worker/db/queries/strikes";
 import { strikes } from "../../../src/worker/db/schema";
 import { AppError } from "../../../src/worker/services/errors";
-import { addStrike, liftStrike } from "../../../src/worker/services/strikes";
+import {
+  addStrike,
+  enforceStrikeThreshold,
+  liftStrike,
+  sweepStrikeThresholds,
+} from "../../../src/worker/services/strikes";
 import {
   auditRows,
   linkById,
@@ -45,7 +51,7 @@ describe("addStrike", () => {
     const first = await settled((deps) =>
       addStrike(deps, { userId: user.id, kind: "malware", nodeId: folder.id }),
     );
-    expect(first).toMatchObject({ activeStrikes: 1, suspended: false, applySuspension: null });
+    expect(first).toMatchObject({ created: true, activeStrikes: 1, suspended: false, applySuspension: null });
     const second = await settled((deps) =>
       addStrike(deps, { userId: user.id, kind: "dmca", note: "notice 7" }),
     );
@@ -271,5 +277,382 @@ describe("addStrike inside a caller's transaction", () => {
     expect(await countActive(testDb(), user.id, STRIKE_WINDOW_DAYS)).toBe(3);
     expect((await userById(user.id))!.suspendedAt).toBeInstanceOf(Date);
     expect(mailTo(email, "accountSuspended")).toHaveLength(1);
+  });
+});
+
+// A 64-character hex digest that belongs to no real content.
+const fakeSha = () =>
+  Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+/** A ServiceDeps whose database refuses to open a transaction `times` times: suspendUser throws. */
+function failingSuspension(times = 1) {
+  const made = serviceDeps();
+  let left = times;
+  const db = new Proxy(made.deps.db, {
+    get(target, property, receiver) {
+      if (property === "transaction" && left > 0) {
+        return () => {
+          left -= 1;
+          return Promise.reject(new Error("the database is unavailable (made up for the test)"));
+        };
+      }
+      const value: unknown = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  return { ...made, deps: { ...made.deps, db } };
+}
+
+describe("the same violation strikes once", () => {
+  it("the same user, kind and node twice: one row, one audit row, the count unchanged", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const first = await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", nodeId }));
+    expect(first).toMatchObject({ created: true, activeStrikes: 1 });
+    // A redelivered verdict, twice more.
+    for (let i = 0; i < 2; i++) {
+      const again = await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", nodeId }));
+      expect(again).toMatchObject({
+        strikeId: first.strikeId,
+        created: false,
+        activeStrikes: 1,
+        suspended: false,
+      });
+    }
+    expect(await strikeRows(user.id)).toHaveLength(1);
+    expect(await auditRows({ action: "strike.added", targetId: user.id })).toHaveLength(1);
+    expect((await userById(user.id))!.suspendedAt, "three deliveries are not three strikes").toBeNull();
+  });
+
+  it("the same content on three different nodes: one strike, and no suspension", async () => {
+    const { user } = await verifiedUser();
+    const sha256 = fakeSha();
+    const first = await settled((deps) =>
+      addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256 }),
+    );
+    for (let i = 0; i < 2; i++) {
+      const retry = await settled((deps) =>
+        addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256 }),
+      );
+      expect(retry).toMatchObject({ strikeId: first.strikeId, created: false, activeStrikes: 1 });
+    }
+    expect(await strikeRows(user.id)).toMatchObject([{ contentSha256: sha256 }]);
+    expect((await userById(user.id))!.suspendedAt).toBeNull();
+    // The control: three DIFFERENT bad files are three strikes and a suspension.
+    for (let i = 0; i < 2; i++) {
+      await settled((deps) =>
+        addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256: fakeSha() }),
+      );
+    }
+    expect(await strikeRows(user.id)).toHaveLength(3);
+    expect((await userById(user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
+  it("another kind, another node, another hash or another user is another strike", async () => {
+    const a = await verifiedUser();
+    const b = await verifiedUser();
+    const nodeId = uuidv7();
+    const sha256 = fakeSha();
+    const add = (input: Parameters<typeof addStrike>[1]) => settled((deps) => addStrike(deps, input));
+    expect((await add({ userId: a.user.id, kind: "malware", nodeId, sha256 })).created).toBe(true);
+    expect((await add({ userId: a.user.id, kind: "dmca", nodeId, sha256 })).created).toBe(true);
+    expect((await add({ userId: b.user.id, kind: "malware", nodeId, sha256 })).created).toBe(true);
+    expect(
+      (await add({ userId: b.user.id, kind: "malware", nodeId: uuidv7(), sha256: fakeSha() })).created,
+    ).toBe(true);
+    expect(await strikeRows(a.user.id)).toHaveLength(2);
+    expect(await strikeRows(b.user.id)).toHaveLength(2);
+  });
+
+  it("a strike with neither a node nor a hash is never de-duplicated", async () => {
+    const { user } = await verifiedUser();
+    const one = await settled((deps) => addStrike(deps, { userId: user.id, kind: "abuse" }));
+    const two = await settled((deps) => addStrike(deps, { userId: user.id, kind: "abuse" }));
+    expect(one.created && two.created).toBe(true);
+    expect(two.strikeId).not.toBe(one.strikeId);
+    expect(two.activeStrikes).toBe(2);
+  });
+
+  it("a lifted strike does not block a new one for the same node or the same content", async () => {
+    const admin = await verifiedUser();
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const sha256 = fakeSha();
+    const first = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", nodeId, sha256 }));
+    await settled((deps) => liftStrike(deps, first.strikeId, admin.user.id));
+    const byNode = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", nodeId }));
+    expect(byNode.created).toBe(true);
+    expect(byNode.strikeId).not.toBe(first.strikeId);
+    // The same node once more: the UNLIFTED strike is the existing one, not the older lifted one.
+    const repeat = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", nodeId }));
+    expect(repeat).toMatchObject({ strikeId: byNode.strikeId, created: false });
+    const byContent = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", sha256 }));
+    expect(byContent.created).toBe(true);
+    expect(await strikeRows(user.id)).toHaveLength(3);
+    expect(await countActive(testDb(), user.id, STRIKE_WINDOW_DAYS)).toBe(2);
+  });
+
+  it("node matches one strike and content another: the older one is returned", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const sha256 = fakeSha();
+    const byContent = await insert(testDb(), { userId: user.id, kind: "malware", sha256 });
+    const byNode = await insert(testDb(), { userId: user.id, kind: "malware", nodeId });
+    expect(byContent.created && byNode.created).toBe(true);
+    expect(await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 })).toEqual({
+      id: byContent.id,
+      created: false,
+    });
+    await testDb()
+      .update(strikes)
+      .set({ at: sql`now() - interval '1 day'` })
+      .where(eq(strikes.id, byNode.id));
+    expect(await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 })).toEqual({
+      id: byNode.id,
+      created: false,
+    });
+    expect(await strikeRows(user.id)).toHaveLength(2);
+  });
+
+  it("two concurrent inserts of the same key, in real transactions, leave one row", async () => {
+    const { user } = await verifiedUser();
+    for (const key of [{ nodeId: uuidv7() }, { sha256: fakeSha() }]) {
+      const before = (await strikeRows(user.id)).length;
+      const results = await Promise.all(
+        // Different nodes for the hash case: the content is what collides.
+        [0, 1, 2, 3].map(() =>
+          testDb().transaction((tx) =>
+            insert(tx, {
+              userId: user.id,
+              kind: "malware",
+              ...("sha256" in key ? { nodeId: uuidv7() } : {}),
+              ...key,
+            }),
+          ),
+        ),
+      );
+      expect(results.filter((result) => result.created)).toHaveLength(1);
+      expect(new Set(results.map((result) => result.id)).size).toBe(1);
+      expect((await strikeRows(user.id)).length - before).toBe(1);
+    }
+  });
+
+  it("the table itself refuses a second unlifted row for the same node or content", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const sha256 = fakeSha();
+    const row = { userId: user.id, kind: "malware" as const };
+    await testDb()
+      .insert(strikes)
+      .values({ ...row, nodeId });
+    await expect(
+      testDb()
+        .insert(strikes)
+        .values({ ...row, nodeId }),
+    ).rejects.toThrow();
+    await testDb()
+      .insert(strikes)
+      .values({ ...row, contentSha256: sha256 });
+    await expect(
+      testDb()
+        .insert(strikes)
+        .values({ ...row, contentSha256: sha256 }),
+    ).rejects.toThrow();
+    // Neither key: any number.
+    await testDb().insert(strikes).values([row, row]);
+  });
+
+  it("in a caller's transaction a repeated strike adds nothing and audits nothing, and still enforces", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", nodeId }));
+    const { deps, settle } = serviceDeps();
+    const again = await testDb().transaction((tx) =>
+      addStrike(deps, { userId: user.id, kind: "malware", nodeId }, { tx }),
+    );
+    expect(again).toMatchObject({ created: false, activeStrikes: 1, suspended: false });
+    await again.applySuspension!();
+    await settle();
+    expect(await strikeRows(user.id)).toHaveLength(1);
+    expect(await auditRows({ action: "strike.added", targetId: user.id })).toHaveLength(1);
+  });
+});
+
+describe("a committed strike can never leave the account un-suspended", () => {
+  /** Three unlifted strikes written as rows only: the state a consumer killed after its commit leaves. */
+  async function atThresholdUnsuspended() {
+    const created = await verifiedUser();
+    const { deps } = serviceDeps();
+    for (let i = 0; i < STRIKES_TO_SUSPEND; i++) {
+      // The tx form, and applySuspension is never called.
+      await testDb().transaction((tx) =>
+        addStrike(deps, { userId: created.user.id, kind: "malware" }, { tx }),
+      );
+    }
+    expect((await userById(created.user.id))!.suspendedAt).toBeNull();
+    return created;
+  }
+
+  it("applySuspension never called: the sweep suspends, with exactly one email", async () => {
+    const { user, email } = await atThresholdUnsuspended();
+    expect(await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000)).toContain(user.id);
+
+    const swept = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect(swept.checked).toBeGreaterThanOrEqual(1);
+    expect(swept.suspended).toBeGreaterThanOrEqual(1);
+    expect(swept.failed).toBe(0);
+    expect((await userById(user.id))!.suspendedAt).toBeInstanceOf(Date);
+    expect((await userById(user.id))!.suspendedReason).toBe("strikes");
+    expect(await sessionsOf(user.id)).toEqual([]);
+    expect(mailTo(email, "accountSuspended")).toHaveLength(1);
+
+    // Swept again: the user is no longer found, and nothing is sent twice.
+    expect(await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000)).not.toContain(
+      user.id,
+    );
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect(mailTo(email, "accountSuspended")).toHaveLength(1);
+    expect(await auditRows({ action: "account.suspended", targetId: user.id })).toHaveLength(1);
+  });
+
+  it("a redelivery repairs it: the repeated strike adds no row and enforces the threshold", async () => {
+    const created = await verifiedUser();
+    const nodeId = uuidv7();
+    const { deps } = serviceDeps();
+    for (let i = 0; i < 2; i++)
+      await settled((d) => addStrike(d, { userId: created.user.id, kind: "abuse" }));
+    // The third strike commits, and the consumer dies before applySuspension.
+    await testDb().transaction((tx) =>
+      addStrike(deps, { userId: created.user.id, kind: "malware", nodeId }, { tx }),
+    );
+    expect((await userById(created.user.id))!.suspendedAt).toBeNull();
+    // The message is delivered again.
+    const again = await settled((d) => addStrike(d, { userId: created.user.id, kind: "malware", nodeId }));
+    expect(again).toMatchObject({ created: false, activeStrikes: 3, suspended: true });
+    expect(await strikeRows(created.user.id)).toHaveLength(3);
+    expect((await userById(created.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
+  it("a suspension that fails is not swallowed: addStrike rejects, the row exists, enforcing later suspends", async () => {
+    const { user, email } = await verifiedUser();
+    for (let i = 0; i < 2; i++) await settled((deps) => addStrike(deps, { userId: user.id, kind: "abuse" }));
+
+    const failing = failingSuspension(1);
+    await expect(addStrike(failing.deps, { userId: user.id, kind: "abuse" })).rejects.toThrow(
+      "the database is unavailable",
+    );
+    await failing.settle();
+    expect(await strikeRows(user.id)).toHaveLength(3);
+    expect(await auditRows({ action: "strike.added", targetId: user.id })).toHaveLength(3);
+    expect((await userById(user.id))!.suspendedAt, "the suspension did fail").toBeNull();
+
+    const enforced = await settled((deps) => enforceStrikeThreshold(deps, user.id));
+    expect(enforced).toEqual({ activeStrikes: 3, suspended: true });
+    expect((await userById(user.id))!.suspendedAt).toBeInstanceOf(Date);
+    expect(mailTo(email, "accountSuspended")).toHaveLength(1);
+    // Enforcing again changes nothing.
+    expect(await settled((deps) => enforceStrikeThreshold(deps, user.id))).toEqual({
+      activeStrikes: 3,
+      suspended: true,
+    });
+    expect(mailTo(email, "accountSuspended")).toHaveLength(1);
+  });
+
+  it("applySuspension can be awaited again after it failed", async () => {
+    const { user } = await verifiedUser();
+    for (let i = 0; i < 2; i++) await settled((deps) => addStrike(deps, { userId: user.id, kind: "abuse" }));
+    const failing = failingSuspension(1);
+    const result = await testDb().transaction((tx) =>
+      addStrike(failing.deps, { userId: user.id, kind: "abuse" }, { tx }),
+    );
+    await expect(result.applySuspension!()).rejects.toThrow("the database is unavailable");
+    expect((await userById(user.id))!.suspendedAt).toBeNull();
+    await result.applySuspension!();
+    await failing.settle();
+    expect((await userById(user.id))!.suspendedAt).toBeInstanceOf(Date);
+    expect(await auditRows({ action: "strike.added", targetId: user.id })).toHaveLength(3);
+  });
+
+  it("enforceStrikeThreshold below the threshold counts and suspends nobody", async () => {
+    const { user } = await verifiedUser();
+    for (let i = 0; i < 2; i++) await settled((deps) => addStrike(deps, { userId: user.id, kind: "abuse" }));
+    expect(await settled((deps) => enforceStrikeThreshold(deps, user.id))).toEqual({
+      activeStrikes: 2,
+      suspended: false,
+    });
+    expect((await userById(user.id))!.suspendedAt).toBeNull();
+  });
+
+  it("the sweep ignores users below the threshold, suspended users, lifted strikes and strikes outside the window", async () => {
+    const admin = await verifiedUser();
+    const rowsOnly = async (userId: string, count: number) => {
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) ids.push((await insert(testDb(), { userId, kind: "abuse" })).id);
+      return ids;
+    };
+    const below = await verifiedUser();
+    await rowsOnly(below.user.id, 2);
+    const lifted = await verifiedUser();
+    const [liftMe] = await rowsOnly(lifted.user.id, 3);
+    await settled((deps) => liftStrike(deps, liftMe!, admin.user.id));
+    const stale = await verifiedUser();
+    const [ageMe] = await rowsOnly(stale.user.id, 3);
+    await testDb()
+      .update(strikes)
+      .set({ at: sql`now() - make_interval(days => ${STRIKE_WINDOW_DAYS + 1})` })
+      .where(eq(strikes.id, ageMe!));
+    const already = await atThresholdUnsuspended();
+    await settled((deps) => enforceStrikeThreshold(deps, already.user.id));
+    const mailsBefore = mailTo(already.email, "accountSuspended").length;
+    // The control: a user at the threshold, unsuspended — the sweep must take this one.
+    const due = await atThresholdUnsuspended();
+
+    const found = await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000);
+    expect(found).toContain(due.user.id);
+    for (const ignored of [below, lifted, stale, already]) expect(found).not.toContain(ignored.user.id);
+
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect((await userById(due.user.id))!.suspendedAt).toBeInstanceOf(Date);
+    for (const ignored of [below, lifted, stale]) {
+      expect((await userById(ignored.user.id))!.suspendedAt).toBeNull();
+      expect(mailTo(ignored.email, "accountSuspended")).toEqual([]);
+    }
+    expect(mailTo(already.email, "accountSuspended")).toHaveLength(mailsBefore);
+    expect(await auditRows({ action: "account.suspended", targetId: already.user.id })).toHaveLength(1);
+  });
+
+  it("one failing user does not stop the rest of the sweep, and is met again by the next", async () => {
+    const one = await atThresholdUnsuspended();
+    const two = await atThresholdUnsuspended();
+    const failing = failingSuspension(1);
+    const swept = await sweepStrikeThresholds(failing.deps, { limit: 1000 });
+    await failing.settle();
+    expect(swept.failed).toBe(1);
+    expect(swept.checked).toBeGreaterThanOrEqual(2);
+    expect(swept.suspended).toBe(swept.checked - 1);
+    // Whoever the failure hit, the next sweep finishes the job for both.
+    const next = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect(next.failed).toBe(0);
+    for (const user of [one, two]) expect((await userById(user.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
+  it("the sweep is bounded and takes the oldest first", async () => {
+    const older = await atThresholdUnsuspended();
+    const newer = await atThresholdUnsuspended();
+    // Make `older` the oldest case there is.
+    await testDb()
+      .update(strikes)
+      .set({ at: sql`now() - make_interval(days => ${STRIKE_WINDOW_DAYS - 1})` })
+      .where(eq(strikes.userId, older.user.id));
+    expect((await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1))[0]).toBe(
+      older.user.id,
+    );
+    const swept = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1 }));
+    expect(swept).toEqual({ checked: 1, suspended: 1, failed: 0 });
+    expect((await userById(older.user.id))!.suspendedAt).toBeInstanceOf(Date);
+    expect((await userById(newer.user.id))!.suspendedAt).toBeNull();
+    // Leave nothing at the threshold behind for other tests' sweeps.
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect((await userById(newer.user.id))!.suspendedAt).toBeInstanceOf(Date);
   });
 });
