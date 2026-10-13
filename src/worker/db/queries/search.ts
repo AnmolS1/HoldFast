@@ -19,6 +19,7 @@
 // directly or by ancestry (a file inside a taken-down folder is not found) — for the owner as well.
 
 import { inArray, sql, type SQL } from "drizzle-orm";
+import { MIME_CATEGORIES } from "../../../shared/constants";
 import type { Executor } from "../client";
 import { decodeCursor, encodeCursor } from "../cursor";
 import { QueryError } from "../errors";
@@ -38,10 +39,10 @@ export type SearchOptions = {
   visibleStatuses: readonly ScanStatus[] | { mine: readonly ScanStatus[]; shared: readonly ScanStatus[] };
   kind?: "file" | "folder";
   /**
-   * The sniffed types and the extension fallback of one category, already resolved.
-   * `not: true` asks for the complement — the files in NONE of these types and extensions, as
-   * `categoryOf` (services/mime.ts) decides it: pass every category's types and extensions and
-   * the result is exactly the files it calls `other`.
+   * The types and the extensions of one category (`MIME_CATEGORIES`), already resolved: the
+   * files `categoryOf` (services/mime.ts) puts in it — every file is in exactly one.
+   * `not: true` asks for the complement — the files in NONE of these types and extensions: pass
+   * every category's types and extensions and the result is exactly the files it calls `other`.
    */
   category?: { mimes: readonly string[]; exts: readonly string[]; not?: true };
   /** Restrict to the content of this folder (any depth). */
@@ -87,6 +88,11 @@ export const WORD_SIMILARITY_THRESHOLD = 0.4;
  */
 export const WORD_MATCH_MIN_CHARS = 5;
 
+/** Every extension some category lists: a generic type with one of these is labelled by it. */
+const CATEGORY_EXTS: readonly string[] = Object.values(MIME_CATEGORIES).flatMap((category) => [
+  ...category.exts,
+]);
+
 const MAX_LIMIT = 50;
 /** How far a search can be paged. Search is ranked, not keyset-ordered. */
 const MAX_OFFSET = 1000;
@@ -127,19 +133,22 @@ function matchAndRank(
     sql`n.scan_status IN (${statusList(statuses)})`,
   ];
   if (opts.kind) conditions.push(sql`n.kind = ${opts.kind}::node_kind`);
-  if (opts.category?.not) {
-    // `categoryOf`'s own rule, negated: a file not yet sniffed, or sniffed as nothing in
-    // particular, is labelled by its extension first — so it is "in none" only when neither its
-    // extension nor its type is listed. IS NOT TRUE, not NOT: an unsniffed file compares as NULL.
+  if (opts.category) {
+    // `categoryOf` (services/mime.ts) in SQL, so that a file is found under the category its
+    // answer shows and under no other. A file not yet sniffed, or sniffed as nothing in
+    // particular, is labelled by its extension first, and by its type only when no category
+    // lists the extension; a specific detected type is never overruled by the name.
+    const type = sql`coalesce(lower(n.mime_sniffed), '')`;
+    const generic = sql`${type} IN ('', 'text/plain', 'application/octet-stream')`;
+    const byType = sql`${type} = ANY(${textArray(opts.category.mimes)})`;
+    const byExt = sql`n.ext = ANY(${textArray(opts.category.exts)})`;
     conditions.push(
-      sql`n.kind = 'file' AND (lower(n.mime_sniffed) = ANY(${textArray(opts.category.mimes)})
-        OR (coalesce(lower(n.mime_sniffed), '') IN ('', 'text/plain', 'application/octet-stream')
-          AND n.ext = ANY(${textArray(opts.category.exts)}))) IS NOT TRUE`,
-    );
-  } else if (opts.category) {
-    conditions.push(
-      sql`n.kind = 'file' AND (n.mime_sniffed = ANY(${textArray(opts.category.mimes)})
-        OR (n.mime_sniffed IS NULL AND n.ext = ANY(${textArray(opts.category.exts)})))`,
+      opts.category.not
+        ? // In none of them: neither its type is listed nor — for a generic type — its extension.
+          sql`n.kind = 'file' AND NOT (${byType} OR (${generic} AND ${byExt}))`
+        : sql`n.kind = 'file' AND CASE WHEN ${generic}
+            THEN ${byExt} OR (${byType} AND NOT n.ext = ANY(${textArray(CATEGORY_EXTS)}))
+            ELSE ${byType} END`,
     );
   }
   if (opts.inFolder !== undefined) {
