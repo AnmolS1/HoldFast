@@ -52,10 +52,20 @@ function skipReason(status: ScanStatus, owner: boolean): ZipSkipReason {
   return "scan_blocked";
 }
 
+/** How many rows of the tree a manifest may walk for each file it may list. */
+const WALK_FACTOR = 3;
+
+export type ZipLimits = {
+  /** At most this many files are answered. */
+  maxFiles: number;
+  /** At most this many rows of the tree (folders and files) are read. Default: 3 × `maxFiles`. */
+  maxWalked?: number;
+};
+
 /**
- * The files under `roots` (a root that is a file is itself one), depth first, each folder's
- * content by name, the roots in the order given. `clean` files are `entries`; the others are
- * `skipped` with the reason their download would be refused for.
+ * The files under `roots` (a root that is a file is itself one), by path, the roots in the order
+ * given. `clean` files are `entries`; the others are `skipped` with the reason their download
+ * would be refused for.
  *
  * LEFT OUT ENTIRELY — from `entries` and from `skipped`, because naming them would disclose
  * them: a root that is hidden or in the trash (itself or by an ancestor), every taken-down or
@@ -65,20 +75,29 @@ function skipReason(status: ScanStatus, owner: boolean): ZipSkipReason {
  * it the walk stops at the first trashed or taken-down row, which is the same test, inherited by
  * the walk itself.
  *
- * At most `maxFiles` files are read (entries and skipped together); `truncated` says there were
- * more. A file reached through two roots (a folder and something inside it) is listed once,
- * under the outer one.
+ * BOUNDED BEFORE IT WALKS. The tree is read level by level, the roots first, and the reading
+ * STOPS after `maxWalked` rows: the recursion is cut by a LIMIT directly above it, with nothing
+ * between that needs the whole set, so a tree of a million files costs what one of `maxWalked`
+ * costs. Everything that does need a whole set — one row per file, the order — works on those
+ * rows only. A tree that is larger is answered from its upper levels, with `truncated`.
+ *
+ * At most `maxFiles` files are answered (entries and skipped together); `truncated` says there
+ * were more, or that the walk was cut. A file reached through two roots (a folder and something
+ * inside it) is listed once, under the outer one.
  */
-export async function zipManifest(db: Executor, roots: ZipRoot[], maxFiles: number): Promise<ZipManifest> {
+export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLimits): Promise<ZipManifest> {
+  const { maxFiles } = limits;
+  const maxWalked = limits.maxWalked ?? maxFiles * WALK_FACTOR;
   const given = roots.filter((root) => isUuid(root.id));
   if (given.length === 0) return { entries: [], totalBytes: 0, skipped: [], truncated: false };
   // One parameter, whatever the number of roots.
   const list = JSON.stringify(given.map(({ id, label, owner }) => ({ id, label, owner })));
   const result = await db.execute<{
-    id: string;
+    walked: number;
+    id: string | null;
     path: string;
     size: string;
-    version_id: string | null;
+    version_id: string;
     modified_at: string;
     scan_status: ScanStatus;
     owner: boolean;
@@ -87,40 +106,50 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], maxFiles: numb
       SELECT (e.value->>'id')::uuid, e.value->>'label', (e.value->>'owner')::boolean, e.ordinality
       FROM jsonb_array_elements(${list}::jsonb) WITH ORDINALITY AS e(value, ordinality)
     ),
-    down(id, kind, path, name_key, depth, owner, ord) AS (
-      SELECT n.id, n.kind, r.label, n.name_key, 0, r.owner, r.ord
+    down(id, kind, path, depth, owner, ord) AS (
+      SELECT n.id, n.kind, r.label, 0, r.owner, r.ord
       FROM roots r JOIN nodes n ON n.id = r.id
       WHERE n.system IS NULL AND ${notEffectivelyTrashedOrHidden("n")}
       UNION ALL
-      SELECT c.id, c.kind, down.path || '/' || c.name, c.name_key, down.depth + 1, down.owner, down.ord
+      SELECT c.id, c.kind, down.path || '/' || c.name, down.depth + 1, down.owner, down.ord
       FROM nodes c JOIN down ON c.parent_id = down.id
       WHERE c.deleted_at IS NULL AND c.takedown_at IS NULL AND c.system IS NULL
-    ) SEARCH DEPTH FIRST BY name_key, id SET ordercol
-      CYCLE id SET is_cycle USING walked,
+    ) CYCLE id SET is_cycle USING seen,
+    -- The cut. Nothing may come between this LIMIT and the recursion.
+    walked AS MATERIALIZED (
+      SELECT down.id, down.kind, down.path, down.depth, down.owner, down.ord
+      FROM down WHERE NOT down.is_cycle
+      LIMIT ${maxWalked + 1}
+    ),
     files AS (
-      SELECT DISTINCT ON (down.id) down.id, down.path, down.owner, down.ord, down.ordercol
-      FROM down
-      WHERE NOT down.is_cycle AND down.kind = 'file'
-      ORDER BY down.id, down.depth DESC
+      SELECT DISTINCT ON (w.id) w.id, w.path, w.owner, w.ord
+      FROM walked w
+      WHERE w.kind = 'file'
+      ORDER BY w.id, w.depth DESC
+    ),
+    listed AS (
+      SELECT f.id, f.path, f.owner, f.ord, n.size, n.version_id, n.scan_status,
+             to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS modified_at
+      FROM files f JOIN nodes n ON n.id = f.id
+      WHERE n.scan_status <> 'suspected_csam' AND n.version_id IS NOT NULL
     )
-    SELECT f.id, f.path, f.owner, n.size, n.version_id, n.scan_status,
-           to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS modified_at
-    FROM files f JOIN nodes n ON n.id = f.id
-    WHERE n.scan_status <> 'suspected_csam' AND n.version_id IS NOT NULL
-    ORDER BY f.ord, f.ordercol
-    LIMIT ${maxFiles + 1}`);
+    SELECT t.walked, l.id, l.path, l.owner, l.size, l.version_id, l.scan_status, l.modified_at
+    FROM (SELECT count(*)::int AS walked FROM walked) t
+    LEFT JOIN listed l ON true
+    ORDER BY l.ord, l.path, l.id`);
 
-  const rows = result.rows.slice(0, maxFiles);
+  const found = result.rows.filter((row) => row.id !== null);
+  const rows = found.slice(0, maxFiles);
   const manifest: ZipManifest = {
     entries: [],
     totalBytes: 0,
     skipped: [],
-    truncated: result.rows.length > maxFiles,
+    truncated: found.length > maxFiles || Number(result.rows[0]?.walked ?? 0) > maxWalked,
   };
   for (const row of rows) {
     if (row.scan_status !== "clean") {
       manifest.skipped.push({
-        nodeId: row.id,
+        nodeId: row.id!,
         path: row.path,
         reason: skipReason(row.scan_status, row.owner),
       });
@@ -128,10 +157,10 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], maxFiles: numb
     }
     const size = Number(row.size);
     manifest.entries.push({
-      nodeId: row.id,
+      nodeId: row.id!,
       path: row.path,
       size,
-      etag: row.version_id ?? "",
+      etag: row.version_id,
       modifiedAt: row.modified_at,
     });
     manifest.totalBytes += size;

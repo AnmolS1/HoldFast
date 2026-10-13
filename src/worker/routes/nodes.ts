@@ -297,7 +297,7 @@ router.post("/nodes/zip-manifest", async (c) => {
     const owned = await ownedRoots(db(c), user.id);
     roots = owned.map((node) => ({ id: node.id, label: node.name, owner: true }));
   }
-  return c.json(await zipManifest(db(c), roots, ZIP_MAX_ENTRIES));
+  return c.json(await zipManifest(db(c), roots, { maxFiles: ZIP_MAX_ENTRIES }));
 });
 
 router.post("/nodes/download-urls", async (c) => {

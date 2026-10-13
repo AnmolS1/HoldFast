@@ -1,9 +1,14 @@
 // The zip manifest: what a zip of these nodes would hold. No URLs — those are minted lazily, a
 // window at a time (download-urls, tested with the mints).
+import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import { afterAll, describe, expect, it } from "vitest";
 import { ZIP_MAX_ENTRIES } from "../../../src/shared/constants";
 import { ZipManifest } from "../../../src/shared/schemas/node";
+import { zipManifest } from "../../../src/worker/db/queries/nodes-api";
+import * as schema from "../../../src/worker/db/schema";
 import { nodes } from "../../../src/worker/db/schema";
 import {
   api,
@@ -239,5 +244,69 @@ describe("POST /nodes/zip-manifest", () => {
     expect(body.truncated).toBe(true);
     expect(body.entries.map((entry) => entry.path)).not.toContain("big/zz-one-more.bin");
     expect(body.totalBytes).toBe(body.entries.reduce((sum, entry) => sum + entry.size, 0));
+  });
+
+  describe("bounded before it walks", () => {
+    // A second handle on the same database that records what it sends, so the plan that is
+    // checked is the plan of the statement the manifest really sent.
+    const sent: { text: string; params: unknown[] }[] = [];
+    const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 1 });
+    const recording = drizzle(pool, {
+      schema,
+      casing: "snake_case",
+      logger: { logQuery: (text, params) => void sent.push({ text, params }) },
+    });
+    afterAll(() => pool.end());
+
+    type Plan = { "Node Type": string; "Actual Rows"?: number; Plans?: Plan[] };
+    const flatten = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(flatten)];
+
+    it("a tree far larger than the bound is read up to the bound and no further; the answer says truncated", async () => {
+      const owner = await person();
+      const folder = await makeFolder(owner.id, null, { name: "huge" });
+      for (let i = 0; i < 3; i++) {
+        const sub = await makeFolder(owner.id, folder.id, { name: `part ${i}` });
+        await manyFiles(owner.id, sub.id, 1_000);
+      }
+      const roots = [{ id: folder.id, label: "huge", owner: true }];
+      sent.length = 0;
+      const cut = await zipManifest(recording, roots, { maxFiles: 100, maxWalked: 250 });
+      expect(cut.truncated).toBe(true);
+      expect(cut.entries.length).toBeGreaterThan(0);
+      expect(cut.entries.length).toBeLessThanOrEqual(100);
+
+      const statement = sent[sent.length - 1]!;
+      const explained = await pool.query(
+        `EXPLAIN (ANALYZE, FORMAT JSON) ${statement.text}`,
+        statement.params,
+      );
+      const plan = flatten((explained.rows[0] as { "QUERY PLAN": { Plan: Plan }[] })["QUERY PLAN"][0]!.Plan);
+      const recursion = plan.filter((node) => node["Node Type"] === "Recursive Union");
+      // Two recursions: the walk down, and the roots' walk up to their ancestors. 3,004 rows are
+      // in the tree; neither produced more than the bound (+1, to see that there is more).
+      expect(recursion.length).toBeGreaterThanOrEqual(1);
+      const produced = recursion.map((node) => node["Actual Rows"] ?? Infinity);
+      expect(Math.max(...produced)).toBeLessThanOrEqual(251);
+      expect(Math.max(...produced)).toBeGreaterThan(100);
+
+      // The control: with room for the whole tree, the same call reads all of it.
+      const whole = await zipManifest(testDb(), roots, { maxFiles: 5_000, maxWalked: 5_000 });
+      expect(whole.truncated).toBe(false);
+      expect(whole.entries).toHaveLength(3_000);
+    });
+
+    it("the upper levels come first: files at the top are answered before files deep in the tree", async () => {
+      const owner = await person();
+      const folder = await makeFolder(owner.id, null, { name: "levels" });
+      const top = await makeFile(owner.id, folder.id, { name: "top.txt", scanStatus: "clean" });
+      const deep = await makeFolder(owner.id, folder.id, { name: "a-deep" });
+      await manyFiles(owner.id, deep.id, 300);
+      const answer = await zipManifest(testDb(), [{ id: folder.id, label: "levels", owner: true }], {
+        maxFiles: 100,
+        maxWalked: 50,
+      });
+      expect(answer.truncated).toBe(true);
+      expect(answer.entries.map((entry) => entry.nodeId)).toContain(top.id);
+    });
   });
 });
