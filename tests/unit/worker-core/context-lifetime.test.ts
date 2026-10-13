@@ -415,7 +415,7 @@ describe("the Worker's own queue and scheduled exports", () => {
     await expect(worker.scheduled?.(controller, testEnv(), ctx)).resolves.toBeUndefined();
   });
 
-  it("queue() acknowledges the batch through the placeholder consumer", async () => {
+  it("queue() acknowledges a batch that holds no scan message (the consumer acks what it does not know)", async () => {
     const batch = createMessageBatch("holdfast-scan-dev", [
       { id: "m1", timestamp: new Date(), body: { n: 1 }, attempts: 1 },
     ]);

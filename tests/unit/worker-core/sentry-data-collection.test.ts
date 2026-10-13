@@ -40,6 +40,16 @@ const CAPTCHA = "zzcaptchavalue";
 const CLIENT_IP = "203.0.113.94";
 const RESET_TOKEN = "zzresettoken";
 
+/**
+ * The wire text without what the SDK draws at random on every run: its `sample_rand` decimal and
+ * its hex ids (event, trace and span ids). A short numeric needle such as the birth year turns up
+ * inside those by chance a few times in a hundred runs, which is not a leak. Nothing a leak
+ * would look like has either shape.
+ */
+function withoutRandomValues(wire: string): string {
+  return wire.replace(/\b0\.\d{6,}\b/g, "0.<random>").replace(/\b[0-9a-f]{16,32}\b/g, "<hex id>");
+}
+
 const NEEDLES = [
   NAME,
   "Zzyzxname",
@@ -240,7 +250,7 @@ describe("what the Worker's Sentry SDK collects from a request", () => {
             expect(request, "request.query_string").not.toHaveProperty("query_string");
             expect((event.user ?? {}) as Record<string, unknown>).not.toHaveProperty("ip_address");
           }
-          const wire = sent.join("\n");
+          const wire = withoutRandomValues(sent.join("\n"));
           for (const needle of NEEDLES) {
             const at = wire.indexOf(needle);
             expect(at === -1 ? "" : wire.slice(Math.max(0, at - 100), at + 60), needle).toBe("");
@@ -253,6 +263,17 @@ describe("what the Worker's Sentry SDK collects from a request", () => {
       );
     },
   );
+
+  it("the random values the SDK draws are not mistaken for a leak — and a leak still is one", () => {
+    // The two values a red run showed (the needle inside `sample_rand`), and ids made up for this test.
+    const noise =
+      '{"sample_rand":"0.5065819879846158"},{"sample_rand":"0.13634145601987746"},{"trace_id":"19870000aaaabbbbccccdddd00001987","span_id":"1987aaaabbbb1987"}';
+    expect(noise).toContain(String(BIRTH_YEAR));
+    expect(withoutRandomValues(noise)).not.toContain(String(BIRTH_YEAR));
+    for (const leak of ['{"birthYear":1987}', '"born 1987-11"', "year=1987&x=1", '"1987"']) {
+      expect(withoutRandomValues(leak), leak).toContain(String(BIRTH_YEAR));
+    }
+  });
 
   it("the final walk replaces a request body whole, should anything ever attach one", () => {
     for (const probe of REQUESTS) {

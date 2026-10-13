@@ -2,7 +2,7 @@
 // intent, passkey options, an OAuth state, a two-factor challenge) and Better Auth deletes one
 // only when it is used. The nightly cron removes what expired more than a day ago.
 import { env } from "cloudflare:workers";
-import { inArray } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import { sweepExpiredVerifications } from "../../../src/worker/db/queries/auth-lifecycle";
 import { verification } from "../../../src/worker/db/schema";
@@ -22,47 +22,74 @@ vi.mock("../../../src/worker/db/queries/auth-lifecycle", async (original) => {
 const HOUR = 3_600_000;
 const id = () => crypto.randomUUID().replace(/-/g, "");
 
-async function plant(expiresInMs: number): Promise<string> {
+type Db = ReturnType<typeof testDb>;
+type Exec = Parameters<Parameters<Db["transaction"]>[0]>[0] | Db;
+
+async function plant(expiresInMs: number, db: Exec = testDb()): Promise<string> {
   const row = id();
   const at = new Date();
-  await testDb()
-    .insert(verification)
-    .values({
-      id: row,
-      identifier: `sweep-test:${row}`,
-      value: "x",
-      expiresAt: new Date(Date.now() + expiresInMs),
-      createdAt: at,
-      updatedAt: at,
-    });
+  await db.insert(verification).values({
+    id: row,
+    identifier: `sweep-test:${row}`,
+    value: "x",
+    expiresAt: new Date(Date.now() + expiresInMs),
+    createdAt: at,
+    updatedAt: at,
+  });
   return row;
 }
-const left = async (ids: string[]) =>
-  (await testDb().select({ id: verification.id }).from(verification).where(inArray(verification.id, ids)))
+const left = async (ids: string[], db: Exec = testDb()) =>
+  (await db.select({ id: verification.id }).from(verification).where(inArray(verification.id, ids)))
     .map((row) => row.id)
     .sort();
 
+// The table is shared with every other test file, and Better Auth itself deletes EVERY expired
+// row on each verification lookup (internal-adapter: `deleteVerificationByIdentifier` cleanup) —
+// so a neighbour's auth request between "plant" and "sweep" removes this file's rows first and
+// the sweep then counts nothing. Rows planted in a transaction that has not committed are
+// invisible to all of that: the count below is the sweep's own.
+const ROLLBACK = new Error("rollback");
+async function isolated(run: (tx: Exec) => Promise<void>): Promise<void> {
+  await testDb()
+    .transaction(async (tx) => {
+      await run(tx);
+      throw ROLLBACK;
+    })
+    .catch((error: unknown) => {
+      if (error !== ROLLBACK) throw error;
+    });
+}
+/** What a neighbour does at any moment: every expired row, table-wide, on its own connection. */
+const neighbourCleanup = () =>
+  testDb().execute(sql`DELETE FROM ${verification} WHERE expires_at < (now() AT TIME ZONE 'UTC')`);
+
 describe("the sweep of expired verification rows", () => {
   it("removes rows that expired more than a day ago — and nothing newer, live or long-lived", async () => {
-    const old = [await plant(-49 * HOUR), await plant(-25 * HOUR)];
-    const kept = [
-      await plant(-23 * HOUR),
-      await plant(-60_000),
-      await plant(HOUR),
-      await plant(50 * 365 * 24 * HOUR),
-    ];
-    const removed = await sweepExpiredVerifications(testDb());
-    expect(removed).toBeGreaterThanOrEqual(2);
-    expect(await left(old)).toEqual([]);
-    expect(await left(kept)).toEqual([...kept].sort());
+    await isolated(async (tx) => {
+      const old = [await plant(-49 * HOUR, tx), await plant(-25 * HOUR, tx)];
+      const kept = [
+        await plant(-23 * HOUR, tx),
+        await plant(-60_000, tx),
+        await plant(HOUR, tx),
+        await plant(50 * 365 * 24 * HOUR, tx),
+      ];
+      await neighbourCleanup();
+      const removed = await sweepExpiredVerifications(tx);
+      expect(removed).toBeGreaterThanOrEqual(2);
+      expect(await left(old, tx)).toEqual([]);
+      expect(await left(kept, tx)).toEqual([...kept].sort());
+    });
   });
 
   it("works in bounded batches: one call removes at most the limit, and says how many", async () => {
-    const old = [await plant(-30 * HOUR), await plant(-30 * HOUR), await plant(-30 * HOUR)];
-    // Whatever other test files left behind is swept too; the call itself never exceeds its limit.
-    expect(await sweepExpiredVerifications(testDb(), { limit: 1 })).toBe(1);
-    await sweepExpiredVerifications(testDb());
-    expect(await left(old)).toEqual([]);
+    await isolated(async (tx) => {
+      const old = [await plant(-30 * HOUR, tx), await plant(-30 * HOUR, tx), await plant(-30 * HOUR, tx)];
+      await neighbourCleanup();
+      // Whatever other test files left behind is swept too; the call itself never exceeds its limit.
+      expect(await sweepExpiredVerifications(tx, { limit: 1 })).toBe(1);
+      await sweepExpiredVerifications(tx);
+      expect(await left(old, tx)).toEqual([]);
+    });
   });
 
   it("the nightly cron runs it; the other crons do not", async () => {
