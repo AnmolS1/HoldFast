@@ -24,7 +24,20 @@ services:
     # one in about a second) and nothing here may depend on surviving a restart of the container.
     tmpfs:
       - /var/lib/postgresql/data
-    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off", "-c", "full_page_writes=off"]
+    # max_connections: every checkout's test run opens pools of its own (5 per context); the default
+    # of 100 is not enough when several worktrees run their suites at the same time.
+    command:
+      [
+        "postgres",
+        "-c",
+        "fsync=off",
+        "-c",
+        "synchronous_commit=off",
+        "-c",
+        "full_page_writes=off",
+        "-c",
+        "max_connections=400",
+      ]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 2s
