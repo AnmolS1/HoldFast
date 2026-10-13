@@ -21,12 +21,13 @@ import { emitNodesChanged } from "../../lib/contracts";
 import { formatDate } from "../../lib/format";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { useSession } from "../../lib/query";
+import { queryClient, useSession } from "../../lib/query";
 import { shortcutLabel, useShortcut } from "../../lib/shortcuts";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ListNotice, ViewError, ViewPage } from "../starred/view-kit";
 import { canLoadMore, hasFailed, isWaitingOffline, useLoadMore } from "../starred/view-state";
+import { viewKeys } from "../starred/view-queries";
 import { EmptyTrashAction } from "./EmptyTrashAction";
 import { deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
 import { t } from "./strings";
@@ -82,6 +83,7 @@ export function TrashPage() {
     setMenu(null);
     setConflict(false);
     setBusy(true);
+    let reread = false;
     try {
       for (const target of targets) {
         try {
@@ -93,11 +95,17 @@ export function TrashPage() {
         } catch (error) {
           // One sentence for every refusal: the API gives no reason and none is guessed.
           if (error instanceof ApiError && error.status === 409) setConflict(true);
-          else toastApiError(error);
+          else {
+            toastApiError(error);
+            // Whatever else went wrong, the row may no longer be what the server has (purged
+            // in another tab, restored elsewhere): read the trash again.
+            reread = true;
+          }
         }
       }
     } finally {
       setBusy(false);
+      if (reread) void queryClient.invalidateQueries({ queryKey: viewKeys.trash });
     }
   };
 
@@ -137,7 +145,17 @@ export function TrashPage() {
     setMenu(null);
     if (targets.length > 0) setDeleting([...targets]);
   };
-  useShortcut("trash", () => askDelete(selected), selected.length > 0 && deleting === null);
+  // Delete / Backspace asks for the selection — unless something is open above the list: this
+  // page's own menu or confirmation (its state), or any dialog at all ("Empty the trash?", the
+  // mobile sheet, the palette — whatever is in the document). The key is theirs then.
+  useShortcut(
+    "trash",
+    () => {
+      if (document.querySelector('[role="dialog"]')) return;
+      askDelete(selected);
+    },
+    selected.length > 0 && deleting === null && menu === null,
+  );
   const loadMore = useLoadMore(trash.fetchNextPage);
 
   const onOpen = useCallback(() => {
@@ -169,10 +187,13 @@ export function TrashPage() {
     );
   }
 
-  const count =
-    items.length === 1
+  const count = trash.hasNextPage
+    ? items.length === 1
+      ? t("trash.count.more.one")
+      : t("trash.count.more", { count: items.length })
+    : items.length === 1
       ? t("trash.count.one")
-      : t(trash.hasNextPage ? "trash.count.more" : "trash.count", { count: items.length });
+      : t("trash.count", { count: items.length });
   const deletingOne = deleting?.length === 1 ? deleting[0] : undefined;
   const menuActions = menu ? (
     <>

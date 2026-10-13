@@ -158,10 +158,13 @@ export function SearchPage() {
     [search.data],
   );
   const searchable = isSearchable(state);
-  const count =
-    items.length === 1
+  const count = search.hasNextPage
+    ? items.length === 1
+      ? t("search.count.more.one")
+      : t("search.count.more", { count: items.length })
+    : items.length === 1
       ? t("search.count.one")
-      : t(search.hasNextPage ? "search.count.more" : "search.count", { count: items.length });
+      : t("search.count", { count: items.length });
 
   let body;
   if (!searchable) {

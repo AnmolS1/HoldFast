@@ -6,6 +6,7 @@ export const messages = {
   "search.count": "{count} results",
   "search.count.one": "1 result",
   "search.count.more": "More than {count} results",
+  "search.count.more.one": "More than 1 result",
   "search.type": "Type",
   "search.type.any": "Any type",
   "search.type.image": "Images",
