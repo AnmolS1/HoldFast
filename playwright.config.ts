@@ -8,7 +8,9 @@
 // and never reuses one: a reused server may be another checkout's. So a dev server and an e2e run
 // cannot be up at the same time in one checkout — stop `npm run dev` first.
 //
-// HOLDFAST_E2E_REAL is not read here: it reaches the specs through the environment untouched.
+// HOLDFAST_E2E_REAL is not read here: it reaches the specs through the environment untouched
+// (tests/e2e/fixtures/mode.ts). HOLDFAST_E2E_WORKERS caps the parallel browsers; unset =
+// Playwright's own default (half the logical cores).
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, devices } from "@playwright/test";
@@ -30,6 +32,16 @@ const port = e2ePort();
 const db = localDbName();
 const baseURL = appOrigin(port);
 
+function workersCap(): { workers?: number } {
+  const raw = process.env.HOLDFAST_E2E_WORKERS;
+  if (raw === undefined || raw === "") return {};
+  const count = Number(raw);
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`HOLDFAST_E2E_WORKERS must be a whole number of at least 1, not "${raw}"`);
+  }
+  return { workers: count };
+}
+
 // Once, in the process that will start the server. Playwright loads this file again in its
 // worker processes, by which time the port is (rightly) held by its own server.
 if (process.env.HOLDFAST_E2E_PREFLIGHT !== String(port)) {
@@ -43,6 +55,7 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: 0,
+  ...workersCap(),
   reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
   globalSetup: "./tests/setup/e2e-global-setup.ts",
   use: {

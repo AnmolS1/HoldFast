@@ -4,6 +4,7 @@
 //
 //   npm test                                                    both configs
 //   npx vitest run -c vitest.workers.config.ts tests/unit/<area>
+//   HOLDFAST_TEST_WORKERS=3 npm test                            at most 3 test files at once
 //
 // `npx vitest run <path>` WITHOUT `-c vitest.workers.config.ts` uses vitest.config.ts and runs zero
 // Worker tests.
@@ -33,6 +34,17 @@ forbidDotEnvFallback();
 const db = localDbName();
 const TABLEWIDE = "tests/unit/**/*.tablewide.test.{ts,tsx}";
 const tablewide = process.env.HOLDFAST_TABLEWIDE === "1";
+
+/** HOLDFAST_TEST_WORKERS caps how many test files run at once; unset = Vitest's own default. */
+function workersCap(): { maxWorkers?: number } {
+  const raw = process.env.HOLDFAST_TEST_WORKERS;
+  if (raw === undefined || raw === "") return {};
+  const count = Number(raw);
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`HOLDFAST_TEST_WORKERS must be a whole number of at least 1, not "${raw}"`);
+  }
+  return { maxWorkers: count };
+}
 const modulePath = (path: string) => fileURLToPath(new URL(`./node_modules/${path}`, import.meta.url));
 
 export default defineConfig({
@@ -74,8 +86,8 @@ export default defineConfig({
       "tests/unit/harness/node/**",
       ...(tablewide ? [] : [TABLEWIDE]),
     ],
-    // One table-wide file at a time; everything else in parallel, as before.
-    ...(tablewide ? { fileParallelism: false } : {}),
+    // One table-wide file at a time; everything else in parallel, up to HOLDFAST_TEST_WORKERS.
+    ...(tablewide ? { fileParallelism: false } : workersCap()),
     // The name of this checkout's database, for tests that assert which one they are talking to.
     provide: { holdfastDb: db },
     // Closing a database client (`client.end()` in pg, `sql.end()` in postgres.js) makes the
