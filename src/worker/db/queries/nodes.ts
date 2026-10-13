@@ -23,7 +23,7 @@ import {
   uploads,
   user,
 } from "../schema";
-import { isDescendantOrSelf, effectiveTrashed, notEffectivelyHidden, notEffectivelyTrashed } from "./tree";
+import { isDescendantOrSelf, effectiveTrashed, notEffectivelyTrashedOrHidden } from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
 export type SortDir = "asc" | "desc";
@@ -56,8 +56,8 @@ function clampLimit(limit: number, max: number): number {
 /**
  * The exclusions every listing shares — each a test of the row ITSELF. A listing that is not
  * scoped to one parent the caller has already resolved (Starred, Recent) adds the inherited
- * forms, `notEffectivelyTrashed()` and `notEffectivelyHidden()`: a file inside a trashed or a
- * taken-down folder is not listed either.
+ * form, `notEffectivelyTrashedOrHidden()`: a file inside a trashed or a taken-down folder is
+ * not listed either.
  */
 function visible(visibleStatuses: readonly ScanStatus[]): SQL[] {
   return [
@@ -270,8 +270,7 @@ export async function listStarred(
       eq(nodes.ownerId, ownerId),
       eq(nodes.starred, true),
       ...visible(opts.visibleStatuses),
-      notEffectivelyTrashed(),
-      notEffectivelyHidden(),
+      notEffectivelyTrashedOrHidden(),
     ],
     sort: "name",
     dir: "asc",
@@ -300,8 +299,7 @@ export async function listRecent(
         eq(nodes.kind, "file"),
         isNotNull(nodes.lastAccessedAt),
         ...visible(opts.visibleStatuses),
-        notEffectivelyTrashed(),
-        notEffectivelyHidden(),
+        notEffectivelyTrashedOrHidden(),
       ),
     )
     .orderBy(sql`${nodes.lastAccessedAt} DESC NULLS LAST`, desc(nodes.updatedAt), desc(nodes.id))

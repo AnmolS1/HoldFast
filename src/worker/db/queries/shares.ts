@@ -5,7 +5,7 @@ import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanStatus, type Share, shares } from "../schema";
-import { notEffectivelyHidden, notEffectivelyTrashed } from "./tree";
+import { notEffectivelyTrashedOrHidden } from "./tree";
 import { ownerIsActive } from "./users";
 
 /** The ACTIVATED share of that user on that node itself (not on an ancestor), or null. */
@@ -96,9 +96,8 @@ export async function sharedWithMe(
         eq(shares.granteeUserId, userId),
         isNotNull(shares.activatedAt),
         isNull(nodes.system),
-        notEffectivelyHidden(),
         inArray(nodes.scanStatus, [...opts.visibleStatuses]),
-        notEffectivelyTrashed(),
+        notEffectivelyTrashedOrHidden(),
         ownerIsActive(sql`${nodes.ownerId}`),
       ),
     )
@@ -121,8 +120,7 @@ export async function sharedByMe(db: Executor, userId: string): Promise<{ share:
         eq(nodes.ownerId, userId),
         isNull(nodes.system),
         sql`${nodes.scanStatus} <> 'suspected_csam'`,
-        notEffectivelyTrashed(),
-        notEffectivelyHidden(),
+        notEffectivelyTrashedOrHidden(),
       ),
     )
     .orderBy(sql`${shares.createdAt} DESC`, shares.id);

@@ -1,4 +1,4 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, type SQL, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Db, statementsSent } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -11,6 +11,8 @@ import {
   isDescendantOrSelf,
   NO_SUCH_OWNER_ID,
   notEffectivelyHidden,
+  notEffectivelyTrashed,
+  notEffectivelyTrashedOrHidden,
   ownedRoots,
   subtree,
 } from "../../../src/worker/db/queries/tree";
@@ -203,6 +205,53 @@ describe("notEffectivelyHidden", () => {
     expect(new Set(result.rows.map((r) => r.id))).toEqual(
       new Set([f.root.id, f.a.id, f.zeta.id, f.alpha.id]),
     );
+  });
+
+  it("notEffectivelyTrashedOrHidden is the two predicates together, row for row", async () => {
+    const f = await fixture();
+    const all = [f.root, f.a, f.b, f.deep, f.zeta, f.alpha];
+    const pass = async (predicate: SQL) =>
+      (
+        await db
+          .select({ id: nodes.id })
+          .from(nodes)
+          .where(
+            and(
+              inArray(
+                nodes.id,
+                all.map((n) => n.id),
+              ),
+              predicate,
+            ),
+          )
+      )
+        .map((r) => r.id)
+        .sort();
+    const agree = async (label: string) => {
+      const both = await pass(notEffectivelyTrashedOrHidden());
+      expect(both, label).toEqual(await pass(sql`${notEffectivelyTrashed()} AND ${notEffectivelyHidden()}`));
+      return both.length;
+    };
+    expect(await agree("nothing")).toBe(6);
+    // `b` taken down: b and deep go. `zeta` trashed by itself: it goes.
+    await takeDown(f.b.id);
+    await db.update(nodes).set({ deletedAt: new Date(), trashedRoot: true }).where(eq(nodes.id, f.zeta.id));
+    expect(await agree("b down, zeta trashed")).toBe(3);
+    // `a` trashed: everything under it is out for one reason or the other.
+    await db.update(nodes).set({ deletedAt: new Date(), trashedRoot: true }).where(eq(nodes.id, f.a.id));
+    expect(await agree("a trashed too")).toBe(2);
+    await restore(f.b.id);
+    expect(await agree("b restored, a still trashed")).toBe(2);
+    await db
+      .update(nodes)
+      .set({ deletedAt: null, trashedRoot: false })
+      .where(inArray(nodes.id, [f.a.id, f.zeta.id]));
+    expect(await agree("all back")).toBe(6);
+    // Under another alias.
+    const aliased = await db.execute<{ id: string }>(
+      sql`SELECT n.id FROM nodes n WHERE n.owner_id = ${f.owner} AND ${notEffectivelyTrashedOrHidden("n")}`,
+    );
+    expect(aliased.rows).toHaveLength(6);
   });
 
   it("agrees with effectiveHidden on every node, suspected CSAM aside", async () => {

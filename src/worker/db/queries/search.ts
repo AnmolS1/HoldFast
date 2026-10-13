@@ -13,7 +13,7 @@ import { decodeCursor, encodeCursor } from "../cursor";
 import { QueryError } from "../errors";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanStatus } from "../schema";
-import { notEffectivelyHidden, notEffectivelyTrashed, type Role } from "./tree";
+import { notEffectivelyTrashedOrHidden, type Role } from "./tree";
 import { ownerIsActive } from "./users";
 
 export type SearchScope = "mine" | "shared" | "all";
@@ -90,8 +90,7 @@ function matchAndRank(
   const conditions: SQL[] = [
     sql`(n.name ILIKE ${"%" + escaped + "%"} OR (n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real))`,
     sql`n.system IS NULL`,
-    notEffectivelyHidden("n"),
-    notEffectivelyTrashed("n"),
+    notEffectivelyTrashedOrHidden("n"),
     sql`n.scan_status IN (${statusList(statuses)})`,
   ];
   if (opts.kind) conditions.push(sql`n.kind = ${opts.kind}::node_kind`);
