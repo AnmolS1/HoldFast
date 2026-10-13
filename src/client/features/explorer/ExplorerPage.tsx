@@ -153,6 +153,33 @@ function StillScanning() {
   );
 }
 
+/**
+ * Put focus back into the list: on the given row when it is drawn, else on the list's own tab
+ * stop. An empty folder has no row: then its first control, else the page itself, so that Tab
+ * starts from here and not from the top of the document.
+ */
+function focusRow(id?: string | null): void {
+  setTimeout(() => {
+    const list = document.querySelector<HTMLElement>("[data-explorer-list]");
+    const row = list
+      ? ((id ? list.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`) : null) ??
+        list.querySelector<HTMLElement>('[data-item-index][tabindex="0"]') ??
+        list.querySelector<HTMLElement>("[data-item-index]") ??
+        list.querySelector<HTMLElement>("button, a[href]"))
+      : null;
+    (row ?? document.getElementById("main"))?.focus();
+  }, 0);
+}
+
+/**
+ * The height of the selection bar as the shared component draws it on one line (its padding, its
+ * tallest control, its rule): the toolbar that it replaces is given the same.
+ */
+const BAR_HEIGHT = { desktop: 41, mobile: 57 } as const;
+
+// A folder opened from the list: the folder that arrives takes the focus the row had.
+let focusOnArrival = false;
+
 const getThumbUrl = (nodeId: string, size: number) => thumbUrl(nodeId, size);
 
 function renderThumb(item: NodeDto) {
@@ -220,19 +247,6 @@ function Explorer({ folderId }: { folderId: string | null }) {
 
   // ---- focus ---------------------------------------------------------------------------------
 
-  /** Put focus back into the list: on the given row when it is drawn, else on the list's own stop. */
-  const focusRow = useCallback((id?: string | null) => {
-    setTimeout(() => {
-      const list = document.querySelector<HTMLElement>("[data-explorer-list]");
-      if (!list) return;
-      const row =
-        (id ? list.querySelector<HTMLElement>(`[data-item-id="${CSS.escape(id)}"]`) : null) ??
-        list.querySelector<HTMLElement>('[data-item-index][tabindex="0"]') ??
-        list.querySelector<HTMLElement>("[data-item-index]");
-      row?.focus();
-    }, 0);
-  }, []);
-
   /** What an action applies to: the selection, else the row that has focus. */
   const targets = useCallback((): NodeDto[] => {
     if (selected.length > 0) return selected;
@@ -246,6 +260,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
   const open = useCallback(
     (node: NodeDto) => {
       if (node.kind === "folder") {
+        focusOnArrival = Boolean(document.activeElement?.closest("[data-explorer-list]"));
         // The folder-enter transition: the row's name becomes the breadcrumb's title.
         startTransition(() => {
           addTransitionType("folder");
@@ -273,7 +288,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
       void trashNodes(items);
       focusRow(next);
     },
-    [order, focusRow],
+    [order],
   );
 
   const download = useCallback((items: readonly NodeDto[]) => {
@@ -291,19 +306,19 @@ function Explorer({ folderId }: { folderId: string | null }) {
 
   const move = useCallback((items: readonly NodeDto[], target: MoveTarget) => {
     dispatch({ type: "clear" });
-    void moveNodes(items, target);
+    void moveNodes(items, target).then(() => {
+      // The moved rows are gone, and with them the focus if it sat on one: back into the list.
+      if (document.activeElement === null || document.activeElement === document.body) focusRow();
+    });
   }, []);
 
   const newFolder = useCallback(() => setDialog({ type: "new-folder", busy: false, error: null }), []);
   const upload = useCallback(() => requestUpload({ parentId: folderId ?? undefined }), [folderId]);
 
-  const closeDialog = useCallback(
-    (focusId?: string | null) => {
-      setDialog(null);
-      focusRow(focusId);
-    },
-    [focusRow],
-  );
+  const closeDialog = useCallback((focusId?: string | null) => {
+    setDialog(null);
+    focusRow(focusId);
+  }, []);
 
   const entriesFor = useCallback(
     (items: readonly NodeDto[]): MenuEntry[] => {
@@ -420,6 +435,25 @@ function Explorer({ folderId }: { folderId: string | null }) {
       },
     ];
   }, [canAdd, newFolder, upload]);
+
+  // ---- focus that waits for the list ---------------------------------------------------------
+
+  const focusWhenListed = useRef<string | null>(null);
+  // Was focus last seen inside the list? A row that is removed takes the focus with it without
+  // any event: when the list changes and focus has fallen to the document, it is put back.
+  const focusInList = useRef(false);
+  useEffect(() => {
+    const wanted = focusWhenListed.current;
+    if (wanted !== null && order.includes(wanted)) {
+      focusWhenListed.current = null;
+      focusRow(wanted);
+    } else if (focusOnArrival && listing.isSuccess) {
+      focusOnArrival = false;
+      focusRow();
+    } else if (focusInList.current && (document.activeElement ?? document.body) === document.body) {
+      focusRow();
+    }
+  }, [order, listing.isSuccess]);
 
   // ---- commands: the frame's New menu, FAB and the ⇧N / F2 / Del keys run these by id ----------
 
@@ -710,66 +744,77 @@ function Explorer({ folderId }: { folderId: string | null }) {
           {t("explorer.offline")}
         </FrameBanner>
       )}
-      <SelectionBar
-        count={selected.length}
-        onClear={() => dispatch({ type: "clear" })}
-        actions={
-          <>
-            {(desktop ? ["download", "zip", "move", "star", "rename", "share"] : []).map((id) => {
-              const entry = barEntry(id);
-              return entry ? (
+      {/* One slot, one height: selecting a row must not move the row under the pointer. */}
+      <Box
+        data-explorer-bar
+        sx={{ flex: "none", minHeight: desktop ? BAR_HEIGHT.desktop : BAR_HEIGHT.mobile }}
+      >
+        <SelectionBar
+          count={selected.length}
+          onClear={() => dispatch({ type: "clear" })}
+          actions={
+            <>
+              {(desktop && !narrow ? ["download", "zip", "move", "star"] : []).map((id) => {
+                const entry = barEntry(id);
+                return entry ? (
+                  <SelectionBarAction
+                    key={id}
+                    label={entry.label}
+                    onClick={entry.run}
+                    shortcut={entry.shortcut}
+                    disabled={entry.disabled}
+                  />
+                ) : null;
+              })}
+              {barEntry("trash") ? (
                 <SelectionBarAction
-                  key={id}
-                  label={entry.label}
-                  onClick={entry.run}
-                  shortcut={entry.shortcut}
-                  disabled={entry.disabled}
+                  label={t("explorer.action.trash")}
+                  onClick={barEntry("trash")!.run}
+                  shortcut={desktop ? "trash" : undefined}
+                  destructive
                 />
-              ) : null;
-            })}
-            {barEntry("trash") ? (
-              <SelectionBarAction
-                label={t("explorer.action.trash")}
-                onClick={barEntry("trash")!.run}
-                shortcut={desktop ? "trash" : undefined}
-                destructive
-              />
-            ) : null}
-            {desktop ? null : (
+              ) : null}
+              {/* Everything else — and, where the bar is narrow, everything but trash — is one step away. */}
               <SelectionBarAction
                 label={shellT("app.more")}
-                onClick={() => setMenu({ ids: selected.map((node) => node.id), anchor: { x: 0, y: 0 } })}
+                onClick={() => {
+                  const focused = document.activeElement;
+                  const bar = document.querySelector<HTMLElement>("[data-selection-bar]");
+                  const anchor = focused instanceof HTMLElement && bar?.contains(focused) ? focused : bar;
+                  if (anchor) setMenu({ ids: selected.map((node) => node.id), anchor });
+                }}
               />
-            )}
-            {zip ? (
-              <Box
-                component="span"
-                data-zip-count
-                sx={{ display: "inline-flex", alignItems: "center", gap: 1, color: hf.textSecondary }}
-              >
-                <span className="num">{zip.label}</span>
-                <SelectionBarAction label={t("explorer.zip.stop")} onClick={() => cancelZip(zip.id)} />
-              </Box>
-            ) : null}
-          </>
-        }
-      />
-      {selected.length === 0 ? (
-        <Toolbar
-          count={nodes.length}
-          more={Boolean(listing.hasNextPage)}
-          showCount={!failed && !listing.isPending}
-          sort={sort}
-          dir={dir}
-          onSort={(nextSort, nextDir) => setSort({ sort: nextSort, dir: nextDir })}
-          desktop={desktop}
-          viewMode={prefs.viewMode}
-          onViewMode={prefs.setViewMode}
-          canAdd={canAdd && !failed}
-          onNewFolder={newFolder}
-          onUpload={upload}
+              {zip ? (
+                <Box
+                  component="span"
+                  data-zip-count
+                  sx={{ display: "inline-flex", alignItems: "center", gap: 1, color: hf.textSecondary }}
+                >
+                  <span className="num">{zip.label}</span>
+                  <SelectionBarAction label={t("explorer.zip.stop")} onClick={() => cancelZip(zip.id)} />
+                </Box>
+              ) : null}
+            </>
+          }
         />
-      ) : null}
+        {selected.length === 0 ? (
+          <Toolbar
+            count={nodes.length}
+            more={Boolean(listing.hasNextPage)}
+            showCount={!failed && !listing.isPending}
+            sort={sort}
+            dir={dir}
+            onSort={(nextSort, nextDir) => setSort({ sort: nextSort, dir: nextDir })}
+            height={desktop ? BAR_HEIGHT.desktop : BAR_HEIGHT.mobile}
+            desktop={desktop}
+            viewMode={prefs.viewMode}
+            onViewMode={prefs.setViewMode}
+            canAdd={canAdd && !failed}
+            onNewFolder={newFolder}
+            onUpload={upload}
+          />
+        ) : null}
+      </Box>
       {moreFailed && !failed ? (
         <FrameBanner
           name="more-failed"
@@ -812,6 +857,17 @@ function Explorer({ folderId }: { folderId: string | null }) {
         <Box
           ref={listRef}
           data-explorer-list
+          onFocusCapture={() => {
+            focusInList.current = true;
+          }}
+          onBlurCapture={(event) => {
+            // Only when focus really went elsewhere — not when it fell to the document.
+            const list = event.currentTarget;
+            setTimeout(() => {
+              const now = document.activeElement;
+              if (now && now !== document.body && !list.contains(now)) focusInList.current = false;
+            }, 0);
+          }}
           onPointerDown={onPointerDown}
           onClick={onBackgroundClick}
           onContextMenu={onBackgroundMenu}
@@ -895,8 +951,11 @@ function Explorer({ folderId }: { folderId: string | null }) {
         onSubmit={(name) => {
           setDialog({ type: "new-folder", busy: true, error: null });
           void createFolderIn(folderId, name).then((result) => {
-            if (result.ok) closeDialog(result.node.id);
-            else if (result.conflict)
+            if (result.ok) {
+              // Its row is drawn once the listing has been read again; focus goes there then.
+              focusWhenListed.current = result.node.id;
+              closeDialog();
+            } else if (result.conflict)
               setDialog({
                 type: "new-folder",
                 busy: false,

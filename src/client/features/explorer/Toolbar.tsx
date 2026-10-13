@@ -23,6 +23,8 @@ export interface ToolbarProps {
   sort: SortKey;
   dir: SortDir;
   onSort(sort: SortKey, dir: SortDir): void;
+  /** px — the height of the selection bar that takes this row's place. */
+  height: number;
   /** Mobile layout: no add buttons (the frame's New button has them), the view switch in the menu. */
   desktop: boolean;
   viewMode: ViewMode;
@@ -39,7 +41,7 @@ const tick = (on: boolean) => (
 );
 
 export function Toolbar(props: ToolbarProps) {
-  const { count, more, showCount, sort, dir, onSort, desktop, viewMode, onViewMode, canAdd } = props;
+  const { count, more, showCount, sort, dir, onSort, height, desktop, viewMode, onViewMode, canAdd } = props;
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const menuId = useId();
   const close = () => setAnchor(null);
@@ -55,7 +57,8 @@ export function Toolbar(props: ToolbarProps) {
         display: "flex",
         alignItems: "center",
         gap: 2,
-        minHeight: desktop ? 44 : 52,
+        minHeight: height,
+        boxSizing: "border-box",
         padding: desktop ? "0 20px" : "0 12px",
         flex: "none",
       }}

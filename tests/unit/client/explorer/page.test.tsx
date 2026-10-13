@@ -565,11 +565,11 @@ describe("sharing waits for the sharing task", () => {
     expect(share.textContent).toContain("Sharing isn't switched on yet");
     fireEvent.keyDown(menu, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    // The selection bar offers the same list under More.
     fireEvent.click(rowOf(NOTES.id)!);
-    const bar = screen.getByRole("toolbar");
-    expect(
-      (within(bar).getByRole("button", { name: "Share or get link" }) as HTMLButtonElement).disabled,
-    ).toBe(true);
+    fireEvent.click(within(screen.getByRole("toolbar")).getByRole("button", { name: "More" }));
+    const more = await screen.findByRole("menu");
+    expect(more.querySelector('[data-action="share"]')!.getAttribute("aria-disabled")).toBe("true");
   });
 });
 
