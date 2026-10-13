@@ -4,6 +4,7 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import { useState } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { hf } from "../../theme/tokens";
 import { startEmptyTrash, stoppedMessage, useEmptyRun } from "./empty-run";
 import { CONFIRM_WORD, needsTypedConfirm, useTrash, type TrashSize } from "./queries";
@@ -42,8 +43,11 @@ export function EmptyTrashAction() {
   // memory may be seconds old, or from before another device filled the trash.
   const ask = async () => {
     setChecking(true);
+    const account = accountEpoch();
     try {
       const fresh = await trash.refetch();
+      // Another account since the click: no dialog about the previous one's trash.
+      if (!sameAccount(account)) return;
       const pages = fresh.isSuccess ? fresh.data.pages : null;
       setAsked(
         pages

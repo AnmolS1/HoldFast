@@ -5,7 +5,7 @@
 import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
-import { queryClient } from "../../lib/query";
+import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { viewKeys } from "../starred/view-queries";
 import { emptyTrash, isAbort } from "./queries";
 import { t } from "./strings";
@@ -49,13 +49,18 @@ export function startEmptyTrash(): void {
   if (run.state === "running") return;
   setRun({ state: "running", remaining: null });
   let remaining: number | null = null;
+  // The purge aborts the loop; this is the second lock: whatever of this run still comes back
+  // after the account's state was purged changes nothing and says nothing.
+  const account = accountEpoch();
   emptyTrash((left) => {
+    if (!sameAccount(account)) return;
     remaining = left;
     setRun({ state: "running", remaining: left });
     // A batch is gone: the list on screen should not show it.
     refresh();
   }).then(
     () => {
+      if (!sameAccount(account)) return;
       setRun(IDLE);
       toast({ message: t("trash.emptyTrash.done"), key: "empty-trash" });
       // No live listing changed; this feature's own trash and storage numbers did.
@@ -63,7 +68,7 @@ export function startEmptyTrash(): void {
     },
     (error: unknown) => {
       // Stopped by the purge below: the account is gone, there is nobody to tell.
-      if (isAbort(error)) return;
+      if (isAbort(error) || !sameAccount(account)) return;
       setRun({ state: "stopped", remaining });
       toast({ message: stoppedMessage(remaining), key: "empty-trash" });
       // Part of it may be gone.

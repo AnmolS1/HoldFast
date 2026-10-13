@@ -12,6 +12,7 @@ import {
   TYPED_CONFIRM_ABOVE,
 } from "../../../../src/client/features/trash/queries";
 import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
+import { viewKeys } from "../../../../src/client/features/starred/view-queries";
 import { ApiError } from "../../../../src/client/lib/api";
 import { purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
 import { mockFetch, sessionOf, setupShell } from "../shell/helpers";
@@ -563,6 +564,115 @@ describe("an account switch that leaves the page mounted", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(document.querySelector("[data-trash-conflict]")).toBeNull();
     expect(document.querySelector("[data-selection-bar]")).toBeNull();
+  });
+});
+
+describe("nothing of one account reaches the next through late work", () => {
+  // Another account signs in (in another tab) while a request of this page is still out: the
+  // state is purged, the session now names B, and the list that is read and shown is B's.
+  // Whatever the late answer to A's request is, it writes nothing, says nothing, sends nothing.
+  const switchAccount = async () => {
+    await act(async () => {
+      await purgeUserState({ keepSession: true });
+      queryClient.setQueryData(sessionQuery.queryKey, sessionOf({ id: "b".repeat(32), name: "Bo" }));
+    });
+    await waitFor(() => expect(queryClient.getQueryState(viewKeys.trash)?.status).toBe("success"));
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+  };
+  const lateRestore = async (answer: () => Response) => {
+    const pending = deferred<Response>();
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": TRASH,
+      [`POST /api/nodes/${REPORT.id}/restore`]: () => pending.promise,
+      [`POST /api/nodes/${NOTES.id}/restore`]: restored(NOTES),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    for (const name of ["report.pdf", "notes.txt"])
+      fireEvent.click(screen.getByRole("checkbox", { name: `Select ${name}` }));
+    fireEvent.click(
+      within(document.querySelector<HTMLElement>("[data-selection-bar]")!).getByRole("button", {
+        name: "Restore",
+      }),
+    );
+    await waitFor(() => expect(requests(calls, "POST", `/api/nodes/${REPORT.id}/restore`)).toHaveLength(1));
+    await switchAccount();
+    pending.resolve(answer());
+    await act(async () => {
+      for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+    });
+    return calls;
+  };
+
+  it("a restore answered 200 after the purge: the list in the cache is not patched, no toast, no event, the next item is not sent", async () => {
+    const calls = await lateRestore(() => json(restored(REPORT)));
+    const cached = queryClient.getQueryData<{ pages: Array<{ items: unknown[] }> }>(viewKeys.trash);
+    expect(cached!.pages[0]!.items).toHaveLength(3);
+    expect(rowNames()).toHaveLength(3);
+    expect(getToasts()).toEqual([]);
+    expect(events).toEqual([]);
+    expect(requests(calls, "POST", `/api/nodes/${NOTES.id}/restore`)).toEqual([]);
+  });
+
+  it("a restore that fails after the purge is not announced", async () => {
+    const calls = await lateRestore(() => envelope("internal", 500));
+    expect(getToasts()).toEqual([]);
+    expect(document.querySelector("[data-trash-conflict]")).toBeNull();
+    expect(requests(calls, "POST", `/api/nodes/${NOTES.id}/restore`)).toEqual([]);
+  });
+
+  it("a refusal (409) that arrives after the purge shows no notice", async () => {
+    await lateRestore(() => envelope("conflict", 409));
+    expect(document.querySelector("[data-trash-conflict]")).toBeNull();
+    expect(getToasts()).toEqual([]);
+  });
+
+  it("delete forever answered after the purge: nothing patched, said or emitted, and the next item is not deleted", async () => {
+    const pending = deferred<Response>();
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": TRASH,
+      [`DELETE /api/nodes/${REPORT.id}`]: () => pending.promise,
+      [`DELETE /api/nodes/${NOTES.id}`]: NO_CONTENT,
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    for (const name of ["report.pdf", "notes.txt"])
+      fireEvent.click(screen.getByRole("checkbox", { name: `Select ${name}` }));
+    fireEvent.click(
+      within(document.querySelector<HTMLElement>("[data-selection-bar]")!).getByRole("button", {
+        name: /Delete forever/,
+      }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Delete forever" }),
+    );
+    await waitFor(() => expect(requests(calls, "DELETE", `/api/nodes/${REPORT.id}`)).toHaveLength(1));
+    await switchAccount();
+    pending.resolve(NO_CONTENT());
+    await act(async () => {
+      for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+    });
+    expect(
+      queryClient.getQueryData<{ pages: Array<{ items: unknown[] }> }>(viewKeys.trash)!.pages[0]!.items,
+    ).toHaveLength(3);
+    expect(getToasts()).toEqual([]);
+    expect(events).toEqual([]);
+    expect(requests(calls, "DELETE", `/api/nodes/${NOTES.id}`)).toEqual([]);
+  });
+
+  it("the re-read before 'Empty the trash?' that answers after the purge opens no dialog", async () => {
+    const pending = deferred<Response>();
+    let hold = false;
+    await openView("/trash", { "GET /api/trash": () => (hold ? pending.promise : json(TRASH)) });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    hold = true;
+    fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+    await act(() => purgeUserState({ keepSession: true }));
+    hold = false;
+    pending.resolve(json(TRASH));
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    await act(async () => {
+      for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 });
 
