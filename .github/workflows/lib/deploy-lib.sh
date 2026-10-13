@@ -184,6 +184,9 @@ eval_built_env() {
   if [ "$env" = "production" ]; then
     got="$(jq -r '.vars.SCAN_STUB // ""' "$file")"
     check "vars.SCAN_STUB" "0" "$got"
+    # Production stores no invocation logs: they keep full request URLs (share-link tokens) for 7 days.
+    got="$(jq -r 'if (.observability.logs | type) == "object" and (.observability.logs | has("invocation_logs")) then (.observability.logs.invocation_logs | tostring) else "unset" end' "$file")"
+    check "observability.logs.invocation_logs" "false" "$got"
   fi
   if grep -q 'TODO_' "$file"; then
     echo "built-env: the emitted config contains a TODO_ sentinel"
@@ -879,7 +882,8 @@ cmd_self_test() {
     routes:[{pattern:"holdfast.ponderance.dev",custom_domain:true},{pattern:"holdfastusercontent.com",custom_domain:true}],
     r2_buckets:[{bucket_name:"holdfast-files"}], queues:{producers:[{queue:"holdfast-scan"}]},
     hyperdrive:[{id:"e899309ce0d543bb99bd09fa582aac90"}],
-    vars:{SENTRY_ENVIRONMENT:"production",APP_ORIGIN:"https://holdfast.ponderance.dev",FILES_ORIGIN:"https://holdfastusercontent.com",EMAIL_TRANSPORT:"resend",SCAN_STUB:"0"}}' >"$prod_json"
+    vars:{SENTRY_ENVIRONMENT:"production",APP_ORIGIN:"https://holdfast.ponderance.dev",FILES_ORIGIN:"https://holdfastusercontent.com",EMAIL_TRANSPORT:"resend",SCAN_STUB:"0"},
+    observability:{enabled:true,head_sampling_rate:1,logs:{invocation_logs:false}}}' >"$prod_json"
   expect pass "dev build as dev" eval_built_env dev "$dev_json"
   expect pass "production build as production" eval_built_env production "$prod_json"
   expect fail "production build offered as dev" eval_built_env dev "$prod_json"
@@ -890,6 +894,10 @@ cmd_self_test() {
   expect fail "production build bound to the dev bucket" eval_built_env production "$tmp/prod-devbucket.json"
   jq '.vars.SCAN_STUB = "1"' "$prod_json" >"$tmp/prod-stub.json"
   expect fail "production build with the scan stub on" eval_built_env production "$tmp/prod-stub.json"
+  jq '.observability.logs.invocation_logs = true' "$prod_json" >"$tmp/prod-invlogs.json"
+  expect fail "production build that stores invocation logs" eval_built_env production "$tmp/prod-invlogs.json"
+  jq 'del(.observability.logs)' "$prod_json" >"$tmp/prod-nologs.json"
+  expect fail "production build with no invocation-log setting (the default stores them)" eval_built_env production "$tmp/prod-nologs.json"
   jq '.vars.EMAIL_TRANSPORT = "memory"' "$dev_json" >"$tmp/dev-memory.json"
   expect fail "deployable build with the memory mail transport" eval_built_env dev "$tmp/dev-memory.json"
   expect fail "no build output" eval_built_env dev "$tmp/does-not-exist.json"

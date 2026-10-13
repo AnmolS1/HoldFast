@@ -53,8 +53,10 @@
     "TURNSTILE_SITEKEY": "0x4AAAAAAFQ7GuCPvHcRBd_q",
     "PHOTODNA_ENABLED": "false",
     "EMAIL_TRANSPORT": "resend",
-    // "1" = files are marked clean by a stub instead of a real scan. Dev only.
-    "SCAN_STUB": "0",
+    // "1" = files are marked clean by a stub instead of a real scan. Dev only: on while the dev
+    // deploy has no real scanner (it goes back to "0" when the scan pipeline lands). Production is
+    // never "1" — the deploy check refuses such a build, and the stub ignores the flag there.
+    "SCAN_STUB": "1",
     "SENTRY_ENVIRONMENT": "dev",
     // Public value (it ships in the browser bundle). Blank until it is set.
     "SENTRY_DSN_WEB": "https://4fbb40d035e576361455d0c0598fcc2a@o4511527807811584.ingest.us.sentry.io/4512218438172672",
@@ -111,6 +113,11 @@
     "production": {
       // Pinned: without it the name is derived as "<top-level name>-production".
       "name": "holdfast",
+      // Written out in full (the docs do not say whether an environment's block merges with the
+      // top-level one). Production keeps NO invocation logs: Cloudflare stores the full request
+      // URL, query, Referer and client address for 7 days (spike S12), and a share link's token is
+      // part of its URL. Our own request line (redacted path) is the request log. Dev keeps them.
+      "observability": { "enabled": true, "head_sampling_rate": 1, "logs": { "invocation_logs": false } },
       // A named environment inherits the top-level routes. This block is what keeps a production
       // build off the dev hostnames. Never remove it.
       "routes": [
