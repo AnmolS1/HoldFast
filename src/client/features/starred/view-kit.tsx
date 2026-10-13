@@ -15,7 +15,10 @@ export type ViewName = "trash" | "recent" | "starred" | "search" | "usage";
 
 export function ViewPage({ view, children }: { view: ViewName; children: ReactNode }) {
   return (
-    <Box data-view={view} sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 0 }}>
+    <Box
+      data-view-page={view}
+      sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 0 }}
+    >
       {children}
     </Box>
   );

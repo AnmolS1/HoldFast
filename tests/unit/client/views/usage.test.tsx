@@ -82,7 +82,7 @@ describe("/storage", () => {
     await waitFor(() => expect(document.querySelector('[data-usage-level="attention"]')).not.toBeNull());
     const warning = main().getByText("Almost full");
     expect(resolveVar(getComputedStyle(warning).color)).toBe(lightTokens.attention);
-    const fill = document.querySelector('[data-view="usage"] [data-storage-fill]')!;
+    const fill = document.querySelector('[data-view-page="usage"] [data-storage-fill]')!;
     expect(resolveVar(getComputedStyle(fill).backgroundColor)).toBe(lightTokens.textSecondary);
   });
 
