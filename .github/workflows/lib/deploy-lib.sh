@@ -731,6 +731,18 @@ cmd_migrate() {
   else
     echo "migrate: OK — $((after - before)) migration(s) newly applied"
   fi
+  # Information only (migration 0007 stores jit = off on the database): what a NEW session gets,
+  # and whether this server can compile queries at all. `pg_jit_available()` is false whenever
+  # `jit` is off, so it is asked with the setting switched on for one rolled-back transaction.
+  # Never fails the step — a server that refuses the question is reported as such.
+  local jit
+  jit="$(psql "$DATABASE_URL_DIRECT" -X -Atq -v ON_ERROR_STOP=1 \
+    -c "select 'new-session=' || current_setting('jit')" \
+    -c "begin" -c "set local jit = on" \
+    -c "select 'compiler-available=' || pg_jit_available()" \
+    -c "rollback" 2>&1 | redact | tr '\n' ' ')" ||
+    jit="could not be read"
+  echo "migrate: jit ${jit:-could not be read}"
 }
 
 # ── utc-zone-self-test ───────────────────────────────────────────────────────────────────────────
