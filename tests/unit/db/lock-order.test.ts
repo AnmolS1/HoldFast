@@ -316,6 +316,184 @@ describe("the CSAM lock holds every uploader: user rows lowest id first, then th
   });
 });
 
+describe("the CSAM lock is not lost to a deadlock", () => {
+  const lockUserRow = (tx: Tx, id: string) =>
+    tx.select({ id: user.id }).from(user).where(eq(user.id, id)).for("update");
+  const lockNodeRow = (tx: Tx, id: string) =>
+    tx.select({ id: nodes.id }).from(nodes).where(eq(nodes.id, id)).for("update");
+  const isHeld = async (id: string) =>
+    (await watch.db.select({ held: user.legalHold }).from(user).where(eq(user.id, id)))[0]!.held;
+  /** Resolves once some backend is blocked by `blocker` (a lock taken on a pooled connection has no pid to ask for). */
+  async function untilSomeoneBlockedBy(blocker: number, label: string): Promise<void> {
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const result = await watch.db.execute<{ n: number }>(sql`
+        SELECT count(*)::int AS n FROM pg_stat_activity
+        WHERE wait_event_type = 'Lock' AND ${blocker}::int = ANY(pg_blocking_pids(pid))`);
+      if (Number(result.rows[0]?.n) > 0) return;
+      if (Date.now() > deadline) throw new Error(`${label}: nobody was ever blocked by ${blocker}`);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+  }
+
+  // A transaction that takes the NODE first and the owner's row second — the opposite order.
+  // The CSAM lock has the owner's row and waits for the node; then the other asks for the
+  // owner's row: a cycle. The lock has waited longest, so its deadlock check runs first and
+  // Postgres ends IT (40P01). Called on the database handle, it runs again and locks the node.
+  it("as the deadlock victim it runs again: the node ends locked and the owner held", async () => {
+    const owner = await makeUser(a.db);
+    const file = await makeFile(a.db, owner, null, `victim-${rand()}.jpg`);
+    const nodeHeld = gate<number>();
+
+    const other = settle(
+      a.db.transaction(async (tx) => {
+        await lockNodeRow(tx, file.id);
+        const pid = await pidOf(tx);
+        nodeHeld.open(pid);
+        await untilSomeoneBlockedBy(pid, "the csam lock");
+        await lockUserRow(tx, owner);
+      }),
+    );
+    await nodeHeld.opened;
+    const locked = await settle(lockSuspectedCsam(b.db, file.id, { source: "photodna" }));
+    const othered = await other;
+
+    // Whichever side Postgres ended, the call resolved with the node locked.
+    expect(sqlState(locked), "the lock did not surface a deadlock").toBeNull();
+    expect(locked).toMatchObject({ ok: true, value: { ownerId: owner } });
+    expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect(await isHeld(owner)).toBe(true);
+    // The other side finished or was the victim itself; nothing else.
+    expect([null, "40P01"]).toContain(sqlState(othered));
+  });
+
+  // The same cycle with the other side waiting longest, so that IT is the one Postgres ends:
+  // the lock (holding the lower user row, held up at the higher one) then just goes on.
+  it("when the other side is the victim the lock simply completes", async () => {
+    const [lo, hi] = [await makeUser(a.db), await makeUser(a.db)].sort() as [string, string];
+    const file = await makeFile(a.db, lo, null, `other-${rand()}.jpg`, { createdBy: hi });
+    const c = openDb();
+    try {
+      const nodeHeld = gate<number>();
+      const hiHeld = gate<number>();
+      const releaseHi = gate();
+      const holdsHi = settle(
+        c.db.transaction(async (tx) => {
+          await lockUserRow(tx, hi);
+          hiHeld.open(await pidOf(tx));
+          await releaseHi.opened;
+        }),
+      );
+      const other = settle(
+        a.db.transaction(async (tx) => {
+          await lockNodeRow(tx, file.id);
+          nodeHeld.open(await pidOf(tx));
+          // Once the lock holds `lo` and is held up at `hi`, ask for `lo`: this side waits first.
+          await untilSomeoneBlockedBy(await hiHeld.opened, "the csam lock");
+          await lockUserRow(tx, lo);
+        }),
+      );
+      const otherPid = await nodeHeld.opened;
+      await hiHeld.opened;
+      const lock = settle(lockSuspectedCsam(b.db, file.id, { source: "photodna" }));
+      await untilWaitingForLock(otherPid, "the node-first transaction");
+      releaseHi.open();
+      const [locked, othered, heldHi] = await Promise.all([lock, other, holdsHi]);
+
+      expect(heldHi.ok).toBe(true);
+      expect(sqlState(locked)).toBeNull();
+      expect(locked).toMatchObject({ ok: true, value: { ownerId: lo } });
+      expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+      expect(await isHeld(lo)).toBe(true);
+      expect(await isHeld(hi)).toBe(true);
+      expect([null, "40P01"]).toContain(sqlState(othered));
+    } finally {
+      await c.close();
+    }
+  });
+
+  // Inside a caller's transaction there is nothing to run again: the failure is the caller's.
+  it("inside a caller's transaction the deadlock is the caller's to retry: nothing is half-applied", async () => {
+    const owner = await makeUser(a.db);
+    const file = await makeFile(a.db, owner, null, `inner-${rand()}.jpg`);
+    const nodeHeld = gate<number>();
+    const lockPid = gate<number>();
+
+    const other = settle(
+      a.db.transaction(async (tx) => {
+        await lockNodeRow(tx, file.id);
+        nodeHeld.open(await pidOf(tx));
+        await untilWaitingForLock(await lockPid.opened, "the csam lock");
+        await lockUserRow(tx, owner);
+      }),
+    );
+    const lock = settle(
+      b.db.transaction(async (tx) => {
+        await nodeHeld.opened;
+        lockPid.open(await pidOf(tx));
+        return lockSuspectedCsam(tx, file.id, { source: "photodna" });
+      }),
+    );
+    const [othered, locked] = await Promise.all([other, lock]);
+    // Exactly one of the two was ended; if it was the lock, nothing of it is left…
+    expect([sqlState(othered), sqlState(locked)].filter((code) => code === "40P01")).toHaveLength(1);
+    if (!locked.ok) {
+      expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "clean", legalHold: false });
+      expect(await isHeld(owner)).toBe(false);
+    }
+    // …and the caller's second try locks it.
+    expect(await lockSuspectedCsam(b.db, file.id, { source: "photodna" })).toMatchObject({ ownerId: owner });
+    expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+  });
+
+  // A Replace holds the owner's row and the node, and then names the PREVIOUS uploader in the
+  // version row it writes: the foreign-key check takes a KEY SHARE lock on that user's row. The
+  // CSAM lock already has that row (it sorts below the owner) and waits for the owner's: with a
+  // plain FOR UPDATE on user rows that is a deadlock.
+  it("does not deadlock with a Replace that names an uploader the lock already holds", async () => {
+    const [editor, owner] = [await makeUser(a.db), await makeUser(a.db)].sort() as [string, string];
+    const replacer = await makeUser(a.db);
+    const file = await makeFile(a.db, owner, null, `fk-${rand()}.jpg`, { createdBy: editor });
+    const lockPid = gate<number>();
+    const ownerRowHeld = gate();
+
+    const replace = settle(
+      a.db.transaction(async (tx) => {
+        // Where a Replace stands after its first step.
+        await lockUserRow(tx, owner);
+        ownerRowHeld.open();
+        await untilWaitingForLock(await lockPid.opened, "the csam lock");
+        return replaceVersion(tx, file.id, {
+          r2Key: `u/${owner}/${file.id}/v2`,
+          versionId: "v2",
+          size: 5,
+          sha256: null,
+          createdBy: replacer,
+        });
+      }),
+    );
+    const lock = settle(
+      b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
+        lockPid.open(await pidOf(tx));
+        return lockSuspectedCsam(tx, file.id, { source: "photodna" });
+      }),
+    );
+    const [replaced, locked] = await Promise.all([replace, lock]);
+    expect(sqlState(replaced), "the Replace was not a deadlock victim").toBeNull();
+    expect(sqlState(locked), "the CSAM lock was not a deadlock victim").toBeNull();
+    expect(replaced.ok).toBe(true);
+    expect(locked).toMatchObject({ ok: true, value: { ownerId: owner } });
+    // The Replace was first: the lock then held the owner, the previous uploader AND the new one.
+    expect(await getNode(a.db, file.id)).toMatchObject({
+      scanStatus: "suspected_csam",
+      legalHold: true,
+      createdBy: replacer,
+    });
+    for (const id of [owner, editor, replacer]) expect(await isHeld(id), id).toBe(true);
+  });
+});
+
 describe("Replace beside a legal hold on the account", () => {
   // The hold is being placed (its transaction has written the owner's row and not committed).
   // A Replace must wait for it and then refuse — not read the old value and go ahead.

@@ -3,13 +3,14 @@
 // transaction (a savepoint when the caller already has one).
 
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { PgTransaction } from "drizzle-orm/pg-core";
 import type { Executor } from "../client";
+import { pgError } from "../errors";
 import { isUuid } from "../ids";
 import { dmcaNotices, hashBlocklist, nodes, reports, type ScanStatus, uploadIps, user } from "../schema";
 import { upsert as blocklistUpsert } from "./blocklist";
 import { pauseLinks, unpauseLinks } from "./links";
 import { notEffectivelyHidden } from "./tree";
-import { lockUser } from "./users";
 
 type ReportCategory = (typeof reports.category.enumValues)[number];
 type ReportSource = (typeof reports.source.enumValues)[number];
@@ -155,6 +156,15 @@ export async function csamSubjects(db: Executor, nodeId: string): Promise<CsamSu
   return { nodeId: row.id, ownerId: row.owner_id, uploaderIds: [...row.uploader_ids].sort() };
 }
 
+/**
+ * How often `lockSuspectedCsam` runs its whole transaction when Postgres ends it for a deadlock
+ * (40P01) or a serialization failure (40001): this many times in all, then the error is thrown.
+ */
+export const CSAM_LOCK_ATTEMPTS = 4;
+/** The pause before attempt n + 1: up to n × this many milliseconds, at random. */
+const CSAM_LOCK_BACKOFF_MS = 15;
+const RETRYABLE = new Set(["40P01", "40001"]);
+
 /** The uploader set grew between the unlocked read and the locked one. */
 class SubjectsGrew extends Error {
   constructor(readonly userIds: string[]) {
@@ -174,6 +184,14 @@ class SubjectsGrew extends Error {
  * blocklisted as `csam`, and a `reports` row is filed. The object is never deleted. Held is not
  * banned: nobody is banned here. Safe to repeat: a second call files no second report.
  * Null when there is no such node (also when a purge that started first deleted it meanwhile).
+ *
+ * LOSING A DEADLOCK DOES NOT LOSE THE LOCK. Called with the database handle itself (not inside a
+ * caller's transaction — every caller in the product), a transaction that Postgres ended as a
+ * deadlock victim (40P01) or for a serialization failure (40001) is run again from the start:
+ * `CSAM_LOCK_ATTEMPTS` times in all, a short random pause between, then the error is thrown.
+ * Nothing was written by the attempt that failed, and the lock is safe to repeat. Called INSIDE
+ * a transaction it cannot do that — the failure has ended the caller's transaction — and the
+ * error is the caller's to retry. (The "uploader set grew twice" failure below is not retried.)
  */
 export async function lockSuspectedCsam(
   db: Executor,
@@ -181,6 +199,28 @@ export async function lockSuspectedCsam(
   opts: { source: "photodna" | "system" | "admin" },
 ): Promise<{ reportId: string; ownerId: string } | null> {
   if (!isUuid(nodeId)) return null;
+  if (isTransaction(db)) return lockInOneTransaction(db, nodeId, opts.source);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await lockInOneTransaction(db, nodeId, opts.source);
+    } catch (error) {
+      if (attempt >= CSAM_LOCK_ATTEMPTS || !RETRYABLE.has(pgError(error)?.code ?? "")) throw error;
+      const pause = Math.random() * CSAM_LOCK_BACKOFF_MS * attempt;
+      await new Promise((resolve) => setTimeout(resolve, pause));
+    }
+  }
+}
+
+/** Is this executor a transaction (a `Tx`), not the database handle? */
+function isTransaction(db: Executor): boolean {
+  return db instanceof PgTransaction;
+}
+
+function lockInOneTransaction(
+  db: Executor,
+  nodeId: string,
+  source: "photodna" | "system" | "admin",
+): Promise<{ reportId: string; ownerId: string } | null> {
   return db.transaction(async (tx) => {
     // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
     // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
@@ -196,12 +236,18 @@ export async function lockSuspectedCsam(
     // uploader committed), the locks are released — the savepoint is rolled back — and taken
     // again for the larger set: once. A set that grows a second time fails the transaction,
     // nothing written; the caller's redelivery tries again.
+    //
+    // The user rows are locked FOR NO KEY UPDATE — what the hold's own UPDATE takes — not FOR
+    // UPDATE: it excludes every other writer and locker of the row just the same, but not the
+    // KEY SHARE lock a foreign-key check takes. A Replace or a trash that already holds the node
+    // and then names one of these users in a row it writes (`created_by`, `trashed_by`) would
+    // otherwise wait for this transaction while this one waits for its node: a deadlock.
     const first = await csamSubjects(tx, nodeId);
     if (!first) return null;
     let userIds = subjectUserIds(first);
     for (let attempt = 1; ; attempt++) {
       try {
-        return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, opts.source));
+        return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, source));
       } catch (error) {
         if (!(error instanceof SubjectsGrew)) throw error;
         if (attempt >= 2) throw new Error("csam lock: the node's uploader set grew twice while locking");
@@ -224,8 +270,10 @@ async function lockRows(
   userIds: string[],
   source: "photodna" | "system" | "admin",
 ): Promise<{ reportId: string; ownerId: string } | null> {
-  // An account deleted since the read locks nothing and is skipped.
-  for (const userId of userIds) await lockUser(sp, userId);
+  // One at a time, in order. An account deleted since the read locks nothing and is skipped.
+  for (const userId of userIds) {
+    await sp.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("no key update");
+  }
   const [node] = await sp
     .select({ ownerId: nodes.ownerId, sha256: nodes.sha256 })
     .from(nodes)
