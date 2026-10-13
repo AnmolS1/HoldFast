@@ -1,6 +1,6 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Db } from "../../../src/worker/db/client";
+import { type Db, statementsSent } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import {
   ancestors,
@@ -9,10 +9,12 @@ import {
   effectiveRole,
   effectiveTrashed,
   isDescendantOrSelf,
+  NO_SUCH_OWNER_ID,
   notEffectivelyHidden,
   ownedRoots,
   subtree,
 } from "../../../src/worker/db/queries/tree";
+import { userState } from "../../../src/worker/db/queries/users";
 import { type Node, nodes, shares, user } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeShare, makeUser, openDb, rand } from "./_helpers";
 
@@ -254,6 +256,31 @@ describe("effectiveAccess", () => {
       canUpload: true,
     });
     expect(await effectiveRole(db, f.owner, f.root.id)).toBe("owner");
+  });
+
+  it("sends the same two statements for the owner, a grantee, a stranger and an unknown id", async () => {
+    const f = await fixture();
+    const grantee = await makeUser(db);
+    const stranger = await makeUser(db);
+    await makeShare(db, f.a.id, f.owner, { userId: grantee });
+    const cost = async (userId: string, nodeId: string) => {
+      const before = statementsSent(db);
+      const access = await effectiveAccess(db, userId, nodeId);
+      return { statements: statementsSent(db) - before, role: access?.role ?? null };
+    };
+    expect(await cost(f.owner, f.deep.id)).toEqual({ statements: 2, role: "owner" });
+    expect(await cost(grantee, f.deep.id)).toEqual({ statements: 2, role: "viewer" });
+    expect(await cost(grantee, f.alpha.id)).toEqual({ statements: 2, role: null });
+    expect(await cost(stranger, f.deep.id)).toEqual({ statements: 2, role: null });
+    expect(await cost(stranger, uuidv7())).toEqual({ statements: 2, role: null });
+    await db.update(user).set({ suspendedAt: new Date() }).where(eq(user.id, f.owner));
+    expect(await cost(grantee, f.deep.id)).toEqual({ statements: 2, role: null });
+    expect(await cost(f.owner, f.deep.id)).toEqual({ statements: 2, role: "owner" });
+    // Not an id at all: nothing is asked.
+    expect(await cost(stranger, "garbage")).toEqual({ statements: 0, role: null });
+    // The padding read is of an id no account has.
+    expect(await userState(db, NO_SUCH_OWNER_ID)).toBeNull();
+    expect(NO_SUCH_OWNER_ID).not.toMatch(/^[A-Za-z0-9]+$/);
   });
 
   it("gives nobody else anything without a share", async () => {

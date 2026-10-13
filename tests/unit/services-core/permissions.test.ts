@@ -477,9 +477,9 @@ describe("a node that listings hide does not exist here either", () => {
       visible: t.secret.id,
     };
     /** Statements one question costs, per id — each in a request of its own (no cache). */
-    const cost = async (caller: Caller, linkRoot?: string) => {
+    const cost = async (caller: Caller, linkRoot?: string, about: Record<string, string> = ids) => {
       const out: Record<string, { statements: number; access: boolean }> = {};
-      for (const [name, id] of Object.entries(ids)) {
+      for (const [name, id] of Object.entries(about)) {
         out[name] = await value(caller, async (c) => {
           if (linkRoot) withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: linkRoot });
           const before = statementsSent(db(c));
@@ -496,18 +496,46 @@ describe("a node that listings hide does not exist here either", () => {
       hiddenAncestor: { statements, access: false },
       visible: { statements, access: visible },
     });
-    // The owner: the access query and the hidden query, every time.
-    expect(await cost(t.owner)).toEqual(same(2, true));
+    // The owner: the access query (the tree statement and the owner-state read, both always)
+    // and the hidden query, every time.
+    expect(await cost(t.owner)).toEqual(same(3, true));
     // Someone with no access to any of them ("no access" and "locked" and "never issued").
-    expect(await cost(t.stranger)).toEqual(same(2, false));
-    // Through a link over the owner's private folder.
+    expect(await cost(t.stranger)).toEqual(same(3, false));
+    // Through a link over the owner's private folder (no access query: the link decides).
     expect(await cost(null, t.privateFolder.id)).toEqual(same(2, true));
-    // NOT COVERED HERE — A GRANTEE: the access query reads the owner's state in a second
-    // statement whenever the caller has a grant on the chain, so for a sharee a hidden shared
-    // node costs one statement more than an unknown id. Equalised by seam pass H1 (in the access
-    // query itself), which adds the grantee rows to this test.
     // Signed out and no link: nothing is asked at all, for any id.
     expect(await cost(null)).toEqual(same(0, false));
+
+    // A GRANTEE (the viewer of `shared/`): a node shared with them that is hidden — itself, by
+    // an ancestor, locked — costs what an unknown id costs, and what a visible shared node costs.
+    const downFolder = await makeFolder(t.ids.owner, t.shared.id);
+    const underDown = await makeFile(t.ids.owner, downFolder.id, { scanStatus: "clean" });
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "abuse" })
+      .where(eq(nodes.id, downFolder.id));
+    const shared = {
+      unknown: ids.unknown,
+      sharedVisible: t.file.id,
+      sharedTakenDown: taken.id,
+      sharedSuspectedCsam: locked.id,
+      sharedHiddenAncestor: underDown.id,
+      notShared: t.secret.id,
+    };
+    const each = (statements: number, visible: boolean) => ({
+      unknown: { statements, access: false },
+      sharedVisible: { statements, access: visible },
+      sharedTakenDown: { statements, access: false },
+      sharedSuspectedCsam: { statements, access: false },
+      sharedHiddenAncestor: { statements, access: false },
+      notShared: { statements, access: false },
+    });
+    for (const grantee of [t.viewer, t.editor]) {
+      expect(await cost(grantee, undefined, shared)).toEqual(each(3, true));
+    }
+    // The owner suspended: the grantee's share grants nothing — for the same work again.
+    await testDb().update(userTable).set({ suspendedAt: new Date() }).where(eq(userTable.id, t.ids.owner));
+    expect(await cost(t.viewer, undefined, shared)).toEqual(each(3, false));
   });
 
   it("includeHidden — the admin routes' option — sees the node; the two answers are cached apart", async () => {
@@ -563,15 +591,16 @@ describe("a node that listings hide does not exist here either", () => {
           await getAccess(c, t.file.id, flag);
           return statementsSent(db(c)) - before;
         });
-        expect(sent, who).toBe(caller === t.editor ? 3 : 2);
+        expect(sent, who).toBe(3);
       }
-      // The control: the admin's own request sees it — with one statement, the access query.
+      // The control: the admin's own request sees it — with the access query alone (its two
+      // statements), no hidden query.
       const admin = await value(asAdmin(t.owner), async (c) => {
         const before = statementsSent(db(c));
         const access = await getAccess(c, t.file.id, flag);
         return { role: access?.role, sent: statementsSent(db(c)) - before };
       });
-      expect(admin, how).toEqual({ role: "owner", sent: 1 });
+      expect(admin, how).toEqual({ role: "owner", sent: 2 });
 
       // Behind a link the option does nothing, whoever is signed in — an admin included.
       for (const caller of [null, t.owner, asAdmin(t.owner)]) {

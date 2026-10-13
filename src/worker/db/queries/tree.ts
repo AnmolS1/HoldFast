@@ -194,6 +194,13 @@ export function notEffectivelyHidden(alias: string = "nodes"): SQL {
 
 export type Role = "owner" | "editor" | "viewer";
 
+/**
+ * A user id no account can have (Better Auth's ids are 32 characters of [A-Za-z0-9]; this has
+ * hyphens). `effectiveAccess` reads this "owner's" state when the node does not exist, so that an
+ * unknown id costs the same statements as a real one.
+ */
+export const NO_SUCH_OWNER_ID = "no-such-owner";
+
 export type Access = {
   role: Role;
   /** The nearest node (this one or an ancestor) with a share to the user; null for the owner. */
@@ -209,6 +216,13 @@ export type Access = {
  *
  * Trash, takedown and scan state are NOT considered here: callers check those separately.
  * A pending share (no `granteeUserId`) grants nothing.
+ *
+ * THE SAME WORK FOR EVERY ANSWER: exactly two statements for any well-formed id — the tree
+ * statement, then ONE read of the owner's state — whether the caller is the owner, a grantee or
+ * nobody, and whether the node exists (for an unknown id the read is of `NO_SUCH_OWNER_ID`). The
+ * state is USED only for a grantee; it is read for everyone so that "shared with you" cannot be
+ * told from "never issued" by counting statements. (A malformed id sends nothing: it is not an
+ * id anyone was issued.)
  */
 export async function effectiveAccess(db: Executor, userId: string, nodeId: string): Promise<Access | null> {
   if (!isUuid(nodeId)) return null;
@@ -232,13 +246,15 @@ export async function effectiveAccess(db: Executor, userId: string, nodeId: stri
     ORDER BY up.depth`);
   const chain = result.rows;
   const self = chain[0];
+  // Read for every caller, used below for a grantee only (see the header).
+  const ownerState = await userState(db, self ? self.owner_id : NO_SUCH_OWNER_ID);
   if (!self) return null;
   if (self.owner_id === userId) return { role: "owner", shareRootId: null, canUpload: true };
 
   const grants = chain.filter((row) => row.role !== null);
   const nearest = grants[0];
   if (!nearest) return null;
-  if (!isActive(await userState(db, self.owner_id))) return null;
+  if (!isActive(ownerState)) return null;
 
   const nearestEditor = grants.find((row) => row.role === "editor");
   if (nearestEditor) {

@@ -20,8 +20,9 @@
 // both sent for every question, whatever the first one answered, so that "this id is locked"
 // and "this id was never issued" cannot be told apart by the number of statements either. That
 // an account holder cannot observe either state is a property of this file, not of each route.
-// (One difference in work is not this file's: for a GRANTEE the access query reads the owner's
-// state in a second statement — for a node shared with them, hidden or not.)
+// (That holds for a grantee too: the access query reads the owner's state in a second statement
+// for EVERY caller and every well-formed id — a real owner's, or a fixed id no account has — and
+// uses it only for a grantee. A signed-in question is three statements, a link's two.)
 // The one way to see such a node is the explicit option `{ includeHidden: true }`, which ONLY
 // ADMIN ROUTES pass (grep for `includeHidden`) and which is honoured ONLY for an admin's own
 // request with no link scope — passed by anyone else it does nothing. The exports that take it:
