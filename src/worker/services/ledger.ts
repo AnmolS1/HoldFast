@@ -4,6 +4,8 @@
 //                                         daily ledger it counts on, BEFORE the first byte is sent
 //   settleServe(deps, charge, sent)       after the stream ended: gives the unsent bytes back and
 //                                         adds the sent ones to the link
+//   refundOthers(deps, charge)            a charged request that serves nothing after all gives
+//                                         back what it took from the owner's cap and the link
 //   notifyLinkLimitOnce(deps, linkId)    the "this link reached today's limit" mail, once a day
 //   notifyOwnerLinkCapOnce(deps, owner)   the "your links reached today's limit" mail, once a day
 //   notifyLinkPausedOnce(deps, id, why)   the "link paused" mail, at most once a day per link —
@@ -13,10 +15,10 @@
 // service's atomic add-if-under, in this order, and the first refusal decides:
 //   a signed-in subject   download_ip → download_user
 //   a link subject        download_ip → download_owner → download_link
-// THE ADDRESS'S CHARGE STAYS when a later ledger refuses: the requester pays for a request the
+// THE ASKER'S OWN CHARGE STAYS when a later ledger refuses: the address pays for a request the
 // owner's cap or the link's ceiling then refuses, and an address over its own ceiling writes
-// nothing at all — so it cannot spend a link's or an owner's day. The OWNER's charge does not
-// stay when the link then refuses: it is given back at once (see below).
+// nothing at all — so it cannot spend a link's or an owner's day. What the request charged to
+// SOMEONE ELSE's budget does not stay: it is given back at once (`refundOthers`).
 // BYTES ONLY. No count is consumed here (the per-link download count belongs to the mint), and a
 // response without a body — 304, 412, 416, HEAD — is not charged and writes no row.
 //
@@ -76,41 +78,58 @@ export async function recordServe(c: Context<AppEnv>, serve: Serve): Promise<Ser
   const charges: Charge[] = [];
   if (bytes === 0) return { bytes, charges, linkId };
 
-  const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes });
-  charges.push({ kind: "download_ip", subjectId: serve.ip, receipt: address });
+  try {
+    const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes });
+    charges.push({ kind: "download_ip", subjectId: serve.ip, receipt: address });
 
-  if (serve.st === "u") {
-    const subject = { id: serve.sub, account: serve.account };
-    const mine = await consumeCeiling(c, "download_user", subject, { bytes });
-    charges.push({ kind: "download_user", subjectId: serve.sub, receipt: mine });
+    if (serve.st === "u") {
+      const subject = { id: serve.sub, account: serve.account };
+      const mine = await consumeCeiling(c, "download_user", subject, { bytes });
+      charges.push({ kind: "download_user", subjectId: serve.sub, receipt: mine });
+      return { bytes, charges, linkId };
+    }
+
+    const owner = { id: serve.owner.id, account: serve.owner.account };
+    const owned = await tryConsumeCeiling(c, "download_owner", owner, { bytes });
+    if (!owned.ok) {
+      await told(() => notifyOwnerLinkCapOnce(deps(c), serve.owner.id, now(c)));
+      throw ceilingExceeded(owned);
+    }
+    charges.push({ kind: "download_owner", subjectId: serve.owner.id, receipt: { day: owned.day } });
+
+    // The link's ceiling scales with its OWNER's account (the new-account factor).
+    const linked = await tryConsumeCeiling(
+      c,
+      "download_link",
+      { id: serve.sub, account: serve.owner.account },
+      { bytes },
+    );
+    if (!linked.ok) {
+      await told(() => notifyLinkLimitOnce(deps(c), serve.sub, now(c)));
+      throw ceilingExceeded(linked);
+    }
+    charges.push({ kind: "download_link", subjectId: serve.sub, receipt: { day: linked.day } });
     return { bytes, charges, linkId };
+  } catch (error) {
+    // Refused by a later ledger, or failed: nothing of this request will be sent.
+    await refundOthers(deps(c), { bytes, charges, linkId });
+    throw error;
   }
+}
 
-  const owner = { id: serve.owner.id, account: serve.owner.account };
-  const owned = await tryConsumeCeiling(c, "download_owner", owner, { bytes });
-  if (!owned.ok) {
-    await told(() => notifyOwnerLinkCapOnce(deps(c), serve.owner.id, now(c)));
-    throw ceilingExceeded(owned);
+/**
+ * A request that was charged and then serves NOTHING — a later ledger refused it, or something
+ * failed before its first byte — gives back at once what it charged to SOMEONE ELSE's budget:
+ * the owner's cap and the link. With no pause to end them, refusals at a full link would
+ * otherwise each take a file's size of the owner's day at no cost in transfer.
+ * The asker's own charges stay — the address's, and a signed-in user's: that is what bounds
+ * hammering from one address. A refund that fails is logged and dropped.
+ */
+export async function refundOthers(source: ServiceDeps, charge: ServeCharge): Promise<void> {
+  for (const { kind, subjectId, receipt } of charge.charges) {
+    if (kind !== "download_owner" && kind !== "download_link") continue;
+    await told(() => refundUsage(source, kind, subjectId, { bytes: charge.bytes }, receipt));
   }
-  charges.push({ kind: "download_owner", subjectId: serve.owner.id, receipt: { day: owned.day } });
-
-  // The link's ceiling scales with its OWNER's account (the new-account factor).
-  const linked = await tryConsumeCeiling(
-    c,
-    "download_link",
-    { id: serve.sub, account: serve.owner.account },
-    { bytes },
-  );
-  if (!linked.ok) {
-    // The owner's cap was charged a moment ago for bytes this request will never send. With no
-    // pause to end them, refusals at a full link would otherwise each take that much of the
-    // owner's day — at no cost in transfer. It goes back now; the address keeps its charge.
-    await told(() => refundUsage(deps(c), "download_owner", serve.owner.id, { bytes }, { day: owned.day }));
-    await told(() => notifyLinkLimitOnce(deps(c), serve.sub, now(c)));
-    throw ceilingExceeded(linked);
-  }
-  charges.push({ kind: "download_link", subjectId: serve.sub, receipt: { day: linked.day } });
-  return { bytes, charges, linkId };
 }
 
 /** A consequence of a refusal must never replace the refusal: its failure is logged and dropped. */

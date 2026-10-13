@@ -293,6 +293,30 @@ describe("a link's own ceiling: a 429 while its ledger is full, one mail that da
     expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
   });
 
+  it("a request that was charged and then fails before its first byte gives the owner and the link their bytes back; the asking address keeps its charge", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    const spy = spyBucket();
+    // The request's deferred work is refused outright, so the settle cannot be arranged — a
+    // failure AFTER all three ledgers were charged, and not one of them refusing.
+    const answer = await ask(await urlFor("download", node, { link }), {
+      ip,
+      limits: { maxDeferredTasks: 0 },
+      env: { FILES: spy.bucket },
+    });
+    expect(answer.status).toBe(500);
+    expect(answer.text).toBe("Something went wrong.\n");
+    expect(spy.cancelled).toBe(1);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(0);
+    expect(await ledgerBytes("link", link.id)).toBe(0);
+    expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(SIZE);
+    expect((await linkById(link.id)).bytesServed).toBe(0);
+    // The control: the same request with its deferred work allowed is served and charged.
+    expect((await ask(await urlFor("download", node, { link }), { ip })).status).toBe(200);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE);
+    expect(await ledgerBytes("link", link.id)).toBe(SIZE);
+  });
+
   it("a link really used up answers 429 until the day rolls over, without a pause; a link paused for another reason still answers 423 and is not touched", async () => {
     const { owner, node, link } = await world();
     const url = await urlFor("download", node, { link });

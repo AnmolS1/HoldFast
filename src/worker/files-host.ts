@@ -44,7 +44,7 @@ import type { ErrorCode } from "../shared/errors";
 import { now } from "./services/clock";
 import { AppError, handlePlainError } from "./services/errors";
 import { dayUTC, ipHashDaily } from "./services/ip-hash";
-import { recordServe, settleServe, type Serve, type ServeCharge } from "./services/ledger";
+import { recordServe, refundOthers, settleServe, type Serve, type ServeCharge } from "./services/ledger";
 import { metric } from "./services/metrics";
 import { contentDisposition, inlineKindAllowed, serveType, thumbEligible } from "./services/mime";
 import {
@@ -433,20 +433,22 @@ function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
   let state: "open" | "in-time" | "late" | "done" = "open";
   let inTime!: (sent: number | null) => void;
   const early = new Promise<number | null>((resolve) => (inTime = resolve));
-  const timer = setTimeout(() => {
-    if (state !== "open") return;
-    state = "late";
-    inTime(null);
-  }, settleInRequestMs(c));
   const failed = () => {
     metric("download", { outcome: "settle_failed" });
     console.warn("files host: a served response was not settled");
   };
   const source = deps(c);
+  // May refuse (the request's deferred work is bounded): then nothing was arranged, and the
+  // caller gives the charge back itself.
   defer(
     c,
     early.then((sent) => (sent === null ? undefined : settleServe(source, charge, sent))).catch(failed),
   );
+  const timer = setTimeout(() => {
+    if (state !== "open") return;
+    state = "late";
+    inTime(null);
+  }, settleInRequestMs(c));
   const { env, executionCtx } = c;
   const core = coreOf(c);
   return (sent) => {
@@ -562,7 +564,15 @@ async function streamed(
     await body.cancel().catch(() => {});
     return null;
   }
-  return counted(body, bytes, settleLater(c, charged));
+  try {
+    return counted(body, bytes, settleLater(c, charged));
+  } catch (error) {
+    // Charged, and now nothing will be sent (the settle could not be arranged): the owner and
+    // the link get their bytes back here, because no settle will.
+    await body.cancel().catch(() => {});
+    await refundOthers(deps(c), charged);
+    throw error;
+  }
 }
 
 // ── serving an object ───────────────────────────────────────────────────────────────────────
