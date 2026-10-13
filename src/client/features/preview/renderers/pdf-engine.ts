@@ -112,7 +112,11 @@ function wrapPage(page: PDFPageProxy): PdfPage {
         text = new TextLayer({ textContentSource: content, container: textLayer, viewport });
         return text.render();
       });
-      const done = Promise.all([task.promise, layer]).then(() => undefined);
+      // Over when BOTH are over, however either ends: a text layer that fails first must not
+      // report the page as drawn while its canvas is still being painted.
+      const done = Promise.allSettled([task.promise, layer]).then(([canvasTask]) => {
+        if (canvasTask.status === "rejected") throw canvasTask.reason;
+      });
       return {
         done,
         cancel() {
@@ -166,7 +170,15 @@ async function pageOfDest(doc: PDFDocumentProxy, dest: unknown): Promise<number 
   }
 }
 
-export async function openPdf(data: Uint8Array): Promise<PdfDocument> {
+/** Thrown by `openPdf` when its signal aborted while pdf.js was still opening the bytes. */
+export class PdfAbortedError extends Error {}
+
+/**
+ * Open a document. `signal` belongs to the view: when it aborts — the preview closed, moved on,
+ * or the account was purged — the loading task is destroyed at once, and a document that still
+ * comes out of it is destroyed instead of returned.
+ */
+export async function openPdf(data: Uint8Array, signal?: AbortSignal): Promise<PdfDocument> {
   const task = getDocument({
     data,
     // One whole file, already fetched: no ranges, no streaming, no fetch by pdf.js.
@@ -178,18 +190,30 @@ export async function openPdf(data: Uint8Array): Promise<PdfDocument> {
     useWorkerFetch: false,
     maxImageSize: PDF_MAX_IMAGE_PIXELS,
   });
+  const destroy = () => void task.destroy();
+  signal?.addEventListener("abort", destroy, { once: true });
   let doc: PDFDocumentProxy;
   try {
+    if (signal?.aborted) throw new PdfAbortedError();
     doc = await task.promise;
   } catch (error) {
-    void task.destroy();
+    signal?.removeEventListener("abort", destroy);
+    destroy();
+    if (signal?.aborted) throw new PdfAbortedError();
     if (error instanceof PasswordException) throw new PdfLockedError();
     throw error;
+  }
+  if (signal?.aborted) {
+    destroy();
+    throw new PdfAbortedError();
   }
   return {
     pageCount: doc.numPages,
     page: async (number) => wrapPage(await doc.getPage(number)),
     pageOfDest: (dest) => pageOfDest(doc, dest),
-    destroy: () => void task.destroy(),
+    destroy: () => {
+      signal?.removeEventListener("abort", destroy);
+      destroy();
+    },
   };
 }

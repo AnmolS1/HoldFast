@@ -37,12 +37,24 @@ export interface RenderSlot {
   granted: Promise<boolean>;
   /** Drawing is over (the canvas, and so its pixels, stay). */
   finished(): void;
+  /** The page came into, or left, the visible part of the window. */
+  setVisible(visible: boolean): void;
   /** The canvas is gone, or the page gave up waiting. */
   release(): void;
 }
 
+export interface RenderRequest {
+  /** On screen now (not merely near): served before pages nobody sees. */
+  visible?: boolean;
+  /**
+   * Called when this page's finished canvas is taken back to make room for a visible page. The
+   * page drops its canvas and may ask again.
+   */
+  onEvict?: () => void;
+}
+
 export interface RenderBudget {
-  request(pixels: number): RenderSlot;
+  request(pixels: number, options?: RenderRequest): RenderSlot;
   /** For tests: what is being drawn, alive and waiting right now. */
   stats(): { rendering: number; pixels: number; waiting: number };
 }
@@ -50,7 +62,9 @@ export interface RenderBudget {
 /**
  * Who may draw now. At most `maxRenders` pages are drawn at a time, and a page starts only while
  * the canvases already alive, plus its own, stay under `maxPixels` — except that one page is
- * always allowed (a single page is already capped by `MAX_CANVAS_PIXELS`). First come, first served.
+ * always allowed (a single page is already capped by `MAX_CANVAS_PIXELS`). A page that is VISIBLE
+ * goes before pages that are only near, and when the pixels are held by finished pages nobody
+ * sees, those give theirs back to it. Otherwise first come, first served.
  */
 export function createRenderBudget(
   maxRenders = PDF_MAX_CONCURRENT_RENDERS,
@@ -58,31 +72,50 @@ export function createRenderBudget(
 ): RenderBudget {
   interface Entry {
     pixels: number;
+    visible: boolean;
     state: "waiting" | "rendering" | "alive" | "gone";
     grant(ok: boolean): void;
+    onEvict: (() => void) | undefined;
   }
   const queue: Entry[] = [];
   const live = new Set<Entry>();
   const rendering = () => Array.from(live).filter((entry) => entry.state === "rendering").length;
   const pixels = () => Array.from(live).reduce((sum, entry) => sum + entry.pixels, 0);
+  const fits = (entry: Entry) => live.size === 0 || pixels() + entry.pixels <= maxPixels;
   const pump = () => {
     while (queue.length > 0) {
-      const next = queue[0]!;
       if (rendering() >= maxRenders) return;
-      if (live.size > 0 && pixels() + next.pixels > maxPixels) return;
-      queue.shift();
+      const next = queue.find((entry) => entry.visible) ?? queue[0]!;
+      if (!fits(next) && next.visible) {
+        // Finished pages that are not on screen make room for one that is.
+        for (const holder of Array.from(live)) {
+          if (fits(next)) break;
+          if (holder.state !== "alive" || holder.visible) continue;
+          holder.state = "gone";
+          live.delete(holder);
+          holder.onEvict?.();
+        }
+      }
+      if (!fits(next)) return;
+      queue.splice(queue.indexOf(next), 1);
       next.state = "rendering";
       live.add(next);
       next.grant(true);
     }
   };
   return {
-    request(wanted) {
+    request(wanted, options = {}) {
       let grant!: (ok: boolean) => void;
       const granted = new Promise<boolean>((resolve) => {
         grant = resolve;
       });
-      const entry: Entry = { pixels: Math.max(0, wanted), state: "waiting", grant };
+      const entry: Entry = {
+        pixels: Math.max(0, wanted),
+        visible: options.visible === true,
+        state: "waiting",
+        grant,
+        onEvict: options.onEvict,
+      };
       queue.push(entry);
       pump();
       return {
@@ -91,6 +124,10 @@ export function createRenderBudget(
           if (entry.state !== "rendering") return;
           entry.state = "alive";
           pump();
+        },
+        setVisible(visible) {
+          entry.visible = visible;
+          if (entry.state !== "gone") pump();
         },
         release() {
           if (entry.state === "gone") return;

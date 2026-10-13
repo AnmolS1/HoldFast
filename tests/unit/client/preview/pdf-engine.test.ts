@@ -12,6 +12,9 @@ const pdfjs = vi.hoisted(() => {
     textItems: 3,
     textChunks: 0,
     textCancelled: 0,
+    textFails: false,
+    canvas: null as Promise<void> | null,
+    opening: null as Promise<unknown> | null,
     fail: null as Error | null,
     destroyed: 0,
   };
@@ -29,7 +32,7 @@ vi.mock("pdfjs-dist", () => {
     }),
     render: (params: Record<string, unknown>) => {
       state.renderCalls.push(params);
-      return { promise: Promise.resolve(), cancel: () => {} };
+      return { promise: state.canvas ?? Promise.resolve(), cancel: () => {} };
     },
     getTextContent: async () => {
       throw new Error("the text is read as a stream, so that it can be counted as it arrives");
@@ -40,6 +43,7 @@ vi.mock("pdfjs-dist", () => {
       return new ReadableStream(
         {
           pull(controller) {
+            if (state.textFails) return controller.error(new Error("damaged content stream"));
             if (sent >= state.textItems) return controller.close();
             const size = Math.min(1000, state.textItems - sent);
             sent += size;
@@ -78,12 +82,12 @@ vi.mock("pdfjs-dist", () => {
       return {
         promise: state.fail
           ? Promise.reject(state.fail)
-          : Promise.resolve({
+          : (state.opening ?? Promise.resolve()).then(() => ({
               numPages: 3,
               getPage: async () => page,
               getDestination: async (name: string) => (name === "chapter-2" ? [{ num: 7, gen: 0 }] : null),
               getPageIndex: async () => 1,
-            }),
+            })),
         destroy: async () => {
           state.destroyed += 1;
         },
@@ -93,7 +97,11 @@ vi.mock("pdfjs-dist", () => {
 });
 
 import { GlobalWorkerOptions } from "pdfjs-dist";
-import { openPdf, PdfLockedError } from "../../../../src/client/features/preview/renderers/pdf-engine";
+import {
+  openPdf,
+  PdfAbortedError,
+  PdfLockedError,
+} from "../../../../src/client/features/preview/renderers/pdf-engine";
 import {
   PAGE_MAX_LINKS,
   PDF_MAX_IMAGE_PIXELS,
@@ -109,6 +117,9 @@ beforeEach(() => {
   state.textItems = 3;
   state.textChunks = 0;
   state.textCancelled = 0;
+  state.textFails = false;
+  state.canvas = null;
+  state.opening = null;
   state.fail = null;
   state.destroyed = 0;
 });
@@ -229,6 +240,50 @@ describe("the PDF engine", () => {
   it("destroy releases the document", async () => {
     const doc = await openPdf(bytes);
     doc.destroy();
+    expect(pdfjs.state.destroyed).toBe(1);
+  });
+
+  it("a page is drawn until its CANVAS is: a text layer that fails first does not end it early", async () => {
+    let paint!: () => void;
+    pdfjs.state.canvas = new Promise<void>((resolve) => (paint = resolve));
+    pdfjs.state.textFails = true;
+    const doc = await openPdf(bytes);
+    const page = await doc.page(1);
+    let over = false;
+    const run = page.render(document.createElement("canvas"), document.createElement("div"), 1, 1);
+    void run.done.then(
+      () => (over = true),
+      () => (over = true),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The text stream has failed by now; the canvas is still being painted.
+    expect(over).toBe(false);
+    paint();
+    await run.done;
+    expect(over).toBe(true);
+  });
+
+  it("the view's signal aborting while the document is opening destroys the loading task; a document that still comes out is destroyed, not returned", async () => {
+    let finish!: () => void;
+    pdfjs.state.opening = new Promise<void>((resolve) => (finish = resolve));
+    const view = new AbortController();
+    const opening = openPdf(bytes, view.signal);
+    opening.catch(() => {});
+    view.abort();
+    expect(pdfjs.state.destroyed).toBe(1);
+    finish();
+    await expect(opening).rejects.toBeInstanceOf(PdfAbortedError);
+    expect(pdfjs.state.destroyed).toBeGreaterThanOrEqual(2);
+
+    // Already aborted before it starts: nothing is waited for.
+    await expect(openPdf(bytes, view.signal)).rejects.toBeInstanceOf(PdfAbortedError);
+
+    // And after it opened: the signal destroys the open document too.
+    pdfjs.state.opening = null;
+    pdfjs.state.destroyed = 0;
+    const later = new AbortController();
+    await openPdf(bytes, later.signal);
+    later.abort();
     expect(pdfjs.state.destroyed).toBe(1);
   });
 });
