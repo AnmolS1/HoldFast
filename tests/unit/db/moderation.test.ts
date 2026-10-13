@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -6,6 +6,7 @@ import { lookup } from "../../../src/worker/db/queries/blocklist";
 import { getById, pauseLinks } from "../../../src/worker/db/queries/links";
 import {
   closeNotice,
+  csamReportsToAnnounce,
   dismissReview,
   insertReport,
   lockSuspectedCsam,
@@ -16,7 +17,15 @@ import {
   takedownNode,
 } from "../../../src/worker/db/queries/moderation";
 import { getNode } from "../../../src/worker/db/queries/nodes";
-import { dmcaNotices, nodes, reports, type ScanStatus, uploadIps, user } from "../../../src/worker/db/schema";
+import {
+  dmcaNotices,
+  downloadLedger,
+  nodes,
+  reports,
+  type ScanStatus,
+  uploadIps,
+  user,
+} from "../../../src/worker/db/schema";
 import { makeFile, makeLink, makeUser, openDb, rand } from "./_helpers";
 
 let db: Db;
@@ -241,6 +250,92 @@ describe("lockSuspectedCsam", () => {
     expect(account!.legalHold).toBe(false);
     expect((await getById(db, link.id))!.pauseReasons).toEqual([]);
     expect(await lookup(db, file.sha256!)).toBeNull();
+  });
+});
+
+describe("csamReportsToAnnounce", () => {
+  /** A locked file and its open `csam` report, filed `ageMinutes` ago. */
+  async function lockedReport(ageMinutes: number) {
+    const { file } = await reported("pending");
+    const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "system" }))!;
+    await db
+      .update(reports)
+      .set({ createdAt: sql`(now() AT TIME ZONE 'UTC') - make_interval(mins => ${ageMinutes})` })
+      .where(eq(reports.id, reportId));
+    return { reportId, nodeId: file.id };
+  }
+  /** The alert marker of a report, claimed `daysAgo` days ago (0 = today, the database's day). */
+  const mark = (reportId: string, daysAgo: number, count = 1) =>
+    db.insert(downloadLedger).values({
+      day: sql`((now() AT TIME ZONE 'UTC')::date - ${daysAgo}::int)`,
+      subjectType: "notice",
+      subjectId: `csam_alert:${reportId}`,
+      bytes: 0,
+      count,
+    });
+  /** Of everything due (the table is shared with other tests), the rows this test made, in order. */
+  const dueAmong = async (mine: { reportId: string }[]) => {
+    const ids = new Set(mine.map((row) => row.reportId));
+    return (await csamReportsToAnnounce(db, 100_000)).filter((row) => ids.has(row.reportId));
+  };
+
+  it("lists open csam reports nobody was told about today, oldest first, with the node", async () => {
+    const newer = await lockedReport(10);
+    const oldest = await lockedReport(30);
+    const middle = await lockedReport(20);
+    expect(await dueAmong([newer, oldest, middle])).toEqual([oldest, middle, newer]);
+  });
+
+  it("only `open`: a report being reviewed, actioned or dismissed is not listed", async () => {
+    const open = await lockedReport(5);
+    const others = [];
+    for (const status of ["reviewing", "actioned", "dismissed"] as const) {
+      const report = await lockedReport(5);
+      await db.update(reports).set({ status }).where(eq(reports.id, report.reportId));
+      others.push(report);
+    }
+    expect(await dueAmong([open, ...others])).toEqual([open]);
+  });
+
+  it("only category `csam`: an open report of another category is not listed", async () => {
+    const csam = await lockedReport(5);
+    const { file, owner } = await reported();
+    const other = await insertReport(db, {
+      nodeId: file.id,
+      ownerId: owner,
+      source: "user",
+      category: "phishing",
+    });
+    expect(await dueAmong([csam, { reportId: other! }])).toEqual([csam]);
+  });
+
+  it("today's claimed marker takes a report off the list; yesterday's, another report's, or an unclaimed one does not", async () => {
+    const toldToday = await lockedReport(5);
+    const toldYesterday = await lockedReport(4);
+    const unclaimed = await lockedReport(3);
+    const untold = await lockedReport(2);
+    await mark(toldToday.reportId, 0);
+    await mark(toldYesterday.reportId, 1);
+    await mark(unclaimed.reportId, 0, 0);
+    expect(await dueAmong([toldToday, toldYesterday, unclaimed, untold])).toEqual([
+      toldYesterday,
+      unclaimed,
+      untold,
+    ]);
+  });
+
+  it("returns at most `limit` rows and writes nothing", async () => {
+    const a = await lockedReport(2);
+    const b = await lockedReport(1);
+    expect(await csamReportsToAnnounce(db, 1)).toHaveLength(1);
+    expect((await csamReportsToAnnounce(db, 2)).length).toBe(2);
+    // Read-only: asked twice, the same reports are still due and no marker appeared.
+    expect(await dueAmong([a, b])).toEqual([a, b]);
+    const markers = await db
+      .select()
+      .from(downloadLedger)
+      .where(eq(downloadLedger.subjectId, `csam_alert:${a.reportId}`));
+    expect(markers).toEqual([]);
   });
 });
 
