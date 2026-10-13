@@ -15,6 +15,7 @@ import {
   consumeCeiling,
   enforceUploadCeilings,
   recordUsage,
+  type CeilingLedgerSubject,
   type CeilingSubject,
 } from "../../../src/worker/services/ceilings";
 import { db, type AppEnv } from "../../../src/worker/services/request-context";
@@ -231,6 +232,12 @@ describe("what cannot be written", () => {
       await consumeCeiling(c, "download_owner", subject, { bytes: 1 });
     };
     expect(typeof neverRun).toBe("function");
+    // A ceiling is never counted on the marker subject, nor on a sign-up velocity subject.
+    type Refused<T extends string> = T extends CeilingLedgerSubject ? "allowed" : "refused";
+    const notice: Refused<"notice"> = "refused";
+    const signup: Refused<"signup_ip"> = "refused";
+    const owner: Refused<"link_owner"> = "allowed";
+    expect([notice, signup, owner]).toEqual(["refused", "refused", "allowed"]);
     // There is no check-then-record call to import: the single-kind enforcer is not exported.
     expect(Object.keys(ceilings).sort()).toEqual([
       "CEILING_KINDS",

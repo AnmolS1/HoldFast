@@ -120,8 +120,25 @@ export type CeilingResult =
 type LimitEnv = Pick<Env, Exclude<CeilingKey, `signup${string}`>>;
 type LimitSettings = Pick<Settings, "ceilings">;
 
+/**
+ * The ledger subjects a ceiling is counted on. Never `notice` (once-a-day markers live there, and
+ * a marker must not be summed into a total) and never a sign-up velocity subject.
+ */
+export type CeilingLedgerSubject = Extract<
+  LedgerSubject,
+  | "user"
+  | "link"
+  | "ip"
+  | "link_owner"
+  | "upload_user"
+  | "upload_editor"
+  | "transform_user"
+  | "share_user"
+  | "link_user"
+>;
+
 type Rule = {
-  subject: LedgerSubject;
+  subject: CeilingLedgerSubject;
   bytes?: Exclude<CeilingKey, `signup${string}`>;
   count?: Exclude<CeilingKey, `signup${string}`>;
   /** Scale with the account's quota. */

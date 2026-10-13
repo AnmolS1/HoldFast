@@ -1,6 +1,6 @@
 // Migration 0005 on a scratch database of its own (the local server only): one unlifted strike
 // per violation, and the ledger subject of the owner-wide link ceiling.
-//   - `ledger_subject` gains the value `link_owner`;
+//   - `ledger_subject` gains the values `link_owner` and `notice`;
 //   - `strikes.content_sha256` (nullable);
 //   - a unique partial index on (user_id, kind, node_id) and one on (user_id, kind, content_sha256),
 //     each over unlifted rows that have the key.
@@ -38,7 +38,7 @@ async function apply(tag: string): Promise<void> {
   }
 }
 
-const TAG = "0005_strikes_dedupe_link_owner";
+const TAG = "0005_strikes_dedupe_ledger_subjects";
 const USER = "u-0005";
 const OTHER = "u-0005-other";
 const NODE = "0199d3c2-7a10-7000-8000-0000000000a1";
@@ -126,6 +126,11 @@ describe("migration 0005", () => {
         "INSERT INTO download_ledger (day, subject_type, subject_id, bytes, count) VALUES (current_date, 'link_owner', 'x', 1, 0)",
       ),
     ).rejects.toThrow(/invalid input value for enum ledger_subject/);
+    await expect(
+      client.query(
+        "INSERT INTO download_ledger (day, subject_type, subject_id, bytes, count) VALUES (current_date, 'notice', 'x', 0, 1)",
+      ),
+    ).rejects.toThrow(/invalid input value for enum ledger_subject/);
     // A table holding such duplicates could not take the unique index: start from none.
     await client.query("DELETE FROM strikes");
   });
@@ -188,14 +193,15 @@ describe("migration 0005", () => {
     expect(await count()).toBe(before + 3);
   });
 
-  it("adds the ledger subject link_owner, usable once the migration has committed", async () => {
+  it("adds the ledger subjects link_owner and notice, usable once the migration has committed", async () => {
     const values = await client.query(
       "SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'ledger_subject' ORDER BY e.enumsortorder",
     );
     const labels = values.rows.map((row) => row.enumlabel as string);
     expect(labels).toContain("link_owner");
+    expect(labels).toContain("notice");
     // Every value that existed before is still there, in its place.
-    expect(labels.filter((label) => label !== "link_owner")).toEqual([
+    expect(labels.filter((label) => label !== "link_owner" && label !== "notice")).toEqual([
       "user",
       "link",
       "ip",
@@ -221,18 +227,28 @@ describe("migration 0005", () => {
       [USER],
     );
     expect(Number(row.rows[0].bytes)).toBe(5);
+    // A once-a-day marker is a row of its own subject: it is not part of the byte total above.
+    await client.query(
+      "INSERT INTO download_ledger (day, subject_type, subject_id, bytes, count) VALUES (current_date, 'notice', $1, 0, 1)",
+      [`download_owner:${USER}`],
+    );
+    const total = await client.query(
+      "SELECT COALESCE(SUM(bytes), 0) AS bytes, COALESCE(SUM(count), 0) AS count FROM download_ledger WHERE subject_type = 'link_owner'",
+    );
+    expect([Number(total.rows[0].bytes), Number(total.rows[0].count)]).toEqual([5, 0]);
   });
 
   it("the migration never uses the new value itself (it could not, in the same transaction)", () => {
     const statements = statementsOf(TAG);
     expect(statements[0]).toMatch(/^ALTER TYPE "public"\."ledger_subject" ADD VALUE 'link_owner'/);
-    for (const statement of statements.slice(1)) expect(statement).not.toContain("link_owner");
+    expect(statements[1]).toMatch(/^ALTER TYPE "public"\."ledger_subject" ADD VALUE 'notice'/);
+    for (const statement of statements.slice(2)) expect(statement).not.toMatch(/link_owner|notice/);
   });
 
   it("expands only: no statement that could break the Worker version before it", () => {
     const sql = readFileSync(`${root}drizzle/${TAG}.sql`, "utf8").replace(/--[^\n]*/g, "");
     expect(sql).not.toMatch(/\b(DROP|RENAME|TRUNCATE|DELETE|UPDATE|SET\s+NOT\s+NULL)\b/i);
     expect(sql).toMatch(/ADD COLUMN "content_sha256" text;/);
-    expect(statementsOf(TAG)).toHaveLength(4);
+    expect(statementsOf(TAG)).toHaveLength(5);
   });
 });
