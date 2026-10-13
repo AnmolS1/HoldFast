@@ -289,6 +289,31 @@ describe("inFolder", () => {
     ]);
   });
 
+  it("is 404 for a folder in the trash — itself or by a folder above it — for a grantee and for its owner", async () => {
+    const owner = await makeUser();
+    const me = await makeUser();
+    const t = token();
+    const shared = await makeFolder(owner.id);
+    const live = await makeFile(owner.id, shared.id, { name: `${t} live.txt`, ...clean });
+    const trashed = await makeFolder(owner.id, shared.id, { deletedAt: new Date(), trashedRoot: true });
+    const under = await makeFolder(owner.id, trashed.id);
+    await makeFile(owner.id, under.id, { name: `${t} binned.txt`, ...clean });
+    await makeShare(shared.id, owner.id, me.id);
+
+    const unknown = await get(as(me), searchPath({ q: t, inFolder: uuidv7() }));
+    expect(unknown.status).toBe(404);
+    const withoutId = (answer: Answer) => ({ ...(answer.body as object), requestId: "" });
+    for (const caller of [me, owner]) {
+      for (const folder of [trashed, under]) {
+        const answer = await get(as(caller), searchPath({ q: t, inFolder: folder.id }));
+        expect(answer.status).toBe(404);
+        expect(withoutId(answer)).toEqual(withoutId(unknown));
+      }
+      // The folder they sit in is searched as before.
+      expect(idsOf(await get(as(caller), searchPath({ q: t, inFolder: shared.id })))).toEqual([live.id]);
+    }
+  });
+
   it("is 400 for an id that is not a node id", async () => {
     const me = await makeUser();
     const answer = await get(as(me), searchPath({ q: "anything", inFolder: "root" }));

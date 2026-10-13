@@ -4,8 +4,9 @@
 // Every query is T05's `searchNames` and every row leaves through the shared mapper
 // (services/node-dto.ts); this file writes no SQL and filters nothing afterwards. What it
 // decides: which scan statuses each side may see, what a category means in types and
-// extensions, and that `inFolder` is a folder the caller has a role on (`requireRole` — a hidden
-// folder is the same 404 as an unknown id).
+// extensions, and that `inFolder` is a folder the caller has a role on and that is not in the
+// trash (`requireRole` and `assertNotTrashed` — a hidden or trashed folder is the same 404 as an
+// unknown id).
 //
 // How close a name must be to count as a typo of the query is T05's (`searchNames` without a
 // `threshold`: its default matching, by whole name and by word). A threshold passed from here
@@ -16,7 +17,7 @@
 //
 // Paths are relative to /api. The pipeline applies RL_API.
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { MIME_CATEGORIES, type MimeCategoryName } from "../../shared/constants";
 import { SearchQuery, type SearchResponse } from "../../shared/schemas/search";
 import { OWNER_VISIBLE_STATUSES } from "../db/queries/nodes";
@@ -25,7 +26,7 @@ import type { ScanStatus } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { toSearchResultDtos } from "../services/node-dto";
-import { requireRole } from "../services/permissions";
+import { assertNotTrashed, requireRole } from "../services/permissions";
 import { db, type AppEnv } from "../services/request-context";
 
 /** What a grantee sees of a shared tree: scanned and clean, nothing else. */
@@ -52,12 +53,27 @@ function categoryFilter(name: MimeCategoryName): NonNullable<SearchOptions["cate
   };
 }
 
+/**
+ * `inFolder` must be a node the caller has a role on that is not in the trash — itself or by a
+ * folder above it. Anything else is one answer, `404 not_found`: no role, no such id, hidden,
+ * trashed. Both questions are always asked, whatever the first one answers, so that "in the
+ * owner's trash" and "never existed" cost the same work as well. The owner gets the same 404 for
+ * their own trashed folder: nothing in the trash is found by a search.
+ */
+async function requireSearchableFolder(c: Context<AppEnv>, folderId: string): Promise<void> {
+  const checks = await Promise.allSettled([
+    requireRole(c, folderId, "viewer"),
+    assertNotTrashed(c, folderId),
+  ]);
+  for (const check of checks) if (check.status === "rejected") throw check.reason;
+}
+
 export const router = new Hono<AppEnv>();
 
 router.get("/search", async (c) => {
   const user = requireVerified(c);
   const query = SearchQuery.parse(c.req.query());
-  if (query.inFolder !== undefined) await requireRole(c, query.inFolder, "viewer");
+  if (query.inFolder !== undefined) await requireSearchableFolder(c, query.inFolder);
 
   const found = await searchNames(db(c), user.id, query.q, {
     scope: query.scope,
