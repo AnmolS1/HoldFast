@@ -1,13 +1,24 @@
 // Folder upload: folders first, each once; a folder that is already there is used, a name that
 // something else holds fails its subtree only — and the folder's children are never listed.
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { carriesFiles, fromDrop, fromFileList } from "../../../../src/client/features/upload/intake";
-import { addFiles } from "../../../../src/client/features/upload/manager";
+import { addFiles, cancelItem, pauseItem, retryItem } from "../../../../src/client/features/upload/manager";
+import { MAX_DROP_FILES } from "../../../../src/client/features/upload/plan";
+import { getToasts } from "../../../../src/client/components/Toaster";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { setupShell } from "../shell/helpers";
 import { EXISTING_ID, FOLDER_ID, folderDto, rowId } from "./fixtures";
-import { envelope, freshUploader, installServer, json, settle, smallFile, type Server } from "./helpers";
+import {
+  envelope,
+  FAKED_TIMERS,
+  freshUploader,
+  installServer,
+  json,
+  settle,
+  smallFile,
+  type Server,
+} from "./helpers";
 
 setupShell();
 
@@ -54,19 +65,28 @@ describe("folder upload", () => {
     stop();
 
     const trip = rowId(0x7001);
-    expect(folderCalls()).toEqual([
-      { parentId: FOLDER_ID, name: "trip" },
+    // Each folder once; "trip" before anything inside it; an empty folder is created too.
+    expect(folderCalls()[0]).toEqual({ parentId: FOLDER_ID, name: "trip" });
+    expect(
+      folderCalls()
+        .slice(1)
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    ).toEqual([
       { parentId: trip, name: "day1" },
       { parentId: trip, name: "day2" },
-      // An empty folder is created too.
       { parentId: trip, name: "empty" },
     ]);
+    const made = Object.fromEntries(
+      server.calls
+        .filter((call) => call.method === "POST" && call.path === "/api/nodes/folder")
+        .map((call, index) => [(call.body as { name: string }).name, rowId(0x7001 + index)]),
+    );
     const parents = Object.fromEntries(server.inits.map((body) => [body.name, body.parentId]));
     expect(parents).toEqual({
       "top.txt": trip,
-      "a.jpg": rowId(0x7002),
-      "b.jpg": rowId(0x7002),
-      "c.jpg": rowId(0x7003),
+      "a.jpg": made.day1,
+      "b.jpg": made.day1,
+      "c.jpg": made.day2,
     });
     expect(server.completes.length).toBe(4);
     // A new folder is a change of its parent's children.
@@ -113,7 +133,8 @@ describe("folder upload", () => {
       expect(item.message).toBe(
         "Couldn't create the folder day1 — something else already has that name. Nothing in it was uploaded.",
       );
-      expect(item.canRetry).toBe(false);
+      // Something else has the name now; it may not later: the file can be tried again.
+      expect(item.canRetry).toBe(true);
     }
     expect(childrenRequests()).toEqual([]);
   });
@@ -124,6 +145,150 @@ describe("folder upload", () => {
     await settle();
     expect(server.inits.map((body) => body.name).sort()).toEqual(["a.jpg", "b.jpg", "top.txt"]);
     expect(items().map((item) => [item.name, item.state])).toEqual([["c.jpg", "error"]]);
+  });
+});
+
+describe("what a drop could not hand over", () => {
+  it("is said at once, by name — and the rest uploads", async () => {
+    await addFiles([{ file: smallFile("a.jpg"), path: "trip" }], null, ["trip"], {
+      unreadable: ["trip/broken.jpg", "trip/raw/x.dng", "trip/raw/y.dng", "trip/raw/z.dng", "notes.txt"],
+    });
+    await settle();
+    const sentence =
+      "5 items could not be read and were left out: trip/broken.jpg, trip/raw/x.dng, trip/raw/y.dng and 2 more";
+    expect(getToasts().map((toast) => toast.message)).toEqual([sentence]);
+    expect(getUploads().announcements[0]!.text).toBe(sentence);
+    expect(server.completes.length).toBe(1);
+  });
+
+  it("one item: the singular sentence", async () => {
+    await addFiles([], null, [], { unreadable: ["broken.jpg"] });
+    expect(getToasts().map((toast) => toast.message)).toEqual([
+      "1 item could not be read and was left out: broken.jpg",
+    ]);
+  });
+
+  it("too many files: nothing is queued and nothing is asked", async () => {
+    await addFiles([{ file: smallFile("a.jpg") }], null, [], { tooMany: true });
+    await settle();
+    expect(items()).toEqual([]);
+    expect(server.calls).toEqual([]);
+    expect(getToasts().map((toast) => toast.message)).toEqual([
+      "That is more than 10,000 files. Nothing was uploaded — upload it in smaller parts.",
+    ]);
+  });
+});
+
+describe("folder creation waits, stops and is tried again with the files", () => {
+  const folderRequests = () => folderCalls().length;
+
+  it("offline while a folder is being made: nothing fails; back online the folder is made and the files upload", async () => {
+    vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
+    // The connection is gone: the request fails, and the browser says so.
+    server.onJson = (call) => {
+      if (call.method === "POST" && call.path === "/api/nodes/folder") throw new TypeError("offline");
+      return undefined;
+    };
+    await addFiles(tree, null);
+    await settle(0);
+    window.dispatchEvent(new Event("offline"));
+    await settle(0);
+    await settle(120_000);
+    expect(items().map((item) => [item.state, item.pauseReason])).toEqual(
+      tree.map(() => ["paused", "offline"]),
+    );
+    // And it is not asked for while offline.
+    const asked = folderRequests();
+    await settle(120_000);
+    expect(folderRequests()).toBe(asked);
+
+    folders({});
+    window.dispatchEvent(new Event("online"));
+    await settle(0);
+    await settle(0);
+    expect(server.completes.length).toBe(4);
+    expect(items()).toEqual([]);
+  });
+
+  it("a folder that cannot be made (a 5xx spell) fails its files with a new try — and the new try makes it", async () => {
+    vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
+    server.onJson = (call) =>
+      call.method === "POST" && call.path === "/api/nodes/folder" ? envelope("internal", 500) : undefined;
+    await addFiles([tree[1]!, tree[2]!], null);
+    await settle(0);
+    await settle(60_000);
+    // One folder, asked for on the schedule — not once per file.
+    expect(folderRequests()).toBe(6);
+    expect(items().map((item) => [item.state, item.canRetry, item.message])).toEqual([
+      ["error", true, "Couldn't create the folder trip. Nothing in it was uploaded."],
+      ["error", true, "Couldn't create the folder trip. Nothing in it was uploaded."],
+    ]);
+    await settle(600_000);
+    expect(folderRequests()).toBe(6);
+
+    folders({});
+    for (const item of items()) retryItem(item.id);
+    await settle(0);
+    await settle(0);
+    expect(server.completes.length).toBe(2);
+    expect(
+      folderCalls()
+        .slice(6)
+        .map((body) => body.name),
+    ).toEqual(["trip", "day1"]);
+  });
+
+  it("a rate limit on a folder pauses the queue like any other request", async () => {
+    vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
+    let limited = true;
+    server.onJson = (call) =>
+      limited && call.method === "POST" && call.path === "/api/nodes/folder"
+        ? envelope("rate_limited", 429, undefined, { "retry-after": "20" })
+        : undefined;
+    await addFiles([tree[0]!], null);
+    await settle(0);
+    expect(items()[0]).toMatchObject({ state: "paused", pauseReason: "limited" });
+    limited = false;
+    folders({});
+    await settle(20_000);
+    await settle(0);
+    expect(server.completes.length).toBe(1);
+  });
+
+  it("cancelling every file of the upload stops the folders: no more are made", async () => {
+    let answer!: (response: Response) => void;
+    server.onJson = (call) =>
+      call.method === "POST" &&
+      call.path === "/api/nodes/folder" &&
+      (call.body as { name: string }).name === "trip"
+        ? new Promise<Response>((resolve) => (answer = resolve))
+        : undefined;
+    await addFiles(tree, null, ["trip/empty1", "trip/empty2"]);
+    await settle();
+    expect(folderRequests()).toBe(1);
+    for (const item of items()) cancelItem(item.id);
+    answer(json(folderDto({ id: rowId(0x7001), name: "trip" })));
+    await settle();
+    await settle();
+    expect(folderRequests()).toBe(1);
+    expect(server.inits).toEqual([]);
+  });
+
+  it("a file paused by hand while it waits for its folder stays paused when that folder fails", async () => {
+    let answer!: (response: Response) => void;
+    server.onJson = (call) =>
+      call.method === "POST" && call.path === "/api/nodes/folder"
+        ? new Promise<Response>((resolve) => (answer = resolve))
+        : undefined;
+    await addFiles([tree[1]!, tree[2]!], null);
+    await settle();
+    pauseItem(items()[1]!.id);
+    answer(envelope("conflict", 409));
+    await settle();
+    expect(items().map((item) => [item.name, item.state])).toEqual([
+      ["a.jpg", "error"],
+      ["b.jpg", "paused"],
+    ]);
   });
 });
 
@@ -211,9 +376,50 @@ describe("what a drop hands over", () => {
     expect(intake.folders).toEqual(["trip", "trip/day1", "trip/empty"]);
   });
 
-  it("an entry that cannot be read is left out; the rest of the drop goes on", async () => {
-    const intake = await fromDrop(dropped([fileEntry("/gone.txt", true), fileEntry("/fine.txt")]));
-    expect(intake.files.map((entry) => entry.file.name)).toEqual(["fine.txt"]);
+  it("an unreadable file inside a dropped folder is left out and named; its siblings and the folders after it are still taken", async () => {
+    const trip = dirEntry("/trip", [
+      fileEntry("/trip/a.jpg"),
+      fileEntry("/trip/broken.jpg", true),
+      fileEntry("/trip/c.jpg"),
+      fileEntry("/trip/d.jpg"),
+      dirEntry("/trip/day1", [fileEntry("/trip/day1/e.jpg")]),
+    ]);
+    const intake = await fromDrop(dropped([fileEntry("/gone.txt", true), trip, fileEntry("/fine.txt")]));
+    expect(intake.files.map((entry) => [entry.file.name, entry.path])).toEqual([
+      ["a.jpg", "trip"],
+      ["c.jpg", "trip"],
+      ["d.jpg", "trip"],
+      ["e.jpg", "trip/day1"],
+      ["fine.txt", ""],
+    ]);
+    expect(intake.unreadable).toEqual(["gone.txt", "trip/broken.jpg"]);
+    expect(intake.tooMany).toBe(false);
+  });
+
+  it("a folder that cannot be listed is named; what was read before it and everything beside it stays", async () => {
+    const locked = {
+      isFile: false,
+      isDirectory: true,
+      fullPath: "/trip/locked",
+      createReader: () => ({
+        readEntries: (_done: unknown, failed: (error: Error) => void) => failed(new Error("denied")),
+      }),
+    };
+    const trip = dirEntry("/trip", [fileEntry("/trip/a.jpg"), locked, fileEntry("/trip/z.jpg")], 5);
+    const intake = await fromDrop(dropped([trip]));
+    expect(intake.files.map((entry) => entry.file.name)).toEqual(["a.jpg", "z.jpg"]);
+    expect(intake.unreadable).toEqual(["trip/locked"]);
+  });
+
+  it("a drop of more files than one upload takes stops walking and says so", async () => {
+    const huge = dirEntry(
+      "/huge",
+      Array.from({ length: MAX_DROP_FILES + 50 }, (_, n) => fileEntry(`/huge/f${n}.txt`)),
+      1000,
+    );
+    const intake = await fromDrop(dropped([huge, fileEntry("/after.txt")]));
+    expect(intake.tooMany).toBe(true);
+    expect(intake.files.length).toBe(MAX_DROP_FILES + 1);
   });
 
   it("where the browser gives no entries, the plain files are taken", async () => {
