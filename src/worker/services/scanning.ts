@@ -22,7 +22,6 @@
 // it usually takes seconds and sometimes about a minute. Nothing may assume a scan starts within
 // N seconds: wait for the row.
 
-import { parseAdminList } from "../../shared/admin-emails";
 import { UUID } from "../../shared/ids";
 import { lockSuspectedCsam as lockRows } from "../db/queries/moderation";
 import { findByR2Key, getNode, resetToPending } from "../db/queries/nodes";
@@ -32,6 +31,7 @@ import { sendOperatorCritical } from "./email";
 import { AppError } from "./errors";
 import { metric } from "./metrics";
 import type { ServiceDeps } from "./request-context";
+import { adminListOf } from "./signup-policy";
 import { UPLOAD_PREFIX } from "./storage";
 
 export type { ScanReason };
@@ -305,7 +305,8 @@ export async function lockSuspectedCsam(
   const { reportId } = locked;
   if (before?.scanStatus !== "suspected_csam") {
     audit(deps, "scan.suspected_csam", { type: "node", id: nodeId }, { source: opts.source, reportId });
-    for (const to of parseAdminList(deps.env.ADMIN_EMAILS).addresses) {
+    // The operators' addresses come from the one reader of that list (the sign-up policy's).
+    for (const to of adminListOf(deps.env).addresses) {
       deps.defer(sendOperatorCritical(deps, { to, event: "csam_lock", id: reportId }));
     }
     metric("scan", { outcome: "suspected_csam", kind: opts.source });
