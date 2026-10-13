@@ -92,7 +92,8 @@ function saveFilePicker(): SaveFilePicker | null {
   return typeof picker === "function" ? picker.bind(globalThis) : null;
 }
 
-const isAbort = (cause: unknown) => cause instanceof DOMException && cause.name === "AbortError";
+// By name: an abort raised by a stream or by `fetch` is not always the page's own DOMException class.
+const isAbort = (cause: unknown) => (cause as { name?: unknown } | null)?.name === "AbortError";
 
 const REASON_TEXT = {
   scan_pending: "explorer.zip.reason.pending",
@@ -196,6 +197,9 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
         status: "active",
       });
     };
+
+    // The count is known as soon as the manifest is.
+    report(true);
 
     const urls = new Map<string, string>();
     const reminted = new Set<string>();
