@@ -386,6 +386,40 @@ describe("inFolder", () => {
     }
   });
 
+  it("costs the same statements whatever makes it a 404: no such id, no role, in the trash", async () => {
+    const owner = await makeUser();
+    const me = await makeUser();
+    const t = token();
+    const theirs = await makeFolder(owner.id);
+    const shared = await makeFolder(owner.id);
+    const trashed = await makeFolder(owner.id, shared.id, { deletedAt: new Date(), trashedRoot: true });
+    const underTrashed = await makeFolder(owner.id, trashed.id);
+    const mineTrashed = await makeFolder(me.id, null, { deletedAt: new Date(), trashedRoot: true });
+    await makeShare(shared.id, owner.id, me.id);
+
+    const cost = async (inFolder: string) => {
+      const answer = await get(as(me), searchPath({ q: t, inFolder }));
+      expect(answer.status).toBe(404);
+      return answer.statements;
+    };
+    const unknown = await cost(uuidv7());
+    // Something was counted: the role's questions and the trash's, at the least.
+    expect(unknown).toBeGreaterThanOrEqual(4);
+    // A folder the caller may see but that is in the trash is refused by the SECOND question; an
+    // id they have no role on by the first. Answering after the first would make these differ.
+    expect({
+      foreign: await cost(theirs.id),
+      trashedShared: await cost(trashed.id),
+      underTrashedShared: await cost(underTrashed.id),
+      ownTrashed: await cost(mineTrashed.id),
+    }).toEqual({
+      foreign: unknown,
+      trashedShared: unknown,
+      underTrashedShared: unknown,
+      ownTrashed: unknown,
+    });
+  });
+
   it("is 400 for an id that is not a node id", async () => {
     const me = await makeUser();
     const answer = await get(as(me), searchPath({ q: "anything", inFolder: "root" }));

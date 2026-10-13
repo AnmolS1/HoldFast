@@ -7,6 +7,7 @@
 import { env } from "cloudflare:workers";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionUser } from "../../../src/worker/auth/types";
+import { statementsSent, type Db } from "../../../src/worker/db/client";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import type { CoreDeps } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
@@ -22,6 +23,8 @@ export type Answer = {
   text: string;
   /** Every data point the request wrote to the metrics binding. */
   metrics: unknown[];
+  /** How many statements the request sent to the database, deferred work included. */
+  statements: number;
 };
 
 const SETTINGS: Settings = {
@@ -57,7 +60,17 @@ export async function get(caller: Caller, path: string): Promise<Answer> {
           : null,
     },
   };
-  const core: CoreDeps = { ...realCore, createAuth: () => auth, getSettings: async () => SETTINGS };
+  const handles: Db[] = [];
+  const core: CoreDeps = {
+    ...realCore,
+    createAuth: () => auth,
+    getSettings: async () => SETTINGS,
+    createDb: (...args) => {
+      const made = realCore.createDb(...args);
+      handles.push(made.db);
+      return made;
+    },
+  };
   const app = createApp(core);
 
   const pending: Promise<unknown>[] = [];
@@ -85,7 +98,8 @@ export async function get(caller: Caller, path: string): Promise<Answer> {
   } catch {
     // Not JSON: the test sees `text`.
   }
-  return { status: response.status, body, text, metrics };
+  const statements = handles.reduce((sum, handle) => sum + statementsSent(handle), 0);
+  return { status: response.status, body, text, metrics, statements };
 }
 
 /** The query string for a search. */
