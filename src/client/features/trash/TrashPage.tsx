@@ -25,7 +25,8 @@ import { useSession } from "../../lib/query";
 import { shortcutLabel, useShortcut } from "../../lib/shortcuts";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
-import { ViewError, ViewPage } from "../starred/view-kit";
+import { ListNotice, ViewError, ViewPage } from "../starred/view-kit";
+import { canLoadMore, hasFailed, isWaitingOffline, useLoadMore } from "../starred/view-state";
 import { EmptyTrashAction } from "./EmptyTrashAction";
 import { deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
 import { t } from "./strings";
@@ -137,6 +138,7 @@ export function TrashPage() {
     if (targets.length > 0) setDeleting([...targets]);
   };
   useShortcut("trash", () => askDelete(selected), selected.length > 0 && deleting === null);
+  const loadMore = useLoadMore(trash.fetchNextPage);
 
   const onOpen = useCallback(() => {
     toast({ message: t("trash.openHint"), key: "trash-open" });
@@ -159,15 +161,10 @@ export function TrashPage() {
     [],
   );
 
-  if (trash.isError && !trash.data) {
+  if (hasFailed(trash) || isWaitingOffline(trash)) {
     return (
       <ViewPage view="trash">
-        <ViewError
-          view="trash"
-          title={t("trash.error.title")}
-          error={trash.error}
-          onRetry={() => void trash.refetch()}
-        />
+        <ViewError view="trash" title={t("trash.error.title")} query={trash} />
       </ViewPage>
     );
   }
@@ -263,12 +260,13 @@ export function TrashPage() {
         onOpen={onOpen}
         rowMenu={rowMenu}
         onContextMenu={desktop ? onContextMenu : undefined}
-        hasMore={trash.hasNextPage}
-        onLoadMore={() => void trash.fetchNextPage()}
+        hasMore={canLoadMore(trash)}
+        onLoadMore={loadMore}
         loading={trash.isPending || trash.isFetchingNextPage}
         emptyState={<EmptyState type="cleared" title={t("trash.empty.title")} body={t("trash.empty.body")} />}
         ariaLabel={t("trash.list")}
       />
+      <ListNotice view="trash" query={trash} />
       {desktop ? (
         <Menu
           open={menu !== null}

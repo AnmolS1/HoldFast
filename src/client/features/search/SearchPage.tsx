@@ -10,7 +10,8 @@ import { BottomSheet } from "../../components/BottomSheet";
 import { EmptyState } from "../../components/EmptyState";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
-import { NodeList, ViewError, ViewPage } from "../starred/view-kit";
+import { ListNotice, NodeList, ViewError, ViewPage } from "../starred/view-kit";
+import { canLoadMore, hasFailed, isWaitingOffline, useLoadMore } from "../starred/view-state";
 import { DEBOUNCE_MS, useSearch } from "./queries";
 import { t } from "./strings";
 import {
@@ -101,6 +102,7 @@ export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const state = useMemo(() => parseSearch(params), [params]);
   const search = useSearch(state);
+  const loadMore = useLoadMore(search.fetchNextPage);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [sheet, setSheet] = useState(false);
 
@@ -153,27 +155,23 @@ export function SearchPage() {
   let body;
   if (!searchable) {
     body = <EmptyState type="no-results" title={t("search.prompt.title")} body={t("search.prompt.body")} />;
-  } else if (search.isError && !search.data) {
-    body = (
-      <ViewError
-        view="search"
-        title={t("search.error.title")}
-        error={search.error}
-        onRetry={() => void search.refetch()}
-      />
-    );
+  } else if (hasFailed(search) || isWaitingOffline(search)) {
+    body = <ViewError view="search" title={t("search.error.title")} query={search} />;
   } else {
     body = (
-      <NodeList
-        items={items}
-        ariaLabel={t("search.results")}
-        loading={search.isPending || search.isFetchingNextPage}
-        hasMore={search.hasNextPage}
-        onLoadMore={() => void search.fetchNextPage()}
-        emptyState={
-          <EmptyState type="no-results" title={t("search.none.title")} body={t("search.none.body")} />
-        }
-      />
+      <>
+        <NodeList
+          items={items}
+          ariaLabel={t("search.results")}
+          loading={search.isPending || search.isFetchingNextPage}
+          hasMore={canLoadMore(search)}
+          onLoadMore={loadMore}
+          emptyState={
+            <EmptyState type="no-results" title={t("search.none.title")} body={t("search.none.body")} />
+          }
+        />
+        <ListNotice view="search" query={search} />
+      </>
     );
   }
 
