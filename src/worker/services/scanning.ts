@@ -454,10 +454,13 @@ export async function lockSuspectedCsam(
   const locked = await lockRows(deps.db, nodeId, opts);
   if (!locked) throw new AppError("not_found");
   const { reportId } = locked;
-  // Only a report nobody has picked up is recorded and announced: a repeat on a node whose
-  // report is being reviewed (someone is on it) or was FILED mails nobody and writes no second
-  // lock row. Decided on the status the lock saw under its locks, not on a second read.
-  if (locked.reportStatus !== "open") return { reportId };
+  // A FIRST lock is always recorded and announced — also when it found a report that was
+  // already being reviewed or was filed (an admin opened the case from a user's report): the
+  // node is locked NOW, and the sweep, which looks at open reports only, would never make a
+  // missing record good. A REPEAT is, only while the report is open (the redelivery that repairs
+  // what was lost with an invocation); on a report someone is reviewing, or that was FILED, it
+  // mails nobody and writes no second lock row. Decided on what the lock saw under its locks.
+  if (locked.alreadyLocked && locked.reportStatus !== "open") return { reportId };
   deps.defer(
     (async () => {
       await attempt(deps, "lock_record", () =>

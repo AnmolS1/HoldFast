@@ -23,9 +23,13 @@ export function isTransaction(db: Executor): boolean {
  * all (default `DEADLOCK_ATTEMPTS`), a short random pause between, then the error is thrown.
  * Any other error is thrown at once.
  *
- * ONLY ON THE DATABASE HANDLE. When `db` is itself a transaction, `run` runs once (in a
- * savepoint): such a failure has ended the CALLER's transaction, there is nothing left to run
- * again, and the error is the caller's to retry.
+ * ONLY ON THE DATABASE HANDLE. When `db` is itself a transaction, `run` runs once, in a
+ * savepoint. A failure there rolls back the SAVEPOINT only: the caller's transaction is still
+ * usable and still holds every lock it took before — which is why running `run` again here
+ * would meet the same deadlock, and why it is not done. The caller should let the error
+ * through (rethrow it, do not carry on with half the work): its own transaction then ends, its
+ * locks are released, and the `retryOnDeadlock` at the top level, if there is one, runs
+ * everything again from the start.
  *
  * `run` MUST DO DATABASE STATEMENTS ONLY — through the `tx` it is given. It may run several
  * times, and what it did outside the database (a mail, a queue message, an object written or

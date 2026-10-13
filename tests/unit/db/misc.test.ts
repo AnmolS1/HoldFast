@@ -27,6 +27,7 @@ import {
   downloadLedger,
   emailLedger,
   hashBlocklist,
+  nodes,
   session,
   settings,
   uploadIps as uploadIpsTable,
@@ -355,6 +356,39 @@ describe("blocklist", () => {
     const created = rand(32);
     await db.insert(hashBlocklist).values({ sha256: created, reason: "csam", sourceNodeId: node });
     expect(await blocklist.remove(db, created, { onlyIfReason: "csam" })).toBe(true);
+  });
+
+  it("remove through an option never deletes a csam entry while a node with that content is still locked; unlocked, or with no option, it goes", async () => {
+    const owner = await makeUser(db);
+    const present = async (sha: string) =>
+      (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha))).length === 1;
+    // The entry a lock created: { csam, source = the locked node }.
+    const locked = await makeFile(db, owner, null, `locked-${rand()}.bin`, { scanStatus: "suspected_csam" });
+    await db
+      .insert(hashBlocklist)
+      .values({ sha256: locked.sha256!, reason: "csam", sourceNodeId: locked.id });
+    expect(await blocklist.remove(db, locked.sha256!, { onlyIfReason: "csam" })).toBe(false);
+    expect(await blocklist.remove(db, locked.sha256!, { onlyIfSourceNodeId: locked.id })).toBe(false);
+    expect(
+      await blocklist.remove(db, locked.sha256!, { onlyIfReason: "csam", onlyIfSourceNodeId: locked.id }),
+    ).toBe(false);
+    expect(await present(locked.sha256!)).toBe(true);
+    // A twin that is locked keeps it too, whichever node the entry names.
+    const twin = await makeFile(db, owner, null, `twin-${rand()}.bin`, {
+      sha256: locked.sha256,
+      scanStatus: "suspected_csam",
+    });
+    await db.update(nodes).set({ scanStatus: "pending" }).where(eq(nodes.id, locked.id));
+    expect(await blocklist.remove(db, locked.sha256!, { onlyIfSourceNodeId: locked.id })).toBe(false);
+    // The control: nothing with that content is locked any more — the same call removes it.
+    await db.update(nodes).set({ scanStatus: "pending" }).where(eq(nodes.id, twin.id));
+    expect(await blocklist.remove(db, locked.sha256!, { onlyIfSourceNodeId: locked.id })).toBe(true);
+    expect(await present(locked.sha256!)).toBe(false);
+
+    // With no option it is the outright delete it always was, locked content or not.
+    const other = await makeFile(db, owner, null, `other-${rand()}.bin`, { scanStatus: "suspected_csam" });
+    await db.insert(hashBlocklist).values({ sha256: other.sha256!, reason: "csam", sourceNodeId: other.id });
+    expect(await blocklist.remove(db, other.sha256!)).toBe(true);
   });
 
   it("an explicit csam upsert and confirmCsam leave a detached entry: no source, nothing raised, author and note of a csam entry kept", async () => {

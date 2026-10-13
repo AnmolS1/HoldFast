@@ -205,9 +205,17 @@ export type CsamLockResult = {
   /**
    * The status of the report returned, as the lock saw it under its locks: `open` for a new
    * report and for one nobody has picked up; `reviewing` when someone is on it; `actioned` when
-   * it was FILED. The caller announces and records only an `open` one.
+   * it was FILED.
    */
   reportStatus: "open" | "reviewing" | "actioned";
+  /**
+   * The node was `suspected_csam` already when this call took its lock: a REPEAT. False for
+   * the call that locked it — which may well find a report that is already `reviewing` or
+   * `actioned` (an admin opened the case from a user's report). The caller records and
+   * announces every FIRST lock, whatever the report's status; a repeat only while the report
+   * is `open` (that is how a record lost with its invocation is made good).
+   */
+  alreadyLocked: boolean;
 };
 
 /** The uploader set grew between the unlocked read and the locked one. */
@@ -239,8 +247,9 @@ class SubjectsGrew extends Error {
  * deadlock victim (40P01) or for a serialization failure (40001) is run again from the start:
  * `CSAM_LOCK_ATTEMPTS` times in all, a short random pause between, then the error is thrown.
  * Nothing was written by the attempt that failed, and the lock is safe to repeat. Called INSIDE
- * a transaction it cannot do that — the failure has ended the caller's transaction — and the
- * error is the caller's to retry. (The "uploader set grew twice" failure below is not retried.)
+ * a transaction it runs once (`retryOnDeadlock`, db/retry.ts): its savepoint is rolled back,
+ * the caller's transaction still holds its earlier locks, and the error is the caller's to let
+ * through and retry as a whole. (The "uploader set grew twice" failure below is not retried.)
  */
 export async function lockSuspectedCsam(
   db: Executor,
@@ -310,7 +319,7 @@ async function lockRows(
     await sp.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("no key update");
   }
   const [node] = await sp
-    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256, kind: nodes.kind })
+    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256, kind: nodes.kind, scanStatus: nodes.scanStatus })
     .from(nodes)
     .where(eq(nodes.id, nodeId))
     .for("update");
@@ -319,6 +328,8 @@ async function lockRows(
   // A FILE only. A folder is dealt with by a takedown: this lock sets a hold that nothing may
   // inherit, and takes no tree lock (queries/tree.ts).
   if (node.kind !== "file") return null;
+  // Read under the node's lock, before anything is written: is this a repeat?
+  const alreadyLocked = node.scanStatus === "suspected_csam";
   const now = await csamSubjects(sp, nodeId);
   if (!now) return null;
   const all = subjectUserIds(now);
@@ -370,10 +381,11 @@ async function lockRows(
       reportId: existing.id,
       ownerId: node.ownerId,
       reportStatus: existing.status as CsamLockResult["reportStatus"],
+      alreadyLocked,
     };
   }
   const reportId = await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" });
-  return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open" };
+  return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open", alreadyLocked };
 }
 
 export type CsamClearResult = {

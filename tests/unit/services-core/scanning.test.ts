@@ -827,6 +827,47 @@ describe("lockSuspectedCsam", () => {
     expect(await lockRowsOf(open.file.id)).toHaveLength(2);
   });
 
+  it("a FIRST lock is always recorded and announced — also when it finds a report already being reviewed, or filed; a repeat on an open report repairs a lost record", async () => {
+    for (const status of ["reviewing", "actioned"] as const) {
+      // The case was opened from a user's report; the node was never locked.
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: rand(32) });
+      const [earlier] = await testDb()
+        .insert(reports)
+        .values({ nodeId: file.id, ownerId: owner.id, source: "user", category: "csam", status })
+        .returning({ id: reports.id });
+      const made = serviceDeps();
+      expect(await lockSuspectedCsam(made.deps, file.id, { source: "admin" }), status).toEqual({
+        reportId: earlier!.id,
+      });
+      await made.settle();
+      expect((await nodeById(file.id))!.scanStatus, status).toBe("suspected_csam");
+      expect(await lockRowsOf(file.id), status).toMatchObject([
+        { meta: { source: "admin", reportId: earlier!.id } },
+      ]);
+      expect(alertsFor(earlier!.id), status).toHaveLength(1);
+      // The control, same node: the repeat finds it locked and the report not open — nothing more.
+      const again = serviceDeps();
+      await lockSuspectedCsam(again.deps, file.id, { source: "admin" });
+      await again.settle();
+      expect(again.deferred, status).toHaveLength(0);
+      expect(await lockRowsOf(file.id), status).toHaveLength(1);
+      expect(alertsFor(earlier!.id), status).toHaveLength(1);
+    }
+
+    // A repeat on an OPEN report whose record was lost with its invocation: made good.
+    const silent = await lockedButSilent();
+    expect(await lockRowsOf(silent.file.id)).toHaveLength(0);
+    expect(alertsFor(silent.reportId)).toHaveLength(0);
+    const repair = serviceDeps();
+    expect(await lockSuspectedCsam(repair.deps, silent.file.id, { source: "photodna" })).toEqual({
+      reportId: silent.reportId,
+    });
+    await repair.settle();
+    expect(await lockRowsOf(silent.file.id)).toHaveLength(1);
+    expect(alertsFor(silent.reportId)).toHaveLength(1);
+  });
+
   it("a mail that is only being retried reached nobody: unclaimed, false — and the lock is on record all the same", async () => {
     const owner = await makeUser();
     const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });

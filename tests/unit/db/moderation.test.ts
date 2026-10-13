@@ -207,7 +207,12 @@ describe("lockSuspectedCsam", () => {
       keyVersion: 1,
     });
     const result = await lockSuspectedCsam(db, file.id, { source: "photodna" });
-    expect(result).toEqual({ reportId: expect.any(String), ownerId: owner, reportStatus: "open" });
+    expect(result).toEqual({
+      reportId: expect.any(String),
+      ownerId: owner,
+      reportStatus: "open",
+      alreadyLocked: false,
+    });
 
     expect(await getNode(db, file.id)).toMatchObject({
       scanStatus: "suspected_csam",
@@ -280,6 +285,37 @@ describe("lockSuspectedCsam", () => {
     const fresh = (await lockSuspectedCsam(db, file.id, { source: "system" }))!;
     expect([first.reportId, open]).not.toContain(fresh.reportId);
     expect(await csamReports()).toHaveLength(3);
+  });
+
+  it("says whether the node was locked already — a FIRST lock that finds a report someone is reviewing, or a filed one, is still a first lock", async () => {
+    for (const status of ["reviewing", "actioned"] as const) {
+      // An admin opened the case from a user's report; the node itself is not locked yet.
+      const { file, owner } = await reported("clean");
+      const earlier = (await insertReport(db, {
+        nodeId: file.id,
+        ownerId: owner,
+        source: "user",
+        category: "csam",
+      }))!;
+      await db.update(reports).set({ status }).where(eq(reports.id, earlier));
+      expect(await lockSuspectedCsam(db, file.id, { source: "admin" }), status).toEqual({
+        reportId: earlier,
+        ownerId: owner,
+        reportStatus: status,
+        alreadyLocked: false,
+      });
+      expect((await getNode(db, file.id))!.scanStatus).toBe("suspected_csam");
+      // The repeat says so.
+      expect(await lockSuspectedCsam(db, file.id, { source: "admin" }), status).toMatchObject({
+        reportId: earlier,
+        alreadyLocked: true,
+      });
+    }
+    // After a clear the next lock is a first lock again.
+    const { file } = await reported("clean");
+    await lockSuspectedCsam(db, file.id, { source: "system" });
+    await clearSuspectedCsam(db, file.id);
+    expect((await lockSuspectedCsam(db, file.id, { source: "system" }))!.alreadyLocked).toBe(false);
   });
 
   it("locks a FILE only: a folder is refused like an unknown id, and nothing is written", async () => {
@@ -377,7 +413,12 @@ describe("lockSuspectedCsam", () => {
     });
 
     const result = await lockSuspectedCsam(db, f.file.id, { source: "photodna" });
-    expect(result).toEqual({ reportId: expect.any(String), ownerId: f.owner, reportStatus: "open" });
+    expect(result).toEqual({
+      reportId: expect.any(String),
+      ownerId: f.owner,
+      reportStatus: "open",
+      alreadyLocked: false,
+    });
     expect(await getNode(db, f.file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
     expect(await heldUsers(everyone)).toEqual([f.owner, f.e1, f.e2, f.e3].sort());
     // `csamSubjects` IS the set the lock held — what "Release holds" will release.
@@ -392,7 +433,7 @@ describe("lockSuspectedCsam", () => {
 
     // Idempotent: the same report, the same holds, the same subjects.
     const again = await lockSuspectedCsam(db, f.file.id, { source: "admin" });
-    expect(again).toEqual(result);
+    expect(again).toEqual({ ...result, alreadyLocked: true });
     expect(await heldUsers(everyone)).toEqual([f.owner, f.e1, f.e2, f.e3].sort());
     expect(await csamSubjects(db, f.file.id)).toEqual(subjects);
   });

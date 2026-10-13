@@ -108,7 +108,10 @@ export async function confirmCsam(tx: Executor, sha256: string): Promise<boolean
  * as malware" must not delete an entry a lock has since raised to `csam`); with
  * `onlyIfSourceNodeId` — only when that node's verdict added it. Through either option an
  * entry a suspected-CSAM lock RAISED (it has its own way back, `raisedFrom`) and a CONFIRMED
- * `csam` listing (no source, nothing raised) are never removed.
+ * `csam` listing (no source, nothing raised) are never removed — and neither is a `csam` entry
+ * while a node with that content is still locked as `suspected_csam` (the entry a lock
+ * CREATED): the options are for undoing an entry of a given reason or source, not for
+ * unblocking content that is locked right now.
  * This is not how a cleared CSAM lock undoes its entry — that is `moderation.clearSuspectedCsam`,
  * which knows the entry's whole state. True when a row went.
  */
@@ -129,7 +132,10 @@ export async function remove(
           : undefined,
         conditional
           ? sql`(${hashBlocklist.raisedFrom} IS NULL AND NOT (${hashBlocklist.reason} = 'csam'
-              AND ${hashBlocklist.sourceNodeId} IS NULL AND ${hashBlocklist.raisedByNodeId} IS NULL))`
+              AND ${hashBlocklist.sourceNodeId} IS NULL AND ${hashBlocklist.raisedByNodeId} IS NULL)
+              AND NOT (${hashBlocklist.reason} = 'csam' AND EXISTS (
+                SELECT 1 FROM nodes locked
+                WHERE locked.sha256 = ${hashBlocklist.sha256} AND locked.scan_status = 'suspected_csam')))`
           : undefined,
       ),
     )
