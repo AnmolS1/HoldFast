@@ -12,7 +12,7 @@ export function Kbd({ children, bare = false }: { children: ReactNode; bare?: bo
         fontSize: 11,
         lineHeight: "18px",
         color: "inherit",
-        opacity: bare ? 0.8 : 1,
+        // No dimming: at 80 % a bare hint on the selection bar's wash is 3.7:1 (AA needs 4.5:1).
         whiteSpace: "nowrap",
         ...(bare
           ? {}
