@@ -112,10 +112,10 @@ describe("files host", () => {
     }
   });
 
-  it("the three content routes are 501 text stubs", async () => {
+  it("the three content routes answer a token that does not verify with 403 text", async () => {
     for (const path of ["/d/abc/def", "/i/abc/def", "/t/abc/256/def"]) {
       const { response } = await filesCall(path);
-      expect(response.status, path).toBe(501);
+      expect(response.status, path).toBe(403);
       expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
       await response.text();
     }

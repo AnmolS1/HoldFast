@@ -378,8 +378,8 @@ describe("files host: the same step, first", () => {
 
   it("the control: the canonical token path reaches its route and is counted", async () => {
     const { send, seen } = filesHost();
-    expect((await send("/d/abcDEF123")).status).toBe(501);
-    expect((await send("/d/abcDEF123", "HEAD")).status).toBe(501);
+    expect((await send("/d/abcDEF123")).status).toBe(403);
+    expect((await send("/d/abcDEF123", "HEAD")).status).toBe(403);
     expect(seen).toHaveLength(2);
   });
 });
