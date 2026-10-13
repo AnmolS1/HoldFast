@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { Email, NodeId, RowId, Timestamp, UserRef } from "./common";
 import { LinkDto } from "./link";
-import { NodeDto, NodeKind } from "./node";
+import { hasAField, NodeDto, NodeKind, NOTHING_TO_CHANGE } from "./node";
 
 export const ShareRole = z.enum(["viewer", "editor"]);
 export type ShareRole = z.infer<typeof ShareRole>;
@@ -31,11 +31,13 @@ export const CreateShareBody = z.strictObject({
 export type CreateShareBody = z.infer<typeof CreateShareBody>;
 
 /** `mutedByGrantee` is the recipient's own switch; the other two are the owner's. */
-export const PatchShareBody = z.strictObject({
-  role: ShareRole.optional(),
-  canUpload: z.boolean().optional(),
-  mutedByGrantee: z.boolean().optional(),
-});
+export const PatchShareBody = z
+  .strictObject({
+    role: ShareRole.optional(),
+    canUpload: z.boolean().optional(),
+    mutedByGrantee: z.boolean().optional(),
+  })
+  .refine(hasAField, NOTHING_TO_CHANGE);
 export type PatchShareBody = z.infer<typeof PatchShareBody>;
 
 /** `GET /api/nodes/:id/sharing`. `inheritedFrom`: the ancestor whose shares also reach this node. */

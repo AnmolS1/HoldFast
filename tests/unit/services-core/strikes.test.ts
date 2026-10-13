@@ -652,6 +652,34 @@ describe("a committed strike can never leave the account un-suspended", () => {
     for (const user of [one, two]) expect((await userById(user.user.id))!.suspendedAt).toBeInstanceOf(Date);
   });
 
+  it("`suspended` counts only the users this run suspended, not the ones it merely found at the threshold", async () => {
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    const one = await atThresholdUnsuspended();
+    const two = await atThresholdUnsuspended();
+    // Between the sweep's read of the list and its turn for `two`, something else suspends `two`
+    // (the redelivery that repairs it, say): the first transaction the sweep opens is `one`'s
+    // suspension, and `two` is suspended just before it runs.
+    const made = serviceDeps();
+    let raced = false;
+    const racing = new Proxy(made.deps.db, {
+      get(target, property, receiver) {
+        const member: unknown = Reflect.get(target, property, receiver);
+        if (typeof member !== "function") return member;
+        const call = (member as (...args: unknown[]) => unknown).bind(target);
+        if (property !== "transaction" || raced) return call;
+        return async (...args: unknown[]) => {
+          raced = true;
+          await settled((deps) => enforceStrikeThreshold(deps, two.user.id));
+          return call(...args);
+        };
+      },
+    });
+    const swept = await sweepStrikeThresholds({ ...made.deps, db: racing }, { limit: 1000 });
+    await made.settle();
+    expect(swept).toEqual({ checked: 2, suspended: 1, failed: 0 });
+    for (const user of [one, two]) expect((await userById(user.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
   it("the sweep is bounded and takes the oldest first", async () => {
     const older = await atThresholdUnsuspended();
     const newer = await atThresholdUnsuspended();

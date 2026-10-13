@@ -17,6 +17,11 @@ import {
   UserRef,
 } from "./common";
 
+/** For a body of optional fields: true when at least one is given. An empty change is refused. */
+export const hasAField = (body: Record<string, unknown>): boolean =>
+  Object.values(body).some((value) => value !== undefined);
+export const NOTHING_TO_CHANGE = { message: "Nothing to change." };
+
 export const NodeKind = z.enum(["file", "folder"]);
 export type NodeKind = z.infer<typeof NodeKind>;
 
@@ -86,7 +91,10 @@ export type NodeDetailDto = z.infer<typeof NodeDetailDto>;
 export const CreateFolderBody = z.strictObject({ parentId: NodeId.nullable(), name: NodeName });
 export type CreateFolderBody = z.infer<typeof CreateFolderBody>;
 
-export const RenameBody = z.strictObject({ name: NodeName.optional(), starred: z.boolean().optional() });
+/** At least one of the two. */
+export const RenameBody = z
+  .strictObject({ name: NodeName.optional(), starred: z.boolean().optional() })
+  .refine(hasAField, NOTHING_TO_CHANGE);
 export type RenameBody = z.infer<typeof RenameBody>;
 
 export const MoveBody = z.strictObject({ parentId: NodeId.nullable() });
@@ -118,11 +126,14 @@ export type ThumbUrlResponse = z.infer<typeof ThumbUrlResponse>;
 // window of at most `ZIP_URL_BATCH` files just ahead of the stream, never the whole manifest up
 // front. A fetch that still meets an expired token re-mints that one node once.
 
-/** `POST /api/nodes/zip-manifest`. `allOwned`: the caller's whole tree ("Download everything"). */
-export const ZipManifestBody = z.strictObject({
-  nodeIds: z.array(NodeId).min(1).max(100),
-  allOwned: z.boolean().optional(),
-});
+/**
+ * `POST /api/nodes/zip-manifest`. Either a list of 1–100 nodes, or `allOwned: true` — the
+ * caller's whole tree ("Download everything") — and then NO list: the two are not combined.
+ */
+export const ZipManifestBody = z.union([
+  z.strictObject({ nodeIds: z.array(NodeId).min(1).max(100), allOwned: z.literal(false).optional() }),
+  z.strictObject({ allOwned: z.literal(true) }),
+]);
 export type ZipManifestBody = z.infer<typeof ZipManifestBody>;
 
 /** `path` is relative and sanitised. */

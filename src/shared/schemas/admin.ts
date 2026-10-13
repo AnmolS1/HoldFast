@@ -382,17 +382,21 @@ export type AuditPage = z.infer<typeof AuditPage>;
 
 // ── settings ────────────────────────────────────────────────────────────────────────────────
 
-const limit = z.number().finite().nonnegative().optional();
+// A limit the ledger can count: a whole number, at most the largest a number holds exactly. (An
+// override above that would make every request of its kind fail as invalid instead of being refused.)
+const limit = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional();
+// The one override that is not a count: the share of a limit a new account gets.
+const factor = z.number().min(0).max(1).optional();
 
 /**
- * Overrides of the daily limits: exactly the keys of `CEILING_KEYS`, each optional, each a
- * non-negative number. Any other key is a validation error.
+ * Overrides of the daily limits: exactly the keys of `CEILING_KEYS`, each optional. Every one is
+ * a non-negative safe INTEGER — except `NEW_ACCOUNT_FACTOR`, a number from 0 to 1. Any other key
+ * is a validation error.
  */
 export const CeilingOverrides = z.strictObject(
-  Object.fromEntries(CEILING_KEYS.map((key) => [key, limit])) as Record<
-    (typeof CEILING_KEYS)[number],
-    typeof limit
-  >,
+  Object.fromEntries(
+    CEILING_KEYS.map((key) => [key, key === "NEW_ACCOUNT_FACTOR" ? factor : limit]),
+  ) as Record<(typeof CEILING_KEYS)[number], typeof limit>,
 );
 export type CeilingOverrides = z.infer<typeof CeilingOverrides>;
 

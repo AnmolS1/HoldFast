@@ -94,8 +94,9 @@ const actorOf = (issuedBy: string | undefined): Actor =>
 async function enforce(deps: ServiceDeps, userId: string, actor: Actor, counted?: number) {
   const activeStrikes = counted ?? (await countActive(deps.db, userId, STRIKE_WINDOW_DAYS));
   const suspended = activeStrikes >= STRIKES_TO_SUSPEND;
-  if (suspended) await suspendUser(deps, userId, STRIKE_SUSPENSION_REASON, actor);
-  return { activeStrikes, suspended };
+  // `changed`: this call is the one that suspended (false for an account that already was).
+  const changed = suspended ? await suspendUser(deps, userId, STRIKE_SUSPENSION_REASON, actor) : false;
+  return { activeStrikes, suspended, changed };
 }
 
 /**
@@ -107,12 +108,16 @@ export async function enforceStrikeThreshold(
   deps: ServiceDeps,
   userId: string,
 ): Promise<{ activeStrikes: number; suspended: boolean }> {
-  return enforce(deps, userId, SYSTEM_ACTOR);
+  const { activeStrikes, suspended } = await enforce(deps, userId, SYSTEM_ACTOR);
+  return { activeStrikes, suspended };
 }
 
 /**
  * Re-establishes the invariant for everyone: walks the users at the threshold whose account is
  * not suspended, oldest first, and enforces each, until `limit` of them have been suspended.
+ *
+ * Returns `checked` (users looked at), `suspended` (users THIS run suspended — one that a
+ * concurrent call suspended first is not counted) and `failed` (users whose suspension threw).
  *
  * IT CANNOT STARVE ON USERS IT CANNOT CHANGE. A user whose suspension fails is reported, counted
  * in `failed` and PASSED: the walk goes on behind them in the same run (a keyset cursor), and
@@ -139,7 +144,7 @@ export async function sweepStrikeThresholds(
     for (const found of page) {
       checked += 1;
       try {
-        if ((await enforce(deps, found.userId, SYSTEM_ACTOR)).suspended) suspended += 1;
+        if ((await enforce(deps, found.userId, SYSTEM_ACTOR)).changed) suspended += 1;
       } catch (error) {
         failed += 1;
         captureError(error, { kind: "strike_sweep" });
@@ -179,7 +184,8 @@ async function afterCommit(
     );
   }
   // Not caught: a strike whose suspension failed must be seen to have failed.
-  return enforce(deps, input.userId, actor, activeStrikes);
+  const enforced = await enforce(deps, input.userId, actor, activeStrikes);
+  return { activeStrikes: enforced.activeStrikes, suspended: enforced.suspended };
 }
 
 export async function addStrike(

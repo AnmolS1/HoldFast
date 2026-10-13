@@ -291,6 +291,7 @@ const EXAMPLES: Record<string, unknown> = {
   "share.SharesMineDto": { node: { id: NODE, name: "report.pdf", kind: "file" }, shares: [shareDto] },
 
   "link.LinkState": "limit_reached",
+  "link.LinkOutcome": "refused",
   "link.LinkPauseReason": "review",
   "link.LinkDto": linkDto,
   "link.CreateLinkBody": {
@@ -309,7 +310,7 @@ const EXAMPLES: Record<string, unknown> = {
   "link.LinkActivityDto": {
     days: [{ day: "2026-10-12", downloads: 3, bytes: 3702 }],
     countries: [{ country: "DE", downloads: 3 }],
-    outcomes: { ok: 3, denied_password: 1 },
+    outcomes: { ok: 3, password: 1 },
   },
   "link.PublicNodeDto": publicNode,
   "link.PublicLinkInfo": { requiresPassword: true, node: null, allowPreview: true, dangerous: false },
@@ -318,8 +319,7 @@ const EXAMPLES: Record<string, unknown> = {
   "link.UnlockResponse": { linkSession: "payload.signature", expiresAt: AT },
   "link.PublicDownloadUrlBody": {
     nodeId: NODE,
-    kind: "thumb",
-    size: 320,
+    kind: "download",
     dangerousAck: true,
     zipGrant: "payload.signature",
   },
@@ -603,7 +603,13 @@ const schemas = Object.entries(modules).flatMap(([moduleName, exports]) =>
 /** A strict object: its catch-all is `never`. */
 const isStrictObject = (candidate: z.ZodType): candidate is z.ZodObject =>
   candidate instanceof z.ZodObject && candidate.def.catchall?._zod.def.type === "never";
-const isObject = (candidate: z.ZodType): candidate is z.ZodObject => candidate instanceof z.ZodObject;
+/** The object shapes a schema can be: itself, or each option of a union of objects. */
+const objectsOf = (candidate: z.ZodType): z.ZodType[] =>
+  candidate instanceof z.ZodUnion ? (candidate.options as z.ZodType[]).flatMap(objectsOf) : [candidate];
+const isObject = (candidate: z.ZodType): boolean =>
+  objectsOf(candidate).every((option) => option instanceof z.ZodObject);
+/** Strict all the way: a union is strict when every one of its options is. */
+const isStrict = (candidate: z.ZodType): boolean => objectsOf(candidate).every(isStrictObject);
 
 describe("every schema", () => {
   it("has a documented example here, and nothing here documents a schema that is gone", () => {
@@ -631,24 +637,25 @@ describe("every schema", () => {
     const predating = ["account.PendingEmailBody", "account.AcceptTermsBody"];
     for (const { key, schema } of sent) {
       expect(isObject(schema), `${key} is an object`).toBe(true);
-      expect(isStrictObject(schema), `${key} is strict`).toBe(!predating.includes(key));
+      expect(isStrict(schema), `${key} is strict`).toBe(!predating.includes(key));
     }
     for (const { key, schema } of answered) {
-      if (isObject(schema)) expect(isStrictObject(schema), `${key} is not strict`).toBe(false);
+      if (schema instanceof z.ZodObject) expect(isStrictObject(schema), `${key} is not strict`).toBe(false);
     }
   });
 
-  it.each(schemas.filter((entry) => isStrictObject(entry.schema)))(
-    "$key rejects an unknown field",
-    ({ key, schema }) => {
-      const example = EXAMPLES[key] as Record<string, unknown>;
-      // The control: without the extra field the same object parses.
-      expect(schema.safeParse(example).success).toBe(true);
-      const parsed = schema.safeParse({ ...example, notInTheContract: 1 });
-      expect(parsed.success).toBe(false);
-      expect(parsed.error?.issues[0]?.code).toBe("unrecognized_keys");
-    },
-  );
+  it.each(
+    schemas.filter(
+      (entry) => /(Body|Query)$/.test(entry.name) && isObject(entry.schema) && isStrict(entry.schema),
+    ),
+  )("$key rejects an unknown field", ({ key, schema }) => {
+    const example = EXAMPLES[key] as Record<string, unknown>;
+    // The control: without the extra field the same object parses.
+    expect(schema.safeParse(example).success).toBe(true);
+    const parsed = schema.safeParse({ ...example, notInTheContract: 1 });
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues)).toContain("unrecognized_keys");
+  });
 
   it("a strict object nested in a strict body is strict too (ceilings)", () => {
     expect(admin.PatchSettingsBody.safeParse({ ceilings: { CEIL_SHARES_DAY: 5 } }).success).toBe(true);
@@ -657,11 +664,30 @@ describe("every schema", () => {
       { ceil_shares_day: 5 },
       { CEIL_SHARES_DAY: -1 },
       { CEIL_SHARES_DAY: "5" },
+      // A limit is a whole number the ledger can hold exactly.
+      { CEIL_SHARES_DAY: 1.5 },
+      { CEIL_USER_BYTES_DAY: Number.MAX_SAFE_INTEGER + 2 },
+      { CEIL_USER_BYTES_DAY: 1e300 },
+      { CEIL_USER_BYTES_DAY: Number.POSITIVE_INFINITY },
+      { NEW_ACCOUNT_DAYS: 0.5 },
+      { signupIpDay: 2.5 },
+      // The factor is a share: 0 to 1.
+      { NEW_ACCOUNT_FACTOR: 1.01 },
+      { NEW_ACCOUNT_FACTOR: -0.1 },
     ]) {
       expect(admin.PatchSettingsBody.safeParse({ ceilings }).success, JSON.stringify(ceilings)).toBe(false);
       expect(
         admin.SettingsDto.safeParse({ ...(EXAMPLES["admin.SettingsDto"] as object), ceilings }).success,
       ).toBe(false);
+    }
+    for (const ceilings of [
+      { CEIL_USER_BYTES_DAY: Number.MAX_SAFE_INTEGER },
+      { CEIL_USER_BYTES_DAY: 0 },
+      { NEW_ACCOUNT_FACTOR: 0 },
+      { NEW_ACCOUNT_FACTOR: 1 },
+      { NEW_ACCOUNT_FACTOR: 0.25 },
+    ]) {
+      expect(admin.PatchSettingsBody.safeParse({ ceilings }).success, JSON.stringify(ceilings)).toBe(true);
     }
     expect(Object.keys(admin.CeilingOverrides.shape).sort()).toEqual([...constants.CEILING_KEYS].sort());
     expect(constants.CEILING_KEYS).toHaveLength(18);
@@ -1016,6 +1042,105 @@ describe("a link's pause reasons, as its owner is told", () => {
     ]) {
       expect(link.ownerCanUnpause(["owner", blocking], false), blocking).toBe(false);
       expect(link.ownerCanUnpause([blocking], false), blocking).toBe(false);
+    }
+  });
+});
+
+describe("shapes that say exactly what their comment says", () => {
+  it("PublicDownloadUrlBody: a size exactly when the kind is thumb", () => {
+    const ok = (body: unknown) => link.PublicDownloadUrlBody.safeParse(body).success;
+    for (const size of constants.THUMB_SIZES) expect(ok({ kind: "thumb", size })).toBe(true);
+    expect(ok({ kind: "thumb", size: 320, nodeId: NODE })).toBe(true);
+    expect(ok({ kind: "download" })).toBe(true);
+    expect(ok({ kind: "inline", nodeId: NODE })).toBe(true);
+    expect(ok({ kind: "download", dangerousAck: true, zipGrant: "payload.signature" })).toBe(true);
+    // A thumbnail without its size, and a size with anything else.
+    expect(ok({ kind: "thumb" })).toBe(false);
+    expect(ok({ kind: "thumb", size: 640 })).toBe(false);
+    expect(ok({ kind: "download", size: 320 })).toBe(false);
+    expect(ok({ kind: "inline", size: 160 })).toBe(false);
+    // A thumbnail carries nothing that belongs to a download.
+    expect(ok({ kind: "thumb", size: 160, zipGrant: "payload.signature" })).toBe(false);
+    expect(ok({ kind: "thumb", size: 160, dangerousAck: true })).toBe(false);
+    expect(ok({ kind: "zip" })).toBe(false);
+    expect(ok({})).toBe(false);
+  });
+
+  it("ZipManifestBody: a list of nodes, or allOwned alone", () => {
+    const ok = (body: unknown) => node.ZipManifestBody.safeParse(body).success;
+    expect(ok({ allOwned: true })).toBe(true);
+    expect(ok({ nodeIds: [NODE] })).toBe(true);
+    expect(ok({ nodeIds: [NODE], allOwned: false })).toBe(true);
+    expect(ok({ nodeIds: [NODE], allOwned: true })).toBe(false);
+    expect(ok({ nodeIds: [], allOwned: true })).toBe(false);
+    expect(ok({ allOwned: false })).toBe(false);
+    expect(ok({ nodeIds: [] })).toBe(false);
+    expect(ok({})).toBe(false);
+  });
+
+  it("the public zip manifest has the same entry maximum as the signed-in one", () => {
+    const entries = (n: number) => Array.from({ length: n }, () => zipEntry);
+    const publicManifest = (n: number) =>
+      link.PublicZipManifest.safeParse({
+        entries: entries(n),
+        totalBytes: 0,
+        skipped: [],
+        truncated: true,
+        zipGrant: "g",
+      }).success;
+    const ownManifest = (n: number) =>
+      node.ZipManifest.safeParse({ entries: entries(n), totalBytes: 0, skipped: [], truncated: true })
+        .success;
+    expect(publicManifest(constants.ZIP_MAX_ENTRIES)).toBe(true);
+    expect(publicManifest(constants.ZIP_MAX_ENTRIES + 1)).toBe(false);
+    expect(ownManifest(constants.ZIP_MAX_ENTRIES)).toBe(true);
+    expect(ownManifest(constants.ZIP_MAX_ENTRIES + 1)).toBe(false);
+  });
+
+  it("a link's activity shows owner-visible outcomes only: the internal reasons fold into `refused`", () => {
+    expect(link.LinkOutcome.options).toEqual(["ok", "password", "expired", "limit", "paused", "refused"]);
+    expect(schema.linkOutcome.enumValues.map((stored) => [stored, link.publicLinkOutcome(stored)])).toEqual([
+      ["ok", "ok"],
+      ["denied_password", "password"],
+      ["denied_expired", "expired"],
+      ["denied_cap", "limit"],
+      ["denied_paused", "paused"],
+      ["denied_scan", "refused"],
+      ["denied_owner", "refused"],
+    ]);
+    for (const unknown of ["denied_something_new", "", "constructor", "__proto__"]) {
+      expect(link.publicLinkOutcome(unknown), unknown).toBe("refused");
+    }
+    // Two stored reasons that fold into one are summed.
+    expect(link.publicLinkOutcomes({ ok: 5, denied_scan: 2, denied_owner: 3, denied_password: 1 })).toEqual({
+      ok: 5,
+      refused: 5,
+      password: 1,
+    });
+    const activity = (outcomes: unknown) =>
+      link.LinkActivityDto.safeParse({ days: [], countries: [], outcomes }).success;
+    expect(activity(link.publicLinkOutcomes({ ok: 5, denied_scan: 2, denied_owner: 3 }))).toBe(true);
+    expect(activity({})).toBe(true);
+    // A stored name cannot be put in the DTO.
+    for (const stored of ["denied_scan", "denied_owner", "denied_password"]) {
+      expect(activity({ ok: 1, [stored]: 1 }), stored).toBe(false);
+    }
+  });
+
+  it("a change with nothing in it is refused", () => {
+    const bodies: [string, z.ZodType, Record<string, unknown>][] = [
+      ["RenameBody", node.RenameBody, { starred: false }],
+      ["PatchShareBody", share.PatchShareBody, { canUpload: false }],
+      ["PatchLinkBody", link.PatchLinkBody, { password: null }],
+      ["PatchPrefsBody", account.PatchPrefsBody, { emailShares: false }],
+    ];
+    for (const [name, body, one] of bodies) {
+      expect(body.safeParse({}).success, `${name} {}`).toBe(false);
+      expect(body.safeParse({}).error?.issues[0]?.message, name).toBe("Nothing to change.");
+      // The control: one field — also a false, also a null — is a change.
+      expect(body.safeParse(one).success, `${name} ${JSON.stringify(one)}`).toBe(true);
+      // And still strict.
+      expect(body.safeParse({ ...one, notInTheContract: 1 }).success, name).toBe(false);
     }
   });
 });

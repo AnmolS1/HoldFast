@@ -1,9 +1,9 @@
 // Public links: what the owner manages, and what the public page is told.
 
 import { z } from "zod";
-import { THUMB_SIZES } from "../constants";
+import { THUMB_SIZES, ZIP_MAX_ENTRIES } from "../constants";
 import { Bytes, MimeCategory, NodeId, Page, PathToken, RowId, Timestamp } from "./common";
-import { DownloadUrlResponse, NodeKind, ZipEntry } from "./node";
+import { DownloadUrlResponse, hasAField, NodeKind, NOTHING_TO_CHANGE, ZipEntry } from "./node";
 
 export const LinkState = z.enum(["active", "paused", "expired", "revoked", "limit_reached", "locked"]);
 export type LinkState = z.infer<typeof LinkState>;
@@ -82,20 +82,55 @@ export const CreateLinkBody = z.strictObject({
 export type CreateLinkBody = z.infer<typeof CreateLinkBody>;
 
 /** `null` removes a password or a download limit. `paused` is the owner's own pause. */
-export const PatchLinkBody = z.strictObject({
-  expiresAt: Timestamp.nullable().optional(),
-  password: LinkPassword.nullable().optional(),
-  maxDownloads: z.number().int().positive().nullable().optional(),
-  allowPreview: z.boolean().optional(),
-  paused: z.boolean().optional(),
-});
+export const PatchLinkBody = z
+  .strictObject({
+    expiresAt: Timestamp.nullable().optional(),
+    password: LinkPassword.nullable().optional(),
+    maxDownloads: z.number().int().positive().nullable().optional(),
+    allowPreview: z.boolean().optional(),
+    paused: z.boolean().optional(),
+  })
+  .refine(hasAField, NOTHING_TO_CHANGE);
 export type PatchLinkBody = z.infer<typeof PatchLinkBody>;
 
-/** No addresses and no hashes: days, countries and outcomes only. */
+/**
+ * How a visit to a link ended, AS ITS OWNER IS TOLD. The stored outcomes say more — that a file
+ * was held back by a scan, or that the owner's own account was the reason — and those must not
+ * reach the owner: they are folded into the one neutral `refused`.
+ */
+export const LinkOutcome = z.enum(["ok", "password", "expired", "limit", "paused", "refused"]);
+export type LinkOutcome = z.infer<typeof LinkOutcome>;
+
+const OUTCOME_SHOWN_AS: Record<string, LinkOutcome> = {
+  ok: "ok",
+  denied_password: "password",
+  denied_expired: "expired",
+  denied_cap: "limit",
+  denied_paused: "paused",
+  denied_scan: "refused",
+  denied_owner: "refused",
+};
+
+/** A stored `link_access_log.outcome` as the owner is told. Anything unknown is `refused`. */
+export function publicLinkOutcome(stored: string): LinkOutcome {
+  return Object.hasOwn(OUTCOME_SHOWN_AS, stored) ? OUTCOME_SHOWN_AS[stored]! : "refused";
+}
+
+/** Counts per stored outcome as `LinkActivityDto.outcomes`: mapped, and summed where two fold into one. */
+export function publicLinkOutcomes(stored: Record<string, number>): Partial<Record<LinkOutcome, number>> {
+  const shown: Partial<Record<LinkOutcome, number>> = {};
+  for (const [outcome, count] of Object.entries(stored)) {
+    const key = publicLinkOutcome(outcome);
+    shown[key] = (shown[key] ?? 0) + count;
+  }
+  return shown;
+}
+
+/** No addresses and no hashes: days, countries and owner-visible outcomes only. */
 export const LinkActivityDto = z.object({
   days: z.array(z.object({ day: z.iso.date(), downloads: z.number().int().nonnegative(), bytes: Bytes })),
   countries: z.array(z.object({ country: z.string(), downloads: z.number().int().nonnegative() })),
-  outcomes: z.record(z.string(), z.number().int().nonnegative()),
+  outcomes: z.partialRecord(LinkOutcome, z.number().int().nonnegative()),
 });
 export type LinkActivityDto = z.infer<typeof LinkActivityDto>;
 
@@ -138,17 +173,26 @@ export const UnlockResponse = z.object({ linkSession: z.string(), expiresAt: Tim
 export type UnlockResponse = z.infer<typeof UnlockResponse>;
 
 /**
- * `nodeId` is absent for a link on a single file. `size` goes with `kind: "thumb"`.
+ * `nodeId` is absent for a link on a single file. `size` is REQUIRED for `kind: "thumb"` and
+ * refused for every other kind.
  * `zipGrant`: a `download` mint carrying a valid grant does not count as another download.
  * Answered with a `DownloadUrlResponse`.
  */
-export const PublicDownloadUrlBody = z.strictObject({
-  nodeId: NodeId.optional(),
-  kind: z.enum(["download", "inline", "thumb"]),
-  size: z.union(THUMB_SIZES.map((size) => z.literal(size))).optional(),
-  dangerousAck: z.boolean().optional(),
-  zipGrant: z.string().min(1).max(2048).optional(),
-});
+export const PublicDownloadUrlBody = z.discriminatedUnion("kind", [
+  // A thumbnail names its size, and nothing that belongs to a download.
+  z.strictObject({
+    nodeId: NodeId.optional(),
+    kind: z.literal("thumb"),
+    size: z.union(THUMB_SIZES.map((size) => z.literal(size))),
+  }),
+  // Anything else has no size.
+  z.strictObject({
+    nodeId: NodeId.optional(),
+    kind: z.enum(["download", "inline"]),
+    dangerousAck: z.boolean().optional(),
+    zipGrant: z.string().min(1).max(2048).optional(),
+  }),
+]);
 export type PublicDownloadUrlBody = z.infer<typeof PublicDownloadUrlBody>;
 
 export const PublicDownloadUrlResponse = DownloadUrlResponse;
@@ -167,7 +211,7 @@ export type PublicZipSkipped = z.infer<typeof PublicZipSkipped>;
  * consumes it and issues `zipGrant`; the per-file URL mints then carry the grant.
  */
 export const PublicZipManifest = z.object({
-  entries: z.array(ZipEntry),
+  entries: z.array(ZipEntry).max(ZIP_MAX_ENTRIES),
   totalBytes: Bytes,
   skipped: z.array(PublicZipSkipped),
   truncated: z.boolean(),

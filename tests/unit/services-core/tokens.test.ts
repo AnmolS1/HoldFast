@@ -407,7 +407,10 @@ describe("link sessions", () => {
     expect(one).toBe([...digest.subarray(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join(""));
     // No password: the constant — which no hashed value can ever equal (it is not 16 hex characters).
     expect(NO_PASSWORD_PWV).toBe("-");
-    for (const none of [null, undefined, ""]) expect(await linkPwv(none)).toBe(NO_PASSWORD_PWV);
+    for (const none of [null, undefined]) expect(await linkPwv(none)).toBe(NO_PASSWORD_PWV);
+    // An EMPTY hash is a bug in the row, not "no password": it is refused, not mapped to the constant.
+    await expect(linkPwv("")).rejects.toThrow("empty password hash");
+    await expect(linkPwv(7 as unknown as string)).rejects.toThrow("empty password hash");
     expect(NO_PASSWORD_PWV).not.toMatch(/^[0-9a-f]{16}$/);
     // A session is minted only for a well-formed version.
     await expect(mintLinkSession(keys(), { ...binding, pwv: "anything" })).rejects.toThrow("invalid binding");
@@ -580,15 +583,38 @@ describe("link tokens", () => {
 describe("sealed values", () => {
   it("a link token round-trips, with a fresh IV each time", async () => {
     const token = newLinkToken();
-    const sealed = await sealLinkToken(keys(), token);
+    const sealed = await sealLinkToken(keys(), token, { linkId: LINK });
     expect(sealed.iv).toHaveLength(12);
     expect(sealed.keyVersion).toBe(1);
     expect(sealed.ciphertext).toHaveLength(token.length + 16);
     expect(new TextDecoder().decode(sealed.ciphertext)).not.toContain(token);
-    expect(await openLinkToken(keys(), sealed)).toBe(token);
-    const again = await sealLinkToken(keys(), token);
+    expect(await openLinkToken(keys(), sealed, { linkId: LINK })).toBe(token);
+    const again = await sealLinkToken(keys(), token, { linkId: LINK });
     expect(b64url(again.iv)).not.toBe(b64url(sealed.iv));
     expect(b64url(again.ciphertext)).not.toBe(b64url(sealed.ciphertext));
+  });
+
+  it("a sealed link token is bound to its row: copied to another link it does not open", async () => {
+    const token = newLinkToken();
+    const sealed = await sealLinkToken(keys(), token, { linkId: LINK });
+    // The control: read from its own row, it opens.
+    expect(await openLinkToken(keys(), sealed, { linkId: LINK })).toBe(token);
+    await expect(openLinkToken(keys(), sealed, { linkId: OTHER_NODE })).rejects.toThrow();
+    // The same token sealed for two rows is two different values, each for its own row only.
+    const other = await sealLinkToken(keys(), token, { linkId: OTHER_NODE });
+    expect(await openLinkToken(keys(), other, { linkId: OTHER_NODE })).toBe(token);
+    await expect(openLinkToken(keys(), other, { linkId: LINK })).rejects.toThrow();
+    // No row, no seal.
+    const loose = { seal: sealLinkToken, open: openLinkToken } as unknown as Record<
+      string,
+      (...args: unknown[]) => Promise<unknown>
+    >;
+    for (const bind of [undefined, {}, { linkId: "" }, { linkId: "not-a-uuid" }, { linkId: USER }]) {
+      await expect(loose.seal!(keys(), token, bind), JSON.stringify(bind)).rejects.toThrow("invalid link id");
+      await expect(loose.open!(keys(), sealed, bind), JSON.stringify(bind)).rejects.toThrow(
+        "invalid link id",
+      );
+    }
   });
 
   it("an address round-trips under IP_ENC_KEY", async () => {
@@ -607,8 +633,8 @@ describe("sealed values", () => {
   it("a tampered ciphertext, IV or key version does not open — for both sealed values", async () => {
     const cases = [
       {
-        sealed: await sealLinkToken(keys(), "made-up-link-token-0001"),
-        open: (s: Parameters<typeof openLinkToken>[1]) => openLinkToken(keys(), s),
+        sealed: await sealLinkToken(keys(), "made-up-link-token-0001", { linkId: LINK }),
+        open: (s: Parameters<typeof openLinkToken>[1]) => openLinkToken(keys(), s, { linkId: LINK }),
       },
       {
         sealed: await sealIp(IP_ENV, "203.0.113.7"),
@@ -633,12 +659,12 @@ describe("sealed values", () => {
   });
 
   it("a value sealed for one purpose or key does not open under another", async () => {
-    const link = await sealLinkToken(keys(), "made-up-link-token-0002");
-    await expect(openLinkToken(otherKeys(), link)).rejects.toThrow();
+    const link = await sealLinkToken(keys(), "made-up-link-token-0002", { linkId: LINK });
+    await expect(openLinkToken(otherKeys(), link, { linkId: LINK })).rejects.toThrow();
     await expect(openIp(IP_ENV, link)).rejects.toThrow();
     const ip = await sealIp(IP_ENV, "203.0.113.9");
     await expect(openIp(OTHER_IP_ENV, ip)).rejects.toThrow();
-    await expect(openLinkToken(keys(), ip)).rejects.toThrow();
+    await expect(openLinkToken(keys(), ip, { linkId: LINK })).rejects.toThrow();
     // The key cache follows the value: after another key was used, the first still opens its own.
     expect(await openIp(IP_ENV, ip)).toBe("203.0.113.9");
   });

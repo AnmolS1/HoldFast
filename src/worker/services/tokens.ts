@@ -15,6 +15,7 @@
 // when the token expires.
 
 import { LINK_TOKEN_BYTES, THUMB_SIZES, TOKEN_TTL, type ThumbSize } from "../../shared/constants";
+import { UUID } from "../../shared/ids";
 import { now } from "./clock";
 import { AppError } from "./errors";
 import type { Keys } from "./keys";
@@ -245,7 +246,10 @@ export async function verifyDownloadToken(
  * The ONE derivation: sessions, grants, download tokens and the files host all call this.
  */
 export async function linkPwv(passwordHash: string | null | undefined): Promise<string> {
-  if (!passwordHash) return NO_PASSWORD_PWV;
+  if (passwordHash === null || passwordHash === undefined) return NO_PASSWORD_PWV;
+  // An EMPTY hash is not "no password": it is a row that was written wrongly. Refuse to derive.
+  if (typeof passwordHash !== "string" || passwordHash === "")
+    throw new Error("link pwv: empty password hash");
   return hex((await sha256(passwordHash)).subarray(0, 8));
 }
 
@@ -352,7 +356,11 @@ export async function hashLinkToken(token: string): Promise<string> {
 
 // ── sealed values (AES-256-GCM) ─────────────────────────────────────────────────────────────
 
-const LINK_TOKEN_AAD = encoder.encode("holdfast/link-token/v1");
+/** The link id is part of what is authenticated: a sealed token copied to another row does not open. */
+function linkTokenAad(linkId: string): Uint8Array {
+  if (typeof linkId !== "string" || !UUID.test(linkId)) throw new Error("sealed link token: invalid link id");
+  return encoder.encode(`holdfast/link-token/v1|${linkId}`);
+}
 const IP_AAD = encoder.encode("holdfast/upload-ip/v1");
 
 async function seal(key: CryptoKey, aad: Uint8Array, plaintext: string, keyVersion: number): Promise<Sealed> {
@@ -378,13 +386,18 @@ async function open(key: CryptoKey, aad: Uint8Array, sealed: Sealed, keyVersion:
   return decoder.decode(plaintext);
 }
 
-/** Seals a link token for `share_links.tokenEnc` / `tokenIv` / `tokenKeyVersion`. */
-export async function sealLinkToken(keys: Keys, token: string): Promise<Sealed> {
-  return seal(await keys.get("link-token-enc"), LINK_TOKEN_AAD, token, LINK_TOKEN_KEY_VERSION);
+/**
+ * Seals a link token for `share_links.tokenEnc` / `tokenIv` / `tokenKeyVersion`, BOUND TO ITS ROW:
+ * `bind.linkId` is the id of the `share_links` row the value is stored in (generate the id before
+ * sealing). The same id opens it; any other does not.
+ */
+export async function sealLinkToken(keys: Keys, token: string, bind: { linkId: string }): Promise<Sealed> {
+  return seal(await keys.get("link-token-enc"), linkTokenAad(bind?.linkId), token, LINK_TOKEN_KEY_VERSION);
 }
 
-export async function openLinkToken(keys: Keys, sealed: Sealed): Promise<string> {
-  return open(await keys.get("link-token-enc"), LINK_TOKEN_AAD, sealed, LINK_TOKEN_KEY_VERSION);
+/** Opens a sealed link token read from the row `bind.linkId`. Throws for any other row's value. */
+export async function openLinkToken(keys: Keys, sealed: Sealed, bind: { linkId: string }): Promise<string> {
+  return open(await keys.get("link-token-enc"), linkTokenAad(bind?.linkId), sealed, LINK_TOKEN_KEY_VERSION);
 }
 
 // The imported address key and the value it was imported from. A resolved key, never a promise

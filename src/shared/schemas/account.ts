@@ -3,7 +3,7 @@
 import { z } from "zod";
 import { Bytes, Email, NodeId, RowId, ScanStatus, SessionId, Sha256, Timestamp, UserId } from "./common";
 import { LinkState } from "./link";
-import { NodeKind } from "./node";
+import { hasAField, NodeKind, NOTHING_TO_CHANGE } from "./node";
 import { ShareRole } from "./share";
 
 /** `usedBytes` is the sum of the four parts. */
@@ -28,13 +28,15 @@ export const PrefsDto = z.object({
 });
 export type PrefsDto = z.infer<typeof PrefsDto>;
 
-export const PatchPrefsBody = z.strictObject({
-  density: PrefsDto.shape.density.optional(),
-  theme: PrefsDto.shape.theme.optional(),
-  viewMode: PrefsDto.shape.viewMode.optional(),
-  emailShares: z.boolean().optional(),
-  emailLinkDigest: z.boolean().optional(),
-});
+export const PatchPrefsBody = z
+  .strictObject({
+    density: PrefsDto.shape.density.optional(),
+    theme: PrefsDto.shape.theme.optional(),
+    viewMode: PrefsDto.shape.viewMode.optional(),
+    emailShares: z.boolean().optional(),
+    emailLinkDigest: z.boolean().optional(),
+  })
+  .refine(hasAField, NOTHING_TO_CHANGE);
 export type PatchPrefsBody = z.infer<typeof PatchPrefsBody>;
 
 /** The caller's own profile (so it carries their own email). The time zone lives here, not in prefs. */
