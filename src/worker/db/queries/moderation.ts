@@ -8,7 +8,6 @@ import type { Executor } from "../client";
 import { pgError } from "../errors";
 import { isUuid } from "../ids";
 import { dmcaNotices, hashBlocklist, nodes, reports, type ScanStatus, uploadIps, user } from "../schema";
-import { upsert as blocklistUpsert } from "./blocklist";
 import { pauseLinks, unpauseLinks } from "./links";
 import { notEffectivelyHidden } from "./tree";
 
@@ -296,7 +295,18 @@ async function lockRows(
   await pauseLinks(sp, { nodeId }, "moderation");
   await sp.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
   if (node.sha256 !== null) {
-    await blocklistUpsert(sp, { sha256: node.sha256, reason: "csam", sourceNodeId: nodeId });
+    // NOT `blocklist.upsert`, which rewrites the whole entry: a hash that was already listed —
+    // by an admin, by an earlier verdict — keeps its source, its author and its note, and only
+    // its reason is raised to `csam` (a `csam` entry is left as it is). `sourceNodeId` is this
+    // node ONLY on an entry this lock created; that is what `clearSuspectedCsam` may remove.
+    await sp
+      .insert(hashBlocklist)
+      .values({ sha256: node.sha256, reason: "csam", sourceNodeId: nodeId })
+      .onConflictDoUpdate({
+        target: hashBlocklist.sha256,
+        set: { reason: "csam" },
+        setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
+      });
   }
 
   const [existing] = await sp
@@ -316,42 +326,88 @@ async function lockRows(
   return { reportId: reportId!, ownerId: node.ownerId };
 }
 
+export type CsamClearResult = {
+  cleared: boolean;
+  /**
+   * Why nothing was written, when `cleared` is false: the node is not `suspected_csam` (or does
+   * not exist), or a `csam` report on it was FILED (`actioned`) — that is never undone here.
+   */
+  refused: "not_locked" | "reported" | null;
+  blocklistRemoved: boolean;
+  /**
+   * Why the hash is still blocklisted after a clear: the entry is not the one this node's lock
+   * created; another node with the same hash is still locked; or a `csam` report on another node
+   * with that hash was filed. Null when the entry was removed or there is none.
+   */
+  blocklistKept: "not_this_locks" | "other_node_locked" | "reported" | null;
+  /** The `csam` reports dismissed, ascending. */
+  reportIds: string[];
+};
+
 /**
  * The way back from a false positive: the reverse of the lock's database half EXCEPT THE HOLDS.
  * For the admin console's "Clear lock" only, inside its transaction; the caller writes the audit
  * row (which is where WHO cleared it is recorded) and enqueues the rescan after the commit.
  *
- * Refused — `cleared: false`, nothing written — unless the node is `suspected_csam` right now
- * (also for an unknown or malformed id); that is what makes a second call a no-op. Otherwise:
+ * REFUSED — `cleared: false`, nothing written, `refused` says why:
+ *   - `not_locked`: the node is not `suspected_csam` right now (also an unknown or malformed id).
+ *     That is what makes a second call a no-op;
+ *   - `reported`: a `csam` report on this node is `actioned` — it was filed. Content that was
+ *     reported is not un-hidden by one call.
+ * Otherwise:
  *   - the node goes to `pending` (never straight to `clean`: it is scanned again before it can
- *     be served) and `scanStatusPrev` is cleared;
+ *     be served) with `scanStatusPrev` cleared — or, when a report of ANOTHER category on it is
+ *     still `open` or `reviewing`, to `under_review` with `scanStatusPrev = 'pending'`: that
+ *     review is still open, and a clean scan must not make the file servable under it (its
+ *     `report` pause on the links is not touched either way);
  *   - `moderation` — that reason only — is removed from the links ON the node, unless the node
  *     or an ancestor is taken down: that takedown put, or would have put, the same reason
  *     there, and its restore removes it;
- *   - the hash leaves the blocklist ONLY if this lock's row is the one there: `sourceNodeId` is
- *     this node and the reason is `csam`. A row with another or no source stays
- *     (`blocklistRemoved: false`) — the lock found it and wrote nothing;
+ *   - the hash leaves the blocklist only when ALL of this holds: the entry is the one this
+ *     node's lock CREATED (`sourceNodeId` is this node, the reason is `csam` — a row the lock
+ *     found, it left as it was or only raised to `csam`); no OTHER node with the same hash is
+ *     `suspected_csam`; and no `csam` report on any node with that hash was filed. Otherwise the
+ *     entry stays and `blocklistKept` says why;
  *   - every `csam` report on the node that is `open` or `reviewing` becomes `dismissed`
- *     (`resolvedAt` now, `resolution` `false_positive`; `assignedTo` as it was). An `actioned`
- *     one — filed — keeps its status. Their ids are returned.
+ *     (`resolvedAt` now, `resolution` `false_positive`; `assignedTo` as it was). Their ids are
+ *     returned.
  * LEGAL HOLDS ARE NOT TOUCHED: the node's, its owner's and uploaders', and the `upload_ips`
  * rows' stay exactly as they are. Releasing them is a separate, deliberate act.
  */
-export async function clearSuspectedCsam(
-  tx: Executor,
-  nodeId: string,
-): Promise<{ cleared: boolean; blocklistRemoved: boolean; reportIds: string[] }> {
-  const refused = { cleared: false, blocklistRemoved: false, reportIds: [] };
-  if (!isUuid(nodeId)) return refused;
+export async function clearSuspectedCsam(tx: Executor, nodeId: string): Promise<CsamClearResult> {
+  const refused = (why: "not_locked" | "reported"): CsamClearResult => ({
+    cleared: false,
+    refused: why,
+    blocklistRemoved: false,
+    blocklistKept: null,
+    reportIds: [],
+  });
+  if (!isUuid(nodeId)) return refused("not_locked");
   return tx.transaction(async (sp) => {
     const [node] = await sp
       .select({ scanStatus: nodes.scanStatus, sha256: nodes.sha256 })
       .from(nodes)
       .where(eq(nodes.id, nodeId))
       .for("update");
-    if (!node || node.scanStatus !== "suspected_csam") return refused;
+    if (!node || node.scanStatus !== "suspected_csam") return refused("not_locked");
 
-    await sp.update(nodes).set({ scanStatus: "pending", scanStatusPrev: null }).where(eq(nodes.id, nodeId));
+    const onNode = await sp
+      .select({ category: reports.category, status: reports.status })
+      .from(reports)
+      .where(eq(reports.nodeId, nodeId));
+    if (onNode.some((r) => r.category === "csam" && r.status === "actioned")) return refused("reported");
+    const otherCaseOpen = onNode.some(
+      (r) => r.category !== "csam" && (r.status === "open" || r.status === "reviewing"),
+    );
+
+    await sp
+      .update(nodes)
+      .set(
+        otherCaseOpen
+          ? { scanStatus: "under_review", scanStatusPrev: "pending" }
+          : { scanStatus: "pending", scanStatusPrev: null },
+      )
+      .where(eq(nodes.id, nodeId));
 
     const [visible] = await sp
       .select({ id: nodes.id })
@@ -359,19 +415,7 @@ export async function clearSuspectedCsam(
       .where(and(eq(nodes.id, nodeId), notEffectivelyHidden()));
     if (visible) await unpauseLinks(sp, { nodeId }, "moderation");
 
-    const removed =
-      node.sha256 === null
-        ? []
-        : await sp
-            .delete(hashBlocklist)
-            .where(
-              and(
-                eq(hashBlocklist.sha256, node.sha256),
-                eq(hashBlocklist.sourceNodeId, nodeId),
-                eq(hashBlocklist.reason, "csam"),
-              ),
-            )
-            .returning({ sha256: hashBlocklist.sha256 });
+    const blocklistKept = node.sha256 === null ? null : await releaseBlocklistEntry(sp, nodeId, node.sha256);
 
     const dismissed = await sp
       .update(reports)
@@ -387,10 +431,49 @@ export async function clearSuspectedCsam(
 
     return {
       cleared: true,
-      blocklistRemoved: removed.length > 0,
+      refused: null,
+      blocklistRemoved: node.sha256 !== null && blocklistKept === "removed",
+      blocklistKept: blocklistKept === "removed" ? null : blocklistKept,
       reportIds: dismissed.map((r) => r.id).sort(),
     };
   });
+}
+
+/**
+ * Removes the hash's blocklist entry if the cleared node's lock is all that stands behind it.
+ * The entry is locked first: a lock of another node with the same hash, running now, either
+ * finished before (its node is seen below) or waits and then inserts its own entry.
+ * `removed`, why it was kept, or null when there is no entry.
+ */
+async function releaseBlocklistEntry(
+  sp: Executor,
+  nodeId: string,
+  sha256: string,
+): Promise<"removed" | "not_this_locks" | "other_node_locked" | "reported" | null> {
+  const [entry] = await sp
+    .select({ reason: hashBlocklist.reason, sourceNodeId: hashBlocklist.sourceNodeId })
+    .from(hashBlocklist)
+    .where(eq(hashBlocklist.sha256, sha256))
+    .for("update");
+  if (!entry) return null;
+  if (entry.reason !== "csam" || entry.sourceNodeId !== nodeId) return "not_this_locks";
+  const [alsoLocked] = await sp
+    .select({ id: nodes.id })
+    .from(nodes)
+    .where(
+      and(eq(nodes.sha256, sha256), eq(nodes.scanStatus, "suspected_csam"), sql`${nodes.id} <> ${nodeId}`),
+    )
+    .limit(1);
+  if (alsoLocked) return "other_node_locked";
+  const [filed] = await sp
+    .select({ id: reports.id })
+    .from(reports)
+    .innerJoin(nodes, eq(nodes.id, reports.nodeId))
+    .where(and(eq(nodes.sha256, sha256), eq(reports.category, "csam"), eq(reports.status, "actioned")))
+    .limit(1);
+  if (filed) return "reported";
+  await sp.delete(hashBlocklist).where(eq(hashBlocklist.sha256, sha256));
+  return "removed";
 }
 
 /**
