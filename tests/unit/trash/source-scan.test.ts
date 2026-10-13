@@ -6,6 +6,9 @@ const jobSources = import.meta.glob("/src/worker/jobs/*.ts", {
   import: "default",
   eager: true,
 });
+const queriesSource = Object.values(
+  import.meta.glob("/src/worker/db/queries/trash-jobs.ts", { query: "?raw", import: "default", eager: true }),
+)[0]!;
 const tests = import.meta.glob("/tests/unit/**/*.test.{ts,tsx}", {
   query: "?raw",
   import: "default",
@@ -30,6 +33,38 @@ describe("the jobs' sources", () => {
     // Control: the scan does see such a line when there is one.
     expect("await tx.update(user).set({ legalHold: false });").toMatch(HOLD);
     expect("await setUserLegalHold(db, id, false);").toMatch(HOLD);
+  });
+
+  it("nor does the jobs' query module: it reads hold columns and writes none", () => {
+    // All of the jobs' SQL is in queries/trash-jobs.ts. It READS `user.legalHold` (to leave a
+    // held account alone), so the word may appear — never in a write.
+    const WRITES_HOLD = new RegExp(
+      [
+        String.raw`\.set\(\s*\{[^}]*\blegalHold\b`, // drizzle: .set({ … legalHold … })
+        String.raw`\.values\(\s*\{[^}]*\blegalHold\b`, // drizzle: .values({ … legalHold … })
+        String.raw`\bSET\b[^;\x60]*\blegal_hold\s*=`, // raw SQL: UPDATE … SET … legal_hold =
+        String.raw`\bset(Node|User)LegalHold\b|\breleaseForNode\b`, // T05's setters
+      ].join("|"),
+      "s",
+    );
+    expect(queriesSource).toMatch(/legalHold/);
+    expect(code(queriesSource)).not.toMatch(WRITES_HOLD);
+    // Controls: each form of a write is seen.
+    for (const write of [
+      "await tx.update(user).set({ legalHold: false }).where(eq(user.id, id));",
+      "await tx.update(uploadIps)\n  .set({\n    at: now,\n    legalHold: true,\n  })",
+      "await tx.insert(uploadIps).values({ nodeId, legalHold: true });",
+      "await tx.execute(sql`UPDATE nodes SET updated_at = now(), legal_hold = false WHERE id = ${id}`);",
+      "await setUserLegalHold(tx, id, false);",
+      "await releaseForNode(tx, nodeId);",
+    ]) {
+      expect(write, write).toMatch(WRITES_HOLD);
+    }
+    // …and a read is not taken for one.
+    expect(".select({ deleteScheduledAt: user.deleteScheduledAt, legalHold: user.legalHold })").not.toMatch(
+      WRITES_HOLD,
+    );
+    expect("return subject.legalHold ? 'held' : 'ok';").not.toMatch(WRITES_HOLD);
   });
 
   it("no retention delete acts on a list of ids: the job never calls upload-ips' expired()", () => {
