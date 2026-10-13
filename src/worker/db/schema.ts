@@ -79,6 +79,8 @@ export const ledgerSubject = pgEnum("ledger_subject", [
   "user",
   "link",
   "ip",
+  // everything one owner's public links serve in a day, summed over the links
+  "link_owner",
   // uploads
   "upload_user",
   "upload_editor",

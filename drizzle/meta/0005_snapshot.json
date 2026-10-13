@@ -1,5 +1,5 @@
 {
-  "id": "ab8f4d01-c074-4c2e-bef1-d8ad5f178184",
+  "id": "b0f97294-7695-4f41-908f-74b672224643",
   "prevId": "d65a8ddb-b3fc-422f-b81c-9378c2a2732d",
   "version": "7",
   "dialect": "postgresql",
@@ -4445,6 +4445,7 @@
         "user",
         "link",
         "ip",
+        "link_owner",
         "upload_user",
         "upload_editor",
         "transform_user",

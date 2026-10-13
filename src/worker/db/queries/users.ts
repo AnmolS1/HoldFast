@@ -48,6 +48,22 @@ export function isActive(state: UserState | null): boolean {
 }
 
 /**
+ * Locks the user's row for the rest of the transaction (`SELECT … FOR UPDATE`). False when no
+ * user has that id.
+ *
+ * For a decision that reads this user's totals and then writes on the strength of them (a daily
+ * ceiling, the cap on live links): with the row locked, two such transactions for one user run
+ * one after the other, and the second sees what the first wrote.
+ *
+ * LOCK ORDER: the `user` row before any other row, and — when a transaction needs two users —
+ * the lower id first. Call it before anything else in the transaction.
+ */
+export async function lockUser(tx: Executor, userId: string): Promise<boolean> {
+  const rows = await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
+  return rows.length > 0;
+}
+
+/**
  * Deletes every session row of the user and returns how many there were. Effective at once:
  * every request reads the session row (the auth layer keeps no cookie cache).
  */

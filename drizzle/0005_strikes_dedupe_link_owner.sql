@@ -1,3 +1,4 @@
+ALTER TYPE "public"."ledger_subject" ADD VALUE 'link_owner' BEFORE 'upload_user';--> statement-breakpoint
 ALTER TABLE "strikes" ADD COLUMN "content_sha256" text;--> statement-breakpoint
 CREATE UNIQUE INDEX "strikes_user_kind_node_uq" ON "strikes" USING btree ("user_id","kind","node_id") WHERE node_id IS NOT NULL AND lifted_at IS NULL;--> statement-breakpoint
 CREATE UNIQUE INDEX "strikes_user_kind_content_uq" ON "strikes" USING btree ("user_id","kind","content_sha256") WHERE content_sha256 IS NOT NULL AND lifted_at IS NULL;
