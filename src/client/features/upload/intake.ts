@@ -1,12 +1,16 @@
 // Turning what the browser hands over — a drop, a paste, a folder picker — into files with the
 // folder path each belongs to.
 import type { IncomingFile } from "./manager";
-import { parentPath } from "./plan";
+import { MAX_DROP_FILES, parentPath } from "./plan";
 
 export interface Intake {
   files: IncomingFile[];
   /** Every folder path seen, including empty folders. */
   folders: string[];
+  /** Paths of entries the browser could not read. They are left out; the rest goes on. */
+  unreadable: string[];
+  /** The drop holds more files than one upload takes: the walk stopped. */
+  tooMany: boolean;
 }
 
 /** Does the drag carry files from the operating system (and not text or a dragged row)? */
@@ -23,7 +27,7 @@ export function fromFileList(list: Iterable<File>): Intake {
     if (path) folders.add(path);
     files.push({ file, path });
   }
-  return { files, folders: Array.from(folders) };
+  return { files, folders: Array.from(folders), unreadable: [], tooMany: files.length > MAX_DROP_FILES };
 }
 
 function readBatch(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
@@ -34,10 +38,20 @@ function fileOf(entry: FileSystemFileEntry): Promise<File> {
   return new Promise((resolve, reject) => entry.file(resolve, reject));
 }
 
+/**
+ * Walk one entry. Each entry fails on its own: an unreadable file or folder is written down and
+ * its siblings are still taken. The walk ends once the drop is larger than one upload takes.
+ */
 async function walk(entry: FileSystemEntry, into: Intake): Promise<void> {
+  if (into.tooMany) return;
   const path = entry.fullPath.replace(/^\/+/, "");
   if (entry.isFile) {
-    into.files.push({ file: await fileOf(entry as FileSystemFileEntry), path: parentPath(path) });
+    try {
+      into.files.push({ file: await fileOf(entry as FileSystemFileEntry), path: parentPath(path) });
+      if (into.files.length > MAX_DROP_FILES) into.tooMany = true;
+    } catch {
+      into.unreadable.push(path);
+    }
     return;
   }
   if (!entry.isDirectory) return;
@@ -45,7 +59,14 @@ async function walk(entry: FileSystemEntry, into: Intake): Promise<void> {
   const reader = (entry as FileSystemDirectoryEntry).createReader();
   // A reader hands its entries over in batches; an empty batch is the end.
   for (;;) {
-    const batch = await readBatch(reader);
+    let batch: FileSystemEntry[];
+    try {
+      batch = await readBatch(reader);
+    } catch {
+      // What was read of this folder stays; what could not be listed is named by the folder.
+      into.unreadable.push(path);
+      return;
+    }
     if (batch.length === 0) return;
     for (const child of batch) await walk(child, into);
   }
@@ -69,14 +90,13 @@ export function fromDrop(transfer: DataTransfer): Promise<Intake> {
   }
   if (entries.length === 0 && loose.length === 0) loose.push(...Array.from(transfer.files ?? []));
   return (async () => {
-    const intake: Intake = { files: loose.map((file) => ({ file, path: "" })), folders: [] };
-    for (const entry of entries) {
-      try {
-        await walk(entry, intake);
-      } catch {
-        // An entry that cannot be read is left out; the rest of the drop goes on.
-      }
-    }
+    const intake: Intake = {
+      files: loose.map((file) => ({ file, path: "" })),
+      folders: [],
+      unreadable: [],
+      tooMany: false,
+    };
+    for (const entry of entries) await walk(entry, intake);
     return intake;
   })();
 }
