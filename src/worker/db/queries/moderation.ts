@@ -8,6 +8,7 @@ import { isUuid } from "../ids";
 import { dmcaNotices, nodes, reports, type ScanStatus, uploadIps, user } from "../schema";
 import { upsert as blocklistUpsert } from "./blocklist";
 import { pauseLinks, unpauseLinks } from "./links";
+import { lockUser } from "./users";
 
 type ReportCategory = (typeof reports.category.enumValues)[number];
 type ReportSource = (typeof reports.source.enumValues)[number];
@@ -112,15 +113,62 @@ export async function insertReport(tx: Executor, report: ReportInput): Promise<s
   return row?.id ?? null;
 }
 
+export type CsamSubjects = {
+  nodeId: string;
+  ownerId: string | null;
+  /** Ascending (code-unit order, the order user rows are locked in); may include the owner. */
+  uploaderIds: string[];
+};
+
+/**
+ * Who a suspected-CSAM lock on this node is about: the node, its owner, and every distinct
+ * uploader of ANY version of it — the current one (`nodes.created_by`), the replaced ones still
+ * kept (`node_versions.created_by`) and everyone an uploader address is on record for
+ * (`upload_ips.uploader_id`, which outlives a purged version). One statement.
+ *
+ * Only accounts that exist: an anonymised uploader (null) and an id whose account is gone are
+ * left out — there is nothing to hold or to release. Null for an unknown or malformed node id.
+ * `lockSuspectedCsam` locks and holds this set; "Release holds" releases it.
+ */
+export async function csamSubjects(db: Executor, nodeId: string): Promise<CsamSubjects | null> {
+  if (!isUuid(nodeId)) return null;
+  const result = await db.execute<{ id: string; owner_id: string; uploader_ids: string[] }>(sql`
+    SELECT n.id, n.owner_id,
+           ARRAY(
+             SELECT s.uploader FROM (
+               SELECT n.created_by AS uploader
+               UNION
+               SELECT v.created_by FROM node_versions v WHERE v.node_id = n.id
+               UNION
+               SELECT i.uploader_id FROM upload_ips i WHERE i.node_id = n.id
+             ) s
+             WHERE s.uploader IS NOT NULL
+               AND EXISTS (SELECT 1 FROM "user" u WHERE u.id = s.uploader)
+           ) AS uploader_ids
+    FROM nodes n WHERE n.id = ${nodeId}`);
+  const row = result.rows[0];
+  if (!row) return null;
+  return { nodeId: row.id, ownerId: row.owner_id, uploaderIds: [...row.uploader_ids].sort() };
+}
+
+/** The uploader set grew between the unlocked read and the locked one. */
+class SubjectsGrew extends Error {
+  constructor(readonly userIds: string[]) {
+    super("the uploader set grew");
+  }
+}
+
 /**
  * The database half of the suspected-CSAM lock. Route and consumer code never call this
  * directly: they call the shared scanning service, which adds the audit row, the alert and the
  * metric.
  *
- * In one transaction: the node becomes `suspected_csam` and is put on legal hold, its owner is
- * put on legal hold, the node's links are paused with `moderation`, the node's `upload_ips` rows
- * are held, its hash is blocklisted as `csam`, and a `reports` row is filed. The object is never
- * deleted. Safe to repeat: a second call files no second report.
+ * In one transaction: the node becomes `suspected_csam` and is put on legal hold; its owner AND
+ * EVERY UPLOADER OF ANY VERSION OF IT (`csamSubjects`) are put on legal hold — an editor who
+ * uploaded into someone else's folder, and one whose version was since replaced, included; the
+ * node's links are paused with `moderation`, the node's `upload_ips` rows are held, its hash is
+ * blocklisted as `csam`, and a `reports` row is filed. The object is never deleted. Held is not
+ * banned: nobody is banned here. Safe to repeat: a second call files no second report.
  * Null when there is no such node (also when a purge that started first deleted it meanwhile).
  */
 export async function lockSuspectedCsam(
@@ -130,51 +178,90 @@ export async function lockSuspectedCsam(
 ): Promise<{ reportId: string; ownerId: string } | null> {
   if (!isUuid(nodeId)) return null;
   return db.transaction(async (tx) => {
-    // LOCK ORDER: the owner's `user` row first, then the node — the order of the purge
-    // (`deleteSubtreeRows`), the reconcile and the quota writers. Taking the node first and the
-    // owner second is the opposite order: run beside a purge of the same owner the two deadlock,
+    // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
+    // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
+    // (`deleteSubtreeRows`), the reconcile and the quota writers. Taking the node first and a
+    // user second is the opposite order: run beside a purge of the same owner the two deadlock,
     // and when Postgres picks THIS transaction as the victim it rolls back whole (no
-    // `suspected_csam`, no hold) and the purge goes on to delete the evidence.
-    // The owner is read without a lock only to learn whose row to lock; `owner_id` never changes.
-    const [peek] = await tx.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
-    if (!peek) return null;
-    await tx.select({ id: user.id }).from(user).where(eq(user.id, peek.ownerId)).for("update");
-    const [node] = await tx
-      .select({ ownerId: nodes.ownerId, sha256: nodes.sha256 })
-      .from(nodes)
-      .where(eq(nodes.id, nodeId))
-      .for("update");
-    // Gone while this waited for the owner's row: a purge that began first has deleted it.
-    if (!node) return null;
-
-    await tx.update(user).set({ legalHold: true }).where(eq(user.id, node.ownerId));
-    await tx
-      .update(nodes)
-      .set({ scanStatus: "suspected_csam", scanStatusPrev: null, legalHold: true })
-      .where(eq(nodes.id, nodeId));
-    await pauseLinks(tx, { nodeId }, "moderation");
-    await tx.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
-    if (node.sha256 !== null) {
-      await blocklistUpsert(tx, { sha256: node.sha256, reason: "csam", sourceNodeId: nodeId });
+    // `suspected_csam`, no hold) and the purge goes on to delete the evidence. Owner-first
+    // instead of lowest-first deadlocks the same way against a lock on a file whose owner and
+    // uploader are the other way round.
+    //
+    // Whose rows to lock is only known from the node's rows, so the set is read WITHOUT a lock
+    // first, and read again once the node is locked. If it grew in between (a Replace by a new
+    // uploader committed), the locks are released — the savepoint is rolled back — and taken
+    // again for the larger set: once. A set that grows a second time fails the transaction,
+    // nothing written; the caller's redelivery tries again.
+    const first = await csamSubjects(tx, nodeId);
+    if (!first) return null;
+    let userIds = subjectUserIds(first);
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, opts.source));
+      } catch (error) {
+        if (!(error instanceof SubjectsGrew)) throw error;
+        if (attempt >= 2) throw new Error("csam lock: the node's uploader set grew twice while locking");
+        userIds = error.userIds;
+      }
     }
-
-    const [existing] = await tx
-      .select({ id: reports.id })
-      .from(reports)
-      .where(
-        and(
-          eq(reports.nodeId, nodeId),
-          eq(reports.category, "csam"),
-          inArray(reports.status, ["open", "reviewing"]),
-        ),
-      )
-      .orderBy(reports.createdAt)
-      .limit(1);
-    const reportId =
-      existing?.id ??
-      (await insertReport(tx, { nodeId, ownerId: node.ownerId, source: opts.source, category: "csam" }));
-    return { reportId: reportId!, ownerId: node.ownerId };
   });
+}
+
+/** The owner and the uploaders, each once, in the order their rows are locked: ascending. */
+function subjectUserIds(subjects: CsamSubjects): string[] {
+  const ids = new Set(subjects.uploaderIds);
+  if (subjects.ownerId !== null) ids.add(subjects.ownerId);
+  return [...ids].sort();
+}
+
+async function lockRows(
+  sp: Executor,
+  nodeId: string,
+  userIds: string[],
+  source: "photodna" | "system" | "admin",
+): Promise<{ reportId: string; ownerId: string } | null> {
+  // An account deleted since the read locks nothing and is skipped.
+  for (const userId of userIds) await lockUser(sp, userId);
+  const [node] = await sp
+    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256 })
+    .from(nodes)
+    .where(eq(nodes.id, nodeId))
+    .for("update");
+  // Gone while this waited for a user row: a purge that began first has deleted it.
+  if (!node) return null;
+  const now = await csamSubjects(sp, nodeId);
+  if (!now) return null;
+  const all = subjectUserIds(now);
+  if (all.some((id) => !userIds.includes(id))) {
+    throw new SubjectsGrew([...new Set([...userIds, ...all])].sort());
+  }
+
+  await sp.update(user).set({ legalHold: true }).where(inArray(user.id, all));
+  await sp
+    .update(nodes)
+    .set({ scanStatus: "suspected_csam", scanStatusPrev: null, legalHold: true })
+    .where(eq(nodes.id, nodeId));
+  await pauseLinks(sp, { nodeId }, "moderation");
+  await sp.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
+  if (node.sha256 !== null) {
+    await blocklistUpsert(sp, { sha256: node.sha256, reason: "csam", sourceNodeId: nodeId });
+  }
+
+  const [existing] = await sp
+    .select({ id: reports.id })
+    .from(reports)
+    .where(
+      and(
+        eq(reports.nodeId, nodeId),
+        eq(reports.category, "csam"),
+        inArray(reports.status, ["open", "reviewing"]),
+      ),
+    )
+    .orderBy(reports.createdAt)
+    .limit(1);
+  const reportId =
+    existing?.id ?? (await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" }));
+  return { reportId: reportId!, ownerId: node.ownerId };
 }
 
 /**

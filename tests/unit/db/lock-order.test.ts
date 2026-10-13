@@ -6,7 +6,7 @@
 // Postgres reports the other side as waiting for a lock (pg_stat_activity), then lets the first
 // side go on. With the two sides locking in opposite orders that is a deadlock — Postgres aborts
 // one of them with 40P01 — and which one it aborts is the whole problem.
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db, Tx } from "../../../src/worker/db/client";
 import { LegalHoldError, pgError, QueryError } from "../../../src/worker/db/errors";
@@ -15,7 +15,7 @@ import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
-import { nodes, pendingUserPurges, user } from "../../../src/worker/db/schema";
+import { nodes, pendingUserPurges, reports, uploadIps, user } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeUser, openDb, rand } from "./_helpers";
 
 // Three pools: the two sides, and an observer that is never inside either transaction.
@@ -43,6 +43,19 @@ async function untilWaitingForLock(pid: number, label: string): Promise<void> {
     );
     if (result.rows[0]?.waiting === true) return;
     if (Date.now() > deadline) throw new Error(`${label}: the backend never waited for a lock`);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
+/** Resolves once backend `pid` is blocked by backend `blocker` — by that one, not by an earlier one. */
+async function untilBlockedBy(pid: number, blocker: number, label: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const result = await watch.db.execute<{ blocked: boolean }>(
+      sql`SELECT ${blocker}::int = ANY(pg_blocking_pids(${pid}::int)) AS blocked`,
+    );
+    if (result.rows[0]?.blocked === true) return;
+    if (Date.now() > deadline) throw new Error(`${label}: the backend was never blocked by ${blocker}`);
     await new Promise((resolve) => setTimeout(resolve, 15));
   }
 }
@@ -152,6 +165,154 @@ describe("the CSAM lock beside a purge of the same owner", () => {
     );
     await a.db.delete(nodes).where(eq(nodes.id, file.id));
     await a.db.delete(nodes).where(eq(nodes.id, folder.id));
+  });
+});
+
+describe("the CSAM lock holds every uploader: user rows lowest id first, then the node", () => {
+  const lockUserRow = (tx: Tx, id: string) =>
+    tx.select({ id: user.id }).from(user).where(eq(user.id, id)).for("update");
+  const held = async (ids: string[]) =>
+    (await watch.db.select({ id: user.id, held: user.legalHold }).from(user).where(inArray(user.id, ids)))
+      .filter((u) => u.held)
+      .map((u) => u.id)
+      .sort();
+  const address = (nodeId: string, uploaderId: string) =>
+    watch.db.insert(uploadIps).values({
+      nodeId,
+      versionId: `v-${rand()}`,
+      uploaderId,
+      ipEncrypted: Buffer.from("c"),
+      iv: Buffer.from("i"),
+      keyVersion: 1,
+    });
+
+  // Two files whose owner and uploader are the other way round. One lock has taken its first
+  // user row (the lower id) and stops; the other starts. Owner-first, the second would take ITS
+  // owner (the higher id) and wait for the lower one, the first would then wait for the higher:
+  // a deadlock. Lowest-first, the second waits at its first row holding nothing.
+  it("two locks on files with owner and uploader swapped never deadlock", async () => {
+    const [lo, hi] = [await makeUser(a.db), await makeUser(a.db)].sort() as [string, string];
+    const fileOfLo = await makeFile(a.db, lo, null, `lo-${rand()}.jpg`, { createdBy: hi });
+    const fileOfHi = await makeFile(a.db, hi, null, `hi-${rand()}.jpg`, { createdBy: lo });
+    const secondPid = gate<number>();
+    const firstRowHeld = gate();
+
+    const first = settle(
+      a.db.transaction(async (tx) => {
+        // Where the lock on `fileOfLo` stands after its first step.
+        await lockUserRow(tx, lo);
+        firstRowHeld.open();
+        await untilWaitingForLock(await secondPid.opened, "the second lock");
+        return lockSuspectedCsam(tx, fileOfLo.id, { source: "photodna" });
+      }),
+    );
+    const second = settle(
+      b.db.transaction(async (tx) => {
+        await firstRowHeld.opened;
+        secondPid.open(await pidOf(tx));
+        return lockSuspectedCsam(tx, fileOfHi.id, { source: "photodna" });
+      }),
+    );
+    const [one, two] = await Promise.all([first, second]);
+    expect(sqlState(one), "the first lock was not a deadlock victim").toBeNull();
+    expect(sqlState(two), "the second lock was not a deadlock victim").toBeNull();
+    expect(one).toMatchObject({ ok: true, value: { ownerId: lo } });
+    expect(two).toMatchObject({ ok: true, value: { ownerId: hi } });
+    expect(await held([lo, hi])).toEqual([lo, hi]);
+    for (const file of [fileOfLo, fileOfHi]) {
+      expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    }
+  });
+
+  // The set of uploaders is read before any lock. While the lock waits for the owner's row, a new
+  // uploader's version is recorded: the locked re-read sees it, the locks are released and taken
+  // again for the larger set, and the newcomer is held.
+  it("an uploader who appears while the lock is waiting is held too", async () => {
+    const owner = await makeUser(a.db);
+    const newcomer = await makeUser(a.db);
+    const file = await makeFile(a.db, owner, null, `grow-${rand()}.jpg`);
+    const lockPid = gate<number>();
+    const ownerRowHeld = gate();
+
+    const blocker = settle(
+      a.db.transaction(async (tx) => {
+        await lockUserRow(tx, owner);
+        ownerRowHeld.open();
+        await untilWaitingForLock(await lockPid.opened, "csam lock");
+        await address(file.id, newcomer);
+      }),
+    );
+    const lock = settle(
+      b.db.transaction(async (tx) => {
+        await ownerRowHeld.opened;
+        lockPid.open(await pidOf(tx));
+        return lockSuspectedCsam(tx, file.id, { source: "system" });
+      }),
+    );
+    const [blocked, locked] = await Promise.all([blocker, lock]);
+    expect(blocked.ok).toBe(true);
+    expect(locked).toMatchObject({ ok: true, value: { ownerId: owner } });
+    expect(await held([owner, newcomer])).toEqual([owner, newcomer].sort());
+    expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+  });
+
+  // It retries ONCE. A set that grows again while the second attempt waits fails the whole
+  // transaction — nothing is written — and the next call (a redelivery) locks all of them.
+  it("a set that grows twice fails the lock with nothing written; the next call holds everyone", async () => {
+    const c = openDb();
+    try {
+      const owner = await makeUser(a.db);
+      const [n1, n2] = [await makeUser(a.db), await makeUser(a.db)];
+      const file = await makeFile(a.db, owner, null, `twice-${rand()}.jpg`);
+      const lockPid = gate<number>();
+      const ownerRowHeld = gate();
+      const n1RowHeld = gate<number>();
+      const releaseN1 = gate();
+
+      const holdsN1 = settle(
+        c.db.transaction(async (tx) => {
+          await lockUserRow(tx, n1);
+          n1RowHeld.open(await pidOf(tx));
+          await releaseN1.opened;
+        }),
+      );
+      const holdsOwner = settle(
+        a.db.transaction(async (tx) => {
+          await lockUserRow(tx, owner);
+          ownerRowHeld.open();
+          await untilWaitingForLock(await lockPid.opened, "csam lock, first attempt");
+          await address(file.id, n1);
+        }),
+      );
+      const lock = settle(
+        b.db.transaction(async (tx) => {
+          await ownerRowHeld.opened;
+          await n1RowHeld.opened;
+          lockPid.open(await pidOf(tx));
+          return lockSuspectedCsam(tx, file.id, { source: "system" });
+        }),
+      );
+      expect((await holdsOwner).ok).toBe(true);
+      // The second attempt now wants n1's row as well, and waits for it.
+      await untilBlockedBy(await lockPid.opened, await n1RowHeld.opened, "csam lock, second attempt");
+      await address(file.id, n2);
+      releaseN1.open();
+      expect((await holdsN1).ok).toBe(true);
+
+      const locked = await lock;
+      expect(locked.ok).toBe(false);
+      expect(sqlState(locked)).toBeNull();
+      expect(String(locked.ok ? "" : locked.error)).toContain("grew twice");
+      expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "clean", legalHold: false });
+      expect(await held([owner, n1, n2])).toEqual([]);
+      expect(await a.db.select().from(reports).where(eq(reports.nodeId, file.id))).toEqual([]);
+
+      // The redelivery: nothing is moving any more.
+      expect(await lockSuspectedCsam(a.db, file.id, { source: "system" })).toMatchObject({ ownerId: owner });
+      expect(await held([owner, n1, n2])).toEqual([owner, n1, n2].sort());
+    } finally {
+      await c.close();
+    }
   });
 });
 

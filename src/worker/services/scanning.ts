@@ -426,7 +426,8 @@ export async function sweepCsamAlerts(
  * the admin console all call this, so there is one code path.
  *
  * AWAITED: only the database half (db/queries/moderation.ts) — the node becomes
- * `suspected_csam`, the node and its owner go on legal hold, the node's links are paused, its
+ * `suspected_csam`, the node, its owner and every uploader of any version of it go on legal
+ * hold, the node's links are paused, its
  * upload addresses are held, its hash is blocklisted and a report is filed. When this function
  * resolves the node IS locked; nothing after the lock can reject it, and the caller's answer
  * takes no longer for this reason than for another (no mail is waited for).

@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -7,6 +7,7 @@ import { getById, pauseLinks } from "../../../src/worker/db/queries/links";
 import {
   closeNotice,
   csamReportsToAnnounce,
+  csamSubjects,
   dismissReview,
   insertReport,
   lockSuspectedCsam,
@@ -16,17 +17,18 @@ import {
   setUserLegalHold,
   takedownNode,
 } from "../../../src/worker/db/queries/moderation";
-import { getNode } from "../../../src/worker/db/queries/nodes";
+import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import {
   dmcaNotices,
   downloadLedger,
   nodes,
+  nodeVersions,
   reports,
   type ScanStatus,
   uploadIps,
   user,
 } from "../../../src/worker/db/schema";
-import { makeFile, makeLink, makeUser, openDb, rand } from "./_helpers";
+import { baId, makeFile, makeFolder, makeLink, makeUser, openDb, rand } from "./_helpers";
 
 let db: Db;
 let close: () => Promise<void>;
@@ -250,6 +252,135 @@ describe("lockSuspectedCsam", () => {
     expect(account!.legalHold).toBe(false);
     expect((await getById(db, link.id))!.pauseReasons).toEqual([]);
     expect(await lookup(db, file.sha256!)).toBeNull();
+  });
+
+  const heldUsers = async (ids: string[]) =>
+    (
+      await db
+        .select({ id: user.id })
+        .from(user)
+        .where(and(inArray(user.id, ids), eq(user.legalHold, true)))
+    )
+      .map((r) => r.id)
+      .sort();
+  const ipRow = (nodeId: string, uploaderId: string, versionId = "v") => ({
+    nodeId,
+    versionId,
+    uploaderId,
+    ipEncrypted: Buffer.from("c"),
+    iv: Buffer.from("i"),
+    keyVersion: 1,
+  });
+
+  /**
+   * Owner O's folder; editor E1 uploads a file into it, editor E2 replaces its contents. E3 is on
+   * record only through an uploader address (their version is long purged). `bystander` has
+   * nothing to do with the file.
+   */
+  async function replacedByEditors() {
+    const owner = await makeUser(db);
+    const [e1, e2, e3, bystander] = [
+      await makeUser(db),
+      await makeUser(db),
+      await makeUser(db),
+      await makeUser(db),
+    ];
+    const folder = await makeFolder(db, owner, null, `shared-${rand()}`);
+    const file = await makeFile(db, owner, folder.id, `up-${rand()}.jpg`, { createdBy: e1 });
+    await replaceVersion(db, file.id, {
+      r2Key: `u/${owner}/${file.id}/v2`,
+      versionId: "v2",
+      size: 9,
+      sha256: rand(32),
+      createdBy: e2,
+    });
+    await db.insert(uploadIps).values(ipRow(file.id, e3, "v0"));
+    return { owner, e1, e2, e3, bystander, folder, file };
+  }
+
+  it("holds every uploader of any version too: the editor who uploaded, the one who replaced, and one known only by an uploader address", async () => {
+    const f = await replacedByEditors();
+    const everyone = [f.owner, f.e1, f.e2, f.e3, f.bystander];
+    // Each is known through ONE column: E2 is the current version's uploader (`nodes`), E1 the
+    // replaced version's (`node_versions`), E3 only an address row's (`upload_ips`).
+    expect((await getNode(db, f.file.id))!.createdBy).toBe(f.e2);
+    expect(
+      (await db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, f.file.id))).map(
+        (v) => v.createdBy,
+      ),
+    ).toEqual([f.e1]);
+    expect(await heldUsers(everyone)).toEqual([]);
+
+    const subjects = await csamSubjects(db, f.file.id);
+    expect(subjects).toEqual({
+      nodeId: f.file.id,
+      ownerId: f.owner,
+      uploaderIds: [f.e1, f.e2, f.e3].sort(),
+    });
+
+    const result = await lockSuspectedCsam(db, f.file.id, { source: "photodna" });
+    expect(result).toEqual({ reportId: expect.any(String), ownerId: f.owner });
+    expect(await getNode(db, f.file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect(await heldUsers(everyone)).toEqual([f.owner, f.e1, f.e2, f.e3].sort());
+    // `csamSubjects` IS the set the lock held — what "Release holds" will release.
+    expect(await heldUsers(everyone)).toEqual(
+      [...new Set([subjects!.ownerId!, ...subjects!.uploaderIds])].sort(),
+    );
+    // Held is not banned.
+    const accounts = await db.select({ banned: user.banned }).from(user).where(inArray(user.id, everyone));
+    expect(accounts.every((u) => u.banned !== true)).toBe(true);
+    // The folder the file sits in is not the subject.
+    expect((await getNode(db, f.folder.id))!.legalHold).toBe(false);
+
+    // Idempotent: the same report, the same holds, the same subjects.
+    const again = await lockSuspectedCsam(db, f.file.id, { source: "admin" });
+    expect(again).toEqual(result);
+    expect(await heldUsers(everyone)).toEqual([f.owner, f.e1, f.e2, f.e3].sort());
+    expect(await csamSubjects(db, f.file.id)).toEqual(subjects);
+  });
+
+  it("the control: an owner who uploaded their own file — exactly the owner and the node are held", async () => {
+    const { file, owner } = await reported("clean");
+    const bystander = await makeUser(db);
+    const other = await makeFile(db, owner, null, `other-${rand()}.bin`);
+    await db.insert(uploadIps).values(ipRow(file.id, owner));
+    // An address row of the bystander for ANOTHER file of the same owner is not this file's.
+    await db.insert(uploadIps).values(ipRow(other.id, bystander));
+    expect(await csamSubjects(db, file.id)).toEqual({
+      nodeId: file.id,
+      ownerId: owner,
+      uploaderIds: [owner],
+    });
+    await lockSuspectedCsam(db, file.id, { source: "system" });
+    expect(await heldUsers([owner, bystander])).toEqual([owner]);
+    expect((await getNode(db, file.id))!.legalHold).toBe(true);
+    expect((await getNode(db, other.id))!.legalHold).toBe(false);
+  });
+
+  it("an uploader who is gone — anonymised, or an address row whose account was deleted — is skipped without a throw", async () => {
+    const owner = await makeUser(db);
+    const file = await makeFile(db, owner, null, `anon-${rand()}.bin`, { createdBy: null });
+    await db.insert(nodeVersions).values({
+      nodeId: file.id,
+      versionId: "old",
+      r2Key: `k/${rand()}`,
+      size: 1,
+      createdBy: null,
+      purgeAfter: new Date(Date.now() + 86_400_000),
+    });
+    const goneId = baId();
+    await db.insert(uploadIps).values(ipRow(file.id, goneId));
+    expect(await csamSubjects(db, file.id)).toEqual({ nodeId: file.id, ownerId: owner, uploaderIds: [] });
+    expect(await lockSuspectedCsam(db, file.id, { source: "system" })).toMatchObject({ ownerId: owner });
+    expect(await heldUsers([owner])).toEqual([owner]);
+    // The gone uploader's address is still held with the node's rows.
+    expect((await db.select().from(uploadIps).where(eq(uploadIps.nodeId, file.id)))[0]!.legalHold).toBe(true);
+    expect(await db.select().from(user).where(eq(user.id, goneId))).toEqual([]);
+  });
+
+  it("csamSubjects is null for an unknown or malformed id", async () => {
+    expect(await csamSubjects(db, uuidv7())).toBeNull();
+    expect(await csamSubjects(db, "nope")).toBeNull();
   });
 });
 
