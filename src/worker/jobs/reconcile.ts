@@ -40,7 +40,9 @@ import { reconcileUsedBytes } from "../db/queries/quota";
 import { knownVersions, referencedKeys, userIdsAfter } from "../db/queries/trash-jobs";
 import { captureError } from "../sentry";
 import { auditInTx } from "../services/audit";
+import { sendOperatorCritical } from "../services/email";
 import { coreFor, type BackgroundContext } from "../services/request-context";
+import { adminListOf } from "../services/signup-policy";
 import { AVATAR_PREFIX, type ListedObject, storage, THUMB_PREFIX, UPLOAD_PREFIX } from "../services/storage";
 import type { Job } from "./index";
 
@@ -118,19 +120,28 @@ export async function checkGeneration(bg: BackgroundContext, database: number): 
   }
   if (object <= database) return "ok";
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
-  alertRollback();
+  await alertRollback(bg);
   return "rollback";
 }
 
-/** The operator's alert for a database that is older than the object store. ONE call site. */
-function alertRollback(): void {
+/**
+ * The operator's alert for a database that is older than the object store. ONE call site: the
+ * critical mail to every operator (sent at once, never counted or coalesced), and the report.
+ * Awaited: nothing a job starts may outlive it. A mail that cannot be sent changes nothing —
+ * the sweep stays stopped, and the next run alerts again.
+ */
+async function alertRollback(bg: BackgroundContext): Promise<void> {
   captureError(
     new Error("reconcile: the database is older than the object store; orphan deletion is stopped"),
-    {
-      kind: "job",
-      job: "reconcile",
-      reason: "rollback_detected",
-    },
+    { kind: "job", job: "reconcile", reason: "rollback_detected" },
+  );
+  const operators = [...adminListOf(bg.env).addresses];
+  await Promise.all(
+    operators.map((to) =>
+      sendOperatorCritical(bg, { to, event: "database_rollback" }).catch((error: unknown) => {
+        captureError(error, { kind: "job", job: "reconcile" });
+      }),
+    ),
   );
 }
 

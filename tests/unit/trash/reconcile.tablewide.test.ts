@@ -27,9 +27,10 @@ import {
 } from "../../../src/worker/jobs/reconcile";
 import { nameKeyOf } from "../../../src/worker/services/filename";
 import { captureError } from "../../../src/worker/sentry";
+import { sendOperatorCritical } from "../../../src/worker/services/email";
 import { registerCoreDeps } from "../../../src/worker/services/request-context";
 import { avatarKey, keyFor, thumbKey } from "../../../src/worker/services/storage";
-import { realCore } from "../auth/helpers";
+import { ADMIN_EMAIL, realCore } from "../auth/helpers";
 import {
   audits,
   cronEvent,
@@ -56,6 +57,11 @@ import {
 vi.mock("../../../src/worker/sentry", async (original) => {
   const real = await original<typeof import("../../../src/worker/sentry")>();
   return { ...real, captureError: vi.fn(real.captureError) };
+});
+
+vi.mock("../../../src/worker/services/email", async (original) => {
+  const real = await original<typeof import("../../../src/worker/services/email")>();
+  return { ...real, sendOperatorCritical: vi.fn(real.sendOperatorCritical) };
 });
 
 const HOUR = 3_600_000;
@@ -380,7 +386,12 @@ describe("reconcile: the orphan sweep", () => {
   describe("the rollback detector: a generation number in the database and in the object store", () => {
     const alerts = () =>
       vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "rollback_detected");
-    beforeEach(() => vi.mocked(captureError).mockClear());
+    /** The critical mails of the runs so far: `[to, event]`. */
+    const mails = () => vi.mocked(sendOperatorCritical).mock.calls.map(([, d]) => [d.to, d.event]);
+    beforeEach(() => {
+      vi.mocked(captureError).mockClear();
+      vi.mocked(sendOperatorCritical).mockClear();
+    });
     const run = (ctx = jobContext()) => runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
 
     it("a database that has gone back in time: no orphan is deleted, by this run or the next; an alert each run; until an operator moves the number", async () => {
@@ -396,6 +407,8 @@ describe("reconcile: the orphan sweep", () => {
       expect(ctx.outcomes("reconcile")).toContain("rollback_detected");
       expect(ctx.outcomes("reconcile")).not.toContain("orphans");
       expect(alerts()).toHaveLength(1);
+      // One critical mail, to the operator, of the rollback's own kind.
+      expect(mails()).toEqual([[ADMIN_EMAIL, "database_rollback"]]);
       // The job never counts a rolled-back database up by itself.
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "7"]);
       // The quota half is not gated.
@@ -405,15 +418,18 @@ describe("reconcile: the orphan sweep", () => {
       expect(await present(p.orphans)).toEqual(p.orphans);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "7"]);
       expect(alerts()).toHaveLength(2);
+      expect(mails()).toHaveLength(2);
 
       // The operator has looked, and moves the database's number up to the object's.
       await generations(7, 7);
       vi.mocked(captureError).mockClear();
+      vi.mocked(sendOperatorCritical).mockClear();
       const after = await run();
       expect(after.generation).toBe("ok");
       expect(await present(p.orphans)).toEqual([]);
       expect(await present(p.referenced)).toEqual(p.referenced);
       expect(alerts()).toHaveLength(0);
+      expect(mails()).toEqual([]);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([8, "8"]);
       await env.FILES.delete(p.odd);
     });
