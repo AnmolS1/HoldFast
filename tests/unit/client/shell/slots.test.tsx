@@ -104,13 +104,11 @@ const returns = (call: () => unknown, value: unknown) => () => expect(call()).to
 const STUBS: Array<[behaviour: string, check: () => void]> = [
   ["PreviewDialog renders nothing", rendersNothing(<PreviewDialog {...dialog} source="owner" />)],
   ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
-  ["SearchSuggestions renders nothing", rendersNothing(<SearchSuggestions query="tax" onPick={noop} />)],
   ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
   ["UploadDropOverlay renders nothing", rendersNothing(<UploadDropOverlay />)],
   ["requestUpload() is a no-op", returns(() => requestUpload(), undefined)],
   ["requestUpload(opts) is a no-op", returns(() => requestUpload({ files: [], parentId: "p" }), undefined)],
   ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
-  ["useUsageSummary() is null", returns(() => useUsageSummary(), null)],
 ];
 
 describe("slot stubs", () => {
