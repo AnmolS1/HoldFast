@@ -5,6 +5,7 @@ import Box from "@mui/material/Box";
 import IconButton from "@mui/material/IconButton";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
+import MenuList from "@mui/material/MenuList";
 import { MoreHorizontal, X } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -290,9 +291,7 @@ export function TrashPage() {
           title={menu?.item.name ?? ""}
           subtitle={menu?.item.secondary}
         >
-          <Box component="ul" role="menu" sx={{ listStyle: "none", margin: 0, padding: 0 }}>
-            {menuActions}
-          </Box>
+          <MenuList aria-label={menu?.item.name}>{menuActions}</MenuList>
         </BottomSheet>
       )}
       <ConfirmDialog
