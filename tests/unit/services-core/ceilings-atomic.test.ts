@@ -12,6 +12,8 @@ import { lockUser } from "../../../src/worker/db/queries/users";
 import { shareLinks, uploads } from "../../../src/worker/db/schema";
 import * as ceilings from "../../../src/worker/services/ceilings";
 import {
+  ceilingExceeded,
+  checkCeiling,
   consumeCeiling,
   enforceUploadCeilings,
   recordUsage,
@@ -21,7 +23,7 @@ import {
 import { db, type AppEnv } from "../../../src/worker/services/request-context";
 import { keyFor } from "../../../src/worker/services/storage";
 import { backendPid, gate, makeFolder, makeUser, rand, testDb, untilBlockedBy } from "./helpers";
-import { invoke, value, type InvokeOptions } from "./request";
+import { consumeOrThrow, invoke, value, type InvokeOptions } from "./request";
 
 /** Small limits, so that "fits alone, not together" is a handful of units. Quota 0: no scaling. */
 const SMALL: Settings = {
@@ -147,6 +149,96 @@ function afterFirstRowLock(tx: Tx, pause: () => Promise<void>): Tx {
   });
 }
 
+describe("consumeCeiling answers; the caller looks", () => {
+  it("ok: true means CHARGED; a refusal says what was refused and writes nothing", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const answers = await value(
+      null,
+      async (c) => [
+        await consumeCeiling(c, "share_user", subject, { count: 2 }),
+        await consumeCeiling(c, "share_user", subject, { count: 2 }),
+        await consumeCeiling(c, "share_user", subject, { count: 1 }),
+        await consumeCeiling(c, "share_user", subject, { count: 1 }),
+      ],
+      small,
+    );
+    expect(answers[0]).toEqual({ ok: true });
+    expect(answers[1]).toMatchObject({
+      ok: false,
+      kind: "share_user",
+      dimension: "count",
+      limit: 3,
+      used: 2,
+    });
+    expect(answers[1]!.ok === false && answers[1]!.retryAfterSec).toBeGreaterThan(0);
+    expect(answers[2]).toEqual({ ok: true });
+    expect(answers[3]).toMatchObject({ ok: false, used: 3 });
+    expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 3 });
+  });
+
+  it("ceilingExceeded is the 429 of a refusal: details and Retry-After", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    const thrown = await invoke(
+      null,
+      async (c) => {
+        const result = await consumeCeiling(c, "transform_user", subject, { count: 4 });
+        if (!result.ok) throw ceilingExceeded(result);
+      },
+      { ...small, headers: { "x-holdfast-test-now": "2026-10-12T23:59:30.000Z" } },
+    );
+    expect(thrown).toMatchObject({
+      ok: false,
+      status: 429,
+      error: "ceiling_exceeded",
+      details: { kind: "transform_user", dimension: "count" },
+    });
+    expect(thrown.headers.get("retry-after")).toBe("30");
+  });
+
+  it("a bytes-only consume adds no count, and a count-only consume no bytes", async () => {
+    const subject = { id: subjectId(), account: oldAccount };
+    await value(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
+    await value(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 100 }), small);
+    expect(await todayTotals(testDb(), "link", subject.id)).toEqual({ bytes: 200, count: 0 });
+    await value(null, (c) => consumeCeiling(c, "download_link", subject, { count: 1 }), small);
+    expect(await todayTotals(testDb(), "link", subject.id)).toEqual({ bytes: 200, count: 1 });
+  });
+
+  it("a preview refuses nothing and counts no metric; an enforcing refusal counts exactly one", async () => {
+    const points: { blobs: string[] }[] = [];
+    const recording = {
+      METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) },
+    };
+    const ceilingPoints = () =>
+      points.filter((point) => point.blobs[0] === "ceiling").map((point) => point.blobs.slice(1, 4));
+    const owner = await makeUser();
+    const subject = { id: owner.id, account: oldAccount };
+    const options = { ...small, env: recording };
+
+    const preview = await value(null, (c) => checkCeiling(c, "share_user", subject, { count: 4 }), options);
+    expect(preview).toMatchObject({ ok: false, dimension: "count" });
+    expect(ceilingPoints()).toEqual([]);
+
+    await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 4 }), options);
+    expect(ceilingPoints()).toEqual([["refused", "share_user", "count"]]);
+    await value(null, (c) => consumeCeiling(c, "share_user", subject, { count: 3 }), options);
+    expect(ceilingPoints(), "a charge is not a refusal").toHaveLength(1);
+
+    await invoke(
+      null,
+      (c) =>
+        db(c).transaction((tx) =>
+          enforceUploadCeilings(c, { owner: subject }, { bytes: 1001, count: 1 }, { tx }),
+        ),
+      options,
+    );
+    expect(ceilingPoints()).toEqual([
+      ["refused", "share_user", "count"],
+      ["refused", "upload_user", "bytes"],
+    ]);
+  });
+});
+
 describe("consumeCeiling: the ledger-only kinds", () => {
   it("two consumes that each fit alone but not together: exactly one succeeds, the ledger holds one amount", async () => {
     const ledger = {
@@ -166,8 +258,8 @@ describe("consumeCeiling: the ledger-only kinds", () => {
       // 600 of 1000 bytes, or 2 of 3: one fits, two do not.
       const amount = byBytes ? { bytes: 600 } : { count: 2 };
       const [a, b] = await Promise.all([
-        invoke(null, (c) => consumeCeiling(c, kind, subject, amount), small),
-        invoke(null, (c) => consumeCeiling(c, kind, subject, amount), small),
+        invoke(null, (c) => consumeOrThrow(c, kind, subject, amount), small),
+        invoke(null, (c) => consumeOrThrow(c, kind, subject, amount), small),
       ]);
       expect([a.ok, b.ok].sort(), kind).toEqual([false, true]);
       expect(
@@ -183,7 +275,7 @@ describe("consumeCeiling: the ledger-only kinds", () => {
   it("a link's download count and its bytes are one consume: both dimensions or neither", async () => {
     const subject = { id: subjectId(), account: oldAccount };
     const consume = (bytes: number, count: number) =>
-      invoke(null, (c) => consumeCeiling(c, "download_link", subject, { bytes, count }), small);
+      invoke(null, (c) => consumeOrThrow(c, "download_link", subject, { bytes, count }), small);
     expect(await consume(400, 1)).toMatchObject({ ok: true });
     // The bytes would fit, the count would not after two more.
     expect(await consume(100, 2)).toMatchObject({ ok: true });
@@ -200,7 +292,7 @@ describe("consumeCeiling: the ledger-only kinds", () => {
     expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 50 });
     // …after which the enforcing call refuses, as it should.
     expect(
-      await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
+      await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
     ).toMatchObject({
       status: 429,
     });
@@ -241,6 +333,7 @@ describe("what cannot be written", () => {
     // There is no check-then-record call to import: the single-kind enforcer is not exported.
     expect(Object.keys(ceilings).sort()).toEqual([
       "CEILING_KINDS",
+      "ceilingExceeded",
       "checkCeiling",
       "consumeCeiling",
       "effectiveLimits",
@@ -555,8 +648,8 @@ describe("download_owner: everything one owner's public links serve in a day", (
       null,
       async (c) => {
         // What the files host does for a link download: the link's own ceiling, and the owner's.
-        await consumeCeiling(c, "download_owner", { id: ownerId, account: oldAccount }, { bytes });
-        await consumeCeiling(c, "download_link", { id: linkId, account: oldAccount }, { bytes });
+        await consumeOrThrow(c, "download_owner", { id: ownerId, account: oldAccount }, { bytes });
+        await consumeOrThrow(c, "download_link", { id: linkId, account: oldAccount }, { bytes });
       },
       owned,
     );
@@ -596,7 +689,7 @@ describe("download_owner: everything one owner's public links serve in a day", (
   it("a refusal is counted in the metric under its own kind", async () => {
     const points: { blobs: string[] }[] = [];
     const subject = { id: (await makeUser()).id, account: oldAccount };
-    await invoke(null, (c) => consumeCeiling(c, "download_owner", subject, { bytes: 1001 }), {
+    await invoke(null, (c) => consumeOrThrow(c, "download_owner", subject, { bytes: 1001 }), {
       ...owned,
       env: { METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) } },
     });
@@ -622,7 +715,7 @@ describe("link_user inside the caller's transaction", () => {
         null,
         (c) =>
           db(c).transaction(async (tx) => {
-            await consumeCeiling(c, "link_user", subject, { count: 1 }, { tx });
+            await consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx });
             await tx.insert(shareLinks).values(linkRow(folder.id, young.id));
             if (fail) throw new Error("the creation failed after the ceiling was consumed");
           }),
@@ -652,7 +745,7 @@ describe("link_user inside the caller's transaction", () => {
         null,
         (c) =>
           db(c).transaction(async (tx) => {
-            await consumeCeiling(c, "link_user", subject, { count: 1 }, { tx });
+            await consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx });
             await tx.insert(shareLinks).values(linkRow(folder.id, user.id));
           }),
         small,
@@ -668,7 +761,7 @@ describe("link_user inside the caller's transaction", () => {
     // NEW_ACCOUNT_MAX_LINKS - 1 live links already.
     for (let i = 0; i < 2; i++) await testDb().insert(shareLinks).values(linkRow(folder.id, young.id));
     const [a, b] = await race(
-      (c, tx) => consumeCeiling(c, "link_user", subject, { count: 1 }, { tx }),
+      (c, tx) => consumeOrThrow(c, "link_user", subject, { count: 1 }, { tx }),
       (tx) => tx.insert(shareLinks).values(linkRow(folder.id, young.id)),
       capped,
     );

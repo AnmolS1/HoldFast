@@ -10,7 +10,6 @@ import { shareLinks } from "../../../src/worker/db/schema";
 import {
   CEILING_KINDS,
   checkCeiling,
-  consumeCeiling,
   effectiveLimits,
   recordUsage,
   type CeilingKind,
@@ -18,7 +17,7 @@ import {
 } from "../../../src/worker/services/ceilings";
 import { makeLink } from "../auth/helpers";
 import { makeFolder, makeUpload, makeUser, rand, testDb } from "./helpers";
-import { invoke, value, type InvokeOptions } from "./request";
+import { consumeOrThrow, invoke, value, type InvokeOptions } from "./request";
 
 const NOW = new Date("2026-10-12T12:00:00.000Z");
 const OLD = { quotaBytes: 5_000_000_000, createdAt: new Date("2025-01-01T00:00:00.000Z") };
@@ -417,51 +416,12 @@ describe("link_user: the new-account cap on live links", () => {
 });
 
 describe("refusals", () => {
-  /** An Analytics Engine stand-in that keeps what is written to it. */
-  function metrics() {
-    const points: { blobs: string[] }[] = [];
-    return {
-      points,
-      env: { METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) } },
-    };
-  }
-  const ceilingPoints = (points: { blobs: string[] }[]) =>
-    points.filter((point) => point.blobs[0] === "ceiling");
-
-  it("a refusal emits exactly one ceiling metric with the kind and the dimension; a pass emits none", async () => {
-    const recorded = metrics();
-    const subject = { id: subjectId(), account: oldAccount };
-    await value(null, (c) => checkCeiling(c, "share_user", subject, { count: 3 }), {
-      ...small,
-      env: recorded.env,
-    });
-    expect(ceilingPoints(recorded.points)).toEqual([]);
-    await value(null, (c) => checkCeiling(c, "share_user", subject, { count: 4 }), {
-      ...small,
-      env: recorded.env,
-    });
-    const points = ceilingPoints(recorded.points);
-    expect(points).toHaveLength(1);
-    // blobs: [name, outcome, kind, reason, route, environment]
-    expect(points[0]!.blobs.slice(0, 4)).toEqual(["ceiling", "refused", "share_user", "count"]);
-
-    // A refused consume adds none of its own.
-    const enforced = metrics();
-    await invoke(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 5000 }), {
-      ...small,
-      env: enforced.env,
-    });
-    expect(ceilingPoints(enforced.points).map((point) => point.blobs.slice(1, 4))).toEqual([
-      ["refused", "download_link", "bytes"],
-    ]);
-  });
-
   it("a refusal is 429 ceiling_exceeded with details and Retry-After to 00:00 UTC", async () => {
     const subject = { id: subjectId(), account: oldAccount };
     const at = (iso: string): InvokeOptions => ({ ...small, headers: { "x-holdfast-test-now": iso } });
     const refused = await invoke(
       null,
-      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T23:59:30.000Z"),
     );
     expect(refused).toMatchObject({
@@ -473,19 +433,19 @@ describe("refusals", () => {
     expect(refused.headers.get("retry-after")).toBe("30");
     const midday = await invoke(
       null,
-      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T12:00:00.000Z"),
     );
     expect(midday.headers.get("retry-after")).toBe("43200");
     const midnight = await invoke(
       null,
-      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeOrThrow(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T00:00:00.000Z"),
     );
     expect(midnight.headers.get("retry-after")).toBe("86400");
     // The control: within the limit nothing is thrown.
     expect(
-      await invoke(null, (c) => consumeCeiling(c, "transform_user", subject, { count: 3 }), small),
+      await invoke(null, (c) => consumeOrThrow(c, "transform_user", subject, { count: 3 }), small),
     ).toMatchObject({
       ok: true,
     });
@@ -509,12 +469,12 @@ describe("recordUsage and consumeCeiling", () => {
     const subject = { id: subjectId(), account: oldAccount };
     for (let i = 0; i < 3; i++) {
       expect(
-        await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
+        await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
       ).toMatchObject({
         ok: true,
       });
     }
-    const refused = await invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small);
+    const refused = await invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small);
     expect(refused).toMatchObject({
       status: 429,
       error: "ceiling_exceeded",
@@ -528,7 +488,7 @@ describe("recordUsage and consumeCeiling", () => {
     const subject = { id: subjectId(), account: oldAccount };
     const results = await Promise.all(
       Array.from({ length: 8 }, () =>
-        invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
+        invoke(null, (c) => consumeOrThrow(c, "share_user", subject, { count: 1 }), small),
       ),
     );
     expect(results.filter((result) => result.ok)).toHaveLength(3);

@@ -40,8 +40,9 @@
 //
 //   the ledger-only kinds        consumeCeiling(c, kind, subject, amount)
 //   (downloads, transforms,      ONE statement that adds the amount only if the day's total stays
-//   shares)                      within the limit. The amount is charged up front: a download
-//                                that is then aborted stays charged (conservative, on purpose).
+//   shares)                      within the limit; it ANSWERS `{ ok: true }` (charged) or the
+//                                refusal, and the caller must look. The amount is charged up
+//                                front: a download that is then aborted stays charged.
 //   the upload kinds             enforceUploadCeilings(c, { owner, editor? }, amount, { tx })
 //                                ONE call for one upload: `upload_user` for the owner being
 //                                filled and, for an editor in someone else's tree, `upload_editor`
@@ -62,7 +63,8 @@
 // `checkCeiling` remains as a READ-ONLY PREVIEW ("this will not fit"). It authorises nothing.
 // `recordUsage` adds to the ledger and enforces nothing: it is for corrections.
 //
-// Every refusal emits one `ceiling` metric (kind, reason = the dimension). Callers add none.
+// Every refusal of an ENFORCING call (`consumeCeiling`, `enforceUploadCeilings`) emits one
+// `ceiling` metric (kind, reason = the dimension). Callers add none; a preview emits none.
 
 import type { Context } from "hono";
 import type { CeilingKey } from "../../shared/constants";
@@ -258,15 +260,21 @@ function secondsToMidnightUTC(at: Date): number {
   return Math.max(1, Math.ceil((next - at.getTime()) / 1000));
 }
 
-function refuse(
+function refusal(
   c: Context<AppEnv>,
   kind: CeilingKind,
   dimension: "bytes" | "count",
   limit: number,
   used: number,
-): CeilingResult {
-  writeMetric(c.env, "ceiling", { kind, outcome: "refused", reason: dimension });
+): Extract<CeilingResult, { ok: false }> {
   return { ok: false, kind, dimension, limit, used, retryAfterSec: secondsToMidnightUTC(now(c)) };
+}
+
+/** One `ceiling` metric per refusal of an ENFORCING call. A preview refuses nothing and counts nothing. */
+function counted<R extends CeilingResult>(c: Context<AppEnv>, result: R): R {
+  if (!result.ok)
+    writeMetric(c.env, "ceiling", { kind: result.kind, outcome: "refused", reason: result.dimension });
+  return result;
 }
 
 /** The new-account cap on live links, or null when it does not apply or is not reached. */
@@ -298,7 +306,7 @@ async function evaluate(
 
   if (kind === "link_user") {
     const cap = await liveLinkCap(c, exec, stored, subject);
-    if (cap) return refuse(c, kind, "count", cap.limit, cap.used);
+    if (cap) return refusal(c, kind, "count", cap.limit, cap.used);
   }
 
   const used = await todayTotals(exec, rule.subject, subject.id);
@@ -313,7 +321,7 @@ async function evaluate(
   for (const dimension of ["bytes", "count"] as const) {
     const limit = limits[dimension];
     if (limit !== undefined && used[dimension] + add[dimension] > limit) {
-      return refuse(c, kind, dimension, limit, used[dimension]);
+      return refusal(c, kind, dimension, limit, used[dimension]);
     }
   }
   return { ok: true };
@@ -323,7 +331,7 @@ async function evaluate(
  * A READ-ONLY PREVIEW: would `amount` more of `kind` still fit today? For a route that wants to
  * say "this will not fit" before doing work. IT AUTHORISES NOTHING — another request can use the
  * room before this one acts. What admits is `consumeCeiling` / `enforceUploadCeilings`.
- * Emits the refusal metric.
+ * Emits no metric: it refused nothing.
  */
 export async function checkCeiling(
   c: Context<AppEnv>,
@@ -334,8 +342,11 @@ export async function checkCeiling(
   return evaluate(c, db(c), kind, subject, amount);
 }
 
-function exceeded(result: CeilingResult): AppError {
-  if (result.ok) throw new Error("ceilings: not a refusal");
+/**
+ * The `429 ceiling_exceeded` of a refusal: `Retry-After` to 00:00 UTC, details `{ kind, dimension }`.
+ * What a caller throws when `consumeCeiling` answered `ok: false`.
+ */
+export function ceilingExceeded(result: Extract<CeilingResult, { ok: false }>): AppError {
   return new AppError(
     "ceiling_exceeded",
     undefined,
@@ -380,11 +391,11 @@ export async function enforceUploadCeilings(
   const tx = requireTx("upload_user", opts);
   const editor = subjects.editor && subjects.editor.id !== subjects.owner.id ? subjects.editor : null;
   await lockUsers(tx, editor ? [subjects.owner.id, editor.id] : [subjects.owner.id]);
-  const forOwner = await evaluate(c, tx, "upload_user", subjects.owner, amount);
-  if (!forOwner.ok) throw exceeded(forOwner);
+  const forOwner = counted(c, await evaluate(c, tx, "upload_user", subjects.owner, amount));
+  if (!forOwner.ok) throw ceilingExceeded(forOwner);
   if (editor) {
-    const forEditor = await evaluate(c, tx, "upload_editor", editor, amount);
-    if (!forEditor.ok) throw exceeded(forEditor);
+    const forEditor = counted(c, await evaluate(c, tx, "upload_editor", editor, amount));
+    if (!forEditor.ok) throw ceilingExceeded(forEditor);
   }
 }
 
@@ -406,37 +417,43 @@ export async function recordUsage(
 
 /**
  * Check AND record in one statement: the amount is added only if today's total stays within the
- * limit, so requests that run together cannot take the counter past it. Throws
- * `429 ceiling_exceeded` (`Retry-After` to 00:00 UTC) otherwise. THE enforcing call for the
- * ledger-only kinds. The amount is charged up front: what is then not used stays charged.
+ * limit on every dimension, so requests that run together cannot take the counter past it.
+ * THE enforcing call for the ledger-only kinds.
+ *
+ * Answers `{ ok: true }` — CHARGED — or the refusal, with nothing written. THE CALLER MUST LOOK AT
+ * THE ANSWER: on `ok: false` nothing may be served or created (`throw ceilingExceeded(result)`).
+ * The amount is charged up front: a download that is then aborted stays charged.
+ * A bytes-only consume adds a count of 0, and a count-only consume 0 bytes.
  *
  * `link_user` also has the new-account cap on LIVE links, which is a count of rows: that form
  * runs in the caller's transaction (`{ tx }`), takes the user's row lock itself, counts and adds
- * through `tx` — and the caller inserts the link in the same transaction.
+ * through `tx` — and the caller inserts the link in the same transaction (and, on a refusal,
+ * throws, so that nothing of it stays).
  */
 export async function consumeCeiling(
   c: Context<AppEnv>,
   kind: LedgerOnlyKind,
   subject: CeilingSubject,
   amount: Amount,
-): Promise<void>;
+): Promise<CeilingResult>;
 export async function consumeCeiling(
   c: Context<AppEnv>,
   kind: "link_user",
   subject: CeilingSubject,
   amount: Amount,
   opts: { tx: Tx },
-): Promise<void>;
+): Promise<CeilingResult>;
 export async function consumeCeiling(
   c: Context<AppEnv>,
   kind: LedgerOnlyKind | "link_user",
   subject: CeilingSubject,
   amount: Amount,
   opts?: { tx: Tx },
-): Promise<void> {
+): Promise<CeilingResult> {
   const rule = RULES[kind];
-  if (!rule || rule.open)
+  if (!rule || rule.open) {
     throw new Error(`ceilings: ${String(kind)} cannot be consumed: use enforceUploadCeilings`);
+  }
   const add = validAmount(amount);
   const stored = await settings(c);
   const limits = effectiveLimits(c.env, stored, kind, subject.account, now(c));
@@ -450,11 +467,23 @@ export async function consumeCeiling(
     await lockUsers(tx, [subject.id]);
     exec = tx;
     const cap = await liveLinkCap(c, tx, stored, subject);
-    if (cap) throw exceeded(refuse(c, kind, "count", cap.limit, cap.used));
+    if (cap) return counted(c, refusal(c, kind, "count", cap.limit, cap.used));
   }
-  if (await addUsageIfUnder(exec, utcDay(), rule.subject, subject.id, add, limits)) return;
+  // The zeros are passed explicitly: the ledger helper counts 1 when no count is given.
+  if (
+    await addUsageIfUnder(
+      exec,
+      utcDay(),
+      rule.subject,
+      subject.id,
+      { bytes: add.bytes, count: add.count },
+      limits,
+    )
+  ) {
+    return { ok: true };
+  }
   // Refused by the statement: say which dimension, from a fresh read.
   const used = await todayTotals(exec, rule.subject, subject.id);
   const dimension = limits.count !== undefined && used.count + add.count > limits.count ? "count" : "bytes";
-  throw exceeded(refuse(c, kind, dimension, limits[dimension] ?? 0, used[dimension]));
+  return counted(c, refusal(c, kind, dimension, limits[dimension] ?? 0, used[dimension]));
 }
