@@ -2,9 +2,10 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import { lookup } from "../../../src/worker/db/queries/blocklist";
-import { getById, pauseLinks } from "../../../src/worker/db/queries/links";
+import { lookup, upsert } from "../../../src/worker/db/queries/blocklist";
+import { getById, pauseLinks, unpauseLinks } from "../../../src/worker/db/queries/links";
 import {
+  clearSuspectedCsam,
   closeNotice,
   csamReportsToAnnounce,
   csamSubjects,
@@ -21,6 +22,7 @@ import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import {
   dmcaNotices,
   downloadLedger,
+  hashBlocklist,
   nodes,
   nodeVersions,
   reports,
@@ -381,6 +383,260 @@ describe("lockSuspectedCsam", () => {
   it("csamSubjects is null for an unknown or malformed id", async () => {
     expect(await csamSubjects(db, uuidv7())).toBeNull();
     expect(await csamSubjects(db, "nope")).toBeNull();
+  });
+});
+
+describe("clearSuspectedCsam", () => {
+  /** A locked file with a link, an uploader address and its open report. */
+  async function locked() {
+    const { file, link, owner } = await reported("clean");
+    await db.insert(uploadIps).values({
+      nodeId: file.id,
+      versionId: file.versionId!,
+      uploaderId: owner,
+      ipEncrypted: Buffer.from("c"),
+      iv: Buffer.from("i"),
+      keyVersion: 1,
+    });
+    const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "photodna" }))!;
+    return { file, link, owner, reportId };
+  }
+  const reportRow = async (id: string) => (await db.select().from(reports).where(eq(reports.id, id)))[0]!;
+
+  it("puts the node back to pending — never clean — and reports what it did", async () => {
+    const { file, reportId } = await locked();
+    expect(await clearSuspectedCsam(db, file.id)).toEqual({
+      cleared: true,
+      blocklistRemoved: true,
+      reportIds: [reportId],
+    });
+    expect(await getNode(db, file.id)).toMatchObject({ scanStatus: "pending", scanStatusPrev: null });
+  });
+
+  it("is refused for any node that is not suspected_csam, an unknown id and a malformed one: nothing is written", async () => {
+    for (const scanStatus of ["clean", "under_review", "infected", "pending", "skipped", "error"] as const) {
+      const { file, link, owner } = await reported(scanStatus);
+      // Everything the clear would touch, in the state a lock leaves it — but the node is not locked.
+      await db.update(nodes).set({ scanStatusPrev: "clean", legalHold: true }).where(eq(nodes.id, file.id));
+      await pauseLinks(db, { nodeId: file.id }, "moderation");
+      await upsert(db, { sha256: file.sha256!, reason: "csam", sourceNodeId: file.id });
+      const reportId = (await insertReport(db, {
+        nodeId: file.id,
+        ownerId: owner,
+        source: "system",
+        category: "csam",
+      }))!;
+
+      expect(await clearSuspectedCsam(db, file.id), scanStatus).toEqual({
+        cleared: false,
+        blocklistRemoved: false,
+        reportIds: [],
+      });
+      expect(await getNode(db, file.id), scanStatus).toMatchObject({ scanStatus, scanStatusPrev: "clean" });
+      expect((await getById(db, link.id))!.pauseReasons, scanStatus).toEqual(["moderation"]);
+      expect(await lookup(db, file.sha256!), scanStatus).toEqual({ reason: "csam", sourceNodeId: file.id });
+      expect(await reportRow(reportId), scanStatus).toMatchObject({ status: "open", resolvedAt: null });
+    }
+    const refused = { cleared: false, blocklistRemoved: false, reportIds: [] };
+    expect(await clearSuspectedCsam(db, uuidv7())).toEqual(refused);
+    expect(await clearSuspectedCsam(db, "nope")).toEqual(refused);
+  });
+
+  it("removes `moderation` from the node's links and nothing else: a link its owner also paused stays paused", async () => {
+    const { file, link, owner } = await locked();
+    const alsoByOwner = await makeLink(db, file.id, owner, { pauseReasons: ["owner"] });
+    await pauseLinks(db, { linkId: alsoByOwner.id }, "moderation");
+    const elsewhere = await makeFile(db, owner, null, `else-${rand()}.bin`);
+    const otherLink = await makeLink(db, elsewhere.id, owner, { pauseReasons: ["moderation"] });
+
+    await clearSuspectedCsam(db, file.id);
+    expect(await getById(db, link.id)).toMatchObject({ pauseReasons: [], pausedAt: null });
+    const kept = (await getById(db, alsoByOwner.id))!;
+    expect(kept.pauseReasons).toEqual(["owner"]);
+    expect(kept.pausedAt).not.toBeNull();
+    // The control: a link on another node keeps its own `moderation`.
+    expect((await getById(db, otherLink.id))!.pauseReasons).toEqual(["moderation"]);
+  });
+
+  it("leaves `moderation` on the links while the node or an ancestor is taken down — that takedown's restore removes it", async () => {
+    const owner = await makeUser(db);
+    const folder = await makeFolder(db, owner, null, `down-${rand()}`);
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const underFolder = await makeFile(db, owner, sub.id, `under-${rand()}.bin`);
+    const itself = await makeFile(db, owner, null, `itself-${rand()}.bin`);
+    const free = await makeFile(db, owner, null, `free-${rand()}.bin`);
+    const links: Record<string, string> = {};
+    for (const [name, node] of Object.entries({ underFolder, itself, free })) {
+      links[name] = (await makeLink(db, node.id, owner)).id;
+      await lockSuspectedCsam(db, node.id, { source: "system" });
+    }
+    await takedownNode(db, folder.id, { reason: "abuse", by: null });
+    await takedownNode(db, itself.id, { reason: "abuse", by: null });
+
+    for (const node of [underFolder, itself, free]) {
+      expect((await clearSuspectedCsam(db, node.id)).cleared).toBe(true);
+      expect((await getNode(db, node.id))!.scanStatus).toBe("pending");
+    }
+    expect((await getById(db, links.underFolder!))!.pauseReasons).toEqual(["moderation"]);
+    expect((await getById(db, links.itself!))!.pauseReasons).toEqual(["moderation"]);
+    // The control: the same clear on a node nothing has taken down resumes its link.
+    expect((await getById(db, links.free!))!.pauseReasons).toEqual([]);
+
+    // The takedown's own restore then removes the reason.
+    await restoreTakedown(db, folder.id);
+    await unpauseLinks(db, { subtreeOf: folder.id }, "moderation");
+    expect((await getById(db, links.underFolder!))!.pauseReasons).toEqual([]);
+  });
+
+  it("removes the blocklist entry only when this lock's row is the one there", async () => {
+    // This lock created it.
+    const mine = await locked();
+    expect(await lookup(db, mine.file.sha256!)).toEqual({ reason: "csam", sourceNodeId: mine.file.id });
+    expect((await clearSuspectedCsam(db, mine.file.id)).blocklistRemoved).toBe(true);
+    expect(await lookup(db, mine.file.sha256!)).toBeNull();
+
+    // The lock found a `csam` row from another node, or one added by hand (no source): it wrote
+    // nothing, so the clear removes nothing.
+    for (const sourceNodeId of [uuidv7(), null]) {
+      const { file } = await reported("clean");
+      await upsert(db, { sha256: file.sha256!, reason: "csam", sourceNodeId });
+      await lockSuspectedCsam(db, file.id, { source: "system" });
+      expect(await lookup(db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId });
+      expect(await clearSuspectedCsam(db, file.id)).toMatchObject({ cleared: true, blocklistRemoved: false });
+      expect(await lookup(db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId });
+    }
+
+    // This node's source but not the lock's reason (rewritten since): not the lock's row.
+    const rewritten = await locked();
+    await db
+      .update(hashBlocklist)
+      .set({ reason: "malware" })
+      .where(eq(hashBlocklist.sha256, rewritten.file.sha256!));
+    expect((await clearSuspectedCsam(db, rewritten.file.id)).blocklistRemoved).toBe(false);
+    expect(await lookup(db, rewritten.file.sha256!)).toEqual({
+      reason: "malware",
+      sourceNodeId: rewritten.file.id,
+    });
+
+    // A file with no hash: nothing to remove.
+    const owner = await makeUser(db);
+    const hashless = await makeFile(db, owner, null, `nohash-${rand()}.bin`, { sha256: null });
+    await lockSuspectedCsam(db, hashless.id, { source: "system" });
+    expect(await clearSuspectedCsam(db, hashless.id)).toMatchObject({
+      cleared: true,
+      blocklistRemoved: false,
+    });
+  });
+
+  it("dismisses the node's open and reviewing csam reports as false positives; a filed one, another category and another node's are untouched", async () => {
+    const { file, owner, reportId } = await locked();
+    const admin = await makeUser(db);
+    const csam = (hash: string) =>
+      insertReport(db, {
+        nodeId: file.id,
+        ownerId: owner,
+        source: "user",
+        category: "csam",
+        reporterIpHashStable: hash,
+      });
+    const reviewing = (await csam(`ip-${rand()}`))!;
+    await db.update(reports).set({ status: "reviewing", assignedTo: admin }).where(eq(reports.id, reviewing));
+    const actioned = (await csam(`ip-${rand()}`))!;
+    await db
+      .update(reports)
+      .set({ status: "actioned", resolvedAt: new Date(1_700_000_000_000), ncmecReportId: "N-1" })
+      .where(eq(reports.id, actioned));
+    const otherCategory = (await insertReport(db, {
+      nodeId: file.id,
+      ownerId: owner,
+      source: "user",
+      category: "malware",
+    }))!;
+    const other = await locked();
+
+    const result = await clearSuspectedCsam(db, file.id);
+    expect(result.reportIds).toEqual([reportId, reviewing].sort());
+    for (const id of [reportId, reviewing]) {
+      const row = await reportRow(id);
+      expect(row).toMatchObject({ status: "dismissed", resolution: "false_positive" });
+      expect(Math.abs(row.resolvedAt!.getTime() - Date.now())).toBeLessThan(60_000);
+    }
+    // Who was assigned is another fact, and stays; who cleared it is the caller's audit row.
+    expect((await reportRow(reviewing)).assignedTo).toBe(admin);
+    expect((await reportRow(reportId)).assignedTo).toBeNull();
+    expect(await reportRow(actioned)).toMatchObject({
+      status: "actioned",
+      resolution: null,
+      resolvedAt: new Date(1_700_000_000_000),
+      ncmecReportId: "N-1",
+    });
+    expect(await reportRow(otherCategory)).toMatchObject({
+      status: "open",
+      resolvedAt: null,
+      resolution: null,
+    });
+    expect(await reportRow(other.reportId)).toMatchObject({ status: "open", resolvedAt: null });
+  });
+
+  it("touches no legal hold — the node's, the owner's, an uploader's, the address rows' — and a second call writes nothing", async () => {
+    const owner = await makeUser(db);
+    const editor = await makeUser(db);
+    const file = await makeFile(db, owner, null, `held-${rand()}.bin`, { createdBy: editor });
+    await db.insert(uploadIps).values({
+      nodeId: file.id,
+      versionId: file.versionId!,
+      uploaderId: editor,
+      ipEncrypted: Buffer.from("c"),
+      iv: Buffer.from("i"),
+      keyVersion: 1,
+    });
+    const link = await makeLink(db, file.id, owner);
+    const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "photodna" }))!;
+    const holds = async () => ({
+      node: (await getNode(db, file.id))!.legalHold,
+      users: (
+        await db
+          .select({ held: user.legalHold })
+          .from(user)
+          .where(inArray(user.id, [owner, editor]))
+      ).map((u) => u.held),
+      addresses: (await db.select().from(uploadIps).where(eq(uploadIps.nodeId, file.id))).map(
+        (r) => r.legalHold,
+      ),
+    });
+    const allHeld = { node: true, users: [true, true], addresses: [true] };
+    expect(await holds()).toEqual(allHeld);
+
+    expect((await clearSuspectedCsam(db, file.id)).cleared).toBe(true);
+    expect(await holds()).toEqual(allHeld);
+
+    // A second call: refused, and nothing it could write has moved — set up so that it would show.
+    await db.update(nodes).set({ scanStatus: "clean" }).where(eq(nodes.id, file.id));
+    await pauseLinks(db, { nodeId: file.id }, "moderation");
+    const resolvedAt = (await reportRow(reportId)).resolvedAt;
+    expect(await clearSuspectedCsam(db, file.id)).toEqual({
+      cleared: false,
+      blocklistRemoved: false,
+      reportIds: [],
+    });
+    expect((await getNode(db, file.id))!.scanStatus).toBe("clean");
+    expect((await getById(db, link.id))!.pauseReasons).toEqual(["moderation"]);
+    expect((await reportRow(reportId)).resolvedAt).toEqual(resolvedAt);
+    expect(await holds()).toEqual(allHeld);
+  });
+
+  it("runs inside the caller's transaction and is undone with it", async () => {
+    const { file, link, reportId } = await locked();
+    await expect(
+      db.transaction(async (tx) => {
+        expect((await clearSuspectedCsam(tx, file.id)).cleared).toBe(true);
+        throw new Error("undo");
+      }),
+    ).rejects.toThrow("undo");
+    expect((await getNode(db, file.id))!.scanStatus).toBe("suspected_csam");
+    expect((await getById(db, link.id))!.pauseReasons).toEqual(["moderation"]);
+    expect(await lookup(db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId: file.id });
+    expect((await reportRow(reportId)).status).toBe("open");
   });
 });
 
