@@ -400,101 +400,113 @@ const SEED = 20261009;
 const GENERATIVE_BUDGET_MS = 600_000;
 
 describe(`generated events (seed ${SEED})`, () => {
-  it("6,000 events with secrets in every string position, under hostile keys, in encoded forms: total, clean, idempotent, never the marker", () => {
-    const r = prng(SEED);
-    let strings = 0;
-    for (let index = 0; index < 6000; index++) {
-      const shape: Shape = { hostileValues: index % 3 === 0 };
-      const input = event(r, shape);
-      const counted: string[] = [];
-      let out: unknown;
-      expect(() => {
-        out = redactEvent(input, (kind) => counted.push(kind));
-      }, `event ${index}: threw`).not.toThrow();
-      let serialised = "";
-      expect(() => {
-        serialised = JSON.stringify(out);
-      }, `event ${index}: output cannot be serialised`).not.toThrow();
-      strings += serialised.length;
-      expect(leak(out), `event ${index}: a secret survived`).toBeNull();
-      // Within the bounds: redacted, not replaced by the marker — a hostile KEY must not be able
-      // to make redaction fail (and with it, make the event's content disappear).
-      expect(counted, `event ${index}: counted as a failure`).toEqual([]);
-      expect((out as { message?: unknown }).message, `event ${index}`).not.toBe(REDACTION_FAILED);
-      expect(redactEvent(out), `event ${index}: not idempotent`).toEqual(out);
-    }
-    expect(strings).toBeGreaterThan(1_000_000);
-  }, GENERATIVE_BUDGET_MS);
+  it(
+    "6,000 events with secrets in every string position, under hostile keys, in encoded forms: total, clean, idempotent, never the marker",
+    () => {
+      const r = prng(SEED);
+      let strings = 0;
+      for (let index = 0; index < 6000; index++) {
+        const shape: Shape = { hostileValues: index % 3 === 0 };
+        const input = event(r, shape);
+        const counted: string[] = [];
+        let out: unknown;
+        expect(() => {
+          out = redactEvent(input, (kind) => counted.push(kind));
+        }, `event ${index}: threw`).not.toThrow();
+        let serialised = "";
+        expect(() => {
+          serialised = JSON.stringify(out);
+        }, `event ${index}: output cannot be serialised`).not.toThrow();
+        strings += serialised.length;
+        expect(leak(out), `event ${index}: a secret survived`).toBeNull();
+        // Within the bounds: redacted, not replaced by the marker — a hostile KEY must not be able
+        // to make redaction fail (and with it, make the event's content disappear).
+        expect(counted, `event ${index}: counted as a failure`).toEqual([]);
+        expect((out as { message?: unknown }).message, `event ${index}`).not.toBe(REDACTION_FAILED);
+        expect(redactEvent(out), `event ${index}: not idempotent`).toEqual(out);
+      }
+      expect(strings).toBeGreaterThan(1_000_000);
+    },
+    GENERATIVE_BUDGET_MS,
+  );
 
-  it("20,000 strings: no secret survives, and redacting twice equals redacting once", () => {
-    const r = prng(SEED + 1);
-    const failures: string[] = [];
-    for (let index = 0; index < 20_000 && failures.length < 12; index++) {
-      const input = r.chance(0.7) ? plant(r) : `${plant(r)} ${r.pick(BENIGN)} ${plant(r)}`;
-      const once = redactText(input);
-      const found = leak(once);
-      if (found !== null)
-        failures.push(
-          `string ${index} LEAK\n  in : ${JSON.stringify(input)}\n  out: ${JSON.stringify(once)}`,
-        );
-      else if (redactText(once) !== once)
-        failures.push(
-          `string ${index} NOT IDEMPOTENT\n  in : ${JSON.stringify(input)}\n  1st: ${JSON.stringify(once)}\n  2nd: ${JSON.stringify(redactText(once))}`,
-        );
-    }
-    expect(failures.join("\n"), "see the list").toBe("");
-  }, GENERATIVE_BUDGET_MS);
+  it(
+    "20,000 strings: no secret survives, and redacting twice equals redacting once",
+    () => {
+      const r = prng(SEED + 1);
+      const failures: string[] = [];
+      for (let index = 0; index < 20_000 && failures.length < 12; index++) {
+        const input = r.chance(0.7) ? plant(r) : `${plant(r)} ${r.pick(BENIGN)} ${plant(r)}`;
+        const once = redactText(input);
+        const found = leak(once);
+        if (found !== null)
+          failures.push(
+            `string ${index} LEAK\n  in : ${JSON.stringify(input)}\n  out: ${JSON.stringify(once)}`,
+          );
+        else if (redactText(once) !== once)
+          failures.push(
+            `string ${index} NOT IDEMPOTENT\n  in : ${JSON.stringify(input)}\n  1st: ${JSON.stringify(once)}\n  2nd: ${JSON.stringify(redactText(once))}`,
+          );
+      }
+      expect(failures.join("\n"), "see the list").toBe("");
+    },
+    GENERATIVE_BUDGET_MS,
+  );
 
-  it("1,000 events past a bound: every one is the marker event, counted once, with nothing of the payload", () => {
-    const r = prng(SEED + 2);
-    const marker = {
-      message: REDACTION_FAILED,
-      level: "error",
-      release: "03e19b8f6c1d4e5a9b7c2d3e4f5a6b7c8d9e0f1a",
-      environment: "dev",
-    };
-    const oversize: Array<(base: Record<string, unknown>) => void> = [
-      (base) => {
-        let deep: unknown = plant(r);
-        for (let i = 0; i < 20 + r.int(30); i++) deep = { next: deep };
-        setOwn(base, "extra", { deep });
-      },
-      (base) =>
-        setOwn(
-          base,
-          "extra",
-          Object.fromEntries(Array.from({ length: 501 + r.int(500) }, (_, i) => [`k${i}`, plant(r)])),
-        ),
-      (base) =>
-        setOwn(
-          base,
-          "breadcrumbs",
-          Array.from({ length: 501 + r.int(500) }, () => ({ message: plant(r) })),
-        ),
-      (base) =>
-        setOwn(base, "extra", {
-          grid: Array.from({ length: 300 }, () => Array.from({ length: 100 }, () => MARK)),
-        }),
-    ];
-    for (let index = 0; index < 1000; index++) {
-      const input = event(r, { hostileValues: index % 2 === 0 });
-      r.pick(oversize)(input);
-      const counted: string[] = [];
-      const out = redactEvent(input, (kind) => counted.push(kind));
-      // `tags.requestId` in these events is a planted secret, not a UUID: the marker leaves it out.
-      expect(out, `event ${index}`).toEqual(marker);
-      expect(counted, `event ${index}`).toEqual(["event"]);
-      // The same payload as a breadcrumb: dropped, and counted.
-      const crumbCounted: string[] = [];
-      expect(
-        redactBreadcrumb(input, (kind) => crumbCounted.push(kind)),
-        `breadcrumb ${index}`,
-      ).toBeNull();
-      expect(crumbCounted).toEqual(["breadcrumb"]);
-      // And the function underneath says why: it throws rather than returning a part.
-      expect(() => redactValue(input)).toThrow();
-    }
-  }, GENERATIVE_BUDGET_MS);
+  it(
+    "1,000 events past a bound: every one is the marker event, counted once, with nothing of the payload",
+    () => {
+      const r = prng(SEED + 2);
+      const marker = {
+        message: REDACTION_FAILED,
+        level: "error",
+        release: "03e19b8f6c1d4e5a9b7c2d3e4f5a6b7c8d9e0f1a",
+        environment: "dev",
+      };
+      const oversize: Array<(base: Record<string, unknown>) => void> = [
+        (base) => {
+          let deep: unknown = plant(r);
+          for (let i = 0; i < 20 + r.int(30); i++) deep = { next: deep };
+          setOwn(base, "extra", { deep });
+        },
+        (base) =>
+          setOwn(
+            base,
+            "extra",
+            Object.fromEntries(Array.from({ length: 501 + r.int(500) }, (_, i) => [`k${i}`, plant(r)])),
+          ),
+        (base) =>
+          setOwn(
+            base,
+            "breadcrumbs",
+            Array.from({ length: 501 + r.int(500) }, () => ({ message: plant(r) })),
+          ),
+        (base) =>
+          setOwn(base, "extra", {
+            grid: Array.from({ length: 300 }, () => Array.from({ length: 100 }, () => MARK)),
+          }),
+      ];
+      for (let index = 0; index < 1000; index++) {
+        const input = event(r, { hostileValues: index % 2 === 0 });
+        r.pick(oversize)(input);
+        const counted: string[] = [];
+        const out = redactEvent(input, (kind) => counted.push(kind));
+        // `tags.requestId` in these events is a planted secret, not a UUID: the marker leaves it out.
+        expect(out, `event ${index}`).toEqual(marker);
+        expect(counted, `event ${index}`).toEqual(["event"]);
+        // The same payload as a breadcrumb: dropped, and counted.
+        const crumbCounted: string[] = [];
+        expect(
+          redactBreadcrumb(input, (kind) => crumbCounted.push(kind)),
+          `breadcrumb ${index}`,
+        ).toBeNull();
+        expect(crumbCounted).toEqual(["breadcrumb"]);
+        // And the function underneath says why: it throws rather than returning a part.
+        expect(() => redactValue(input)).toThrow();
+      }
+    },
+    GENERATIVE_BUDGET_MS,
+  );
 
   it("oversize and hostile strings: bounded, total, and a string nested too deep in encodings is not guessed at", () => {
     const r = prng(SEED + 3);

@@ -223,10 +223,17 @@ router.patch(
               ),
             );
             // The row too: started now, its INSERT would race the padding below (auth/observe.ts).
-            recordAfterAnswer(scope, c, "auth.pending_email_changed", { type: "user", id: account.id }, null, {
-              actorUserId: account.id,
-              actorType: "user",
-            });
+            recordAfterAnswer(
+              scope,
+              c,
+              "auth.pending_email_changed",
+              { type: "user", id: account.id },
+              null,
+              {
+                actorUserId: account.id,
+                actorType: "user",
+              },
+            );
           }
         }
       }

@@ -199,13 +199,13 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
   // ── impersonation ────────────────────────────────────────────────────────────────────────
   if (path === "/admin/impersonate-user" && ok) {
     const target = facts.newSessions.find((s) => s.impersonatedBy)?.userId ?? null;
-    auditRow(scope,c, "auth.impersonation_started", target ? userTarget(target) : null);
+    auditRow(scope, c, "auth.impersonation_started", target ? userTarget(target) : null);
     count("auth", { outcome: "ok", kind: "impersonate" });
     return;
   }
   if (path === "/admin/stop-impersonating" && ok) {
     // requestActor() names the admin behind an impersonated session.
-    auditRow(scope,c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
+    auditRow(scope, c, "auth.impersonation_stopped", before ? userTarget(before.id) : null);
     return;
   }
 
@@ -213,11 +213,11 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     const account = before ? { to: before.email, name: before.name } : null;
     switch (path) {
       case "/sign-out":
-        if (before) auditRow(scope,c, "auth.sign_out", userTarget(before.id));
+        if (before) auditRow(scope, c, "auth.sign_out", userTarget(before.id));
         break;
       case "/change-password":
         if (before && account) {
-          auditRow(scope,c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
+          auditRow(scope, c, "auth.password_changed", userTarget(before.id), { via: "change" }, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasswordChanged(deps(c), account)),
@@ -246,7 +246,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
       case "/two-factor/verify-totp":
         // With a session and two-factor not yet on, a correct code is what switches it on.
         if (before && account && before.twoFactorEnabled !== true) {
-          auditRow(scope,c, "auth.2fa_enabled", userTarget(before.id), null, self);
+          auditRow(scope, c, "auth.2fa_enabled", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendTwoFactorEnabled(deps(c), account)),
@@ -255,7 +255,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/two-factor/disable":
         if (before && account) {
-          auditRow(scope,c, "auth.2fa_disabled", userTarget(before.id), null, self);
+          auditRow(scope, c, "auth.2fa_disabled", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendTwoFactorDisabled(deps(c), account)),
@@ -264,7 +264,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/passkey/verify-registration":
         if (before && account) {
-          auditRow(scope,c, "auth.passkey_added", userTarget(before.id), null, self);
+          auditRow(scope, c, "auth.passkey_added", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasskeyAdded(deps(c), account)),
@@ -273,7 +273,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         break;
       case "/passkey/delete-passkey":
         if (before && account) {
-          auditRow(scope,c, "auth.passkey_removed", userTarget(before.id), null, self);
+          auditRow(scope, c, "auth.passkey_removed", userTarget(before.id), null, self);
           defer(
             c,
             afterAnswer(scope, () => sendPasskeyRemoved(deps(c), account)),
@@ -283,7 +283,7 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
     }
     if (facts.emailChangedUserId) {
       const id = facts.emailChangedUserId;
-      auditRow(scope,c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
+      auditRow(scope, c, "auth.email_changed", userTarget(id), null, { actorUserId: id, actorType: "user" });
     }
     return;
   }
