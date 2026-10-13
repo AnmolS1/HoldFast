@@ -110,6 +110,15 @@ export function isEditableTarget(target: EventTarget | null): boolean {
   return !["checkbox", "radio", "button", "submit", "reset", "range", "file"].includes(type);
 }
 
+/**
+ * Whether a modal dialog is in the way: the key was pressed inside a dialog, or one is open
+ * anywhere in the document (focus can sit on the body while a dialog is up).
+ */
+export function modalOpen(target: EventTarget | null): boolean {
+  if (target instanceof Element && target.closest('[role="dialog"], [role="alertdialog"]')) return true;
+  return document.querySelector('[role="dialog"][aria-modal="true"], [role="alertdialog"]') !== null;
+}
+
 type KeyLike = Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey">;
 
 function matches(combo: Combo, event: KeyLike, apple: boolean): boolean {
@@ -151,6 +160,9 @@ export function useShortcut(id: ShortcutId, handler: (event: KeyboardEvent) => v
       if (event.defaultPrevented || event.isComposing) return;
       if (!def.combos.some((combo) => matches(combo, event, isApplePlatform()))) return;
       if (!def.global && isEditableTarget(event.target)) return;
+      // A page's shortcut never acts through a modal dialog: with a Move / Rename / confirm
+      // dialog open, Backspace or F2 would otherwise act on the selection underneath it.
+      if (!def.global && modalOpen(event.target)) return;
       latest.current(event);
     };
     document.addEventListener("keydown", onKeyDown);

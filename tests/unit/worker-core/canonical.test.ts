@@ -248,7 +248,7 @@ describe("app host: a spelling that is not canonical never reaches anything", ()
 
   it("what the handler is given: the raw path, Hono's path and the accessor are the same bytes", async () => {
     const { send } = setup();
-    for (const path of ["/api/nodes/a.b_c~d-e", "/api/links/x;y=1,z@q:r", "/api/trash"]) {
+    for (const path of ["/api/nodes/a.b_c~d-e", "/api/links/x;y=1,z@q:r", "/api/_probe/trash"]) {
       const answer = await send(path);
       expect(answer.body, path).toEqual({ reached: path, method: "GET", path });
     }
