@@ -5,11 +5,12 @@
 import Box from "@mui/material/Box";
 import { Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { accountEpoch, sameAccount, useSession } from "../../lib/query";
 import { isEditableTarget } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { ConflictDialog } from "./ConflictDialog";
 import { carriesFiles, fromDrop, fromFileList } from "./intake";
-import { addFiles, restoreUploads } from "./manager";
+import { addFiles, pauseAll, restoreUploads } from "./manager";
 import { registerPicker, takePickerTarget, targetFromLocation } from "./picker";
 import { getNode } from "./protocol";
 import { useUploads } from "./store";
@@ -25,18 +26,9 @@ const hidden = {
   whiteSpace: "nowrap",
 } as const;
 
-/** Folder names already asked for, by id. Forgotten with the page; it is only a label. */
-const folderNames = new Map<string, string>();
-
 interface DropTarget {
   parentId: string | null;
   folder: string;
-}
-
-function dropTarget(): DropTarget {
-  const parentId = targetFromLocation();
-  if (parentId === null) return { parentId, folder: t("drop.root") };
-  return { parentId, folder: folderNames.get(parentId) ?? t("drop.thisFolder") };
 }
 
 export function UploadHost() {
@@ -44,9 +36,15 @@ export function UploadHost() {
   const [target, setTarget] = useState<DropTarget | null>(null);
   const depth = useRef(0);
 
+  // The device's list is read for whoever is signed in — again when that changes without a reload.
+  const userId = useSession().data?.user.id;
   useEffect(() => {
-    void restoreUploads();
-  }, []);
+    if (userId) void restoreUploads();
+  }, [userId]);
+
+  // Leaving the frame (a public page, the sign-in screen) stops what is running: nothing reads a
+  // file or sends a body for a page that shows no progress. The rows wait, paused.
+  useEffect(() => () => pauseAll(), []);
 
   useEffect(() => {
     const enter = (event: DragEvent) => {
@@ -54,14 +52,15 @@ export function UploadHost() {
       event.preventDefault();
       depth.current += 1;
       if (depth.current > 1) return;
-      const next = dropTarget();
-      setTarget(next);
-      const { parentId } = next;
-      if (parentId === null || folderNames.has(parentId)) return;
-      // The folder's name, for the sentence. Not knowing it changes nothing but the wording.
+      const parentId = targetFromLocation();
+      setTarget({ parentId, folder: parentId === null ? t("drop.root") : t("drop.thisFolder") });
+      if (parentId === null) return;
+      // The folder's name, for the sentence — asked each time and kept nowhere: it is the
+      // account's. An answer that arrives after the account changed is not shown.
+      const account = accountEpoch();
       getNode(parentId).then(
         (detail) => {
-          folderNames.set(parentId, detail.node.name);
+          if (!sameAccount(account)) return;
           setTarget((shown) =>
             shown?.parentId === parentId ? { parentId, folder: detail.node.name } : shown,
           );
@@ -84,7 +83,9 @@ export function UploadHost() {
       depth.current = 0;
       setTarget(null);
       const parentId = targetFromLocation();
-      void fromDrop(event.dataTransfer).then((intake) => addFiles(intake.files, parentId, intake.folders));
+      void fromDrop(event.dataTransfer).then((intake) =>
+        addFiles(intake.files, parentId, intake.folders, intake),
+      );
     };
     const paste = (event: ClipboardEvent) => {
       const files = Array.from(event.clipboardData?.files ?? []);
@@ -110,7 +111,7 @@ export function UploadHost() {
     const intake = fromFileList(Array.from(input.files ?? []));
     // Emptied, so choosing the same file again is a change again.
     input.value = "";
-    void addFiles(intake.files, takePickerTarget(), intake.folders);
+    void addFiles(intake.files, takePickerTarget(), intake.folders, intake);
   };
 
   return (
@@ -145,11 +146,12 @@ export function UploadHost() {
           sx={{
             position: "fixed",
             inset: 0,
-            zIndex: 1500,
+            // Above everything the page draws, dialogs included: the drop is what is happening.
+            zIndex: (theme) => theme.zIndex.tooltip,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            padding: 4,
+            p: 4,
             backgroundColor: hf.scrim,
             // The window's own drag events drive this; the layer must not swallow them.
             pointerEvents: "none",
@@ -160,13 +162,14 @@ export function UploadHost() {
               display: "flex",
               alignItems: "center",
               gap: 3,
-              padding: "16px 20px",
+              py: 4,
+              px: 5,
               maxWidth: "100%",
               borderRadius: `${layout.radius.dialog}px`,
               border: `2px dashed ${hf.text}`,
               backgroundColor: hf.surface,
               color: hf.text,
-              fontWeight: 600,
+              typography: "h3",
               overflowWrap: "anywhere",
             }}
           >
