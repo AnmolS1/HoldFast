@@ -72,10 +72,19 @@ export async function seedLarge(size: number) {
   };
 }
 
-/** Reads a response to its end without keeping it: the byte count, and its first and last bytes. */
+/**
+ * Reads a response to its end without keeping it: the byte count, and its first and last bytes.
+ *
+ * Every 32 MiB it lets the event loop turn. Here the store, the host and this reader are one
+ * isolate and every hand-over between them is a resolved promise: read flat out, a large body is
+ * one unbroken run of microtasks for its whole length, in which no timer fires and no database
+ * answer is read — the request's deferred work then sits unsettled until its drain deadline. A
+ * real reader is a network: it yields at every write.
+ */
 export async function drain(response: Response, keep = 4096) {
   const reader = response.body!.getReader();
   let total = 0;
+  let sinceTurn = 0;
   let first = new Uint8Array(0);
   let last = new Uint8Array(0);
   for (;;) {
@@ -93,6 +102,11 @@ export async function drain(response: Response, keep = 4096) {
     tail.set(value.subarray(Math.max(0, value.byteLength - (tail.byteLength - fromLast))), fromLast);
     last = tail;
     total += value.byteLength;
+    sinceTurn += value.byteLength;
+    if (sinceTurn >= 32 * 1024 * 1024) {
+      sinceTurn = 0;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   }
   return { total, first, last };
 }

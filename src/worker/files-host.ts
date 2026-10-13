@@ -410,11 +410,13 @@ function windowOf(object: { size: number; range?: R2Range }): { offset: number; 
 
 /**
  * How long after the handler returned the settle still runs on the request's own database
- * client: half the drain deadline, so the client is certainly still open. A stream that ends
- * later is settled in a background context of its own.
+ * client: a quarter of the drain deadline (5 s), so the client is certainly still open. A stream
+ * that ends later is settled in a background context of its own.
+ * Shorter than the 10 s after which the database pool retires an idle connection: the request's
+ * connections are then closed together by the drain, not one by one while it waits.
  */
 const settleInRequestMs = (c: Ctx) =>
-  Math.floor((coreOf(c).limits?.drainDeadlineMs ?? DRAIN_DEADLINE_MS) / 2);
+  Math.floor((coreOf(c).limits?.drainDeadlineMs ?? DRAIN_DEADLINE_MS) / 4);
 
 /**
  * Arranges the ONE settle of a response's charge and returns the function to call when its

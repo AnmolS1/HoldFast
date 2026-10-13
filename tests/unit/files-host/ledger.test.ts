@@ -523,8 +523,8 @@ describe("unsent bytes are given back when the stream ends", () => {
 
 describe("the settle runs once, on the request's client or — for a long stream — in a context of its own", () => {
   const N = 300;
-  // Half of this is how long the settle may still use the request's own client.
-  const limits = { drainDeadlineMs: 80 };
+  // A quarter of this is how long the settle may still use the request's own client.
+  const limits = { drainDeadlineMs: 160 };
 
   it("a stream that outlives the request's drain is settled afterwards: cancelled after N → N on every ledger, and bytesServed", async () => {
     const { owner, node, link } = await world();
