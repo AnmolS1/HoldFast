@@ -257,6 +257,41 @@ describe("GET /nodes/:id", () => {
     expect((await api(viewer.as, "GET", `/nodes/${top.id}`)).status).toBe(404);
   });
 
+  it("the owner's marks stay the owner's: star and last-opened are false / null for a share partner", async () => {
+    const t = await sharedTree();
+    await testDb()
+      .update(nodes)
+      .set({ starred: true, lastAccessedAt: new Date(), sha256: "a".repeat(64) })
+      .where(eq(nodes.id, t.notes.id));
+    const mine = (await api(t.owner.as, "GET", `/nodes/${t.notes.id}`)).body.node;
+    expect(mine.starred).toBe(true);
+    expect(mine.lastAccessedAt).not.toBeNull();
+    for (const who of [t.editor, t.viewer]) {
+      const theirs = (await api(who.as, "GET", `/nodes/${t.notes.id}`)).body.node;
+      expect([theirs.starred, theirs.lastAccessedAt, theirs.sha256]).toEqual([false, null, null]);
+      const listed = (await api(who.as, "GET", `/nodes/${t.inner.id}/children`)).body.items.find(
+        (item: { id: string }) => item.id === t.notes.id,
+      );
+      expect([listed.starred, listed.lastAccessedAt]).toEqual([false, null]);
+    }
+  });
+
+  it("a share partner's share root does not say where it sits: parentId null; inside it, parents are kept", async () => {
+    const owner = await person();
+    const viewer = await person();
+    const top = await makeFolder(owner.id);
+    const shared = await makeFolder(owner.id, top.id);
+    const inner = await makeFolder(owner.id, shared.id);
+    await makeShare(shared.id, owner.id, viewer.id);
+    expect((await api(owner.as, "GET", `/nodes/${shared.id}`)).body.node.parentId).toBe(top.id);
+    const root = await api(viewer.as, "GET", `/nodes/${shared.id}`);
+    expect(root.body.node.parentId).toBeNull();
+    expect(JSON.stringify(root.body)).not.toContain(top.id);
+    expect((await api(viewer.as, "GET", `/nodes/${inner.id}`)).body.node.parentId).toBe(shared.id);
+    const listed = await api(viewer.as, "GET", `/nodes/${shared.id}/children`);
+    expect(listed.body.items.map((item: { parentId: string }) => item.parentId)).toEqual([shared.id]);
+  });
+
   it("sharing is the owner's to see: people (pending ones too) and the link; zero for anyone else", async () => {
     const t = await sharedTree();
     await makeLink(t.shared.id, t.owner.id);

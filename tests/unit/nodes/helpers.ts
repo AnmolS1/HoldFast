@@ -9,6 +9,7 @@ import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo } from "../../../src/worker/auth/types";
+import { takedownNode } from "../../../src/worker/db/queries/moderation";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import { dmcaNoticeNodes, dmcaNotices, nodes, type ScanStatus } from "../../../src/worker/db/schema";
 import type { CoreDeps } from "../../../src/worker/services/request-context";
@@ -193,11 +194,9 @@ export type SharedTree = Awaited<ReturnType<typeof sharedTree>>;
 
 // ── states a test puts a node in (written directly: the admin routes do not exist yet) ──────
 
+/** Through the query the admin console will use: under the owner's tree lock. */
 export async function takeDown(nodeId: string): Promise<void> {
-  await testDb()
-    .update(nodes)
-    .set({ takedownAt: new Date(), takedownReason: "abuse" })
-    .where(eq(nodes.id, nodeId));
+  if (!(await takedownNode(testDb(), nodeId, { reason: "abuse", by: null }))) throw new Error("no such node");
 }
 
 export async function setStatus(nodeId: string, scanStatus: ScanStatus): Promise<void> {
