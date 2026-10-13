@@ -381,6 +381,35 @@ describe("the pause set", () => {
     expect(await reasonsOf(f.links.deep.id)).toEqual(["moderation"]);
   });
 
+  it("`moderation` is never removed from a link whose node is still hidden, whichever selector asks: a file restored on its own under a folder that is still down", async () => {
+    const f = await subtreeFixture();
+    // The folder and `file` inside it are both taken down; then `file` alone is restored.
+    await takedownNode(db, f.folder.id, { reason: "abuse", by: null });
+    await takedownNode(db, f.file.id, { reason: "dmca", by: null });
+    await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    await pauseLinks(db, { linkId: f.links.file.id }, "report");
+    await restoreTakedown(db, f.file.id);
+
+    expect(await unpauseLinks(db, { nodeId: f.file.id }, "moderation")).toEqual([]);
+    expect(await unpauseLinks(db, { linkId: f.links.file.id }, "moderation")).toEqual([]);
+    expect(await unpauseLinks(db, { ownerId: f.owner }, "moderation")).toEqual([]);
+    expect(await reasonsOf(f.links.file.id)).toEqual(["moderation", "report"]);
+    // The control: another reason on the same link is not this rule's — it goes.
+    expect((await unpauseLinks(db, { nodeId: f.file.id }, "report")).map((c) => c.linkId)).toEqual([
+      f.links.file.id,
+    ]);
+    // A locked file is hidden too.
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.outside.id));
+    await pauseLinks(db, { nodeId: f.outside.id }, "moderation");
+    expect(await unpauseLinks(db, { nodeId: f.outside.id }, "moderation")).toEqual([]);
+
+    // The folder restored: now the same call lifts it.
+    await restoreTakedown(db, f.folder.id);
+    expect(await unpauseLinks(db, { nodeId: f.file.id }, "moderation")).toEqual([
+      { linkId: f.links.file.id, nodeId: f.file.id, ownerId: f.owner, nowLive: true },
+    ]);
+  });
+
   it("unpauseLinks({ all: true }, 'ceiling') removes ceiling only and leaves lockedByAdmin rows alone", async () => {
     const onlyCeiling = await linked(["ceiling"]);
     const both = await linked(["ceiling", "report"]);

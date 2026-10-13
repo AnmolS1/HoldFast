@@ -7,16 +7,28 @@
 // side go on. With the two sides locking in opposite orders that is a deadlock — Postgres aborts
 // one of them with 40P01 — and which one it aborts is the whole problem.
 import { eq, inArray, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Db, Tx } from "../../../src/worker/db/client";
 import { LegalHoldError, pgError, QueryError } from "../../../src/worker/db/errors";
-import { lockSuspectedCsam, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
+import { lookup } from "../../../src/worker/db/queries/blocklist";
+import {
+  clearSuspectedCsam,
+  lockSuspectedCsam,
+  setUserLegalHold,
+} from "../../../src/worker/db/queries/moderation";
 import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
-import { nodes, pendingUserPurges, reports, uploadIps, user } from "../../../src/worker/db/schema";
-import { makeFile, makeFolder, makeUser, openDb, rand } from "./_helpers";
+import {
+  nodes,
+  pendingUserPurges,
+  reports,
+  shareLinks,
+  uploadIps,
+  user,
+} from "../../../src/worker/db/schema";
+import { makeFile, makeFolder, makeLink, makeUser, openDb, rand } from "./_helpers";
 
 // Three pools: the two sides, and an observer that is never inside either transaction.
 let a: { db: Db; close: () => Promise<void> };
@@ -338,8 +350,11 @@ describe("the CSAM lock is not lost to a deadlock", () => {
 
   // A transaction that takes the NODE first and the owner's row second — the opposite order.
   // The CSAM lock has the owner's row and waits for the node; then the other asks for the
-  // owner's row: a cycle. The lock has waited longest, so its deadlock check runs first and
-  // Postgres ends IT (40P01). Called on the database handle, it runs again and locks the node.
+  // owner's row: a cycle. WHO DIES IS FIXED HERE: Postgres ends the transaction whose backend
+  // runs the deadlock check, and the other side's check is put off (`deadlock_timeout` 20 s in
+  // that transaction only), so it is always the lock's — after its own second of waiting.
+  // Called on the database handle, the lock runs again and locks the node: the handle's
+  // `transaction` is entered TWICE (the test's only seam), and the other side is never ended.
   it("as the deadlock victim it runs again: the node ends locked and the owner held", async () => {
     const owner = await makeUser(a.db);
     const file = await makeFile(a.db, owner, null, `victim-${rand()}.jpg`);
@@ -347,6 +362,7 @@ describe("the CSAM lock is not lost to a deadlock", () => {
 
     const other = settle(
       a.db.transaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL deadlock_timeout = '20s'`);
         await lockNodeRow(tx, file.id);
         const pid = await pidOf(tx);
         nodeHeld.open(pid);
@@ -355,21 +371,31 @@ describe("the CSAM lock is not lost to a deadlock", () => {
       }),
     );
     await nodeHeld.opened;
-    const locked = await settle(lockSuspectedCsam(b.db, file.id, { source: "photodna" }));
+    const attempts = vi.spyOn(b.db, "transaction");
+    let locked: Outcome<{ reportId: string; ownerId: string } | null>;
+    let ran: number;
+    try {
+      locked = await settle(lockSuspectedCsam(b.db, file.id, { source: "photodna" }));
+      ran = attempts.mock.calls.length;
+    } finally {
+      attempts.mockRestore();
+    }
     const othered = await other;
 
-    // Whichever side Postgres ended, the call resolved with the node locked.
-    expect(sqlState(locked), "the lock did not surface a deadlock").toBeNull();
+    expect(sqlState(othered), "the other side was not the one ended").toBeNull();
+    expect(ran, "the lock's whole transaction ran twice: ended once as the victim, then again").toBe(2);
+    expect(sqlState(locked), "the lock did not surface the deadlock").toBeNull();
     expect(locked).toMatchObject({ ok: true, value: { ownerId: owner } });
     expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
     expect(await isHeld(owner)).toBe(true);
-    // The other side finished or was the victim itself; nothing else.
-    expect([null, "40P01"]).toContain(sqlState(othered));
+    expect(await watch.db.select().from(reports).where(eq(reports.nodeId, file.id))).toHaveLength(1);
   });
 
-  // The same cycle with the other side waiting longest, so that IT is the one Postgres ends:
-  // the lock (holding the lower user row, held up at the higher one) then just goes on.
-  it("when the other side is the victim the lock simply completes", async () => {
+  // The same cycle with the other side waiting longest, so that IT is normally the one Postgres
+  // ends: the lock (holding the lower user row, held up at the higher one) then just goes on.
+  // (This direction cannot be pinned — the lock runs on a pooled connection whose settings a
+  // test cannot reach — so the test asserts what must hold whichever side is ended.)
+  it("whichever side is ended in the other order, the call resolves with the node locked", async () => {
     const [lo, hi] = [await makeUser(a.db), await makeUser(a.db)].sort() as [string, string];
     const file = await makeFile(a.db, lo, null, `other-${rand()}.jpg`, { createdBy: hi });
     const c = openDb();
@@ -491,6 +517,89 @@ describe("the CSAM lock is not lost to a deadlock", () => {
       createdBy: replacer,
     });
     for (const id of [owner, editor, replacer]) expect(await isHeld(id), id).toBe(true);
+  });
+});
+
+describe("clearing a lock beside the filing of a report", () => {
+  const linkOf = async (nodeId: string) =>
+    (await watch.db.select().from(shareLinks).where(eq(shareLinks.nodeId, nodeId)))[0]!;
+
+  // The filing has set the node's report `actioned` and has not committed; it did NOT take the
+  // node's row (the rule for writers says it should — the clear must be safe without it). The
+  // clear reads the reports it decides on FOR UPDATE: it waits for the filing and then refuses.
+  // Reading them without a lock it sees `reviewing`, clears the node, and its own UPDATE of the
+  // reports then skips the filed one: a cleared node with a filed report on it.
+  it("a report filed while the clear runs: the clear waits, then refuses — nothing written", async () => {
+    const owner = await makeUser(a.db);
+    const file = await makeFile(a.db, owner, null, `filed-${rand()}.jpg`);
+    await makeLink(a.db, file.id, owner);
+    const { reportId } = (await lockSuspectedCsam(a.db, file.id, { source: "photodna" }))!;
+    await a.db.update(reports).set({ status: "reviewing" }).where(eq(reports.id, reportId));
+    const clearPid = gate<number>();
+    const filedNotCommitted = gate();
+
+    const filing = settle(
+      a.db.transaction(async (tx) => {
+        await tx.update(reports).set({ status: "actioned" }).where(eq(reports.id, reportId));
+        filedNotCommitted.open();
+        await untilWaitingForLock(await clearPid.opened, "the clear");
+      }),
+    );
+    const clear = settle(
+      b.db.transaction(async (tx) => {
+        await filedNotCommitted.opened;
+        clearPid.open(await pidOf(tx));
+        return clearSuspectedCsam(tx, file.id);
+      }),
+    );
+    const [filed, cleared] = await Promise.all([filing, clear]);
+    expect(filed.ok).toBe(true);
+    expect(cleared).toMatchObject({
+      ok: true,
+      value: { cleared: false, refused: "reported", reportIds: [] },
+    });
+    expect(await getNode(a.db, file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect((await linkOf(file.id)).pauseReasons).toEqual(["moderation"]);
+    expect(await lookup(a.db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId: file.id });
+    expect((await a.db.select().from(reports).where(eq(reports.id, reportId)))[0]!.status).toBe("actioned");
+  });
+
+  // The same for the hash: a csam report on ANOTHER node with the same content is being filed.
+  // This node may be cleared, but the hash must stay blocklisted.
+  it("a report on a twin filed while the clear runs: the node is cleared, the hash stays blocklisted", async () => {
+    const owner = await makeUser(a.db);
+    const sha256 = rand(32);
+    const file = await makeFile(a.db, owner, null, `mine-${rand()}.jpg`, { sha256 });
+    const twin = await makeFile(a.db, owner, null, `twin-${rand()}.jpg`, { sha256 });
+    await lockSuspectedCsam(a.db, file.id, { source: "photodna" });
+    const [twinReport] = await a.db
+      .insert(reports)
+      .values({ nodeId: twin.id, ownerId: owner, source: "admin", category: "csam" })
+      .returning({ id: reports.id });
+    const clearPid = gate<number>();
+    const filedNotCommitted = gate();
+
+    const filing = settle(
+      a.db.transaction(async (tx) => {
+        await tx.update(reports).set({ status: "actioned" }).where(eq(reports.id, twinReport!.id));
+        filedNotCommitted.open();
+        await untilWaitingForLock(await clearPid.opened, "the clear");
+      }),
+    );
+    const clear = settle(
+      b.db.transaction(async (tx) => {
+        await filedNotCommitted.opened;
+        clearPid.open(await pidOf(tx));
+        return clearSuspectedCsam(tx, file.id);
+      }),
+    );
+    const [filed, cleared] = await Promise.all([filing, clear]);
+    expect(filed.ok).toBe(true);
+    expect(cleared).toMatchObject({
+      ok: true,
+      value: { cleared: true, blocklistRemoved: false, blocklistKept: "reported" },
+    });
+    expect(await lookup(a.db, sha256)).toEqual({ reason: "csam", sourceNodeId: file.id });
   });
 });
 

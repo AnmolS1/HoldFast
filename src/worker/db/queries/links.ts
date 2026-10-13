@@ -192,13 +192,14 @@ export async function pauseLinks(
  * is cleared only where the set became empty. A link without the reason is untouched.
  * `{ all: true }` matches every link carrying the reason, except rows with `lockedByAdmin`.
  *
- * `{ subtreeOf }` with reason `moderation` is the restore of a folder's takedown, and it is the
- * ONE form that looks at the nodes: the reason is removed only from links whose node is NO LONGER
- * HIDDEN at that moment — not taken down itself or by another ancestor, and not locked as
- * `suspected_csam`. Call it AFTER `restoreTakedown`, in the same transaction: a file inside the
- * folder that is taken down separately (or lies under another taken-down folder, or is locked)
- * keeps its pause, a sibling's link resumes, and the caller re-applies nothing. Every other
- * selector and reason removes the reason from all it matches, as before.
+ * REASON `moderation` IS THE ONE THAT LOOKS AT THE NODES, whichever selector is used: it is
+ * removed only from links whose node is NO LONGER HIDDEN at that moment — not taken down itself
+ * or by an ancestor, and not locked as `suspected_csam`. So the restore of a folder's takedown
+ * (`{ subtreeOf }`, called AFTER `restoreTakedown` in the same transaction) leaves the pause on
+ * a file inside that is taken down separately, lies under another taken-down folder or is
+ * locked, while a sibling's link resumes; and `{ nodeId }` for a file restored on its own
+ * leaves it while the folder above is still down. The caller re-applies nothing. Every other
+ * reason is removed from all it matches.
  * Returns the links that changed; `nowLive` marks those with no reason left.
  */
 export async function unpauseLinks(
@@ -211,7 +212,7 @@ export async function unpauseLinks(
   if (!match) return [];
   // The same test as the tree's `effectiveHidden`: the inherited takedown, or the file's own lock.
   const stillHidden =
-    "subtreeOf" in where && reason === "moderation"
+    reason === "moderation"
       ? sql`AND NOT EXISTS (
           SELECT 1 FROM nodes x
           WHERE x.id = l.node_id
