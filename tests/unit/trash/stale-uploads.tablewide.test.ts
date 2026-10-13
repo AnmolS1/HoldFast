@@ -9,6 +9,7 @@ import { job as staleUploadsJob } from "../../../src/worker/jobs/stale-uploads";
 import {
   countingBucket,
   cronEvent,
+  hookedDb,
   jobContext,
   makeFile,
   makeUpload,
@@ -139,6 +140,33 @@ describe("the stale-upload job", () => {
     expect(await usedBytes(owner.id)).toBe(290);
     expect(ctx.outcomes("stale-uploads")).toEqual(expect.arrayContaining(["done", "aborted"]));
     expect(ctx.outcomes("stale-uploads")).not.toContain("error");
+  });
+
+  it("a session its client claimed after the job listed it is left alone, reservation and all", async () => {
+    const owner = await member();
+    // Two stale sessions; the job lists both, oldest first.
+    const first = await makeUpload(owner.id, owner.id, { size: 100, expiresAt: ago(3 * HOUR) });
+    const claimed = await multipart(owner.id, { size: 900, expiresAt: ago(HOUR) });
+    await setUsedBytes(owner.id, 1000);
+    // Before the job's first transaction — after its list — the client starts completing one.
+    let done = false;
+    const handle = hookedDb(async () => {
+      if (done) return;
+      done = true;
+      await testDb()
+        .update(uploads)
+        .set({ status: "completing", completingAt: new Date() })
+        .where(eq(uploads.id, claimed.id));
+    });
+    await run(jobContext({ db: handle.db }));
+    await handle.close();
+    expect(done).toBe(true);
+    expect(await uploadRow(first.id)).toMatchObject({ status: "aborted" });
+    // Not aborted under its client: still completing, its parts, its upload and its bytes intact.
+    expect(await uploadRow(claimed.id)).toMatchObject({ status: "completing" });
+    expect(await partsOf(claimed.id)).toBe(1);
+    expect(await multipartIsOpen(claimed.r2Key, claimed.r2UploadId)).toBe(true);
+    expect(await usedBytes(owner.id)).toBe(900);
   });
 
   it("the row decides, not the list: a session a client claimed meanwhile is left alone", async () => {

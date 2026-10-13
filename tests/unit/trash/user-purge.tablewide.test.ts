@@ -4,6 +4,7 @@ import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
+import { ownedRoots } from "../../../src/worker/db/queries/tree";
 import { remainingForUser } from "../../../src/worker/db/queries/uploads";
 import { cancel, due } from "../../../src/worker/db/queries/user-purge";
 import { pendingUserPurges, session, uploads, user } from "../../../src/worker/db/schema";
@@ -383,14 +384,17 @@ describe("the account purge", () => {
 
   it("a hold placed while the purge is running stops the account row: it is re-read under the row's lock", async () => {
     const a = await account();
-    // The hold lands in the middle of the run — the moment the first root's objects are removed.
+    // The hold lands after the LAST root's rows have been committed — while its objects are
+    // being removed — so that nothing but the final re-read can see it.
+    const roots = await ownedRoots(testDb(), a.id, { includeSystem: true });
+    const last = roots[roots.length - 1]!.id === a.loose.id ? a.loose.r2Key! : a.inner.r2Key!;
     let placed = false;
     const bucket = new Proxy(env.FILES, {
       get(target, property) {
         const value = Reflect.get(target, property) as unknown;
         if (typeof value !== "function") return value;
         return async (...args: unknown[]) => {
-          if (property === "delete" && !placed) {
+          if (property === "delete" && !placed && Array.isArray(args[0]) && args[0].includes(last)) {
             placed = true;
             await setUserLegalHold(testDb(), a.id, true);
           }
@@ -402,6 +406,7 @@ describe("the account purge", () => {
     expect(placed).toBe(true);
     expect(outcome).toBe("held");
     // What was purged before the hold stays purged; the account and its sign-in rows are kept.
+    expect(await nodesLeft(a.nodeIds)).toEqual([]);
     expect(await userRow(a.id)).not.toBeNull();
     expect(await sessionsLeft(a.sessionId)).toBe(1);
     expect(await audits("system.user_purge", a.id)).toEqual([]);

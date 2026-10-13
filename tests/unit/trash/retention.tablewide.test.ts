@@ -226,6 +226,19 @@ async function recordsOf(person: { id: string }) {
     ),
     await attemptRow(link.id, ago(25 * HOUR), "a password-attempt counter on their link"),
   ];
+  // A link they created on a node that is NOT theirs (and that nothing protects): only the
+  // creator's hold can keep its records.
+  const foreign = await makeLink((await makeFile(host.id, null, { scanStatus: "clean" })).id, person.id);
+  rows.push(
+    await accessRow(
+      foreign.id,
+      null,
+      ago(181 * DAY),
+      "an access row of a link they created on someone else's file",
+    ),
+    await ledgerRow("link", foreign.id, dayAgo(91), "a ledger row of that link"),
+    await attemptRow(foreign.id, ago(25 * HOUR), "a password-attempt counter on that link"),
+  );
   for (const subject of USER_SUBJECTS) {
     rows.push(await ledgerRow(subject, person.id, dayAgo(91), `a ledger row with them as ${subject}`));
   }

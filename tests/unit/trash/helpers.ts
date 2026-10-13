@@ -217,6 +217,17 @@ export function deadlockingDb(failures = 1) {
   return { ...made, counter };
 }
 
+/** A database handle that awaits `before()` every time a transaction is about to start on it. */
+export function hookedDb(before: () => Promise<void>) {
+  const made = createDb(env);
+  const real = made.db.transaction.bind(made.db);
+  (made.db as { transaction: unknown }).transaction = async (...args: Parameters<typeof real>) => {
+    await before();
+    return real(...args);
+  };
+  return made;
+}
+
 // ── a background context ────────────────────────────────────────────────────────────────────
 
 export type JobContext = {
