@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../../src/shared/constants";
 import { countActive, insert, usersAtThreshold } from "../../../src/worker/db/queries/strikes";
-import { strikes } from "../../../src/worker/db/schema";
+import { strikes, user as userTable } from "../../../src/worker/db/schema";
 import { AppError } from "../../../src/worker/services/errors";
 import {
   addStrike,
@@ -396,10 +396,16 @@ describe("the same violation strikes once", () => {
     const { user } = await verifiedUser();
     const nodeId = uuidv7();
     const sha256 = fakeSha();
-    const byContent = await insert(testDb(), { userId: user.id, kind: "malware", sha256 });
-    const byNode = await insert(testDb(), { userId: user.id, kind: "malware", nodeId });
+    const byContent = await insert(
+      testDb(),
+      { userId: user.id, kind: "malware", sha256 },
+      STRIKE_WINDOW_DAYS,
+    );
+    const byNode = await insert(testDb(), { userId: user.id, kind: "malware", nodeId }, STRIKE_WINDOW_DAYS);
     expect(byContent.created && byNode.created).toBe(true);
-    expect(await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 })).toEqual({
+    expect(
+      await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 }, STRIKE_WINDOW_DAYS),
+    ).toEqual({
       id: byContent.id,
       created: false,
     });
@@ -407,7 +413,9 @@ describe("the same violation strikes once", () => {
       .update(strikes)
       .set({ at: sql`now() - interval '1 day'` })
       .where(eq(strikes.id, byNode.id));
-    expect(await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 })).toEqual({
+    expect(
+      await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 }, STRIKE_WINDOW_DAYS),
+    ).toEqual({
       id: byNode.id,
       created: false,
     });
@@ -422,12 +430,16 @@ describe("the same violation strikes once", () => {
         // Different nodes for the hash case: the content is what collides.
         [0, 1, 2, 3].map(() =>
           testDb().transaction((tx) =>
-            insert(tx, {
-              userId: user.id,
-              kind: "malware",
-              ...("sha256" in key ? { nodeId: uuidv7() } : {}),
-              ...key,
-            }),
+            insert(
+              tx,
+              {
+                userId: user.id,
+                kind: "malware",
+                ...("sha256" in key ? { nodeId: uuidv7() } : {}),
+                ...key,
+              },
+              STRIKE_WINDOW_DAYS,
+            ),
           ),
         ),
       );
@@ -478,6 +490,11 @@ describe("the same violation strikes once", () => {
   });
 });
 
+const atThreshold = async (limit = 1000) =>
+  (await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, limit)).map(
+    (found) => found.userId,
+  );
+
 describe("a committed strike can never leave the account un-suspended", () => {
   /** Three unlifted strikes written as rows only: the state a consumer killed after its commit leaves. */
   async function atThresholdUnsuspended() {
@@ -495,7 +512,7 @@ describe("a committed strike can never leave the account un-suspended", () => {
 
   it("applySuspension never called: the sweep suspends, with exactly one email", async () => {
     const { user, email } = await atThresholdUnsuspended();
-    expect(await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000)).toContain(user.id);
+    expect(await atThreshold()).toContain(user.id);
 
     const swept = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
     expect(swept.checked).toBeGreaterThanOrEqual(1);
@@ -507,9 +524,7 @@ describe("a committed strike can never leave the account un-suspended", () => {
     expect(mailTo(email, "accountSuspended")).toHaveLength(1);
 
     // Swept again: the user is no longer found, and nothing is sent twice.
-    expect(await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000)).not.toContain(
-      user.id,
-    );
+    expect(await atThreshold()).not.toContain(user.id);
     await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
     expect(mailTo(email, "accountSuspended")).toHaveLength(1);
     expect(await auditRows({ action: "account.suspended", targetId: user.id })).toHaveLength(1);
@@ -587,7 +602,8 @@ describe("a committed strike can never leave the account un-suspended", () => {
     const admin = await verifiedUser();
     const rowsOnly = async (userId: string, count: number) => {
       const ids: string[] = [];
-      for (let i = 0; i < count; i++) ids.push((await insert(testDb(), { userId, kind: "abuse" })).id);
+      for (let i = 0; i < count; i++)
+        ids.push((await insert(testDb(), { userId, kind: "abuse" }, STRIKE_WINDOW_DAYS)).id);
       return ids;
     };
     const below = await verifiedUser();
@@ -607,7 +623,7 @@ describe("a committed strike can never leave the account un-suspended", () => {
     // The control: a user at the threshold, unsuspended — the sweep must take this one.
     const due = await atThresholdUnsuspended();
 
-    const found = await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1000);
+    const found = await atThreshold();
     expect(found).toContain(due.user.id);
     for (const ignored of [below, lifted, stale, already]) expect(found).not.toContain(ignored.user.id);
 
@@ -644,9 +660,7 @@ describe("a committed strike can never leave the account un-suspended", () => {
       .update(strikes)
       .set({ at: sql`now() - make_interval(days => ${STRIKE_WINDOW_DAYS - 1})` })
       .where(eq(strikes.userId, older.user.id));
-    expect((await usersAtThreshold(testDb(), STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, 1))[0]).toBe(
-      older.user.id,
-    );
+    expect((await atThreshold(1))[0]).toBe(older.user.id);
     const swept = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1 }));
     expect(swept).toEqual({ checked: 1, suspended: 1, failed: 0 });
     expect((await userById(older.user.id))!.suspendedAt).toBeInstanceOf(Date);
@@ -654,5 +668,200 @@ describe("a committed strike can never leave the account un-suspended", () => {
     // Leave nothing at the threshold behind for other tests' sweeps.
     await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
     expect((await userById(newer.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+});
+
+describe("an expired strike does not swallow a new violation", () => {
+  const ageTo = (strikeId: string, days: number) =>
+    testDb()
+      .update(strikes)
+      .set({ at: sql`now() - make_interval(days => ${days})` })
+      .where(eq(strikes.id, strikeId));
+
+  it("the same content after 366 days: the old strike is lifted as expired and a NEW one is created", async () => {
+    const { user } = await verifiedUser();
+    const sha256 = fakeSha();
+    const old = await settled((deps) =>
+      addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256, note: "first time" }),
+    );
+    await ageTo(old.strikeId, STRIKE_WINDOW_DAYS + 1);
+    expect(await countActive(testDb(), user.id, STRIKE_WINDOW_DAYS)).toBe(0);
+
+    const again = await settled((deps) =>
+      addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256 }),
+    );
+    expect(again.created).toBe(true);
+    expect(again.strikeId).not.toBe(old.strikeId);
+    expect(again.activeStrikes).toBe(1);
+    const rows = await strikeRows(user.id);
+    expect(rows).toHaveLength(2);
+    const lifted = rows.find((row) => row.id === old.strikeId)!;
+    expect(lifted.liftedAt).toBeInstanceOf(Date);
+    expect(lifted.liftedBy, "the system lifted it").toBeNull();
+    expect(lifted.note).toBe(
+      "first time [expired: lifted when a new strike was issued for the same file or content]",
+    );
+    expect(rows.find((row) => row.id === again.strikeId)).toMatchObject({
+      liftedAt: null,
+      contentSha256: sha256,
+    });
+    expect(await auditRows({ action: "strike.added", targetId: user.id })).toHaveLength(2);
+  });
+
+  it("the same node after 366 days: likewise; and a note-less strike gets the note alone", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const old = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", nodeId }));
+    await ageTo(old.strikeId, STRIKE_WINDOW_DAYS + 1);
+    const again = await settled((deps) => addStrike(deps, { userId: user.id, kind: "dmca", nodeId }));
+    expect(again).toMatchObject({ created: true, activeStrikes: 1 });
+    const lifted = (await strikeRows(user.id)).find((row) => row.id === old.strikeId)!;
+    expect(lifted.liftedAt).toBeInstanceOf(Date);
+    expect(lifted.note).toBe("[expired: lifted when a new strike was issued for the same file or content]");
+  });
+
+  it("at 364 days the old strike still counts: created false, nothing lifted (the control)", async () => {
+    const { user } = await verifiedUser();
+    const sha256 = fakeSha();
+    const old = await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", sha256 }));
+    await ageTo(old.strikeId, STRIKE_WINDOW_DAYS - 1);
+    const again = await settled((deps) =>
+      addStrike(deps, { userId: user.id, kind: "malware", nodeId: uuidv7(), sha256 }),
+    );
+    expect(again).toMatchObject({ strikeId: old.strikeId, created: false, activeStrikes: 1 });
+    expect(await strikeRows(user.id)).toMatchObject([{ id: old.strikeId, liftedAt: null, note: null }]);
+  });
+
+  it("three violations of the same content, each after the last expired, are three strikes over the years — never zero", async () => {
+    const { user } = await verifiedUser();
+    const sha256 = fakeSha();
+    for (let round = 0; round < 3; round++) {
+      const strike = await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", sha256 }));
+      expect(strike, `round ${round}`).toMatchObject({ created: true, activeStrikes: 1, suspended: false });
+      await ageTo(strike.strikeId, STRIKE_WINDOW_DAYS + 1);
+    }
+    expect(await strikeRows(user.id)).toHaveLength(3);
+  });
+
+  it("an expired match on the node and a live one on the content: the live one is returned, the expired one stays", async () => {
+    const { user } = await verifiedUser();
+    const nodeId = uuidv7();
+    const sha256 = fakeSha();
+    const byNode = await insert(testDb(), { userId: user.id, kind: "malware", nodeId }, STRIKE_WINDOW_DAYS);
+    const byContent = await insert(
+      testDb(),
+      { userId: user.id, kind: "malware", sha256 },
+      STRIKE_WINDOW_DAYS,
+    );
+    await ageTo(byNode.id, STRIKE_WINDOW_DAYS + 1);
+    expect(
+      await insert(testDb(), { userId: user.id, kind: "malware", nodeId, sha256 }, STRIKE_WINDOW_DAYS),
+    ).toEqual({
+      id: byContent.id,
+      created: false,
+    });
+    expect((await strikeRows(user.id)).find((row) => row.id === byNode.id)!.liftedAt).toBeNull();
+  });
+
+  it("inside a caller's transaction the lift and the new strike commit or roll back together", async () => {
+    const { user } = await verifiedUser();
+    const sha256 = fakeSha();
+    const old = await settled((deps) => addStrike(deps, { userId: user.id, kind: "malware", sha256 }));
+    await ageTo(old.strikeId, STRIKE_WINDOW_DAYS + 1);
+    const { deps } = serviceDeps();
+    await expect(
+      testDb().transaction(async (tx) => {
+        const added = await addStrike(deps, { userId: user.id, kind: "malware", sha256 }, { tx });
+        expect(added.created).toBe(true);
+        throw new Error("the caller's verdict failed");
+      }),
+    ).rejects.toThrow("the caller's verdict failed");
+    expect(await strikeRows(user.id)).toMatchObject([{ id: old.strikeId, liftedAt: null }]);
+  });
+});
+
+describe("the sweep does not starve behind users it cannot change", () => {
+  it("limit 2, two users whose suspension fails at the head, an ordinary user behind: suspended in the same run", async () => {
+    // Leave nobody at the threshold from earlier tests, so the three below are the whole list.
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    const age = (userId: string, days: number) =>
+      testDb()
+        .update(strikes)
+        .set({ at: sql`now() - make_interval(days => ${days})` })
+        .where(eq(strikes.userId, userId));
+    const threeRows = async () => {
+      const created = await verifiedUser();
+      for (let i = 0; i < STRIKES_TO_SUSPEND; i++) {
+        await insert(testDb(), { userId: created.user.id, kind: "abuse" }, STRIKE_WINDOW_DAYS);
+      }
+      return created;
+    };
+    const stuckA = await threeRows();
+    const stuckB = await threeRows();
+    const ordinary = await threeRows();
+    // The two stuck users are the oldest cases there are; the ordinary one comes after them.
+    await age(stuckA.user.id, STRIKE_WINDOW_DAYS - 1);
+    await age(stuckB.user.id, STRIKE_WINDOW_DAYS - 2);
+    await age(ordinary.user.id, STRIKE_WINDOW_DAYS - 3);
+    expect((await atThreshold(3)).slice(0, 3)).toEqual([stuckA.user.id, stuckB.user.id, ordinary.user.id]);
+
+    // Suspension fails for the first two users the sweep meets: the head of the list.
+    const failing = failingSuspension(2);
+    const swept = await sweepStrikeThresholds(failing.deps, { limit: 2 });
+    await failing.settle();
+    expect(swept.failed).toBe(2);
+    expect(swept.suspended).toBeGreaterThanOrEqual(1);
+    expect((await userById(stuckA.user.id))!.suspendedAt).toBeNull();
+    expect((await userById(stuckB.user.id))!.suspendedAt).toBeNull();
+    expect(
+      (await userById(ordinary.user.id))!.suspendedAt,
+      "the user behind them was reached",
+    ).toBeInstanceOf(Date);
+
+    // Clean up: nobody is left at the threshold.
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect((await userById(stuckA.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
+  it("a run looks at no more than 20 users per user it may suspend", async () => {
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    const made = [];
+    for (let i = 0; i < 3; i++) {
+      const created = await verifiedUser();
+      for (let j = 0; j < STRIKES_TO_SUSPEND; j++) {
+        await insert(testDb(), { userId: created.user.id, kind: "abuse" }, STRIKE_WINDOW_DAYS);
+      }
+      made.push(created);
+    }
+    // Every suspension fails: the run examines what there is — far fewer than its bound — and ends.
+    const failing = failingSuspension(1000);
+    const swept = await sweepStrikeThresholds(failing.deps, { limit: 1 });
+    expect(swept.suspended).toBe(0);
+    expect(swept.failed).toBe(swept.checked);
+    expect(swept.checked).toBeGreaterThanOrEqual(3);
+    expect(swept.checked).toBeLessThanOrEqual(20);
+    await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    for (const user of made) expect((await userById(user.user.id))!.suspendedAt).toBeInstanceOf(Date);
+  });
+
+  it("banned and deletion-scheduled accounts at the threshold are suspended like any other, and leave the list", async () => {
+    const { user: bannedUser } = await verifiedUser();
+    const { user: leaving } = await verifiedUser();
+    for (const id of [bannedUser.id, leaving.id]) {
+      for (let i = 0; i < STRIKES_TO_SUSPEND; i++)
+        await insert(testDb(), { userId: id, kind: "abuse" }, STRIKE_WINDOW_DAYS);
+    }
+    await testDb().update(userTable).set({ banned: true }).where(eq(userTable.id, bannedUser.id));
+    await testDb()
+      .update(userTable)
+      .set({ deleteScheduledAt: new Date(Date.now() + 86_400_000) })
+      .where(eq(userTable.id, leaving.id));
+    expect(await atThreshold()).toEqual(expect.arrayContaining([bannedUser.id, leaving.id]));
+    const swept = await settled((deps) => sweepStrikeThresholds(deps, { limit: 1000 }));
+    expect(swept.failed).toBe(0);
+    for (const id of [bannedUser.id, leaving.id]) {
+      expect((await userById(id))!.suspendedAt).toBeInstanceOf(Date);
+      expect(await atThreshold()).not.toContain(id);
+    }
   });
 });

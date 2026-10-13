@@ -17,7 +17,8 @@
 // returns the existing strike with `created: false` and writes no second audit row — but still
 // enforces the threshold, which is what repairs a delivery that died after its commit.
 // A strike with neither a node nor a hash (issued by a person against the account) is never
-// de-duplicated.
+// de-duplicated. A strike older than the window has EXPIRED: it no longer counts, so it does not
+// de-duplicate either — the new violation lifts it and is a strike of its own.
 //
 // NO HONO CONTEXT. Everything takes a `ServiceDeps`: routes pass `deps(c)`, the queue consumer
 // and jobs pass `bg`.
@@ -38,7 +39,14 @@
 
 import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../shared/constants";
 import type { Tx } from "../db/client";
-import { countActive, insert, lift, type StrikeKind, usersAtThreshold } from "../db/queries/strikes";
+import {
+  countActive,
+  insert,
+  lift,
+  type StrikeKind,
+  type ThresholdCursor,
+  usersAtThreshold,
+} from "../db/queries/strikes";
 import { captureError } from "../sentry";
 import { suspendUser, SYSTEM_ACTOR, type Actor } from "./account-state";
 import { audit } from "./audit";
@@ -75,8 +83,10 @@ export type StrikeResult = {
 
 /** What `user.suspendedReason` says after a suspension for strikes. */
 export const STRIKE_SUSPENSION_REASON = "strikes";
-/** Users one sweep looks at, unless told otherwise. */
+/** Users one sweep suspends at most, unless told otherwise. */
 export const SWEEP_DEFAULT_LIMIT = 100;
+/** One sweep looks at no more than this many users per user it may suspend. */
+export const SWEEP_MAX_EXAMINED_FACTOR = 20;
 
 const actorOf = (issuedBy: string | undefined): Actor =>
   issuedBy ? { userId: issuedBy, type: "admin" } : SYSTEM_ACTOR;
@@ -101,28 +111,44 @@ export async function enforceStrikeThreshold(
 }
 
 /**
- * Re-establishes the invariant for everyone: finds the users at the threshold whose account is
- * not suspended (oldest first, at most `limit`) and enforces each. One failing user does not stop
- * the rest: it is reported, counted in `failed` and met again by the next sweep.
+ * Re-establishes the invariant for everyone: walks the users at the threshold whose account is
+ * not suspended, oldest first, and enforces each, until `limit` of them have been suspended.
+ *
+ * IT CANNOT STARVE ON USERS IT CANNOT CHANGE. A user whose suspension fails is reported, counted
+ * in `failed` and PASSED: the walk goes on behind them in the same run (a keyset cursor), and
+ * they do not use up the budget — `limit` counts suspensions, not attempts. So a failing user at
+ * the head of the list never keeps the sweep from the users behind. What bounds one run instead
+ * is `SWEEP_MAX_EXAMINED_FACTOR × limit` users looked at; only that many users failing in a row
+ * could hold up whoever is behind them, and each of those failures is reported.
+ * (No account state makes suspension a no-op for a user this walk finds: see `usersAtThreshold`.)
  */
 export async function sweepStrikeThresholds(
   deps: ServiceDeps,
   opts: { limit?: number } = {},
 ): Promise<{ checked: number; suspended: number; failed: number }> {
   const limit = Math.max(1, Math.min(opts.limit ?? SWEEP_DEFAULT_LIMIT, 1_000));
-  const userIds = await usersAtThreshold(deps.db, STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, limit);
+  const maxExamined = limit * SWEEP_MAX_EXAMINED_FACTOR;
+  let cursor: ThresholdCursor | undefined;
+  let checked = 0;
   let suspended = 0;
   let failed = 0;
-  for (const userId of userIds) {
-    try {
-      if ((await enforce(deps, userId, SYSTEM_ACTOR)).suspended) suspended += 1;
-    } catch (error) {
-      failed += 1;
-      captureError(error, { kind: "strike_sweep" });
-      metric("error", { kind: "strike_sweep" });
+  while (suspended < limit && checked < maxExamined) {
+    const want = Math.min(limit - suspended, maxExamined - checked);
+    const page = await usersAtThreshold(deps.db, STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND, want, cursor);
+    if (page.length === 0) break;
+    for (const found of page) {
+      checked += 1;
+      try {
+        if ((await enforce(deps, found.userId, SYSTEM_ACTOR)).suspended) suspended += 1;
+      } catch (error) {
+        failed += 1;
+        captureError(error, { kind: "strike_sweep" });
+        metric("error", { kind: "strike_sweep" });
+      }
     }
+    cursor = page.at(-1);
   }
-  return { checked: userIds.length, suspended, failed };
+  return { checked, suspended, failed };
 }
 
 /**
@@ -162,7 +188,7 @@ export async function addStrike(
   opts: { tx?: Tx } = {},
 ): Promise<StrikeResult> {
   if (opts.tx) {
-    const strike = await insert(opts.tx, input);
+    const strike = await insert(opts.tx, input, STRIKE_WINDOW_DAYS);
     // As this transaction sees it; the decision is taken again after the commit.
     const activeStrikes = await countActive(opts.tx, input.userId, STRIKE_WINDOW_DAYS);
     let applied: Promise<unknown> | null = null;
@@ -183,8 +209,10 @@ export async function addStrike(
       },
     };
   }
-  // One statement (two when the strike already exists): atomic without a transaction of its own.
-  const strike = await insert(deps.db, input);
+  // No transaction of its own: a new strike is one statement. When it meets an EXPIRED strike for
+  // the same file or content it lifts that one first, and a lift that outlives a failed insert
+  // only lifts a strike that had stopped counting anyway.
+  const strike = await insert(deps.db, input, STRIKE_WINDOW_DAYS);
   const { activeStrikes, suspended } = await afterCommit(deps, input, strike);
   return { strikeId: strike.id, created: strike.created, activeStrikes, suspended, applySuspension: null };
 }
