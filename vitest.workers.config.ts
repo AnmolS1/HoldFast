@@ -10,6 +10,17 @@
 //
 // Storage isolation is per test FILE: tests in one file share R2, queue and Durable Object state.
 // Postgres is not isolated at all — create rows with random ids, never assert on table-wide counts.
+//
+// TABLE-WIDE TESTS. A test of code that acts on every row of a table (a purge of everything due,
+// a sweep, a reconcile over all users) cannot share the database with files that are writing to
+// it. Name such a file `*.tablewide.test.ts`: it is LEFT OUT of the run above and runs in the
+// third step of `npm test`, after the other two have finished, one file at a time:
+//
+//   HOLDFAST_TABLEWIDE=1 npx vitest run -c vitest.workers.config.ts            all of them
+//   HOLDFAST_TABLEWIDE=1 npx vitest run -c vitest.workers.config.ts <path>     one
+//
+// Without the variable a table-wide path is "No test files found" (exit 1), never a pass. The
+// rows other files left behind are still there: only nothing else is writing while it runs.
 // Custom environments are not supported here; jsdom and plain-Node tests live in vitest.config.ts.
 import { fileURLToPath } from "node:url";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
@@ -20,6 +31,8 @@ import { testVars } from "./tests/setup/test-vars.ts";
 forbidDotEnvFallback();
 
 const db = localDbName();
+const TABLEWIDE = "tests/unit/**/*.tablewide.test.{ts,tsx}";
+const tablewide = process.env.HOLDFAST_TABLEWIDE === "1";
 const modulePath = (path: string) => fileURLToPath(new URL(`./node_modules/${path}`, import.meta.url));
 
 export default defineConfig({
@@ -51,15 +64,18 @@ export default defineConfig({
     }),
   ],
   test: {
-    name: "workers",
-    include: ["tests/unit/**/*.test.{ts,tsx}"],
+    name: tablewide ? "tablewide" : "workers",
+    include: [tablewide ? TABLEWIDE : "tests/unit/**/*.test.{ts,tsx}"],
     exclude: [
       "tests/unit/client/**",
       "tests/unit/db/**",
       "tests/unit/e2e-harness/**",
       "tests/unit/harness/client/**",
       "tests/unit/harness/node/**",
+      ...(tablewide ? [] : [TABLEWIDE]),
     ],
+    // One table-wide file at a time; everything else in parallel, as before.
+    ...(tablewide ? { fileParallelism: false } : {}),
     // The name of this checkout's database, for tests that assert which one they are talking to.
     provide: { holdfastDb: db },
     // Closing a database client (`client.end()` in pg, `sql.end()` in postgres.js) makes the
