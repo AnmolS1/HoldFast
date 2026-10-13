@@ -15,6 +15,7 @@ import {
   setupShell,
   shellFetch,
 } from "./helpers";
+import { buildRoutesWithTestPage, TEST_PAGE, testPage } from "./test-page";
 
 setupShell();
 
@@ -66,8 +67,8 @@ describe("401 and the route that is showing", () => {
 
   it("control — an app route: the SAME request opens the modal", async () => {
     arrange(sessionOf());
-    renderRoutes(buildRoutes(), ["/recent"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Recent"]')).not.toBeNull());
+    renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(testPage()).not.toBeNull());
     const held = api("/api/nodes");
     held.catch(() => {});
     await flush();

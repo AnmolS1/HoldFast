@@ -4,6 +4,7 @@ import { api, isTermsPending } from "../../../../src/client/lib/api";
 import type { SessionShape } from "../../../../src/client/lib/contracts";
 import { buildRoutes } from "../../../../src/client/router";
 import { CONFIG, envelope, json, renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
+import { buildRoutesWithTestPage, TEST_PAGE, testPage } from "./test-page";
 
 setupShell();
 
@@ -20,13 +21,14 @@ describe("terms re-acceptance", () => {
         return undefined;
       },
     });
-    const { router } = renderRoutes(buildRoutes(), ["/recent"]);
+    const { router } = renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
     expect(
       await screen.findByRole("heading", { name: "We've updated the Terms and Privacy Policy." }),
     ).toBeTruthy();
     // The screen replaces the app: no frame, no page content.
     expect(document.querySelector("[data-frame]")).toBeNull();
     expect(document.querySelector("[data-placeholder-page]")).toBeNull();
+    expect(testPage()).toBeNull();
     expect(screen.getByRole("link", { name: "Read the Terms" }).getAttribute("href")).toBe(
       "https://ponderance.dev/terms",
     );
@@ -48,8 +50,8 @@ describe("terms re-acceptance", () => {
 
     fireEvent.click(checkbox);
     fireEvent.click(accept);
-    await waitFor(() => expect(router.state.location.pathname).toBe("/recent"));
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Recent"]')).not.toBeNull());
+    await waitFor(() => expect(router.state.location.pathname).toBe(TEST_PAGE));
+    await waitFor(() => expect(testPage()).not.toBeNull());
     const post = calls.find((call) => call.path === "/api/account/accept-terms");
     expect(post?.body).toEqual({ version: "2026-10" });
   });
@@ -84,8 +86,8 @@ describe("terms re-acceptance", () => {
         return undefined;
       },
     });
-    const { router } = renderRoutes(buildRoutes(), ["/trash"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Trash"]')).not.toBeNull());
+    const { router } = renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(testPage()).not.toBeNull());
 
     // The terms were bumped on the server after this page loaded.
     configTerms = "2026-11";
@@ -95,13 +97,13 @@ describe("terms re-acceptance", () => {
     const pending = api<{ id: string }>("/api/nodes/folder", { method: "POST", body: { name: "Taxes" } });
     await waitFor(() => expect(router.state.location.pathname).toBe("/accept-terms"));
     expect(isTermsPending()).toBe(true);
-    expect(new URLSearchParams(router.state.location.search).get("next")).toBe("/trash");
+    expect(new URLSearchParams(router.state.location.search).get("next")).toBe(TEST_PAGE);
 
     fireEvent.click(await screen.findByRole("checkbox"));
     fireEvent.click(screen.getByRole("button", { name: "Accept and continue" }));
     await expect(pending).resolves.toEqual({ id: "new" });
     expect(isTermsPending()).toBe(false);
-    await waitFor(() => expect(router.state.location.pathname).toBe("/trash"));
+    await waitFor(() => expect(router.state.location.pathname).toBe(TEST_PAGE));
     expect(calls.filter((call) => call.path === "/api/nodes/folder").map((call) => call.body)).toEqual([
       { name: "Taxes" },
       { name: "Taxes" },

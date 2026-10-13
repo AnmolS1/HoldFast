@@ -30,6 +30,7 @@ import {
   setupShell,
   shellFetch,
 } from "./helpers";
+import { buildRoutesWithTestPage, TEST_PAGE, testPage } from "./test-page";
 
 setupShell();
 
@@ -175,16 +176,17 @@ describe("2. identity changes purge user-scoped state", () => {
   it("router guard: a session for another account purges the previous account's cache before the page renders", async () => {
     let current: SessionShape = ALICE;
     shellFetch({ session: () => current });
-    const first = renderRoutes(buildRoutes(), ["/"]);
-    await waitFor(() => expect(document.querySelector("[data-frame]")).not.toBeNull());
+    const first = renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(testPage()).not.toBeNull());
+    expect(document.querySelector("[data-frame]")).not.toBeNull();
     queryClient.setQueryData(["nodes", "root"], [{ id: "alice-file" }]);
     first.unmount();
 
     // Alice's session ended elsewhere; Bob signs in on this device without a reload.
     current = BOB;
     await queryClient.invalidateQueries({ queryKey: ["session"] });
-    renderRoutes(buildRoutes(), ["/recent"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Recent"]')).not.toBeNull());
+    renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(testPage()).not.toBeNull());
     expect(queryClient.getQueryData(["nodes", "root"])).toBeUndefined();
     expect(getKnownUserId()).toBe(BOB!.user.id);
   });

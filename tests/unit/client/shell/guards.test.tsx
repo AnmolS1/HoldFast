@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { buildRoutes } from "../../../../src/client/router";
 import { safeNext } from "../../../../src/client/routes/auth";
 import { renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
+import { buildRoutesWithTestPage, TEST_PAGE, testPage } from "./test-page";
 
 setupShell();
 
@@ -101,9 +102,18 @@ describe("route guards", () => {
 
   it("a verified user with current terms reaches the page", async () => {
     shellFetch({ session: sessionOf() });
-    const { router } = renderRoutes(buildRoutes(), ["/trash"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Trash"]')).not.toBeNull());
-    expect(path(router)).toBe("/trash");
+    const { router } = renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(testPage()).not.toBeNull());
+    expect(path(router)).toBe(TEST_PAGE);
+  });
+
+  it("the tests' own page is behind the same guard: signed out → /login?next=, and it is not drawn", async () => {
+    shellFetch({ session: null });
+    const { router } = renderRoutes(buildRoutesWithTestPage(), [TEST_PAGE]);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+    expect(new URLSearchParams(router.state.location.search).get("next")).toBe(TEST_PAGE);
+    expect(await screen.findByRole("heading", { name: "Sign in" })).toBeTruthy();
+    expect(testPage()).toBeNull();
   });
 
   it("/admin/* without the admin role renders not-found (no hint that it exists)", async () => {

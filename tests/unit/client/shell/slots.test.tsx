@@ -4,7 +4,7 @@ import { render } from "@testing-library/react";
 import { createAuthClient } from "better-auth/react";
 import { adminClient, twoFactorClient } from "better-auth/client/plugins";
 import { passkeyClient } from "@better-auth/passkey/client";
-import type { ComponentType } from "react";
+import type { ComponentType, ReactElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type * as Slots from "../../../../src/client/components/slots";
 import type { FileListItem, MimeCategory, ScanStatus } from "../../../../src/client/components/types";
@@ -92,20 +92,31 @@ const realClient = () => createAuthClient({ plugins: [passkeyClient(), twoFactor
 const asContract = (): AuthClientContract => realClient();
 void asContract;
 
+const target = { nodeId: "n1", linkToken: "tok" };
+const noop = () => {};
+const dialog = { open: true, nodeId: "n1", onClose: noop };
+const rendersNothing = (element: ReactElement) => () => expect(render(element).container.innerHTML).toBe("");
+const returns = (call: () => unknown, value: unknown) => () => expect(call()).toBe(value);
+
+// What each slot does while it is still the shell's stub. ONE STUB PER LINE: the task that fills a
+// slot deletes that slot's line(s) and nothing else. The order is deliberate — lines of different
+// Wave-2 tasks are never neighbours, so two tasks deleting theirs do not meet in a merge.
+const STUBS: Array<[behaviour: string, check: () => void]> = [
+  ["PreviewDialog renders nothing", rendersNothing(<PreviewDialog {...dialog} source="owner" />)],
+  ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
+  ["SearchSuggestions renders nothing", rendersNothing(<SearchSuggestions query="tax" onPick={noop} />)],
+  ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
+  ["UploadDropOverlay renders nothing", rendersNothing(<UploadDropOverlay />)],
+  ["requestUpload() is a no-op", returns(() => requestUpload(), undefined)],
+  ["requestUpload(opts) is a no-op", returns(() => requestUpload({ files: [], parentId: "p" }), undefined)],
+  ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
+  ["useUsageSummary() is null", returns(() => useUsageSummary(), null)],
+];
+
 describe("slot stubs", () => {
-  it("render nothing", () => {
-    const target = { nodeId: "n1", linkToken: "tok" };
-    const { container } = render(
-      <>
-        <ReportLink target={target} />
-        <ReportDialog open onClose={() => {}} target={target} />
-        <PreviewDialog open nodeId="n1" onClose={() => {}} source="owner" />
-        <ShareDialog open nodeId="n1" onClose={() => {}} />
-        <SearchSuggestions query="tax" onPick={() => {}} />
-        <UploadDropOverlay />
-      </>,
-    );
-    expect(container.innerHTML).toBe("");
+  it.each(STUBS)("%s", (_behaviour, check) => check());
+
+  it("every slot component is usable by a consumer of the contract's props", () => {
     expect(consumers.length).toBe(7);
   });
 
@@ -122,12 +133,6 @@ describe("slot stubs", () => {
     expect(onContinue).toHaveBeenCalledTimes(1);
     expect(onCancel).not.toHaveBeenCalled();
     expect(view.container.innerHTML).toBe("");
-  });
-
-  it("requestUpload is a no-op and useUsageSummary is null", () => {
-    expect(requestUpload()).toBeUndefined();
-    expect(requestUpload({ files: [], parentId: "p" })).toBeUndefined();
-    expect(useUsageSummary()).toBeNull();
   });
 
   it("the frame's upload slots come from features/upload/slots.tsx and index.ts re-exports the same objects", () => {

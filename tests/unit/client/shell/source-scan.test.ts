@@ -90,14 +90,57 @@ describe("tokens with restricted use", () => {
   });
 });
 
+// Every feature folder that is still the shell's placeholder, with its files. ONE FOLDER PER LINE:
+// the task that takes a folder over deletes that folder's line and nothing else. The order is
+// deliberate — folders of different Wave-2 tasks are never on neighbouring lines, so two tasks
+// deleting their lines do not meet in a merge. Keep it when adding a line.
+const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
+  account: ["routes.tsx"],
+  explorer: ["index.ts", "routes.tsx"],
+  admin: ["routes.tsx"],
+  preview: ["index.ts", "routes.tsx"],
+  dmca: ["routes.tsx"],
+  upload: ["index.ts", "routes.tsx", "slots.tsx"],
+  interstitial: ["index.ts", "routes.tsx"],
+  recent: ["routes.tsx"],
+  search: ["index.ts", "routes.tsx"],
+  starred: ["routes.tsx"],
+  trash: ["routes.tsx"],
+  usage: ["index.ts", "routes.tsx"],
+  "public-link": ["index.ts", "routes.tsx"],
+  report: ["index.ts", "routes.tsx"],
+  share: ["index.ts", "routes.tsx"],
+  "shared-by-me": ["index.ts", "routes.tsx"],
+};
+
 describe("placeholder modules", () => {
-  it("every placeholder module says who takes it over", () => {
-    const placeholders = Object.entries(sources).filter(
-      ([path]) => path.startsWith("/src/client/features/") && path !== "/src/client/features/index.ts",
-    );
-    expect(placeholders.length).toBe(27);
-    for (const [path, code] of placeholders) expect(code, path).toMatch(/PLACEHOLDER — taken over by/);
+  const MARKER = /PLACEHOLDER — taken over by/;
+  const FEATURES = "/src/client/features/";
+  const featureFiles = Object.entries(sources).filter(
+    ([path]) => path.startsWith(FEATURES) && path !== `${FEATURES}index.ts`,
+  );
+  const folderOf = (path: string) => path.slice(FEATURES.length).split("/")[0]!;
+  const listed = Object.entries(PLACEHOLDER_FOLDERS).flatMap(([folder, files]) =>
+    files.map((file) => `${FEATURES}${folder}/${file}`),
+  );
+
+  it("every listed placeholder file exists and says who takes it over", () => {
+    expect(listed.length).toBeGreaterThan(0);
+    for (const path of listed) expect(sources[path], path).toMatch(MARKER);
     // The auth client is no longer one: it is the real Better Auth client.
     expect(sources["/src/client/lib/auth-client.ts"]).not.toMatch(/PLACEHOLDER/);
+  });
+
+  it("a listed folder holds exactly its listed files — nothing is added beside a placeholder", () => {
+    const inListedFolders = featureFiles
+      .map(([path]) => path)
+      .filter((path) => Object.hasOwn(PLACEHOLDER_FOLDERS, folderOf(path)));
+    expect(inListedFolders.sort()).toEqual([...listed].sort());
+  });
+
+  it("a file without the marker is in a folder that left the list, and no such folder still carries it", () => {
+    for (const [path, code] of featureFiles) {
+      expect(MARKER.test(code), path).toBe(Object.hasOwn(PLACEHOLDER_FOLDERS, folderOf(path)));
+    }
   });
 });

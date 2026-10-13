@@ -11,7 +11,7 @@
 // cannot start; the two tests that need Vite's module graph are skipped there and say so.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join } from "node:path";
-import type { Page, Route } from "@playwright/test";
+import type { Locator, Page, Route } from "@playwright/test";
 import { expect, expectNoA11yViolations, stubTurnstile, test } from "./fixtures";
 
 const DESKTOP_MIN = 1024;
@@ -112,8 +112,58 @@ async function mockShell(page: Page, port: number, options: MockOptions = {}): P
 }
 
 const isMobile = (page: Page) => (page.viewportSize()?.width ?? 0) < DESKTOP_MIN;
-const placeholder = (page: Page, name: string) => page.locator(`[data-placeholder-page="${name}"]`);
+const placeholder = (scope: Page | Locator, name: string) =>
+  scope.locator(`[data-placeholder-page="${name}"]`);
 const notFound = (page: Page) => page.getByRole("heading", { name: "Page not found" });
+
+interface Destination {
+  path: string;
+  /** The header title, and the name its placeholder page carries. */
+  title: string;
+  /** Its id in the desktop sidebar, when it has an entry there. */
+  nav?: string;
+  /** Rendered above the page it was opened from. */
+  overlay?: true;
+  /** Still the shell's "Coming soon" page. */
+  placeholder: boolean;
+}
+
+// Every in-frame destination. ONE DESTINATION PER LINE: the task that builds a page flips its own
+// line(s) to `placeholder: false` and touches nothing else in this file. From then on the tests
+// below check for that line only what the shell still owns (the route exists, the frame, the
+// navigation state) and that no placeholder is left. The order is deliberate — lines of different
+// Wave-2 tasks are never neighbours, so two tasks flipping theirs do not meet in a merge.
+const DESTINATIONS: Destination[] = [
+  { path: "/", title: "Files", nav: "files", placeholder: true },
+  { path: "/folder/abc", title: "Files", placeholder: true },
+  { path: "/shared", title: "Shared with me", nav: "shared", placeholder: true },
+  { path: "/uploads", title: "Uploads", placeholder: true },
+  { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: true },
+  { path: "/recent", title: "Recent", nav: "recent", placeholder: true },
+  { path: "/starred", title: "Starred", nav: "starred", placeholder: true },
+  { path: "/trash", title: "Trash", nav: "trash", placeholder: true },
+  { path: "/search?q=tax", title: "Search", placeholder: true },
+  { path: "/storage", title: "Storage", placeholder: true },
+  { path: "/account/security", title: "Account", placeholder: true },
+  { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: true },
+  { path: "/admin/users", title: "Admin", placeholder: true },
+];
+
+function destination(path: string): Destination {
+  const found = DESTINATIONS.find((entry) => entry.path === path);
+  if (!found) throw new Error(`no destination ${path} in DESTINATIONS`);
+  return found;
+}
+
+/**
+ * The destination's own page is showing: its placeholder while it is one, and no placeholder at
+ * all after (any — so the check also waits for the page it came from to leave).
+ */
+async function expectDestination(page: Page, { title, placeholder: isPlaceholder }: Destination) {
+  if (isPlaceholder) await expect(placeholder(page, title)).toBeVisible();
+  else await expect(page.locator("[data-placeholder-page]")).toHaveCount(0);
+  await expect(notFound(page)).toHaveCount(0);
+}
 
 async function gotoFrame(page: Page, path: string): Promise<void> {
   await page.goto(path);
@@ -263,15 +313,6 @@ test.describe("shell routes", () => {
 });
 
 test.describe("navigation", () => {
-  const DESTINATIONS: Array<[id: string, path: string, title: string]> = [
-    ["files", "/", "Files"],
-    ["shared", "/shared", "Shared with me"],
-    ["shared-by-me", "/shared-by-me", "Shared by me"],
-    ["recent", "/recent", "Recent"],
-    ["starred", "/starred", "Starred"],
-    ["trash", "/trash", "Trash"],
-  ];
-
   test("desktop: every sidebar destination shows its placeholder, none shows not-found", async ({
     page,
     origins,
@@ -280,13 +321,16 @@ test.describe("navigation", () => {
     await mockShell(page, origins.port);
     await gotoFrame(page, "/");
     await expect(page.locator("[data-sidebar] [data-nav]")).toHaveCount(6);
-    for (const [id, path, title] of DESTINATIONS) {
-      await page.locator(`[data-sidebar] [data-nav="${id}"]`).click();
-      await expect(page).toHaveURL(new RegExp(`${path === "/" ? "/" : path}$`));
-      await expect(placeholder(page, title)).toBeVisible();
-      await expect(page.getByRole("heading", { level: 1 })).toHaveText(title);
-      await expect(notFound(page)).toHaveCount(0);
-      await expect(page.locator(`[data-sidebar] [data-nav="${id}"]`)).toHaveAttribute("aria-current", "page");
+    const inSidebar = DESTINATIONS.filter((entry) => entry.nav !== undefined);
+    expect(inSidebar.length).toBe(6);
+    for (const entry of inSidebar) {
+      const item = page.locator(`[data-sidebar] [data-nav="${entry.nav}"]`);
+      await item.click();
+      await expect(page).toHaveURL(new RegExp(`${entry.path}$`));
+      await expectDestination(page, entry);
+      // A placeholder leaves the header to the route's default title; a real page may set its own.
+      if (entry.placeholder) await expect(page.getByRole("heading", { level: 1 })).toHaveText(entry.title);
+      await expect(item).toHaveAttribute("aria-current", "page");
     }
     await page.locator('[data-sidebar] [data-nav="shared"]').click();
     await expect(placeholder(page, "Shared with me")).toContainText(
@@ -309,18 +353,18 @@ test.describe("navigation", () => {
     ]);
     await expect(page.locator("[data-bottom-nav]").locator("a, button")).toHaveCount(3);
     await expect(page.locator("[data-sidebar]")).toHaveCount(0);
-    await expect(placeholder(page, "Files")).toBeVisible();
+    await expectDestination(page, destination("/"));
 
-    for (const [label, title] of [
-      ["Recent", "Recent"],
-      ["Starred", "Starred"],
-      ["Trash", "Trash"],
-      ["My files", "Files"],
+    for (const [label, path] of [
+      ["Recent", "/recent"],
+      ["Starred", "/starred"],
+      ["Trash", "/trash"],
+      ["My files", "/"],
     ] as const) {
       await page.getByRole("button", { name: "Switch files view" }).click();
       await page.getByRole("dialog", { name: "Files" }).getByRole("button", { name: label }).click();
-      await expect(placeholder(page, title)).toBeVisible();
-      await expect(notFound(page)).toHaveCount(0);
+      await expect(page).toHaveURL(new RegExp(`${path}$`));
+      await expectDestination(page, destination(path));
       await expect(page.locator('[data-bottom-nav-item="files"]')).toHaveAttribute("aria-current", "page");
     }
 
@@ -348,32 +392,30 @@ test.describe("navigation", () => {
     await expect(page.locator('[data-bottom-nav-item="account"]')).toHaveAttribute("aria-current", "page");
   });
 
-  test("every other in-frame placeholder route renders (deep links, both layouts)", async ({
-    page,
-    origins,
-  }) => {
+  test("every in-frame destination renders from a deep link (both layouts)", async ({ page, origins }) => {
     await mockShell(page, origins.port, { user: { role: "admin" } });
-    for (const [path, title] of [
-      ["/folder/abc", "Files"],
-      ["/uploads", "Uploads"],
-      ["/search?q=tax", "Search"],
-      ["/storage", "Storage"],
-      ["/account/security", "Account"],
-      ["/admin/users", "Admin"],
-      ...DESTINATIONS.map(([, path, title]) => [path, title] as [string, string]),
-    ] as Array<[string, string]>) {
-      await gotoFrame(page, path);
-      await expect(placeholder(page, title)).toBeVisible();
-      await expect(notFound(page)).toHaveCount(0);
+    const pages = DESTINATIONS.filter((entry) => !entry.overlay);
+    expect(pages.length).toBe(12);
+    for (const entry of pages) {
+      await gotoFrame(page, entry.path);
+      await expectDestination(page, entry);
     }
   });
 
   test("the preview is an overlay above the page it was opened from", async ({ page, origins }) => {
     await mockShell(page, origins.port);
-    await gotoFrame(page, "/preview/node-1");
-    await expect(page.locator("[data-overlay]").locator('[data-placeholder-page="Preview"]')).toBeVisible();
+    const preview = destination("/preview/node-1");
+    const root = destination("/");
+    await gotoFrame(page, preview.path);
+    const overlay = page.locator("[data-overlay]");
+    await expect(overlay).toBeAttached();
+    if (preview.placeholder) await expect(placeholder(overlay, preview.title)).toBeVisible();
+    else await expect(placeholder(page, preview.title)).toHaveCount(0);
     // Cold link: the root page is the background.
-    await expect(page.locator('[data-background="kept"] [data-placeholder-page="Files"]')).toBeAttached();
+    const background = page.locator('[data-background="kept"]');
+    await expect(background).toBeAttached();
+    if (root.placeholder) await expect(placeholder(background, root.title)).toBeAttached();
+    else await expect(placeholder(page, root.title)).toHaveCount(0);
   });
 
   test("a non-admin asking for /admin gets not-found", async ({ page, origins }) => {
@@ -516,10 +558,12 @@ test.describe("accessibility (light)", () => {
     await expectNoA11yViolations(page);
   });
 
-  test("/ has no axe violations", async ({ page, origins }) => {
+  // The frame around a page. `/shared` is a placeholder until Wave 3; each feature's own spec
+  // audits its own pages.
+  test("the frame has no axe violations", async ({ page, origins }) => {
     await mockShell(page, origins.port);
-    await gotoFrame(page, "/");
-    await expect(placeholder(page, "Files")).toBeVisible();
+    await gotoFrame(page, "/shared");
+    await expect(placeholder(page, "Shared with me")).toBeVisible();
     await expectNoA11yViolations(page);
   });
 
