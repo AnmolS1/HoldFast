@@ -256,7 +256,8 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
           name: session.finalName,
           parentId: session.body.parentId,
           size: session.body.size,
-          sha256: sent.sha256,
+          // The digest is not given out while the scan is pending.
+          sha256: api.scan === "clean" ? sent.sha256 : null,
           scanStatus: api.scan === "clean" ? "clean" : "pending",
         });
         done.set(session.uploadId, node);
