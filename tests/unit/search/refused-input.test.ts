@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SearchResponse } from "../../../src/shared/schemas/search";
 import { encodeCursor } from "../../../src/worker/db/cursor";
+import { uuidv7 } from "../../../src/worker/db/ids";
 import { auditRows } from "../auth/helpers";
 import { makeFile, makeFolder, makeShare, makeUser } from "../services-core/helpers";
 import { get, searchPath, type Answer, type Caller } from "./helpers";
@@ -99,14 +100,27 @@ describe("the other text the three routes pass on", () => {
 
     // A cursor's value, forged with a NUL where the listing expects text or a number.
     const forgedSearch = encodeCursor(`search:${me.id}:mine:nulcase`, { offset: "1\u0000" });
-    const forgedStarred = encodeCursor(`starred:${me.id}`, { k: "folder", v: "a\u0000", id: "\u0000" });
+    // The starred listing's own cursor, well formed in every field (tag, scope, sort, direction,
+    // kind, one name key, a node id) — so that only the NUL in its name key can refuse it.
+    const starredCursor = (nameKey: string) =>
+      encodeCursor("nodes", {
+        scope: `starred:${me.id}`,
+        sort: "name",
+        dir: "asc",
+        kind: "file",
+        key: [nameKey],
+        id: uuidv7(),
+      });
+    // The twin without the NUL is a cursor the listing takes.
+    expect((await get(as(me), `/starred?cursor=${starredCursor("a")}`)).status).toBe(200);
     for (const path of [
       "/search?q=nulcase&scope=mine&cursor=%00",
       `/search?q=nulcase&scope=mine&cursor=${search.nextCursor}%00`,
       `/search?q=nulcase&scope=mine&cursor=${forgedSearch}`,
       "/starred?cursor=%00",
       `/starred?cursor=${starred.nextCursor}%00`,
-      `/starred?cursor=${forgedStarred}`,
+      `/starred?cursor=${starredCursor("a\u0000")}`,
+      `/starred?cursor=${starredCursor("\u0000")}`,
     ]) {
       expectRefused(await get(as(me), path), path);
     }
