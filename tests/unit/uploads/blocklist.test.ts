@@ -8,7 +8,7 @@ import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import type { SessionUser } from "../../../src/worker/auth/types";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
-import { hashBlocklist, nodes, reports, uploadIps } from "../../../src/worker/db/schema";
+import { hashBlocklist, nodes, reports, shares, uploadIps } from "../../../src/worker/db/schema";
 import { BLOCKED_MESSAGE, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { storage } from "../../../src/worker/services/storage";
@@ -32,11 +32,13 @@ import {
   complete,
   init,
   ledgerOf,
+  putParts,
   sessionRow,
   sessionsOf,
   sha,
   sha256Of,
   strikesOf,
+  TWO_PARTS,
   uniqueBytes,
   uploaded,
   uploader,
@@ -391,22 +393,58 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(await usedBytes(owner.id)).toBe(1100);
   });
 
-  it("while the DECLARED hash says CSAM no path of complete deletes the object: a revoked share gives the upload up and removes nothing", async () => {
+  /** An editor's finished single upload into a folder whose share is then revoked. */
+  async function revokedBeforeComplete(bytes: Uint8Array, size?: number) {
     const owner = await uploader();
     const editor = await uploader();
     const folder = await makeFolder(owner.id);
     const share = await makeShare(folder.id, owner.id, editor.id, { role: "editor", canUpload: true });
+    const session =
+      size === undefined
+        ? await uploaded(editor, { parentId: folder.id }, bytes)
+        : await init(editor, { parentId: folder.id, size });
+    const row = (await sessionRow(session.uploadId))!;
+    const revoke = () => testDb().delete(shares).where(eq(shares.id, share.id));
+    return { owner, editor, session, row, revoke };
+  }
+
+  it("a path of complete that gives the upload up never deletes an object whose OWN hash is listed as CSAM", async () => {
     const known = await listed("csam");
-    const session = await uploaded(editor, { parentId: folder.id }, known.bytes);
-    const key = (await sessionRow(session.uploadId))!.r2Key;
-    const { shares } = await import("../../../src/worker/db/schema");
-    await testDb().delete(shares).where(eq(shares.id, share.id));
+    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(known.bytes);
+    await revoke();
     const answer = await complete(editor, session.uploadId, { sha256: known.sha256 });
     expect(answer.status).toBe(404);
     expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
     expect(await usedBytes(owner.id)).toBe(0);
-    expect(await env.FILES.head(key)).not.toBeNull();
-    // Control: the same refusal for a hash that is not listed removes the object (complete.test.ts).
+    expect(await env.FILES.head(row.r2Key)).not.toBeNull();
+    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(1);
     expect(await sessionsOf(editor.id)).toHaveLength(1);
+  });
+
+  it("… but a DECLARED hash alone keeps nothing: innocent bytes under a listed hash are deleted like any abandoned upload (no storage outside the quota)", async () => {
+    const known = await listed("csam");
+    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(uniqueBytes());
+    await revoke();
+    const answer = await complete(editor, session.uploadId, { sha256: known.sha256 });
+    expect(answer.status).toBe(404);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+    expect(await usedBytes(owner.id)).toBe(0);
+    expect(await env.FILES.head(row.r2Key)).toBeNull();
+    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(0);
+  });
+
+  it("… and an unfinished multipart upload has no object to keep: it is aborted in the store", async () => {
+    const known = await listed("csam");
+    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(new Uint8Array(0), TWO_PARTS);
+    const parts = await putParts(editor, session, TWO_PARTS);
+    await revoke();
+    const answer = await complete(editor, session.uploadId, { sha256: known.sha256, parts });
+    expect(answer.status).toBe(404);
+    expect(await usedBytes(owner.id)).toBe(0);
+    expect(await env.FILES.head(row.r2Key)).toBeNull();
+    const store = storage(env);
+    await expect(
+      store.uploadPart(store.resumeMultipart(row.r2Key, row.r2UploadId!), 1, new Uint8Array(8), 8),
+    ).rejects.toThrow();
   });
 });

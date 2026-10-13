@@ -34,10 +34,10 @@
 // THE BLOCKLIST IS ACTED ON ONLY FOR BYTES THIS SERVER HASHED. `sha256` in the body is the
 // client's word: a hit on it makes `complete` read the stored object back and hash it, and what
 // happens next is decided by that hash — nobody is struck or locked on a declared one.
-// A HASH ON THE BLOCKLIST AS CSAM IS NEVER DELETED — by no path of `complete`: the lookup is made
-// right after the claim, and while the declared hash says so the paths that give an upload up
-// remove nothing from the store. A real hit writes the node and hands it to `lockSuspectedCsam`;
-// the caller gets the same `403` as for any other blocked content.
+// AN OBJECT WHOSE HASH IS ON THE BLOCKLIST AS CSAM IS NEVER DELETED by `complete`: the lookup is
+// made right after the claim, and while the declared hash says so a path that gives the upload
+// up hashes the object first and leaves one that really is listed. A real hit writes the node and
+// hands it to `lockSuspectedCsam`; the caller gets the same `403` as for any other blocked content.
 //
 // ONE AVATAR PER USER: the transaction that makes an avatar current removes the others (a held
 // one stays), so avatars — which never count against the quota — cannot pile up.
@@ -303,16 +303,30 @@ async function discardStored(c: Ctx, session: Upload, assembled: boolean): Promi
 
 /**
  * Complete gives the claimed session up: reservation released, session `aborted`, and what it
- * stored removed — unless `keepStored`, the case of a hash that is on the blocklist as CSAM.
+ * stored removed.
+ *
+ * `declaredCsam`: the hash the client declared is on the blocklist as CSAM. Then an object that
+ * exists is hashed first, and one whose OWN hash is listed that way is left where it is — an
+ * object like that is never deleted here. (A declared hash alone keeps nothing: bytes kept on a
+ * client's word would be storage outside every quota.) An unfinished multipart upload has no
+ * object, and is aborted.
  */
 async function abandonClaimed(
   c: Ctx,
   session: Upload,
-  opts: { assembled: boolean; keepStored: boolean; reason: string },
+  opts: { assembled: boolean; declaredCsam: boolean; reason: string },
 ): Promise<void> {
   await releaseAndAbort(db(c), session, "claimed");
-  if (!opts.keepStored) await discardStored(c, session, opts.assembled);
   metric("upload", { outcome: "aborted", kind: modeOf(session), reason: opts.reason });
+  if (opts.declaredCsam && (opts.assembled || !session.r2UploadId)) {
+    const actual = await storedSha256(storage(c.env), session.r2Key);
+    if (actual !== null && (await blocklist.lookup(db(c), actual))?.reason === "csam") {
+      audit(c, "upload.csam_object_kept", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+      metric("upload", { outcome: "csam_object_kept", kind: modeOf(session) });
+      return;
+    }
+  }
+  await discardStored(c, session, opts.assembled);
 }
 
 // ── init ────────────────────────────────────────────────────────────────────────────────────
@@ -401,9 +415,9 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
   const r2Key = avatar ? avatarKey(user.id, nodeId) : keyFor(place.ownerId, nodeId, versionId);
   const at = now(c);
 
-  // The admission. Not `retryOnDeadlock`: nothing here may run twice (a refusal is counted
-  // inside), and the lock order below cannot deadlock against another admission.
-  const admitted = await db(c).transaction(async (tx) => {
+  // The admission. Database statements only: a transaction Postgres ends as a deadlock victim is
+  // run again (a refusal throws, and is never run twice).
+  const admitted = await retryOnDeadlock(db(c), async (tx) => {
     await enforceUploadCeilings(
       c,
       {
@@ -511,6 +525,9 @@ router.put(`/uploads/${ID}/parts/${PART_NUMBER}`, verified, uploadsOn, async (c)
     // Aborted or completed while the bytes were on their way: the store has no such upload.
     const current = await sessions.get(db(c), session.id);
     if (current?.status !== "open") throw new AppError("conflict", "This upload is no longer open.");
+    // The body was not as long as it said (or the client went away): the stream's own error, a
+    // TypeError — the store's failures are plain Errors with its code. Nothing was stored.
+    if (error instanceof TypeError) throw bodyNotAsDeclared();
     throw error;
   }
   if (!(await sessions.upsertPart(db(c), session.id, { n, etag: part.etag, size: length }))) {
@@ -519,6 +536,11 @@ router.put(`/uploads/${ID}/parts/${PART_NUMBER}`, verified, uploadsOn, async (c)
   const answer: PartResponse = { n, etag: part.etag };
   return c.json(answer);
 });
+
+const bodyNotAsDeclared = () =>
+  new AppError("validation", "The body is not as long as its Content-Length says.", {
+    reason: "content_length",
+  });
 
 /** Thrown inside the body stream when the gate is closed: the store then keeps nothing. */
 class GateClosed extends Error {}
@@ -545,9 +567,11 @@ router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
   };
   const store = storage(c.env);
   let stored: { etag: string };
+  // Bytes of the body that have arrived. An empty file has none to wait for.
+  let seen = session.size === 0 ? 0 : -1;
   try {
     if (source && session.size > 0) {
-      let seen = 0;
+      seen = 0;
       const gated = source.pipeThrough(
         new TransformStream<Uint8Array, Uint8Array>({
           async transform(chunk, controller) {
@@ -566,6 +590,8 @@ router.put(`/uploads/${ID}/single`, verified, uploadsOn, async (c) => {
   } catch (error) {
     // The store failed after the gate: the marker goes, so that the client can try again.
     if (gate.state === "passed") await sessions.clearSinglePut(db(c), session.id, token);
+    // A body shorter or longer than it said (or a client that went away): nothing was stored.
+    if (gate.state !== "closed" && seen !== session.size) throw bodyNotAsDeclared();
     if (gate.state === "closed") {
       throw new AppError("conflict", "This upload is no longer open, or is being written.");
     }
@@ -831,10 +857,10 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   // a PUT is recorded only while the session is `open`.
   const recorded = await sessions.listParts(db(c), session.id);
 
-  // Looked up now, acted on below. While the DECLARED hash says CSAM nothing this request does
-  // removes the object — the paths below that give the upload up come before the bytes are hashed.
+  // Looked up now, acted on below. While the DECLARED hash says CSAM, a path below that gives the
+  // upload up hashes the object before it removes it (`abandonClaimed`).
   const declared = await blocklist.lookup(db(c), body.sha256);
-  const keepStored = declared?.reason === "csam";
+  const declaredCsam = declared?.reason === "csam";
 
   // Everything init checked, against the state of now.
   let place = OWN_ROOT(user);
@@ -855,7 +881,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     }
   } catch (error) {
     if (error instanceof AppError || error instanceof QueryError) {
-      await abandonClaimed(c, session, { assembled: false, keepStored, reason: "recheck" });
+      await abandonClaimed(c, session, { assembled: false, declaredCsam, reason: "recheck" });
     }
     throw error;
   }
@@ -868,7 +894,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
         recorded.map((part) => ({ n: part.n, etag: part.etag })),
       );
     } catch (error) {
-      await abandonClaimed(c, session, { assembled: false, keepStored, reason: "store" });
+      await abandonClaimed(c, session, { assembled: false, declaredCsam, reason: "store" });
       throw error;
     }
   }
@@ -877,11 +903,11 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   // the object to look at, and there is no way back from `completing`.
   const marker = single ? recorded.find((part) => part.n === 1) : undefined;
   if (single && (!marker || sessions.isCommitting(marker.etag))) {
-    await abandonClaimed(c, session, { assembled: true, keepStored, reason: "put_racing" });
+    await abandonClaimed(c, session, { assembled: true, declaredCsam, reason: "put_racing" });
     throw new AppError("conflict", "This upload was still being written.");
   }
   if (!head || head.size !== session.size || (marker && head.etag !== marker.etag)) {
-    await abandonClaimed(c, session, { assembled: true, keepStored, reason: "size" });
+    await abandonClaimed(c, session, { assembled: true, declaredCsam, reason: "size" });
     throw notAsDeclared();
   }
 
@@ -897,7 +923,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
       // The declaration was false. What the bytes really are decides.
       hit = actual === null ? null : await blocklist.lookup(db(c), actual);
       if (!hit || actual === null) {
-        await abandonClaimed(c, session, { assembled: true, keepStored: false, reason: "hash" });
+        await abandonClaimed(c, session, { assembled: true, declaredCsam: false, reason: "hash" });
         audit(c, "upload.hash_mismatch", { type: "upload", id: session.id }, { nodeId: session.nodeId });
         metric("upload", { outcome: "hash_mismatch", kind: modeOf(session) });
         throw notAsDeclared();
@@ -930,7 +956,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     // An avatar is a picture the image service takes — decided from the bytes, not the declared
     // type. Anything else is not stored at all.
     if (!thumbEligible({ mimeSniffed, size: session.size, scanStatus: "clean" })) {
-      await abandonClaimed(c, session, { assembled: true, keepStored: false, reason: "not_image" });
+      await abandonClaimed(c, session, { assembled: true, declaredCsam: false, reason: "not_image" });
       throw new AppError("validation", "An avatar is an image.");
     }
     becomes = {
@@ -958,7 +984,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   } catch (error) {
     if (!(error instanceof ReplaceRefused)) throw error;
     // The target changed under the upload (a scan, a hold, a takedown): the same answer for all.
-    await abandonClaimed(c, session, { assembled: true, keepStored: false, reason: "replace" });
+    await abandonClaimed(c, session, { assembled: true, declaredCsam: false, reason: "replace" });
     throw replaceRefused();
   }
 

@@ -85,7 +85,8 @@ describe("PUT /uploads/:id/single", () => {
     // A body that lies about its length: shorter and longer than declared.
     for (const actual of [2000, 4000]) {
       const answer = await call(user, "PUT", path, { body: zeros(actual), contentLength: 3000 });
-      expect(answer.status).not.toBe(200);
+      expect(answer.status, String(actual)).toBe(400);
+      expect(answer.body).toMatchObject({ error: "validation", details: { reason: "content_length" } });
     }
     expect(await env.FILES.head(key)).toBeNull();
     expect(await partRows(session.uploadId)).toHaveLength(0);
@@ -284,7 +285,8 @@ describe("PUT /uploads/:id/parts/:n", () => {
       body: zeros(last - 5),
       contentLength: last,
     });
-    expect(short.status).not.toBe(200);
+    expect(short.status).toBe(400);
+    expect(short.body).toMatchObject({ error: "validation", details: { reason: "content_length" } });
     expect(await partRows(session.uploadId)).toHaveLength(0);
     await call(user, "DELETE", `/uploads/${session.uploadId}`);
   });

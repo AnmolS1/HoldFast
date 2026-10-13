@@ -3,7 +3,17 @@
 // its own connections — and hold the route to "fits alone, not together → exactly one".
 import { describe, expect, it } from "vitest";
 import { MAX_OPEN_UPLOADS } from "../../../src/shared/constants";
-import { makeFolder, makeShare, makeUpload } from "../services-core/helpers";
+import { eq, sql } from "drizzle-orm";
+import { nodes } from "../../../src/worker/db/schema";
+import {
+  backendPid,
+  gate,
+  makeFolder,
+  makeShare,
+  makeUpload,
+  testDb,
+  untilBlockedBy,
+} from "../services-core/helpers";
 import {
   call,
   initBody,
@@ -160,5 +170,40 @@ describe("lock order", () => {
     expect(admitted).toBe(48);
     // Every transaction of every request was observed: none failed, for any reason.
     expect(failures).toEqual([]);
+  });
+
+  it("an init that Postgres ends as a deadlock victim is run again: the request is answered 201", async () => {
+    const owner = await uploader();
+    const folder = await makeFolder(owner.id);
+    const failures: TxFailure[] = [];
+    const holding = gate<number>();
+    const goOn = gate();
+    let otherFailed: unknown = null;
+    // A writer in the opposite order: the folder's row first, then the owner's `user` row.
+    const other = testDb()
+      .transaction(async (tx) => {
+        await tx.select({ id: nodes.id }).from(nodes).where(eq(nodes.id, folder.id)).for("update");
+        holding.open(await backendPid(tx));
+        await goOn.opened;
+        await tx.execute(sql`SELECT 1 FROM "user" WHERE id = ${owner.id} FOR KEY SHARE`);
+      })
+      .catch((error: unknown) => {
+        otherFailed = error;
+      });
+    const pid = await holding.opened;
+    // The init takes the owner's row (the ceilings), then waits for the folder's.
+    const initing = post(owner, initBody({ parentId: folder.id }), { failures });
+    await untilBlockedBy(pid);
+    goOn.open();
+    const [answer] = await Promise.all([initing, other]);
+    // One of the two was the victim. Whichever: the init is answered, and nothing is half-done.
+    expect(answer.status).toBe(201);
+    expect(otherFailed !== null || failures.some((failure) => failure.code === "40P01")).toBe(true);
+    expect(failures.every((failure) => failure.code === "40P01")).toBe(true);
+    expect(await sessionsOf(owner.id)).toHaveLength(1);
+    expect(await usedBytes(owner.id)).toBe(1000);
+    console.log(
+      `T12 DEADLOCK victim: ${otherFailed !== null ? "the other writer" : "the init"}; init attempts failed: ${failures.length}`,
+    );
   });
 });
