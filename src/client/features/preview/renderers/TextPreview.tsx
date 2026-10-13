@@ -40,6 +40,9 @@ export default function TextPreview({ source, item, download }: RendererProps) {
     if (firstUrl === null) return;
     const abort = new AbortController();
     void (async () => {
+      // A mount that is undone at once (development's double mount) fetches nothing.
+      await Promise.resolve();
+      if (abort.signal.aborted) return;
       const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
       if (!response) return;
       try {

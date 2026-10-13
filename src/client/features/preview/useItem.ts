@@ -42,7 +42,10 @@ export function useItem(source: PreviewSource, nodeId: string): { state: ItemSta
         },
       );
     };
-    read();
+    // A mount that is undone at once (development's double mount) asks for nothing.
+    queueMicrotask(() => {
+      if (!abort.signal.aborted) read();
+    });
     return () => {
       abort.abort();
       clearTimeout(timer);
@@ -78,15 +81,18 @@ export function useSiblingIds(
   useEffect(() => {
     if (wanted === null || wanted === have) return;
     const abort = new AbortController();
-    listSiblingIds(parentId, abort.signal).then(
-      (ids) => {
-        if (!abort.signal.aborted) setListed({ parentKey: wanted, ids });
-      },
-      () => {
-        // No list: the preview still works, without prev/next.
-        if (!abort.signal.aborted) setListed({ parentKey: wanted, ids: [] });
-      },
-    );
+    queueMicrotask(() => {
+      if (abort.signal.aborted) return;
+      listSiblingIds(parentId, abort.signal).then(
+        (ids) => {
+          if (!abort.signal.aborted) setListed({ parentKey: wanted, ids });
+        },
+        () => {
+          // No list: the preview still works, without prev/next.
+          if (!abort.signal.aborted) setListed({ parentKey: wanted, ids: [] });
+        },
+      );
+    });
     return () => abort.abort();
   }, [wanted, have, parentId]);
 

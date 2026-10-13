@@ -453,6 +453,9 @@ export default function PdfPreview({ source, item, download }: RendererProps) {
     const abort = new AbortController();
     let doc: PdfDocument | null = null;
     void (async () => {
+      // A mount that is undone at once (development's double mount) fetches nothing.
+      await Promise.resolve();
+      if (abort.signal.aborted) return;
       const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
       if (!response) return;
       try {

@@ -1,6 +1,7 @@
 // The bounds of the viewers that read a file themselves: how much they take, what happens to a
 // file that is larger than it said, and that a transfer nobody is waiting for is stopped.
 import { act, screen, waitFor, within } from "@testing-library/react";
+import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { PreviewDialog } from "../../../../src/client/features/preview";
 import { fetchLimitFor, PDF_PREVIEW_MAX_BYTES } from "../../../../src/client/features/preview/renderer-map";
@@ -11,10 +12,11 @@ import {
 } from "../../../../src/client/features/preview/renderers/pdf-limits";
 import { readLimited, TOO_LARGE } from "../../../../src/client/features/preview/usePreviewUrl";
 import { PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
-import { ID, NODES, nodeOf } from "./fixtures";
+import { ID, NODES, nodeOf, pageOf } from "./fixtures";
 import {
   dialog,
   installFetch,
+  json,
   ownerApi,
   preloadRenderers,
   renderPreview,
@@ -205,5 +207,42 @@ describe("the PDF viewer's page and pixel caps", () => {
 
   it("the page cap is 500", () => {
     expect(PDF_MAX_PAGES).toBe(500);
+  });
+});
+
+describe("one view of a file is one of everything", () => {
+  it("under StrictMode's double mount: one node read, one mint, one fetch — and the text shows", async () => {
+    await preloadRenderers();
+    const api = ownerApi([NODES.ts]);
+    const network = installFetch({ api: api.handler, files: () => new Response("const a = 1;\n") });
+    renderPreview(
+      <StrictMode>
+        <PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(dialog()?.querySelector("pre")?.textContent).toBe("const a = 1;"));
+    await settle(20);
+    expect(network.api(`/api/nodes/${ID.ts}`).filter((call) => call.method === "GET").length).toBe(1);
+    expect(api.minted.map((mint) => mint.kind)).toEqual(["inline"]);
+    expect(network.files().length).toBe(1);
+  });
+
+  it("under StrictMode a cold link lists the folder once", async () => {
+    const api = ownerApi([NODES.svg], (call) =>
+      call.url.pathname.endsWith("/children") ? json(pageOf([NODES.svg, NODES.html])) : undefined,
+    );
+    const network = installFetch({ api: api.handler });
+    renderPreview(
+      <StrictMode>
+        <PreviewDialog open nodeId={ID.svg} onClose={noop} onNavigate={noop} source="owner" />
+      </StrictMode>,
+    );
+    await screen.findByRole("button", { name: "Next file" });
+    await settle(20);
+    expect(network.api().filter((call) => call.url.pathname.endsWith("/children")).length).toBe(1);
+    expect(
+      network.api(`/api/nodes/${ID.svg}`).filter((call) => call.url.pathname === `/api/nodes/${ID.svg}`)
+        .length,
+    ).toBe(1);
   });
 });

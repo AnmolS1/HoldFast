@@ -146,7 +146,11 @@ export function usePreviewUrl(
       },
     };
     controller.current = own;
-    void mint();
+    // Asked a moment later: a mount that is undone at once (development's double mount) mints
+    // nothing, so one view of a file is one URL.
+    queueMicrotask(() => {
+      if (!cancelled) void mint();
+    });
     return () => {
       cancelled = true;
       clearTimeout(timer);
