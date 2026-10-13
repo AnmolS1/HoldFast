@@ -15,7 +15,13 @@ import { MOBILE_QUERY } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { useOpenNode } from "./open-node";
 import { t } from "./strings";
-import { isWaitingOffline, type PagedQueryLike, type QueryLike } from "./view-state";
+import {
+  isWaitingOffline,
+  retryNotBefore,
+  useBlockedUntil,
+  type PagedQueryLike,
+  type QueryLike,
+} from "./view-state";
 
 export type ViewName = "trash" | "recent" | "starred" | "search" | "usage";
 
@@ -35,6 +41,34 @@ export function ViewPage({ view, children }: { view: ViewName; children: ReactNo
       sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 0 }}
     >
       {children}
+    </Box>
+  );
+}
+
+/**
+ * "Try again" — which waits when the failure asked for it: after a `429` with `Retry-After` the
+ * button stays off until that time has passed, and says why.
+ */
+function RetryButton({
+  query,
+  onRetry,
+  variant,
+}: {
+  query: QueryLike;
+  onRetry(): void;
+  variant?: "contained";
+}) {
+  const blocked = useBlockedUntil(retryNotBefore(query.error, query.errorUpdatedAt));
+  return (
+    <Box sx={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
+      {blocked ? (
+        <Box component="span" data-retry-wait sx={{ color: hf.textSecondary }}>
+          {t("view.retry.wait")}
+        </Box>
+      ) : null}
+      <Button variant={variant} onClick={onRetry} disabled={blocked}>
+        {t("view.error.retry")}
+      </Button>
     </Box>
   );
 }
@@ -64,11 +98,7 @@ export function ViewError({ view, title, query }: ViewErrorProps) {
         title={offline ? t("view.offline.title") : title}
         body={offline ? t("view.offline.body") : t("view.error.body")}
         requestId={!offline && query.error instanceof ApiError ? query.error.requestId : undefined}
-        actions={
-          <Button variant="contained" onClick={() => void query.refetch()}>
-            {t("view.error.retry")}
-          </Button>
-        }
+        actions={<RetryButton query={query} onRetry={() => void query.refetch()} variant="contained" />}
       />
     </Box>
   );
@@ -111,9 +141,7 @@ export function ListNotice({ view, query }: { view: ViewName; query: QueryLike |
           </>
         ) : null}
       </Box>
-      <Button onClick={() => void (paged ? paged.fetchNextPage() : query.refetch())}>
-        {t("view.error.retry")}
-      </Button>
+      <RetryButton query={query} onRetry={() => void (paged ? paged.fetchNextPage() : query.refetch())} />
     </Box>
   );
 }

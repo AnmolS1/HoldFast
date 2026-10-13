@@ -119,3 +119,44 @@ describe.each(LISTS)("$path: the next page fails", ({ path, view, api, first, se
     expect(sentinel()).toBeNull();
   });
 });
+
+describe("a 429 that names a wait (Retry-After)", () => {
+  const limited = (seconds: string) => () =>
+    envelope("rate_limited", 429, undefined, { "retry-after": seconds });
+  const retry = () => screen.getByRole("button", { name: "Try again" }) as HTMLButtonElement;
+
+  it("on a next page: 'Try again' stays off until the wait has passed, and says why", async () => {
+    let fail = true;
+    const { calls } = await openView("/starred", {
+      "GET /api/starred": (call) => {
+        if (queryOf(call).get("cursor") !== "c2") return json({ ...STARRED, nextCursor: "c2" });
+        return fail ? limited("1")() : json({ items: [node(77, { starred: true })], nextCursor: null });
+      },
+    });
+    await waitFor(() => expect(notice("starred")).not.toBeNull());
+    expect(retry().disabled).toBe(true);
+    expect(notice("starred")!.querySelector("[data-retry-wait]")!.textContent).toBe(
+      "Too many requests just now. You can try again shortly.",
+    );
+    fireEvent.click(retry());
+    expect(requests(calls, "GET", "/api/starred")).toHaveLength(2);
+    // The API's own second, awaited as the button coming back.
+    await waitFor(() => expect(retry().disabled).toBe(false), { timeout: 4000 });
+    expect(notice("starred")!.querySelector("[data-retry-wait]")).toBeNull();
+    fail = false;
+    fireEvent.click(retry());
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+  });
+
+  it("on the first page: the error state's 'Try again' waits too; a failure without the header does not", async () => {
+    let answer = limited("1");
+    await openView("/starred", { "GET /api/starred": () => answer() });
+    await waitFor(() => expect(document.querySelector('[data-view-error="starred"]')).not.toBeNull());
+    expect(retry().disabled).toBe(true);
+    await waitFor(() => expect(retry().disabled).toBe(false), { timeout: 4000 });
+    answer = () => envelope("rate_limited", 429);
+    fireEvent.click(retry());
+    await waitFor(() => expect(document.querySelector("[data-retry-wait]")).toBeNull());
+    await waitFor(() => expect(retry().disabled).toBe(false));
+  });
+});

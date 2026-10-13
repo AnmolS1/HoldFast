@@ -6,6 +6,7 @@ import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
+import { retryNotBefore } from "../starred/view-state";
 import { viewKeys } from "../starred/view-queries";
 import { emptyTrash, isAbort } from "./queries";
 import { t } from "./strings";
@@ -13,7 +14,8 @@ import { t } from "./strings";
 export type EmptyRun =
   | { state: "idle" }
   | { state: "running"; remaining: number | null }
-  | { state: "stopped"; remaining: number | null };
+  /** `retryAt`: before this time (ms) the API asked not to be called again; 0 = no wait. */
+  | { state: "stopped"; remaining: number | null; retryAt: number };
 
 const IDLE: EmptyRun = { state: "idle" };
 let run: EmptyRun = IDLE;
@@ -69,7 +71,7 @@ export function startEmptyTrash(): void {
     (error: unknown) => {
       // Stopped by the purge below: the account is gone, there is nobody to tell.
       if (isAbort(error) || !sameAccount(account)) return;
-      setRun({ state: "stopped", remaining });
+      setRun({ state: "stopped", remaining, retryAt: retryNotBefore(error, Date.now()) });
       toast({ message: stoppedMessage(remaining), key: "empty-trash" });
       // Part of it may be gone.
       emitNodesChanged([]);

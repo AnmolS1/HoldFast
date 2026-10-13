@@ -1,5 +1,6 @@
 // The trash: restore, delete forever, empty trash — what each asks of the API, what it tells the
 // other features, and what it shows when the API refuses.
+import { onlineManager } from "@tanstack/react-query";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
@@ -506,7 +507,7 @@ describe("leaving the page while the trash is being emptied", () => {
     await act(() => router.navigate("/starred"));
     const usageBefore = usageCalls(calls);
     second.resolve(envelope("internal", 500));
-    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240 }));
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240, retryAt: 0 }));
     expect(getToasts().map((toast) => toast.message)).toContain(
       "Couldn't finish emptying the trash. 240 left. Try again.",
     );
@@ -724,6 +725,37 @@ describe("review fixes on the trash page", () => {
     const dialog = await screen.findByRole("dialog", { name: "Empty the trash?" });
     expect(within(dialog).getByText(/Everything in the trash is deleted\./)).toBeTruthy();
     expect(within(dialog).getByLabelText(`Type ${CONFIRM_WORD} to confirm`)).toBeTruthy();
+  });
+
+  it("m3: offline, the confirmation opens at once with the size unknown — it does not wait for the connection", async () => {
+    const { calls } = await openTrash();
+    const before = requests(calls, "GET", "/api/trash").length;
+    onlineManager.setOnline(false);
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Empty trash" }));
+      const dialog = await screen.findByRole("dialog", { name: "Empty the trash?" });
+      expect(within(dialog).getByLabelText(`Type ${CONFIRM_WORD} to confirm`)).toBeTruthy();
+      expect(requests(calls, "GET", "/api/trash").length).toBe(before);
+    } finally {
+      onlineManager.setOnline(true);
+    }
+  });
+
+  it("a run stopped by a 429 cannot be started again before the time the API named", async () => {
+    const { calls } = await openTrash({
+      "DELETE /api/trash": () => envelope("rate_limited", 429, undefined, { "retry-after": "1" }),
+    });
+    const button = () => screen.getByRole("button", { name: "Empty trash" }) as HTMLButtonElement;
+    fireEvent.click(button());
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Empty trash" }));
+    await waitFor(() => expect(getEmptyRun().state).toBe("stopped"));
+    const run = getEmptyRun();
+    expect(run.state === "stopped" && run.retryAt > Date.now()).toBe(true);
+    await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
+    expect(button().disabled).toBe(true);
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
+    // Enabled again when that second has passed — the wait is the API's, awaited as an event.
+    await waitFor(() => expect(button().disabled).toBe(false), { timeout: 4000 });
   });
 
   it("m4: Delete does not open a second dialog over 'Empty the trash?', nor over the row menu", async () => {

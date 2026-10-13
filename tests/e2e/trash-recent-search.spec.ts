@@ -397,7 +397,7 @@ test.describe("review fixes", () => {
       return fail
         ? route.fulfill({
             status: 429,
-            headers: { "retry-after": "30" },
+            headers: { "retry-after": "4" },
             json: mockEnvelope("rate_limited", "Too many requests."),
           })
         : route.fulfill({
@@ -409,15 +409,19 @@ test.describe("review fixes", () => {
     await expect(notice).toContainText("Couldn't load more of this list.");
     await expect(notice).toContainText("req req-e2e");
     await expect(rows(page)).toHaveCount(2);
+    // The API named a wait (Retry-After): the retry is off until it has passed.
+    const retry = notice.getByRole("button", { name: "Try again" });
+    await expect(retry).toBeDisabled();
+    await expect(notice).toContainText("You can try again shortly.");
     // Two seconds with nobody touching the page. It is an ABSENCE that is measured — requests
     // that must not be made — so there is no event to wait for instead.
     await page.waitForTimeout(2000);
     expect(pageTwo, "requests for the page that failed").toBe(1);
     await expect(rows(page)).toHaveCount(2);
 
-    // The retry is a full-size target and nothing floats over it (on the phone layout the "New"
-    // button sits in that corner).
-    const retry = notice.getByRole("button", { name: "Try again" });
+    // Then the retry comes back — a full-size target with nothing floating over it (on the phone
+    // layout the "New" button sits in that corner).
+    await expect(retry).toBeEnabled();
     if (isMobile(page)) expect(await height(retry)).toBeGreaterThanOrEqual(TOUCH_TARGET);
     fail = false;
     await retry.click();
