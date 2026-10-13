@@ -70,7 +70,7 @@ import { AppError } from "../services/errors";
 import { nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
 import { inlineKindAllowed, thumbEligible } from "../services/mime";
-import { toNodeDto, toNodeDtos } from "../services/node-dto";
+import { toNodeDto, toNodeDtos, type NodeView } from "../services/node-dto";
 import {
   assertContentAccess,
   assertNotTrashed,
@@ -117,6 +117,13 @@ async function visibleNode(c: Ctx, nodeId: string, min: Role): Promise<{ node: N
 
 const statusesFor = (access: Access) =>
   access.role === "owner" ? OWNER_VISIBLE_STATUSES : SHARED_VISIBLE_STATUSES;
+
+/** Who the mapper answers for: the role, and the node a share partner's role comes from. */
+const viewOf = (user: SessionUser, access: Access): NodeView => ({
+  viewerId: user.id,
+  role: access.role,
+  shareRootId: access.shareRootId,
+});
 
 const target = (nodeId: string) => ({ type: "node", id: nodeId });
 
@@ -168,13 +175,13 @@ router.post("/nodes/folder", async (c) => {
   const user = requireVerified(c);
   const body = parse(CreateFolderBody, await jsonBody(c));
   let ownerId = user.id;
-  let role: Role = "owner";
+  let view: NodeView = { viewerId: user.id, role: "owner" };
   if (body.parentId !== null) {
     const parent = await visibleNode(c, body.parentId, "editor");
     if (parent.node.kind !== "folder") throw new AppError("not_found");
     // Inside a shared folder the new folder belongs to the tree's owner, not to its maker.
     ownerId = parent.node.ownerId;
-    role = parent.access.role;
+    view = viewOf(user, parent.access);
   }
   let created: Node;
   try {
@@ -191,7 +198,7 @@ router.post("/nodes/folder", async (c) => {
     throw new AppError("conflict", error.message, details);
   }
   audit(c, "node.create_folder", target(created.id), { parentId: body.parentId });
-  return c.json(await toNodeDto(db(c), created, { viewerId: user.id, role }));
+  return c.json(await toNodeDto(db(c), created, view));
 });
 
 // ── files-host URLs ─────────────────────────────────────────────────────────────────────────
@@ -210,7 +217,7 @@ async function visibleFile(c: Ctx, nodeId: string): Promise<{ node: CurrentFile;
 
 /**
  * The scan rows of the download matrix, in its order. Returns whether the file goes out with the
- * `unscanned` warning. (A `suspected_csam` file never gets here: it is hidden.)
+ * `unscanned` warning. (A file locked as suspected CSAM never gets here: it is hidden.)
  */
 function scanGate(node: Node, access: Access, kind: UrlKind): { unscanned: boolean } {
   if (node.scanStatus === "pending") throw new AppError("scan_pending");
@@ -336,7 +343,7 @@ router.get(`/nodes/${ID}/children`, async (c) => {
     visibleStatuses: statusesFor(access),
   });
   // A child has the role of the folder it is listed in.
-  const items = await toNodeDtos(db(c), page.items, { viewerId: user.id, role: access.role });
+  const items = await toNodeDtos(db(c), page.items, viewOf(user, access));
   return c.json({ items, nextCursor: page.nextCursor } satisfies NodePage);
 });
 
@@ -353,7 +360,7 @@ router.get(`/nodes/${ID}`, async (c) => {
         ? chain.length
         : chain.findIndex((row) => row.id === access.shareRootId);
   const breadcrumbs = (from < 0 ? [] : chain.slice(from)).map((row) => ({ id: row.id, name: row.name }));
-  const dto = await toNodeDto(db(c), node, { viewerId: user.id, role: access.role });
+  const dto = await toNodeDto(db(c), node, viewOf(user, access));
   return c.json({ node: dto, breadcrumbs } satisfies NodeDetailDto);
 });
 
@@ -383,7 +390,7 @@ router.patch(`/nodes/${ID}`, async (c) => {
     node = { ...node, starred: body.starred };
     audit(c, "node.star", target(id), { starred: body.starred });
   }
-  return c.json(await toNodeDto(db(c), node, { viewerId: user.id, role: access.role }));
+  return c.json(await toNodeDto(db(c), node, viewOf(user, access)));
 });
 
 /**
@@ -425,7 +432,7 @@ router.post(`/nodes/${ID}/move`, async (c) => {
   const moved = await moveNode(c, id, body.parentId);
   audit(c, "node.move", target(id), { from: node.parentId, to: body.parentId });
   metric("node", { kind: "move", outcome: "ok" });
-  return c.json(await toNodeDto(db(c), moved, { viewerId: user.id, role: access.role }));
+  return c.json(await toNodeDto(db(c), moved, viewOf(user, access)));
 });
 
 // ── by id: URLs ─────────────────────────────────────────────────────────────────────────────
