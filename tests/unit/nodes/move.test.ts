@@ -45,6 +45,23 @@ describe("POST /nodes/:id/move", () => {
     expect(rows).toHaveLength(2);
   });
 
+  it("a move that changes nothing is answered and not recorded: the same request twice is one node.move row", async () => {
+    const t = await sharedTree();
+    const stay = await move(t.owner.as, t.notes.id, t.inner.id);
+    expect([stay.status, stay.body.parentId]).toEqual([200, t.inner.id]);
+    expect(await auditFor("node.move", t.notes.id)).toEqual([]);
+
+    expect((await move(t.owner.as, t.notes.id, t.dest.id)).status).toBe(200);
+    const again = await move(t.owner.as, t.notes.id, t.dest.id);
+    expect([again.status, again.body.parentId]).toEqual([200, t.dest.id]);
+    const rows = await auditFor("node.move", t.notes.id);
+    expect(rows.map((row) => row.meta)).toEqual([{ from: t.inner.id, to: t.dest.id }]);
+    // At the top level too.
+    const top = await makeFile(t.owner.id, null, { scanStatus: "clean" });
+    expect((await move(t.owner.as, top.id, null)).status).toBe(200);
+    expect(await auditFor("node.move", top.id)).toEqual([]);
+  });
+
   it("an editor moves inside the share; not to the owner's top level; a viewer not at all", async () => {
     const t = await sharedTree();
     expect((await move(t.editor.as, t.notes.id, t.dest.id)).status).toBe(200);

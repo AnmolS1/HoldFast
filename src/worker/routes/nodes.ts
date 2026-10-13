@@ -434,8 +434,12 @@ router.post(`/nodes/${ID}/move`, async (c) => {
     await visibleNode(c, body.parentId, "editor");
   }
   const moved = await moveNode(c, id, body.parentId);
-  audit(c, "node.move", target(id), { from: node.parentId, to: body.parentId });
-  metric("node", { kind: "move", outcome: "ok" });
+  // A move to where the node already is changes nothing and is not recorded as one (the same
+  // request sent twice is one move). `from` is what this request read before the transaction.
+  if (moved.parentId !== node.parentId) {
+    audit(c, "node.move", target(id), { from: node.parentId, to: moved.parentId });
+    metric("node", { kind: "move", outcome: "ok" });
+  }
   return c.json(await toNodeDto(db(c), moved, viewOf(user, access)));
 });
 
