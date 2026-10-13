@@ -135,21 +135,6 @@ async function expectNoOverflow(page: Page): Promise<void> {
   expect(overflow, "horizontal overflow of the page, px").toBeLessThanOrEqual(0);
 }
 
-/**
- * The view itself fits: nothing in it is wider than it, and it ends inside the window. Used on the
- * desktop layout, where the document as a whole cannot be asked — the shell's transfer ribbon
- * keeps a hidden live region there that is as wide as the window and starts after the sidebar
- * (reported; not this feature's to change).
- */
-async function expectViewFits(page: Page): Promise<void> {
-  const fit = await page.locator("[data-view-page]").evaluate((element) => ({
-    inner: element.scrollWidth - element.clientWidth,
-    outer: Math.round(element.getBoundingClientRect().right) - window.innerWidth,
-  }));
-  expect(fit.inner, "content wider than the view, px").toBeLessThanOrEqual(0);
-  expect(fit.outer, "the view ends past the window, px").toBeLessThanOrEqual(0);
-}
-
 const height = async (locator: Locator) => (await locator.boundingBox())?.height ?? 0;
 
 test.describe("trash", () => {
@@ -500,7 +485,7 @@ test.describe("mobile layout", () => {
     await expect(page.locator("[data-frame]")).toHaveAttribute("data-frame", "desktop");
     await expect(view(page, "search").locator("select")).toHaveCount(2);
     await expect(page.getByRole("button", { name: "Filters" })).toHaveCount(0);
-    await expectViewFits(page);
+    await expectNoOverflow(page);
   });
 });
 
