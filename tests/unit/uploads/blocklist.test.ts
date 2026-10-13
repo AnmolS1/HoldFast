@@ -33,8 +33,8 @@ import {
   init,
   ledgerOf,
   putParts,
+  ROOMY,
   sessionRow,
-  sessionsOf,
   sha,
   sha256Of,
   strikesOf,
@@ -200,39 +200,61 @@ describe("blocked content (malware, dmca, admin)", () => {
   });
 });
 
-describe("a false declaration: the hash a client sends locks nobody and strikes nobody", () => {
-  it("an editor declares a CSAM-listed hash for innocent bytes in someone else's folder: no node, no lock, no hold, no report, no alert — 400", async () => {
+describe("a false declaration: the hash a client sends locks nobody, strikes nobody — and learns nothing", () => {
+  /** A response with everything that differs between any two uploads taken out. */
+  function comparable(answer: { status: number; body: Record<string, unknown>; headers: Headers }) {
+    const { id, parentId, etag, sha256, createdAt, updatedAt, ...rest } = answer.body;
+    void [id, parentId, etag, sha256, createdAt, updatedAt];
+    const headers = [...answer.headers.entries()].filter(([name]) => name !== "x-request-id").sort();
+    return JSON.stringify({ status: answer.status, rest, headers });
+  }
+
+  it("an editor declares a CSAM-listed hash for innocent bytes in someone else's folder: an ordinary pending upload — no lock, no hold, no report, no alert, no strike", async () => {
     const owner = await uploader();
     const editor = await uploader();
     const folder = await makeFolder(owner.id);
+    const other = await makeFolder(owner.id);
     await makeShare(folder.id, owner.id, editor.id, { role: "editor", canUpload: true });
+    await makeShare(other.id, owner.id, editor.id, { role: "editor", canUpload: true });
     const known = await listed("csam");
-    const session = await uploaded(editor, { parentId: folder.id }, uniqueBytes());
+    const session = await uploaded(editor, { parentId: folder.id, name: "same.bin" }, uniqueBytes());
     const key = (await sessionRow(session.uploadId))!.r2Key;
     const mailsBefore = operatorMails();
 
-    const answer = await complete(editor, session.uploadId, { sha256: known.sha256 });
-    expect(answer.status).toBe(400);
-    expect(answer.body.error).toBe("validation");
-    // Nothing in the answer says the declared value was on a list.
-    expect(JSON.stringify(answer.body)).not.toMatch(/block|list|csam/i);
+    const sent: unknown[] = [];
+    const answer = await complete(editor, session.uploadId, { sha256: known.sha256 }, { sent });
+    expect(answer.status).toBe(201);
+    expect(answer.body.scanStatus).toBe("pending");
+    const nodeId = String(answer.body.id);
 
-    expect(await nodesOf(owner.id)).toHaveLength(1); // the folder
+    // THE ANSWER SAYS NOTHING: it is, field for field and header for header, what any other
+    // wrong hash gets — one that is on no list at all.
+    const control = await uploaded(editor, { parentId: other.id, name: "same.bin" }, uniqueBytes());
+    const unlisted = await complete(editor, control.uploadId, { sha256: sha() });
+    expect(comparable(answer)).toBe(comparable(unlisted));
+    expect(JSON.stringify(answer.body)).not.toMatch(/block|listed|csam/i);
+
+    // The same rows as any upload: a pending node with the DECLARED hash, a scan message.
+    expect(await nodeById(nodeId)).toMatchObject({
+      scanStatus: "pending",
+      legalHold: false,
+      sha256: known.sha256,
+      ownerId: owner.id,
+      createdBy: editor.id,
+    });
+    expect(sent).toEqual([{ v: 1, nodeId, key, force: false }]);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done" });
     expect(await userRow(owner.id)).toMatchObject({ legalHold: false });
     expect(await userRow(editor.id)).toMatchObject({ legalHold: false, suspendedAt: null });
     expect(await reportsOn(owner.id)).toHaveLength(0);
     expect(await strikesOf(editor.id)).toHaveLength(0);
     expect(operatorMails()).toBe(mailsBefore);
-    expect(await auditRows({ action: "scan.suspected_csam", actorUserId: null })).not.toContainEqual(
-      expect.objectContaining({ targetId: (await sessionRow(session.uploadId))!.nodeId }),
-    );
-    // An integrity failure like any other: object gone, reservation back, session aborted.
-    expect(await env.FILES.head(key)).toBeNull();
-    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
-    expect(await usedBytes(owner.id)).toBe(0);
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: nodeId })).toHaveLength(0);
+    // What happened is recorded on the server only — with what the declared value was listed as.
     expect(await auditFor("upload.hash_mismatch", session.uploadId)).toMatchObject([
-      { actorUserId: editor.id, actorType: "user" },
+      { actorUserId: editor.id, meta: { declaredListedAs: "csam", actualListedAs: null } },
     ]);
+    expect(await auditFor("upload.hash_mismatch", control.uploadId)).toHaveLength(0);
     // The entry on the list is what it was.
     expect(await blocklist.lookup(testDb(), known.sha256)).toMatchObject({
       reason: "csam",
@@ -240,16 +262,18 @@ describe("a false declaration: the hash a client sends locks nobody and strikes 
     });
   });
 
-  it("the same with a malware-listed hash: no strike", async () => {
+  it("the same with a malware-listed hash: no strike, nothing refused", async () => {
     const user = await uploader();
     const known = await listed("malware");
     const session = await uploaded(user, {}, uniqueBytes());
     const answer = await complete(user, session.uploadId, { sha256: known.sha256 });
-    expect(answer.status).toBe(400);
+    expect(answer.status).toBe(201);
     expect(await strikesOf(user.id)).toHaveLength(0);
     expect(await auditFor("upload.blocked", session.uploadId)).toHaveLength(0);
-    expect(await auditFor("upload.hash_mismatch", session.uploadId)).toHaveLength(1);
-    expect(await usedBytes(user.id)).toBe(0);
+    expect(await auditFor("upload.hash_mismatch", session.uploadId)).toMatchObject([
+      { meta: { declaredListedAs: "malware", actualListedAs: null } },
+    ]);
+    expect(await usedBytes(user.id)).toBe(1000);
   });
 
   it("a false declaration over bytes that ARE listed is the real hit, with the real hash", async () => {
@@ -262,7 +286,9 @@ describe("a false declaration: the hash a client sends locks nobody and strikes 
     expect(await strikesOf(user.id)).toMatchObject([{ kind: "malware", contentSha256: actual.sha256 }]);
     expect(await userRow(user.id)).toMatchObject({ legalHold: false });
     expect(await reportsOn(user.id)).toHaveLength(0);
-    expect(await auditFor("upload.hash_mismatch", session.uploadId)).toHaveLength(0);
+    expect(await auditFor("upload.hash_mismatch", session.uploadId)).toMatchObject([
+      { meta: { declaredListedAs: "csam", actualListedAs: "malware" } },
+    ]);
   });
 
   it("NOT caught here: a clean hash declared for listed bytes completes — the scanner that hashes the bytes must catch it", async () => {
@@ -393,49 +419,95 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(await usedBytes(owner.id)).toBe(1100);
   });
 
-  /** An editor's finished single upload into a folder whose share is then revoked. */
-  async function revokedBeforeComplete(bytes: Uint8Array, size?: number) {
+  /** An editor's finished upload into an owner's folder — about to fail complete's re-check. */
+  async function beforeComplete(bytes: Uint8Array, size?: number) {
     const owner = await uploader();
     const editor = await uploader();
     const folder = await makeFolder(owner.id);
     const share = await makeShare(folder.id, owner.id, editor.id, { role: "editor", canUpload: true });
     const session =
       size === undefined
-        ? await uploaded(editor, { parentId: folder.id }, bytes)
+        ? await uploaded(editor, { parentId: folder.id, name: "held.bin" }, bytes)
         : await init(editor, { parentId: folder.id, size });
     const row = (await sessionRow(session.uploadId))!;
     const revoke = () => testDb().delete(shares).where(eq(shares.id, share.id));
-    return { owner, editor, session, row, revoke };
+    return { owner, editor, folder, session, row, revoke };
   }
 
-  it("a path of complete that gives the upload up never deletes an object whose OWN hash is listed as CSAM", async () => {
-    const known = await listed("csam");
-    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(known.bytes);
-    await revoke();
-    const answer = await complete(editor, session.uploadId, { sha256: known.sha256 });
-    expect(answer.status).toBe(404);
-    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
-    expect(await usedBytes(owner.id)).toBe(0);
-    expect(await env.FILES.head(row.r2Key)).not.toBeNull();
-    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(1);
-    expect(await sessionsOf(editor.id)).toHaveLength(1);
-  });
+  it.each([
+    ["the share was revoked", 404],
+    ["the folder was trashed", 404],
+    ["uploads were switched off", 503],
+  ] as const)(
+    "bytes the server found on the list are evidence even when complete gives the upload up (%s): a locked node of the UPLOADER's, the folder's owner untouched",
+    async (what, status) => {
+      const known = await listed("csam");
+      const { owner, editor, folder, session, row, revoke } = await beforeComplete(known.bytes);
+      const mailsBefore = operatorMails();
+      let settings = {};
+      if (what === "the share was revoked") await revoke();
+      if (what === "the folder was trashed") {
+        await testDb()
+          .update(nodes)
+          .set({ deletedAt: new Date(), trashedRoot: true })
+          .where(eq(nodes.id, folder.id));
+      }
+      if (what === "uploads were switched off") settings = { settings: { ...ROOMY, uploadsEnabled: false } };
 
-  it("… but a DECLARED hash alone keeps nothing: innocent bytes under a listed hash are deleted like any abandoned upload (no storage outside the quota)", async () => {
+      const answer = await complete(editor, session.uploadId, { sha256: known.sha256 }, settings);
+      // The request is answered as the failed re-check is; nothing about the lock.
+      expect(answer.status).toBe(status);
+      expect(JSON.stringify(answer.body)).not.toMatch(/block|csam|held/i);
+
+      // The object is there, and it has a row: a node of the uploader's own, at their top level.
+      expect(await env.FILES.head(row.r2Key)).not.toBeNull();
+      const [held] = await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key));
+      expect(held).toMatchObject({
+        ownerId: editor.id,
+        createdBy: editor.id,
+        parentId: null,
+        name: "held.bin",
+        scanStatus: "suspected_csam",
+        legalHold: true,
+        sha256: known.sha256,
+        size: 1000,
+      });
+      expect(await userRow(editor.id)).toMatchObject({ legalHold: true });
+      expect(await reportsOn(editor.id)).toMatchObject([
+        { nodeId: held!.id, category: "csam", status: "open" },
+      ]);
+      expect(await testDb().select().from(uploadIps).where(eq(uploadIps.nodeId, held!.id))).toMatchObject([
+        { legalHold: true, uploaderId: editor.id },
+      ]);
+      expect(operatorMails()).toBe(mailsBefore + 1);
+      expect(await auditRows({ action: "scan.suspected_csam", targetId: held!.id })).toHaveLength(1);
+      // The folder's owner: not held, nothing of theirs written, their reservation back.
+      expect(await userRow(owner.id)).toMatchObject({ legalHold: false });
+      expect(await reportsOn(owner.id)).toHaveLength(0);
+      expect(await nodesOf(owner.id)).toHaveLength(1); // the folder
+      expect(await usedBytes(owner.id)).toBe(0);
+      expect(await usedBytes(editor.id)).toBe(0);
+      expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+      expect(await strikesOf(editor.id)).toHaveLength(0);
+    },
+  );
+
+  it("… but a DECLARED hash alone keeps nothing: innocent bytes under a listed hash are deleted like any abandoned upload (no storage outside the quota, nobody locked)", async () => {
     const known = await listed("csam");
-    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(uniqueBytes());
+    const { owner, editor, session, row, revoke } = await beforeComplete(uniqueBytes());
     await revoke();
     const answer = await complete(editor, session.uploadId, { sha256: known.sha256 });
     expect(answer.status).toBe(404);
     expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
     expect(await usedBytes(owner.id)).toBe(0);
     expect(await env.FILES.head(row.r2Key)).toBeNull();
-    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(0);
+    expect(await nodesOf(editor.id)).toHaveLength(0);
+    expect(await userRow(editor.id)).toMatchObject({ legalHold: false });
   });
 
   it("… and an unfinished multipart upload has no object to keep: it is aborted in the store", async () => {
     const known = await listed("csam");
-    const { owner, editor, session, row, revoke } = await revokedBeforeComplete(new Uint8Array(0), TWO_PARTS);
+    const { owner, editor, session, row, revoke } = await beforeComplete(new Uint8Array(0), TWO_PARTS);
     const parts = await putParts(editor, session, TWO_PARTS);
     await revoke();
     const answer = await complete(editor, session.uploadId, { sha256: known.sha256, parts });
@@ -446,5 +518,30 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     await expect(
       store.uploadPart(store.resumeMultipart(row.r2Key, row.r2UploadId!), 1, new Uint8Array(8), 8),
     ).rejects.toThrow();
+    expect(await nodesOf(editor.id)).toHaveLength(0);
+  });
+
+  it("if the node cannot be written the object still stays, and the operators are told by its session", async () => {
+    const known = await listed("csam");
+    const { editor, session, row, revoke } = await beforeComplete(known.bytes);
+    await revoke();
+    const mailsBefore = operatorMails();
+    // The first transaction this request opens is the one that would write the node.
+    const answer = await complete(
+      editor,
+      session.uploadId,
+      { sha256: known.sha256 },
+      {
+        beforeCommit: (attempt) => {
+          if (attempt === 1) throw new Error("test: the node cannot be written");
+        },
+      },
+    );
+    expect(answer.status).toBe(404);
+    expect(await env.FILES.head(row.r2Key)).not.toBeNull();
+    expect(await nodesOf(editor.id)).toHaveLength(0);
+    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(1);
+    expect(operatorMails()).toBe(mailsBefore + 1);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
   });
 });

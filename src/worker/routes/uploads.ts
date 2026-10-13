@@ -33,11 +33,14 @@
 //
 // THE BLOCKLIST IS ACTED ON ONLY FOR BYTES THIS SERVER HASHED. `sha256` in the body is the
 // client's word: a hit on it makes `complete` read the stored object back and hash it, and what
-// happens next is decided by that hash — nobody is struck or locked on a declared one.
+// happens next is decided by that hash — nobody is struck or locked on a declared one. A listed
+// hash declared for other bytes is answered like any other wrong hash (the upload completes; the
+// scanner finds the mismatch): the answer never says whether a value is on the list.
 // AN OBJECT WHOSE HASH IS ON THE BLOCKLIST AS CSAM IS NEVER DELETED by `complete`: the lookup is
 // made right after the claim, and while the declared hash says so a path that gives the upload
-// up hashes the object first and leaves one that really is listed. A real hit writes the node and
-// hands it to `lockSuspectedCsam`; the caller gets the same `403` as for any other blocked content.
+// up hashes the object first; one that really is listed becomes a locked node of the UPLOADER's.
+// A real hit on a healthy upload writes the node where it was meant to go and hands it to
+// `lockSuspectedCsam`; the caller gets the same `403` as for any other blocked content.
 //
 // ONE AVATAR PER USER: the transaction that makes an avatar current removes the others (a held
 // one stays), so avatars — which never count against the quota — cannot pile up.
@@ -83,11 +86,13 @@ import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { extOf, nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
+import { sendOperatorCritical } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES, thumbEligible } from "../services/mime";
 import { toNodeDto, toOwnAvatarDto } from "../services/node-dto";
 import { assertNotTrashed, requireRole, requireUpload, type Role } from "../services/permissions";
 import * as quota from "../services/quota";
 import { db, deps, settings, type AppEnv } from "../services/request-context";
+import { adminListOf } from "../services/signup-policy";
 import { enqueueScan, lockSuspectedCsam, scanSmallObject, type ScanVerdict } from "../services/scanning";
 import { avatarKey, keyFor, storage, thumbKey, type Storage, type UploadedPart } from "../services/storage";
 import { addStrike } from "../services/strikes";
@@ -306,9 +311,9 @@ async function discardStored(c: Ctx, session: Upload, assembled: boolean): Promi
  * stored removed.
  *
  * `declaredCsam`: the hash the client declared is on the blocklist as CSAM. Then an object that
- * exists is hashed first, and one whose OWN hash is listed that way is left where it is — an
- * object like that is never deleted here. (A declared hash alone keeps nothing: bytes kept on a
- * client's word would be storage outside every quota.) An unfinished multipart upload has no
+ * exists is hashed first, and one whose OWN hash is listed that way is never deleted: it is
+ * preserved and locked (`preserveCsam`). A declared hash alone keeps nothing — bytes kept on a
+ * client's word would be storage outside every quota. An unfinished multipart upload has no
  * object, and is aborted.
  */
 async function abandonClaimed(
@@ -316,17 +321,65 @@ async function abandonClaimed(
   session: Upload,
   opts: { assembled: boolean; declaredCsam: boolean; reason: string },
 ): Promise<void> {
-  await releaseAndAbort(db(c), session, "claimed");
-  metric("upload", { outcome: "aborted", kind: modeOf(session), reason: opts.reason });
+  let preserved = false;
   if (opts.declaredCsam && (opts.assembled || !session.r2UploadId)) {
-    const actual = await storedSha256(storage(c.env), session.r2Key);
+    const store = storage(c.env);
+    const actual = await storedSha256(store, session.r2Key);
     if (actual !== null && (await blocklist.lookup(db(c), actual))?.reason === "csam") {
-      audit(c, "upload.csam_object_kept", { type: "upload", id: session.id }, { nodeId: session.nodeId });
-      metric("upload", { outcome: "csam_object_kept", kind: modeOf(session) });
-      return;
+      const size = (await store.head(session.r2Key))?.size ?? session.size;
+      await preserveCsam(c, session, actual, size);
+      preserved = true;
     }
   }
-  await discardStored(c, session, opts.assembled);
+  await releaseAndAbort(db(c), session, "claimed");
+  metric("upload", { outcome: "aborted", kind: modeOf(session), reason: opts.reason });
+  if (!preserved) await discardStored(c, session, opts.assembled);
+}
+
+/**
+ * An upload that complete gives up, whose stored bytes the server has hashed and found on the
+ * blocklist as CSAM. They are evidence now: never deleted, and not left without a row (the
+ * orphan sweep would remove them). The object becomes a node of the UPLOADER's own — at their
+ * top level, whatever folder the upload was meant for: the folder's owner is not held for
+ * something uploaded into a folder the uploader no longer has — and the one shared handler
+ * locks it. The request still answers what made complete give up; nothing here is told.
+ *
+ * If the node cannot be written, the object still stays: an audit row and the critical operator
+ * alert name it by its session.
+ */
+async function preserveCsam(c: Ctx, session: Upload, sha256: string, size: number): Promise<void> {
+  const uploader = requireVerified(c);
+  try {
+    const sealed = await sealIp(c.env, c.get("ip"));
+    const values: NodeValues = {
+      ...nodeValues(session, uploader, sha256, session.replaceNodeId === null ? session.nodeId : uuidv7()),
+      ownerId: uploader.id,
+      parentId: null,
+      size,
+    };
+    const node = await retryOnDeadlock(db(c), async (tx) => {
+      const written = await insertNamed(tx, values);
+      await uploadIps.record(tx, {
+        nodeId: written.id,
+        versionId: session.versionId,
+        uploaderId: uploader.id,
+        ipEncrypted: sealed.ciphertext,
+        iv: sealed.iv,
+        keyVersion: sealed.keyVersion,
+      });
+      return written;
+    });
+    audit(c, "upload.csam_preserved", { type: "node", id: node.id }, { uploadId: session.id });
+    metric("upload", { outcome: "csam_preserved", kind: modeOf(session) });
+    await lockSuspectedCsam(deps(c), node.id, { source: "system" });
+  } catch (error) {
+    captureError(error, { kind: "upload_csam_preserve" });
+    audit(c, "upload.csam_object_kept", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+    metric("upload", { outcome: "csam_object_kept", kind: modeOf(session) });
+    for (const to of adminListOf(c.env).addresses) {
+      await sendOperatorCritical(deps(c), { to, event: "csam_lock", id: session.id }).catch(() => "failed");
+    }
+  }
 }
 
 // ── init ────────────────────────────────────────────────────────────────────────────────────
@@ -920,15 +973,18 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   if (declared) {
     const actual = await storedSha256(store, session.r2Key);
     if (actual !== body.sha256) {
-      // The declaration was false. What the bytes really are decides.
+      // The declaration was false; what the bytes really are decides. With no real hit this
+      // upload goes on exactly like any other whose declared hash is not its bytes' — the
+      // answer must not say that the declared value was on a list. Recorded here only.
       hit = actual === null ? null : await blocklist.lookup(db(c), actual);
-      if (!hit || actual === null) {
-        await abandonClaimed(c, session, { assembled: true, declaredCsam: false, reason: "hash" });
-        audit(c, "upload.hash_mismatch", { type: "upload", id: session.id }, { nodeId: session.nodeId });
-        metric("upload", { outcome: "hash_mismatch", kind: modeOf(session) });
-        throw notAsDeclared();
-      }
-      sha256 = actual;
+      audit(
+        c,
+        "upload.hash_mismatch",
+        { type: "upload", id: session.id },
+        { nodeId: session.nodeId, declaredListedAs: declared.reason, actualListedAs: hit?.reason ?? null },
+      );
+      metric("upload", { outcome: "hash_mismatch", kind: modeOf(session) });
+      if (hit && actual !== null) sha256 = actual;
     }
   }
 
