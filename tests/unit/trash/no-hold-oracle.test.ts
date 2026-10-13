@@ -3,7 +3,8 @@
 //
 // Every comparison is between the answer for something held and the answer for its un-held
 // twin, made the same way by an owner with the same tree: status, body, EVERY response header,
-// and the number of SQL statements sent before the answer existed.
+// and the number of SQL statements sent before the answer existed — with ONE exception, which
+// has a case of its own below: the statement count of the "delete forever" request itself.
 import { describe, expect, it } from "vitest";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { countTrash } from "../../../src/worker/db/queries/trash-jobs";
@@ -207,6 +208,38 @@ describe("a file trashed on its own inside a folder that is then deleted for goo
       expect(await empty(held.t)).toEqual(await empty(free.t));
     },
   );
+});
+
+describe("DELETE /nodes/:id: the work behind the same answer", () => {
+  // NOT EQUAL IN GENERAL, AND NOT MADE EQUAL — a residual, stated with its numbers (measured
+  // 2026-10-13: held 23 statements whatever is under the root; un-held 23 for an empty folder and
+  // 24 as soon as there are bytes to give back — the one `UPDATE` of the owner's `used_bytes` —
+  // and more again when upload sessions point into the subtree). The answer, body and headers of
+  // a "delete forever" are the same held or not (above); the WORK is that of two different
+  // things: a held delete runs the gate, rolls back, and writes the marker and the request row;
+  // an un-held one deletes, and removes objects after its commit. No header or body carries a
+  // count; response time is the only channel, and it already varies with the object store.
+  // (The comparisons above leave `statements` out for this one request, and only for it.)
+  const measure = async (files: number, held: boolean) => {
+    const owner = await member();
+    const caller: Caller = { user: owner };
+    const folder = await makeFolder(owner.id);
+    for (let index = 0; index < files; index++) await makeFile(owner.id, folder.id, { scanStatus: "clean" });
+    if (held) await setNodeLegalHold(testDb(), folder.id, true);
+    await api(caller, `/nodes/${folder.id}/trash`, POST);
+    const answer = await api(caller, `/nodes/${folder.id}`, DELETE);
+    expect(answer.status).toBe(204);
+    return answer.statements;
+  };
+
+  it("held: the same count whatever is under the root; un-held: that count, plus one once bytes are given back", async () => {
+    const heldCounts = [await measure(0, true), await measure(1, true), await measure(5, true)];
+    const freeCounts = [await measure(0, false), await measure(1, false), await measure(5, false)];
+    const held = heldCounts[0]!;
+    expect(heldCounts).toEqual([held, held, held]);
+    // Statements over a subtree are one each, so the size of the subtree does not show either.
+    expect(freeCounts).toEqual([held, held + 1, held + 1]);
+  });
 });
 
 describe("a restore out of a trashed folder that protects the file", () => {
