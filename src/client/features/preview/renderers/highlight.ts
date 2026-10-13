@@ -1,7 +1,12 @@
 // Syntax highlighting as DATA: the highlighter's tree is read into plain `{ text, token }` pieces
 // and the viewer renders those as React text nodes. Nothing derived from a file's content is ever
 // parsed as markup.
-import { codeToHast, createCssVariablesTheme } from "shiki/bundle/web";
+import {
+  codeToHast,
+  createCssVariablesTheme,
+  getLastGrammarState,
+  type GrammarState,
+} from "shiki/bundle/web";
 
 export interface Piece {
   text: string;
@@ -102,17 +107,45 @@ function collectLines(node: HastNode, out: Line[]): void {
   for (const child of node.children ?? []) collectLines(child, out);
 }
 
-/** Highlight `code`; one entry per line. Rejects when the grammar cannot be loaded. */
-export async function highlight(code: string, lang: string): Promise<Line[]> {
-  const root = (await codeToHast(code, {
-    lang,
-    theme,
-    // A grammar can take very long over one hostile line: a long line is left plain, and no
-    // line gets more than a moment.
-    tokenizeMaxLineLength: HIGHLIGHT_MAX_LINE_LENGTH,
-    tokenizeTimeLimit: HIGHLIGHT_LINE_TIME_MS,
-  })) as unknown as HastNode;
+/** Lines handed to the grammar at a time; between two slices the page gets to breathe. */
+export const HIGHLIGHT_SLICE_LINES = 200;
+
+const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+/**
+ * Highlight `code`; one entry per line. Works through the text in slices of
+ * `HIGHLIGHT_SLICE_LINES`, carrying the grammar's state from one to the next, and looks at
+ * `signal` before each: an aborted run stops there and resolves with null. Rejects when the
+ * grammar cannot be loaded. The caller decides beforehand whether the text is small enough.
+ */
+export async function highlight(code: string, lang: string, signal?: AbortSignal): Promise<Line[] | null> {
+  const source = code.split(/\r\n|\r|\n/);
   const lines: Line[] = [];
-  collectLines(root, lines);
+  let grammarState: GrammarState | undefined;
+  for (let start = 0; start < source.length; start += HIGHLIGHT_SLICE_LINES) {
+    if (signal?.aborted) return null;
+    if (start > 0) {
+      await pause();
+      if (signal?.aborted) return null;
+    }
+    const slice = source.slice(start, start + HIGHLIGHT_SLICE_LINES).join("\n");
+    const options = {
+      lang,
+      theme,
+      grammarState,
+      // A grammar can take very long over one hostile line: a long line is left plain, and no
+      // line gets more than a moment.
+      tokenizeMaxLineLength: HIGHLIGHT_MAX_LINE_LENGTH,
+      tokenizeTimeLimit: HIGHLIGHT_LINE_TIME_MS,
+    };
+    collectLines((await codeToHast(slice, options)) as unknown as HastNode, lines);
+    if (start + HIGHLIGHT_SLICE_LINES < source.length) {
+      // The state the grammar is in after this slice (inside a comment, a string, …).
+      grammarState = await (getLastGrammarState as (code: string, options: unknown) => Promise<GrammarState>)(
+        slice,
+        options,
+      );
+    }
+  }
   return lines;
 }

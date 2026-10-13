@@ -6,12 +6,18 @@ import { PreviewDialog } from "../../../../src/client/features/preview";
 import {
   highlight,
   HIGHLIGHT_MAX_LINE_LENGTH,
+  HIGHLIGHT_SLICE_LINES,
   languageFor,
 } from "../../../../src/client/features/preview/renderers/highlight";
 import {
+  canHighlight,
   decodeText,
+  fewEnoughPieces,
+  HIGHLIGHT_MAX_CHARS,
   HIGHLIGHT_MAX_LINE,
+  HIGHLIGHT_MAX_LINES,
   TEXT_MAX_LINES,
+  TEXT_MAX_PIECES,
 } from "../../../../src/client/features/preview/renderers/text";
 import { PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
 import type { NodeDto } from "../../../../src/shared/schemas/node";
@@ -208,7 +214,7 @@ describe("highlighting", () => {
 
   it("a line longer than the limit is left plain, by the grammar's own limit and before it is even asked", async () => {
     const long = `const s = "${"x".repeat(HIGHLIGHT_MAX_LINE_LENGTH)}";`;
-    const lines = await highlight(`const a = 1;\n${long}\n`, "typescript");
+    const lines = (await highlight(`const a = 1;\n${long}\n`, "typescript"))!;
     expect(lines[0]!.some((piece) => piece.token === "keyword")).toBe(true);
     // The long line comes back as it is, with no token on any piece.
     expect(lines[1]!.map((piece) => piece.text).join("")).toBe(long);
@@ -235,7 +241,7 @@ describe("highlighting", () => {
 
   it("the highlighter's result is pieces of text with a token name — the file's text, unchanged", async () => {
     const code = 'const tag: string = "<script>alert(1)</script>"; // done\n\nexport default tag;\n';
-    const lines = await highlight(code, "typescript");
+    const lines = (await highlight(code, "typescript"))!;
     expect(lines.map((line) => line.map((piece) => piece.text).join("")).join("\n")).toBe(code);
     const tokens = new Set(lines.flat().map((piece) => piece.token));
     expect(tokens.has("keyword")).toBe(true);
@@ -260,5 +266,115 @@ describe("highlighting", () => {
     expect(pre()!.querySelector("script")).toBeNull();
     expect(pre()!.querySelector("[style]")).toBeNull();
     expect((window as unknown as { __ran?: boolean }).__ran).toBeUndefined();
+  });
+});
+
+describe("highlighting — its bounds are decided before it starts", () => {
+  beforeAll(async () => {
+    await highlight("const warm = 1;", "typescript");
+  });
+
+  it("the constants", () => {
+    expect([
+      HIGHLIGHT_MAX_CHARS,
+      HIGHLIGHT_MAX_LINES,
+      HIGHLIGHT_MAX_LINE,
+      TEXT_MAX_LINES,
+      TEXT_MAX_PIECES,
+    ]).toEqual([200_000, 5_000, 2_000, 5_000, 50_000]);
+    expect(HIGHLIGHT_SLICE_LINES).toBe(200);
+  });
+
+  it("characters AND line count AND longest line — each alone refuses", () => {
+    const lines = (count: number, length: number) => Array.from({ length: count }, () => "x".repeat(length));
+    const chars = (all: string[]) => all.reduce((sum, line) => sum + line.length + 1, 0);
+    const ok = lines(1000, 100);
+    expect(canHighlight(ok, chars(ok))).toBe(true);
+    // Characters: 200,000 is in, one more is out.
+    expect(canHighlight(["a"], HIGHLIGHT_MAX_CHARS)).toBe(true);
+    expect(canHighlight(["a"], HIGHLIGHT_MAX_CHARS + 1)).toBe(false);
+    // Lines: short ones, few characters, too many of them.
+    expect(canHighlight(lines(HIGHLIGHT_MAX_LINES, 1), 10_000)).toBe(true);
+    expect(canHighlight(lines(HIGHLIGHT_MAX_LINES + 1, 1), 10_001)).toBe(false);
+    // Longest line: one line over the limit in an otherwise tiny file.
+    expect(canHighlight(["ok", "x".repeat(HIGHLIGHT_MAX_LINE)], 2_003)).toBe(true);
+    expect(canHighlight(["ok", "x".repeat(HIGHLIGHT_MAX_LINE + 1)], 2_004)).toBe(false);
+    // And a highlighted result of too many pieces is not drawn.
+    expect(fewEnoughPieces(Array.from({ length: 5_000 }, () => new Array(10).fill(0)))).toBe(true);
+    expect(fewEnoughPieces([...Array.from({ length: 5_000 }, () => new Array(10).fill(0)), [0]])).toBe(false);
+  });
+
+  it.each([
+    ["too many characters", `${"const a = 1; ".repeat(100)}\n`.repeat(160)],
+    ["too many lines", "const a = 1;\n".repeat(HIGHLIGHT_MAX_LINES + 1)],
+    ["one line too long", `const a = "${"x".repeat(HIGHLIGHT_MAX_LINE)}";\nconst b = 2;\n`],
+  ])(
+    "%s: the highlighter is never called and the text is shown plain, as text nodes",
+    async (_name, source) => {
+      const module = await import("../../../../src/client/features/preview/renderers/highlight");
+      const spy = vi.spyOn(module, "highlight");
+      await openText(nodeOf({ ...NODES.ts, size: 1000 }), source);
+      await waitFor(() => expect(pre()).not.toBeNull());
+      await settle(50);
+      expect(spy).not.toHaveBeenCalled();
+      expect(
+        dialog()!.querySelector('[data-preview-renderer="text"]')!.getAttribute("data-highlighted"),
+      ).toBe("false");
+      expect(pre()!.querySelector("[data-token]")).toBeNull();
+      expect(pre()!.querySelector("[data-line]")!.textContent).toBe(source.split("\n")[0]);
+    },
+  );
+
+  it("a megabyte of one-character lines draws 5,000 lines — about ten thousand elements, not millions", async () => {
+    const source = "x\n".repeat(500_000);
+    await openText(nodeOf({ ...NODES.ts, size: source.length }), source);
+    await waitFor(() => expect(pre()).not.toBeNull());
+    expect(pre()!.querySelectorAll("[data-line]").length).toBe(TEXT_MAX_LINES);
+    expect(pre()!.querySelectorAll("*").length).toBeLessThanOrEqual(2 * TEXT_MAX_LINES + 1);
+    expect(
+      screen.getByText("Showing the first 5000 of 500000 lines. Download the file for the rest."),
+    ).toBeTruthy();
+  });
+
+  it("slices carry the grammar's state: a comment that spans two slices is a comment on both sides", async () => {
+    const before = Array.from(
+      { length: HIGHLIGHT_SLICE_LINES - 1 },
+      (_, index) => `const v${index} = ${index};`,
+    );
+    const source = [
+      ...before,
+      "/* opens on the last line of slice one",
+      "still inside, first line of slice two",
+      "*/ const after = 1;",
+    ];
+    const lines = (await highlight(source.join("\n"), "typescript"))!;
+    expect(lines.length).toBe(source.length);
+    expect(lines.map((line) => line.map((piece) => piece.text).join(""))).toEqual(source);
+    expect(lines[HIGHLIGHT_SLICE_LINES]!.every((piece) => piece.token === "comment")).toBe(true);
+    expect(lines[HIGHLIGHT_SLICE_LINES + 1]!.some((piece) => piece.token === "keyword")).toBe(true);
+  });
+
+  it("an aborted run stops at the next slice and gives nothing; closing the preview aborts it", async () => {
+    const source = "const a = 1;\n".repeat(3 * HIGHLIGHT_SLICE_LINES);
+    const gone = new AbortController();
+    gone.abort();
+    expect(await highlight(source, "typescript", gone.signal)).toBeNull();
+    const midway = new AbortController();
+    const run = highlight(source, "typescript", midway.signal);
+    midway.abort();
+    expect(await run).toBeNull();
+
+    const module = await import("../../../../src/client/features/preview/renderers/highlight");
+    const spy = vi.spyOn(module, "highlight");
+    await preloadRenderers();
+    const api = ownerApi([NODES.ts]);
+    installFetch({ api: api.handler, files: () => new Response(source) });
+    const view = renderPreview(<PreviewDialog open nodeId={NODES.ts.id} onClose={noop} source="owner" />);
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    const signal = spy.mock.calls[0]![2]!;
+    expect(signal.aborted).toBe(false);
+    view.unmount();
+    // The run was handed the signal that closing aborts (what an aborted run does is above).
+    expect(signal.aborted).toBe(true);
   });
 });
