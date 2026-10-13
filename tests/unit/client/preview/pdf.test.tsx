@@ -1,10 +1,12 @@
 // PDF: the bytes are fetched with an inline URL and handed to the engine; pages are drawn only
 // near the window; a link out of the document asks first. pdf.js itself cannot run in jsdom (no
 // canvas, no worker) — the engine module is replaced here and exercised for real in the e2e spec.
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PublicPreviewSource } from "../../../../src/client/components/slots";
 import { PreviewDialog } from "../../../../src/client/features/preview";
+import PdfPreview from "../../../../src/client/features/preview/renderers/PdfPreview";
+import { purgeUserState } from "../../../../src/client/lib/query";
 import { safeExternalUrl } from "../../../../src/client/features/preview/renderers/pdf-links";
 import type { PdfDocument, PdfLink } from "../../../../src/client/features/preview/renderers/pdf-engine";
 import {
@@ -19,6 +21,7 @@ import {
   dialog,
   envelope,
   installFetch,
+  loadedOf,
   ownerApi,
   renderPreview,
   renderer,
@@ -48,6 +51,15 @@ vi.mock("../../../../src/client/features/preview/renderers/pdf-engine", () => ({
 setupPreview();
 
 const noop = () => {};
+
+/**
+ * Bring a page near the window. Effects are flushed first: the pages' observers are attached in
+ * an effect, and a page that is not observed yet cannot be told it is near.
+ */
+async function see(page: number): Promise<void> {
+  await settle();
+  intersect((element) => element.getAttribute("data-pdf-page") === String(page));
+}
 const EXTERNAL = "https://example.com/holdfast-fixture";
 
 function fakeDocument(pageCount: number, links: Record<number, PdfLink[]> = {}): PdfDocument {
@@ -124,9 +136,8 @@ describe("PdfPreview", () => {
     expect(engine.rendered).toEqual([]);
     expect(dialog()!.querySelectorAll("canvas").length).toBe(0);
 
-    intersect((element) => element.getAttribute("data-pdf-page") === "2");
-    await settle(10);
-    expect(engine.rendered.map((entry) => entry.page)).toEqual([2]);
+    await see(2);
+    await waitFor(() => expect(engine.rendered.map((entry) => entry.page)).toEqual([2]));
     expect(dialog()!.querySelectorAll("canvas").length).toBe(1);
     expect(dialog()!.querySelector('[data-pdf-page="2"] .textLayer')).not.toBeNull();
   });
@@ -154,15 +165,15 @@ describe("PdfPreview", () => {
   it("zoom redraws the pages in view at the new scale", async () => {
     await openPdfPreview();
     await waitFor(() => expect(renderer()).toBe("pdf"));
-    intersect((element) => element.getAttribute("data-pdf-page") === "1");
-    await settle(10);
+    await see(1);
+    await waitFor(() => expect(engine.rendered.length).toBe(1));
     const before = engine.rendered.at(-1)!.scale;
     fireEvent.click(screen.getByRole("button", { name: "Zoom in" }));
-    await settle(10);
+    await waitFor(() => expect(engine.rendered.length).toBe(2));
     expect(engine.rendered.at(-1)!.scale).toBeCloseTo(before * 1.25);
     expect(screen.getByRole("button", { name: "Fit width" }).getAttribute("aria-pressed")).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: "Fit width" }));
-    await settle(10);
+    await waitFor(() => expect(engine.rendered.length).toBe(3));
     expect(engine.rendered.at(-1)!.scale).toBeCloseTo(before);
   });
 
@@ -181,8 +192,8 @@ describe("PdfPreview", () => {
     const opened = vi.spyOn(window, "open").mockImplementation(() => null);
     await openPdfPreview();
     await waitFor(() => expect(renderer()).toBe("pdf"));
-    intersect((element) => element.getAttribute("data-pdf-page") === "1");
-    await settle(10);
+    await see(1);
+    await waitFor(() => expect(dialog()!.querySelector('[data-pdf-link="external"]')).not.toBeNull());
     const link = dialog()!.querySelector<HTMLElement>('[data-pdf-link="external"]')!;
     // Not an anchor with an address: a middle click cannot go around the question.
     expect(link.tagName).toBe("BUTTON");
@@ -204,8 +215,8 @@ describe("PdfPreview", () => {
   it("a link inside the document goes to its page, with no question", async () => {
     await openPdfPreview();
     await waitFor(() => expect(renderer()).toBe("pdf"));
-    intersect((element) => element.getAttribute("data-pdf-page") === "1");
-    await settle(10);
+    await see(1);
+    await waitFor(() => expect(dialog()!.querySelector('[data-pdf-link="internal"]')).not.toBeNull());
     const internal = dialog()!.querySelector<HTMLElement>('[data-pdf-link="internal"]')!;
     // Named for what it is — not after the page it happens to sit on.
     expect(internal.getAttribute("aria-label")).toBe("Link to another place in this document");
@@ -313,31 +324,203 @@ describe("PdfPreview — refusals", () => {
   });
 });
 
+describe("PdfPreview across a purge of the account — at each stage", () => {
+  const purge = () => act(async () => void (await purgeUserState()));
+  const item = loadedOf(NODES.pdf);
+  /** The renderer alone: no dialog remounts it, so what stops the work is its own scope. */
+  async function alone(files: () => Response | Promise<Response> = () => new Response(BYTES)) {
+    const api = ownerApi([NODES.pdf]);
+    const network = installFetch({ api: api.handler, files });
+    const view = renderPreview(<PdfPreview source="owner" item={item} />);
+    return { api, network, view };
+  }
+  const shown = (view: { container: HTMLElement }) =>
+    view.container.querySelector('[data-preview-renderer="pdf"]');
+
+  it("while the bytes are on their way: the transfer is aborted and pdf.js is never called", async () => {
+    let release!: (response: Response) => void;
+    const { network, view } = await alone(() => new Promise<Response>((resolve) => (release = resolve)));
+    await waitFor(() => expect(network.files().length).toBe(1));
+    const signal = network.files()[0]!.signal!;
+    await purge();
+    expect(signal.aborted).toBe(true);
+    release(new Response(BYTES));
+    await settle(20);
+    expect(engine.openPdf).not.toHaveBeenCalled();
+    expect(shown(view)).toBeNull();
+  });
+
+  it("while pdf.js is opening the bytes: the document that comes out is destroyed — no page asked, nothing drawn", async () => {
+    let finish!: (doc: PdfDocument) => void;
+    engine.openPdf.mockImplementation(() => new Promise<PdfDocument>((resolve) => (finish = resolve)));
+    const { view } = await alone();
+    await waitFor(() => expect(engine.openPdf).toHaveBeenCalledTimes(1));
+    // The engine is handed the view's signal, which the purge aborts (the real engine destroys
+    // its loading task on it — `pdf-engine.test.ts`).
+    const signal = engine.openPdf.mock.calls[0]![1] as AbortSignal;
+    expect(signal.aborted).toBe(false);
+    await purge();
+    expect(signal.aborted).toBe(true);
+    finish(fakeDocument(3));
+    await settle(20);
+    expect(engine.destroyed).toBe(1);
+    expect(engine.pagesAsked).toEqual([]);
+    expect(engine.rendered).toEqual([]);
+    expect(shown(view)).toBeNull();
+  });
+
+  it("between pages: the document is destroyed, its pages leave the screen, and no further page is drawn", async () => {
+    const { view } = await alone();
+    await waitFor(() => expect(shown(view)).not.toBeNull());
+    await see(1);
+    await waitFor(() => expect(engine.rendered.map((entry) => entry.page)).toEqual([1]));
+    await purge();
+    await settle(10);
+    expect(engine.destroyed).toBe(1);
+    expect(shown(view)).toBeNull();
+    expect(view.container.querySelector("canvas")).toBeNull();
+    intersect();
+    await settle(20);
+    expect(engine.rendered.map((entry) => entry.page)).toEqual([1]);
+    expect(engine.pagesAsked.filter((page) => page > 1)).toEqual([]);
+  });
+
+  it("a page that arrives after the purge is released, not shown; a link list that arrives late is dropped", async () => {
+    let givePage!: () => void;
+    let giveLinks!: (links: PdfLink[]) => void;
+    const released: number[] = [];
+    engine.openPdf.mockImplementation(async () => ({
+      ...fakeDocument(3),
+      page: async (number: number) => {
+        // Page 1 is read at once for the sheet's size; page 2 is held until the test lets it go.
+        if (number === 2) await new Promise<void>((resolve) => (givePage = resolve));
+        engine.pagesAsked.push(number);
+        return {
+          width: 612,
+          height: 792,
+          render: (_canvas: HTMLCanvasElement, _text: HTMLElement, scale: number) => {
+            engine.rendered.push({ page: number, scale });
+            return { done: Promise.resolve(), cancel: () => {} };
+          },
+          links: () => new Promise<PdfLink[]>((resolve) => (giveLinks = resolve)),
+          release: () => released.push(number),
+        };
+      },
+    }));
+    const { view } = await alone();
+    await waitFor(() => expect(shown(view)).not.toBeNull());
+    await see(1);
+    await waitFor(() => expect(engine.rendered.length).toBe(1));
+    await see(2);
+    await settle(5);
+    await purge();
+    givePage();
+    giveLinks([{ left: 0, top: 0, width: 10, height: 10, url: EXTERNAL }]);
+    await settle(20);
+    expect(released).toContain(2);
+    expect(engine.rendered.map((entry) => entry.page)).toEqual([1]);
+    expect(view.container.querySelector("[data-pdf-link]")).toBeNull();
+  });
+
+  it("mid-render: the drawing under way is cancelled", async () => {
+    const cancelled: number[] = [];
+    engine.openPdf.mockImplementation(async () => ({
+      ...fakeDocument(3),
+      page: async (number: number) => ({
+        width: 612,
+        height: 792,
+        render: () => {
+          engine.rendered.push({ page: number, scale: 1 });
+          return { done: new Promise<void>(() => {}), cancel: () => cancelled.push(number) };
+        },
+        links: async () => [],
+        release: () => {},
+      }),
+    }));
+    const { view } = await alone();
+    await waitFor(() => expect(shown(view)).not.toBeNull());
+    await see(1);
+    await waitFor(() => expect(engine.rendered.length).toBe(1));
+    await purge();
+    expect(cancelled).toContain(1);
+    expect(engine.destroyed).toBe(1);
+  });
+
+  it("a jump inside the document that resolves after the purge moves nothing", async () => {
+    let answer!: (page: number) => void;
+    engine.openPdf.mockImplementation(async () => ({
+      ...fakeDocument(3, { 1: [{ left: 0, top: 0, width: 10, height: 10, dest: "later" }] }),
+      pageOfDest: () => new Promise<number>((resolve) => (answer = resolve)),
+    }));
+    // In the dialog, so that the page field can be read before the purge.
+    const a = { gone: false };
+    const api = ownerApi([NODES.pdf]);
+    installFetch({
+      api: (call) => (a.gone ? envelope("not_found", 404) : api.handler(call)),
+      files: () => new Response(BYTES),
+    });
+    renderPreview(<PreviewDialog open nodeId={ID.pdf} onClose={noop} source="owner" />);
+    await waitFor(() => expect(renderer()).toBe("pdf"));
+    await see(1);
+    await waitFor(() => expect(dialog()!.querySelector('[data-pdf-link="internal"]')).not.toBeNull());
+    fireEvent.click(dialog()!.querySelector<HTMLElement>('[data-pdf-link="internal"]')!);
+    a.gone = true;
+    await purge();
+    answer(3);
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(renderer()).toBeNull();
+    expect(screen.queryByText("three-pages.pdf")).toBeNull();
+    expect(engine.destroyed).toBe(1);
+  });
+
+  it("in the dialog: an open PDF is gone after the purge — title, pages, Download — and the dialog reads again", async () => {
+    const a = { gone: false };
+    const api = ownerApi([NODES.pdf]);
+    installFetch({
+      api: (call) => (a.gone ? envelope("not_found", 404) : api.handler(call)),
+      files: () => new Response(BYTES),
+    });
+    renderPreview(<PreviewDialog open nodeId={ID.pdf} onClose={noop} source="owner" />);
+    await waitFor(() => expect(renderer()).toBe("pdf"));
+    a.gone = true;
+    await purge();
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(dialog()!.querySelectorAll("[data-pdf-page]").length).toBe(0);
+    expect(screen.queryByText("three-pages.pdf")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+    expect(engine.destroyed).toBe(1);
+    intersect();
+    await settle(20);
+    expect(engine.rendered).toEqual([]);
+  });
+});
+
 describe("PdfPreview — how much is drawn at once", () => {
-  /** An IntersectionObserver the test drives both ways: pages come near, and leave. */
-  const observed = new Map<Element, (entries: Array<{ isIntersecting: boolean; target: Element }>) => void>();
+  /** An IntersectionObserver the test drives both ways: pages come near (and into view), and leave. */
+  type Report = (entries: Array<{ isIntersecting: boolean; target: Element }>) => void;
+  const observed = new Map<Element, Set<Report>>();
   const near = (page: number, isIntersecting: boolean) => {
     const element = document.querySelector(`[data-pdf-page="${page}"]`)!;
-    observed.get(element)!([{ isIntersecting, target: element }]);
+    for (const report of Array.from(observed.get(element) ?? []))
+      report([{ isIntersecting, target: element }]);
   };
 
   beforeEach(() => {
     observed.clear();
     class DrivenObserver {
       private readonly targets = new Set<Element>();
-      constructor(
-        private readonly callback: (entries: Array<{ isIntersecting: boolean; target: Element }>) => void,
-      ) {}
+      constructor(private readonly callback: Report) {}
       observe(element: Element) {
         this.targets.add(element);
-        observed.set(element, this.callback);
+        if (!observed.has(element)) observed.set(element, new Set());
+        observed.get(element)!.add(this.callback);
       }
       unobserve(element: Element) {
         this.targets.delete(element);
-        observed.delete(element);
+        observed.get(element)?.delete(this.callback);
       }
       disconnect() {
-        for (const element of this.targets) observed.delete(element);
+        for (const element of this.targets) observed.get(element)?.delete(this.callback);
         this.targets.clear();
       }
       takeRecords() {
@@ -418,7 +601,7 @@ describe("PdfPreview — how much is drawn at once", () => {
     expect(mostPixels).toBeLessThanOrEqual(PDF_LIVE_CANVAS_MAX_PIXELS);
     expect(mostPixels).toBe(5 * 12_000_000);
     // And it did draw: five pages of every window (the cap), all the way down.
-    expect(drawn).toBe((PDF_MAX_PAGES / WINDOW) * 5);
+    expect(drawn).toBeGreaterThanOrEqual((PDF_MAX_PAGES / WINDOW) * 5);
   });
 });
 
@@ -470,6 +653,64 @@ describe("the render budget", () => {
     huge.release();
     huge.release();
     expect(budget.stats()).toEqual({ rendering: 0, pixels: 0, waiting: 0 });
+  });
+
+  it("a page on screen goes before pages that are only near, whoever asked first", async () => {
+    const budget = createRenderBudget(1, 1000);
+    const order: string[] = [];
+    const first = budget.request(10);
+    for (const [name, visible] of [
+      ["near-1", false],
+      ["near-2", false],
+      ["visible", true],
+    ] as const) {
+      void budget.request(10, { visible }).granted.then((ok) => ok && order.push(name));
+    }
+    first.finished();
+    await Promise.resolve();
+    expect(order).toEqual(["visible"]);
+  });
+
+  it("a page that comes into view while waiting is served next", async () => {
+    const budget = createRenderBudget(1, 1000);
+    const order: string[] = [];
+    const first = budget.request(10);
+    void budget.request(10).granted.then((ok) => ok && order.push("a"));
+    const b = budget.request(10);
+    void b.granted.then((ok) => ok && order.push("b"));
+    b.setVisible(true);
+    first.finished();
+    await Promise.resolve();
+    expect(order).toEqual(["b"]);
+  });
+
+  it("finished pages nobody sees give their pixels back to a page on screen; visible and drawing ones are never taken", async () => {
+    const budget = createRenderBudget(2, 100);
+    const evicted: string[] = [];
+    const hidden = budget.request(40, { onEvict: () => evicted.push("hidden") });
+    hidden.finished();
+    const seen = budget.request(40, { visible: true, onEvict: () => evicted.push("seen") });
+    seen.finished();
+    const drawing = budget.request(20, { onEvict: () => evicted.push("drawing") });
+    let granted: boolean | null = null;
+    void budget.request(40, { visible: true }).granted.then((ok) => {
+      granted = ok;
+    });
+    await Promise.resolve();
+    expect(evicted).toEqual(["hidden"]);
+    expect(granted).toBe(true);
+    expect(budget.stats().pixels).toBe(100);
+    // Control: a page that is only near takes nothing from anybody — it waits.
+    const waits = budget.request(40);
+    let late: boolean | null = null;
+    void waits.granted.then((ok) => {
+      late = ok;
+    });
+    await Promise.resolve();
+    expect(late).toBeNull();
+    expect(evicted).toEqual(["hidden"]);
+    drawing.release();
+    waits.release();
   });
 
   it("the product's numbers", () => {

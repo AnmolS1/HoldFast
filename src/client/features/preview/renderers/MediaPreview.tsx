@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { FileBadge } from "../../../components/FileBadge";
 import { hf } from "../../../theme/tokens";
 import { ErrorState } from "../parts";
+import { useViewScope } from "../scope";
 import { t } from "../strings";
 import { usePreviewUrl } from "../usePreviewUrl";
 import { NoPreview } from "./NoPreview";
@@ -18,7 +19,7 @@ interface Position {
 }
 
 export default function MediaPreview(props: RendererProps & { kind: "video" | "audio" }) {
-  const { source, item, kind } = props;
+  const { source, item, kind, onRetry } = props;
   const preview = usePreviewUrl(source, item.id, "inline");
   const element = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
   // Where playback was when the URL was swapped; applied once the new one has its metadata.
@@ -30,6 +31,8 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
   const failures = useRef(0);
   const probing = useRef(false);
   const [unsupported, setUnsupported] = useState(false);
+  // The element's handlers ask this first: false after unmount and after a purge of the account.
+  const view = useViewScope();
 
   const track = () => {
     const media = element.current;
@@ -41,7 +44,7 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
     };
   };
 
-  const { url, reportFailure } = preview;
+  const { url, reportFailure, settle } = preview;
   useEffect(() => {
     const media = element.current;
     if (!media || !url) return;
@@ -75,7 +78,7 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
 
   const onLoadedMetadata = () => {
     const media = element.current;
-    if (!media) return;
+    if (!media || !view.alive()) return;
     const position = resume.current;
     resume.current = null;
     if (!position) return;
@@ -86,7 +89,7 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
 
   const onError = () => {
     const media = element.current;
-    if (!media || !media.error) return;
+    if (!media || !media.error || !view.alive()) return;
     failures.current += 1;
     if (failures.current === 1) {
       // An expired or refused URL: one more, then playback resumes where it was.
@@ -99,17 +102,24 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
     if (probing.current) return;
     probing.current = true;
     const current = media.currentSrc || media.src;
-    fetch(current, { method: "HEAD", mode: "cors", credentials: "omit" }).then(
+    // The question carries the view's signal: it is dropped when the view ends or the account
+    // is purged, and its answer is not acted on after either.
+    fetch(current, { method: "HEAD", mode: "cors", credentials: "omit", signal: view.signal() }).then(
       (response) => {
-        if (response.ok) setUnsupported(true);
-        else void reportFailure();
+        if (!view.alive()) return;
+        if (!response.ok) return void reportFailure();
+        // Nothing will be played: the URL need not be kept fresh behind the card.
+        settle();
+        setUnsupported(true);
       },
-      () => void reportFailure(),
+      () => {
+        if (view.alive()) void reportFailure();
+      },
     );
   };
 
   if (unsupported) return <NoPreview item={item} message={t("media.unsupported")} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} onRetry={onRetry} />;
 
   const shared = {
     controls: true,

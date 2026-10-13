@@ -3,11 +3,13 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PublicPreviewSource } from "../../../../src/client/components/slots";
+import { ApiError } from "../../../../src/client/lib/api";
 import {
   fetchPreview,
   REFRESH_MIN_MS,
   REFRESH_RETRY_MS,
   refreshDelayMs,
+  refreshRetryMs,
   usePreviewUrl,
 } from "../../../../src/client/features/preview/usePreviewUrl";
 import { ID, NODES, filesUrl } from "./fixtures";
@@ -211,6 +213,60 @@ describe("usePreviewUrl — a proactive refresh that fails", () => {
     await advance(15_000);
     expect(mints).toBe(3);
     expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "tok-2"));
+  });
+});
+
+describe("usePreviewUrl — a refresh the API asked to wait for", () => {
+  it("the wait is the ladder's rung or the API's Retry-After, whichever is longer — and none past the URL's end", () => {
+    const limited = (seconds?: number) =>
+      new ApiError({ status: 429, code: "rate_limited", message: "slow down", retryAfter: seconds });
+    expect(refreshRetryMs(0, new Error("offline"), 180_000)).toBe(15_000);
+    expect(refreshRetryMs(1, limited(), 180_000)).toBe(30_000);
+    expect(refreshRetryMs(0, limited(5), 180_000)).toBe(15_000);
+    expect(refreshRetryMs(0, limited(120), 180_000)).toBe(120_000);
+    // Asked to wait longer than the URL in use will last: there is nothing to refresh for.
+    expect(refreshRetryMs(0, limited(600), 180_000)).toBeNull();
+    expect(refreshRetryMs(2, new Error("offline"), 50_000)).toBeNull();
+    // The ladder is three rungs.
+    expect(refreshRetryMs(3, new Error("offline"), 180_000)).toBeNull();
+  });
+
+  it("a 429 with Retry-After: 120 at the refresh → nothing is asked for 120 s (not after 15)", async () => {
+    vi.useFakeTimers();
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints === 2 ? envelope("rate_limited", 429, undefined, { "retry-after": "120" }) : undefined;
+    });
+    installFetch({ api: api.handler });
+    const { result } = renderHook(() => usePreviewUrl("owner", ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    expect(mints).toBe(2);
+    await advance(119_000);
+    expect(mints).toBe(2);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "tok-1"));
+    await advance(1_000);
+    expect(mints).toBe(3);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "tok-2"));
+  });
+
+  it("a 429 that asks for longer than the URL has left: no retry at all", async () => {
+    vi.useFakeTimers();
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints >= 2 ? envelope("rate_limited", 429, undefined, { "retry-after": "600" }) : undefined;
+    });
+    installFetch({ api: api.handler });
+    renderHook(() => usePreviewUrl("owner", ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    await advance(10 * INLINE_MS);
+    expect(mints).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

@@ -1,12 +1,19 @@
-// Late work across an account change: after the account's state is purged (sign-out, another
-// identity) nothing the preview had under way asks, writes or shows anything.
+// An account change while the preview is open. After the account's state is purged (sign-out,
+// another identity) the preview shows nothing of the old account, asks nothing with its URLs,
+// and does not hang: it starts over for whoever is signed in now.
 import { act, fireEvent, renderHook, screen, waitFor } from "@testing-library/react";
+import { type RouteObject } from "react-router";
 import { describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
-import { PreviewDialog } from "../../../../src/client/features/preview";
+import { PreviewDialog, routes as previewRoutes } from "../../../../src/client/features/preview";
+import ImagePreview from "../../../../src/client/features/preview/renderers/ImagePreview";
+import MediaPreview from "../../../../src/client/features/preview/renderers/MediaPreview";
+import { openScope, openScopeCount } from "../../../../src/client/features/preview/scope";
 import { SCAN_POLL_MS } from "../../../../src/client/features/preview/useItem";
 import { usePreviewUrl } from "../../../../src/client/features/preview/usePreviewUrl";
-import { purgeUserState } from "../../../../src/client/lib/query";
+import { purgeUserState, refreshSession } from "../../../../src/client/lib/query";
+import { Frame } from "../../../../src/client/routes/frame/Frame";
+import { renderRoutes, seedConfig, seedSession, sessionOf } from "../shell/helpers";
 import { ID, NODES, nodeOf } from "./fixtures";
 import {
   advance,
@@ -14,6 +21,7 @@ import {
   envelope,
   installFetch,
   json,
+  loadedOf,
   ownerApi,
   preloadRenderers,
   renderPreview,
@@ -21,6 +29,7 @@ import {
   setupPreview,
   settle,
   state,
+  type Handler,
 } from "./helpers";
 
 setupPreview();
@@ -37,10 +46,43 @@ function held<T>() {
   return { promise, release };
 }
 
-describe("a purge of the account while the preview has work under way", () => {
+/**
+ * The API as account A sees it — until `gone.now` is set: from then on every node route answers
+ * as it does for someone who has no such file.
+ */
+function accountA(nodes: Parameters<typeof ownerApi>[0], extra?: Handler) {
+  const gone = { now: false };
+  const api = ownerApi(nodes, extra);
+  const handler: Handler = (call) => (gone.now ? envelope("not_found", 404) : api.handler(call));
+  return { api, handler, gone };
+}
+
+describe("the scope every late continuation goes through", () => {
+  it("ends when it is closed, and when the account is purged — and a purge ends every open one", async () => {
+    const before = openScopeCount();
+    const first = openScope();
+    const second = openScope();
+    expect(openScopeCount()).toBe(before + 2);
+    expect(first.alive()).toBe(true);
+    first.close();
+    expect(first.alive()).toBe(false);
+    expect(first.signal.aborted).toBe(true);
+    expect(second.alive()).toBe(true);
+    await purgeUserState();
+    expect(second.alive()).toBe(false);
+    expect(second.signal.aborted).toBe(true);
+    expect(openScopeCount()).toBe(0);
+    // A scope opened afterwards belongs to whoever is signed in now.
+    const third = openScope();
+    expect(third.alive()).toBe(true);
+    third.close();
+  });
+});
+
+describe("the URL hook across a purge", () => {
   it("a mint still on its way: its URL is never published, and no refresh is ever scheduled", async () => {
     vi.useFakeTimers();
-    const gate = held<Response>();
+    const gate = held<null>();
     const api = ownerApi([NODES.mp4]);
     let mints = 0;
     const network = installFetch({
@@ -55,7 +97,7 @@ describe("a purge of the account while the preview has work under way", () => {
     await advance(0);
     expect(mints).toBe(1);
     await purge();
-    gate.release(new Response());
+    gate.release(null);
     await advance(0);
     expect(result.current.url).toBeNull();
     expect(result.current.failure).toBeNull();
@@ -65,7 +107,7 @@ describe("a purge of the account while the preview has work under way", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("a refresh timer and its retries: after the purge they ask for nothing", async () => {
+  it("a refresh timer: after the purge it asks for nothing; nor does a failure reported by an element", async () => {
     vi.useFakeTimers();
     const api = ownerApi([NODES.mp4]);
     installFetch({ api: api.handler });
@@ -75,119 +117,190 @@ describe("a purge of the account while the preview has work under way", () => {
     await purge();
     await advance(10 * 900_000);
     expect(api.minted.length).toBe(1);
-    // And a failure reported by an element that is still on the page mints nothing either.
     await act(async () => void (await result.current.reportFailure()));
     expect(api.minted.length).toBe(1);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("control: without a purge the same clock does refresh", async () => {
+  it("a RETRY timer of a failed refresh: after the purge the retry is never sent", async () => {
     vi.useFakeTimers();
-    const api = ownerApi([NODES.mp4]);
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints >= 2 ? envelope("internal", 503) : undefined;
+    });
     installFetch({ api: api.handler });
     renderHook(() => usePreviewUrl("owner", ID.mp4, "inline"));
     await advance(0);
     await advance(720_000);
-    expect(api.minted.length).toBe(2);
+    // The refresh failed: a retry is waiting for its 15 s.
+    expect(mints).toBe(2);
+    expect(vi.getTimerCount()).toBe(1);
+    await purge();
+    await advance(10 * 900_000);
+    expect(mints).toBe(2);
   });
 
-  it("the scan poll: no further read of the node", async () => {
+  it("control: without a purge the same clock does retry", async () => {
     vi.useFakeTimers();
-    const pending = nodeOf({ scanStatus: "pending" });
-    const network = installFetch({ api: ownerApi([pending]).handler });
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints >= 2 ? envelope("internal", 503) : undefined;
+    });
+    installFetch({ api: api.handler });
+    renderHook(() => usePreviewUrl("owner", ID.mp4, "inline"));
+    await advance(0);
+    await advance(720_000);
+    await advance(15_000);
+    expect(mints).toBe(3);
+  });
+});
+
+describe("the dialog across a purge: nothing of the old account stays, and nothing hangs", () => {
+  it("a file without a preview: its name, type and Download are gone; the dialog reads again for the new account", async () => {
+    const a = accountA([NODES.svg]);
+    const network = installFetch({ api: a.handler });
+    renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
+    await screen.findByText("sample.svg");
+    a.gone.now = true;
+    await purge();
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(screen.queryByText("sample.svg")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "This file isn't here" })).toBeTruthy();
+    expect(renderer()).toBeNull();
+    // One read as the old account, one as the new.
+    expect(network.api(`/api/nodes/${ID.svg}`).length).toBe(2);
+  });
+
+  it("text on screen: the text is gone", async () => {
+    await preloadRenderers();
+    const a = accountA([NODES.ts]);
+    installFetch({ api: a.handler, files: () => new Response("const secret = 1;\n") });
+    renderPreview(<PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />);
+    await waitFor(() => expect(dialog()?.querySelector("pre")?.textContent).toContain("secret"));
+    a.gone.now = true;
+    await purge();
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(document.body.textContent).not.toContain("secret");
+    expect(dialog()!.querySelector("pre")).toBeNull();
+  });
+
+  it("text bytes still on their way: the transfer is aborted at the purge, and what arrives is never drawn", async () => {
+    await preloadRenderers();
+    const gate = held<Response>();
+    const a = accountA([NODES.ts]);
+    const network = installFetch({ api: a.handler, files: () => gate.promise });
+    renderPreview(<PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />);
+    await waitFor(() => expect(network.files().length).toBe(1));
+    const signal = network.files()[0]!.signal!;
+    expect(signal.aborted).toBe(false);
+    a.gone.now = true;
+    await purge();
+    expect(signal.aborted).toBe(true);
+    gate.release(new Response("const secret = 1;\n"));
+    await settle(50);
+    expect(document.body.textContent).not.toContain("secret");
+    expect(network.files().length).toBe(1);
+    expect(state()).toBe("error");
+  });
+
+  it("a first mint still on its way: not a skeleton for ever — the dialog starts over", async () => {
+    await preloadRenderers();
+    vi.useFakeTimers();
+    const gate = held<null>();
+    const a = accountA([NODES.ts]);
+    installFetch({
+      api: async (call) => {
+        if (!a.gone.now && call.url.pathname.endsWith("/download-url")) await gate.promise;
+        return a.handler(call);
+      },
+    });
+    renderPreview(<PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />);
+    await advance(0);
+    await advance(0);
+    expect(state()).toBe("loading");
+    a.gone.now = true;
+    await purge();
+    await advance(0);
+    await advance(0);
+    expect(state()).toBe("error");
+    expect(screen.queryByText("sample.ts")).toBeNull();
+    gate.release(null);
+    await advance(60 * 60_000);
+    expect(state()).toBe("error");
+  });
+
+  it("a film that was playing: the element is stopped and gone, and no question goes to the files host", async () => {
+    await preloadRenderers();
+    const a = accountA([NODES.mp4]);
+    const network = installFetch({ api: a.handler });
+    renderPreview(<PreviewDialog open nodeId={ID.mp4} onClose={noop} source="owner" />);
+    await waitFor(() => expect(renderer()).toBe("video"));
+    await settle();
+    const video = dialog()!.querySelector("video")!;
+    expect(video.getAttribute("src")).toContain(`/i/${ID.mp4}/`);
+    a.gone.now = true;
+    await purge();
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(video.isConnected).toBe(false);
+    expect(video.hasAttribute("src")).toBe(false);
+    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
+    expect(network.files()).toEqual([]);
+    expect(a.api.minted.length).toBe(1);
+  });
+
+  it("the scan poll: the old account's poll stops; the new account's read is its own", async () => {
+    vi.useFakeTimers();
+    const a = accountA([nodeOf({ scanStatus: "pending" })]);
+    const network = installFetch({ api: a.handler });
     renderPreview(<PreviewDialog open nodeId={ID.png} onClose={noop} source="owner" />);
     await advance(0);
     expect(state()).toBe("scanning");
-    const before = network.api(`/api/nodes/${ID.png}`).length;
+    a.gone.now = true;
     await purge();
+    await advance(0);
+    const after = network.api(`/api/nodes/${ID.png}`).length;
+    expect(state()).toBe("error");
     await advance(6 * SCAN_POLL_MS);
-    expect(network.api(`/api/nodes/${ID.png}`).length).toBe(before);
-  });
-
-  it("a node read still on its way: its answer is not shown", async () => {
-    const gate = held<null>();
-    const api = ownerApi([NODES.svg]);
-    installFetch({
-      api: async (call) => {
-        if (call.url.pathname === `/api/nodes/${ID.svg}`) await gate.promise;
-        return api.handler(call);
-      },
-    });
-    renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
-    await waitFor(() => expect(state()).toBe("loading"));
-    await purge();
-    gate.release(null);
-    await settle(20);
-    expect(screen.queryByText("sample.svg")).toBeNull();
-    expect(renderer()).toBeNull();
-  });
-
-  it("text bytes still on their way: they are dropped — nothing of the file is drawn or highlighted", async () => {
-    await preloadRenderers();
-    const gate = held<Response>();
-    const api = ownerApi([NODES.ts]);
-    installFetch({ api: api.handler, files: () => gate.promise });
-    renderPreview(<PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />);
-    await waitFor(() => expect(api.minted.length).toBe(1));
-    await settle(10);
-    await purge();
-    gate.release(new Response("const secret = 1;\n"));
-    await settle(50);
-    expect(dialog()!.querySelector("pre")).toBeNull();
-    expect(document.body.textContent).not.toContain("secret");
-    expect(api.minted.length).toBe(1);
+    expect(network.api(`/api/nodes/${ID.png}`).length).toBe(after);
   });
 
   it("a Download still being minted: no download starts and nothing is said", async () => {
-    const gate = held<null>();
-    const api = ownerApi([NODES.svg]);
-    let refuse = false;
-    installFetch({
-      api: async (call) => {
-        if (!call.url.pathname.endsWith("/download-url")) return api.handler(call);
-        await gate.promise;
-        return refuse ? envelope("scan_blocked", 403) : api.handler(call);
-      },
-    });
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
-    const view = renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
-    await screen.findByText("sample.svg");
-    fireEvent.click(screen.getByRole("button", { name: "Download" }));
-    await settle(5);
-    await purge();
-    gate.release(null);
-    await settle(20);
-    expect(click).not.toHaveBeenCalled();
-    view.unmount();
-
-    // The same with a refusal: no toast for the account that is gone.
-    refuse = true;
-    const second = held<null>();
-    installFetch({
-      api: async (call) => {
-        if (!call.url.pathname.endsWith("/download-url")) return api.handler(call);
-        await second.promise;
-        return envelope("scan_blocked", 403);
-      },
-    });
-    renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
-    await screen.findByText("sample.svg");
-    fireEvent.click(screen.getByRole("button", { name: "Download" }));
-    await settle(5);
-    await purge();
-    second.release(null);
-    await settle(20);
-    expect(getToasts()).toEqual([]);
-    expect(click).not.toHaveBeenCalled();
+    for (const refuse of [false, true]) {
+      const gate = held<null>();
+      const api = ownerApi([NODES.svg]);
+      installFetch({
+        api: async (call) => {
+          if (!call.url.pathname.endsWith("/download-url")) return api.handler(call);
+          await gate.promise;
+          return refuse ? envelope("scan_blocked", 403) : api.handler(call);
+        },
+      });
+      const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+      const view = renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
+      await screen.findByText("sample.svg");
+      fireEvent.click(screen.getByRole("button", { name: "Download" }));
+      await settle(5);
+      await purge();
+      gate.release(null);
+      await settle(20);
+      expect(click).not.toHaveBeenCalled();
+      expect(getToasts()).toEqual([]);
+      view.unmount();
+    }
   });
 
   it("the folder listing for prev/next stops at the page it was on", async () => {
     const gate = held<null>();
-    const api = ownerApi([NODES.svg]);
+    const a = accountA([NODES.svg]);
     let pages = 0;
     installFetch({
       api: async (call) => {
-        if (!call.url.pathname.endsWith("/children")) return api.handler(call);
+        if (a.gone.now || !call.url.pathname.endsWith("/children")) return a.handler(call);
         pages += 1;
         await gate.promise;
         return json({ items: [], nextCursor: "more" });
@@ -196,9 +309,140 @@ describe("a purge of the account while the preview has work under way", () => {
     renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} onNavigate={noop} source="owner" />);
     await screen.findByText("sample.svg");
     await waitFor(() => expect(pages).toBe(1));
+    a.gone.now = true;
     await purge();
     gate.release(null);
     await settle(30);
+    // Page one answered after the purge: page two is never asked for.
     expect(pages).toBe(1);
   });
+});
+
+describe("an element's own handlers after a purge (a renderer that is still mounted)", () => {
+  it("an image that finishes loading after the purge is not shown", async () => {
+    const api = ownerApi([nodeOf({ thumb: false })]);
+    installFetch({ api: api.handler });
+    const view = renderPreview(
+      <ImagePreview source="owner" item={loadedOf(nodeOf({ thumb: false }))} variant="inline" />,
+    );
+    await settle();
+    const img = view.container.querySelector("img")!;
+    await purge();
+    fireEvent.load(img);
+    expect(view.container.querySelector("[data-preview-blurup]")).not.toBeNull();
+    expect((screen.getByRole("button", { name: "Fit" }) as HTMLButtonElement).disabled).toBe(true);
+    // Nor does its failing mint anything.
+    fireEvent.error(img);
+    await settle();
+    expect(api.minted.length).toBe(1);
+  });
+
+  it("a film's errors after the purge: no re-mint, and no HEAD to the files host with the old account's URL", async () => {
+    const api = ownerApi([NODES.mp4]);
+    const network = installFetch({ api: api.handler });
+    const view = renderPreview(<MediaPreview source="owner" item={loadedOf(NODES.mp4)} kind="video" />);
+    await settle();
+    const video = view.container.querySelector("video")!;
+    await purge();
+    for (let round = 0; round < 3; round += 1) {
+      Object.defineProperty(video, "error", { configurable: true, value: { code: 2 } });
+      fireEvent.error(video);
+      await settle();
+    }
+    expect(network.files()).toEqual([]);
+    expect(api.minted.length).toBe(1);
+  });
+
+  it("the probe is aborted when the preview closes", async () => {
+    const api = ownerApi([NODES.mp4]);
+    const network = installFetch({ api: api.handler, files: () => new Promise<Response>(() => {}) });
+    const view = renderPreview(<MediaPreview source="owner" item={loadedOf(NODES.mp4)} kind="video" />);
+    await settle();
+    const video = view.container.querySelector("video")!;
+    for (let round = 0; round < 2; round += 1) {
+      Object.defineProperty(video, "error", { configurable: true, value: { code: 4 } });
+      fireEvent.error(video);
+      await settle();
+    }
+    expect(network.files().map((call) => call.method)).toEqual(["HEAD"]);
+    const signal = network.files()[0]!.signal!;
+    expect(signal.aborted).toBe(false);
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it('after "can\'t play" nothing is minted any more behind the card', async () => {
+    vi.useFakeTimers();
+    const api = ownerApi([NODES.mp4]);
+    installFetch({ api: api.handler, files: () => new Response(null, { status: 200 }) });
+    const view = renderPreview(<MediaPreview source="owner" item={loadedOf(NODES.mp4)} kind="video" />);
+    await advance(0);
+    const video = view.container.querySelector("video")!;
+    for (let round = 0; round < 2; round += 1) {
+      Object.defineProperty(video, "error", { configurable: true, value: { code: 4 } });
+      fireEvent.error(video);
+      await advance(0);
+    }
+    expect(screen.getByText("Your browser can't play this — download")).toBeTruthy();
+    expect(api.minted.length).toBe(2);
+    await advance(10 * 900_000);
+    expect(api.minted.length).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("in the real frame: the session re-read names another account, with no navigation", () => {
+  const children: RouteObject[] = [
+    { index: true, element: <div data-testid="root-page">root</div>, handle: { title: "Files" } },
+    ...previewRoutes,
+  ];
+  const background = children.filter((route) => !(route.handle as { overlay?: boolean }).overlay);
+  const routes: RouteObject[] = [{ path: "/", element: <Frame backgroundRoutes={background} />, children }];
+  const B = "b".repeat(32);
+
+  it.each([
+    ["a text file on screen", NODES.ts, "const secret = 1;"],
+    ["a film", NODES.mp4, null],
+    ["a file with no preview", NODES.svg, null],
+  ] as const)(
+    "%s: afterwards nothing of account A is on screen and nothing is left waiting",
+    async (_name, node, text) => {
+      await preloadRenderers();
+      let who = sessionOf();
+      const api = ownerApi([node]);
+      const network = installFetch({
+        api: (call) => {
+          if (call.url.pathname === "/api/auth/get-session") return json(who);
+          if (call.url.pathname === "/api/account/deletion-status") return json({ scheduledFor: null });
+          // B has no such file.
+          if (who.user.id === B && call.url.pathname.startsWith("/api/nodes"))
+            return envelope("not_found", 404);
+          return api.handler(call);
+        },
+        files: () => new Response(text ?? ""),
+      });
+      seedSession(sessionOf());
+      seedConfig();
+      const { router } = renderRoutes(routes, [`/preview/${node.id}`]);
+      await screen.findByText(node.name);
+      if (text) await waitFor(() => expect(document.body.textContent).toContain(text));
+      const before = network.files().length;
+
+      // Another tab signed A out and B in; this tab's session is read again (what a window focus does).
+      who = sessionOf({ id: B, name: "Bea Other", email: "bea@example.com" });
+      await act(async () => void (await refreshSession()));
+      await settle(30);
+
+      expect(router.state.location.pathname).toBe(`/preview/${node.id}`);
+      expect(screen.queryByText(node.name)).toBeNull();
+      if (text) expect(document.body.textContent).not.toContain(text);
+      expect(document.querySelector("video, audio, img[alt]:not([alt=''])")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+      // Not a dead skeleton: the dialog says what B gets for this address.
+      await waitFor(() => expect(state()).toBe("error"));
+      expect(screen.getByRole("heading", { name: "This file isn't here" })).toBeTruthy();
+      // Nothing more went to the files host with A's URL.
+      expect(network.files().length).toBe(before);
+    },
+  );
 });

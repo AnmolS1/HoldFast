@@ -1,6 +1,6 @@
 // The file a preview is about, from either source, re-read every 5 s while its scan is pending.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { accountEpoch, sameAccount } from "../../lib/query";
+import { openScope } from "./scope";
 import { listSiblingIds, loadItem, type LoadedItem, type PreviewSource } from "./source";
 import { failureOf, type PreviewFailure } from "./usePreviewUrl";
 
@@ -27,32 +27,29 @@ export function useItem(source: PreviewSource, nodeId: string): { state: ItemSta
   });
 
   useEffect(() => {
-    const abort = new AbortController();
+    // Ends with the view and with the account: the poll then asks nothing more, a read on its
+    // way is aborted and its answer dropped.
+    const scope = openScope();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    // After a purge of the account (sign-out, another identity) the poll asks nothing more and
-    // an answer still on its way is dropped.
-    const account = accountEpoch();
     const read = () => {
-      if (!sameAccount(account)) return;
-      loadItem(latestSource.current, nodeId, abort.signal).then(
+      if (!scope.alive()) return;
+      loadItem(latestSource.current, nodeId, scope.signal).then(
         (item) => {
-          if (abort.signal.aborted || !sameAccount(account)) return;
+          if (!scope.alive()) return;
           setHeld({ key, state: { status: "ready", item } });
           // The preview opens by itself once the status leaves `pending`.
           if (item.scanStatus === "pending") timer = setTimeout(read, SCAN_POLL_MS);
         },
         (error: unknown) => {
-          if (abort.signal.aborted || !sameAccount(account)) return;
+          if (!scope.alive()) return;
           setHeld({ key, state: { status: "error", failure: failureOf(error) } });
         },
       );
     };
     // A mount that is undone at once (development's double mount) asks for nothing.
-    queueMicrotask(() => {
-      if (!abort.signal.aborted) read();
-    });
+    queueMicrotask(read);
     return () => {
-      abort.abort();
+      scope.close();
       clearTimeout(timer);
     };
   }, [nodeId, key]);
@@ -85,22 +82,20 @@ export function useSiblingIds(
 
   useEffect(() => {
     if (wanted === null || wanted === have) return;
-    const abort = new AbortController();
-    const account = accountEpoch();
-    const current = () => !abort.signal.aborted && sameAccount(account);
+    const scope = openScope();
     queueMicrotask(() => {
-      if (!current()) return;
-      listSiblingIds(parentId, abort.signal).then(
+      if (!scope.alive()) return;
+      listSiblingIds(parentId, scope.signal).then(
         (ids) => {
-          if (current()) setListed({ parentKey: wanted, ids });
+          if (scope.alive()) setListed({ parentKey: wanted, ids });
         },
         () => {
           // No list: the preview still works, without prev/next.
-          if (current()) setListed({ parentKey: wanted, ids: [] });
+          if (scope.alive()) setListed({ parentKey: wanted, ids: [] });
         },
       );
     });
-    return () => abort.abort();
+    return () => scope.close();
   }, [wanted, have, parentId]);
 
   if (given !== undefined) return given;

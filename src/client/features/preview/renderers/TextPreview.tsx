@@ -6,15 +6,15 @@ import Checkbox from "@mui/material/Checkbox";
 import FormControlLabel from "@mui/material/FormControlLabel";
 import Typography from "@mui/material/Typography";
 import { useEffect, useMemo, useState } from "react";
-import { accountEpoch, sameAccount } from "../../../lib/query";
 import { fontMono, hf } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
+import { openScope } from "../scope";
 import { t } from "../strings";
 import { fetchLimitFor } from "../renderer-map";
 import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import type { Line } from "./highlight";
 import { NoPreview } from "./NoPreview";
-import { canHighlight, decodeText, fewEnoughPieces, TEXT_MAX_LINES } from "./text";
+import { canHighlight, decodeText, TEXT_MAX_LINES } from "./text";
 import type { RendererProps } from "./types";
 
 // One weight and two neutrals: the design has no colour that means "keyword".
@@ -26,11 +26,13 @@ const TOKEN_STYLES = {
   '& [data-token="function"]': { fontWeight: 500 },
 } as const;
 
-export default function TextPreview({ source, item }: RendererProps) {
+export default function TextPreview({ source, item, onRetry }: RendererProps) {
   const preview = usePreviewUrl(source, item.id, "inline");
   const [text, setText] = useState<string | null>(null);
   const [highlighted, setHighlighted] = useState<Line[] | null>(null);
   const [wrap, setWrap] = useState(false);
+  // Where the colouring is: not asked for, under way, finished, or given up (the text stays plain).
+  const [phase, setPhase] = useState<"none" | "running" | "done" | "plain">("none");
   const [tooLarge, setTooLarge] = useState(false);
 
   // The bytes are fetched once, starting from the first URL; a refused one is re-minted inside.
@@ -39,22 +41,19 @@ export default function TextPreview({ source, item }: RendererProps) {
   const { reportFailure, fail, settle } = preview;
   useEffect(() => {
     if (firstUrl === null) return;
-    const abort = new AbortController();
-    // Bytes of the account that asked: after a purge they are dropped, not shown.
-    const account = accountEpoch();
+    // Ends with the view and with the account: the transfer is aborted, bytes already here dropped.
+    const scope = openScope();
     void (async () => {
       // A mount that is undone at once (development's double mount) fetches nothing.
       await Promise.resolve();
-      if (abort.signal.aborted) return;
-      const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
+      if (!scope.alive()) return;
+      const response = await fetchPreview(firstUrl, { reportFailure, fail }, scope.signal);
       if (!response) return;
       try {
         // The server refuses a URL for a larger file; the count here is of what really arrives.
         const bytes = await readLimited(response, fetchLimitFor("text"));
-        if (abort.signal.aborted) return;
-        if (!sameAccount(account)) return abort.abort();
+        if (!scope.alive()) return;
         if (bytes === TOO_LARGE) {
-          abort.abort();
           settle();
           return setTooLarge(true);
         }
@@ -64,10 +63,10 @@ export default function TextPreview({ source, item }: RendererProps) {
         settle();
         setText(decoded);
       } catch {
-        if (!abort.signal.aborted) fail();
+        if (scope.alive()) fail();
       }
     })();
-    return () => abort.abort();
+    return () => scope.close();
   }, [firstUrl, reportFailure, fail, settle]);
 
   const all = useMemo(() => (text === null ? [] : text.split(/\r\n|\r|\n/)), [text]);
@@ -80,27 +79,28 @@ export default function TextPreview({ source, item }: RendererProps) {
     // Decided BEFORE any highlighting starts, on what the work grows with: characters, lines and
     // the longest line. Above any of them the text stays as it is — plain text nodes.
     if (text === null || !canHighlight(all, text.length)) return;
-    const abort = new AbortController();
-    const account = accountEpoch();
+    const scope = openScope();
     // The highlighter is its own chunk and is asked for only when there is something to colour.
     void import("./highlight")
       .then(async ({ highlight, languageFor }) => {
         const lang = languageFor(item.ext);
-        if (!lang || abort.signal.aborted) return;
-        // In slices, each of which checks the signal: closing the preview or moving on stops it.
-        const lines = await highlight(text, lang, abort.signal);
-        if (lines === null || abort.signal.aborted || !sameAccount(account)) return;
-        // A grammar that cuts the text into very many pieces would be as many elements.
-        if (!fewEnoughPieces(lines)) return;
-        setHighlighted(lines.slice(0, TEXT_MAX_LINES));
+        if (!lang || !scope.alive()) return;
+        setPhase("running");
+        // A few milliseconds of work at a time, the signal looked at in between: closing the
+        // preview, moving on or a purge of the account stops it at the next yield.
+        const lines = await highlight(text, lang, { signal: scope.signal });
+        // null: aborted, out of time, or too many pieces to draw — the plain text stays.
+        if (!scope.alive()) return;
+        setPhase(lines === null ? "plain" : "done");
+        if (lines !== null) setHighlighted(lines.slice(0, TEXT_MAX_LINES));
       })
       // No grammar, no colours: the plain text is already showing.
       .catch(() => {});
-    return () => abort.abort();
+    return () => scope.close();
   }, [text, all, item.ext]);
 
   if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} onRetry={onRetry} />;
   if (text === null) return <PreviewSkeleton />;
 
   const lines = highlighted ?? plain;
@@ -108,6 +108,7 @@ export default function TextPreview({ source, item }: RendererProps) {
     <Box
       data-preview-renderer="text"
       data-highlighted={highlighted ? "true" : "false"}
+      data-highlight={phase}
       sx={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}
     >
       <Box

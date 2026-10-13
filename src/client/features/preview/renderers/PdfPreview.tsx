@@ -9,14 +9,20 @@ import Typography from "@mui/material/Typography";
 import { ChevronDown, ChevronUp, Minus, Plus } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { accountEpoch, sameAccount } from "../../../lib/query";
 import { hf, layout } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
+import { openScope, useViewScope } from "../scope";
 import { t } from "../strings";
 import { fetchLimitFor } from "../renderer-map";
 import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import { NoPreview } from "./NoPreview";
-import { createRenderBudget, PDF_MAX_PAGES, pixelRatioFor, type RenderBudget } from "./pdf-limits";
+import {
+  createRenderBudget,
+  PDF_MAX_PAGES,
+  pixelRatioFor,
+  type RenderBudget,
+  type RenderSlot,
+} from "./pdf-limits";
 import { safeExternalUrl } from "./pdf-links";
 import {
   openPdf,
@@ -107,6 +113,10 @@ function PageView(props: PageViewProps) {
   const [near, setNear] = useState(() => typeof IntersectionObserver === "undefined");
   const [page, setPage] = useState<PdfPage | null>(null);
   const [links, setLinks] = useState<PdfLink[]>([]);
+  // Bumped when the budget takes this page's canvas back: the render effect then asks again.
+  const [turn, setTurn] = useState(0);
+  const visible = useRef(false);
+  const slot = useRef<RenderSlot | null>(null);
 
   useEffect(() => {
     const element = box.current;
@@ -122,13 +132,29 @@ function PageView(props: PageViewProps) {
     return () => observer.disconnect();
   }, []);
 
+  // On screen (not merely near): the budget serves such a page first.
+  useEffect(() => {
+    const element = box.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        visible.current = entry.isIntersecting;
+        slot.current?.setVisible(entry.isIntersecting);
+      }
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   useEffect(() => {
     if (!near) return;
-    let cancelled = false;
+    // Ends when the page leaves the window, the preview closes or moves on, or the account is
+    // purged: a page that arrives after that is released, not shown.
+    const scope = openScope();
     let loaded: PdfPage | null = null;
     doc.page(number).then(
       (next) => {
-        if (cancelled) return next.release();
+        if (!scope.alive()) return next.release();
         loaded = next;
         setPage(next);
       },
@@ -137,7 +163,7 @@ function PageView(props: PageViewProps) {
       },
     );
     return () => {
-      cancelled = true;
+      scope.close();
       loaded?.release();
       setPage(null);
       setLinks([]);
@@ -148,35 +174,51 @@ function PageView(props: PageViewProps) {
     const surface = canvas.current;
     const layer = textLayer.current;
     if (!page || !surface || !layer) return;
-    let cancelled = false;
+    const scope = openScope();
     let render: PdfRender | null = null;
     const ratio = pixelRatioFor(page.width * scale, page.height * scale, window.devicePixelRatio);
     // Drawn when the document's budget allows: two pages at a time, and only while the canvases
     // already alive leave room for this one.
-    const slot = budget.request(
+    const own = budget.request(
       Math.floor(page.width * scale * ratio) * Math.floor(page.height * scale * ratio),
+      // Its finished canvas taken back for a page on screen: drop it and ask again.
+      {
+        visible: visible.current,
+        onEvict: () => {
+          render?.cancel();
+          // Its pixels go back at once — the page it made room for is about to take them.
+          surface.width = 0;
+          surface.height = 0;
+          if (scope.alive()) setTurn((turn) => turn + 1);
+        },
+      },
     );
-    void slot.granted.then((ok) => {
-      if (!ok || cancelled) return;
+    slot.current = own;
+    void own.granted.then((ok) => {
+      if (!ok || !scope.alive()) return;
       render = page.render(surface, layer, scale, ratio);
       // A cancelled render rejects; that is not a failure.
-      render.done.then(slot.finished, slot.finished);
+      render.done.then(own.finished, own.finished);
       page.links(scale).then(
         (found) => {
-          if (!cancelled) setLinks(found);
+          if (scope.alive()) setLinks(found);
         },
         () => {},
       );
     });
+    // A purge of the account ends the scope without an unmount: the drawing stops with it.
+    const stop = () => render?.cancel();
+    scope.signal.addEventListener("abort", stop, { once: true });
     return () => {
-      cancelled = true;
+      scope.close();
       render?.cancel();
       // The canvas gives its pixels back now, not when it is collected.
       surface.width = 0;
       surface.height = 0;
-      slot.release();
+      own.release();
+      if (slot.current === own) slot.current = null;
     };
-  }, [page, scale, budget]);
+  }, [page, scale, budget, turn]);
 
   const width = Math.floor((page?.width ?? baseWidth) * scale);
   const height = Math.floor((page?.height ?? baseHeight) * scale);
@@ -303,13 +345,15 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
     setCurrent(found);
   };
 
+  const view = useViewScope();
   const onInternalLink = useCallback(
     (dest: unknown) => {
       void doc.pageOfDest(dest).then((number) => {
-        if (number !== null) goTo(number);
+        // Answered after the view ended or the account went: nothing moves.
+        if (number !== null && view.alive()) goTo(number);
       });
     },
-    [doc, goTo],
+    [doc, goTo, view],
   );
 
   const commitTyped = () => {
@@ -466,7 +510,7 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
   );
 }
 
-export default function PdfPreview({ source, item }: RendererProps) {
+export default function PdfPreview({ source, item, onRetry }: RendererProps) {
   const preview = usePreviewUrl(source, item.id, "inline");
   const [opened, setOpened] = useState<Opened | null>(null);
   const [locked, setLocked] = useState(false);
@@ -478,50 +522,61 @@ export default function PdfPreview({ source, item }: RendererProps) {
   const { reportFailure, fail, settle } = preview;
   useEffect(() => {
     if (firstUrl === null) return;
-    const abort = new AbortController();
-    // Bytes of the account that asked: after a purge they are dropped, not opened.
-    const account = accountEpoch();
+    // ONE scope for everything from the first byte to the open document: it ends when the
+    // preview closes or moves on AND when the account is purged. Each step below asks it; its
+    // signal aborts the transfer and destroys pdf.js's loading task.
+    const scope = openScope();
     let doc: PdfDocument | null = null;
+    const drop = () => {
+      doc?.destroy();
+      doc = null;
+    };
+    // A purge ends the scope without an unmount: the open document goes with it, and so do its
+    // pages on screen.
+    scope.signal.addEventListener(
+      "abort",
+      () => {
+        drop();
+        setOpened(null);
+      },
+      { once: true },
+    );
     void (async () => {
       // A mount that is undone at once (development's double mount) fetches nothing.
       await Promise.resolve();
-      if (abort.signal.aborted) return;
-      const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
+      if (!scope.alive()) return;
+      const response = await fetchPreview(firstUrl, { reportFailure, fail }, scope.signal);
       if (!response) return;
       try {
         // Counted as it arrives: a file larger than the viewer takes is dropped mid-transfer.
         const bytes = await readLimited(response, fetchLimitFor("pdf"));
-        if (abort.signal.aborted) return;
-        if (!sameAccount(account)) return abort.abort();
+        if (!scope.alive()) return;
         if (bytes === TOO_LARGE) {
-          abort.abort();
           settle();
           return setTooLarge(true);
         }
         // pdf.js holds the whole file from here on: no URL is needed any more.
         settle();
-        doc = await openPdf(bytes);
-        const first = await doc.page(1);
+        const opening = await openPdf(bytes, scope.signal);
+        if (!scope.alive()) return opening.destroy();
+        doc = opening;
+        const first = await opening.page(1);
         const size = { width: first.width, height: first.height };
         first.release();
-        if (abort.signal.aborted) return doc.destroy();
-        setOpened({ doc, ...size });
+        if (!scope.alive()) return drop();
+        setOpened({ doc: opening, ...size });
       } catch (error) {
-        if (abort.signal.aborted) return;
+        if (!scope.alive()) return drop();
         if (error instanceof PdfLockedError) setLocked(true);
         else fail();
       }
     })();
-    return () => {
-      abort.abort();
-      doc?.destroy();
-      setOpened(null);
-    };
+    return () => scope.close();
   }, [firstUrl, reportFailure, fail, settle]);
 
   if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} />;
   if (locked) return <NoPreview item={item} message={t("pdf.locked")} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} onRetry={onRetry} />;
   if (!opened) return <PreviewSkeleton />;
   return <Pages opened={opened} name={item.name} />;
 }

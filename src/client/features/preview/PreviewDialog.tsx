@@ -14,7 +14,6 @@ import { FileBadge } from "../../components/FileBadge";
 import { ProgressUnderline } from "../../components/ProgressUnderline";
 import type { PreviewDialogProps } from "../../components/slots";
 import { toastApiError } from "../../lib/api";
-import { accountEpoch, sameAccount } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ReportLink } from "../report";
@@ -24,6 +23,7 @@ import { ErrorState, PreviewSkeleton } from "./parts";
 import { rendererFor } from "./renderer-map";
 import { NoPreview } from "./renderers/NoPreview";
 import type { RendererProps } from "./renderers/types";
+import { openScope, usePurgeCount } from "./scope";
 import { mintUrl, type LoadedItem, type PreviewSource } from "./source";
 import { t } from "./strings";
 import { useItem, useSiblingIds } from "./useItem";
@@ -51,17 +51,18 @@ function DownloadButton({ nodeId }: { nodeId: string }) {
   const [busy, setBusy] = useState(false);
   const onClick = async () => {
     setBusy(true);
-    // The account that pressed the button: an answer that arrives after it has gone (sign-out,
-    // another identity) starts no download and says nothing.
-    const account = accountEpoch();
+    // The view that pressed the button: an answer that arrives after it has gone — closed, or
+    // its account purged — starts no download and says nothing.
+    const scope = openScope();
     try {
       // The only `download`-kind mint in the preview: every renderer uses `inline`.
       const minted = await mintUrl("owner", nodeId, "download");
       // Only ever a files-host address over http(s): nothing else is opened.
-      if (sameAccount(account) && /^https?:\/\//i.test(minted.url)) startDownload(minted.url);
+      if (scope.alive() && /^https?:\/\//i.test(minted.url)) startDownload(minted.url);
     } catch (error) {
-      if (sameAccount(account)) toastApiError(error);
+      if (scope.alive()) toastApiError(error);
     } finally {
+      scope.close();
       setBusy(false);
     }
   };
@@ -106,7 +107,7 @@ function Scanning({ item }: { item: LoadedItem }) {
   );
 }
 
-function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) {
+function Content({ source, item, onRetry }: RendererProps) {
   // The one Download button is the header's; here it only decides what the sentence says.
   const canDownload = downloadAllowed(source, item);
   const status = item.scanStatus;
@@ -125,7 +126,7 @@ function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) 
     );
   }
   const choice = rendererFor(item);
-  const props: RendererProps = { source, item };
+  const props: RendererProps = { source, item, onRetry };
   switch (choice.kind) {
     case "image":
       return <ImagePreview {...props} variant="inline" />;
@@ -180,6 +181,9 @@ function Body(props: BodyProps) {
   // The share dialog is open for one file; moving to the next closes it.
   const [sharing, setSharing] = useState<string | null>(null);
   const shareOpen = sharing === nodeId;
+  // Bumped by a renderer's "Try again": the file's preview starts over as a NEW view. A person
+  // pressing a button is the bound — nothing re-arms itself.
+  const [view, setView] = useState(0);
 
   const index = ids.indexOf(nodeId);
   const previousId = onNavigate && index > 0 ? ids[index - 1] : undefined;
@@ -292,7 +296,12 @@ function Body(props: BodyProps) {
           >
             <Suspense fallback={<PreviewSkeleton />}>
               {/* A different file is a different preview: no state of the last one survives. */}
-              <Content key={item.id} source={source} item={item} />
+              <Content
+                key={`${item.id}|${view}`}
+                source={source}
+                item={item}
+                onRetry={() => setView((count) => count + 1)}
+              />
             </Suspense>
           </ErrorBoundary>
         ) : null}
@@ -310,6 +319,10 @@ export function PreviewDialogView(props: ViewProps) {
   const desktop = useIsDesktop();
   const titleId = useId();
   const keys = useRef<{ previous?: () => void; next?: () => void }>({});
+  // Changes when the account's state is purged: everything the dialog shows is thrown away and
+  // read again for whoever is signed in now (every renderer's cleanup runs: transfers abort, the
+  // pdf.js document is destroyed, the media element is stopped).
+  const purges = usePurgeCount();
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     // Keys of a dialog opened from inside this one (share, a confirm) are that dialog's.
@@ -345,6 +358,7 @@ export function PreviewDialogView(props: ViewProps) {
     >
       {nodeId !== null ? (
         <Body
+          key={purges}
           nodeId={nodeId}
           source={source}
           titleId={titleId}

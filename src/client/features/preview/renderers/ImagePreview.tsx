@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ThumbImage } from "../../../components/ThumbImage";
 import { hf, layout } from "../../../theme/tokens";
 import { ErrorState } from "../parts";
+import { useViewScope } from "../scope";
 import { mintUrl } from "../source";
 import { t } from "../strings";
 import { usePreviewUrl } from "../usePreviewUrl";
@@ -70,7 +71,7 @@ function BlurUp({ source, item }: Pick<RendererProps, "source" | "item">) {
 }
 
 export default function ImagePreview(props: RendererProps & { variant: "inline" | "thumb" }) {
-  const { source, item, variant } = props;
+  const { source, item, variant, onRetry } = props;
   const preview = usePreviewUrl(
     source,
     item.id,
@@ -81,6 +82,7 @@ export default function ImagePreview(props: RendererProps & { variant: "inline" 
   const [naturalWidth, setNaturalWidth] = useState(0);
   // null = fit the window; a number = displayed pixels per image pixel.
   const [zoom, setZoom] = useState<number | null>(null);
+  const view = useViewScope();
   const viewport = useRef<HTMLDivElement | null>(null);
   const image = useRef<HTMLImageElement | null>(null);
 
@@ -135,7 +137,7 @@ export default function ImagePreview(props: RendererProps & { variant: "inline" 
     if (preview.failure.host || (variant === "thumb" && preview.failure.notFound)) {
       return <NoPreview item={item} message={t("none.imageUnavailable")} />;
     }
-    return <ErrorState failure={preview.failure} />;
+    return <ErrorState failure={preview.failure} onRetry={onRetry} />;
   }
 
   const width = zoom !== null && naturalWidth > 0 ? naturalWidth * zoom : undefined;
@@ -168,12 +170,15 @@ export default function ImagePreview(props: RendererProps & { variant: "inline" 
             alt={item.name}
             draggable={false}
             onLoad={(event) => {
+              // Loaded after the view ended or the account went: not shown.
+              if (!view.alive()) return;
               setNaturalWidth(event.currentTarget.naturalWidth);
               setShown(true);
               // Decoded: nothing needs swapping any more.
               preview.settle();
             }}
             onError={() => {
+              if (!view.alive()) return;
               setShown(false);
               void preview.reportFailure();
             }}

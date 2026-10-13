@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TOKEN_TTL } from "../../../shared/constants";
 import { ApiError } from "../../lib/api";
-import { accountEpoch, sameAccount } from "../../lib/query";
+import { openScope } from "./scope";
 import { mintUrl, type MintedUrl, type PreviewSource } from "./source";
 
 /** Why a preview could not be shown. `requestId` only when the app API answered. */
@@ -81,6 +81,19 @@ export function refreshDelayMs(minted: MintedUrl, kind: "inline" | "thumb", now:
   return Math.max(REFRESH_MIN_MS, lifetime * REFRESH_AT);
 }
 
+/**
+ * How long to wait before a failed proactive refresh is tried again: the next rung of the ladder,
+ * or what the API asked for (`Retry-After` on a 429) when that is longer. null = give up — the
+ * ladder is used up, or the wait would end after the URL in use has stopped working anyway.
+ */
+export function refreshRetryMs(attempt: number, error: unknown, untilExpiryMs: number): number | null {
+  const rung = REFRESH_RETRY_MS[attempt];
+  if (rung === undefined) return null;
+  const asked = error instanceof ApiError && error.retryAfter !== undefined ? error.retryAfter * 1000 : 0;
+  const wait = Math.max(rung, asked);
+  return wait < untilExpiryMs ? wait : null;
+}
+
 export function usePreviewUrl(
   source: PreviewSource,
   nodeId: string,
@@ -99,15 +112,14 @@ export function usePreviewUrl(
   });
 
   useEffect(() => {
-    let cancelled = false;
+    // Every continuation below asks this scope first: it ends when the view ends AND when the
+    // account is purged (a URL is a bearer token of the account that minted it).
+    const scope = openScope();
     let dead = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    // The account this view belongs to. After a purge (sign-out, another identity) nothing here
-    // asks, publishes or re-arms a timer: a URL is a bearer token of the account that minted it.
-    const account = accountEpoch();
     const live = () => {
-      if (cancelled || dead) return false;
-      if (sameAccount(account)) return true;
+      if (dead) return false;
+      if (scope.alive()) return true;
       dead = true;
       clearTimeout(timer);
       return false;
@@ -119,10 +131,11 @@ export function usePreviewUrl(
     let inUse: string | null = null;
     // Only the latest mint may publish: an older one answering late is dropped.
     let latest = 0;
+    let expires = Number.POSITIVE_INFINITY;
 
     const publish = (url: string | null, failure: PreviewFailure | null) => {
       inUse = url;
-      if (!cancelled) setState({ key, url, failure });
+      if (scope.alive()) setState({ key, url, failure });
     };
     const stop = (failure: PreviewFailure) => {
       dead = true;
@@ -131,7 +144,10 @@ export function usePreviewUrl(
     };
     const adopt = (minted: MintedUrl): string => {
       publish(minted.url, null);
-      if (!settled) timer = setTimeout(() => refresh(0), refreshDelayMs(minted, kind, Date.now()));
+      const delay = refreshDelayMs(minted, kind, Date.now());
+      // When this URL stops working, as far as this device can tell (the delay is 80 % of it).
+      expires = Date.now() + delay / REFRESH_AT;
+      if (!settled) timer = setTimeout(() => refresh(0), delay);
       return minted.url;
     };
     /** The first URL, and the one after a failure: a refusal is final. */
@@ -163,10 +179,10 @@ export function usePreviewUrl(
         (minted) => {
           if (live() && !settled && mine === latest) adopt(minted);
         },
-        () => {
+        (error: unknown) => {
           if (!live() || settled || mine !== latest) return;
-          const wait = REFRESH_RETRY_MS[attempt];
-          if (wait !== undefined) timer = setTimeout(() => refresh(attempt + 1), wait);
+          const wait = refreshRetryMs(attempt, error, expires - Date.now());
+          if (wait !== null) timer = setTimeout(() => refresh(attempt + 1), wait);
         },
       );
     };
@@ -196,7 +212,7 @@ export function usePreviewUrl(
       if (live()) void mint(null);
     });
     return () => {
-      cancelled = true;
+      scope.close();
       clearTimeout(timer);
       if (controller.current === own) controller.current = null;
     };
