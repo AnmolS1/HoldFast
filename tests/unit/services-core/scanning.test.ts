@@ -3,7 +3,7 @@
 import { env } from "cloudflare:workers";
 import { and, eq, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
-import { todayTotals } from "../../../src/worker/db/queries/ledger";
+import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
 import {
   csamReportsToAnnounce,
   lockSuspectedCsam as lockRows,
@@ -17,9 +17,12 @@ import {
   uploadIps,
   user,
 } from "../../../src/worker/db/schema";
+import { testOutbound } from "../../../src/worker/auth/test-outbound";
+import { CRITICAL_RETRY_WAITS_MS } from "../../../src/worker/services/email";
 import { AppError } from "../../../src/worker/services/errors";
 import {
   csamAlertMarker,
+  csamLockMarker,
   enqueueRescan,
   enqueueScan,
   ensureCsamAlerted,
@@ -560,13 +563,21 @@ describe("lockSuspectedCsam", () => {
     // No strike.
     expect(await auditRows({ action: "strike.added", targetId: owner.id })).toEqual([]);
 
+    // The alert has a row of its own: who was told is a count, never an address.
+    const sentRows = await auditRows({ action: "scan.csam_alert_sent", targetId: file.id });
+    expect(sentRows).toMatchObject([{ actorType: "system", meta: { reportId, via: "lock", recipients: 1 } }]);
+    expect(JSON.stringify(sentRows[0]!.meta)).not.toContain("@");
+
     // Repeated (the upload route and the consumer may both see the hit): the same report, no
-    // second alert, no second audit row.
+    // second alert, no second audit row of either kind.
     const again = serviceDeps();
     expect(await lockSuspectedCsam(again.deps, file.id, { source: "photodna" })).toEqual({ reportId });
     await again.settle();
     expect(mailTo(ADMIN_EMAIL).filter((mail) => String(mail.text).includes(reportId))).toHaveLength(1);
-    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toHaveLength(1);
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toMatchObject([
+      { meta: { source: "system", reportId } },
+    ]);
+    expect(await auditRows({ action: "scan.csam_alert_sent", targetId: file.id })).toHaveLength(1);
     expect(await testDb().select().from(reports).where(eq(reports.nodeId, file.id))).toHaveLength(1);
   });
 
@@ -580,6 +591,66 @@ describe("lockSuspectedCsam", () => {
   const alertsFor = (reportId: string) =>
     mailTo(ADMIN_EMAIL).filter((mail) => String(mail.text).includes(reportId));
   const markerOf = (reportId: string) => todayTotals(testDb(), "notice", csamAlertMarker(reportId));
+  const lockRowsOf = (nodeId: string) => auditRows({ action: "scan.suspected_csam", targetId: nodeId });
+  const sentRowsOf = (nodeId: string) => auditRows({ action: "scan.csam_alert_sent", targetId: nodeId });
+  const viaOf = async (nodeId: string) =>
+    (await sentRowsOf(nodeId)).map((row) => (row.meta as { via: string }).via).sort();
+  /** "Tomorrow": today's alert marker of a report becomes yesterday's. */
+  const ageAlertMarker = (reportId: string) =>
+    testDb()
+      .update(downloadLedger)
+      .set({ day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10) })
+      .where(
+        and(
+          eq(downloadLedger.subjectType, "notice"),
+          eq(downloadLedger.subjectId, csamAlertMarker(reportId)),
+        ),
+      );
+  /**
+   * Deps whose mail goes to a stand-in for the mail API that accepts a message only for the
+   * addresses in `reachable` (made-up addresses) and answers 500 for everyone else. `finish`
+   * runs the deferred retries out under a fake timer.
+   */
+  function mailApiDeps(operators: string[], reachable: string[]) {
+    const outbound = testOutbound()!;
+    const accepted: string[] = [];
+    outbound.answer("api.resend.com", async (request) => {
+      const { to } = (await request.json()) as { to: string | string[] };
+      const address = String(Array.isArray(to) ? to[0] : to);
+      if (!reachable.includes(address))
+        return Response.json(
+          { name: "internal_server_error", message: "down", statusCode: 500 },
+          { status: 500 },
+        );
+      accepted.push(address);
+      return Response.json({ id: "sent" });
+    });
+    const points: { blobs: string[] }[] = [];
+    const made = serviceDeps({
+      ADMIN_EMAILS: operators.join(","),
+      EMAIL_TRANSPORT: "resend",
+      // A made-up key: the stand-in above answers, nothing leaves the test.
+      RESEND_API_KEY: "re_test_key",
+      METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) },
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    return {
+      ...made,
+      accepted,
+      errors: () =>
+        points.filter((point) => point.blobs[0] === "error").map((point) => point.blobs.slice(2, 4)),
+      async finish() {
+        try {
+          await vi.advanceTimersByTimeAsync(CRITICAL_RETRY_WAITS_MS[0] + CRITICAL_RETRY_WAITS_MS[1] + 100);
+          vi.useRealTimers();
+          await made.settle();
+        } finally {
+          vi.useRealTimers();
+          outbound.answer("api.resend.com", null);
+        }
+      },
+    };
+  }
 
   it("the database half committed and the invocation died: the redelivery alerts", async () => {
     const { file, reportId } = await lockedButSilent();
@@ -593,36 +664,107 @@ describe("lockSuspectedCsam", () => {
     await settle();
     expect(alertsFor(reportId)).toHaveLength(1);
     expect(alertsFor(reportId)[0]!.template).toBe("operatorCritical");
-    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toMatchObject([
+    // The lock's own row is written by the redelivery too, with the caller's real source.
+    expect(await lockRowsOf(file.id)).toMatchObject([
       { actorType: "system", meta: { source: "photodna", reportId } },
     ]);
+    expect(await viaOf(file.id)).toEqual(["lock"]);
     expect(await markerOf(reportId)).toEqual({ bytes: 0, count: 1 });
+    expect(await todayTotals(testDb(), "notice", csamLockMarker(reportId))).toEqual({ bytes: 0, count: 1 });
+
+    // Delivered a third time the same day: still one of each.
+    const third = serviceDeps();
+    await lockSuspectedCsam(third.deps, file.id, { source: "system" });
+    await third.settle();
+    expect(alertsFor(reportId)).toHaveLength(1);
+    expect(await lockRowsOf(file.id)).toHaveLength(1);
+    expect(await sentRowsOf(file.id)).toHaveLength(1);
   });
 
-  it("two calls the same day are one mail; the next day the open report is announced again", async () => {
-    const { file, reportId } = await lockedButSilent();
+  it("two calls the same day are one mail; the next day the sweep announces the open report again — one lock row, two alert rows", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
     const first = serviceDeps();
-    expect(await ensureCsamAlerted(first.deps, reportId, { nodeId: file.id, source: "system" })).toBe(true);
-    expect(await ensureCsamAlerted(first.deps, reportId, { nodeId: file.id, source: "system" })).toBe(false);
+    const { reportId } = await lockSuspectedCsam(first.deps, file.id, { source: "admin" });
+    expect(await ensureCsamAlerted(first.deps, reportId, { via: "lock", nodeId: file.id })).toBe(false);
     expect(await lockSuspectedCsam(first.deps, file.id, { source: "system" })).toEqual({ reportId });
     await first.settle();
     expect(alertsFor(reportId)).toHaveLength(1);
-    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toHaveLength(1);
+    expect(await lockRowsOf(file.id)).toHaveLength(1);
+    expect(await viaOf(file.id)).toEqual(["lock"]);
 
-    // "Tomorrow": today's marker is yesterday's.
-    await testDb()
-      .update(downloadLedger)
-      .set({ day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10) })
-      .where(
-        and(
-          eq(downloadLedger.subjectType, "notice"),
-          eq(downloadLedger.subjectId, csamAlertMarker(reportId)),
-        ),
-      );
+    await ageAlertMarker(reportId);
     const next = serviceDeps();
-    expect(await ensureCsamAlerted(next.deps, reportId)).toBe(true);
+    await sweepCsamAlerts(next.deps, { limit: 1000 });
     await next.settle();
     expect(alertsFor(reportId)).toHaveLength(2);
+    // The re-announcement is not a second lock: the lock's row keeps its real source, alone.
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "admin", reportId } }]);
+    expect(await viaOf(file.id)).toEqual(["lock", "sweep"]);
+  });
+
+  it("a mail that is only being retried reached nobody: unclaimed, false — and the lock is on record all the same", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+    // Made-up operator addresses; none of them can be reached.
+    const operators = [1, 2, 3].map((n) => `op${n}-${rand(4)}@example.test`);
+    const down = mailApiDeps(operators, []);
+    let reportId: string;
+    try {
+      ({ reportId } = await lockSuspectedCsam(down.deps, file.id, { source: "photodna" }));
+      expect(await ensureCsamAlerted(down.deps, reportId, { via: "lock", nodeId: file.id })).toBe(false);
+    } finally {
+      await down.finish();
+    }
+    expect(down.accepted).toEqual([]);
+    expect(await markerOf(reportId), "unclaimed: the next call and the sweep try again").toEqual({
+      bytes: 0,
+      count: 0,
+    });
+    expect(down.errors().filter(([, reason]) => reason === "send_failed")).toEqual([
+      ["csam_alert", "send_failed"],
+      ["csam_alert", "send_failed"],
+    ]);
+    // The node is locked and the lock is recorded with its real source; no alert row exists.
+    expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "photodna", reportId } }]);
+    expect(await sentRowsOf(file.id)).toEqual([]);
+    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+  });
+
+  it("the marker is read and claimed on ONE day — the day this call computed, not the database's", async () => {
+    const { file, reportId } = await lockedButSilent();
+    const { deps, settle } = serviceDeps();
+    // The Worker's clock says a day the database's does not (as, for a moment, around 00:00 UTC).
+    vi.useFakeTimers({ toFake: ["Date"], now: new Date("2031-03-04T23:59:59.900Z") });
+    try {
+      expect(await ensureCsamAlerted(deps, reportId, { nodeId: file.id })).toBe(true);
+      // Read on the day it was claimed on: the second call finds the marker.
+      expect(await ensureCsamAlerted(deps, reportId, { nodeId: file.id })).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    await settle();
+    expect(alertsFor(reportId)).toHaveLength(1);
+    expect(await totalsOn(testDb(), "2031-03-04", "notice", csamAlertMarker(reportId))).toEqual({
+      bytes: 0,
+      count: 1,
+    });
+  });
+
+  it("one operator reached and two not: claimed, true, and the row counts the one", async () => {
+    const { file, reportId } = await lockedButSilent();
+    const operators = [1, 2, 3].map((n) => `op${n}-${rand(4)}@example.test`);
+    const partly = mailApiDeps(operators, [operators[1]!]);
+    try {
+      expect(await ensureCsamAlerted(partly.deps, reportId, { via: "lock", nodeId: file.id })).toBe(true);
+    } finally {
+      await partly.finish();
+    }
+    expect(partly.accepted).toEqual([operators[1]]);
+    expect(await markerOf(reportId)).toEqual({ bytes: 0, count: 1 });
+    expect(await sentRowsOf(file.id)).toMatchObject([{ meta: { reportId, via: "lock", recipients: 1 } }]);
+    expect(partly.errors().filter(([, reason]) => reason === "send_failed")).toEqual([]);
   });
 
   it("the sweep finds a report nobody was told about, tells them once, and leaves handled reports alone", async () => {
@@ -641,8 +783,10 @@ describe("lockSuspectedCsam", () => {
     expect(swept.checked).toBeGreaterThanOrEqual(1);
     expect(swept.alerted).toBeGreaterThanOrEqual(1);
     expect(alertsFor(silent.reportId)).toHaveLength(1);
-    expect(await auditRows({ action: "scan.suspected_csam", targetId: silent.file.id })).toMatchObject([
-      { meta: { source: "sweep", reportId: silent.reportId } },
+    // The sweep records an ALERT, never a lock: it does not know who locked.
+    expect(await lockRowsOf(silent.file.id)).toEqual([]);
+    expect(await sentRowsOf(silent.file.id)).toMatchObject([
+      { meta: { reportId: silent.reportId, via: "sweep", recipients: 1 } },
     ]);
     expect(alertsFor(handled.reportId)).toHaveLength(0);
     expect(alertsFor(closed.reportId)).toHaveLength(0);
@@ -681,7 +825,10 @@ describe("lockSuspectedCsam", () => {
       ["csam_alert", "no_recipient"],
     ]);
     expect(await markerOf(reportId), "unclaimed: the sweep keeps trying").toEqual({ bytes: 0, count: 0 });
-    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toEqual([]);
+    // Locked, and the lock is on record with its real source — with nobody to tell.
+    expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
+    expect(await sentRowsOf(file.id)).toEqual([]);
     expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
 
     // Once there is someone to tell, the very next call tells them.
@@ -689,6 +836,8 @@ describe("lockSuspectedCsam", () => {
     expect(await ensureCsamAlerted(fixed.deps, reportId, { nodeId: file.id })).toBe(true);
     await fixed.settle();
     expect(alertsFor(reportId)).toHaveLength(1);
+    expect(await viaOf(file.id), "via defaults to the sweep").toEqual(["sweep"]);
+    expect(await lockRowsOf(file.id)).toHaveLength(1);
   });
 
   it("ensureCsamAlerted for something that is not a report id does nothing", async () => {

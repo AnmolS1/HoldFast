@@ -23,7 +23,7 @@
 // N seconds: wait for the row.
 
 import { UUID } from "../../shared/ids";
-import { addUsageIfUnder, todayTotals, utcDay } from "../db/queries/ledger";
+import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import { csamReportsToAnnounce, lockSuspectedCsam as lockRows } from "../db/queries/moderation";
 import { findByR2Key, getNode, resetToPending } from "../db/queries/nodes";
 import type { ScanReason } from "../db/schema";
@@ -285,18 +285,29 @@ export async function enqueueRescan(
 
 /** Today's "the operators were told" marker of a report: ledger subject `notice`, this id. */
 export const csamAlertMarker = (reportId: string) => `csam_alert:${reportId}`;
+/** Today's "the lock was recorded" marker of a report: ledger subject `notice`, this id. */
+export const csamLockMarker = (reportId: string) => `csam_locked:${reportId}`;
 export const CSAM_SWEEP_DEFAULT_LIMIT = 50;
 /** Logged, at error level and with no address in it, when there is nobody to alert. */
 export const NO_OPERATOR_MESSAGE = "csam alert: no operator address is configured — nobody was told";
 
+const ONCE = { amount: { bytes: 0, count: 1 }, limit: { count: 1 } } as const;
+
 /**
  * Makes sure the operators have been told about a suspected-CSAM report TODAY: at least once per
- * UTC day while it matters. True when it alerted; false when today's marker was already claimed
- * (nothing is done then), when there is nobody to tell, or when no mail could be handed over.
+ * UTC day while it matters. True when at least one operator was reached now; false when today's
+ * marker was already claimed (nothing is done then), when there is nobody to tell, or when no
+ * mail was actually handed over.
  *
  * SEND, THEN CLAIM — on purpose. The critical operator mail (the report id and nothing else) is
- * sent FIRST, awaited; only then is the day's marker claimed and the audit row and the metric
- * written. A crash between the two repeats the alert on the next call; it can never lose it.
+ * sent FIRST, awaited; the day's marker is claimed only when AT LEAST ONE send answered `sent` —
+ * a mail that is merely being retried reached nobody yet. A crash between the two repeats the
+ * alert on the next call; it can never lose it. The marker is read and claimed on ONE day, the
+ * one this call computed.
+ *
+ * Each claim writes the audit action `scan.csam_alert_sent` (`{ reportId, via, recipients }` —
+ * a count, never an address). The LOCK has its own row, written by `lockSuspectedCsam`; this
+ * function never writes it.
  *
  * An EMPTY operator list is not silent: an error-level log line with a fixed text, a metric, and
  * the marker is NOT claimed — so the next call and the sweep keep trying.
@@ -307,11 +318,12 @@ export const NO_OPERATOR_MESSAGE = "csam alert: no operator address is configure
 export async function ensureCsamAlerted(
   deps: ServiceDeps,
   reportId: string,
-  context: { nodeId?: string | null; source?: string } = {},
+  context: { via?: "lock" | "sweep"; nodeId?: string | null } = {},
 ): Promise<boolean> {
   if (typeof reportId !== "string" || !UUID.test(reportId)) return false;
   const marker = csamAlertMarker(reportId);
-  if ((await todayTotals(deps.db, "notice", marker)).count > 0) return false;
+  const day = utcDay();
+  if ((await totalsOn(deps.db, day, "notice", marker)).count > 0) return false;
 
   // The operators' addresses come from the one reader of that list (the sign-up policy's).
   const operators = [...adminListOf(deps.env).addresses];
@@ -325,30 +337,21 @@ export async function ensureCsamAlerted(
       sendOperatorCritical(deps, { to, event: "csam_lock", id: reportId }).catch(() => "failed" as const),
     ),
   );
-  if (outcomes.every((outcome) => outcome === "failed")) {
+  const reached = outcomes.filter((outcome) => outcome === "sent").length;
+  if (reached === 0) {
     // Nobody was reached: the marker stays unclaimed and the next call tries again.
     writeMetric(deps.env, "error", { kind: "csam_alert", reason: "send_failed" });
     return false;
   }
 
   // Claimed only now. Lost to a concurrent call: both sent — a duplicate, never a gap.
-  const claimed = await addUsageIfUnder(
-    deps.db,
-    utcDay(),
-    "notice",
-    marker,
-    { bytes: 0, count: 1 },
-    { count: 1 },
-  );
-  if (claimed) {
-    const source = context.source ?? "sweep";
+  if (await addUsageIfUnder(deps.db, day, "notice", marker, ONCE.amount, ONCE.limit)) {
     audit(
       deps,
-      "scan.suspected_csam",
+      "scan.csam_alert_sent",
       context.nodeId ? { type: "node", id: context.nodeId } : { type: "report", id: reportId },
-      { source, reportId },
+      { reportId, via: context.via ?? "sweep", recipients: reached },
     );
-    writeMetric(deps.env, "scan", { outcome: "suspected_csam", kind: source });
   }
   return true;
 }
@@ -368,7 +371,7 @@ export async function sweepCsamAlerts(
   let alerted = 0;
   for (const report of due) {
     try {
-      if (await ensureCsamAlerted(deps, report.reportId, { nodeId: report.nodeId, source: "sweep" }))
+      if (await ensureCsamAlerted(deps, report.reportId, { via: "sweep", nodeId: report.nodeId }))
         alerted += 1;
     } catch (error) {
       captureError(error, { kind: "csam_alert" });
@@ -384,11 +387,16 @@ export async function sweepCsamAlerts(
  *
  * The database half (db/queries/moderation.ts): the node becomes `suspected_csam`, the node and
  * its owner go on legal hold, the node's links are paused, its upload addresses are held, its
- * hash is blocklisted and a report is filed. Then, here, `ensureCsamAlerted`: the critical
- * operator mail, the audit row and a metric — ON EVERY CALL, whatever state the node was found
- * in. A redelivery that finds the node already locked therefore still makes sure the operators
- * were told (once a day at most); nothing about the alert hangs on having been the call that
- * locked.
+ * hash is blocklisted and a report is filed. Then, here, ON EVERY CALL and whatever state the
+ * node was found in, two separate facts:
+ *   - THE LOCK is recorded: the audit row `scan.suspected_csam` (`{ source, reportId }`, the
+ *     caller's own source) and a metric, once per report per UTC day behind a marker of its own.
+ *     It does not depend on any mail. A redelivery the same day writes nothing; one on a LATER
+ *     day writes a second row (accepted: the marker is a day's). The marker is claimed before the
+ *     row is handed to the deferred work, so a crash exactly between the two loses that row.
+ *   - THE ALERT: `ensureCsamAlerted` (the critical operator mail, its own audit action).
+ * A redelivery that finds the node already locked therefore still records the lock and still
+ * makes sure the operators were told; nothing hangs on having been the call that locked.
  *
  * It never deletes anything, never notifies the owner and issues no strike. Safe to repeat: the
  * same report is returned. `404 not_found` when there is no such node.
@@ -400,6 +408,11 @@ export async function lockSuspectedCsam(
 ): Promise<{ reportId: string }> {
   const locked = await lockRows(deps.db, nodeId, opts);
   if (!locked) throw new AppError("not_found");
-  await ensureCsamAlerted(deps, locked.reportId, { nodeId, source: opts.source });
-  return { reportId: locked.reportId };
+  const { reportId } = locked;
+  if (await addUsageIfUnder(deps.db, utcDay(), "notice", csamLockMarker(reportId), ONCE.amount, ONCE.limit)) {
+    audit(deps, "scan.suspected_csam", { type: "node", id: nodeId }, { source: opts.source, reportId });
+    writeMetric(deps.env, "scan", { outcome: "suspected_csam", kind: opts.source });
+  }
+  await ensureCsamAlerted(deps, reportId, { via: "lock", nodeId });
+  return { reportId };
 }
