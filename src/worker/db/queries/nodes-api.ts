@@ -59,7 +59,8 @@ function skipReason(status: ScanStatus, owner: boolean): ZipSkipReason {
  *
  * LEFT OUT ENTIRELY — from `entries` and from `skipped`, because naming them would disclose
  * them: a root that is hidden or in the trash (itself or by an ancestor), every taken-down or
- * trashed node below a root with everything under it, system nodes, and `suspected_csam` files.
+ * trashed node below a root with everything under it, system nodes, `suspected_csam` files, and
+ * a file without a current version (no download URL would be minted for it either).
  * The roots get the inherited test (`notEffectivelyTrashedOrHidden`); below a root that passed
  * it the walk stops at the first trashed or taken-down row, which is the same test, inherited by
  * the walk itself.
@@ -105,7 +106,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], maxFiles: numb
     SELECT f.id, f.path, f.owner, n.size, n.version_id, n.scan_status,
            to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS modified_at
     FROM files f JOIN nodes n ON n.id = f.id
-    WHERE n.scan_status <> 'suspected_csam'
+    WHERE n.scan_status <> 'suspected_csam' AND n.version_id IS NOT NULL
     ORDER BY f.ord, f.ordercol
     LIMIT ${maxFiles + 1}`);
 

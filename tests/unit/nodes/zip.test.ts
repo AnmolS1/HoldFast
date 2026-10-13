@@ -1,8 +1,10 @@
 // The zip manifest: what a zip of these nodes would hold. No URLs — those are minted lazily, a
 // window at a time (download-urls, tested with the mints).
+import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { ZIP_MAX_ENTRIES } from "../../../src/shared/constants";
 import { ZipManifest } from "../../../src/shared/schemas/node";
+import { nodes } from "../../../src/worker/db/schema";
 import {
   api,
   makeFile,
@@ -12,6 +14,7 @@ import {
   person,
   setStatus,
   takeDown,
+  testDb,
   type Caller,
 } from "./helpers";
 
@@ -168,6 +171,26 @@ describe("POST /nodes/zip-manifest", () => {
       ]);
     }
     expect((await manifest(t.owner.as, { nodeIds: [t.folder.id], allOwned: false })).status).toBe(200);
+  });
+
+  it("a file without a current version is in neither list: no URL would be minted for it", async () => {
+    const owner = await person();
+    const folder = await makeFolder(owner.id, null, { name: "versions" });
+    const whole = await makeFile(owner.id, folder.id, { name: "whole.txt", scanStatus: "clean" });
+    const clean = await makeFile(owner.id, folder.id, { name: "no-version.txt", scanStatus: "clean" });
+    const pending = await makeFile(owner.id, folder.id, {
+      name: "no-version-yet.txt",
+      scanStatus: "pending",
+    });
+    for (const node of [clean, pending]) {
+      await testDb().update(nodes).set({ versionId: null, r2Key: null }).where(eq(nodes.id, node.id));
+    }
+    const body = ZipManifest.parse((await manifest(owner.as, { nodeIds: [folder.id] })).body);
+    expect(body.entries.map((entry) => entry.nodeId)).toEqual([whole.id]);
+    expect(body.skipped).toEqual([]);
+    // What the batch answers for them, and why they must not be entries.
+    const urls = await api(owner.as, "POST", "/nodes/download-urls", { body: { nodeIds: [clean.id] } });
+    expect(urls.body.items).toEqual([{ nodeId: clean.id, error: "not_found" }]);
   });
 
   it("role ≥ viewer on EVERY root: one root the caller cannot see refuses the whole manifest", async () => {
