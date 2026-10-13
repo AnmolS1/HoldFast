@@ -39,7 +39,21 @@ async function hiddenIn(t: SharedTree) {
   await takeDown(downFolder.id);
   const locked = await makeFile(t.owner.id, t.inner.id, { mimeSniffed: "image/png" });
   await setStatus(locked.id, "suspected_csam");
+  const trashedFile = await makeFile(t.owner.id, t.inner.id, {
+    scanStatus: "clean",
+    mimeSniffed: "image/png",
+    deletedAt: new Date(),
+    trashedRoot: true,
+  });
+  const trashedFolder = await makeFolder(t.owner.id, t.shared.id, {
+    deletedAt: new Date(),
+    trashedRoot: true,
+  });
+  const inTrashedFolder = await makeFile(t.owner.id, trashedFolder.id, { scanStatus: "clean" });
   return {
+    "a file in the trash": trashedFile,
+    "a folder in the trash": trashedFolder,
+    "a file inside a trashed folder": inTrashedFolder,
     "a taken-down file": downFile,
     "a taken-down folder": downFolder,
     "a file inside a taken-down folder": fileInside,
@@ -49,7 +63,7 @@ async function hiddenIn(t: SharedTree) {
   };
 }
 
-describe("hidden nodes answer as an id that was never issued", () => {
+describe("hidden and trashed nodes answer as an id that was never issued — same answer, same work", () => {
   it.each(BY_ID)("$name — for the owner and for a share partner", async (route) => {
     const t = await sharedTree();
     const hidden = await hiddenIn(t);
@@ -72,6 +86,8 @@ describe("hidden nodes answer as an id that was never issued", () => {
           `${label}, as the ${who === t.owner ? "owner" : "partner"}`,
         ).toEqual(comparable(unknown, { [unknownId]: "ID" }));
         expect(JSON.stringify(answer.body).replaceAll(node.id, "")).not.toContain(node.name);
+        // The same WORK too: the number of statements must not tell the kinds of "not there" apart.
+        expect(answer.statements, `${route.name}: statements for ${label}`).toBe(unknown.statements);
       }
     }
     // Nothing a refused request asked for was done.
@@ -208,11 +224,18 @@ describe("the route file itself", () => {
   });
 
   it("reads a node by id only after asking the permission service about it", () => {
-    // `getNode` appears once, inside `visibleNode`, after `requireRole`.
+    // `getNode` appears once, inside `liveNode`, after `requireRole`.
     const calls = [...ROUTE_SOURCE.matchAll(/\bgetNode\(/g)];
     expect(calls).toHaveLength(1);
-    const helper = ROUTE_SOURCE.slice(ROUTE_SOURCE.indexOf("async function visibleNode"));
+    const helper = ROUTE_SOURCE.slice(ROUTE_SOURCE.indexOf("async function liveNode"));
     expect(helper.indexOf("requireRole(")).toBeLessThan(helper.indexOf("getNode("));
     expect(helper.indexOf("requireRole(")).toBeGreaterThan(-1);
+  });
+
+  it("keeps no visibility rule of its own: no trash check, no partner rule — the permission service has both", () => {
+    expect(ROUTE_SOURCE).toContain("notTrashed: true");
+    expect(ROUTE_SOURCE).not.toContain("assertNotTrashed");
+    expect(ROUTE_SOURCE).not.toContain("effectiveTrashed");
+    expect(ROUTE_SOURCE).not.toMatch(/function partnerSees|createdBy ===/);
   });
 });

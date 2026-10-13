@@ -16,6 +16,7 @@ import {
   scanQueueSpy,
   setStatus,
   sharedTree,
+  takeDown,
   testDb,
   type Answer,
   type Caller,
@@ -282,6 +283,8 @@ describe("a share partner and files that are not clean", () => {
         expect(comparable(answer, { [file.id]: "ID" }), route.name).toEqual(
           comparable(unknown, { [unknownId]: "ID" }),
         );
+        // And for the same work: "not visible to you" costs what "never issued" costs.
+        expect(answer.statements, `${route.name}: statements`).toBe(unknown.statements);
       }
       const row = (await nodeById(file.id))!;
       expect([row.name, row.parentId, row.starred, row.scanStatus]).toEqual([
@@ -343,6 +346,7 @@ describe("a share partner and files that are not clean", () => {
       expect(comparable(answer, { [file.id]: "ID" }), route.name).toEqual(
         comparable(unknown, { [unknownId]: "ID" }),
       );
+      expect(answer.statements, `${route.name}: statements`).toBe(unknown.statements);
     }
     const zip = await api(callers.uploader, "POST", "/nodes/zip-manifest", {
       body: { nodeIds: [folder.id] },
@@ -362,6 +366,48 @@ describe("a share partner and files that are not clean", () => {
       expect((await api(callers[viewer], "GET", `/nodes/${folder.id}`)).status).toBe(200);
       expect((await api(callers[viewer], "GET", `/nodes/${files.clean.id}`)).status).toBe(200);
       expect((await api(callers[viewer], "GET", `/nodes/${t.notes.id}`)).status).toBe(200);
+    }
+  });
+
+  it("every kind of 404 costs one number of statements on a route: unknown, no share, hidden, trashed, not visible", async () => {
+    const { t, folder, files, callers } = await withUploads();
+    const down = await makeFile(t.owner.id, folder.id, { scanStatus: "clean" });
+    await takeDown(down.id);
+    const locked = await makeFile(t.owner.id, folder.id, {});
+    await setStatus(locked.id, "suspected_csam");
+    const trashed = await makeFile(t.owner.id, folder.id, {
+      scanStatus: "clean",
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    const kinds: [string, string][] = [
+      ["no share to it", t.secret.id],
+      ["taken down", down.id],
+      ["locked", locked.id],
+      ["in the trash", trashed.id],
+      ["under review", files.under_review.id],
+      ["pending, someone else's", files.pending.id],
+      ["infected, someone else's", files.infected.id],
+    ];
+    for (const viewer of ["otherEditor", "viewer"] as const) {
+      for (const route of BY_ID) {
+        const unknown = await route.call(callers[viewer], crypto.randomUUID(), t);
+        const counts = new Map<string, number>([["unknown", unknown.statements]]);
+        for (const [label, id] of kinds) {
+          const answer = await route.call(callers[viewer], id, t);
+          expect(answer.status, `${viewer} ${route.name} ${label}`).toBe(unknown.status);
+          counts.set(label, answer.statements);
+        }
+        expect(new Set(counts.values()).size, `${viewer} ${route.name}: ${JSON.stringify([...counts])}`).toBe(
+          1,
+        );
+      }
+    }
+    // The stranger, who has no share at all: the same number for a real id and a made-up one.
+    for (const route of BY_ID) {
+      const unknown = await route.call(t.stranger.as, crypto.randomUUID(), t);
+      const real = await route.call(t.stranger.as, files.clean.id, t);
+      expect(real.statements, route.name).toBe(unknown.statements);
     }
   });
 });

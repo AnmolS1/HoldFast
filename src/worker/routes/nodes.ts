@@ -14,12 +14,12 @@
 //   GET   /api/account/usage
 //
 // WHO MAY SEE WHAT is decided in services/permissions.ts and nowhere else: every node id of a
-// path or a body goes through `requireRole` before anything is read about it (`visibleNode`
-// below). So an id that was never issued, one the caller has no share to, and a node that is
-// hidden from everyone but an admin all get the same `404 not_found` — this file has no branch
-// for the last of these, and must never grow one. What `requireRole` does not look at is added
-// here, once, for every route alike: a node in the trash (the trash routes have their own file)
-// and a system node (an avatar) are `404` too.
+// path or a body goes through `requireRole` before anything is read about it (`liveNode` below).
+// So an id that was never issued, one the caller has no share to, a node that is hidden from
+// everyone but an admin, one in the trash, and a file a share partner's listing would not show
+// them all get the same `404 not_found`, for the same work — this file has no branch for any of
+// these, and must never grow one. (The trash has its own routes, in their own file.) The zip
+// manifest reads a tree, not ids: its query is handed the terms of the same rule.
 //
 // `403 forbidden` is only ever answered to a caller who can already see the node.
 
@@ -52,6 +52,7 @@ import {
   listChildren,
   move,
   OWNER_VISIBLE_STATUSES,
+  UPLOADER_VISIBLE_STATUSES,
   rename,
   requestRescan,
   setStar,
@@ -78,13 +79,7 @@ import { nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
 import { inlineKindAllowed, thumbEligible } from "../services/mime";
 import { toNodeDto, toNodeDtos, type NodeView } from "../services/node-dto";
-import {
-  assertContentAccess,
-  assertNotTrashed,
-  requireRole,
-  type Access,
-  type Role,
-} from "../services/permissions";
+import { assertContentAccess, requireRole, type Access, type Role } from "../services/permissions";
 import { db, deps, keys, type AppEnv } from "../services/request-context";
 import { enqueueRescan } from "../services/scanning";
 import { mintDownloadToken } from "../services/tokens";
@@ -108,38 +103,18 @@ function parse<T>(schema: z.ZodType<T>, input: unknown): T {
 }
 
 /**
- * The scan states in which a file is still there, by id, for the share partner who UPLOADED it:
- * they must be able to watch their own upload become "Blocked". Never a file under review —
- * that somebody reported a file is nobody's to learn but the owner's.
+ * The node behind an id of the request, for a caller who has at least `min` on it. WHETHER IT IS
+ * THERE FOR THEM is `requireRole`'s answer alone — no access, hidden, in the trash (asked with
+ * `notTrashed`), a file a share partner may not see: one `404 not_found` from one fixed amount of
+ * work — and too low a role is its `403`. Only then is the row read. The one thing added here: a
+ * system node (an avatar) is no node of this API — `404` for its own owner, the only caller who
+ * can get this far.
  */
-const UPLOADER_SEES: readonly ScanStatus[] = ["pending", "infected", "skipped", "error"];
-
-/**
- * What a share partner may see of a node BY ID: what their listing would show them — a folder,
- * a `clean` file — and, the one exception, their own upload while the scanner has not passed it.
- * Everything else does not exist for them. THE ONE PLACE this is decided for the by-id routes
- * (`visibleNode`); the zip manifest's query is handed the same two terms.
- */
-function partnerSees(node: Node, viewerId: string | undefined): boolean {
-  if (node.kind !== "file" || node.scanStatus === "clean") return true;
-  return node.createdBy === viewerId && UPLOADER_SEES.includes(node.scanStatus);
-}
-
-/**
- * The node behind an id of the request, for a caller who has at least `min` on it.
- * `404 not_found` — never anything else — when the caller has no access at all, when the node is
- * hidden (both decided by `requireRole`), in the trash, a system node, or — for anyone but the
- * owner — a file their listing would not show them (`partnerSees`); `403 forbidden` only
- * once all of that is settled and the role is too low.
- */
-async function visibleNode(c: Ctx, nodeId: string, min: Role): Promise<{ node: Node; access: Access }> {
-  const reach = await requireRole(c, nodeId, "viewer");
-  await assertNotTrashed(c, nodeId);
+async function liveNode(c: Ctx, nodeId: string, min: Role): Promise<{ node: Node; access: Access }> {
+  const access = await requireRole(c, nodeId, min, { notTrashed: true });
   const node = await getNode(db(c), nodeId);
   if (!node || node.system !== null) throw new AppError("not_found");
-  if (reach.role !== "owner" && !partnerSees(node, c.get("user")?.id)) throw new AppError("not_found");
-  // Answered from the request's cache: no second question is sent.
-  return { node, access: await requireRole(c, nodeId, min) };
+  return { node, access };
 }
 
 const statusesFor = (access: Access) =>
@@ -204,7 +179,7 @@ router.post("/nodes/folder", async (c) => {
   let ownerId = user.id;
   let view: NodeView = { viewerId: user.id, role: "owner" };
   if (body.parentId !== null) {
-    const parent = await visibleNode(c, body.parentId, "editor");
+    const parent = await liveNode(c, body.parentId, "editor");
     if (parent.node.kind !== "folder") throw new AppError("not_found");
     // Inside a shared folder the new folder belongs to the tree's owner, not to its maker.
     ownerId = parent.node.ownerId;
@@ -236,8 +211,8 @@ type CurrentFile = Node & { versionId: string };
 const isoOf = (unixSeconds: number) => new Date(unixSeconds * 1000).toISOString();
 
 /** A file the caller may see, with a current version. Anything else is `404`. */
-async function visibleFile(c: Ctx, nodeId: string): Promise<{ node: CurrentFile; access: Access }> {
-  const { node, access } = await visibleNode(c, nodeId, "viewer");
+async function liveFile(c: Ctx, nodeId: string): Promise<{ node: CurrentFile; access: Access }> {
+  const { node, access } = await liveNode(c, nodeId, "viewer");
   if (node.kind !== "file" || node.versionId === null) throw new AppError("not_found");
   return { node: node as CurrentFile, access };
 }
@@ -268,7 +243,7 @@ async function mintUrl(
   kind: UrlKind,
   zip: boolean,
 ): Promise<{ answer: DownloadUrlResponse; owner: boolean }> {
-  const { node, access } = await visibleFile(c, nodeId);
+  const { node, access } = await liveFile(c, nodeId);
   const { unscanned } = scanGate(node, access, kind);
   if (kind === "inline" && !inlineKindAllowed(node)) throw new AppError("forbidden");
 
@@ -313,8 +288,8 @@ router.post("/nodes/zip-manifest", async (c) => {
     const ids = [...new Set(body.nodeIds)];
     // One after the other: the first root the caller may not see ends the request, and nothing
     // more is asked about the rest.
-    const found: Awaited<ReturnType<typeof visibleNode>>[] = [];
-    for (const id of ids) found.push(await visibleNode(c, id, "viewer"));
+    const found: Awaited<ReturnType<typeof liveNode>>[] = [];
+    for (const id of ids) found.push(await liveNode(c, id, "viewer"));
     const labels = uniqueLabels(found.map(({ node }) => node.name));
     roots = found.map(({ node, access }, index) => ({
       id: node.id,
@@ -330,7 +305,7 @@ router.post("/nodes/zip-manifest", async (c) => {
   return c.json(
     await zipManifest(db(c), roots, {
       maxFiles: ZIP_MAX_ENTRIES,
-      partner: { viewerId: user.id, uploaderSees: UPLOADER_SEES },
+      partner: { viewerId: user.id, uploaderSees: UPLOADER_VISIBLE_STATUSES },
     }),
   );
 });
@@ -370,7 +345,7 @@ router.get("/account/usage", async (c) => {
 router.get(`/nodes/${ID}/children`, async (c) => {
   const user = requireVerified(c);
   const query = parse(ListChildrenQuery, c.req.query());
-  const { node, access } = await visibleNode(c, c.req.param("id"), "viewer");
+  const { node, access } = await liveNode(c, c.req.param("id"), "viewer");
   if (node.kind !== "folder") throw new AppError("not_found");
   const page = await listChildren(db(c), {
     scope: { ownerId: node.ownerId },
@@ -397,7 +372,7 @@ router.get(`/nodes/${ID}/children`, async (c) => {
 
 router.get(`/nodes/${ID}`, async (c) => {
   const user = requireVerified(c);
-  const { node, access } = await visibleNode(c, c.req.param("id"), "viewer");
+  const { node, access } = await liveNode(c, c.req.param("id"), "viewer");
   // Root first, the node itself not included. Anyone but the owner sees the chain from the node
   // that was shared with them: what lies above it is not theirs to know.
   const chain = await ancestors(db(c), node.id);
@@ -418,7 +393,7 @@ router.patch(`/nodes/${ID}`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
   const body = parse(RenameBody, await jsonBody(c));
-  const found = await visibleNode(c, id, "viewer");
+  const found = await liveNode(c, id, "viewer");
   const { access } = found;
   let node = found.node;
   // Both permissions before either write: a refused half must not leave the other half done.
@@ -478,13 +453,13 @@ router.post(`/nodes/${ID}/move`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
   const body = parse(MoveBody, await jsonBody(c));
-  const { access } = await visibleNode(c, id, "editor");
+  const { access } = await liveNode(c, id, "editor");
   if (access.shareRootId === id) throw new AppError("forbidden");
   if (body.parentId === null) {
     // The top level of a tree is its owner's alone: no share reaches it.
     if (access.role !== "owner") throw new AppError("forbidden");
   } else {
-    await visibleNode(c, body.parentId, "editor");
+    await liveNode(c, body.parentId, "editor");
   }
   const { node: moved, changed } = await moveNode(c, id, body.parentId);
   // A move to where the node already is changes nothing and is not recorded as one: the same
@@ -527,7 +502,7 @@ router.get(`/nodes/${ID}/thumb-url`, async (c) => {
   // A GET: the read-only rule for an impersonated session does not cover it, so this does.
   assertContentAccess(c);
   const { size } = parse(ThumbQuery, c.req.query());
-  const { node } = await visibleFile(c, c.req.param("id"));
+  const { node } = await liveFile(c, c.req.param("id"));
   if (node.scanStatus === "pending") throw new AppError("scan_pending");
   if (node.scanStatus === "infected" || node.scanStatus === "under_review") {
     throw new AppError("scan_blocked");
@@ -553,7 +528,7 @@ router.get(`/nodes/${ID}/thumb-url`, async (c) => {
 router.post(`/nodes/${ID}/rescan`, async (c) => {
   requireVerified(c);
   const id = c.req.param("id");
-  const { node } = await visibleNode(c, id, "owner");
+  const { node } = await liveNode(c, id, "owner");
   if (node.kind !== "file") throw new AppError("not_found");
   // Before the throttle: a request that cannot be granted must not use up the hour.
   if (node.scanStatus !== "error" && node.scanStatus !== "skipped") throw new AppError("conflict");
