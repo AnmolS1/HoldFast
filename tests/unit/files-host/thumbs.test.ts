@@ -6,21 +6,25 @@ import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
-import { thumbKey } from "../../../src/worker/services/storage";
-import { makeThumbnail } from "../../../src/worker/services/thumbnails";
+import { keyFor, thumbKey } from "../../../src/worker/services/storage";
+import { failureMarker, makeThumbnail, UNCODED_TRIES } from "../../../src/worker/services/thumbnails";
 import {
   ask,
   FAKE_WEBP,
+  freshIp,
   gate,
   imagesMock,
+  ipSubject,
   ledgerRow,
   linkOn,
   makeAccount,
+  makeShare,
   NOT_FOUND,
   pattern,
   rand,
   spyBucket,
   storedFile,
+  updateNode,
   urlFor,
   type AskOptions,
 } from "./harness";
@@ -366,5 +370,184 @@ describe("the daily transform ceiling", () => {
     ]);
     expect(images.calls).toHaveLength(N);
     expect(await units(owner.id)).toBe(N);
+  });
+});
+
+describe("a thumbnail that failed today is not tried again today", () => {
+  it("thirteen requests for one failing thumbnail — a link, a share partner, an address already over its own ceiling — cost the owner ONE unit and the account ONE call; nobody is charged a byte", async () => {
+    const owner = await makeAccount();
+    const partner = await makeAccount();
+    const node = await picture(owner.id);
+    await makeShare(node.id, owner.id, partner.id);
+    const link = await linkOn(node.id, owner.id);
+    const images = imagesMock(() => {
+      throw imagesError(9523, "heif: Decoder plugin generated an error");
+    });
+    const spy = spyBucket();
+    const env = { IMAGES: images.binding, FILES: spy.bucket };
+    const ip = freshIp();
+    const statuses: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      const subject = i % 2 ? { user: partner.id } : { link };
+      const answer = await ask(await urlFor("thumb", node, subject), { ip, env });
+      expect(answer.text).toBe(NOT_FOUND);
+      statuses.push(answer.status);
+    }
+    const over = freshIp();
+    for (let i = 0; i < 3; i++) {
+      const answer = await ask(await urlFor("thumb", node, { link }), {
+        ip: over,
+        env,
+        settings: { ceilings: { CEIL_IP_BYTES_DAY: 0 } },
+      });
+      statuses.push(answer.status);
+    }
+    expect(statuses).toEqual(Array.from({ length: 13 }, () => 404));
+    expect(images.calls).toHaveLength(1);
+    expect(await ledgerRow("transform_user", owner.id)).toEqual({ bytes: 0, count: 1 });
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 1 });
+    expect(spy.puts).toEqual([]);
+    // The file itself was read once: for the one attempt.
+    expect(spy.gets.filter((call) => call.key === node.r2Key)).toHaveLength(1);
+    for (const row of [
+      await ledgerRow("ip", await ipSubject(ip)),
+      await ledgerRow("ip", await ipSubject(over)),
+      await ledgerRow("user", partner.id),
+      await ledgerRow("link", link.id),
+      await ledgerRow("link_owner", owner.id),
+    ]) {
+      expect(row).toBeNull();
+    }
+  });
+
+  it("the marker is for one size of one version on one day: another size, a replaced file and the next UTC day each get a fresh attempt", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const failing = imagesMock(() => {
+      throw imagesError(9422, "The transformation quota has been reached");
+    });
+    const working = imagesMock();
+    const subject = { user: owner.id };
+    expect(
+      (await ask(await urlFor("thumb", node, subject), { env: { IMAGES: failing.binding } })).status,
+    ).toBe(404);
+    // Marked: even a service that would now succeed is not asked.
+    expect(
+      (await ask(await urlFor("thumb", node, subject), { env: { IMAGES: working.binding } })).status,
+    ).toBe(404);
+    expect(working.calls).toHaveLength(0);
+
+    // Another size.
+    const small = await ask(await urlFor("thumb", node, subject, { size: 160 }), {
+      env: { IMAGES: working.binding },
+    });
+    expect(small.status).toBe(200);
+    expect(working.calls).toHaveLength(1);
+
+    // The next UTC day: the marker was yesterday's.
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    const later = await ask(await urlFor("thumb", node, subject), {
+      now: tomorrow,
+      env: { IMAGES: working.binding },
+    });
+    expect(later.status).toBe(200);
+    expect(working.calls).toHaveLength(2);
+
+    // A replaced file: a new version, a new key, no marker.
+    const replaced = await picture(owner.id);
+    expect(
+      (await ask(await urlFor("thumb", replaced, subject), { env: { IMAGES: failing.binding } })).status,
+    ).toBe(404);
+    const versionId = crypto.randomUUID();
+    const r2Key = keyFor(owner.id, replaced.id, versionId);
+    await spyBucket().bucket.put(r2Key, pattern(2000, 3));
+    await updateNode(replaced.id, { versionId, r2Key });
+    const fresh = await ask(await urlFor("thumb", { id: replaced.id, versionId }, subject), {
+      env: { IMAGES: working.binding },
+    });
+    expect(fresh.status).toBe(200);
+    expect(working.calls).toHaveLength(3);
+  });
+
+  it("a transform that succeeds leaves no marker; a missing source object and an empty output leave one", async () => {
+    const owner = await makeAccount();
+    const good = await picture(owner.id);
+    expect(
+      (await ask(await urlFor("thumb", good, { user: owner.id }), { env: { IMAGES: imagesMock().binding } }))
+        .status,
+    ).toBe(200);
+    expect(await ledgerRow("notice", failureMarker(good, 320))).toBeNull();
+
+    const gone = await picture(owner.id, { content: null, node: { size: 2000 } });
+    const empty = await picture(owner.id);
+    const nothing = imagesMock(() => new Uint8Array(0));
+    for (const node of [gone, empty]) {
+      for (let i = 0; i < 4; i++) {
+        expect(
+          (await ask(await urlFor("thumb", node, { user: owner.id }), { env: { IMAGES: nothing.binding } }))
+            .status,
+        ).toBe(404);
+      }
+      expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 1 });
+    }
+    // One call for the empty output; none at all for the missing object. Three units in all.
+    expect(nothing.calls).toHaveLength(1);
+    expect(await units(owner.id)).toBe(3);
+  });
+
+  it("a failure without a code is tried again, three times a day at most: six requests → three calls, three units", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock(() => {
+      throw new Error("Network connection lost.");
+    });
+    const url = await urlFor("thumb", node, { user: owner.id });
+    for (let i = 0; i < 6; i++)
+      expect((await ask(url, { env: { IMAGES: images.binding } })).status).toBe(404);
+    expect(UNCODED_TRIES).toBe(3);
+    expect(images.calls).toHaveLength(3);
+    expect(await units(owner.id)).toBe(3);
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 3, count: 0 });
+    // A connection that comes back within the three tries is not held against the thumbnail.
+    const flaky = await picture(owner.id);
+    let failures = 2;
+    const recovering = imagesMock(() => {
+      if (failures-- > 0) throw new Error("Network connection lost.");
+      return FAKE_WEBP;
+    });
+    const statuses: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      statuses.push(
+        (await ask(await urlFor("thumb", flaky, { user: owner.id }), { env: { IMAGES: recovering.binding } }))
+          .status,
+      );
+    }
+    expect(statuses).toEqual([404, 404, 200, 200]);
+    expect(recovering.calls).toHaveLength(3);
+  });
+
+  it("two misses at once that both fail → at most two calls and ONE marker; after them, none", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const hold = gate();
+    const bothIn = gate();
+    let inside = 0;
+    const images = imagesMock(async () => {
+      if (++inside === 2) bothIn.open();
+      await hold.opened;
+      throw imagesError(9523, "heif: Decoder plugin generated an error");
+    });
+    const env = { IMAGES: images.binding };
+    const url = await urlFor("thumb", node, { user: owner.id });
+    const both = [ask(url, { env }), ask(url, { env })];
+    // Both are inside the image service before either has failed.
+    await bothIn.opened;
+    hold.open();
+    expect((await Promise.all(both)).map((answer) => answer.status)).toEqual([404, 404]);
+    expect(images.calls).toHaveLength(2);
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 1 });
+    for (let i = 0; i < 5; i++) expect((await ask(url, { env })).status).toBe(404);
+    expect(images.calls).toHaveLength(2);
+    expect(await units(owner.id)).toBe(2);
   });
 });
