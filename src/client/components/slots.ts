@@ -1,7 +1,7 @@
 // Props of the typed slot components. The placeholder feature modules export stubs with exactly
 // these props, so consumers compile and integrate in any order; the owning task replaces the stub
 // file and keeps the props. Cross-feature imports go only through `features/<name>/index.ts`.
-import type { MimeCategory } from "./types";
+import type { MimeCategory, ScanStatus } from "./types";
 
 /** `linkToken` is the proof of access on public pages. */
 export interface ReportTarget {
@@ -32,6 +32,10 @@ export interface PreviewItem {
   mimeCategory: MimeCategory;
   ext: string;
   mimeSniffed?: string | null;
+  /** Whether a thumbnail may be asked for, as on a node; absent = not known. */
+  thumb?: boolean;
+  /** Absent = the source does not say (a public page serves clean files only). */
+  scanStatus?: ScanStatus;
 }
 
 /** A public page supplies metadata and URLs itself; `"owner"` means the authenticated API. */
