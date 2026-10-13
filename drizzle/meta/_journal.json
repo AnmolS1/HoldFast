@@ -50,6 +50,13 @@
       "when": 1791866343195,
       "tag": "0006_blocklist_raised_from",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1791923079866,
+      "tag": "0007_jit_off",
+      "breakpoints": true
     }
   ]
 }
