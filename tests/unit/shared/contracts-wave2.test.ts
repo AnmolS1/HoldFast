@@ -115,4 +115,14 @@ describe("uploads", () => {
     expect(upload.OpenUploadsResponse.safeParse({ items: [session] }).success).toBe(false);
     expectTypeOf<upload.OpenUploadsResponse>().toEqualTypeOf<upload.UploadSessionDto[]>();
   });
+
+  it("a search query is trimmed before it is measured and carries no control character", () => {
+    expect(search.SearchQuery.parse({ q: "  report  " }).q).toBe("report");
+    expect(search.SearchQuery.safeParse({ q: " a " }).success).toBe(false);
+    expect(search.SearchQuery.safeParse({ q: "ab\u0000" }).success).toBe(false);
+    expect(search.SearchQuery.safeParse({ q: "ab\u0000cd" }).success).toBe(false);
+    expect(search.SearchQuery.safeParse({ q: "ab\tcd" }).success).toBe(false);
+    expect(search.SearchQuery.safeParse({ q: "ab\u007fcd" }).success).toBe(false);
+    expect(search.SearchQuery.parse({ q: "résumé 2026" }).q).toBe("résumé 2026");
+  });
 });
