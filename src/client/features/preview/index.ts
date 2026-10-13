@@ -1,10 +1,4 @@
-// PLACEHOLDER — taken over by the preview task (T18), which keeps `PreviewDialog` and its props.
-import type { PreviewDialogProps } from "../../components/slots";
-
+// The preview feature's public face: its route, and the dialog other features and the public
+// page render through the `PreviewDialog` slot (props in `components/slots.ts`).
+export { PreviewDialog } from "./PreviewDialog";
 export { routes } from "./routes";
-
-/** Stub: renders nothing. */
-export function PreviewDialog(props: PreviewDialogProps): null {
-  void props;
-  return null;
-}

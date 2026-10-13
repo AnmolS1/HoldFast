@@ -1,0 +1,359 @@
+// The preview dialog: a large modal on desktop, full-screen below the layout breakpoint. It shows
+// one file from either source and walks its siblings. Nothing from a file's content ever runs
+// here — every renderer draws to an <img>, a canvas, text nodes or a media element.
+import Box from "@mui/material/Box";
+import Button from "@mui/material/Button";
+import Dialog from "@mui/material/Dialog";
+import IconButton from "@mui/material/IconButton";
+import Typography from "@mui/material/Typography";
+import { ChevronLeft, ChevronRight, Download, Share2, X } from "lucide-react";
+import { lazy, Suspense, useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
+import { Bytes } from "../../components/Bytes";
+import { ErrorBoundary } from "../../components/ErrorBoundary";
+import { FileBadge } from "../../components/FileBadge";
+import { ProgressUnderline } from "../../components/ProgressUnderline";
+import type { PreviewDialogProps } from "../../components/slots";
+import { toastApiError } from "../../lib/api";
+import { useIsDesktop } from "../../theme/breakpoints";
+import { hf, layout } from "../../theme/tokens";
+import { ReportLink } from "../report";
+import { ShareDialog } from "../share";
+import { typeLabel } from "./labels";
+import { ErrorState, PreviewSkeleton } from "./parts";
+import { rendererFor } from "./renderer-map";
+import { NoPreview } from "./renderers/NoPreview";
+import type { RendererProps } from "./renderers/types";
+import { mintUrl, type LoadedItem, type PreviewSource } from "./source";
+import { t } from "./strings";
+import { useItem, useSiblingIds } from "./useItem";
+
+const ImagePreview = lazy(() => import("./renderers/ImagePreview"));
+const PdfPreview = lazy(() => import("./renderers/PdfPreview"));
+const TextPreview = lazy(() => import("./renderers/TextPreview"));
+const MediaPreview = lazy(() => import("./renderers/MediaPreview"));
+
+/** Start a browser download. The URL is used once and kept nowhere. */
+function startDownload(url: string): void {
+  const link = document.createElement("a");
+  link.href = url;
+  link.rel = "noopener";
+  link.click();
+}
+
+function DownloadButton({ nodeId }: { nodeId: string }) {
+  const [busy, setBusy] = useState(false);
+  const onClick = async () => {
+    setBusy(true);
+    try {
+      // The only `download`-kind mint in the preview: every renderer uses `inline`.
+      const minted = await mintUrl("owner", nodeId, "download");
+      startDownload(minted.url);
+    } catch (error) {
+      toastApiError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Button onClick={() => void onClick()} disabled={busy} data-preview-download>
+      <Download size={16} aria-hidden="true" />
+      {t("preview.download")}
+    </Button>
+  );
+}
+
+/** May this viewer download the file? Only through the signed-in API, and never a blocked file. */
+function downloadAllowed(source: PreviewSource, item: LoadedItem): boolean {
+  if (source !== "owner") return false;
+  if (item.scanStatus === "clean") return true;
+  // Unscanned files: their owner only, with the warning.
+  return (item.scanStatus === "skipped" || item.scanStatus === "error") && item.node?.role === "owner";
+}
+
+function Scanning({ item }: { item: LoadedItem }) {
+  return (
+    <Box
+      data-preview-state="scanning"
+      sx={{
+        position: "relative",
+        flex: "1 1 auto",
+        minHeight: 240,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 3,
+        padding: 8,
+        textAlign: "center",
+      }}
+    >
+      <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={56} />
+      <Typography role="status">{t("scan.pending")}</Typography>
+      <Typography sx={{ color: hf.textSecondary, maxWidth: 320 }}>{t("scan.pending.body")}</Typography>
+      <ProgressUnderline value={null} label={t("scan.pending.label", { name: item.name })} />
+    </Box>
+  );
+}
+
+function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) {
+  const download = downloadAllowed(source, item) ? <DownloadButton nodeId={item.id} /> : undefined;
+  const status = item.scanStatus;
+  // Only clean files are previewed.
+  if (status === "pending") return <Scanning item={item} />;
+  if (status === "infected" || status === "under_review" || status === "suspected_csam") {
+    return <NoPreview item={item} message={t("none.blocked")} />;
+  }
+  if (status === "skipped" || status === "error") {
+    return (
+      <NoPreview
+        item={item}
+        message={download ? t("none.typeDownload") : t("none.title")}
+        warning={download ? t("preview.unscanned") : undefined}
+        download={download}
+      />
+    );
+  }
+  const choice = rendererFor(item);
+  const props: RendererProps = { source, item, download };
+  switch (choice.kind) {
+    case "image":
+      return <ImagePreview {...props} variant="inline" />;
+    case "heic":
+      // No thumbnail to ask for (too large for the image service): nothing to show but Download.
+      if (!item.thumb)
+        return <NoPreview item={item} message={t("none.heicUnavailable")} download={download} />;
+      return <ImagePreview {...props} variant="thumb" />;
+    case "pdf":
+      return <PdfPreview {...props} />;
+    case "text":
+      return <TextPreview {...props} />;
+    case "video":
+    case "audio":
+      return <MediaPreview {...props} kind={choice.kind} />;
+    case "none":
+      return (
+        <NoPreview
+          item={item}
+          message={
+            choice.reason === "tooLarge"
+              ? t("none.tooLarge")
+              : download
+                ? t("none.typeDownload")
+                : t("none.title")
+          }
+          download={download}
+        />
+      );
+  }
+}
+
+interface ViewProps extends PreviewDialogProps {
+  /** Route mode: told about the file once it is known (its folder is where Close goes). */
+  onItem?(item: LoadedItem): void;
+}
+
+interface BodyProps {
+  nodeId: string;
+  source: PreviewSource;
+  titleId: string;
+  siblingIds: string[] | undefined;
+  onNavigate: ((nodeId: string) => void) | undefined;
+  onClose(): void;
+  onItem: ((item: LoadedItem) => void) | undefined;
+  registerKeys(keys: { previous?: () => void; next?: () => void }): void;
+}
+
+function Body(props: BodyProps) {
+  const { nodeId, source, titleId, onNavigate, onClose, onItem, registerKeys } = props;
+  const { state, retry } = useItem(source, nodeId);
+  const item = state.status === "ready" ? state.item : null;
+  const ids = useSiblingIds(source, props.siblingIds, item);
+  // The share dialog is open for one file; moving to the next closes it.
+  const [sharing, setSharing] = useState<string | null>(null);
+  const shareOpen = sharing === nodeId;
+
+  const index = ids.indexOf(nodeId);
+  const previousId = onNavigate && index > 0 ? ids[index - 1] : undefined;
+  const nextId = onNavigate && index >= 0 && index < ids.length - 1 ? ids[index + 1] : undefined;
+  const walkable = Boolean(onNavigate) && index >= 0 && ids.length > 1;
+
+  useEffect(() => {
+    registerKeys({
+      previous: previousId ? () => onNavigate?.(previousId) : undefined,
+      next: nextId ? () => onNavigate?.(nextId) : undefined,
+    });
+  });
+
+  const latestOnItem = useRef(onItem);
+  useEffect(() => {
+    latestOnItem.current = onItem;
+  });
+  useEffect(() => {
+    // Once per file loaded, not per render of the caller.
+    if (item) latestOnItem.current?.(item);
+  }, [item]);
+
+  const canShare = source === "owner" && item?.node?.role === "owner";
+  return (
+    <>
+      <Box
+        component="header"
+        sx={{
+          flex: "none",
+          display: "flex",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 2,
+          minHeight: layout.header,
+          padding: "8px 12px 8px 20px",
+          borderBottom: `1px solid ${hf.hairline}`,
+        }}
+      >
+        <Box sx={{ display: "flex", alignItems: "center", gap: 3, minWidth: 0, flex: "1 1 200px" }}>
+          {item ? <FileBadge name={item.name} mimeCategory={item.mimeCategory} size={20} /> : null}
+          <Box sx={{ minWidth: 0 }}>
+            <Typography
+              id={titleId}
+              component="h2"
+              variant="h2"
+              sx={{ margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              {item ? item.name : t("preview.loading")}
+            </Typography>
+            {item ? (
+              <Typography
+                variant="body2"
+                data-preview-meta
+                sx={{ color: hf.textSecondary, display: "flex", gap: 2, whiteSpace: "nowrap" }}
+              >
+                <span>{typeLabel(item)}</span>
+                <Bytes value={item.size} />
+                {walkable ? (
+                  <span className="mono">
+                    {t("preview.position", { index: index + 1, count: ids.length })}
+                  </span>
+                ) : null}
+              </Typography>
+            ) : null}
+          </Box>
+        </Box>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1, flex: "none", marginLeft: "auto" }}>
+          {walkable ? (
+            <>
+              <IconButton
+                aria-label={t("preview.previous")}
+                disabled={!previousId}
+                onClick={() => previousId && onNavigate?.(previousId)}
+              >
+                <ChevronLeft size={16} aria-hidden="true" />
+              </IconButton>
+              <IconButton
+                aria-label={t("preview.next")}
+                disabled={!nextId}
+                onClick={() => nextId && onNavigate?.(nextId)}
+              >
+                <ChevronRight size={16} aria-hidden="true" />
+              </IconButton>
+            </>
+          ) : null}
+          {item && downloadAllowed(source, item) ? <DownloadButton nodeId={item.id} /> : null}
+          {canShare ? (
+            <Button onClick={() => setSharing(nodeId)}>
+              <Share2 size={16} aria-hidden="true" />
+              {t("preview.share")}
+            </Button>
+          ) : null}
+          {item ? <ReportLink target={{ nodeId: item.id }} /> : null}
+          <IconButton aria-label={t("preview.close")} onClick={onClose} data-preview-close>
+            <X size={16} aria-hidden="true" />
+          </IconButton>
+        </Box>
+      </Box>
+      <Box
+        data-preview-content
+        sx={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        {state.status === "loading" ? <PreviewSkeleton /> : null}
+        {state.status === "error" ? <ErrorState failure={state.failure} onRetry={retry} /> : null}
+        {item ? (
+          // A renderer that fails to load or throws shows the error state, never a broken page.
+          <ErrorBoundary
+            resetKey={`${item.id}|${item.scanStatus}`}
+            fallback={() => <ErrorState failure={{}} onRetry={retry} />}
+          >
+            <Suspense fallback={<PreviewSkeleton />}>
+              {/* A different file is a different preview: no state of the last one survives. */}
+              <Content key={item.id} source={source} item={item} />
+            </Suspense>
+          </ErrorBoundary>
+        ) : null}
+      </Box>
+      {canShare ? <ShareDialog open={shareOpen} nodeId={nodeId} onClose={() => setSharing(null)} /> : null}
+    </>
+  );
+}
+
+/** Keys the dialog itself owns: a renderer that needs the arrows marks its element with this. */
+const OWN_KEYS = "video, audio, input, textarea, select, [contenteditable='true'], [data-preview-keys='own']";
+
+export function PreviewDialogView(props: ViewProps) {
+  const { open, nodeId, siblingIds, onNavigate, onClose, source, onItem } = props;
+  const desktop = useIsDesktop();
+  const titleId = useId();
+  const keys = useRef<{ previous?: () => void; next?: () => void }>({});
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Keys of a dialog opened from inside this one (share, a confirm) are that dialog's.
+    if (!(event.target instanceof Node) || !event.currentTarget.contains(event.target)) return;
+    // Escape is left to the dialog, which closes on it.
+    if (event.key === "Escape") return;
+    // Nothing typed in the preview is a shortcut of the page underneath (Delete, "/", …).
+    event.stopPropagation();
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    if (event.target instanceof Element && event.target.closest(OWN_KEYS)) return;
+    const go = event.key === "ArrowLeft" ? keys.current.previous : keys.current.next;
+    if (!go) return;
+    event.preventDefault();
+    go();
+  };
+
+  return (
+    <Dialog
+      open={open && nodeId !== null}
+      onClose={onClose}
+      onKeyDown={onKeyDown}
+      fullScreen={!desktop}
+      maxWidth={false}
+      aria-labelledby={titleId}
+      data-preview-dialog
+      slotProps={{
+        paper: {
+          sx: desktop
+            ? { width: "min(1200px, calc(100vw - 64px))", height: "calc(100vh - 64px)", maxHeight: "none" }
+            : { margin: 0, border: 0, borderRadius: 0 },
+        },
+      }}
+    >
+      {nodeId !== null ? (
+        <Body
+          nodeId={nodeId}
+          source={source}
+          titleId={titleId}
+          siblingIds={siblingIds}
+          onNavigate={onNavigate}
+          onClose={onClose}
+          onItem={onItem}
+          registerKeys={(next) => {
+            keys.current = next;
+          }}
+        />
+      ) : null}
+    </Dialog>
+  );
+}
+
+/** The slot other features and the public page use (props: `components/slots.ts`). */
+export function PreviewDialog(props: PreviewDialogProps) {
+  return <PreviewDialogView {...props} />;
+}
