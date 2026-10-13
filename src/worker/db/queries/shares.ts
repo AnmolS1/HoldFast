@@ -5,7 +5,7 @@ import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanStatus, type Share, shares } from "../schema";
-import { notEffectivelyTrashed } from "./tree";
+import { notEffectivelyHidden, notEffectivelyTrashed } from "./tree";
 import { ownerIsActive } from "./users";
 
 /** The ACTIVATED share of that user on that node itself (not on an ancestor), or null. */
@@ -76,7 +76,7 @@ export async function activatePendingShares(db: Executor, userId: string, email:
 
 /**
  * What other people share with the user: active shares only, on nodes that are live (not
- * trashed, taken down or system), whose owner is active (not banned, suspended or scheduled
+ * system, and neither trashed nor taken down — themselves or by an ancestor), whose owner is active (not banned, suspended or scheduled
  * for deletion), and whose scan status is one of the MANDATORY `visibleStatuses` — a grantee's
  * view passes `['clean']`, like every other listing a non-owner sees (a folder is `clean`). A
  * share root that is `infected` or `suspected_csam` is not listed, name included.
@@ -96,7 +96,7 @@ export async function sharedWithMe(
         eq(shares.granteeUserId, userId),
         isNotNull(shares.activatedAt),
         isNull(nodes.system),
-        isNull(nodes.takedownAt),
+        notEffectivelyHidden(),
         inArray(nodes.scanStatus, [...opts.visibleStatuses]),
         notEffectivelyTrashed(),
         ownerIsActive(sql`${nodes.ownerId}`),
@@ -105,12 +105,25 @@ export async function sharedWithMe(
     .orderBy(sql`${shares.createdAt} DESC`, shares.id);
 }
 
-/** Every share on the user's own nodes, pending ones included, newest first. */
+/**
+ * The shares on the user's own nodes, pending ones included, newest first — on nodes the owner
+ * can still open: not a system node, not in the trash and not taken down (itself or by an
+ * ancestor, both), and not locked as `suspected_csam`. Such a share is absent, not deleted: the
+ * row is untouched and is listed again when the node is restored.
+ */
 export async function sharedByMe(db: Executor, userId: string): Promise<{ share: Share; node: Node }[]> {
   return db
     .select({ share: shares, node: nodes })
     .from(shares)
     .innerJoin(nodes, eq(nodes.id, shares.nodeId))
-    .where(eq(nodes.ownerId, userId))
+    .where(
+      and(
+        eq(nodes.ownerId, userId),
+        isNull(nodes.system),
+        sql`${nodes.scanStatus} <> 'suspected_csam'`,
+        notEffectivelyTrashed(),
+        notEffectivelyHidden(),
+      ),
+    )
     .orderBy(sql`${shares.createdAt} DESC`, shares.id);
 }

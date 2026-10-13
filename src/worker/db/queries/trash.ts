@@ -16,7 +16,7 @@ import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { type HoldCause, isUniqueViolation, LegalHoldError, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import { type Node, nodes, nodeVersions, uploads, user } from "../schema";
-import { effectiveTrashed } from "./tree";
+import { effectiveTrashed, notEffectivelyHidden } from "./tree";
 
 export { LegalHoldError };
 
@@ -122,8 +122,8 @@ const isTrashCursor = (v: unknown): v is TrashCursor =>
 
 /**
  * The owner's trashed roots, most recently trashed first. Never a root whose purge was
- * requested (it is hidden until the hold lifts), a system node, a taken-down node or
- * `suspected_csam`.
+ * requested (it is hidden until the hold lifts), a system node, a node that is taken down —
+ * itself or by an ancestor — or `suspected_csam`.
  */
 export async function listTrash(
   db: Executor,
@@ -138,7 +138,7 @@ export async function listTrash(
     isNotNull(nodes.deletedAt),
     isNull(nodes.purgeRequestedAt),
     isNull(nodes.system),
-    isNull(nodes.takedownAt),
+    notEffectivelyHidden(),
     sql`${nodes.scanStatus} <> 'suspected_csam'`,
   ];
   if (opts.cursor) {

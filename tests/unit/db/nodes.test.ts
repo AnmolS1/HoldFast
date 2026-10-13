@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
+import { restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
 import {
   createFolder,
   findByR2Key,
@@ -406,6 +407,99 @@ describe("listRecent and listStarred", () => {
     } while (cursor && pages < 10);
     expect(pages).toBe(3);
     expect(all).toEqual(expected);
+  });
+
+  it("hidden is inherited: a file inside a taken-down folder leaves Recent and Starred, and the folder leaves its parent's listing — until the takedown is restored", async () => {
+    const owner = await makeUser(db);
+    const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000);
+    const top = await makeFolder(db, owner, null, `top-${rand()}`);
+    const folder = await makeFolder(db, owner, top.id, "folder", { starred: true });
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    // Opened and starred BEFORE the takedown: one directly inside, one a level further down.
+    const inside = await makeFile(db, owner, folder.id, "inside.txt", {
+      lastAccessedAt: at(1),
+      starred: true,
+    });
+    const deeper = await makeFile(db, owner, sub.id, "deeper.txt", { lastAccessedAt: at(2), starred: true });
+    const outside = await makeFile(db, owner, top.id, "outside.txt", {
+      lastAccessedAt: at(3),
+      starred: true,
+    });
+
+    const recent = async () =>
+      (await listRecent(db, owner, { limit: 50, visibleStatuses: OWNER })).map((n) => n.id);
+    const starred = async () =>
+      (await listStarred(db, owner, { limit: 50, visibleStatuses: OWNER })).items.map((n) => n.id);
+    const children = async () =>
+      (
+        await listChildren(db, {
+          parentId: top.id,
+          scope: { ownerId: owner },
+          sort: "name",
+          dir: "asc",
+          limit: 50,
+          visibleStatuses: OWNER,
+        })
+      ).items.map((n) => n.id);
+
+    // The control: before the takedown all of it is listed.
+    expect(await recent()).toEqual([inside.id, deeper.id, outside.id]);
+    expect(await starred()).toEqual([folder.id, deeper.id, inside.id, outside.id]);
+    expect(await children()).toEqual([folder.id, outside.id]);
+
+    expect(await takedownNode(db, folder.id, { reason: "abuse", by: null })).toBe(true);
+    expect(await recent()).toEqual([outside.id]);
+    expect(await starred()).toEqual([outside.id]);
+    expect(await children()).toEqual([outside.id]);
+
+    expect(await restoreTakedown(db, folder.id)).toBe(true);
+    expect(await recent()).toEqual([inside.id, deeper.id, outside.id]);
+    expect(await starred()).toEqual([folder.id, deeper.id, inside.id, outside.id]);
+    expect(await children()).toEqual([folder.id, outside.id]);
+  });
+
+  it("listStarred: a page boundary that falls on a hidden row neither skips nor repeats a visible one", async () => {
+    const owner = await makeUser(db);
+    const folderC = await makeFolder(db, owner, null, `zz-c-${rand()}`);
+    const folderD = await makeFolder(db, owner, null, `zz-d-${rand()}`);
+    const file = (parentId: string | null, name: string) =>
+      makeFile(db, owner, parentId, name, { starred: true });
+    const a = await file(null, "a.txt");
+    const b = await file(null, "b.txt");
+    const c = await file(folderC.id, "c.txt");
+    const d = await file(folderD.id, "d.txt");
+    const e = await file(null, "e.txt");
+    const f = await file(null, "f.txt");
+    const page = (limit: number, cursor: string | null = null) =>
+      listStarred(db, owner, { cursor, limit, visibleStatuses: OWNER });
+    const rest = async (cursor: string | null) => {
+      const ids: string[] = [];
+      for (let guard = 0; cursor && guard < 10; guard++) {
+        const next = await page(2, cursor);
+        ids.push(...next.items.map((n) => n.id));
+        cursor = next.nextCursor;
+      }
+      return ids;
+    };
+
+    // The cursor's own row (c, last of the first page) is hidden before the next page is asked for…
+    const first = await page(3);
+    expect(first.items.map((n) => n.id)).toEqual([a.id, b.id, c.id]);
+    await takedownNode(db, folderC.id, { reason: "abuse", by: null });
+    // …and so is the row the next page would have started with (d).
+    await takedownNode(db, folderD.id, { reason: "abuse", by: null });
+    expect(await rest(first.nextCursor)).toEqual([e.id, f.id]);
+
+    // From the start: the hidden rows are not counted into a page, so no page comes back short
+    // and none repeats a row.
+    const one = await page(2);
+    expect(one.items.map((n) => n.id)).toEqual([a.id, b.id]);
+    expect(await rest(one.nextCursor)).toEqual([e.id, f.id]);
+
+    // The control: restored, the same walk passes through c and d.
+    await restoreTakedown(db, folderC.id);
+    await restoreTakedown(db, folderD.id);
+    expect(await rest(one.nextCursor)).toEqual([c.id, d.id, e.id, f.id]);
   });
 });
 

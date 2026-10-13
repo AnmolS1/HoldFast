@@ -23,7 +23,7 @@ import {
   uploads,
   user,
 } from "../schema";
-import { isDescendantOrSelf, effectiveTrashed, notEffectivelyTrashed } from "./tree";
+import { isDescendantOrSelf, effectiveTrashed, notEffectivelyHidden, notEffectivelyTrashed } from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
 export type SortDir = "asc" | "desc";
@@ -53,7 +53,12 @@ function clampLimit(limit: number, max: number): number {
   return Math.min(limit, max);
 }
 
-/** The exclusions every listing shares. */
+/**
+ * The exclusions every listing shares — each a test of the row ITSELF. A listing that is not
+ * scoped to one parent the caller has already resolved (Starred, Recent) adds the inherited
+ * forms, `notEffectivelyTrashed()` and `notEffectivelyHidden()`: a file inside a trashed or a
+ * taken-down folder is not listed either.
+ */
 function visible(visibleStatuses: readonly ScanStatus[]): SQL[] {
   return [
     isNull(nodes.system),
@@ -223,7 +228,8 @@ export type ListChildrenArgs = {
 /**
  * The direct children of a folder (or the top level), folders first, keyset-paginated. The cursor
  * is opaque and tied to the folder, the sort and the direction; any other cursor is `validation`.
- * Whether the folder itself may be listed (permission, trash) is the caller's check.
+ * Whether the folder itself may be listed (permission, trash, a takedown of it or of an ancestor)
+ * is the caller's check; a taken-down CHILD is left out here, by the row's own test.
  */
 export async function listChildren(
   db: Executor,
@@ -247,7 +253,10 @@ export async function listChildren(
   });
 }
 
-/** The owner's starred nodes by name, folders first; nothing that sits in the trash. */
+/**
+ * The owner's starred nodes by name, folders first; nothing that sits in the trash or under a
+ * taken-down folder.
+ */
 export async function listStarred(
   db: Executor,
   ownerId: string,
@@ -262,6 +271,7 @@ export async function listStarred(
       eq(nodes.starred, true),
       ...visible(opts.visibleStatuses),
       notEffectivelyTrashed(),
+      notEffectivelyHidden(),
     ],
     sort: "name",
     dir: "asc",
@@ -270,7 +280,10 @@ export async function listStarred(
   });
 }
 
-/** The owner's most recently opened files (at most 50), newest first. */
+/**
+ * The owner's most recently opened files (at most 50), newest first; nothing that sits in the
+ * trash or under a taken-down folder.
+ */
 export async function listRecent(
   db: Executor,
   ownerId: string,
@@ -288,6 +301,7 @@ export async function listRecent(
         isNotNull(nodes.lastAccessedAt),
         ...visible(opts.visibleStatuses),
         notEffectivelyTrashed(),
+        notEffectivelyHidden(),
       ),
     )
     .orderBy(sql`${nodes.lastAccessedAt} DESC NULLS LAST`, desc(nodes.updatedAt), desc(nodes.id))

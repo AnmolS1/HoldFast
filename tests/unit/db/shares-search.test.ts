@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
+import { restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
 import { OWNER_VISIBLE_STATUSES } from "../../../src/worker/db/queries/nodes";
 import { escapeLike, searchNames } from "../../../src/worker/db/queries/search";
 import {
@@ -109,7 +110,7 @@ describe("shares", () => {
     expect(rows[0]).toMatchObject({ id: direct.id, granteeUserId: grantee, role: "viewer" });
   });
 
-  it("sharedWithMe: active shares on live nodes of active owners; sharedByMe: everything I granted", async () => {
+  it("sharedWithMe: active shares on live nodes of active owners; sharedByMe: what I granted on nodes I can still open", async () => {
     const me = await makeUser(db);
     const good = await makeUser(db);
     const suspended = await makeUser(db, { suspendedAt: new Date() });
@@ -160,15 +161,77 @@ describe("shares", () => {
     expect(entry.share).toMatchObject({ id: visibleShare.id, role: "editor", granteeUserId: me });
     expect(entry.node).toMatchObject({ ownerId: good, name: visible.name });
 
+    // The owner's list (changed by seam pass H1, to T24's `GET /api/shares/mine`): a share on a
+    // trashed node — itself or by its folder — on a taken-down node or on a locked
+    // (`suspected_csam`) one is absent; the other scan states are the owner's to see.
+    const [, lockedId] = blocked;
     const granted = await sharedByMe(db, good);
     expect(granted.map((r) => r.node.id).sort()).toEqual(
-      [visible.id, trashed.id, insideTrash.id, down.id, pendingOnly.id, ...blocked].sort(),
+      [visible.id, pendingOnly.id, ...blocked.filter((id) => id !== lockedId)].sort(),
     );
+    for (const absent of [trashed.id, insideTrash.id, down.id, lockedId!]) {
+      expect(
+        granted.some((r) => r.node.id === absent),
+        absent,
+      ).toBe(false);
+    }
     expect(granted.find((r) => r.node.id === pendingOnly.id)!.share).toMatchObject({
       granteeUserId: null,
       activatedAt: null,
     });
     expect(await sharedByMe(db, me)).toEqual([]);
+  });
+
+  it("sharedByMe: a share on a system node is absent; trash is inherited and comes back on restore", async () => {
+    const owner = await makeUser(db);
+    const friend = await makeUser(db);
+    const avatar = await makeFile(db, owner, null, "avatar", { system: "avatar" });
+    await makeShare(db, avatar.id, owner, { userId: friend });
+    const folder = await makeFolder(db, owner, null, `folder-${rand()}`);
+    const inside = await makeFile(db, owner, folder.id, "inside.txt");
+    await makeShare(db, inside.id, owner, { userId: friend });
+    const kept = await makeFile(db, owner, null, `kept-${rand()}.txt`);
+    await makeShare(db, kept.id, owner, { userId: friend });
+    const listed = async () => (await sharedByMe(db, owner)).map((r) => r.node.id).sort();
+
+    // The control for the system test is the row beside it; for trash, the state before.
+    expect(await listed()).toEqual([inside.id, kept.id].sort());
+    await db.update(nodes).set({ deletedAt: new Date(), trashedRoot: true }).where(eq(nodes.id, folder.id));
+    expect(await listed()).toEqual([kept.id]);
+    await db.update(nodes).set({ deletedAt: null, trashedRoot: false }).where(eq(nodes.id, folder.id));
+    expect(await listed()).toEqual([inside.id, kept.id].sort());
+    // Nothing was written to the share rows.
+    expect(await countGrantees(db, avatar.id)).toBe(1);
+  });
+
+  it("hidden is inherited: shares on a taken-down folder and on a file inside it leave both lists, and return when the takedown is restored", async () => {
+    const owner = await makeUser(db);
+    const me = await makeUser(db);
+    const top = await makeFolder(db, owner, null, `top-${rand()}`);
+    const folder = await makeFolder(db, owner, top.id, "folder");
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const inside = await makeFile(db, owner, sub.id, "inside.txt");
+    const sibling = await makeFile(db, owner, top.id, "sibling.txt");
+    for (const node of [folder, inside, sibling]) await makeShare(db, node.id, owner, { userId: me });
+    const withMe = async () =>
+      (await sharedWithMe(db, me, { visibleStatuses: ["clean"] })).map((r) => r.node.id).sort();
+    const byMe = async () => (await sharedByMe(db, owner)).map((r) => r.node.id).sort();
+    const all = [folder.id, inside.id, sibling.id].sort();
+
+    // The control: before the takedown all three shares are in both lists.
+    expect(await withMe()).toEqual(all);
+    expect(await byMe()).toEqual(all);
+
+    await takedownNode(db, folder.id, { reason: "dmca", by: null });
+    expect(await withMe()).toEqual([sibling.id]);
+    expect(await byMe()).toEqual([sibling.id]);
+
+    await restoreTakedown(db, folder.id);
+    expect(await withMe()).toEqual(all);
+    expect(await byMe()).toEqual(all);
+    // The share rows were never touched.
+    expect(await countGrantees(db, folder.id)).toBe(1);
+    expect(await countGrantees(db, inside.id)).toBe(1);
   });
 });
 
@@ -227,6 +290,48 @@ describe("searchNames", () => {
       notShared,
     };
   }
+
+  it("hidden is inherited in all three scopes: a taken-down folder and a file inside it are not found, until the takedown is restored", async () => {
+    const token = `h${rand(5)}`;
+    const owner = await makeUser(db);
+    const me = await makeUser(db);
+    const top = await makeFolder(db, owner, null, `top-${rand()}`);
+    const folder = await makeFolder(db, owner, top.id, `${token} folder`);
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const inside = await makeFile(db, owner, sub.id, `${token}-inside.txt`);
+    const sibling = await makeFile(db, owner, top.id, `${token}-sibling.txt`);
+    await makeShare(db, top.id, owner, { userId: me });
+    const mineOfMe = await makeFile(db, me, null, `${token}-my-own.txt`);
+    const split = { mine: OWNER, shared: ["clean"] as const };
+    const found = async (userId: string, scope: "mine" | "shared" | "all") =>
+      (
+        await searchNames(db, userId, token, {
+          scope,
+          limit: 50,
+          visibleStatuses: scope === "all" ? split : scope === "mine" ? OWNER : ["clean"],
+        })
+      ).items
+        .map((hit) => hit.node.id)
+        .sort();
+    const everything = [folder.id, inside.id, sibling.id].sort();
+
+    // The control: before the takedown every scope finds the folder and the file inside it.
+    expect(await found(owner, "mine")).toEqual(everything);
+    expect(await found(me, "shared")).toEqual(everything);
+    expect(await found(owner, "all")).toEqual(everything);
+    expect(await found(me, "all")).toEqual([...everything, mineOfMe.id].sort());
+
+    await takedownNode(db, folder.id, { reason: "abuse", by: null });
+    expect(await found(owner, "mine")).toEqual([sibling.id]);
+    expect(await found(me, "shared")).toEqual([sibling.id]);
+    expect(await found(owner, "all")).toEqual([sibling.id]);
+    expect(await found(me, "all")).toEqual([sibling.id, mineOfMe.id].sort());
+
+    await restoreTakedown(db, folder.id);
+    expect(await found(owner, "mine")).toEqual(everything);
+    expect(await found(me, "shared")).toEqual(everything);
+    expect(await found(me, "all")).toEqual([...everything, mineOfMe.id].sort());
+  });
 
   it("mine: ranks a name prefix, then a word prefix, then the rest; hides what listings hide", async () => {
     const lib = await library();

@@ -4,8 +4,8 @@
 // Matching: `name ILIKE '%q%'` or trigram similarity (`name % q`, pg_trgm's default threshold
 // 0.3). Both are served by the GIN trigram index on `nodes.name`. Ranking: a name that starts
 // with the query, then a word that starts with it, then the rest by similarity.
-// Exclusions are the listings' own: system nodes, taken-down nodes, anything in the trash
-// (directly or by ancestry) — for the owner as well.
+// Exclusions are the listings' own: system nodes, and anything in the trash or taken down —
+// directly or by ancestry (a file inside a taken-down folder is not found) — for the owner as well.
 
 import { inArray, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
@@ -13,7 +13,7 @@ import { decodeCursor, encodeCursor } from "../cursor";
 import { QueryError } from "../errors";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanStatus } from "../schema";
-import { notEffectivelyTrashed, type Role } from "./tree";
+import { notEffectivelyHidden, notEffectivelyTrashed, type Role } from "./tree";
 import { ownerIsActive } from "./users";
 
 export type SearchScope = "mine" | "shared" | "all";
@@ -90,7 +90,7 @@ function matchAndRank(
   const conditions: SQL[] = [
     sql`(n.name ILIKE ${"%" + escaped + "%"} OR (n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real))`,
     sql`n.system IS NULL`,
-    sql`n.takedown_at IS NULL`,
+    notEffectivelyHidden("n"),
     notEffectivelyTrashed("n"),
     sql`n.scan_status IN (${statusList(statuses)})`,
   ];

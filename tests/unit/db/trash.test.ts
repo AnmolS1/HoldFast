@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { LegalHoldError, QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import { closeNotice } from "../../../src/worker/db/queries/moderation";
+import { closeNotice, restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
 import { getNode, OWNER_VISIBLE_STATUSES, listChildren } from "../../../src/worker/db/queries/nodes";
 import { release } from "../../../src/worker/db/queries/quota";
 import {
@@ -174,6 +174,26 @@ describe("trash and restore", () => {
     expect(((await rejection(listTrash(db, other, { cursor: first.nextCursor }))) as QueryError).code).toBe(
       "validation",
     );
+  });
+
+  it("listTrash: a trashed root under a taken-down ancestor is not listed, until the takedown is restored", async () => {
+    const owner = await makeUser(db);
+    const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000);
+    const folder = await makeFolder(db, owner, null, `folder-${rand()}`);
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const inFolder = await makeFile(db, owner, folder.id, "in.txt", { deletedAt: at(1), trashedRoot: true });
+    const deeper = await makeFile(db, owner, sub.id, "deeper.txt", { deletedAt: at(2), trashedRoot: true });
+    const outside = await makeFile(db, owner, null, "outside.txt", { deletedAt: at(3), trashedRoot: true });
+    const listed = async () => (await listTrash(db, owner)).items.map((n) => n.id);
+
+    // The control: before the takedown all three trashed roots are listed.
+    expect(await listed()).toEqual([inFolder.id, deeper.id, outside.id]);
+    await takedownNode(db, folder.id, { reason: "dmca", by: null });
+    expect(await listed()).toEqual([outside.id]);
+    // A page is filled with visible rows only: the hidden ones leave no gap and no cursor.
+    expect(await listTrash(db, owner, { limit: 1 })).toMatchObject({ nextCursor: null });
+    await restoreTakedown(db, folder.id);
+    expect(await listed()).toEqual([inFolder.id, deeper.id, outside.id]);
   });
 
   it("purgeDue returns roots past purgeAfter and every purge-requested root; versionsDue the old versions", async () => {
