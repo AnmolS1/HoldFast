@@ -649,6 +649,19 @@ export const templates = {
       { text: "Your own downloads are not affected." },
     ],
   }),
+  // One link's own daily limit. Like the owner cap it pauses nothing: requests are refused while
+  // the day's ledger is full and served again when it has room (a refund, or the day rolling
+  // over), so this says "limit", never "paused".
+  linkLimitReached: (d: { name?: unknown; itemName: unknown }): Draft => ({
+    subject: "A public link reached today's transfer limit",
+    heading: "A public link reached today's transfer limit",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: `The public link to “${safeLabel(d.itemName)}” reached today's transfer limit, so downloads through it are unavailable for now. It comes back on its own, at the latest at midnight UTC; there is nothing you need to do.`,
+      },
+    ],
+  }),
   linkAvailableAgain: (d: { name?: unknown; itemName: unknown }): Draft => ({
     subject: "A public link is available again",
     heading: "A public link is available again",
@@ -809,6 +822,7 @@ export const KINDS = {
   uploadNotIntact: { class: "transactional_user", severity: "routine", bucket: "product" },
   linkPaused: { class: "transactional_user", severity: "routine", bucket: "product" },
   linkCapReached: { class: "transactional_user", severity: "routine", bucket: "product" },
+  linkLimitReached: { class: "transactional_user", severity: "routine", bucket: "product" },
   linkAvailableAgain: { class: "transactional_user", severity: "routine", bucket: "product" },
   adminDigest: { class: "transactional_user", severity: "routine", bucket: "product" },
   reportReviewed: { class: "transactional_user", severity: "routine", bucket: "product" },
@@ -1452,6 +1466,8 @@ export const sendLinkPaused = (deps: ServiceDeps, d: To & { itemName: string }) 
   deliver(deps, "linkPaused", d.to, () => templates.linkPaused(d), SYSTEM);
 export const sendLinkCapReached = (deps: ServiceDeps, d: To) =>
   deliver(deps, "linkCapReached", d.to, () => templates.linkCapReached(d), SYSTEM);
+export const sendLinkLimitReached = (deps: ServiceDeps, d: To & { itemName: string }) =>
+  deliver(deps, "linkLimitReached", d.to, () => templates.linkLimitReached(d), SYSTEM);
 export const sendLinkAvailableAgain = (deps: ServiceDeps, d: To & { itemName: string }) =>
   deliver(deps, "linkAvailableAgain", d.to, () => templates.linkAvailableAgain(d), SYSTEM);
 export const sendAdminDigest = (
