@@ -305,15 +305,25 @@ export const NO_SUCH_OWNER_ID = "no-such-owner";
 
 export type Access = {
   role: Role;
-  /** The nearest node (this one or an ancestor) with a share to the user; null for the owner. */
+  /**
+   * The node (this one or an ancestor) whose share GRANTS `role`; with several shares of that
+   * role on the path, the OUTERMOST. Null for the owner. A grantee may not rename, move or trash
+   * this node — its name and place belong to a folder their role does not come from — and may do
+   * so with everything below it.
+   */
   shareRootId: string | null;
-  /** Whether the user may add files here: always for the owner, the share's toggle for an editor. */
+  /**
+   * Whether the user may add files here: always for the owner; for an editor, when ANY of their
+   * editor shares on the path allows it (each share's toggle holds for everything under it).
+   */
   canUpload: boolean;
 };
 
 /**
  * What `userId` may do with the node, through ownership or through ACTIVATED shares on the node
- * or any ancestor (the highest role wins). Null when there is no access — and, for anyone but
+ * or any ancestor. THE HIGHEST ROLE OVER ALL SHARES ON THE PATH WINS, not the nearest: an editor
+ * of an outer folder stays an editor inside an inner folder that is also shared with them as a
+ * viewer (`search.searchShared` takes the same maximum). Null when there is no access — and, for anyone but
  * the owner, when the node's owner is banned, suspended or scheduled for deletion.
  *
  * Trash, takedown and scan state are NOT considered here: callers check those separately.
@@ -353,16 +363,18 @@ export async function effectiveAccess(db: Executor, userId: string, nodeId: stri
   if (!self) return null;
   if (self.owner_id === userId) return { role: "owner", shareRootId: null, canUpload: true };
 
+  // Nearest first (the chain is ordered by depth): the last of a list is the outermost.
   const grants = chain.filter((row) => row.role !== null);
-  const nearest = grants[0];
-  if (!nearest) return null;
+  if (grants.length === 0) return null;
   if (!isActive(ownerState)) return null;
 
-  const nearestEditor = grants.find((row) => row.role === "editor");
-  if (nearestEditor) {
-    return { role: "editor", shareRootId: nearest.id, canUpload: nearestEditor.can_upload === true };
-  }
-  return { role: "viewer", shareRootId: nearest.id, canUpload: false };
+  const editors = grants.filter((row) => row.role === "editor");
+  const granting = editors.length > 0 ? editors : grants;
+  return {
+    role: editors.length > 0 ? "editor" : "viewer",
+    shareRootId: granting[granting.length - 1]!.id,
+    canUpload: editors.some((row) => row.can_upload === true),
+  };
 }
 
 /** `effectiveAccess(...)?.role ?? null`. */

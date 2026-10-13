@@ -73,9 +73,12 @@ export type Role = "viewer" | "editor" | "owner";
 
 export interface Access {
   role: Role;
-  /** The nearest node with a share to the user (or the link's root); null for the owner. */
+  /**
+   * The node whose share grants `role` — the outermost, when several shares of that role lie on
+   * the path — or the link's root; null for the owner. See `tree.Access`.
+   */
   shareRootId: string | null;
-  /** Whether files may be added here: always for the owner, the share's toggle for an editor. */
+  /** Whether files may be added here: always for the owner; for an editor, when a share of theirs on the path allows it. */
   canUpload: boolean;
   via: "owner" | "share" | "link";
 }
