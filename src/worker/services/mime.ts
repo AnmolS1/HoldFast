@@ -13,42 +13,25 @@
 //    degrades to the type icon in the files host).
 
 import { fileTypeFromBuffer } from "file-type";
-import {
-  MIME_CATEGORIES,
-  PREVIEW_TEXT_MAX_BYTES,
-  THUMB_INPUT_MAX_BYTES,
-  type MimeCategoryName,
-} from "../../shared/constants";
+import { INLINE_TYPES, PREVIEW_TEXT_TYPES, THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
+import { BARE_TYPE, inlineAllowed, OCTET_STREAM } from "../../shared/mime";
+
+// The pure half of the policy — the lists and every predicate that only looks at a type, an
+// extension and a size — lives in `src/shared` (the SPA's viewers ask the same code). It is
+// re-exported here under the same names.
+export { INLINE_TYPES, PREVIEW_TEXT_TYPES };
+export {
+  categoryOf,
+  inlineAllowed,
+  inlineKindAllowed,
+  isActiveType,
+  OCTET_STREAM,
+  previewFetchAllowed,
+  serveType,
+} from "../../shared/mime";
 
 /** How many leading bytes of an object `sniff` is given. A shorter object passes all of it. */
 export const SNIFF_PREFIX_BYTES = 8_192;
-
-export const OCTET_STREAM = "application/octet-stream";
-
-/**
- * Media a browser may render in place. The strings are the ones the detector emits: an .m4a is
- * `audio/x-m4a` and an .m4v `video/x-m4v` (the MP4 container under the detector's names).
- */
-export const INLINE_TYPES: readonly string[] = Object.freeze([
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
-  "image/avif",
-  "image/bmp",
-  "image/heic",
-  "image/heif",
-  "video/mp4",
-  "video/webm",
-  "video/quicktime",
-  "video/x-m4v",
-  "audio/mpeg",
-  "audio/ogg",
-  "audio/wav",
-  "audio/flac",
-  "audio/mp4",
-  "audio/x-m4a",
-]);
 
 /**
  * Images the thumbnailer is asked to transform. AVIF and BMP are inline types but not here (the
@@ -62,9 +45,6 @@ const THUMB_TYPES: readonly string[] = Object.freeze([
   "image/heic",
   "image/heif",
 ]);
-
-/** Text the SPA's text viewer may fetch, besides whatever `categoryOf` calls code. */
-const PREVIEW_TEXT_TYPES: readonly string[] = Object.freeze(["text/plain", "text/markdown", "text/csv"]);
 
 /** Extensions that get a warning page before a public-link download. */
 const DANGEROUS_EXTS: readonly string[] = Object.freeze([
@@ -110,9 +90,6 @@ const DANGEROUS_TYPES: readonly string[] = Object.freeze([
   "application/x-xpinstall",
 ]);
 
-// A bare `type/subtype`: no parameters, no spaces, nothing a header could be broken with.
-const BARE_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
-
 // Characters that reorder the text of a file name: the bidi marks, embeddings, overrides and
 // isolates. (Not the zero-width joiner: emoji sequences are made of it.)
 const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
@@ -127,47 +104,6 @@ export function extOf(name: string): string {
   const cleaned = name.replace(BIDI, "").replace(/[. ]+$/, "");
   const dot = cleaned.lastIndexOf(".");
   return dot <= 0 ? "" : cleaned.slice(dot + 1).toLowerCase();
-}
-
-/**
- * True for a type that can run script when a browser opens it: HTML, SVG, and every XML type
- * (`application/xml`, `text/xml`, anything ending in `+xml` or `/xml`).
- */
-export function isActiveType(type: string | null | undefined): boolean {
-  const t = lower(type).split(";", 1)[0]!.trim();
-  return t === "text/html" || t.endsWith("+xml") || t.endsWith("/xml");
-}
-
-/** True when a response of this type may be rendered in place (`Content-Disposition: inline`). */
-export function inlineAllowed(servedType: string | null | undefined): boolean {
-  return INLINE_TYPES.includes(lower(servedType));
-}
-
-/**
- * The `Content-Type` a file is served with: its detected type, or `application/octet-stream` when
- * there is none, when it is not a bare `type/subtype`, or when it is an active type. The declared
- * type and the name are never used (`name` is part of the signature only).
- */
-export function serveType(mimeSniffed: string | null | undefined, name: string): string {
-  void name;
-  const type = lower(mimeSniffed);
-  if (!BARE_TYPE.test(type) || isActiveType(type)) return OCTET_STREAM;
-  return type;
-}
-
-/** The category a file shows under. A label only — see `MIME_CATEGORIES`. */
-export function categoryOf(mimeSniffed: string | null | undefined, ext: string): MimeCategoryName {
-  const type = lower(mimeSniffed);
-  const extension = lower(ext).replace(/^\./, "");
-  const names = Object.keys(MIME_CATEGORIES) as MimeCategoryName[];
-  const byType = names.find((name) => (MIME_CATEGORIES[name].types as readonly string[]).includes(type));
-  const byExt = names.find((name) => (MIME_CATEGORIES[name].exts as readonly string[]).includes(extension));
-  // Not yet scanned, or detected as nothing in particular (plain text, unknown bytes): the
-  // extension is the better label. A SPECIFIC detected type is never overruled by the name — a
-  // program called photo.jpg does not show as an image.
-  const generic = type === "" || type === "text/plain" || type === OCTET_STREAM;
-  if (generic) return byExt ?? byType ?? "other";
-  return byType ?? "other";
 }
 
 /** True for a file a public link shows a warning page for before the download starts. */
@@ -201,33 +137,6 @@ export function contentDisposition(kind: DispositionKind, name: string, servedTy
     (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`,
   );
   return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
-}
-
-/**
- * The types the SPA previews by FETCHING bytes (the PDF viewer, the text viewer) instead of by
- * navigation: PDF, and text or code up to `PREVIEW_TEXT_MAX_BYTES`. Never an active type, and
- * never a file with no detected type. The response is still an attachment.
- */
-export function previewFetchAllowed(file: {
-  mimeSniffed: string | null | undefined;
-  ext: string;
-  size: number;
-}): boolean {
-  const type = lower(file.mimeSniffed);
-  if (type === "" || type === OCTET_STREAM || isActiveType(type)) return false;
-  if (type === "application/pdf") return true;
-  const text = PREVIEW_TEXT_TYPES.includes(type) || categoryOf(type, file.ext) === "code";
-  return text && Number.isFinite(file.size) && file.size <= PREVIEW_TEXT_MAX_BYTES;
-}
-
-/** The rule for minting and for serving an `inline` token. */
-export function inlineKindAllowed(node: {
-  mimeSniffed: string | null | undefined;
-  name: string;
-  ext: string;
-  size: number;
-}): boolean {
-  return inlineAllowed(serveType(node.mimeSniffed, node.name)) || previewFetchAllowed(node);
 }
 
 /**

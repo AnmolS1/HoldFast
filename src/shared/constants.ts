@@ -32,6 +32,45 @@ export type ThumbSize = (typeof THUMB_SIZES)[number];
 export const THUMB_INPUT_MAX_BYTES = 20_000_000;
 /** Largest text or code file the text viewer fetches. */
 export const PREVIEW_TEXT_MAX_BYTES = 2_000_000;
+/**
+ * Largest PDF and largest image the viewers open. Above either there is no preview, only the
+ * Download action: the PDF renderer holds several times the file in memory, and a phone must
+ * survive it.
+ */
+export const PDF_PREVIEW_MAX_BYTES = 50_000_000;
+export const IMAGE_PREVIEW_MAX_BYTES = 50_000_000;
+
+/**
+ * Media a browser may render in place. The strings are the ones the detector emits: an .m4a is
+ * `audio/x-m4a` and an .m4v `video/x-m4v` (the MP4 container under the detector's names).
+ */
+export const INLINE_TYPES: readonly string[] = Object.freeze([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+  "image/heic",
+  "image/heif",
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-m4v",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/flac",
+  "audio/mp4",
+  "audio/x-m4a",
+]);
+
+/** Text the SPA's text viewer may fetch, besides whatever the Worker's `categoryOf` calls code. */
+export const PREVIEW_TEXT_TYPES: readonly string[] = Object.freeze([
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+]);
 
 // ── zip ─────────────────────────────────────────────────────────────────────────────────────
 
