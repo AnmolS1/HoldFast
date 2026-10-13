@@ -930,7 +930,7 @@ describe("constants", () => {
       PREVIEW_TEXT_MAX_BYTES: 2_000_000,
       ZIP_URL_BATCH: 50,
       ZIP_MAX_ENTRIES: 10_000,
-      TOKEN_TTL: { download: 300, inline: 900, thumb: 600, scan: 900, zip: 900 },
+      TOKEN_TTL: { download: 300, inline: 900, thumb: 600, zip: 900 },
       LINK_TOKEN_BYTES: 16,
       PASSWORD_FREE_ATTEMPTS: 3,
       PASSWORD_LOCK_MAX_SEC: 900,

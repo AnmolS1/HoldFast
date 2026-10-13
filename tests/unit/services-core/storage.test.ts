@@ -9,11 +9,13 @@ import {
   keyFor,
   parseUploadKey,
   storage,
+  type GetResult,
   thumbKey,
   thumbPrefix,
 } from "../../../src/worker/services/storage";
 
 const store = storage(env);
+const textOf = async (result: GetResult) => (result?.kind === "body" ? result.object.text() : null);
 const OWNER = "o".repeat(32);
 const encoder = new TextEncoder();
 const fresh = () => ({ nodeId: uuidv7(), versionId: uuidv7() });
@@ -127,8 +129,7 @@ describe("put, head, get", () => {
     // The declared type is never stored under u/.
     expect(head?.httpMetadata?.contentType).toBe("application/octet-stream");
     expect(head?.customMetadata).toEqual({ nodeId, ownerId: OWNER });
-    const object = await store.get(key);
-    expect(object && "body" in object ? await object.text() : null).toBe("hello storage");
+    expect(await textOf(await store.get(key))).toBe("hello storage");
     expect(await store.head(freshKey())).toBeNull();
     expect(await store.get(freshKey())).toBeNull();
   });
@@ -149,8 +150,7 @@ describe("put, head, get", () => {
     // The control: the bare binding refuses this stream.
     await expect(env.FILES.put(freshKey(), streamOf(a, b))).rejects.toThrow(/known length/);
     await store.put(key, streamOf(a, b), { size: a.length + b.length });
-    const object = await store.get(key);
-    expect(object && "body" in object ? await object.text() : null).toBe("first second");
+    expect(await textOf(await store.get(key))).toBe("first second");
   });
 
   it("a body that is not the declared size fails and stores nothing", async () => {
@@ -168,17 +168,268 @@ describe("put, head, get", () => {
       "upload key",
     );
   });
+});
 
-  it("reads a range and honours a condition", async () => {
+describe("get: ranges and conditions", () => {
+  // Exactly 1,000 bytes, byte i = i mod 251 — the object the range spike measured on the real store.
+  const k1000 = new Uint8Array(1000).map((_, i) => i % 251);
+  async function stored() {
     const key = freshKey();
-    const stored = await store.put(key, encoder.encode("0123456789"), { size: 10 });
-    const range = await store.get(key, { range: { offset: 2, length: 3 } });
-    expect(range && "body" in range ? await range.text() : null).toBe("234");
-    const suffix = await store.get(key, { range: { suffix: 4 } });
-    expect(suffix && "body" in suffix ? await suffix.text() : null).toBe("6789");
-    const unchanged = await store.get(key, { onlyIf: { etagDoesNotMatch: stored.etag } });
-    expect(unchanged).not.toBeNull();
-    expect(unchanged && "body" in unchanged).toBe(false);
+    const object = await store.put(key, k1000, { size: 1000 });
+    return { key, etag: object.etag };
+  }
+  /** What a read gave, in the spike's own terms. */
+  async function seen(result: GetResult) {
+    if (result === null) return "null";
+    if (result.kind !== "body") return result;
+    const bytes = new Uint8Array(await result.object.arrayBuffer());
+    return { kind: "body", range: result.object.range, bodyBytes: bytes.length, firstByte: bytes[0] ?? null };
+  }
+
+  it("a satisfiable range is the part asked for, clamped to the object", async () => {
+    const { key } = await stored();
+    const cases: [R2Range, { offset: number; length: number }, number][] = [
+      [{ offset: 0 }, { offset: 0, length: 1000 }, 0],
+      [{ suffix: 100 }, { offset: 900, length: 100 }, 147],
+      [{ offset: 999 }, { offset: 999, length: 1 }, 246],
+      [{ offset: 0, length: 5000 }, { offset: 0, length: 1000 }, 0],
+      [{ offset: 900, length: 200 }, { offset: 900, length: 100 }, 147],
+      [{ suffix: 2000 }, { offset: 0, length: 1000 }, 0],
+      [{ length: 10 }, { offset: 0, length: 10 }, 0],
+      [{ offset: 2, length: 3 }, { offset: 2, length: 3 }, 2],
+    ];
+    for (const [range, expected, firstByte] of cases) {
+      expect(await seen(await store.get(key, { range })), JSON.stringify(range)).toEqual({
+        kind: "body",
+        range: expected,
+        bodyBytes: expected.length,
+        firstByte,
+      });
+    }
+    // A read without a range reports the whole object as its range.
+    expect(await seen(await store.get(key))).toEqual({
+      kind: "body",
+      range: { offset: 0, length: 1000 },
+      bodyBytes: 1000,
+      firstByte: 0,
+    });
+  });
+
+  it("a range outside the object is unsatisfiable_range with the size — never a throw", async () => {
+    const { key } = await stored();
+    const outside: unknown[] = [
+      { offset: 5000 },
+      { offset: 1000 },
+      { offset: 1000, length: 6 },
+      { offset: 0, length: 0 },
+      { suffix: 0 },
+      { offset: -1 },
+      { offset: 1.5 },
+      { length: -3 },
+      { suffix: -1 },
+      { offset: Number.NaN },
+      { offset: "0" },
+      {},
+    ];
+    for (const range of outside) {
+      expect(await store.get(key, { range: range as R2Range }), JSON.stringify(range)).toEqual({
+        kind: "unsatisfiable_range",
+        size: 1000,
+      });
+    }
+    // The last byte is inside; one past it is not.
+    expect((await store.get(key, { range: { offset: 999 } }))?.kind).toBe("body");
+    expect((await store.get(key, { range: { offset: 1000 } }))?.kind).toBe("unsatisfiable_range");
+    // An empty object has no satisfiable range at all — and reads whole.
+    const empty = freshKey();
+    await store.put(empty, new Uint8Array(0), { size: 0 });
+    for (const range of [{ offset: 0 }, { suffix: 10 }, { offset: 0, length: 10 }]) {
+      expect(await store.get(empty, { range }), JSON.stringify(range)).toEqual({
+        kind: "unsatisfiable_range",
+        size: 0,
+      });
+    }
+    expect((await store.get(empty))?.kind).toBe("body");
+  });
+
+  it("what the bare binding does with the same ranges here (recorded: the local store against the real one)", async () => {
+    const { key } = await stored();
+    const rows: string[] = [];
+    for (const range of [
+      { offset: 5000 },
+      { offset: 1000 },
+      { offset: 0, length: 0 },
+      { suffix: 0 },
+      { offset: -1 },
+    ]) {
+      const outcome = await env.FILES.get(key, { range }).then(
+        async (object) => (object ? `body of ${(await object.arrayBuffer()).byteLength} bytes` : "null"),
+        (error: Error) => `THROWS ${error.message}`,
+      );
+      rows.push(`${JSON.stringify(range)}\t${outcome}`);
+    }
+    console.log(`RANGE-TABLE range\tlocal binding\n${rows.map((row) => `RANGE-TABLE ${row}`).join("\n")}`);
+    expect(rows).toHaveLength(5);
+  });
+
+  it("a missing key is null, with or without a range or a condition", async () => {
+    const key = freshKey();
+    expect(await store.get(key)).toBeNull();
+    expect(await store.get(key, { range: { offset: 0, length: 10 } })).toBeNull();
+    expect(await store.get(key, { range: { offset: 5000 } })).toBeNull();
+    expect(await store.get(key, { range: { suffix: 0 } })).toBeNull();
+    expect(await store.get(key, { onlyIf: { etagMatches: "abc" } })).toBeNull();
+  });
+
+  it("a condition that does not hold is precondition_failed, with the metadata and no body", async () => {
+    const { key, etag } = await stored();
+    const failing: R2Conditional[] = [
+      { etagDoesNotMatch: etag },
+      { etagMatches: "0cc175b9c0f1b6a831c399e269772661" },
+      { uploadedAfter: new Date(Date.now() + 86_400_000) },
+      { uploadedBefore: new Date("2020-01-01T00:00:00.000Z") },
+    ];
+    for (const onlyIf of failing) {
+      const result = await store.get(key, { onlyIf });
+      expect(result?.kind, JSON.stringify(onlyIf)).toBe("precondition_failed");
+      if (result?.kind !== "precondition_failed") continue;
+      expect(result.meta.size).toBe(1000);
+      expect(result.meta.etag).toBe(etag);
+      expect("body" in result.meta).toBe(false);
+    }
+    // A failed condition wins over a range.
+    expect(
+      (await store.get(key, { onlyIf: { etagDoesNotMatch: etag }, range: { offset: 0, length: 100 } }))?.kind,
+    ).toBe("precondition_failed");
+    // The controls: the same conditions the other way round give the body.
+    for (const onlyIf of [
+      { etagMatches: etag },
+      { etagDoesNotMatch: "0cc175b9c0f1b6a831c399e269772661" },
+      { uploadedAfter: new Date("2020-01-01T00:00:00.000Z") },
+      { uploadedBefore: new Date(Date.now() + 86_400_000) },
+    ]) {
+      expect((await store.get(key, { onlyIf }))?.kind, JSON.stringify(onlyIf)).toBe("body");
+    }
+  });
+
+  it("an ETag is accepted quoted, weak or bare — and a malformed one is no condition, never a throw", async () => {
+    const { key, etag } = await stored();
+    for (const spelling of [etag, `"${etag}"`, `W/"${etag}"`, ` "${etag}" `]) {
+      expect((await store.get(key, { onlyIf: { etagDoesNotMatch: spelling } }))?.kind, spelling).toBe(
+        "precondition_failed",
+      );
+      expect((await store.get(key, { onlyIf: { etagMatches: spelling } }))?.kind, spelling).toBe("body");
+    }
+    const malformed: unknown[] = [
+      '"unterminated',
+      'has"quote',
+      "has space",
+      "x".repeat(300),
+      "",
+      "line\nbreak",
+      7,
+      null,
+      {},
+      ["", 7],
+    ];
+    for (const bad of malformed) {
+      // As "if none match": dropped, so the body is served (not a 304, not a 500).
+      const none = await store.get(key, { onlyIf: { etagDoesNotMatch: bad as string } });
+      expect(none?.kind, JSON.stringify(bad)).toBe("body");
+      if (none?.kind === "body") await none.object.body.cancel();
+      // As "if match": dropped too — no condition.
+      const match = await store.get(key, { onlyIf: { etagMatches: bad as string } });
+      expect(match?.kind, JSON.stringify(bad)).toBe("body");
+      if (match?.kind === "body") await match.object.body.cancel();
+    }
+    // A malformed value beside a good condition leaves the good one standing.
+    expect(
+      (await store.get(key, { onlyIf: { etagMatches: "has space", etagDoesNotMatch: etag } }))?.kind,
+    ).toBe("precondition_failed");
+    // A date that is not a date is dropped as well.
+    expect((await store.get(key, { onlyIf: { uploadedBefore: new Date("nope") } }))?.kind).toBe("body");
+    expect((await store.get(key, { onlyIf: null as unknown as R2Conditional }))?.kind).toBe("body");
+  });
+
+  it("request headers are not an option: the parsed forms are the only ones the type takes", async () => {
+    const { key } = await stored();
+    const headers = new Headers({ range: "bytes=0-9" });
+    // @ts-expect-error a Headers object is not a range
+    const asRange = await store.get(key, { range: headers });
+    // Handed in anyway, it is not passed on as a header: it is no valid range.
+    expect(asRange).toEqual({ kind: "unsatisfiable_range", size: 1000 });
+    // @ts-expect-error a Headers object is not a condition
+    const asCondition = await store.get(key, { onlyIf: new Headers({ "if-none-match": "unquoted" }) });
+    expect(asCondition?.kind).toBe("body");
+  });
+
+  it("a range that is wrong whatever the size is never handed to the store at all", async () => {
+    const asked: unknown[] = [];
+    const counting = storage({
+      FILES: {
+        get: async (_key: string, options: unknown) => {
+          asked.push(options);
+          return null;
+        },
+        head: async () => ({ size: 1000 }),
+      } as unknown as R2Bucket,
+    });
+    for (const range of [
+      { suffix: 0 },
+      { offset: 0, length: 0 },
+      { offset: -1 },
+      {},
+      new Headers({ range: "bytes=0-" }),
+    ]) {
+      expect(await counting.get("t/x/y", { range: range as R2Range })).toEqual({
+        kind: "unsatisfiable_range",
+        size: 1000,
+      });
+    }
+    expect(asked).toEqual([]);
+    // The control: a well-formed range is asked for, as the parsed object.
+    await counting.get("t/x/y", { range: { offset: 5, length: 10 } });
+    expect(asked).toEqual([{ range: { offset: 5, length: 10 } }]);
+  });
+
+  it("an error that is not about the range still surfaces", async () => {
+    const failing = storage({
+      FILES: {
+        get: async () => {
+          throw new Error("the store is down (made up for the test)");
+        },
+        head: async () => ({ size: 1000 }),
+      } as unknown as R2Bucket,
+    });
+    await expect(failing.get("t/x/y", { range: { offset: 0, length: 10 } })).rejects.toThrow(
+      "the store is down",
+    );
+    await expect(failing.get("t/x/y")).rejects.toThrow("the store is down");
+  });
+
+  it("a store that THROWS for a range past the end (as the real one does, error 10039) is mapped", async () => {
+    // The real store's behaviour, reproduced: the local one may answer differently (see the table).
+    const throwing = storage({
+      FILES: {
+        get: async (_key: string, options?: { range?: { offset?: number } }) => {
+          if ((options?.range?.offset ?? 0) >= 1000) {
+            throw new Error("get: The requested range is not satisfiable (10039)");
+          }
+          return null;
+        },
+        head: async (key: string) => (key === "t/x/gone" ? null : { size: 1000 }),
+      } as unknown as R2Bucket,
+    });
+    expect(await throwing.get("t/x/y", { range: { offset: 1000 } })).toEqual({
+      kind: "unsatisfiable_range",
+      size: 1000,
+    });
+    expect(await throwing.get("t/x/y", { range: { offset: 5000, length: 5 } })).toEqual({
+      kind: "unsatisfiable_range",
+      size: 1000,
+    });
+    // The object vanished between the two calls.
+    expect(await throwing.get("t/x/gone", { range: { offset: 5000 } })).toBeNull();
   });
 });
 
@@ -263,7 +514,7 @@ describe("multipart", () => {
     expect(head?.httpMetadata?.contentType).toBe("application/octet-stream");
     expect(head?.customMetadata).toEqual({ nodeId, ownerId: OWNER });
     const second = await store.get(key, { range: { offset: MIN_PART_BYTES, length: 1 } });
-    expect(second && "body" in second ? new Uint8Array(await second.arrayBuffer())[0] : null).toBe(2);
+    expect(second?.kind === "body" ? new Uint8Array(await second.object.arrayBuffer())[0] : null).toBe(2);
   });
 
   it("a part stream of unknown length needs its size", async () => {

@@ -142,7 +142,7 @@ describe("inlineAllowed and serveType", () => {
   });
 
   it("inline is granted only to an inline REQUEST for an inline type", () => {
-    for (const kind of ["download", "thumb", "scan"] as const) {
+    for (const kind of ["download", "thumb"] as const) {
       expect(contentDisposition(kind, "a.png", "image/png"), kind).toMatch(/^attachment; /);
     }
     expect(contentDisposition("inline", "a.png", "image/png")).toMatch(/^inline; /);

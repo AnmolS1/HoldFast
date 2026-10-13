@@ -81,7 +81,27 @@ export type PutOptions = {
   /** The exact length in bytes. A body of any other length fails and stores nothing. */
   size: number;
 };
-export type GetOptions = { range?: R2Range | Headers; onlyIf?: R2Conditional | Headers };
+/**
+ * Only the PARSED forms: a range object and a condition object. Never request headers — the
+ * binding ignores `If-Range`, reads a multi-range or malformed `Range` header as "everything" and
+ * throws on an unquoted ETag. Parsing HTTP headers is the files host's job.
+ */
+export type GetOptions = { range?: R2Range; onlyIf?: R2Conditional };
+
+/**
+ * What a read found. The caller must handle each case:
+ *   null                    no such key
+ *   body                    the object, or the requested part of it (`object.range` says which)
+ *   precondition_failed     `onlyIf` did not hold: the object's metadata, no body. (The store
+ *                           does not say WHICH condition failed: 304 or 412 is decided from the
+ *                           condition that was sent.)
+ *   unsatisfiable_range     the range lies outside the object: its size, for `Content-Range`
+ */
+export type GetResult =
+  | { kind: "body"; object: R2ObjectBody }
+  | { kind: "precondition_failed"; meta: R2Object }
+  | { kind: "unsatisfiable_range"; size: number }
+  | null;
 export type UploadedPart = { n: number; etag: string };
 export type ListedObject = { key: string; size: number; etag: string; uploaded: Date };
 
@@ -92,8 +112,12 @@ export type Storage = {
    */
   put(key: string, body: PutBody, options: PutOptions): Promise<R2Object>;
   head(key: string): Promise<R2Object | null>;
-  /** With `onlyIf`, an object whose condition failed comes back without a body. */
-  get(key: string, options?: GetOptions): Promise<R2ObjectBody | R2Object | null>;
+  /**
+   * Never throws for what a client can cause: a range outside the object is
+   * `unsatisfiable_range` (the store itself THROWS for it), and a malformed ETag in `onlyIf` is
+   * dropped — treated as no condition — before the store sees it (it would throw too).
+   */
+  get(key: string, options?: GetOptions): Promise<GetResult>;
   /** Deletes in batches of 1,000. Missing keys are not an error. */
   delete(keys: string[]): Promise<void>;
   /** Deletes everything under a SCOPED prefix (an area and at least one id). Returns the count. */
@@ -137,6 +161,67 @@ function sized(body: PutBody, size: number | undefined): PutBody {
   return body;
 }
 
+const isCount = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * True when the range selects nothing of an object of `size` bytes (unknown size: only what is
+ * wrong whatever the size). Decided by arithmetic — the same answer locally and deployed — and
+ * not from the text of the store's error.
+ */
+function rangeUnsatisfiable(range: R2Range, size?: number): boolean {
+  const { offset, length, suffix } = range as { offset?: unknown; length?: unknown; suffix?: unknown };
+  if (suffix !== undefined) return !isCount(suffix) || suffix === 0 || size === 0;
+  if (offset !== undefined && !isCount(offset)) return true;
+  if (length !== undefined && (!isCount(length) || length === 0)) return true;
+  if (offset === undefined && length === undefined) return true;
+  return size !== undefined && ((offset as number | undefined) ?? 0) >= size;
+}
+
+// What an ETag may look like once its quotes and weak prefix are gone.
+const ETAG = /^[A-Za-z0-9_.+/=-]{1,256}$/;
+
+function cleanEtag(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const bare = value
+    .trim()
+    .replace(/^W\//, "")
+    .replace(/^"(.*)"$/, "$1");
+  return bare === "*" || ETAG.test(bare) ? bare : null;
+}
+
+function cleanEtags(value: unknown): string | string[] | undefined {
+  if (Array.isArray(value)) {
+    const kept = value.map(cleanEtag).filter((etag): etag is string => etag !== null);
+    return kept.length > 0 ? kept : undefined;
+  }
+  return cleanEtag(value) ?? undefined;
+}
+
+const validDate = (value: unknown): Date | undefined =>
+  value instanceof Date && !Number.isNaN(value.getTime()) ? value : undefined;
+
+/**
+ * The condition with every part the store could choke on removed: an ETag is bare (no quotes, no
+ * `W/`), a malformed one is DROPPED — which means "no such condition", never an error — and a date
+ * that is not a date is dropped too. Undefined when nothing is left.
+ */
+function cleanCondition(onlyIf: R2Conditional | undefined): R2Conditional | undefined {
+  if (!onlyIf || typeof onlyIf !== "object") return undefined;
+  const out: R2Conditional = {};
+  const matches = cleanEtags(onlyIf.etagMatches);
+  const differs = cleanEtags(onlyIf.etagDoesNotMatch);
+  const before = validDate(onlyIf.uploadedBefore);
+  const after = validDate(onlyIf.uploadedAfter);
+  if (matches !== undefined) out.etagMatches = matches as R2Conditional["etagMatches"];
+  if (differs !== undefined) out.etagDoesNotMatch = differs as R2Conditional["etagDoesNotMatch"];
+  if (before) out.uploadedBefore = before;
+  if (after) out.uploadedAfter = after;
+  if (Object.keys(out).length === 0) return undefined;
+  if (onlyIf.secondsGranularity !== undefined) out.secondsGranularity = onlyIf.secondsGranularity === true;
+  return out;
+}
+
 function scoped(prefix: string): string {
   if (typeof prefix !== "string" || !SCOPED_PREFIX.test(prefix))
     throw new Error("storage: prefix is not scoped");
@@ -168,7 +253,37 @@ export function storage(env: Pick<Env, "FILES">): Storage {
       return stored;
     },
     head: (key) => bucket.head(key),
-    get: (key, options = {}) => bucket.get(key, options),
+    async get(key, options = {}) {
+      const range = options.range;
+      const onlyIf = cleanCondition(options.onlyIf);
+      const outside = async (): Promise<GetResult> => {
+        const head = await bucket.head(key);
+        return head ? { kind: "unsatisfiable_range", size: head.size } : null;
+      };
+      // Wrong whatever the object's size: the store is not asked at all.
+      if (range && rangeUnsatisfiable(range)) return outside();
+
+      let found: R2ObjectBody | R2Object | null;
+      try {
+        found = await bucket.get(key, { ...(range ? { range } : {}), ...(onlyIf ? { onlyIf } : {}) });
+      } catch (error) {
+        // The store throws for a range that starts at or past the end (error 10039). Whether
+        // that is what happened is decided from the object's size, not from the error's text.
+        if (!range) throw error;
+        const head = await bucket.head(key);
+        if (!head) return null;
+        if (rangeUnsatisfiable(range, head.size)) return { kind: "unsatisfiable_range", size: head.size };
+        throw error;
+      }
+      if (!found) return null;
+      if (!("body" in found)) return { kind: "precondition_failed", meta: found };
+      // A store that does NOT throw for such a range (the local one may not) gets the same answer.
+      if (range && rangeUnsatisfiable(range, found.size)) {
+        await found.body.cancel().catch(() => {});
+        return { kind: "unsatisfiable_range", size: found.size };
+      }
+      return { kind: "body", object: found };
+    },
     delete: remove,
     async deletePrefix(prefix) {
       let deleted = 0;

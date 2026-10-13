@@ -1,7 +1,7 @@
 // Signed tokens and sealed values. Every key comes from services/keys.ts (one HKDF key per
 // purpose) or, for client addresses, from `IP_ENC_KEY` — never a raw secret used directly.
 //
-//   download tokens   files-host URLs (/d, /i, /t and the scanner's read). HMAC-SHA256, purpose
+//   download tokens   files-host URLs (/d, /i, /t). HMAC-SHA256, purpose
 //                     `download-token`. NOT stored: revocation is the database re-check the
 //                     files host makes on every request.
 //   link sessions     proof that a public link's password was entered. Purpose `link-session`.
@@ -21,9 +21,13 @@ import type { Keys } from "./keys";
 
 export { TOKEN_TTL };
 
-export type TokenKind = "download" | "inline" | "thumb" | "scan";
-/** Who a token was minted for: a user, a public link, or the system (the scanner). */
-export type SubjectType = "u" | "l" | "s";
+export type TokenKind = "download" | "inline" | "thumb";
+/**
+ * Who a token was minted for: a user or a public link. There is no system subject and no token
+ * for the scanner (the Worker streams an object to it): every token there is names someone the
+ * files host re-checks.
+ */
+export type SubjectType = "u" | "l";
 
 export interface DownloadClaims {
   v: 1;
@@ -32,7 +36,7 @@ export interface DownloadClaims {
   n: string;
   /** The version id: a token is for one version of a file. */
   ver: string;
-  /** Both mandatory. `u`: `sub` is a user id; `l`: a `share_links.id`; `s`: the literal "scanner". */
+  /** Both mandatory. `u`: `sub` is a user id; `l`: a `share_links.id`. */
   st: SubjectType;
   sub: string;
   /** Unix seconds. */
@@ -52,8 +56,6 @@ export interface DownloadClaims {
 export const NO_PASSWORD_PWV = "-";
 const PWV = /^(?:[0-9a-f]{16}|-)$/;
 
-/** The `sub` of a system token. */
-export const SCANNER_SUBJECT = "scanner";
 /** Lifetime of a link session and of a zip grant, in seconds. */
 export const LINK_SESSION_TTL_SEC = 3_600;
 export const ZIP_GRANT_TTL_SEC = 3_600;
@@ -64,8 +66,8 @@ export const IP_KEY_VERSION = 1;
 
 export type Sealed = { ciphertext: Uint8Array; iv: Uint8Array; keyVersion: number };
 
-const KINDS: readonly TokenKind[] = ["download", "inline", "thumb", "scan"];
-const SUBJECTS: readonly SubjectType[] = ["u", "l", "s"];
+const KINDS: readonly TokenKind[] = ["download", "inline", "thumb"];
+const SUBJECTS: readonly SubjectType[] = ["u", "l"];
 const MAX_TOKEN_CHARS = 2_048;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 
@@ -143,16 +145,6 @@ const isExp = (value: unknown): value is number => typeof value === "number" && 
 
 // ── download tokens ─────────────────────────────────────────────────────────────────────────
 
-/**
- * The one table of who may hold which kind: a system token is a scan token and a scan token is a
- * system token; everything else belongs to a user or a link. There is no combination without a
- * subject, so there is no token the files host can serve without re-checking that subject.
- */
-function subjectAllowed(kind: TokenKind, st: SubjectType, sub: string): boolean {
-  if (kind === "scan" || st === "s") return kind === "scan" && st === "s" && sub === SCANNER_SUBJECT;
-  return st === "u" || st === "l";
-}
-
 const isPwv = (value: unknown): value is string => typeof value === "string" && PWV.test(value);
 
 function isThumbSize(value: unknown): value is ThumbSize {
@@ -167,7 +159,6 @@ function asClaims(payload: Record<string, unknown>): DownloadClaims | null {
   if (!isText(n) || !isText(ver)) return null;
   if (!SUBJECTS.includes(st as SubjectType) || !isText(sub)) return null;
   if (!isExp(exp)) return null;
-  if (!subjectAllowed(k as TokenKind, st as SubjectType, sub)) return null;
   if (k === "thumb" ? !isThumbSize(sz) : sz !== undefined) return null;
   // A link token names the password version it was minted under; nobody else's token has one.
   if (st === "l" ? !isPwv(pwv) : pwv !== undefined) return null;
@@ -220,8 +211,9 @@ export async function mintDownloadToken(
  * `expect.nodeId` the id in the path, `expect.size` the thumb size in the path.
  *
  * Throws `AppError("invalid_token")` (403) for every failure — malformed, forged, expired, wrong
- * kind, wrong node, wrong size, a missing subject, a subject that may not hold that kind. The
- * files host does not tell these apart, and neither does this function.
+ * kind, wrong node, wrong size, a missing subject, a kind or subject that does not exist (a token
+ * carrying `k: "scan"` or `st: "s"` is one). The files host does not tell these apart, and
+ * neither does this function.
  *
  * The caller still re-checks the subject against the database (`st` / `sub`), compares `ver`
  * with the node's current version and — for a link token — `pwv` with the link's current

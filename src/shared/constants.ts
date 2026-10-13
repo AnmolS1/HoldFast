@@ -42,7 +42,7 @@ export const ZIP_MAX_ENTRIES = 10_000;
 // ── tokens and links ────────────────────────────────────────────────────────────────────────
 
 /** Lifetimes of files-host tokens, in seconds. `zip` is a `download` token minted for a zip. */
-export const TOKEN_TTL = { download: 300, inline: 900, thumb: 600, scan: 900, zip: 900 } as const;
+export const TOKEN_TTL = { download: 300, inline: 900, thumb: 600, zip: 900 } as const;
 /** Random bytes in a public link token (base64url in the URL). */
 export const LINK_TOKEN_BYTES = 16;
 /** Wrong link passwords that carry no delay. */

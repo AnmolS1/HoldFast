@@ -95,7 +95,7 @@ describe("download tokens", () => {
         exp: expiresAt,
       });
     }
-    expect(TOKEN_TTL).toEqual({ download: 300, inline: 900, thumb: 600, scan: 900, zip: 900 });
+    expect(TOKEN_TTL).toEqual({ download: 300, inline: 900, thumb: 600, zip: 900 });
     const zip = await mintDownloadToken(keys(), userClaims(), { ttlSec: TOKEN_TTL.zip });
     expect(zip.expiresAt).toBe(at + 900);
     const link = await mintDownloadToken(keys(), {
@@ -110,18 +110,6 @@ describe("download tokens", () => {
       st: "l",
       sub: LINK,
       pwv: NO_PASSWORD_PWV,
-    });
-    const scan = await mintDownloadToken(keys(), {
-      k: "scan",
-      n: NODE,
-      ver: VERSION,
-      st: "s",
-      sub: "scanner",
-    });
-    expect(scan.expiresAt).toBe(at + 900);
-    expect(await verifyDownloadToken(keys(), scan.token, { kind: "scan", nodeId: NODE })).toMatchObject({
-      st: "s",
-      sub: "scanner",
     });
   });
 
@@ -190,7 +178,7 @@ describe("download tokens", () => {
     await expect(
       verifyDownloadToken(keys(), token, { kind: "download", nodeId: NODE }),
     ).resolves.toBeTruthy();
-    for (const kind of ["inline", "thumb", "scan"] as const) {
+    for (const kind of ["inline", "thumb"] as const) {
       await refused(verifyDownloadToken(keys(), token, { kind, nodeId: NODE }));
     }
     await refused(verifyDownloadToken(keys(), token, { kind: "download", nodeId: OTHER_NODE }));
@@ -258,34 +246,49 @@ describe("download tokens", () => {
     }
   });
 
-  it("the system subject holds scan tokens and nothing else; scan tokens belong to it alone", async () => {
+  it("there is no scan kind and no system subject: a validly SIGNED token carrying either is refused", async () => {
     freeze(T0);
     const exp = Math.floor(T0 / 1000) + 300;
     const base = { v: 1, n: NODE, ver: VERSION, exp };
-    for (const kind of ["download", "inline"] as const) {
-      await expect(
-        mintDownloadToken(keys(), { k: kind, n: NODE, ver: VERSION, st: "s", sub: "scanner" }),
-      ).rejects.toThrow("invalid claims");
-      const signed = await forge(keys(), { ...base, k: kind, st: "s", sub: "scanner" });
-      await refused(verifyDownloadToken(keys(), signed, { kind, nodeId: NODE }));
+    // The control: a user's download token, forged the same way, verifies.
+    const good = await forge(keys(), { ...base, k: "download", st: "u", sub: USER });
+    await expect(verifyDownloadToken(keys(), good, { kind: "download", nodeId: NODE })).resolves.toBeTruthy();
+
+    // What the scanner's token used to be, and every mixture of it with what exists.
+    const gone: Record<string, unknown>[] = [
+      { ...base, k: "scan", st: "s", sub: "scanner" },
+      { ...base, k: "scan", st: "u", sub: USER },
+      { ...base, k: "scan", st: "l", sub: LINK, pwv: "-" },
+      { ...base, k: "download", st: "s", sub: "scanner" },
+      { ...base, k: "inline", st: "s", sub: "scanner" },
+      { ...base, k: "thumb", st: "s", sub: "scanner", sz: 160 },
+      { ...base, k: "download", st: "s", sub: USER },
+    ];
+    for (const payload of gone) {
+      const signed = await forge(keys(), payload);
+      // On every route there is, and on a route there is not.
+      for (const kind of ["download", "inline", "thumb", "scan"]) {
+        await refused(
+          verifyDownloadToken(keys(), signed, {
+            kind: kind as "download",
+            nodeId: NODE,
+            ...(kind === "thumb" ? { size: 160 } : {}),
+          }),
+        );
+      }
     }
-    const thumb = await forge(keys(), { ...base, k: "thumb", st: "s", sub: "scanner", sz: 160 });
-    await refused(verifyDownloadToken(keys(), thumb, { kind: "thumb", nodeId: NODE, size: 160 }));
-    for (const [st, sub] of [
-      ["u", USER],
-      ["l", LINK],
-      ["s", USER],
-      ["s", "Scanner"],
-    ] as const) {
-      await expect(
-        mintDownloadToken(keys(), { k: "scan", n: NODE, ver: VERSION, st, sub }),
-      ).rejects.toThrow();
-      const signed = await forge(keys(), { ...base, k: "scan", st, sub });
-      await refused(verifyDownloadToken(keys(), signed, { kind: "scan", nodeId: NODE }));
-    }
-    // The control: the one permitted combination, forged the same way, verifies.
-    const good = await forge(keys(), { ...base, k: "scan", st: "s", sub: "scanner" });
-    await expect(verifyDownloadToken(keys(), good, { kind: "scan", nodeId: NODE })).resolves.toBeTruthy();
+    // Neither can be minted.
+    const mint = mintDownloadToken as unknown as (
+      k: Keys,
+      claims: Record<string, unknown>,
+    ) => Promise<unknown>;
+    await expect(
+      mint(keys(), { k: "scan", n: NODE, ver: VERSION, st: "s", sub: "scanner" }),
+    ).rejects.toThrow();
+    await expect(
+      mint(keys(), { k: "download", n: NODE, ver: VERSION, st: "s", sub: "scanner" }),
+    ).rejects.toThrow("invalid claims");
+    expect(Object.keys(TOKEN_TTL).sort()).toEqual(["download", "inline", "thumb", "zip"]);
   });
 
   it("malformed input is refused, never thrown as anything else", async () => {
@@ -444,21 +447,14 @@ describe("link download tokens and the password version", () => {
     expect(after.token).not.toBe(before.token);
   });
 
-  it("a user or system token with a pwv is refused, and cannot be minted", async () => {
+  it("a user's token with a pwv is refused, and cannot be minted", async () => {
     freeze(T0);
     const exp = Math.floor(T0 / 1000) + 300;
     await expect(mintDownloadToken(keys(), { ...userClaims(), pwv: PWV })).rejects.toThrow("invalid claims");
-    await expect(
-      mintDownloadToken(keys(), { k: "scan", n: NODE, ver: VERSION, st: "s", sub: "scanner", pwv: PWV }),
-    ).rejects.toThrow("invalid claims");
     const user = { v: 1, ...userClaims(), exp };
-    const scan = { v: 1, k: "scan", n: NODE, ver: VERSION, st: "s", sub: "scanner", exp };
-    // The controls: without it both verify.
+    // The control: without it the token verifies.
     await expect(
       verifyDownloadToken(keys(), await forge(keys(), user), { kind: "download", nodeId: NODE }),
-    ).resolves.toBeTruthy();
-    await expect(
-      verifyDownloadToken(keys(), await forge(keys(), scan), { kind: "scan", nodeId: NODE }),
     ).resolves.toBeTruthy();
     for (const pwv of [PWV, NO_PASSWORD_PWV]) {
       await refused(
@@ -466,9 +462,6 @@ describe("link download tokens and the password version", () => {
           kind: "download",
           nodeId: NODE,
         }),
-      );
-      await refused(
-        verifyDownloadToken(keys(), await forge(keys(), { ...scan, pwv }), { kind: "scan", nodeId: NODE }),
       );
     }
   });

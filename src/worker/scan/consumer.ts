@@ -67,8 +67,8 @@ async function readPrefix(env: Env, key: string, size: number): Promise<Uint8Arr
   const head = await storage(env).get(key, {
     range: { offset: 0, length: Math.min(size, SNIFF_PREFIX_BYTES) },
   });
-  if (!head || !("body" in head)) throw new Error("scan: the object is gone");
-  return new Uint8Array(await head.arrayBuffer());
+  if (head?.kind !== "body") throw new Error("scan: the object is gone");
+  return new Uint8Array(await head.object.arrayBuffer());
 }
 
 /** Steps 5 and 6 for a claimed job. */
@@ -84,8 +84,9 @@ async function scanClaimed(
   if (!head) throw new Error("scan: the object is gone");
   // Awaited: the detector is asynchronous, and a Promise must never be stored as a type.
   const mimeSniffed = await sniff(await readPrefix(env, scan.key, head.size), name);
-  const object = await store.get(scan.key);
-  if (!object || !("body" in object)) throw new Error("scan: the object is gone");
+  const read = await store.get(scan.key);
+  if (read?.kind !== "body") throw new Error("scan: the object is gone");
+  const { object } = read;
   const verdict = await getScanner(env).scanStream(object.body, { key: scan.key, size: object.size });
 
   return bg.db.transaction(async (tx) => {

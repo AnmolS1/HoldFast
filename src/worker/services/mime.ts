@@ -177,7 +177,7 @@ export function dangerousForPublicLink(name: string, mimeSniffed: string | null 
   return DANGEROUS_EXTS.includes(extOf(name)) || DANGEROUS_TYPES.includes(lower(mimeSniffed));
 }
 
-export type DispositionKind = "download" | "inline" | "thumb" | "scan";
+export type DispositionKind = "download" | "inline" | "thumb";
 
 /**
  * The `Content-Disposition` value (RFC 6266): `attachment` unless the request is for an inline
