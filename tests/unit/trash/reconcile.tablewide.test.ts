@@ -326,6 +326,39 @@ describe("reconcile: the orphan sweep", () => {
     await env.FILES.delete(p.odd);
   });
 
+  it("an area whose list cursor has died is started again and counted once", async () => {
+    const p = await planted();
+    const real = await keysUnder("u/");
+    // The store hands out a cursor after the first page of `u/` and then refuses it.
+    let faked = false;
+    const bucket = new Proxy(env.FILES, {
+      get(target, property) {
+        const value = Reflect.get(target, property) as unknown;
+        if (property !== "list" || typeof value !== "function") {
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+        return async (options: R2ListOptions) => {
+          if (options.cursor === "dead-cursor") throw new Error("list: the cursor has expired");
+          const page = await target.list(options);
+          if (options.prefix !== "u/" || faked) return page;
+          faked = true;
+          return { objects: page.objects, delimitedPrefixes: [], truncated: true, cursor: "dead-cursor" };
+        };
+      },
+    });
+    const ctx = jobContext({ env: { FILES: bucket } });
+    const result = await sweepOrphans(ctx.bg, { from: START, stopAt: FAR, now: inHours(49) });
+    expect(faked).toBe(true);
+    // `u/` was read twice; it is counted, and its orphan is a candidate, once.
+    expect(result).toMatchObject({ outcome: "swept", candidates: 3, deleted: 3, done: true });
+    expect(result.listed).toBe(
+      real.length + (await keysUnder("t/")).length + (await keysUnder("a/")).length + 2,
+    );
+    expect(await present(p.orphans)).toEqual([]);
+    expect(await present(p.referenced)).toEqual(p.referenced);
+    await env.FILES.delete(p.odd);
+  });
+
   it("the single-PUT object a purge left behind is an orphan: swept after 48 hours, not before", async () => {
     const owner = await member();
     const folder = await makeFolder(owner.id);

@@ -265,6 +265,9 @@ export async function sweepOrphans(
   let listed = 0;
   let done = false;
   const candidates: string[] = [];
+  // What the run had counted when it entered the area it is in: an area that has to be started
+  // again is counted once, not once more for every page already read.
+  let entered = { listed: 0, candidates: 0 };
 
   // The dry run: list, and note what would go. Nothing is deleted in this loop.
   for (let pages = 0; pages < maxPages; pages++) {
@@ -273,9 +276,11 @@ export async function sweepOrphans(
     try {
       page = await store.list(prefix, object ?? undefined);
     } catch (error) {
-      // A list cursor does not live for ever: the area is started again.
+      // A list cursor does not live for ever: the area is started again — from nothing.
       if (object === null) throw error;
       object = null;
+      listed = entered.listed;
+      candidates.length = entered.candidates;
       continue;
     }
     listed += page.objects.length;
@@ -285,6 +290,7 @@ export async function sweepOrphans(
     object = page.cursor;
     if (object === null) {
       area += 1;
+      entered = { listed, candidates: candidates.length };
       if (area >= ORPHAN_AREAS.length) {
         area = 0;
         done = true;
