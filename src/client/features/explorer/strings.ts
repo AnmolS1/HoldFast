@@ -104,6 +104,8 @@ export const messages = {
   "explorer.done.restored": "{what} restored",
   "explorer.done.moved": "{what} moved to {name}",
   "explorer.done.recheck": "Checking {name} again",
+  "explorer.done.scanned": "{name} is scanned and ready",
+  "explorer.done.scanEnded": "{name}: {status}",
 
   "explorer.error.nameTaken": "“{name}” is already used in this folder. Choose another name.",
   "explorer.error.renameConflict": "Couldn't rename: “{name}” is already used in this folder.",

@@ -63,6 +63,7 @@ import { ShareDialog } from "../share";
 import { requestUpload } from "../upload";
 import { ActionMenu, type MenuAnchor, type MenuEntry } from "./ActionMenu";
 import {
+  announce,
   createFolderIn,
   describe,
   downloadNode,
@@ -530,7 +531,16 @@ function Explorer({ folderId }: { folderId: string | null }) {
     [nodes],
   );
   const stillScanning = useScanPolling(pendingIds, {
-    onSettled: (node) => patchInListings(queryClient, folderId, node.id, () => node),
+    onSettled: (node) => {
+      patchInListings(queryClient, folderId, node.id, () => node);
+      // A scan that ended is said once: ready, or what the row now says.
+      const sentence = statusSentence(node.scanStatus, node.scanReason);
+      announce(
+        sentence === null
+          ? t("explorer.done.scanned", { name: node.name })
+          : t("explorer.done.scanEnded", { name: node.name, status: sentence }),
+      );
+    },
     onGone: (id) => removeFromListings(queryClient, folderId, [id]),
   });
 

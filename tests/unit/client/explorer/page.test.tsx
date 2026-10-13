@@ -761,6 +761,23 @@ describe("downloading one file", () => {
   });
 });
 
+describe("offline", () => {
+  it("a banner says so while the connection is down, and goes when it is back", async () => {
+    serveDrive(top());
+    renderExplorer("/");
+    await waitForRows(4);
+    expect(document.querySelector('[data-banner="offline"]')).toBeNull();
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    act(() => void window.dispatchEvent(new Event("offline")));
+    expect(document.querySelector('[data-banner="offline"]')!.textContent).toContain("You're offline.");
+    // The list stays: what was loaded is still there to read.
+    expect(rows()).toHaveLength(4);
+    online.mockReturnValue(true);
+    act(() => void window.dispatchEvent(new Event("online")));
+    expect(document.querySelector('[data-banner="offline"]')).toBeNull();
+  });
+});
+
 describe("drag and drop", () => {
   /** A stand-in for the browser's DataTransfer (jsdom has none). */
   const transfer = (types: string[] = []) => ({

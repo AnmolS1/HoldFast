@@ -76,6 +76,7 @@ describe("a pending file", () => {
     expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
     expect(rowOf(PENDING.id)!.querySelector('[role="progressbar"]')).toBeNull();
+    expect(document.querySelector("[data-explorer-live]")!.textContent).toBe("new.pdf is scanned and ready");
     // Settled: nobody asks again.
     await after(70_000);
     expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
@@ -88,6 +89,10 @@ describe("a pending file", () => {
     await after(5_000);
     expect(rowOf(PENDING.id)!.querySelector("[data-status]")!.textContent).toContain(
       "Blocked — flagged by the malware scan",
+    );
+    // …and the change is said once in the live region.
+    expect(document.querySelector("[data-explorer-live]")!.textContent).toBe(
+      "new.pdf: Blocked — flagged by the malware scan",
     );
   });
 
