@@ -95,6 +95,7 @@ export const messages = {
   "conflict.title": "{name} is already here",
   "conflict.body": "Replace the file that is here, keep both, or skip this one.",
   "conflict.bodyNoReplace": "Keep both files, or skip this one.",
+  "conflict.cannotReplace": "You can't replace the file that is here. Keep both files, or skip this one.",
   "conflict.replace": "Replace",
   "conflict.keepBoth": "Keep both",
   "conflict.skip": "Skip",

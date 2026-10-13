@@ -230,6 +230,58 @@ describe("a name that is taken", () => {
   });
 });
 
+describe("a replace the caller may not make", () => {
+  it.each([
+    ["403", () => envelope("forbidden", 403)],
+    ["404", () => envelope("not_found", 404)],
+  ])(
+    "%s on the replace init: back to the question without Replace, in the uploader's own words",
+    async (_s, answer) => {
+      server.onInit = (body) =>
+        body.onConflict === "fail"
+          ? envelope("conflict", 409, { existingId: EXISTING_ID })
+          : body.onConflict === "replace"
+            ? answer()
+            : undefined;
+      renderUploader();
+      await act(() => addFiles([{ file: smallFile("notes.txt") }], null));
+      await settled();
+      await act(async () => screen.getByRole("button", { name: "Replace" }).click());
+      await settled();
+      expect(items()[0]!.state).toBe("conflict");
+      const dialog = screen.getByRole("dialog");
+      expect(
+        within(dialog).getByText(
+          "You can't replace the file that is here. Keep both files, or skip this one.",
+        ),
+      ).toBeTruthy();
+      expect(
+        within(dialog)
+          .getAllByRole("button")
+          .map((button) => button.textContent),
+      ).toEqual(["Skip", "Keep both"]);
+      await act(async () => within(dialog).getByRole("button", { name: "Keep both" }).click());
+      await settled();
+      expect(server.inits.map((body) => body.onConflict)).toEqual(["fail", "replace", "rename"]);
+      expect(server.completes.length).toBe(1);
+    },
+  );
+
+  it("a 403 that is blocked content stays what it is: refused, with no question", async () => {
+    server.onInit = (body) =>
+      body.onConflict === "fail"
+        ? envelope("conflict", 409, { existingId: EXISTING_ID })
+        : envelope("forbidden", 403, { reason: "blocked_content" });
+    renderUploader();
+    await act(() => addFiles([{ file: smallFile("notes.txt") }], null));
+    await settled();
+    await act(async () => screen.getByRole("button", { name: "Replace" }).click());
+    await settled();
+    expect(items()[0]!.state).toBe("refused");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+});
+
 describe("the session ends", () => {
   it("a 401 on a part pauses the queue and asks for the sign-in; after it the file goes on where it was", async () => {
     server.hold = true;

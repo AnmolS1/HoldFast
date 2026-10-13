@@ -625,13 +625,17 @@ function fail(id: string, cause: unknown): void {
     announce(t("live.refused", { name }));
     return;
   }
-  if (cause.status === 409 && work.phase === "init") {
+  // The name is taken (409) — or the replace that was asked for is not allowed: a 409 in the
+  // server's own words, or a 403 / 404 because the file there is not the caller's to replace.
+  const replacing = work.phase === "init" && item.onConflict === "replace";
+  const notReplaceable = replacing && (cause.status === 403 || cause.status === 404);
+  if ((cause.status === 409 && work.phase === "init") || notReplaceable) {
     const existingId = typeof cause.details?.existingId === "string" ? cause.details.existingId : null;
     patchItem(id, {
       state: "conflict",
       conflict: {
-        existingId: item.onConflict === "replace" ? (item.conflict?.existingId ?? null) : existingId,
-        replaceRefused: item.onConflict === "replace" ? cause.message : null,
+        existingId: replacing ? (item.conflict?.existingId ?? null) : existingId,
+        replaceRefused: !replacing ? null : notReplaceable ? t("conflict.cannotReplace") : cause.message,
       },
       onConflict: "fail",
       replaceNodeId: null,
