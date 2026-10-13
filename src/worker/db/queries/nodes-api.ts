@@ -2,7 +2,7 @@
 // own shares on the rows of a listing, the files of a zip manifest — and one write: giving the
 // rescan hour back.
 
-import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql, type SQL } from "drizzle-orm";
 import type { ZipManifest } from "../../../shared/schemas/node";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
@@ -145,6 +145,10 @@ export type ZipLimits = {
  * fresh database) compared every row of the tree with every other: 10,000 files took over five
  * seconds.
  *
+ * WHAT THE CALLER CANNOT SEE IS NOT WALKED: the tests for a listable file are part of each step,
+ * before the cut, so such a file is in neither list and sets `truncated` in no way — not through
+ * the entry cap and not through the walk bound.
+ *
  * At most `maxFiles` ENTRIES are answered; `truncated` says there were more clean files, or that
  * the walk was cut. Skipped files do not count against the cap (their number is bounded by the
  * walk). A file reached through two roots (a folder and something
@@ -159,6 +163,16 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
   const given = roots.filter((root) => isUuid(root.id));
   if (given.length === 0) return { entries: [], totalBytes: 0, skipped: [], truncated: false };
   // One parameter, whatever the number of roots.
+  // A row the walk may take: any folder; a file only when it would be listed at all — so that
+  // what the caller cannot see is not even WALKED, and counts towards no bound and no flag.
+  const listable = (alias: string, owner: SQL): SQL => {
+    const row = sql.raw(alias);
+    return sql`(${row}.kind = 'folder' OR (
+      ${row}.scan_status <> 'suspected_csam' AND ${row}.version_id IS NOT NULL
+      AND (${owner} OR ${row}.scan_status = 'clean'
+           OR (${row}.created_by = ${viewerId}
+               AND ${row}.scan_status::text = ANY (string_to_array(${uploaderSees}, ','))))))`;
+  };
   const list = JSON.stringify(given.map(({ id, label, owner }) => ({ id, label, owner })));
   const result = await db.execute<{
     walked: number;
@@ -180,6 +194,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
       CROSS JOIN LATERAL (
         SELECT n.id, n.kind FROM nodes n
         WHERE n.id = r.id AND n.system IS NULL AND ${notEffectivelyTrashedOrHidden("n")}
+          AND ${listable("n", sql`r.owner`)}
         OFFSET 0
       ) n
       UNION ALL
@@ -189,6 +204,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
         SELECT c.id, c.kind, c.name FROM nodes c
         WHERE c.parent_id = down.id
           AND c.deleted_at IS NULL AND c.takedown_at IS NULL AND c.system IS NULL
+          AND ${listable("c", sql`down.owner`)}
         OFFSET 0
       ) c
       WHERE down.kind = 'folder'
@@ -209,9 +225,6 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
       SELECT f.id, f.path, f.owner, f.ord, n.size, n.version_id, n.scan_status,
              to_char(n.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS modified_at
       FROM files f JOIN nodes n ON n.id = f.id
-      WHERE n.scan_status <> 'suspected_csam' AND n.version_id IS NOT NULL
-        AND (f.owner OR n.scan_status = 'clean'
-             OR (n.created_by = ${viewerId} AND n.scan_status::text = ANY (string_to_array(${uploaderSees}, ','))))
     )
     SELECT t.walked, l.id, l.path, l.owner, l.size, l.version_id, l.scan_status, l.modified_at
     FROM (SELECT count(*)::int AS walked FROM walked) t

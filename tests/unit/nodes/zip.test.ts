@@ -149,6 +149,24 @@ describe("POST /nodes/zip-manifest", () => {
       0,
       false,
     ]);
+
+    // Nor against the bound on the walk: 40 more files the partner cannot see, a bound of 10 rows.
+    for (let i = 0; i < 40; i++)
+      await makeFile(owner.id, folder.id, { name: `a-more-${i}.bin`, scanStatus: "infected" });
+    const view = { viewerId: partner.id, uploaderSees: ["pending", "infected", "skipped", "error"] as const };
+    const bounded = await zipManifest(testDb(), [{ id: folder.id, label: "counted", owner: false }], {
+      maxFiles: 100,
+      maxWalked: 10,
+      partner: view,
+    });
+    expect([bounded.entries.length, bounded.skipped.length, bounded.truncated]).toEqual([4, 0, false]);
+    // The control: the owner's manifest of the same folder, with the same bound, IS cut.
+    const owners = await zipManifest(testDb(), [{ id: folder.id, label: "counted", owner: true }], {
+      maxFiles: 100,
+      maxWalked: 10,
+      partner: view,
+    });
+    expect(owners.truncated).toBe(true);
   });
 
   it("a taken-down folder and everything under it, a locked file, the trash: in neither list — also with allOwned", async () => {
