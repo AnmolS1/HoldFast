@@ -21,6 +21,7 @@ import {
   dmcaNotices,
   nodes,
   nodeVersions,
+  pendingUserPurges,
   uploadParts,
   uploads,
   user,
@@ -39,6 +40,7 @@ import { makeUser, rand } from "../services-core/helpers";
 
 export {
   auditRows,
+  backendPid,
   baId,
   gate,
   makeFile,
@@ -50,6 +52,7 @@ export {
   putObject,
   rand,
   testDb,
+  untilBlockedBy,
 } from "../services-core/helpers";
 
 export const TERMS = "2026-10";
@@ -269,10 +272,22 @@ export async function makeDue(id: string) {
     .where(eq(nodes.id, id));
 }
 
-/** A kept old version of a file, with a real key. `dueDays` ago is when it became purgeable. */
+/** The account as T06 leaves it when its deletion is confirmed: the date, and the pending row. */
+export async function scheduleDeletion(userId: string, dueInDays: number) {
+  const at = new Date(Date.now() + dueInDays * 86_400_000);
+  await db().update(user).set({ deleteScheduledAt: at }).where(eq(user.id, userId));
+  await db().insert(pendingUserPurges).values({ userId, scheduledFor: at });
+}
+
+export async function pendingPurge(userId: string) {
+  const [row] = await db().select().from(pendingUserPurges).where(eq(pendingUserPurges.userId, userId));
+  return row ?? null;
+}
+
+/** A kept old version of a file, with a real key. `due`: its purge date passed yesterday. */
 export async function makeVersion(
   file: { id: string; ownerId: string },
-  overrides: { size?: number; dueDaysAgo?: number } = {},
+  overrides: { size?: number; due?: boolean } = {},
 ) {
   const versionId = uuidv7();
   const [row] = await db()
@@ -283,7 +298,7 @@ export async function makeVersion(
       r2Key: keyFor(file.ownerId, file.id, versionId),
       size: overrides.size ?? 40,
       createdBy: file.ownerId,
-      purgeAfter: new Date(Date.now() - (overrides.dueDaysAgo ?? -30) * 86_400_000),
+      purgeAfter: new Date(Date.now() + (overrides.due ? -1 : 30) * 86_400_000),
     })
     .returning();
   return row!;
