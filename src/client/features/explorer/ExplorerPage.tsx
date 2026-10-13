@@ -42,7 +42,7 @@ import {
 } from "react";
 import { Link as RouterLink, matchPath, useLocation, useNavigate, useParams } from "react-router";
 import type { NodeDto } from "../../../shared/schemas/node";
-import { useBreadcrumbs } from "../../components/Breadcrumbs";
+import { useBreadcrumbs, type Crumb } from "../../components/Breadcrumbs";
 import { COMMAND_IDS, registerCommands, type Command } from "../../components/CommandPalette";
 import { useDetailsPanel } from "../../components/DetailsPanel";
 import { EmptyState } from "../../components/EmptyState";
@@ -78,7 +78,7 @@ import {
 import { thumbUrl } from "./api";
 import { NodeDetails, SelectionDetails } from "./Details";
 import { MoveDialog, NameDialog } from "./dialogs";
-import { DRAG_TYPE, DROP_RING, isNodeDrag, useBreadcrumbDrop } from "./dnd";
+import { DRAG_TYPE, DROP_RING, isNodeDrag } from "./dnd";
 import {
   actionsFor,
   actionsForSelection,
@@ -217,12 +217,6 @@ function Explorer({ folderId }: { folderId: string | null }) {
   const dragging = useRef<NodeDto[]>([]);
   const [marqueeStart, setMarqueeStart] = useState<{ x: number; y: number } | null>(null);
   const marqueeMoved = useRef(false);
-
-  const crumbs = useMemo(() => {
-    const trail = buildCrumbs(folderId, folder);
-    return trail ? truncateMiddle(trail, narrow ? 4 : 7) : null;
-  }, [folderId, folder, narrow]);
-  useBreadcrumbs(crumbs);
 
   // ---- focus ---------------------------------------------------------------------------------
 
@@ -517,7 +511,40 @@ function Explorer({ folderId }: { folderId: string | null }) {
     },
     [move],
   );
-  useBreadcrumbDrop(desktop && inFront, (id, label) => dropOn({ id, name: label }));
+
+  // The trail, whose parent crumbs are drop targets too (the link's own attributes, through the
+  // shared component's `dropProps`).
+  const crumbs = useMemo(() => {
+    const trail = buildCrumbs(folderId, folder);
+    if (!trail) return null;
+    const droppable = desktop && canAddTo(role);
+    return truncateMiddle(trail, narrow ? 4 : 7).map((crumb): Crumb => {
+      if (!droppable || crumb.to === undefined) return crumb;
+      const target: MoveTarget = { id: crumb.id ?? null, name: crumb.label };
+      const key = `crumb:${target.id ?? "top"}`;
+      return {
+        ...crumb,
+        dropProps: {
+          onDragOver: (event) => {
+            if (!isNodeDrag(event.dataTransfer)) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            setDropTarget(key);
+          },
+          onDragLeave: () => setDropTarget((current) => (current === key ? null : current)),
+          onDrop: (event) => {
+            if (!isNodeDrag(event.dataTransfer)) return;
+            event.preventDefault();
+            dropOn(target);
+          },
+          ...(dropTarget === key
+            ? { style: { ...DROP_RING, outlineOffset: 2 }, "data-drop-target": "true" }
+            : {}),
+        },
+      };
+    });
+  }, [folderId, folder, narrow, desktop, role, dropTarget, dropOn]);
+  useBreadcrumbs(crumbs);
 
   const openMenuFor = useCallback(
     (item: NodeDto, anchor: MenuAnchor) => {

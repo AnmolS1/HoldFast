@@ -761,6 +761,88 @@ describe("downloading one file", () => {
   });
 });
 
+describe("drag and drop", () => {
+  /** A stand-in for the browser's DataTransfer (jsdom has none). */
+  const transfer = (types: string[] = []) => ({
+    types,
+    effectAllowed: "",
+    dropEffect: "",
+    setData(type: string) {
+      this.types.push(type);
+    },
+  });
+
+  it("a row dropped on a folder row moves it there; the target shows the dashed ring while over it", async () => {
+    const drive = top();
+    serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    const seen = recordNodesChanged();
+    const data = transfer();
+    fireEvent.dragStart(rowOf(NOTES.id)!, { dataTransfer: data });
+    expect(data.types).toEqual(["application/x-holdfast-nodes"]);
+    fireEvent.dragOver(rowOf(ALPHA.id)!, { dataTransfer: data });
+    expect(rowOf(ALPHA.id)!.getAttribute("data-drop-target")).toBe("true");
+    expect(rowOf(ALPHA.id)!.style.outline).toContain("dashed");
+    // A file is not a place to drop.
+    fireEvent.dragOver(rowOf(PHOTO.id)!, { dataTransfer: data });
+    expect(rowOf(PHOTO.id)!.getAttribute("data-drop-target")).toBeNull();
+    fireEvent.drop(rowOf(ALPHA.id)!, { dataTransfer: data });
+    await waitFor(() => expect(drive.nodes.get(NOTES.id)!.parentId).toBe(ALPHA.id));
+    await waitFor(() => expect(seen.events).toEqual([[null, ALPHA.id]]));
+    expect(rowOf(ALPHA.id)!.getAttribute("data-drop-target")).toBeNull();
+    seen.stop();
+  });
+
+  it("a selected row drags the whole selection; a folder cannot be dropped on itself", async () => {
+    const drive = top();
+    serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    fireEvent.click(rowOf(NOTES.id)!);
+    fireEvent.click(rowOf(BETA.id)!, { ctrlKey: true });
+    const data = transfer();
+    fireEvent.dragStart(rowOf(BETA.id)!, { dataTransfer: data });
+    fireEvent.dragOver(rowOf(BETA.id)!, { dataTransfer: data });
+    expect(rowOf(BETA.id)!.getAttribute("data-drop-target")).toBeNull();
+    fireEvent.drop(rowOf(ALPHA.id)!, { dataTransfer: data });
+    await waitFor(() => expect(drive.callsTo("POST", /\/move$/)).toHaveLength(2));
+    expect(drive.nodes.get(NOTES.id)!.parentId).toBe(ALPHA.id);
+    expect(drive.nodes.get(BETA.id)!.parentId).toBe(ALPHA.id);
+  });
+
+  it("a row dropped on a breadcrumb moves it to that folder (here: up to the top level)", async () => {
+    const inside = fileNode(5, { parentId: ALPHA.id, name: "inside.pdf" });
+    const drive = top().add(inside);
+    serveDrive(drive);
+    renderExplorer(`/folder/${ALPHA.id}`);
+    await waitForRows(1);
+    const files = await screen.findByRole("link", { name: "Files" });
+    const data = transfer();
+    fireEvent.dragStart(rowOf(inside.id)!, { dataTransfer: data });
+    fireEvent.dragOver(files, { dataTransfer: data });
+    await waitFor(() => expect(files.getAttribute("data-drop-target")).toBe("true"));
+    expect(files.style.outline).toContain("dashed");
+    fireEvent.drop(files, { dataTransfer: data });
+    await waitFor(() => expect(drive.nodes.get(inside.id)!.parentId).toBeNull());
+    expect(drive.callsTo("POST", /\/move$/)[0]!.body).toEqual({ parentId: null });
+    await waitForRows(0);
+  });
+
+  it("files dragged in from the desktop are not this feature's: no ring, no move", async () => {
+    const drive = top();
+    serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    const data = transfer(["Files"]);
+    fireEvent.dragOver(rowOf(ALPHA.id)!, { dataTransfer: data });
+    expect(rowOf(ALPHA.id)!.getAttribute("data-drop-target")).toBeNull();
+    fireEvent.drop(rowOf(ALPHA.id)!, { dataTransfer: data });
+    await act(async () => {});
+    expect(drive.callsTo("POST", /\/move$/)).toHaveLength(0);
+  });
+});
+
 describe("underneath a preview the page is not the page in front", () => {
   it("its commands are withdrawn: the Delete key cannot trash a selection the user cannot see", async () => {
     const drive = top();
