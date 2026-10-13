@@ -3,6 +3,7 @@ import { defineMessages } from "../../lib/i18n";
 
 export const messages = {
   "preview.loading": "Loading preview",
+  "preview.title": "Preview",
   "preview.previous": "Previous file",
   "preview.next": "Next file",
   "preview.position": "{index} of {count}",

@@ -146,6 +146,8 @@ describe("errors never throw", () => {
     open(NODES.png);
     expect(await screen.findByRole("heading", { name: title })).toBeTruthy();
     expect(state()).toBe("error");
+    // The dialog is not still called "Loading preview" once loading has failed.
+    expect(screen.getByRole("dialog", { name: "Preview" })).toBe(dialog());
     expect(within(dialog()!).getByText("req req-1234")).toBeTruthy();
     expect(renderer()).toBeNull();
     expect(errors).not.toHaveBeenCalled();

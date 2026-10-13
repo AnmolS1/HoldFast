@@ -218,7 +218,7 @@ function Body(props: BodyProps) {
               variant="h2"
               sx={{ margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
             >
-              {item ? item.name : t("preview.loading")}
+              {item ? item.name : state.status === "error" ? t("preview.title") : t("preview.loading")}
             </Typography>
             {item ? (
               <Typography
