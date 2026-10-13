@@ -86,7 +86,8 @@ describe("a finished upload", () => {
       ext: "txt",
       size: 1000,
       scanStatus: "pending",
-      sha256,
+      // Not shown while the scan is pending: until then it is only what the client declared.
+      sha256: null,
       thumb: false,
       role: "owner",
       owner: { id: user.id },

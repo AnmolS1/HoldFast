@@ -354,7 +354,14 @@ describe("PUT /uploads/:id/parts/:n", () => {
     const done = await complete(user, session.uploadId, { sha256, parts: [threeAgain, one, two] }, { sent });
     expect(done.status).toBe(201);
     const node = NodeDto.parse(done.body);
-    expect(node).toMatchObject({ name: "sparse.bin", size, scanStatus: "pending", sha256, role: "owner" });
+    expect(node).toMatchObject({
+      name: "sparse.bin",
+      size,
+      scanStatus: "pending",
+      sha256: null,
+      role: "owner",
+    });
+    expect((await nodeById(node.id))?.sha256).toBe(sha256);
     const row = (await sessionRow(session.uploadId))!;
     expect(row.status).toBe("done");
     const head = (await env.FILES.head(row.r2Key))!;

@@ -288,6 +288,39 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
     });
   });
 
+  it("the OWNER's view of the two lies is the same too — the answer of complete and a repeat of it: sha256 null, pending", async () => {
+    const owner = await uploader();
+    const [one, two] = [await makeFolder(owner.id), await makeFolder(owner.id)];
+    const known = await listed("csam");
+    const listedLie = await uploaded(owner, { parentId: one.id, name: "same.bin" }, uniqueBytes());
+    const unlistedLie = await uploaded(owner, { parentId: two.id, name: "same.bin" }, uniqueBytes());
+    const a = await complete(owner, listedLie.uploadId, { sha256: known.sha256 });
+    const b = await complete(owner, unlistedLie.uploadId, { sha256: sha() });
+    expect(a.status).toBe(201);
+    expect(a.body).toMatchObject({ sha256: null, scanStatus: "pending" });
+    expect(b.body).toMatchObject({ sha256: null, scanStatus: "pending" });
+    // Nothing is taken out of the comparison but ids, the folder and the times.
+    const view = (answer: typeof a) => {
+      const { id, parentId, etag, createdAt, updatedAt, requestId, ...rest } = answer.body;
+      void [id, parentId, etag, createdAt, updatedAt, requestId];
+      return JSON.stringify({ status: answer.status, rest });
+    };
+    expect(view(a)).toBe(view(b));
+    // A later read of each (the repeat of complete answers through the same mapper as a read).
+    const againA = await complete(owner, listedLie.uploadId, { sha256: known.sha256 });
+    const againB = await complete(owner, unlistedLie.uploadId, {
+      sha256: String((await sessionRow(unlistedLie.uploadId))!.expectedSha256),
+    });
+    expect(againA.status).toBe(200);
+    expect(view(againA)).toBe(view(againB));
+    // On the rows the truth differs, where no client reads it: the server's hash, the claim.
+    const [rowA, rowB] = [(await nodeById(String(a.body.id)))!, (await nodeById(String(b.body.id)))!];
+    expect(rowA.sha256).not.toBe(known.sha256);
+    expect(await blocklist.lookup(testDb(), rowA.sha256!)).toBeNull();
+    expect(rowB.sha256).toBe((await sessionRow(unlistedLie.uploadId))!.expectedSha256);
+    expect([rowA.scanStatus, rowB.scanStatus]).toEqual(["pending", "pending"]);
+  });
+
   it("the same with a malware-listed hash: no strike, nothing refused", async () => {
     const user = await uploader();
     const known = await listed("malware");
