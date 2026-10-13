@@ -7,11 +7,20 @@
 // REAL (HOLDFAST_E2E_REAL=1, post-integration): the two folder journeys run unchanged against the
 // API as built, with a user who really signed up; every test that scripts the API's answers
 // (files, scan states, 2,000 items, errors) is `mockedOnly()`.
-import type { Locator, Page } from "@playwright/test";
+import type { Download, Locator, Page, Route } from "@playwright/test";
 import { signedInUser } from "../setup/auth-fixtures";
 import { FakeDrive } from "../unit/client/explorer/fixtures/drive";
 import { fileNode, folderNode, manyNodes } from "../unit/client/explorer/fixtures/nodes";
-import { expect, expectNoA11yViolations, mockedOnly, mockEnvelope, mockShell, REAL, test } from "./fixtures";
+import {
+  expect,
+  expectNoA11yViolations,
+  MOCK_USER,
+  mockedOnly,
+  mockEnvelope,
+  mockShell,
+  REAL,
+  test,
+} from "./fixtures";
 
 const DESKTOP_MIN = 1024;
 const isMobile = (page: Page) => (page.viewportSize()?.width ?? 0) < DESKTOP_MIN;
@@ -35,8 +44,9 @@ async function serve(page: Page, port: number, drive: FakeDrive): Promise<FakeDr
       return true;
     },
   });
-  // The files host: any minted URL serves a few bytes as an attachment.
-  await page.route(`${drive.filesOrigin}/**`, (route) =>
+  // The files host: any minted URL serves a few bytes as an attachment — in whichever tab asks
+  // (a single download opens in a tab of its own).
+  await page.context().route(`${drive.filesOrigin}/**`, (route) =>
     route.fulfill({
       status: 200,
       headers: {
@@ -263,9 +273,17 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     test.skip(isMobile(page), "desktop menus; the mobile sheet is tested below");
     const fake = await serve(page, origins.port, drive());
     await openExplorer(page);
-    const download = page.waitForEvent("download");
+    // The link opens in a tab of its own (an error page from the files host must never replace the
+    // app): the download belongs to that tab.
+    const download = new Promise<Download>((resolve) => {
+      page.on("download", resolve);
+      page.context().on("page", (tab) => tab.on("download", resolve));
+    });
     await menuAction(page, row(page, "notes.pdf"), "Download");
     expect((await download).url()).toContain(`${fake.filesOrigin}/d/${NOTES.id}/`);
+    // The app is where it was.
+    await expect(page).toHaveURL(/\/$/);
+    await expect(row(page, "notes.pdf")).toBeVisible();
     expect(fake.callsTo("POST", /\/download-url$/)[0]!.body).toEqual({ kind: "download" });
   });
 
@@ -307,6 +325,8 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
   }) => {
     mockedOnly();
     test.skip(isMobile(page), "the persistent panel is the desktop layout's");
+    // The page's clock is the test's: the 5 s poll is stepped over, not waited for.
+    await page.clock.install();
     const fake = await serve(page, origins.port, drive());
     await openExplorer(page);
     const panel = page.locator("[data-details-panel]");
@@ -339,7 +359,8 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
 
     // The poll (5 s) reads `.node.scanStatus`: once the scan says clean, the underline goes.
     fake.nodes.set(BROKEN.id, { ...BROKEN, scanStatus: "clean", scanReason: null });
-    await expect(row(page, "broken.bin").getByRole("progressbar")).toHaveCount(0, { timeout: 15_000 });
+    await page.clock.fastForward(6_000);
+    await expect(row(page, "broken.bin").getByRole("progressbar")).toHaveCount(0);
     await expect(row(page, "broken.bin").locator("[data-status]")).toHaveCount(0);
   });
 
@@ -396,7 +417,6 @@ test.describe("long folders and accessibility", () => {
     origins,
   }) => {
     mockedOnly();
-    test.setTimeout(90_000);
     const fake = await serve(page, origins.port, new FakeDrive(manyNodes(2000)));
     await openExplorer(page);
     const grid = page.getByRole("grid");
@@ -455,6 +475,88 @@ test.describe("failures", () => {
       expect(errors).toEqual([]);
     });
   }
+});
+
+test.describe("one account never sees another's files", () => {
+  test("an action in flight when the account changes: its late failure puts nothing of A into B's page", async ({
+    page,
+    origins,
+  }) => {
+    mockedOnly();
+    test.skip(isMobile(page), "one layout is enough: the rule is in the cache, not the layout");
+    await page.clock.install();
+    // Two accounts on one browser. Whoever the session endpoint names is signed in.
+    const A = { ...MOCK_USER, id: "a".repeat(32), name: "Account A", email: "a@example.com" };
+    const B = { ...MOCK_USER, id: "b".repeat(32), name: "Account B", email: "b@example.com" };
+    const drives = {
+      A: new FakeDrive([fileNode(1, { name: "salary-of-A.pdf" }), fileNode(2, { name: "diary-of-A.txt" })]),
+      B: new FakeDrive([fileNode(3, { name: "notes-of-B.txt" })]),
+    };
+    let current: "A" | "B" = "A";
+    let heldTrash: Route | null = null;
+    const listings: string[] = [];
+    await mockShell(page, origins.port, {
+      api: async (route, path) => {
+        if (path === "/api/auth/get-session") {
+          await route.fulfill({ json: { user: current === "A" ? A : B, session: {} } });
+          return true;
+        }
+        if (!path.startsWith("/api/nodes")) return false;
+        const request = route.request();
+        // A's trash is slow: it is still on its way when the account changes.
+        if (path.endsWith("/trash")) {
+          heldTrash = route;
+          return true;
+        }
+        if (path === "/api/nodes/root") listings.push(current);
+        const url = new URL(request.url());
+        const answer = drives[current].handle({
+          method: request.method(),
+          path: url.pathname + url.search,
+          body: request.postDataJSON() ?? undefined,
+        })!;
+        await route.fulfill({ status: answer.status, json: answer.body });
+        return true;
+      },
+    });
+
+    await openExplorer(page);
+    await expect(row(page, "salary-of-A.pdf")).toBeVisible();
+    await row(page, "salary-of-A.pdf").click();
+    await page.keyboard.press("Delete");
+    await expect(row(page, "salary-of-A.pdf")).toHaveCount(0);
+    await expect.poll(() => heldTrash !== null).toBe(true);
+
+    // Another person signs in on this browser. A's page is left; the next session read names B,
+    // and the shell purges everything that belonged to A before B sees a page.
+    current = "B";
+    const nav = page.getByRole("navigation", { name: "Primary" });
+    await nav.getByRole("link", { name: "Recent" }).click();
+    await expect(page).toHaveURL(/\/recent$/);
+    // The session is read again when the tab comes back to the front, once it is 15 s old.
+    await page.clock.fastForward(20_000);
+    await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange", { bubbles: true })));
+    await expect(page.getByRole("button", { name: "Account menu" })).toContainText("Account B");
+
+    // B opens the top level: B's own rows, read by B's own request.
+    expect(listings.filter((who) => who === "B")).toHaveLength(0);
+    await nav.getByRole("link", { name: "Files" }).click();
+    await expect(page).toHaveURL(/\/$/);
+    await expect(row(page, "notes-of-B.txt")).toBeVisible();
+    await expect(page.locator("[data-item-id]")).toHaveCount(1);
+    expect(listings.filter((who) => who === "B").length).toBeGreaterThan(0);
+
+    // Only now does A's request fail — the worst moment: B's listing sits in the cache under the
+    // very key A's did. The rollback belongs to an account that is gone: no row of A's is put into
+    // B's list, and B is told nothing about an action B never made.
+    const settled = page.waitForResponse((response) => response.url().endsWith("/trash"));
+    await heldTrash!.fulfill({ status: 500, json: mockEnvelope("internal", "Internal error.") });
+    await settled;
+    await expect(page.locator("[data-item-id]")).toHaveCount(1);
+    await expect(page.getByText("-of-A")).toHaveCount(0);
+    await expect(toastText(page).locator("[data-toast]")).toHaveCount(0);
+    await expect(page.locator("[data-explorer-live]")).toHaveText("");
+  });
 });
 
 test.describe("mobile layout", () => {
