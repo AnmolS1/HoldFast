@@ -135,6 +135,27 @@ export async function effectiveTrashed(db: Executor, nodeId: string): Promise<bo
 }
 
 /**
+ * True when nobody but an admin may learn the node exists: it or one of its ancestors is taken
+ * down, or it is itself locked as suspected CSAM (a state of one file: it is not inherited) —
+ * and for an id that does not exist, so a caller that only asks "may this be shown?" fails
+ * closed. One statement, whatever the answer.
+ */
+export async function effectiveHidden(db: Executor, nodeId: string): Promise<boolean> {
+  if (!isUuid(nodeId)) return true;
+  const result = await db.execute<{ found: boolean; hidden: boolean }>(sql`
+    WITH RECURSIVE up(id, parent_id, takedown_at, locked) AS (
+      SELECT n.id, n.parent_id, n.takedown_at, n.scan_status = 'suspected_csam'
+      FROM nodes n WHERE n.id = ${nodeId}
+      UNION ALL
+      SELECT p.id, p.parent_id, p.takedown_at, false FROM nodes p JOIN up ON p.id = up.parent_id
+    ) CYCLE id SET is_cycle USING path
+    SELECT EXISTS (SELECT 1 FROM up) AS found,
+           EXISTS (SELECT 1 FROM up WHERE takedown_at IS NOT NULL OR locked) AS hidden`);
+  const row = result.rows[0];
+  return !row || !row.found || row.hidden;
+}
+
+/**
  * A predicate for a query over `nodes`: the row is not in the trash, directly or by ancestry.
  * `alias` is the SQL name the outer query gives the table (default `nodes`).
  */

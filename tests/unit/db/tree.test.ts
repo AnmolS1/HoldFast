@@ -5,6 +5,7 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import {
   ancestors,
   effectiveAccess,
+  effectiveHidden,
   effectiveRole,
   effectiveTrashed,
   isDescendantOrSelf,
@@ -101,6 +102,48 @@ describe("isDescendantOrSelf", () => {
     expect(await isDescendantOrSelf(db, f.alpha.id, f.a.id)).toBe(false);
     expect(await isDescendantOrSelf(db, uuidv7(), f.a.id)).toBe(false);
     expect(await isDescendantOrSelf(db, "x", f.a.id)).toBe(false);
+  });
+});
+
+describe("effectiveHidden", () => {
+  it("is true for a taken-down node and everything below it, false elsewhere, true for an unknown node", async () => {
+    const f = await fixture();
+    for (const node of [f.root, f.a, f.b, f.deep, f.zeta, f.alpha]) {
+      expect(await effectiveHidden(db, node.id)).toBe(false);
+    }
+    await db
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "abuse" })
+      .where(eq(nodes.id, f.a.id));
+    expect(await effectiveHidden(db, f.a.id)).toBe(true);
+    expect(await effectiveHidden(db, f.b.id)).toBe(true);
+    expect(await effectiveHidden(db, f.deep.id)).toBe(true);
+    expect(await effectiveHidden(db, f.zeta.id)).toBe(true);
+    // Not above it, and not beside it.
+    expect(await effectiveHidden(db, f.root.id)).toBe(false);
+    expect(await effectiveHidden(db, f.alpha.id)).toBe(false);
+    expect(await effectiveHidden(db, uuidv7())).toBe(true);
+    expect(await effectiveHidden(db, "nope")).toBe(true);
+  });
+
+  it("suspected CSAM hides the file itself and is not inherited; no other scan state hides", async () => {
+    const f = await fixture();
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.deep.id));
+    expect(await effectiveHidden(db, f.deep.id)).toBe(true);
+    expect(await effectiveHidden(db, f.b.id)).toBe(false);
+    expect(await effectiveHidden(db, f.zeta.id)).toBe(false);
+    // A state only a file has: on an ancestor (which cannot happen through the product) it
+    // hides that node alone.
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.a.id));
+    expect(await effectiveHidden(db, f.a.id)).toBe(true);
+    expect(await effectiveHidden(db, f.zeta.id)).toBe(false);
+    for (const scanStatus of ["pending", "clean", "infected", "under_review", "error"] as const) {
+      await db.update(nodes).set({ scanStatus }).where(eq(nodes.id, f.alpha.id));
+      expect(await effectiveHidden(db, f.alpha.id), scanStatus).toBe(false);
+    }
+    // In the trash is not hidden: that is `effectiveTrashed`'s question.
+    await db.update(nodes).set({ deletedAt: new Date(), trashedRoot: true }).where(eq(nodes.id, f.alpha.id));
+    expect(await effectiveHidden(db, f.alpha.id)).toBe(false);
   });
 });
 

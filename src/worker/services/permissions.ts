@@ -13,10 +13,15 @@
 // ancestor (the highest role wins) — which already answers "no access" for anyone but the owner
 // when the owner is banned, suspended or scheduled for deletion.
 //
-// A NODE THAT LISTINGS HIDE DOES NOT EXIST HERE EITHER. A node that is taken down, or locked as
-// `suspected_csam`, is `not_found` for everyone — its owner included — exactly as an id that was
-// never issued: the same error, thrown the same way, no detail, no audit row, no metric. That an
-// account holder cannot observe either state is a property of this file, not of each route.
+// A HIDDEN NODE DOES NOT EXIST HERE. A node that is taken down — ITSELF OR BY AN ANCESTOR, like
+// trash — or is itself locked as `suspected_csam`, is `not_found` for everyone — its owner
+// included — exactly as an id that was never issued: the same error, thrown the same way, no
+// detail, no audit row, no metric, AND THE SAME WORK: the access query and the hidden query are
+// both sent for every question, whatever the first one answered, so that "this id is locked"
+// and "this id was never issued" cannot be told apart by the number of statements either. That
+// an account holder cannot observe either state is a property of this file, not of each route.
+// (One difference in work is not this file's: for a GRANTEE the access query reads the owner's
+// state in a second statement — for a node shared with them, hidden or not.)
 // The one way to see such a node is the explicit option `{ includeHidden: true }`, which ONLY
 // ADMIN ROUTES pass (grep for `includeHidden`). The exports that take it: `getAccess` and
 // `requireRole`. `requireUpload` never does (nobody uploads into a hidden folder), nor does the
@@ -37,8 +42,7 @@
 // writes that depend on it re-check under their own lock (the tree queries, the upload claim).
 
 import type { Context } from "hono";
-import { getNode } from "../db/queries/nodes";
-import { effectiveAccess, effectiveTrashed, isDescendantOrSelf } from "../db/queries/tree";
+import { effectiveAccess, effectiveHidden, effectiveTrashed, isDescendantOrSelf } from "../db/queries/tree";
 import { forbidImpersonation } from "../middleware/impersonation";
 import { AppError } from "./errors";
 import { db, type AppEnv } from "./request-context";
@@ -57,8 +61,9 @@ export interface Access {
 export type LinkScope = { linkId: string; rootNodeId: string };
 
 /**
- * `includeHidden: true` — FOR ADMIN ROUTES ONLY — also answers for a node that is taken down or
- * locked as `suspected_csam`. Without it such a node is `not_found`, like an unknown id.
+ * `includeHidden: true` — FOR ADMIN ROUTES ONLY — also answers for a node that is taken down
+ * (itself or by an ancestor) or locked as `suspected_csam`. Without it such a node is
+ * `not_found`, like an unknown id.
  */
 export type AccessOptions = { includeHidden?: true };
 
@@ -89,15 +94,24 @@ export function withLinkScope(c: Context<AppEnv>, scope: LinkScope): void {
   state.cache.clear();
 }
 
-/** True for a node no non-admin may learn exists: taken down, or locked as suspected CSAM. */
-async function isHidden(c: Context<AppEnv>, nodeId: string): Promise<boolean> {
-  const node = await getNode(db(c), nodeId);
-  return !node || node.takedownAt !== null || node.scanStatus === "suspected_csam";
+/** What the session or the link alone says, hidden or not. One access query (none: signed out). */
+async function reach(c: Context<AppEnv>, link: LinkScope | null, nodeId: string): Promise<Access | null> {
+  if (link) {
+    // The link decides alone: a signed-in visitor gets no more through it than a stranger.
+    return (await isDescendantOrSelf(db(c), nodeId, link.rootNodeId))
+      ? { role: "viewer", shareRootId: link.rootNodeId, canUpload: false, via: "link" }
+      : null;
+  }
+  const user = c.get("user");
+  const found = user ? await effectiveAccess(db(c), user.id, nodeId) : null;
+  return found ? { ...found, via: found.role === "owner" ? "owner" : "share" } : null;
 }
 
 /**
  * The caller's access to a node, or null: no access, no such node, or a node that is hidden
- * (taken down, suspected CSAM) — never told apart. `{ includeHidden: true }` is for admin routes.
+ * (taken down itself or by an ancestor, suspected CSAM) — never told apart, by the answer or by
+ * the work. Behind a link the same holds for the target: a hidden node anywhere on its chain —
+ * the link's root included — hides it. `{ includeHidden: true }` is for admin routes.
  */
 export async function getAccess(
   c: Context<AppEnv>,
@@ -109,20 +123,14 @@ export async function getAccess(
   const cacheKey = `${includeHidden ? "all" : "visible"}:${nodeId}`;
   if (state.cache.has(cacheKey)) return state.cache.get(cacheKey) ?? null;
 
-  let access: Access | null = null;
-  if (state.link) {
-    // The link decides alone: a signed-in visitor gets no more through it than a stranger.
-    if (await isDescendantOrSelf(db(c), nodeId, state.link.rootNodeId)) {
-      access = { role: "viewer", shareRootId: state.link.rootNodeId, canUpload: false, via: "link" };
-    }
-  } else {
-    const user = c.get("user");
-    const found = user ? await effectiveAccess(db(c), user.id, nodeId) : null;
-    if (found) access = { ...found, via: found.role === "owner" ? "owner" : "share" };
-  }
-  // Asked only for a node the caller could otherwise reach: the answer for everyone else is
-  // already "nothing", and it must stay exactly that.
-  if (access && !includeHidden && (await isHidden(c, nodeId))) access = null;
+  // A caller with neither a session nor a link reaches nothing, and nothing is asked.
+  const anyone = state.link !== null || Boolean(c.get("user"));
+  // ALWAYS BOTH, never "hidden only when reachable": the work must not depend on the answer.
+  const [reached, hidden] = await Promise.all([
+    reach(c, state.link, nodeId),
+    anyone && !includeHidden ? effectiveHidden(db(c), nodeId) : false,
+  ]);
+  const access = hidden ? null : reached;
   state.cache.set(cacheKey, access);
   return access;
 }

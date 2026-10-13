@@ -390,6 +390,110 @@ describe("a node that listings hide does not exist here either", () => {
     expect(rooted).toBeNull();
   });
 
+  it("hidden is inherited, like trash: a file in a taken-down folder is the same 404 for everyone, and behind a link rooted above, at and below the folder", async () => {
+    const t = await tree();
+    const sibling = await makeFile(t.ids.owner, t.shared.id, { scanStatus: "clean" });
+    const unknown = crypto.randomUUID();
+    const reference = shape(await invoke(t.owner, (c) => requireRole(c, unknown, "viewer")));
+    const viaLink = (rootNodeId: string, nodeId: string) =>
+      value(null, async (c) => {
+        withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId });
+        return (await getAccess(c, nodeId))?.via ?? null;
+      });
+    // Before: everyone with a role reaches the file, and so does each link.
+    expect((await value(t.viewer, (c) => getAccess(c, t.file.id)))?.role).toBe("viewer");
+    for (const root of [t.shared.id, t.inner.id, t.file.id])
+      expect(await viaLink(root, t.file.id)).toBe("link");
+
+    // ONE node is taken down: the folder. Its file is not touched.
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "abuse" })
+      .where(eq(nodes.id, t.inner.id));
+    for (const caller of [t.owner, t.editor, t.editorNoUpload, t.viewer, t.stranger]) {
+      for (const min of ["viewer", "editor", "owner"] as const) {
+        expect(shape(await invoke(caller, (c) => requireRole(c, t.file.id, min)))).toEqual(reference);
+      }
+      expect(await value(caller, (c) => getAccess(c, t.file.id))).toBeNull();
+    }
+    expect(await outcome(t.owner, (c) => requireUpload(c, t.inner.id))).toBe("404 not_found");
+    // A link rooted above the folder, at the folder, and at the file below it.
+    for (const root of [t.shared.id, t.inner.id, t.file.id]) {
+      expect(await viaLink(root, t.file.id), root).toBeNull();
+      const scoped = await invoke(null, async (c) => {
+        withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: root });
+        return requireRole(c, t.file.id, "viewer");
+      });
+      expect(shape(scoped)).toEqual(reference);
+    }
+
+    // The admin routes' option still sees it — and grants nothing to someone with no role.
+    expect((await value(t.owner, (c) => getAccess(c, t.file.id, { includeHidden: true })))?.role).toBe(
+      "owner",
+    );
+    expect(await value(t.stranger, (c) => getAccess(c, t.file.id, { includeHidden: true }))).toBeNull();
+    // A sibling outside the folder is unaffected, for a role and through the link above.
+    expect((await value(t.owner, (c) => getAccess(c, sibling.id)))?.role).toBe("owner");
+    expect((await value(t.viewer, (c) => getAccess(c, sibling.id)))?.role).toBe("viewer");
+    expect(await viaLink(t.shared.id, sibling.id)).toBe("link");
+    expect(await viaLink(t.shared.id, t.shared.id)).toBe("link");
+  });
+
+  it("the same WORK for an unknown id, a hidden node, a node under a hidden ancestor and a node with no access", async () => {
+    const t = await tree();
+    const taken = await makeFile(t.ids.owner, t.shared.id, { scanStatus: "clean" });
+    const locked = await makeFile(t.ids.owner, t.shared.id, { scanStatus: "clean" });
+    const folder = await makeFolder(t.ids.owner, t.privateFolder.id);
+    const below = await makeFile(t.ids.owner, folder.id, { scanStatus: "clean" });
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "dmca" })
+      .where(eq(nodes.id, taken.id));
+    await testDb()
+      .update(nodes)
+      .set({ scanStatus: "suspected_csam", legalHold: true })
+      .where(eq(nodes.id, locked.id));
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "abuse" })
+      .where(eq(nodes.id, folder.id));
+    const ids = {
+      unknown: crypto.randomUUID(),
+      takenDown: taken.id,
+      suspectedCsam: locked.id,
+      hiddenAncestor: below.id,
+      visible: t.secret.id,
+    };
+    /** Statements one question costs, per id — each in a request of its own (no cache). */
+    const cost = async (caller: Caller, linkRoot?: string) => {
+      const out: Record<string, { statements: number; access: boolean }> = {};
+      for (const [name, id] of Object.entries(ids)) {
+        out[name] = await value(caller, async (c) => {
+          if (linkRoot) withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: linkRoot });
+          const before = statementsSent(db(c));
+          const access = await getAccess(c, id);
+          return { statements: statementsSent(db(c)) - before, access: access !== null };
+        });
+      }
+      return out;
+    };
+    const same = (statements: number, visible: boolean) => ({
+      unknown: { statements, access: false },
+      takenDown: { statements, access: false },
+      suspectedCsam: { statements, access: false },
+      hiddenAncestor: { statements, access: false },
+      visible: { statements, access: visible },
+    });
+    // The owner: the access query and the hidden query, every time.
+    expect(await cost(t.owner)).toEqual(same(2, true));
+    // Someone with no access to any of them ("no access" and "locked" and "never issued").
+    expect(await cost(t.stranger)).toEqual(same(2, false));
+    // Through a link over the owner's private folder.
+    expect(await cost(null, t.privateFolder.id)).toEqual(same(2, true));
+    // Signed out and no link: nothing is asked at all, for any id.
+    expect(await cost(null)).toEqual(same(0, false));
+  });
+
   it("includeHidden — the admin routes' option — sees the node; the two answers are cached apart", async () => {
     for (const how of ["taken_down", "suspected_csam"] as const) {
       const t = await hidden(how);
