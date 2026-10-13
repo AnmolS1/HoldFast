@@ -18,26 +18,31 @@
 // OWNER before the image service is called — one atomic add-if-under, so parallel misses cannot
 // pass the daily ceiling together — and a transform that then fails stays charged.
 //
-// A THUMBNAIL THAT FAILED TODAY IS NOT TRIED AGAIN TODAY. Nothing is cached for a failure, so
-// without a memory of it every request for that thumbnail — by anyone holding a URL for it, at
-// no cost to them — would take another unit of the owner's day and another call of the image
-// service. So a failure leaves a marker for (node, version, size) in the daily ledger, under the
-// subject `notice` (rows no total is summed from), and a miss that finds it answers "no
-// thumbnail" at once: no unit, no call, nothing written.
-//   a failure the service gave a CODE for (its quota, an input it cannot decode), an empty
-//   output, a missing source object           → `count` 1: ONE unit and ONE call that day
-//   a failure WITHOUT a code (a lost connection — which is also how the service answers an
-//   oversize input: the two cannot be told apart) → `bytes` + 1, and no more tries at
-//   UNCODED_TRIES: at most three units and three calls that day
-// A new version of the file has a new key and so a fresh attempt; so has another size; so has the
-// next UTC day. A transform that succeeded never has a marker — it has a cached object.
+// A THUMBNAIL IS ATTEMPTED AT MOST THREE TIMES A DAY, AND NOT AGAIN ONCE IT IS KNOWN TO FAIL.
+// Nothing is cached for a failure, and a burst of misses for one thumbnail arrives before any of
+// them has finished — so without a memory every such request, by anyone holding a URL for it and
+// at no cost to them, would take another unit of the owner's day and another call of the image
+// service. So before the unit is taken a request CLAIMS AN ATTEMPT: one add-if-under statement on
+// a marker row for (node, version, size) in the daily ledger, under the subject `notice` (rows no
+// total is summed from). A request that does not get the claim answers "no thumbnail" at once:
+// no unit, no call, nothing written — the page's next load finds the cached thumbnail or the
+// marker.
+//   `count`   attempts made today, at most THUMB_ATTEMPTS_PER_DAY — whatever became of them. A
+//             failure WITHOUT a code (a lost connection — which is also how the service answers
+//             an oversize input: the two cannot be told apart) is simply one attempt used.
+//   `bytes`   1 once it is known that this thumbnail cannot be made today: a failure the service
+//             gave a CODE for (its quota, an input it cannot decode), an empty output, a missing
+//             source object. The claim's own ceiling refuses every attempt after that.
+// So one thumbnail costs its owner at most three units and three calls a day however many ask,
+// and however many ask AT ONCE; a known failure costs one. A new version of the file has a new
+// key and so fresh attempts; so has another size; so has the next UTC day. A thumbnail that was
+// made is found in the cache and never comes here again.
 //
-// NO LOCK. Two concurrent misses both transform and both write the same bytes to the same key
-// (and when both fail, both claim the one marker).
-
+// NO LOCK. Concurrent misses that hold a claim each transform and each write the same bytes to
+// the same key — two writers of one key are harmless.
 import type { Context } from "hono";
 import { THUMB_INPUT_MAX_BYTES, type ThumbSize } from "../../shared/constants";
-import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
+import { addUsageIfUnder, utcDay } from "../db/queries/ledger";
 import { tryConsumeCeiling } from "./ceilings";
 import { now } from "./clock";
 import { db, type AppEnv } from "./request-context";
@@ -56,10 +61,10 @@ export type MadeThumbnail =
 
 const none = (reason: string): MadeThumbnail => ({ ok: false, reason });
 
-/** How often a day a thumbnail is tried again after a failure that carried no code. */
-export const UNCODED_TRIES = 3;
+/** How many attempts a day one thumbnail — one size of one version of a file — gets. */
+export const THUMB_ATTEMPTS_PER_DAY = 3;
 
-/** The id of a thumbnail's failure marker (ledger subject `notice`). */
+/** The id of a thumbnail's attempt marker (ledger subject `notice`). */
 export function failureMarker(node: Pick<ThumbSource, "id" | "versionId">, size: ThumbSize): string {
   return `thumb_failed:${node.id}:${node.versionId}:${size}`;
 }
@@ -69,19 +74,28 @@ const hasCode = (error: unknown): boolean => {
   return typeof code === "number" || (typeof code === "string" && /^\d{1,6}$/.test(code));
 };
 
-/** Remembers a failure for the rest of the UTC day. Never throws: the answer is a 404 either way. */
-async function remember(c: Context<AppEnv>, marker: string, day: string, final: boolean): Promise<void> {
+/**
+ * Claims one of today's attempts: true exactly THUMB_ATTEMPTS_PER_DAY times a day per marker,
+ * and never once the thumbnail was given up on. One statement, so any number of requests at once
+ * get at most that many claims between them.
+ */
+function claimAttempt(c: Context<AppEnv>, marker: string, day: string): Promise<boolean> {
+  return addUsageIfUnder(
+    db(c),
+    day,
+    "notice",
+    marker,
+    { bytes: 0, count: 1 },
+    { bytes: 0, count: THUMB_ATTEMPTS_PER_DAY },
+  );
+}
+
+/** No further attempt today. Never throws: the answer is a 404 either way. */
+async function giveUp(c: Context<AppEnv>, marker: string, day: string): Promise<void> {
   try {
-    await addUsageIfUnder(
-      db(c),
-      day,
-      "notice",
-      marker,
-      final ? { bytes: 0, count: 1 } : { bytes: 1, count: 0 },
-      final ? { count: 1 } : { bytes: UNCODED_TRIES },
-    );
+    await addUsageIfUnder(db(c), day, "notice", marker, { bytes: 1, count: 0 }, { bytes: 1 });
   } catch {
-    // Not remembered: the next request tries once more.
+    // Not recorded: the attempts that are left may still be used.
   }
 }
 
@@ -104,11 +118,10 @@ export async function makeThumbnail(
   // The image service's failure for a larger input is an untyped connection error: never ask.
   if (!Number.isFinite(node.size) || node.size > THUMB_INPUT_MAX_BYTES) return none("too_large");
 
-  // Failed today already: the same answer, and nothing is spent on it.
+  // An attempt of today's, claimed before anything is spent. Not got: the same answer, at once.
   const marker = failureMarker(node, size);
   const day = utcDay(now(c));
-  const failed = await totalsOn(db(c), day, "notice", marker);
-  if (failed.count >= 1 || failed.bytes >= UNCODED_TRIES) return none("failed_today");
+  if (!(await claimAttempt(c, marker, day))) return none("attempted_today");
 
   const unit = await tryConsumeCeiling(c, "transform_user", owner, { count: 1 });
   if (!unit.ok) return none("ceiling");
@@ -118,7 +131,7 @@ export async function makeThumbnail(
   try {
     const source = await store.get(node.r2Key);
     if (!source || source.kind !== "body") {
-      await remember(c, marker, day, true);
+      await giveUp(c, marker, day);
       return none("no_source");
     }
     const result = await c.env.IMAGES.input(source.object.body)
@@ -127,11 +140,11 @@ export async function makeThumbnail(
     // Read whole: the store takes no stream of unknown length, and a thumbnail is small.
     buffer = await result.response().arrayBuffer();
   } catch (error) {
-    await remember(c, marker, day, hasCode(error));
+    if (hasCode(error)) await giveUp(c, marker, day);
     return none(reasonOf(error));
   }
   if (buffer.byteLength === 0) {
-    await remember(c, marker, day, true);
+    await giveUp(c, marker, day);
     return none("empty");
   }
 
