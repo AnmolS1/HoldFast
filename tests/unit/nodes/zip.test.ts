@@ -207,6 +207,21 @@ describe("POST /nodes/zip-manifest", () => {
     expect(unknown.status).toBe(404);
   });
 
+  it("stops at the first root that is refused: 100 unknown ids cost what one costs", async () => {
+    const t = await album();
+    const ids = (count: number) => Array.from({ length: count }, () => crypto.randomUUID());
+    const one = await manifest(t.viewer.as, { nodeIds: ids(1) });
+    const hundred = await manifest(t.viewer.as, { nodeIds: ids(100) });
+    expect([one.status, hundred.status]).toEqual([404, 404]);
+    expect(one.statements).toBeGreaterThan(0);
+    expect(hundred.statements).toBe(one.statements);
+    // A refusal in the middle: what came before it was asked, what comes after is not.
+    const middle = await manifest(t.owner.as, { nodeIds: [t.folder.id, crypto.randomUUID(), ...ids(50)] });
+    const first = await manifest(t.owner.as, { nodeIds: [t.folder.id, crypto.randomUUID()] });
+    expect(middle.status).toBe(404);
+    expect(middle.statements).toBe(first.statements);
+  });
+
   it("a file as a root is its own entry; two roots of one name get distinct paths; a file reached twice is listed once", async () => {
     const owner = await person();
     const one = await makeFolder(owner.id);

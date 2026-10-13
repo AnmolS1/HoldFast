@@ -284,7 +284,10 @@ router.post("/nodes/zip-manifest", async (c) => {
   let roots: ZipRoot[];
   if ("nodeIds" in body) {
     const ids = [...new Set(body.nodeIds)];
-    const found = await Promise.all(ids.map((id) => visibleNode(c, id, "viewer")));
+    // One after the other: the first root the caller may not see ends the request, and nothing
+    // more is asked about the rest.
+    const found: Awaited<ReturnType<typeof visibleNode>>[] = [];
+    for (const id of ids) found.push(await visibleNode(c, id, "viewer"));
     const labels = uniqueLabels(found.map(({ node }) => node.name));
     roots = found.map(({ node, access }, index) => ({
       id: node.id,
@@ -304,19 +307,20 @@ router.post("/nodes/download-urls", async (c) => {
   const user = requireVerified(c);
   assertContentAccess(c);
   const { nodeIds } = parse(BatchDownloadUrlsBody, await jsonBody(c));
-  const items = await Promise.all(
-    nodeIds.map(async (nodeId): Promise<BatchDownloadUrlItem> => {
-      try {
-        const { answer } = await mintUrl(c, user, nodeId, "download", true);
-        return { nodeId, url: answer.url, expiresAt: answer.expiresAt };
-      } catch (error) {
-        if (!(error instanceof AppError)) throw error;
-        const code: ErrorCode = error.code;
-        metric("download", { kind: "download", outcome: code });
-        return { nodeId, error: code };
-      }
-    }),
-  );
+  // One after the other, in the order asked: a failure that is nobody's refusal ends the request
+  // there, with nothing minted or recorded for the nodes after it.
+  const items: BatchDownloadUrlItem[] = [];
+  for (const nodeId of nodeIds) {
+    try {
+      const { answer } = await mintUrl(c, user, nodeId, "download", true);
+      items.push({ nodeId, url: answer.url, expiresAt: answer.expiresAt });
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      const code: ErrorCode = error.code;
+      metric("download", { kind: "download", outcome: code });
+      items.push({ nodeId, error: code });
+    }
+  }
   return c.json({ items } satisfies BatchDownloadUrlsResponse);
 });
 

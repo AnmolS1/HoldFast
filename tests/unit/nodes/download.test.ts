@@ -425,6 +425,25 @@ describe("download-urls (the zip batch)", () => {
     expect(new Set(rows.map((row) => row.targetId)).size).toBe(50);
   });
 
+  it("a failure that is nobody's refusal ends the batch where it happens: nothing is asked about the nodes after it", async () => {
+    const t = await sharedTree();
+    // No signing secret: the first mint throws (a plain error, not a refusal).
+    const broken = { env: { FILES_TOKEN_SECRET: "" } };
+    const one = await api(t.owner.as, "POST", "/nodes/download-urls", {
+      body: { nodeIds: [t.notes.id] },
+      ...broken,
+    });
+    const many = await api(t.owner.as, "POST", "/nodes/download-urls", {
+      body: { nodeIds: [t.notes.id, t.photo.id, t.secret.id, t.broken.id] },
+      ...broken,
+    });
+    expect([one.status, one.body.error]).toEqual([500, "internal"]);
+    expect([many.status, many.body.error]).toEqual([500, "internal"]);
+    expect(many.statements).toBe(one.statements);
+    for (const node of [t.notes, t.photo, t.secret, t.broken])
+      expect(await auditFor("file.download", node.id)).toEqual([]);
+  });
+
   it("takes 1 to 50 ids", async () => {
     const t = await sharedTree();
     const ids = (count: number) => Array.from({ length: count }, () => crypto.randomUUID());

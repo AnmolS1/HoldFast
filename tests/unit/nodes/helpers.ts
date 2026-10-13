@@ -9,6 +9,7 @@ import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo } from "../../../src/worker/auth/types";
+import { statementsSent, type Db } from "../../../src/worker/db/client";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import { dmcaNoticeNodes, dmcaNotices, nodes, type ScanStatus } from "../../../src/worker/db/schema";
@@ -36,6 +37,8 @@ export type Answer = {
   /** The parsed JSON body (every answer of the app host is JSON). */
   body: any; // eslint-disable-line @typescript-eslint/no-explicit-any
   headers: Headers;
+  /** How many SQL statements the request sent in all, its deferred work included. */
+  statements: number;
 };
 
 export type ApiOptions = {
@@ -77,8 +80,14 @@ export async function api(
       getSession: async () => (caller ? { session: sessionFor(caller), user: caller.user } : null),
     },
   };
+  let handle: Db | null = null;
   const core: CoreDeps = {
     ...realCore,
+    createDb: (...args) => {
+      const made = realCore.createDb(...args);
+      handle = made.db;
+      return made;
+    },
     createAuth: () => auth,
     getSettings: async () => ({ ...BASE_SETTINGS, ...options.settings }),
   };
@@ -112,7 +121,12 @@ export async function api(
   );
   const text = await response.text();
   while (pending.length) await Promise.allSettled(pending.splice(0));
-  return { status: response.status, body: text === "" ? null : JSON.parse(text), headers: response.headers };
+  return {
+    status: response.status,
+    body: text === "" ? null : JSON.parse(text),
+    headers: response.headers,
+    statements: handle ? statementsSent(handle) : 0,
+  };
 }
 
 /**
