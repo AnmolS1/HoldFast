@@ -15,7 +15,8 @@
 // purge-request marker and from then on is gone as far as its owner can tell — out of the
 // listing, and `not_found` by id here, for itself and for everything under it, as a purged id
 // is: the same answer for the same number of statements (`requireKnown`). The purge job
-// finishes the delete by itself once the hold is released.
+// finishes the delete by itself once the hold is released. The request leaves the same audit
+// row either way (`node.purge_requested`).
 //
 // A RESTORE THAT CANNOT HAPPEN NOW has one answer, `409 conflict` with no detail — whether the
 // folder it was in is in the trash and the caller is not the owner, or the node would leave a
@@ -59,6 +60,13 @@ export function setEmptyTrashDeadlineForTests(ms: number): () => void {
     emptyTrashDeadlineMs = EMPTY_TRASH_DEADLINE_MS;
   };
 }
+
+/**
+ * What a "delete forever" REQUEST is recorded as — written after its transaction, the same row
+ * whether the root was purged or is held (nothing in it says which). The purge itself is
+ * recorded as `node.purge`, with its deletes, when it happens: at once, or once a hold is gone.
+ */
+const PURGE_REQUESTED = "node.purge_requested";
 
 /** The one "cannot do that now" of this file: no message of its own, no detail, no cause. */
 const refused = () => new AppError("conflict");
@@ -114,14 +122,22 @@ router.get("/trash", async (c) => {
 router.delete("/trash", async (c) => {
   const user = requireVerified(c);
   const stopAt = Date.now() + emptyTrashDeadlineMs;
+  // One request row for the whole request (it may take hundreds of roots), counting every root it
+  // took — purged or held alike.
+  let roots = 0;
+  const requested = () => audit(c, PURGE_REQUESTED, { type: "user", id: user.id }, { roots });
   for (;;) {
     // Always the first page: a root that was purged, or marked as requested, has left the listing.
     const page = await listTrash(db(c), user.id, { limit: EMPTY_TRASH_BATCH });
-    if (page.items.length === 0) return c.body(null, 204);
+    if (page.items.length === 0) {
+      requested();
+      return c.body(null, 204);
+    }
     for (const root of page.items) {
-      await purgeOne(c, root.id);
+      if (await purgeOne(c, root.id)) roots += 1;
       if (Date.now() < stopAt) continue;
       const remaining = await countTrash(db(c), user.id);
+      requested();
       if (remaining === 0) return c.body(null, 204);
       const body: EmptyTrashResponse = { remaining };
       return c.json(body, 202);
@@ -188,5 +204,6 @@ router.delete(`/nodes/${ID}`, async (c) => {
   const node = await knownNode(c, id);
   if (!isTrashedRoot(node)) throw refused();
   if (!(await purgeOne(c, id))) throw refused();
+  audit(c, PURGE_REQUESTED, { type: "node", id });
   return c.body(null, 204);
 });

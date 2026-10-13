@@ -9,6 +9,7 @@ import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queri
 import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
+  audits,
   closeNotice,
   makeFile,
   makeFolder,
@@ -86,6 +87,25 @@ describe.each(CAUSES)("%s", (_name, hold) => {
     expect(await nodeById(held.file.id)).not.toBeNull();
     expect([a.status, a.body, a.headers]).toEqual([b.status, b.body, b.headers]);
     expect(a.status).toBe(204);
+    // The request is recorded the same way for both: nothing in the row says which was held.
+    const rows = [
+      await audits("node.purge_requested", held.file.id),
+      await audits("node.purge_requested", free.file.id),
+    ];
+    expect([rows[0]!.length, rows[1]!.length]).toEqual([1, 1]);
+    const comparable = (row: (typeof rows)[0][0], t: Tree) => ({
+      ...row,
+      id: "",
+      at: "",
+      requestId: typeof row.requestId,
+      targetId: row.targetId === t.file.id,
+      actorUserId: row.actorUserId === t.owner.id,
+    });
+    expect(comparable(rows[0]![0]!, held)).toEqual(comparable(rows[1]![0]!, free));
+    expect(rows[0]![0]).toMatchObject({ actorType: "user", targetType: "node", meta: null });
+    // The purge itself is recorded only where it happened.
+    expect((await audits("node.purge", held.file.id)).length).toBe(0);
+    expect((await audits("node.purge", free.file.id)).length).toBe(1);
     // Afterwards both are unknown ids, on every route here, at the same cost.
     for (const [method, path] of [
       ["POST", "/trash"],
@@ -173,5 +193,15 @@ describe("DELETE /trash with a held root in it", () => {
       [204, null],
     ]);
     for (const caller of withHeld) expect(await countdown(caller)).toEqual(expected);
+    // One request row per request, counting the roots it took — a held one counts like any other.
+    const requestRows = async (caller: Caller) =>
+      (await audits("node.purge_requested", caller!.user.id)).map((row) => [row.targetType, row.meta]);
+    const expectedRows = await requestRows(free);
+    expect(expectedRows).toEqual([
+      ["user", { roots: 1 }],
+      ["user", { roots: 1 }],
+      ["user", { roots: 1 }],
+    ]);
+    for (const caller of withHeld) expect(await requestRows(caller)).toEqual(expectedRows);
   });
 });
