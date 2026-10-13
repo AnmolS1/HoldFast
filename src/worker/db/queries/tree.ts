@@ -156,10 +156,11 @@ export async function effectiveHidden(db: Executor, nodeId: string): Promise<boo
 }
 
 /**
- * No ancestor of the row `t` has `column` set: the walk up `parent_id` from the row's parent.
+ * No ancestor of the row aliased `alias` has `column` set: the walk up `parent_id` from the row's parent.
  * The one ancestor walk the two predicates below share.
  */
-function noAncestorWith(t: SQL, column: "deleted_at" | "takedown_at"): SQL {
+function noAncestorWith(alias: string, column: "deleted_at" | "takedown_at"): SQL {
+  const t = sql.identifier(alias);
   const c = sql.raw(column);
   return sql`NOT EXISTS (
     WITH RECURSIVE up(id, parent_id, ${c}) AS (
@@ -176,7 +177,7 @@ function noAncestorWith(t: SQL, column: "deleted_at" | "takedown_at"): SQL {
  */
 export function notEffectivelyTrashed(alias: string = "nodes"): SQL {
   const t = sql.identifier(alias);
-  return sql`(${t}.deleted_at IS NULL AND ${noAncestorWith(t, "deleted_at")})`;
+  return sql`(${t}.deleted_at IS NULL AND ${noAncestorWith(alias, "deleted_at")})`;
 }
 
 /**
@@ -189,7 +190,7 @@ export function notEffectivelyTrashed(alias: string = "nodes"): SQL {
  */
 export function notEffectivelyHidden(alias: string = "nodes"): SQL {
   const t = sql.identifier(alias);
-  return sql`(${t}.takedown_at IS NULL AND ${noAncestorWith(t, "takedown_at")})`;
+  return sql`(${t}.takedown_at IS NULL AND ${noAncestorWith(alias, "takedown_at")})`;
 }
 
 export type Role = "owner" | "editor" | "viewer";
