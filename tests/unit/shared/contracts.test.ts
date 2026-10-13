@@ -180,6 +180,20 @@ const dmcaNotice = {
 };
 const page = <T>(item: T) => ({ items: [item], nextCursor: null });
 
+const uploadSession = {
+  uploadId: ROW,
+  parentId: PARENT,
+  name: "video.mp4",
+  size: 2_000_000_000,
+  partBytes: 67_108_864,
+  partCount: 30,
+  uploadedParts: 4,
+  fileLastModified: AT,
+  createdAt: AT,
+  expiresAt: AT,
+};
+const trashedDto = { ...nodeDto, deletedAt: AT, purgeAfter: AT };
+
 /** One documented example per exported schema, keyed `module.Name`. */
 const EXAMPLES: Record<string, unknown> = {
   "common.UserId": USER,
@@ -216,6 +230,11 @@ const EXAMPLES: Record<string, unknown> = {
   "node.RenameBody": { name: "Reports", starred: true },
   "node.MoveBody": { parentId: PARENT },
   "node.EmptyTrashResponse": { remaining: 12 },
+  "node.TrashItemDto": trashedDto,
+  "node.TrashQuery": { cursor: "b3BhcXVl", limit: "50" },
+  "node.TrashResponse": { items: [trashedDto], nextCursor: null },
+  "node.TrashNodeResponse": trashedDto,
+  "node.RestoreNodeResponse": { ...nodeDto, parentId: null, name: "report (restored).pdf" },
   "node.DownloadUrlBody": { kind: "inline" },
   "node.DownloadUrlResponse": { url: "https://files.example/d/x/y", expiresAt: AT, warning: "unscanned" },
   "node.ThumbUrlResponse": { url: "https://files.example/t/x/y", expiresAt: AT },
@@ -258,20 +277,11 @@ const EXAMPLES: Record<string, unknown> = {
     expiresAt: AT,
   },
   "upload.PartResponse": { n: 2, etag: "92eb5ffee6ae2fec3ad71c777531578f" },
+  "upload.SinglePutResponse": { etag: "92eb5ffee6ae2fec3ad71c777531578f" },
+  "upload.OpenUploadsResponse": [uploadSession],
   "upload.CompleteUploadBody": { sha256: SHA, parts: [{ n: 1, etag: "0cc175b9c0f1b6a831c399e269772661" }] },
   "upload.CompleteUploadResponse": nodeDto,
-  "upload.UploadSessionDto": {
-    uploadId: ROW,
-    parentId: PARENT,
-    name: "video.mp4",
-    size: 2_000_000_000,
-    partBytes: 67_108_864,
-    partCount: 30,
-    uploadedParts: 4,
-    fileLastModified: AT,
-    createdAt: AT,
-    expiresAt: AT,
-  },
+  "upload.UploadSessionDto": uploadSession,
 
   "share.ShareRole": "viewer",
   "share.ShareDto": shareDto,
@@ -346,6 +356,9 @@ const EXAMPLES: Record<string, unknown> = {
   "search.SearchResultDto": { ...nodeDto, pathHint: "Documents / 2026" },
   "search.SearchResponse": page({ ...nodeDto, pathHint: "Documents" }),
   "search.RecentQuery": { limit: "10" },
+  "search.RecentResponse": { items: [{ ...nodeDto, lastAccessedAt: AT }] },
+  "search.StarredQuery": { cursor: "b3BhcXVl", limit: "200" },
+  "search.StarredResponse": { items: [{ ...nodeDto, starred: true }], nextCursor: "b3BhcXVl" },
 
   "account.UsageDto": {
     usedBytes: 100,

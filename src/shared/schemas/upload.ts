@@ -43,6 +43,10 @@ export type InitUploadResponse = z.infer<typeof InitUploadResponse>;
 export const PartResponse = z.object({ n: z.number().int().min(1).max(MAX_PARTS), etag: z.string() });
 export type PartResponse = z.infer<typeof PartResponse>;
 
+/** `PUT /api/uploads/:id/single` — the whole file in one request, for a session of mode `single`. */
+export const SinglePutResponse = z.object({ etag: z.string() });
+export type SinglePutResponse = z.infer<typeof SinglePutResponse>;
+
 /** `sha256` is of the whole file, computed by the client. Answered with the new `NodeDto`. */
 export const CompleteUploadBody = z.strictObject({
   sha256: Sha256,
@@ -66,3 +70,7 @@ export const UploadSessionDto = z.object({
   expiresAt: Timestamp,
 });
 export type UploadSessionDto = z.infer<typeof UploadSessionDto>;
+
+/** `GET /api/uploads/open` → the caller's own open sessions, as a bare array (for resume matching). */
+export const OpenUploadsResponse = z.array(UploadSessionDto);
+export type OpenUploadsResponse = z.infer<typeof OpenUploadsResponse>;

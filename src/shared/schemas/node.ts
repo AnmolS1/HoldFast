@@ -104,6 +104,37 @@ export type MoveBody = z.infer<typeof MoveBody>;
 export const EmptyTrashResponse = z.object({ remaining: z.number().int().nonnegative() });
 export type EmptyTrashResponse = z.infer<typeof EmptyTrashResponse>;
 
+// ── trash ───────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A trashed root as the trash shows it: `deletedAt` is when it was moved there, `purgeAfter` when
+ * it is deleted for good — both always set here. `parentId` is the folder it was in.
+ */
+export const TrashItemDto = NodeDto.extend({ deletedAt: Timestamp, purgeAfter: Timestamp });
+export type TrashItemDto = z.infer<typeof TrashItemDto>;
+
+/** `GET /api/trash` → `TrashResponse`: the caller's own trashed roots, most recently trashed first. */
+export const TrashQuery = z.strictObject({
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(100),
+});
+export type TrashQuery = z.infer<typeof TrashQuery>;
+
+export const TrashResponse = Page(TrashItemDto);
+export type TrashResponse = z.infer<typeof TrashResponse>;
+
+/** `POST /api/nodes/:id/trash` → the node as it now sits in the trash. */
+export const TrashNodeResponse = TrashItemDto;
+export type TrashNodeResponse = z.infer<typeof TrashNodeResponse>;
+
+/**
+ * `POST /api/nodes/:id/restore` → the node as it came back. Read `parentId` and `name` from it:
+ * it returns to the top level when its folder is gone, and under "<name> (restored)" when its
+ * name was taken meanwhile.
+ */
+export const RestoreNodeResponse = NodeDto;
+export type RestoreNodeResponse = z.infer<typeof RestoreNodeResponse>;
+
 // ── download and thumbnail URLs ─────────────────────────────────────────────────────────────
 
 /** `inline` is granted for media a browser renders and for the PDF and text the viewers fetch. */

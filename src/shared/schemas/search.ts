@@ -1,4 +1,4 @@
-// Search and recent.
+// Search, recent and starred.
 
 import { z } from "zod";
 import { MimeCategory, NodeId, Page } from "./common";
@@ -25,3 +25,17 @@ export type SearchResponse = z.infer<typeof SearchResponse>;
 
 export const RecentQuery = z.strictObject({ limit: z.coerce.number().int().min(1).max(50).default(20) });
 export type RecentQuery = z.infer<typeof RecentQuery>;
+
+/** `GET /api/recent` → the caller's own most recently opened files, newest first. Not paged. */
+export const RecentResponse = z.object({ items: z.array(NodeDto) });
+export type RecentResponse = z.infer<typeof RecentResponse>;
+
+/** `GET /api/starred` → `StarredResponse`: the caller's own starred nodes by name, folders first. */
+export const StarredQuery = z.strictObject({
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(100),
+});
+export type StarredQuery = z.infer<typeof StarredQuery>;
+
+export const StarredResponse = Page(NodeDto);
+export type StarredResponse = z.infer<typeof StarredResponse>;
