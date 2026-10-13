@@ -301,21 +301,27 @@ export async function verifyLinkSession(
   return { linkId: expect.linkId, expiresAt: payload.exp as number };
 }
 
-type ZipGrantBinding = { linkId: string; n: string; pwv: string };
+type ZipGrantBinding = { linkId: string; n: string; pwv: string; ipHashStable: string };
 
-const grantBound = (g: ZipGrantBinding) => `zg|${g.linkId}|${g.n}|${g.pwv}`;
+const grantBound = (g: ZipGrantBinding) => `zg|${g.linkId}|${g.n}|${g.pwv}|${g.ipHashStable}`;
 
 /**
  * A zip grant: issued by the public zip-manifest call after it consumed the link's one download.
- * `n` is the id of the node the manifest was built for; `pwv` the link's password version, bound
- * into the MAC like a session's. Valid for one hour.
+ * Valid for one hour, and bound like a link session — so that it is not a pass that anyone who
+ * holds it can spend from anywhere:
+ *   `n`             the node the manifest was built for (the caller honours the grant only for
+ *                   nodes inside that node's subtree);
+ *   `pwv`           the link's password version;
+ *   `ipHashStable`  the client address, as the same non-rotating hash link sessions use.
+ * The password version and the address hash are bound into the MAC, not written into the grant.
  */
 export async function mintZipGrant(
   keys: Keys,
   grant: ZipGrantBinding,
 ): Promise<{ token: string; expiresAt: number }> {
-  if (!isText(grant.linkId) || !isText(grant.n) || !isPwv(grant.pwv))
+  if (!isText(grant.linkId) || !isText(grant.n) || !isPwv(grant.pwv) || !isText(grant.ipHashStable)) {
     throw new Error("zip grant: invalid claims");
+  }
   const exp = unixNow() + ZIP_GRANT_TTL_SEC;
   const payload = { v: 1, t: "zg", l: grant.linkId, n: grant.n, exp };
   const token = await signToken(await keys.get("link-session"), payload, grantBound(grant));
@@ -323,8 +329,9 @@ export async function mintZipGrant(
 }
 
 /**
- * The grant when it is an unexpired grant for this link, this node and the link's CURRENT
- * password version; null otherwise. Never throws: a grant is optional, and a request without a
+ * The grant when it is an unexpired grant for this link, this node, the link's CURRENT password
+ * version and THIS client address; null otherwise — presented from another address, for another
+ * node or after a password change it does not verify, and the request is counted the ordinary way. Never throws: a grant is optional, and a request without a
  * valid one is simply counted as a download.
  */
 export async function verifyZipGrant(

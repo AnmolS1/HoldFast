@@ -488,7 +488,8 @@ describe("link download tokens and the password version", () => {
 
 describe("zip grants", () => {
   const PWV = "0011223344556677";
-  const grant = { linkId: LINK, n: NODE, pwv: PWV };
+  const ADDRESS = "a".repeat(64);
+  const grant = { linkId: LINK, n: NODE, pwv: PWV, ipHashStable: ADDRESS };
 
   it("verify for their link, node and password version, for one hour", async () => {
     freeze(T0);
@@ -501,8 +502,9 @@ describe("zip grants", () => {
     for (const missing of [undefined, null, "", "x.y", `${token}x`]) {
       expect(await verifyZipGrant(keys(), missing, grant)).toBeNull();
     }
-    // The password version is not readable from the grant.
+    // Neither the password version nor the address hash is readable from the grant.
     expect(new TextDecoder().decode(unb64url(token.split(".")[0]!))).not.toContain(PWV);
+    expect(new TextDecoder().decode(unb64url(token.split(".")[0]!))).not.toContain(ADDRESS);
     vi.setSystemTime((expiresAt - 1) * 1000);
     expect(await verifyZipGrant(keys(), token, grant)).not.toBeNull();
     vi.setSystemTime(expiresAt * 1000);
@@ -523,9 +525,18 @@ describe("zip grants", () => {
     await expect(mintZipGrant(keys(), { ...grant, pwv: "" })).rejects.toThrow("invalid claims");
   });
 
+  it("a grant presented from another address does not verify", async () => {
+    freeze(T0);
+    const { token } = await mintZipGrant(keys(), grant);
+    // The control: from the address it was issued to, it verifies.
+    expect(await verifyZipGrant(keys(), token, grant)).not.toBeNull();
+    expect(await verifyZipGrant(keys(), token, { ...grant, ipHashStable: "b".repeat(64) })).toBeNull();
+    await expect(mintZipGrant(keys(), { ...grant, ipHashStable: "" })).rejects.toThrow("invalid claims");
+  });
+
   it("a link session is not a zip grant and a zip grant is not a link session (one key, two types)", async () => {
     freeze(T0);
-    const binding = { linkId: LINK, ipHashStable: "a".repeat(64), pwv: PWV };
+    const binding = { linkId: LINK, ipHashStable: ADDRESS, pwv: PWV };
     const session = await mintLinkSession(keys(), binding);
     const issued = await mintZipGrant(keys(), grant);
     expect(await verifyZipGrant(keys(), session.token, grant)).toBeNull();
@@ -538,7 +549,7 @@ describe("zip grants", () => {
       const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(`${body}.${bound}`)));
       return `${body}.${b64url(mac)}`;
     };
-    const asGrant = `zg|${LINK}|${NODE}|${PWV}`;
+    const asGrant = `zg|${LINK}|${NODE}|${PWV}|${ADDRESS}`;
     const asSession = `ls|${LINK}|${binding.ipHashStable}|${PWV}`;
     expect(
       await verifyZipGrant(keys(), await sign({ v: 1, t: "ls", l: LINK, n: NODE, exp }, asGrant), grant),
