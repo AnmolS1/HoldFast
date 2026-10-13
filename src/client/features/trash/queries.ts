@@ -100,7 +100,8 @@ registerUserStatePurger(() => {
 });
 
 /**
- * Repeat `DELETE /api/trash` until it answers `204`. Rejects with the request's error (the loop
+ * Repeat `DELETE /api/trash` until it answers `204`. Callers use `startEmptyTrash()`
+ * (empty-run.ts), which keeps the run's state where every page can read it. Rejects with the request's error (the loop
  * stops there — nothing is retried), with `EmptyTrashStalled`, or with an `AbortError` when
  * `signal` fires or the account's state is purged.
  */
@@ -125,6 +126,8 @@ export async function emptyTrash(
       })) as EmptyTrashResponse | undefined;
       // `204`: the API client hands back no body.
       if (answer === undefined) return;
+      // Stopped while that request was out: its answer is nobody's progress any more.
+      controller.signal.throwIfAborted();
       onProgress(answer.remaining);
       stalled = answer.remaining < least ? 0 : stalled + 1;
       least = Math.min(least, answer.remaining);
@@ -136,6 +139,7 @@ export async function emptyTrash(
   }
 }
 
+/** An abort, whichever realm's `DOMException` carries it. */
 export function isAbort(error: unknown): boolean {
-  return error instanceof DOMException && error.name === "AbortError";
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
 }

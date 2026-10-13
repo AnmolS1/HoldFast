@@ -1,71 +1,72 @@
-// "Empty trash": the button, its confirmation, and the progress of the `202` loop. Used on the
-// Trash page and as the shortcut on the Storage page.
+// "Empty trash": the button, its confirmation, and the progress of the run (empty-run.ts). Used
+// on the Trash page and as the shortcut on the Storage page.
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { toast } from "../../components/Toaster";
-import { emitNodesChanged } from "../../lib/contracts";
 import { hf } from "../../theme/tokens";
-import { CONFIRM_WORD, emptyTrash, isAbort, needsTypedConfirm, useTrash, type TrashSize } from "./queries";
+import { startEmptyTrash, stoppedMessage, useEmptyRun } from "./empty-run";
+import { CONFIRM_WORD, needsTypedConfirm, useTrash, type TrashSize } from "./queries";
 import { t } from "./strings";
 
-type Run =
-  | { state: "idle" }
-  | { state: "running"; remaining: number | null }
-  | { state: "stopped"; remaining: number | null };
+const UNKNOWN: TrashSize = { count: null, more: false };
 
 function consequence(size: TrashSize): string {
   const folders = t("trash.delete.folders");
   if (size.count === null) return `${t("trash.emptyTrash.everything")} ${folders}`;
-  if (size.more) return `${t("trash.emptyTrash.more", { count: size.count })} ${folders}`;
+  if (size.more) {
+    const more =
+      size.count === 1 ? t("trash.emptyTrash.more.one") : t("trash.emptyTrash.more", { count: size.count });
+    return `${more} ${folders}`;
+  }
   if (size.count === 1) return `${t("trash.delete.consequence.one")} ${folders}`;
   return `${t("trash.delete.consequence", { count: size.count })} ${folders}`;
 }
 
 export function EmptyTrashAction() {
   const trash = useTrash();
-  const [confirming, setConfirming] = useState(false);
-  const [run, setRun] = useState<Run>({ state: "idle" });
-  const controller = useRef<AbortController | null>(null);
-  // Leaving the page stops the loop after the request in flight.
-  const stop = useCallback(() => controller.current?.abort(), []);
-  useEffect(() => stop, [stop]);
+  const run = useEmptyRun();
+  const [checking, setChecking] = useState(false);
+  // What the dialog was opened with: the trash as the server had it at that moment.
+  const [asked, setAsked] = useState<TrashSize | null>(null);
 
-  const size: TrashSize = trash.data
+  const cached: TrashSize = trash.data
     ? {
         count: trash.data.pages.reduce((sum, page) => sum + page.items.length, 0),
         more: trash.hasNextPage,
       }
-    : { count: null, more: false };
-  const knownEmpty = size.count === 0 && !size.more;
-  const typed = needsTypedConfirm(size);
+    : UNKNOWN;
+  const knownEmpty = cached.count === 0 && !cached.more;
 
-  const start = async () => {
-    setConfirming(false);
-    setRun({ state: "running", remaining: null });
-    const own = new AbortController();
-    controller.current = own;
-    let remaining: number | null = null;
+  // The count decides whether the word must be typed, so it is read again first: the list in
+  // memory may be seconds old, or from before another device filled the trash.
+  const ask = async () => {
+    setChecking(true);
     try {
-      await emptyTrash((left) => {
-        remaining = left;
-        setRun({ state: "running", remaining: left });
-      }, own.signal);
-      setRun({ state: "idle" });
-      toast({ message: t("trash.emptyTrash.done"), key: "empty-trash" });
-    } catch (error) {
-      if (isAbort(error)) return;
-      setRun({ state: "stopped", remaining });
+      const fresh = await trash.refetch();
+      const pages = fresh.isSuccess ? fresh.data.pages : null;
+      setAsked(
+        pages
+          ? {
+              count: pages.reduce((sum, page) => sum + page.items.length, 0),
+              more: (pages.at(-1)?.nextCursor ?? null) !== null,
+            }
+          : UNKNOWN,
+      );
     } finally {
-      // No live listing changed; this feature's own trash and storage numbers did.
-      if (!own.signal.aborted) emitNodesChanged([]);
+      setChecking(false);
     }
   };
+  const size = asked ?? UNKNOWN;
+  const typed = needsTypedConfirm(size);
 
   return (
     <Box data-empty-trash sx={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
-      <Button onClick={() => setConfirming(true)} disabled={run.state === "running" || knownEmpty}>
+      <Button
+        onClick={() => void ask()}
+        disabled={run.state === "running" || checking || knownEmpty}
+        data-empty-trash-button
+      >
         {t("trash.emptyTrash")}
       </Button>
       <Box
@@ -83,21 +84,22 @@ export function EmptyTrashAction() {
       </Box>
       {run.state === "stopped" ? (
         <Box role="alert" data-empty-trash-stopped>
-          {run.remaining === null
-            ? t("trash.emptyTrash.stopped")
-            : t("trash.emptyTrash.stoppedLeft", { remaining: run.remaining })}
+          {stoppedMessage(run.remaining)}
         </Box>
       ) : null}
       <ConfirmDialog
-        open={confirming}
+        open={asked !== null}
         title={t("trash.emptyTrash.title")}
         consequence={consequence(size)}
         confirmLabel={t("trash.emptyTrash")}
         destructive
         typeToConfirm={typed ? CONFIRM_WORD : undefined}
         typeToConfirmLabel={typed ? t("trash.emptyTrash.type", { word: CONFIRM_WORD }) : undefined}
-        onConfirm={() => void start()}
-        onCancel={() => setConfirming(false)}
+        onConfirm={() => {
+          setAsked(null);
+          startEmptyTrash();
+        }}
+        onCancel={() => setAsked(null)}
       />
     </Box>
   );
