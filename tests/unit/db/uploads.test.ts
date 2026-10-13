@@ -13,6 +13,7 @@ import {
   openBytes,
   trimFinished,
 } from "../../../src/worker/db/queries/uploads";
+import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { uploadParts, uploads } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeUpload, makeUser, openDb, rand } from "./_helpers";
 
@@ -238,5 +239,45 @@ describe("expired and trimFinished", () => {
       batch.push((await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(9) })).id);
     expect(await trimFinished(db, 7, 2)).toBe(2);
     expect(await db.select().from(uploads).where(inArray(uploads.id, batch))).toHaveLength(1);
+  });
+
+  it("trimFinished keeps the finished sessions of a held owner, a held uploader and a held node; the count is of rows actually deleted", async () => {
+    // An age no other row in the (shared) database has, so the count below is exact.
+    const days = 10_000 + Math.floor(Math.random() * 100_000);
+    const ended = new Date(Date.now() - days * 86_400_000 - 43_200_000);
+    const held = await makeUser(db);
+    const free = await makeUser(db);
+    const other = await makeUser(db);
+    await setUserLegalHold(db, held, true);
+    const heldFile = await makeFile(db, free, null, `held-${rand()}.bin`, { legalHold: true });
+    const done = (ownerId: string, uploaderId: string, nodeId?: string) =>
+      makeUpload(db, ownerId, uploaderId, {
+        status: "done",
+        completedAt: ended,
+        ...(nodeId ? { nodeId } : {}),
+      });
+    const ofHeldOwner = await done(held, held);
+    const byHeldUploader = await done(free, held);
+    const intoHeldOwner = await done(held, other);
+    const ofHeldNode = await done(free, free, heldFile.id);
+    // The control: the same row for a user who is not held.
+    const ofFree = await done(free, free);
+    const ids = [ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id, ofHeldNode.id, ofFree.id];
+    const left = async () =>
+      (await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids)))
+        .map((u) => u.id)
+        .sort();
+
+    expect(await trimFinished(db, days)).toBe(1);
+    expect(await left()).toEqual([ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id, ofHeldNode.id].sort());
+    expect(await trimFinished(db, days)).toBe(0);
+
+    // Released one at a time, each goes on the next call.
+    await setNodeLegalHold(db, heldFile.id, false);
+    expect(await trimFinished(db, days)).toBe(1);
+    expect(await left()).toEqual([ofHeldOwner.id, byHeldUploader.id, intoHeldOwner.id].sort());
+    await setUserLegalHold(db, held, false);
+    expect(await trimFinished(db, days)).toBe(3);
+    expect(await left()).toEqual([]);
   });
 });

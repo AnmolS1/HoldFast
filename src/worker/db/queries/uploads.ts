@@ -6,10 +6,11 @@
 // (`deleteForUser`, which says so): the caller releases with `quota.release` in the same
 // transaction as the status change.
 
-import { and, eq, gt, inArray, isNull, lt, lte, ne, or, sql, type SQL } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, lt, lte, ne, not, or, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Upload, uploadParts, uploads, user } from "../schema";
+import { nodeHeld, userHeld } from "./holds";
 
 /** A `completing` session older than this is considered abandoned by its request. */
 export const COMPLETING_STALE_MINUTES = 60;
@@ -161,6 +162,7 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
 /**
  * Deletes finished (`done` / `aborted`) sessions that ended more than `olderThanDays` ago, at
  * most `limit` per call. Returns how many were deleted.
+ * A session is kept while its owner or its uploader is on legal hold, or the node it wrote is.
  */
 export async function trimFinished(
   db: Executor,
@@ -177,6 +179,9 @@ export async function trimFinished(
           sql`COALESCE(${uploads.completedAt}, ${uploads.createdAt})`,
           sql`now() - make_interval(days => ${olderThanDays})`,
         ),
+        not(userHeld(sql`${uploads.ownerId}`)),
+        not(userHeld(sql`${uploads.uploaderId}`)),
+        not(nodeHeld(sql`${uploads.nodeId}`)),
       ),
     )
     .limit(limit);

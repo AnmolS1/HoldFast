@@ -1,7 +1,7 @@
 // The small modules: ledger, email ledger, blocklist, settings, audit, upload IPs, users, and
 // the filename stub.
 
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { decodeCursor, encodeCursor } from "../../../src/worker/db/cursor";
@@ -18,6 +18,7 @@ import {
   totalsOn,
   utcDay,
 } from "../../../src/worker/db/queries/ledger";
+import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { clearSettingsCache, getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import * as uploadIps from "../../../src/worker/db/queries/upload-ips";
 import { isActive, revokeAllSessions, termsVersionOf, userState } from "../../../src/worker/db/queries/users";
@@ -479,6 +480,60 @@ describe("upload-ips", () => {
       "v1",
       "v2",
     ]);
+  });
+
+  it("expired / deleteExpired keep every row of a held uploader and of a held node, whatever the row's own flag says", async () => {
+    const cipher = new Uint8Array([1, 2, 3]);
+    const iv = new Uint8Array(12);
+    const old = new Date(Date.now() - 91 * 86_400_000);
+    const heldUser = await makeUser(db);
+    const freeUser = await makeUser(db);
+    await setUserLegalHold(db, heldUser, true);
+    // The held user's row is for a DIFFERENT file, one that is not held; the row's own flag is unset.
+    const plainFile = await makeFile(db, freeUser, null, `plain-${rand()}.bin`);
+    // A held node whose `upload_ips` rows never got their flag (held by hand, not by the lock).
+    const heldFile = await makeFile(db, freeUser, null, `held-${rand()}.bin`, { legalHold: true });
+    const values = (nodeId: string, uploaderId: string) => ({
+      nodeId,
+      versionId: "v",
+      uploaderId,
+      ipEncrypted: cipher,
+      iv,
+      keyVersion: 1,
+      at: old,
+    });
+    const [ofHeldUser, ofFreeUser, ofHeldNode] = await db
+      .insert(uploadIpsTable)
+      .values([values(plainFile.id, heldUser), values(plainFile.id, freeUser), values(heldFile.id, freeUser)])
+      .returning({ id: uploadIpsTable.id, legalHold: uploadIpsTable.legalHold });
+    expect([ofHeldUser!.legalHold, ofHeldNode!.legalHold]).toEqual([false, false]);
+    const left = async () =>
+      (
+        await db
+          .select({ id: uploadIpsTable.id })
+          .from(uploadIpsTable)
+          .where(inArray(uploadIpsTable.id, [ofHeldUser!.id, ofFreeUser!.id, ofHeldNode!.id]))
+      )
+        .map((r) => r.id)
+        .sort();
+
+    const due = await uploadIps.expired(db, 100_000);
+    expect(due).not.toContain(ofHeldUser!.id);
+    expect(due).not.toContain(ofHeldNode!.id);
+    // The control, in the same call: the un-held user's old row for the same file is due…
+    expect(due).toContain(ofFreeUser!.id);
+    // …and is the one that is deleted.
+    expect(await uploadIps.deleteExpired(db, 100_000)).toBeGreaterThanOrEqual(1);
+    expect(await left()).toEqual([ofHeldUser!.id, ofHeldNode!.id].sort());
+
+    // The holds lifted: both are due on the next call, and go.
+    await setUserLegalHold(db, heldUser, false);
+    expect(await uploadIps.expired(db, 100_000)).toContain(ofHeldUser!.id);
+    expect(await uploadIps.expired(db, 100_000)).not.toContain(ofHeldNode!.id);
+    await setNodeLegalHold(db, heldFile.id, false);
+    expect(await uploadIps.expired(db, 100_000)).toContain(ofHeldNode!.id);
+    await uploadIps.deleteExpired(db, 100_000);
+    expect(await left()).toEqual([]);
   });
 });
 
