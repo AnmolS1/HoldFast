@@ -57,7 +57,13 @@ import {
   setStar,
   touchAccessed,
 } from "../db/queries/nodes";
-import { liveNameHolder, ownEditorShares, zipManifest, type ZipRoot } from "../db/queries/nodes-api";
+import {
+  liveNameHolder,
+  ownEditorShares,
+  releaseRescan,
+  zipManifest,
+  type ZipRoot,
+} from "../db/queries/nodes-api";
 import { usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
@@ -521,7 +527,14 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
     throw new AppError("rate_limited", undefined, undefined, { "Retry-After": String(wait) });
   }
   // Decides on the locked row, and answers `404` itself for a file that may not be rescanned.
-  await enqueueRescan(deps(c), id, { by: "owner" });
+  try {
+    await enqueueRescan(deps(c), id, { by: "owner" });
+  } catch (error) {
+    // Not a refusal: the rescan could not be queued. The hour it took is given back, so that
+    // the failure is not also a throttle.
+    if (!(error instanceof AppError)) await releaseRescan(db(c), id, node.rescanRequestedAt);
+    throw error;
+  }
   audit(c, "node.rescan", target(id), null);
   return c.json({ ok: true }, 202);
 });

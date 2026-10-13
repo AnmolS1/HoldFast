@@ -1,5 +1,6 @@
 // Reads only the nodes routes make (routes/nodes.ts): who holds a name in a folder, the caller's
-// own shares on the rows of a listing, and the files of a zip manifest.
+// own shares on the rows of a listing, the files of a zip manifest — and one write: giving the
+// rescan hour back.
 
 import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { ZipManifest } from "../../../shared/schemas/node";
@@ -56,6 +57,15 @@ export async function ownEditorShares(db: Executor, userId: string, nodeIds: str
       ),
     );
   return new Set(rows.map((row) => row.nodeId));
+}
+
+/**
+ * Gives the owner-rescan hour back: `rescan_requested_at` is set to what it was before the
+ * request took it. For a rescan that was granted and then could not be queued.
+ */
+export async function releaseRescan(db: Executor, nodeId: string, previous: Date | null): Promise<void> {
+  if (!isUuid(nodeId)) return;
+  await db.update(nodes).set({ rescanRequestedAt: previous }).where(eq(nodes.id, nodeId));
 }
 
 export type ZipRoot = {

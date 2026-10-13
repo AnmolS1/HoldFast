@@ -94,6 +94,28 @@ describe("POST /nodes/:id/rescan", () => {
     expect(await auditFor("node.rescan", file.id)).toHaveLength(2);
   });
 
+  it("a rescan that could not be queued does not use up the hour: the throttle is as it was before", async () => {
+    const owner = await person();
+    const failing = { SCAN_QUEUE: { send: async () => Promise.reject(new Error("made-up queue failure")) } };
+    const fresh = await makeFile(owner.id, null, { scanStatus: "error" });
+    const earlier = new Date(Date.now() - 61 * 60_000);
+    const asked = await makeFile(owner.id, null, { scanStatus: "skipped", rescanRequestedAt: earlier });
+    for (const [file, before] of [
+      [fresh, null],
+      [asked, earlier],
+    ] as const) {
+      const answer = await api(owner.as, "POST", `/nodes/${file.id}/rescan`, { env: failing });
+      expect([answer.status, answer.body.error]).toEqual([500, "internal"]);
+      expect((await nodeById(file.id))!.rescanRequestedAt).toEqual(before);
+      expect(await auditFor("node.rescan", file.id)).toEqual([]);
+    }
+    // The control: the same request with a queue that takes the message keeps the hour.
+    const fine = await makeFile(owner.id, null, { scanStatus: "error" });
+    expect((await rescan(owner.as, fine.id)).status).toBe(202);
+    expect((await nodeById(fine.id))!.rescanRequestedAt).not.toBeNull();
+    // A REFUSAL keeps it too (the file was hidden while the request ran: see the next block).
+  });
+
   it("the owner's alone: an editor and a viewer are 403, a stranger 404; nothing is queued", async () => {
     const t = await sharedTree();
     const spy = scanQueueSpy();
