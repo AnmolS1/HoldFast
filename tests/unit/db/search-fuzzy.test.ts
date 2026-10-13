@@ -99,8 +99,60 @@ describe("searchNames, fuzzy by word", () => {
     // Two statements as before: the ranked read and the rows of the page.
     expect(await cost("cat")).toBe(2);
     expect(await cost("repeat", { threshold: 0.5 })).toBe(2);
-    // By word: the transaction (BEGIN, its limits, COMMIT) and the setting on top.
-    expect(await cost("repeat")).toBe(6);
+    // The fallback: the strict read, then the transaction (BEGIN, its limits, the setting, the
+    // read by word, COMMIT), then the rows of the page.
+    expect(await cost("repeat")).toBe(7);
+  });
+
+  it("is a fallback: a page the strict matches fill costs and returns what it did before", async () => {
+    const me = await makeUser(db);
+    const strict = ["report.txt", "report 2.txt", "my report.txt"];
+    const byWord = [
+      "reprint schedule for the whole of next year.txt",
+      "repro steps collected by the support team.txt",
+      "repair log of the old machine downstairs.txt",
+      "replacement parts ordered in the spring.txt",
+    ];
+    for (const name of [...byWord, ...strict]) await makeFile(db, me, null, name);
+    const page = async (limit: number, cursor: string | null = null, extra: Partial<SearchOptions> = {}) => {
+      const before = statementsSent(db);
+      const result = await searchNames(db, me, "report", { ...mine, limit, cursor, ...extra });
+      return {
+        names: result.items.map((hit) => hit.node.name),
+        next: result.nextCursor,
+        statements: statementsSent(db) - before,
+      };
+    };
+
+    // The window (limit + 1 = 3) is filled by strict matches: two statements, as a search
+    // without any word matching costs (the control: the same call with the fallback off).
+    const first = await page(2);
+    expect(first.names).toEqual(["report.txt", "report 2.txt"]);
+    expect(first.statements).toBe(2);
+    expect((await page(2, null, { threshold: 0.3 })).statements).toBe(2);
+
+    // Three strict matches and room for twenty: the three first, then the matches by word.
+    const whole = await page(20);
+    expect(whole.names.slice(0, 3)).toEqual(["report.txt", "report 2.txt", "my report.txt"]);
+    expect(whole.names.slice(3).sort()).toEqual([...byWord].sort());
+    expect(whole.next).toBeNull();
+    expect(whole.statements).toBe(7);
+    // Without the fallback the same search ends after the strict three.
+    expect((await page(20, null, { threshold: 0.3 })).names).toEqual(whole.names.slice(0, 3));
+
+    // Paging across the boundary: nothing twice, nothing missing, the same order as in one go.
+    const paged: string[] = [];
+    const sizes: number[] = [];
+    let cursor: string | null = null;
+    do {
+      const next = await page(2, cursor);
+      paged.push(...next.names);
+      sizes.push(next.names.length);
+      cursor = next.next;
+    } while (cursor);
+    expect(sizes).toEqual([2, 2, 2, 1]);
+    expect(paged).toEqual(whole.names);
+    expect(new Set(paged).size).toBe(7);
   });
 
   it("the setting ends with the search: no pooled connection keeps it", async () => {

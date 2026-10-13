@@ -4,6 +4,7 @@ import { MIME_CATEGORIES, type MimeCategoryName } from "../../../src/shared/cons
 import type { Db } from "../../../src/worker/db/client";
 import { OWNER_VISIBLE_STATUSES } from "../../../src/worker/db/queries/nodes";
 import { type SearchOptions, searchNames } from "../../../src/worker/db/queries/search";
+import type { Node } from "../../../src/worker/db/schema";
 import { categoryOf } from "../../../src/worker/services/mime";
 import { makeFile, makeFolder, makeShare, makeUser, openDb, rand } from "./_helpers";
 
@@ -57,7 +58,7 @@ describe("searchNames, category with not: true", () => {
     expect(await ids()).toHaveLength(5);
   });
 
-  it("agrees with categoryOf for every pairing of a detected type and an extension", async () => {
+  it("the eight categories partition a tree of awkward files, and agree with categoryOf row by row", async () => {
     const me = await makeUser(db);
     const token = `par${rand()}`;
     const types = [
@@ -70,8 +71,8 @@ describe("searchNames, category with not: true", () => {
       "application/zip",
       "application/x-unheard-of",
     ];
-    const exts = ["", "png", "pdf", "ts", "zip", "qqq"];
-    const files = [];
+    const exts = ["", "png", "pdf", "ts", "zip", "mp3", "qqq"];
+    const files: Node[] = [];
     for (const [t, mimeSniffed] of types.entries()) {
       for (const [e, ext] of exts.entries()) {
         const name = `${token}-${t}-${e}${ext ? "." + ext : ""}`;
@@ -80,31 +81,44 @@ describe("searchNames, category with not: true", () => {
         );
       }
     }
-    const expected = files.filter((row) => categoryOf(row.mimeSniffed, row.ext) === "other");
-    const others = files.filter((row) => categoryOf(row.mimeSniffed, row.ext) !== "other");
-    // The fixture has both kinds, and the cases a plain negation gets wrong: an unsniffed file
-    // (NULL) of no known extension, and a generic type with a known one.
-    expect(expected.length).toBeGreaterThan(5);
-    expect(others.length).toBeGreaterThan(5);
-    expect(expected.some((row) => row.mimeSniffed === null)).toBe(true);
-    expect(others.some((row) => row.mimeSniffed === "application/octet-stream" && row.ext === "png")).toBe(
-      true,
-    );
+    const expected = new Map(NAMES.map((name) => [name, [] as string[]]));
+    for (const row of files) expected.get(categoryOf(row.mimeSniffed, row.ext))!.push(row.name);
+    // The fixture has the cases a filter by type alone gets wrong: a scanned source file
+    // (text/plain, .ts) is code, an octet-stream .png an image, a text file of no known
+    // extension a document, and an unsniffed file of no known extension nothing at all.
+    const called = (mimeSniffed: string | null, ext: string) =>
+      categoryOf(files.find((row) => row.mimeSniffed === mimeSniffed && row.ext === ext)!.mimeSniffed, ext);
+    expect(called("text/plain", "ts")).toBe("code");
+    expect(called("application/octet-stream", "png")).toBe("image");
+    expect(called("text/plain", "qqq")).toBe("document");
+    expect(called("image/png", "pdf")).toBe("image");
+    expect(called(null, "qqq")).toBe("other");
+    expect(expected.get("other")!.length).toBeGreaterThan(5);
 
-    const found = new Set<string>();
-    let cursor: string | null = null;
-    do {
-      const page: Awaited<ReturnType<typeof searchNames>> = await searchNames(db, me, token, {
-        scope: "mine",
-        visibleStatuses: OWNER_VISIBLE_STATUSES,
-        limit: 50,
-        cursor,
-        category: OTHER,
-      });
-      for (const hit of page.items) found.add(hit.node.name);
-      cursor = page.nextCursor;
-    } while (cursor);
-    expect([...found].sort()).toEqual(expected.map((row) => row.name).sort());
+    const found = new Map<MimeCategoryName, string[]>();
+    for (const name of NAMES) {
+      const hits: string[] = [];
+      let cursor: string | null = null;
+      do {
+        const page: Awaited<ReturnType<typeof searchNames>> = await searchNames(db, me, token, {
+          scope: "mine",
+          visibleStatuses: OWNER_VISIBLE_STATUSES,
+          limit: 50,
+          cursor,
+          category: name === "other" ? OTHER : only(name),
+        });
+        for (const hit of page.items) hits.push(hit.node.name);
+        cursor = page.nextCursor;
+      } while (cursor);
+      found.set(name, hits);
+    }
+    for (const name of NAMES) {
+      expect(found.get(name)!.sort(), name).toEqual(expected.get(name)!.sort());
+    }
+    // Nothing in two categories, nothing in none.
+    const everything = [...found.values()].flat();
+    expect(everything).toHaveLength(files.length);
+    expect(new Set(everything).size).toBe(files.length);
   });
 
   it("applies to the shared side as well", async () => {
