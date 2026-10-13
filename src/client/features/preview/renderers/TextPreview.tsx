@@ -13,7 +13,7 @@ import { fetchLimitFor } from "../renderer-map";
 import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import type { Line } from "./highlight";
 import { NoPreview } from "./NoPreview";
-import { decodeText, HIGHLIGHT_MAX_CHARS, TEXT_MAX_LINES } from "./text";
+import { decodeText, HIGHLIGHT_MAX_CHARS, HIGHLIGHT_MAX_LINE, TEXT_MAX_LINES } from "./text";
 import type { RendererProps } from "./types";
 
 // One weight and two neutrals: the design has no colour that means "keyword".
@@ -25,7 +25,7 @@ const TOKEN_STYLES = {
   '& [data-token="function"]': { fontWeight: 500 },
 } as const;
 
-export default function TextPreview({ source, item, download }: RendererProps) {
+export default function TextPreview({ source, item }: RendererProps) {
   const preview = usePreviewUrl(source, item.id, "inline");
   const [text, setText] = useState<string | null>(null);
   const [highlighted, setHighlighted] = useState<Line[] | null>(null);
@@ -74,6 +74,8 @@ export default function TextPreview({ source, item, download }: RendererProps) {
 
   useEffect(() => {
     if (text === null || text.length > HIGHLIGHT_MAX_CHARS) return;
+    // One very long line is where a grammar can stall the page: such a file stays plain.
+    if (all.some((line) => line.length > HIGHLIGHT_MAX_LINE)) return;
     let cancelled = false;
     // The highlighter is its own chunk and is asked for only when there is something to colour.
     void import("./highlight")
@@ -88,10 +90,10 @@ export default function TextPreview({ source, item, download }: RendererProps) {
     return () => {
       cancelled = true;
     };
-  }, [text, item.ext]);
+  }, [text, all, item.ext]);
 
-  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} download={download} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} actions={download} />;
+  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} />;
   if (text === null) return <PreviewSkeleton />;
 
   const lines = highlighted ?? plain;

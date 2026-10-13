@@ -1,6 +1,5 @@
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
-import type { ReactNode } from "react";
 import { Bytes } from "../../../components/Bytes";
 import { FileBadge } from "../../../components/FileBadge";
 import { StatusDot } from "../../../components/StatusDot";
@@ -14,12 +13,10 @@ export interface NoPreviewProps {
   message: string;
   /** Said under the status: the unscanned warning. */
   warning?: string;
-  /** The Download button, when this viewer may download the file. */
-  download?: ReactNode;
 }
 
-/** The file as a card: glyph, type, size, its scan status in words, and Download when allowed. */
-export function NoPreview({ item, message, warning, download }: NoPreviewProps) {
+/** The file as a card: glyph, type, size, its scan status in words. Download is the header's. */
+export function NoPreview({ item, message, warning }: NoPreviewProps) {
   return (
     <Box
       data-preview-renderer="none"
@@ -47,7 +44,6 @@ export function NoPreview({ item, message, warning, download }: NoPreviewProps) 
           {warning}
         </Typography>
       ) : null}
-      {download}
     </Box>
   );
 }

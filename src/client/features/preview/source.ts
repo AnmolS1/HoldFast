@@ -6,6 +6,7 @@ import {
   NodeDetailDto,
   NodePage,
   ThumbUrlResponse,
+  type DownloadUrlBody,
   type NodeDto,
 } from "../../../shared/schemas/node";
 import type { PreviewItem, PublicPreviewSource } from "../../components/slots";
@@ -84,7 +85,7 @@ export async function mintUrl(
     }
     return api(`${nodePath(nodeId)}/download-url`, {
       method: "POST",
-      body: { kind },
+      body: { kind } satisfies DownloadUrlBody,
       schema: DownloadUrlResponse,
     });
   }
@@ -101,12 +102,15 @@ export async function listSiblingIds(parentId: string | null, signal?: AbortSign
   const base = parentId === null ? "/api/nodes/root" : `${nodePath(parentId)}/children`;
   const ids: string[] = [];
   let cursor: string | null = null;
+  let pages = 0;
   do {
     const query = new URLSearchParams({ kind: "file", limit: String(SIBLING_PAGE) });
     if (cursor) query.set("cursor", cursor);
     const page: NodePage = await api(`${base}?${query.toString()}`, { schema: NodePage, signal });
     for (const node of page.items) ids.push(node.id);
     cursor = page.nextCursor;
-  } while (cursor && ids.length < SIBLING_LIMIT);
+    pages += 1;
+    // Bounded by pages as well as by ids: a run of empty pages that each carry a cursor ends.
+  } while (cursor && ids.length < SIBLING_LIMIT && pages < SIBLING_LIMIT / SIBLING_PAGE);
   return ids;
 }

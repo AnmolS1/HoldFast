@@ -118,10 +118,10 @@ async function arrange(
     }
     if (match[2] === "/thumb-url" && request.method() === "GET") {
       const size = Number(url.searchParams.get("size"));
-      minted += 1;
       arranged.mints.push({ nodeId: node.id, kind: "thumb", size });
+      // As the real API: a thumbnail URL is the same string for every mint within its bucket.
       return route.fulfill({
-        json: { url: `${origins.files}/t/${node.id}/${size}/tok-${minted}`, expiresAt: expiresAt(600) },
+        json: { url: `${origins.files}/t/${node.id}/${size}/thumb-bucket`, expiresAt: expiresAt(600) },
       });
     }
     return route.fallback();
@@ -180,7 +180,13 @@ const dialog = (page: Page) => page.getByRole("dialog");
 const renderer = (page: Page, kind: string) => page.locator(`[data-preview-renderer="${kind}"]`);
 
 async function open(page: Page, nodeId: string): Promise<void> {
-  await page.goto(`/preview/${nodeId}`);
+  const response = await page.goto(`/preview/${nodeId}`);
+  // "No CSP violation" means something only on a page that was served WITH the policy.
+  const csp = response?.headers()["content-security-policy"] ?? "";
+  expect(csp, "the page's Content-Security-Policy").toContain("default-src 'self'");
+  expect(csp).toContain("worker-src 'self' blob:");
+  expect(csp).toMatch(/script-src 'self' 'wasm-unsafe-eval'/);
+  expect(csp).not.toMatch(/script-src[^;]*'unsafe-(inline|eval)'/);
   await expect(dialog(page)).toBeVisible();
 }
 
@@ -346,7 +352,7 @@ test.describe("previews (mocked API and files host)", () => {
       await open(page, node.id);
       await expect(renderer(page, "none")).toBeVisible();
       await expect(renderer(page, "none")).toContainText("No preview for this type");
-      await expect(dialog(page).getByRole("button", { name: "Download" }).first()).toBeVisible();
+      await expect(dialog(page).getByRole("button", { name: "Download" })).toHaveCount(1);
       await expect(dialog(page).locator("img, iframe, object, embed, #fixture-html-heading")).toHaveCount(0);
       expect(
         await page.evaluate(() => {
@@ -365,13 +371,16 @@ test.describe("previews (mocked API and files host)", () => {
     origins,
   }) => {
     const arranged = await arrange(page, origins, [nodeOf({ scanStatus: "pending" })]);
+    // The page's clock is the test's: the 5 s between two polls is stepped over, not waited for.
+    await page.clock.install();
     await open(page, ID.png);
     await expect(page.locator('[data-preview-state="scanning"]')).toBeVisible();
     await expect(page.getByRole("progressbar", { name: "Scanning sample.png" })).toBeAttached();
     expect(arranged.mints).toEqual([]);
     arranged.nodes.set(ID.png, NODES.png);
     // The dialog asks again every 5 s: the preview appears at the next poll.
-    await expect(renderer(page, "image")).toBeVisible({ timeout: 15_000 });
+    await page.clock.fastForward(5_000);
+    await expect(renderer(page, "image")).toBeVisible();
     await expect(page.locator('[data-preview-state="scanning"]')).toHaveCount(0);
     expectClean(arranged);
   });
@@ -389,6 +398,28 @@ test.describe("previews (mocked API and files host)", () => {
     expect(arranged.mints.every((mint) => mint.kind === "thumb")).toBe(true);
     expect(arranged.served.some((entry) => entry.path.startsWith("/i/"))).toBe(false);
     expectClean(arranged);
+  });
+
+  test("a HEIC whose thumbnail the files host answers 404: no preview, not a skeleton for ever", async ({
+    page,
+    origins,
+  }) => {
+    mockedOnly("the files host's 404 is scripted");
+    const arranged = await arrange(page, origins, [NODES.heic], {
+      files: async (route, path) => {
+        if (!path.startsWith("/t/")) return false;
+        await route.fulfill({ status: 404, body: "Not found.", headers: { "content-type": "text/plain" } });
+        return true;
+      },
+    });
+    await open(page, ID.heic);
+    // The re-mint answers the same URL (see `arrange`): the dialog must not wait for a reload.
+    await expect(renderer(page, "none")).toBeVisible();
+    await expect(renderer(page, "none")).toContainText("No preview for this image — download to see it");
+    await expect(page.locator("[data-preview-blurup]")).toHaveCount(0);
+    await expect(dialog(page).getByRole("button", { name: "Download" })).toHaveCount(1);
+    expect(arranged.mints.filter((mint) => mint.size === 1280).length).toBe(2);
+    expect(arranged.mints.some((mint) => mint.kind === "inline")).toBe(false);
   });
 
   test("a refused URL: one more is minted, one retry is made, then the error state — whatever the refusal says", async ({

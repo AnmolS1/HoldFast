@@ -51,6 +51,11 @@ export function languageFor(ext: string): string | null {
   return LANG_BY_EXT[ext.replace(/^\./, "").toLowerCase()] ?? null;
 }
 
+/** A line longer than this is shown without colours. */
+export const HIGHLIGHT_MAX_LINE_LENGTH = 2_000;
+/** The most time the grammar may spend on one line. */
+export const HIGHLIGHT_LINE_TIME_MS = 100;
+
 const PREFIX = "--hf-code-";
 // Colours come from the stylesheet, by token name: the theme only names the variables.
 const theme = createCssVariablesTheme({
@@ -99,7 +104,14 @@ function collectLines(node: HastNode, out: Line[]): void {
 
 /** Highlight `code`; one entry per line. Rejects when the grammar cannot be loaded. */
 export async function highlight(code: string, lang: string): Promise<Line[]> {
-  const root = (await codeToHast(code, { lang, theme })) as unknown as HastNode;
+  const root = (await codeToHast(code, {
+    lang,
+    theme,
+    // A grammar can take very long over one hostile line: a long line is left plain, and no
+    // line gets more than a moment.
+    tokenizeMaxLineLength: HIGHLIGHT_MAX_LINE_LENGTH,
+    tokenizeTimeLimit: HIGHLIGHT_LINE_TIME_MS,
+  })) as unknown as HastNode;
   const lines: Line[] = [];
   collectLines(root, lines);
   return lines;

@@ -114,22 +114,24 @@ describe("a file larger than it said", () => {
     expect(taken.chunks).toBe(Math.floor(PREVIEW_TEXT_MAX_BYTES / 65_536) + 1);
     expect(taken.cancelled).toBe(true);
     expect(dialog()!.querySelector("pre")).toBeNull();
-    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBeGreaterThan(0);
+    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBe(1);
     // No re-mint, no retry: a fresh URL would serve the same bytes.
     expect(api.minted.length).toBe(1);
   });
 
   it("PDF: more than the limit arrives → cut, too large, and pdf.js is never given a byte", async () => {
-    const { body, taken } = endless(1_048_576, 10_000);
+    // Four large pieces (one buffer, handed out again and again) pass the limit quickly.
+    const piece = 16 * 1_048_576;
+    const { body, taken } = endless(piece, 10_000);
     const api = ownerApi([NODES.pdf]);
     installFetch({ api: api.handler, files: () => new Response(body) });
     renderPreview(<PreviewDialog open nodeId={ID.pdf} onClose={noop} source="owner" />);
-    await screen.findByText("Too large to preview — download", undefined, { timeout: 20_000 });
-    expect(taken.chunks).toBe(Math.floor(PDF_PREVIEW_MAX_BYTES / 1_048_576) + 1);
+    await screen.findByText("Too large to preview — download");
+    expect(taken.chunks).toBe(Math.floor(PDF_PREVIEW_MAX_BYTES / piece) + 1);
     expect(taken.cancelled).toBe(true);
     expect(engine.openPdf).not.toHaveBeenCalled();
     expect(api.minted.length).toBe(1);
-  }, 30_000);
+  });
 
   it("a PDF or an image whose size is above the limit is never asked for at all", async () => {
     await preloadRenderers();

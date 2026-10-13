@@ -357,22 +357,57 @@ describe("Download and Share", () => {
     const api = ownerApi([NODES.svg]);
     const network = installFetch({ api: api.handler });
     const clicked: string[] = [];
+    const opened: Array<[string, string]> = [];
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
       clicked.push(this.href);
+      opened.push([this.target, this.rel]);
     });
     open(NODES.svg);
     await screen.findByText("sample.svg");
     expect(api.minted).toEqual([]);
-    fireEvent.click(screen.getAllByRole("button", { name: "Download" })[0]!);
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
     await waitFor(() => expect(clicked.length).toBe(1));
     expect(api.minted.map((mint) => mint.kind)).toEqual(["download"]);
     expect(clicked[0]).toBe(filesUrl("download", ID.svg, "tok-1"));
+    // One Download in the dialog, even beside a file that has no preview.
+    expect(screen.getAllByRole("button", { name: "Download" }).length).toBe(1);
     expect(
       network
         .api()
         .filter((call) => call.method === "POST")
         .map((call) => call.body),
     ).toEqual([{ kind: "download" }]);
+    // In a tab of its own: a files-host refusal (plain text) must never replace the app, nor
+    // leave the URL in the app's address bar.
+    expect(opened).toEqual([["_blank", "noopener noreferrer"]]);
+  });
+
+  it("a minted address that is not http(s) is never opened", async () => {
+    const api = ownerApi([NODES.svg], (call) =>
+      call.url.pathname.endsWith("/download-url")
+        ? json({ url: "javascript:alert(1)", expiresAt: new Date(Date.now() + 300_000).toISOString() })
+        : undefined,
+    );
+    const network = installFetch({ api: api.handler });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    open(NODES.svg);
+    await screen.findByText("sample.svg");
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    await waitFor(() => expect(network.api().some((call) => call.method === "POST")).toBe(true));
+    await settle(10);
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("a folder whose pages keep carrying a cursor and no files is not listed for ever", async () => {
+    const api = ownerApi([NODES.svg], (call) =>
+      call.url.pathname.endsWith("/children") ? json(pageOf([], "more")) : undefined,
+    );
+    const network = installFetch({ api: api.handler });
+    open(NODES.svg, { onNavigate: vi.fn() });
+    await screen.findByText("sample.svg");
+    await settle(30);
+    expect(network.api().filter((call) => call.url.pathname.endsWith("/children")).length).toBe(5);
+    expect(screen.queryByRole("button", { name: "Next file" })).toBeNull();
   });
 
   it("a refused download is said in a toast with the request id, and nothing is started", async () => {
@@ -383,7 +418,7 @@ describe("Download and Share", () => {
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     open(NODES.svg);
     await screen.findByText("sample.svg");
-    fireEvent.click(screen.getAllByRole("button", { name: "Download" })[0]!);
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
     await waitFor(() => expect(getToasts().length).toBe(1));
     expect(getToasts()[0]).toMatchObject({ message: "scan_blocked message", requestId: "req-1234" });
     expect(click).not.toHaveBeenCalled();

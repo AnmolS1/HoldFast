@@ -32,11 +32,17 @@ const PdfPreview = lazy(() => import("./renderers/PdfPreview"));
 const TextPreview = lazy(() => import("./renderers/TextPreview"));
 const MediaPreview = lazy(() => import("./renderers/MediaPreview"));
 
-/** Start a browser download. The URL is used once and kept nowhere. */
+/**
+ * Start a browser download in a tab of its own: the files host answers a download as an
+ * attachment, and when it answers anything else (a refusal, in plain text) it is that tab which
+ * shows it — the app is never unloaded and its address bar never carries the URL. The URL is used
+ * once and kept nowhere.
+ */
 function startDownload(url: string): void {
   const link = document.createElement("a");
   link.href = url;
-  link.rel = "noopener";
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
   link.click();
 }
 
@@ -47,7 +53,8 @@ function DownloadButton({ nodeId }: { nodeId: string }) {
     try {
       // The only `download`-kind mint in the preview: every renderer uses `inline`.
       const minted = await mintUrl("owner", nodeId, "download");
-      startDownload(minted.url);
+      // Only ever a files-host address over http(s): nothing else is opened.
+      if (/^https?:\/\//i.test(minted.url)) startDownload(minted.url);
     } catch (error) {
       toastApiError(error);
     } finally {
@@ -96,7 +103,8 @@ function Scanning({ item }: { item: LoadedItem }) {
 }
 
 function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) {
-  const download = downloadAllowed(source, item) ? <DownloadButton nodeId={item.id} /> : undefined;
+  // The one Download button is the header's; here it only decides what the sentence says.
+  const canDownload = downloadAllowed(source, item);
   const status = item.scanStatus;
   // Only clean files are previewed.
   if (status === "pending") return <Scanning item={item} />;
@@ -107,21 +115,19 @@ function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) 
     return (
       <NoPreview
         item={item}
-        message={download ? t("none.typeDownload") : t("none.title")}
-        warning={download ? t("preview.unscanned") : undefined}
-        download={download}
+        message={canDownload ? t("none.typeDownload") : t("none.title")}
+        warning={canDownload ? t("preview.unscanned") : undefined}
       />
     );
   }
   const choice = rendererFor(item);
-  const props: RendererProps = { source, item, download };
+  const props: RendererProps = { source, item };
   switch (choice.kind) {
     case "image":
       return <ImagePreview {...props} variant="inline" />;
     case "heic":
       // No thumbnail to ask for (too large for the image service): nothing to show but Download.
-      if (!item.thumb)
-        return <NoPreview item={item} message={t("none.heicUnavailable")} download={download} />;
+      if (!item.thumb) return <NoPreview item={item} message={t("none.imageUnavailable")} />;
       return <ImagePreview {...props} variant="thumb" />;
     case "pdf":
       return <PdfPreview {...props} />;
@@ -137,11 +143,10 @@ function Content({ source, item }: { source: PreviewSource; item: LoadedItem }) 
           message={
             choice.reason === "tooLarge"
               ? t("none.tooLarge")
-              : download
+              : canDownload
                 ? t("none.typeDownload")
                 : t("none.title")
           }
-          download={download}
         />
       );
   }

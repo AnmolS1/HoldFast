@@ -1,10 +1,18 @@
 // Text and code: fetched with an inline URL, shown as source, and never parsed as markup.
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { PublicPreviewSource } from "../../../../src/client/components/slots";
 import { PreviewDialog } from "../../../../src/client/features/preview";
-import { highlight, languageFor } from "../../../../src/client/features/preview/renderers/highlight";
-import { decodeText, TEXT_MAX_LINES } from "../../../../src/client/features/preview/renderers/text";
+import {
+  highlight,
+  HIGHLIGHT_MAX_LINE_LENGTH,
+  languageFor,
+} from "../../../../src/client/features/preview/renderers/highlight";
+import {
+  decodeText,
+  HIGHLIGHT_MAX_LINE,
+  TEXT_MAX_LINES,
+} from "../../../../src/client/features/preview/renderers/text";
 import { PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
 import type { NodeDto } from "../../../../src/shared/schemas/node";
 import { filesUrl, ID, NODES, nodeOf } from "./fixtures";
@@ -124,7 +132,7 @@ describe("TextPreview", () => {
     expect(renderer()).toBe("none");
     expect(api.minted).toEqual([]);
     expect(network.files()).toEqual([]);
-    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBeGreaterThan(0);
+    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBe(1);
   });
 });
 
@@ -192,6 +200,31 @@ describe("TextPreview — refusals", () => {
 });
 
 describe("highlighting", () => {
+  // The grammar and the engine are loaded once, before the tests that wait for colours — so none
+  // of them waits on a cold import.
+  beforeAll(async () => {
+    await highlight("const warm = 1;", "typescript");
+  });
+
+  it("a line longer than the limit is left plain, by the grammar's own limit and before it is even asked", async () => {
+    const long = `const s = "${"x".repeat(HIGHLIGHT_MAX_LINE_LENGTH)}";`;
+    const lines = await highlight(`const a = 1;\n${long}\n`, "typescript");
+    expect(lines[0]!.some((piece) => piece.token === "keyword")).toBe(true);
+    // The long line comes back as it is, with no token on any piece.
+    expect(lines[1]!.map((piece) => piece.text).join("")).toBe(long);
+    expect(lines[1]!.every((piece) => piece.token === undefined)).toBe(true);
+
+    // In the viewer such a file is not handed to the highlighter at all.
+    await openText(NODES.ts, `const a = 1;\n${long}\n`);
+    await waitFor(() => expect(pre()).not.toBeNull());
+    await settle(50);
+    expect(dialog()!.querySelector('[data-preview-renderer="text"]')!.getAttribute("data-highlighted")).toBe(
+      "false",
+    );
+    expect(pre()!.querySelectorAll("[data-line]").length).toBe(2);
+    expect(HIGHLIGHT_MAX_LINE).toBe(HIGHLIGHT_MAX_LINE_LENGTH);
+  });
+
   it("a language comes from the extension; an unknown one is plain text", () => {
     expect(languageFor("ts")).toBe("typescript");
     expect(languageFor(".TSX")).toBe("tsx");
@@ -211,23 +244,21 @@ describe("highlighting", () => {
       expect(typeof piece.text).toBe("string");
       if (piece.token !== undefined) expect(piece.token).toMatch(/^[a-z-]+$/);
     }
-  }, 30_000);
+  });
 
   it("a .ts file is highlighted in the page: token spans, and its markup-looking string stays text", async () => {
     const source = 'export const markup = "<script>window.__ran = true</script>";\n';
     await openText(NODES.ts, source);
     await waitFor(() => expect(pre()).not.toBeNull());
-    await waitFor(
-      () =>
-        expect(
-          dialog()!.querySelector('[data-preview-renderer="text"]')!.getAttribute("data-highlighted"),
-        ).toBe("true"),
-      { timeout: 30_000 },
+    await waitFor(() =>
+      expect(
+        dialog()!.querySelector('[data-preview-renderer="text"]')!.getAttribute("data-highlighted"),
+      ).toBe("true"),
     );
     expect(pre()!.querySelectorAll('[data-token="keyword"]').length).toBeGreaterThan(0);
     expect(pre()!.querySelector("[data-line]")!.textContent).toBe(source.trimEnd());
     expect(pre()!.querySelector("script")).toBeNull();
     expect(pre()!.querySelector("[style]")).toBeNull();
     expect((window as unknown as { __ran?: boolean }).__ran).toBeUndefined();
-  }, 40_000);
+  });
 });
