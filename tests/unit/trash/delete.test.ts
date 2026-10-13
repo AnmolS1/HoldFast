@@ -5,14 +5,17 @@ import { afterEach, describe, expect, it } from "vitest";
 import { EmptyTrashResponse, TrashResponse } from "../../../src/shared/schemas/node";
 import { setNodeLegalHold } from "../../../src/worker/db/queries/moderation";
 import { usageBreakdown } from "../../../src/worker/db/queries/quota";
+import { restore as restoreQuery } from "../../../src/worker/db/queries/trash";
 import { uploadParts, uploads } from "../../../src/worker/db/schema";
 import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
   audits,
+  backendPid,
   countingBucket,
   deadlockingDb,
   envelope,
+  gate,
   keysUnder,
   makeFile,
   makeFolder,
@@ -31,6 +34,7 @@ import {
   storeFile,
   storeVersion,
   testDb,
+  untilBlockedBy,
   uploadRow,
   usedBytes,
   versionsLeft,
@@ -208,6 +212,40 @@ describe("DELETE /nodes/:id", () => {
     expect(handle.counter.attempts).toBe(2);
     expect(await nodesLeft([t.folder.id])).toEqual([]);
     expect(await audits("node.purge", t.folder.id)).toHaveLength(1);
+  });
+
+  it("a restore that commits just before the delete wins: 409, and nothing is deleted", async () => {
+    const t = await library();
+    const editor = as(await member());
+    await makeShare(t.folder.id, t.id, editor!.user.id, { role: "editor" });
+    // The editor trashed the file — and restores it while the owner deletes it for good.
+    await trash(editor, t.file.id);
+    const everything = await t.objects();
+    const committed = gate();
+    const inside = gate<number>();
+    const restoring = testDb().transaction(async (tx) => {
+      await restoreQuery(tx, t.file.id);
+      inside.open(await backendPid(tx));
+      await committed.opened;
+    });
+    const pid = await inside.opened;
+    // The owner's request read the file as a trashed root; its purge now waits for the tree lock.
+    const deleting = purge(t.owner, t.file.id);
+    expect(await untilBlockedBy(pid)).toBe("blocked");
+    committed.open();
+    await restoring;
+
+    expect(envelope(await deleting)).toEqual({
+      status: 409,
+      error: "conflict",
+      message: "That conflicts with the current state.",
+    });
+    expect(await nodesLeft([t.file.id])).toEqual([t.file.id]);
+    expect((await nodeById(t.file.id))!.deletedAt).toBeNull();
+    expect(await versionsLeft(t.file.id)).toEqual([t.version.versionId]);
+    expect(await t.objects()).toEqual(everything);
+    expect(await usedBytes(t.id)).toBe(240);
+    expect(await audits("node.purge", t.file.id)).toEqual([]);
   });
 
   it("a trashed file inside a held folder: the same 204, nothing deleted, and it is gone to its owner", async () => {

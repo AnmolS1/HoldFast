@@ -14,7 +14,8 @@
 // had everything been purged; a root the gate refused keeps every row and object, gets the
 // purge-request marker and from then on is gone as far as its owner can tell — out of the
 // listing, and `not_found` by id here, for itself and for everything under it, as a purged id
-// is. The purge job finishes the delete by itself once the hold is released.
+// is: the same answer for the same number of statements (`requireKnown`). The purge job
+// finishes the delete by itself once the hold is released.
 //
 // A RESTORE THAT CANNOT HAPPEN NOW has one answer, `409 conflict` with no detail — whether the
 // folder it was in is in the trash and the caller is not the owner, or the node would leave a
@@ -38,7 +39,7 @@ import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { AppError } from "../services/errors";
 import { toNodeDto, toTrashItemDto, toTrashItemDtos } from "../services/node-dto";
-import { assertNotTrashed, getAccess, requireRole } from "../services/permissions";
+import { assertNotTrashed, getAccess, requireRole, type Access, type Role } from "../services/permissions";
 import { db, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
@@ -63,14 +64,26 @@ export function setEmptyTrashDeadlineForTests(ms: number): () => void {
 const refused = () => new AppError("conflict");
 
 /**
- * The node behind a by-id route that acts on something IN the trash, when its owner may still
- * know it. A system node, and a root whose purge was requested (or anything under one), is
- * `not_found`: to its owner the first never existed and the second is gone.
+ * The caller's access to the node, when it is at least `min` — for every by-id route here.
+ *
+ * `not_found` for an id that was never issued, for a hidden node, AND for a root whose purge was
+ * requested (or anything under one): to its owner that root is deleted, and it must answer as a
+ * purged id does — by the answer and BY THE WORK. Both questions are therefore always asked,
+ * whatever the first one answered: "you deleted this and it is still here" cannot be told from
+ * "this id does not exist" by counting statements either.
  */
+async function requireKnown(c: Context<AppEnv>, id: string, min: Role): Promise<Access> {
+  const access = await getAccess(c, id);
+  const gone = await purgeWasRequested(db(c), id);
+  if (!access || gone) throw new AppError("not_found");
+  // Answered from the request's cache: the role check only.
+  return requireRole(c, id, min);
+}
+
+/** The row behind a by-id route that acts on something IN the trash. Never a system node. */
 async function knownNode(c: Context<AppEnv>, id: string): Promise<Node> {
   const node = await getNode(db(c), id);
-  const gone = await purgeWasRequested(db(c), id);
-  if (!node || node.system !== null || gone) throw new AppError("not_found");
+  if (!node || node.system !== null) throw new AppError("not_found");
   return node;
 }
 
@@ -119,7 +132,7 @@ router.delete("/trash", async (c) => {
 router.post(`/nodes/${ID}/trash`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
-  const access = await requireRole(c, id, "editor");
+  const access = await requireKnown(c, id, "editor");
   // An editor may trash what is inside a shared folder, never the shared folder itself.
   if (access.role !== "owner" && access.shareRootId === id) {
     throw new AppError("forbidden", undefined, { reason: "share_root" });
@@ -138,7 +151,7 @@ router.post(`/nodes/${ID}/trash`, async (c) => {
 router.post(`/nodes/${ID}/restore`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
-  const access = await requireRole(c, id, "viewer");
+  const access = await requireKnown(c, id, "viewer");
   const node = await knownNode(c, id);
   if (access.role !== "owner") {
     // The editor who trashed it, for as long as they are an editor of the folder it was in.
@@ -171,7 +184,7 @@ router.post(`/nodes/${ID}/restore`, async (c) => {
 router.delete(`/nodes/${ID}`, async (c) => {
   requireVerified(c);
   const id = c.req.param("id");
-  await requireRole(c, id, "owner");
+  await requireKnown(c, id, "owner");
   const node = await knownNode(c, id);
   if (!isTrashedRoot(node)) throw refused();
   if (!(await purgeOne(c, id))) throw refused();

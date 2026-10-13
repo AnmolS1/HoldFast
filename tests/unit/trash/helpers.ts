@@ -12,7 +12,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo, SessionUser } from "../../../src/worker/auth/types";
-import { createDb, type Db } from "../../../src/worker/db/client";
+import { createDb, statementsSent, type Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import type { Settings } from "../../../src/worker/db/queries/settings";
 import {
@@ -86,7 +86,15 @@ export type ApiOptions = {
   env?: Record<string, unknown>;
 };
 
-export type Answer = { status: number; body: unknown; requestId: string | null };
+export type Answer = {
+  status: number;
+  body: unknown;
+  requestId: string | null;
+  /** Every response header, by name. */
+  headers: Record<string, string>;
+  /** SQL statements the request had sent when its answer existed. */
+  statements: number;
+};
 
 const allow = { limit: async () => ({ success: true }) };
 
@@ -111,11 +119,14 @@ export async function api(caller: Caller, path: string, options: ApiOptions = {}
       getSession: async () => (caller ? { session: sessionFor(caller), user: caller.user } : null),
     },
   };
+  let handle: ReturnType<typeof createDb> | null = null;
+  const make = options.core?.createDb ?? createDb;
   const core: CoreDeps = {
     ...realCore,
     createAuth: () => auth,
     getSettings: async () => ({ ...BASE_SETTINGS, ...options.settings }),
     ...options.core,
+    createDb: (...args) => (handle = make(...args)),
   };
   const app = createApp(core);
   const pending: Promise<unknown>[] = [];
@@ -147,6 +158,7 @@ export async function api(caller: Caller, path: string, options: ApiOptions = {}
     requestEnv as unknown as Env,
     ctx,
   );
+  const statements = handle ? statementsSent((handle as ReturnType<typeof createDb>).db) : 0;
   while (pending.length) await Promise.allSettled(pending.splice(0));
   // The app was built over this call's modules; code with no request falls back to the last
   // registered ones, which must be the real ones again.
@@ -162,7 +174,13 @@ export async function api(caller: Caller, path: string, options: ApiOptions = {}
     body && typeof body === "object" && "requestId" in body
       ? String((body as { requestId: unknown }).requestId)
       : null;
-  return { status: response.status, body, requestId };
+  return {
+    status: response.status,
+    body,
+    requestId,
+    headers: Object.fromEntries(response.headers.entries()),
+    statements,
+  };
 }
 
 /** An error answer without its request id: what two refusals are compared by. */
