@@ -22,11 +22,12 @@ import {
   INHERITED_CAUSES,
   type InheritedCause,
   inheritedCauses,
+  lostByLeaving,
   nodeProtected,
   ownCauses,
   userHeld,
 } from "./holds";
-import { effectiveTrashed, notEffectivelyHidden } from "./tree";
+import { effectiveTrashed, lockOwnerTree, notEffectivelyHidden } from "./tree";
 
 export { LegalHoldError };
 
@@ -83,7 +84,9 @@ function restoredName(name: string, attempt: number): string {
  * (the caller passes it when the parent is itself trashed). When the name is taken there, the
  * node comes back as "<name> (restored)".
  * Null when the node is not a restorable trashed root (not trashed, purge already requested);
- * `conflict` when the parent is in the trash and `toRoot` was not passed.
+ * `conflict` when the parent is in the trash and `toRoot` was not passed; `LegalHoldError`
+ * (internal, as from the purge gate) when `toRoot` would take it out from under a folder that
+ * is on legal hold or named by an open notice — restored in place it stays protected.
  */
 export async function restore(
   db: Executor,
@@ -92,9 +95,18 @@ export async function restore(
 ): Promise<Node | null> {
   if (!isUuid(nodeId)) return null;
   return db.transaction(async (tx) => {
+    // The owner's tree lock first: `toRoot` re-parents, and a purge of this root may be deciding.
+    const [peek] = await tx.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
+    if (!peek) return null;
+    await lockOwnerTree(tx, peek.ownerId);
     const [node] = await tx.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
     if (!node || node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
     const parentId = opts.toRoot ? null : node.parentId;
+    // Like `move`: not out from under a folder that is on legal hold or under an open notice.
+    if (parentId !== node.parentId) {
+      const lost = await lostByLeaving(tx, nodeId, parentId);
+      if (lost.length > 0) throw new LegalHoldError({ [nodeId]: lost });
+    }
     if (parentId !== null && (await effectiveTrashed(tx, parentId))) {
       throw new QueryError("conflict", "the parent folder is in the trash");
     }
@@ -254,7 +266,10 @@ const HOLD_CAUSES = Object.keys(holdCauses(sql`n`, sql`u`)) as HoldCause[];
  *     `counter_received` — the content must survive the counter-notice window),
  * when the subtree's owner has `user.legalHold`, or when a folder ABOVE the root has `legalHold`
  * or is named by an open notice: those two reach down (a folder taken down as `csam` is held as
- * one row; a file inside it is not purged on its own). The causes are queries/holds.ts. Throws `LegalHoldError` naming every held
+ * one row; a file inside it is not purged on its own). The causes are queries/holds.ts.
+ * Its answer is about the tree as it is NOW: a caller that deletes on the strength of it holds
+ * the owner's tree lock (queries/tree.ts) from before this call until the delete has happened —
+ * `deleteSubtreeRows` and `deleteVersionRows` do. Throws `LegalHoldError` naming every held
  * root; a root is held or purgeable as a whole. Ids that do not exist are ignored.
  */
 export async function assertPurgeable(tx: Executor, rootIds: readonly string[]): Promise<void> {
@@ -303,23 +318,6 @@ export async function assertPurgeable(tx: Executor, rootIds: readonly string[]):
   if (Object.keys(causes).length > 0) throw new LegalHoldError(causes);
 }
 
-/**
- * Locks every folder ABOVE the node `FOR SHARE`, lowest id first, for the rest of the
- * transaction. The gate reads their holds and notices; with them locked, a hold that is being
- * placed on one of them (an UPDATE of that row) either has committed and is seen, or waits for
- * the delete. Shared: two purges under one folder do not block each other.
- */
-async function lockAncestors(sp: Executor, nodeId: string): Promise<void> {
-  await sp.execute(sql`
-    WITH RECURSIVE up(id, parent_id) AS (
-      SELECT a.id, a.parent_id FROM nodes a
-      WHERE a.id = (SELECT s.parent_id FROM nodes s WHERE s.id = ${nodeId})
-      UNION ALL
-      SELECT p.id, p.parent_id FROM nodes p JOIN up ON p.id = up.parent_id
-    ) CYCLE id SET is_cycle USING path
-    SELECT n.id FROM nodes n WHERE n.id IN (SELECT id FROM up) ORDER BY n.id FOR SHARE OF n`);
-}
-
 export type DeletedRows = {
   /** Whose `used_bytes` the `freedBytes` belong to. Null when the root did not exist. */
   ownerId: string | null;
@@ -348,7 +346,8 @@ const emptyDeleted = (ownerId: string | null): DeletedRows => ({
  * Deletes a whole subtree's rows — any root, trashed or not — after `assertPurgeable`. One
  * transaction (a savepoint inside the caller's): it locks the owner's `user` row, then every node
  * of the subtree, so a hold set concurrently either is seen or waits for this delete.
- * It also locks the folders above the root (shared), whose holds reach down. Upload sessions
+ * Before both it takes the owner's tree lock, so the folders above the root — whose holds reach
+ * down — cannot change meanwhile and the root cannot be moved. Upload sessions
  * that point into the subtree are deleted too, finished ones included (their `parent_id`
  * reference would block the delete) — except one a hold protects (a held uploader's), which is
  * kept, detached from the folder; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
@@ -358,8 +357,11 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
   return tx.transaction(async (sp) => {
     const [root] = await sp.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, rootId));
     if (!root) return emptyDeleted(null);
+    // The tree lock, then the owner's row, then the nodes (queries/tree.ts): with the tree
+    // lock held no move can re-parent the root and no hold or notice can appear on a folder
+    // above it between the gate's answer below and the delete.
+    await lockOwnerTree(sp, root.ownerId);
     await sp.select({ id: user.id }).from(user).where(eq(user.id, root.ownerId)).for("update");
-    await lockAncestors(sp, rootId);
 
     const locked = await sp.execute<{
       id: string;
@@ -479,8 +481,8 @@ export async function deleteVersionRows(
       .from(nodes)
       .where(eq(nodes.id, nodeId));
     if (!node) return emptyDeleted(null);
+    await lockOwnerTree(sp, node.ownerId);
     await sp.select({ id: user.id }).from(user).where(eq(user.id, node.ownerId)).for("update");
-    await lockAncestors(sp, nodeId);
     await sp.select({ id: nodes.id }).from(nodes).where(eq(nodes.id, nodeId)).for("update");
     await assertPurgeable(sp, [nodeId]);
 

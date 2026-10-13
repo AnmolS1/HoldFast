@@ -214,6 +214,27 @@ export function notEffectivelyTrashedOrHidden(alias: string = "nodes"): SQL {
   return unsetByAncestry(alias, ["deleted_at", "takedown_at"]);
 }
 
+/**
+ * THE TREE LOCK of one owner: a transaction-scoped advisory lock that serialises everything
+ * whose answer depends on where nodes sit in that owner's tree, or on what the folders above
+ * them carry — so that no such answer goes stale between the moment it is read and the moment
+ * it is acted on:
+ *   - `nodes.move` and `trash.restore` (they re-parent: two moves could build a cycle together,
+ *     and a move could take a file out from under a held folder while a purge decides);
+ *   - every purge path that runs the gate (`trash.deleteSubtreeRows`, `deleteVersionRows`): a
+ *     hold or a notice on a folder ABOVE the root protects it (queries/holds.ts);
+ *   - every writer that sets or clears such a cause on a node: `moderation.takedownNode`,
+ *     `restoreTakedown`, `setNodeLegalHold` — and the admin console's attach / detach of a DMCA
+ *     notice, when it is built.
+ *
+ * LOCK ORDER: the tree lock FIRST — before any row lock of the transaction — then `user` rows
+ * (lowest id first), then `nodes`, then the rest. It ends with the (outermost) transaction.
+ * Call it inside a transaction; outside one it would be released at once.
+ */
+export async function lockOwnerTree(tx: Executor, ownerId: string): Promise<void> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"tree:" + ownerId}, 0))`);
+}
+
 export type Role = "owner" | "editor" | "viewer";
 
 /**

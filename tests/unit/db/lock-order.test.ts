@@ -1,5 +1,7 @@
-// Lock order between transactions that touch one owner: the `user` row first, then node rows
-// (and, for scheduled deletion, the `user` row first, then the pending row).
+// Lock order between transactions that touch one owner: the owner's TREE LOCK first (an
+// advisory lock — queries/tree.ts: move, restore, the purge paths, takedown and node holds),
+// then `user` rows (lowest id first), then node rows, then the rest (and, for scheduled
+// deletion, the `user` row first, then the pending row).
 //
 // Every test here runs TWO real transactions on two connections against the local Postgres and
 // controls the interleaving: one side takes its first lock and stops, the test waits until
@@ -16,9 +18,11 @@ import {
   lockSuspectedCsam,
   setNodeLegalHold,
   setUserLegalHold,
+  takedownNode,
 } from "../../../src/worker/db/queries/moderation";
-import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
+import { getNode, move, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import { deleteSubtreeRows, deleteVersionRows } from "../../../src/worker/db/queries/trash";
+import { lockOwnerTree } from "../../../src/worker/db/queries/tree";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
 import {
@@ -606,9 +610,10 @@ describe("clearing a lock beside the filing of a report", () => {
 });
 
 describe("a purge beside a hold being placed on a folder above", () => {
-  // The hold on the FOLDER has been written and not committed. A purge of a file inside it
-  // starts: the gate would read the folder as not held. The purge takes a shared lock on every
-  // folder above its root first, so it waits for the hold — and then refuses.
+  // The hold on the FOLDER has been written and not committed (its writer holds the owner's tree
+  // lock). A purge of a file inside it starts: without that lock its gate would read the folder
+  // as not held and delete. It takes the tree lock first, so it waits for the hold — and then
+  // refuses: the file exists and is protected.
   for (const what of ["the file itself", "an old version of it"] as const) {
     it(`${what}: the purge waits for the hold, then refuses — nothing is deleted`, async () => {
       const owner = await makeUser(a.db);
@@ -649,9 +654,172 @@ describe("a purge beside a hold being placed on a folder above", () => {
       expect(purged.ok).toBe(false);
       expect(purged.ok ? null : purged.error).toBeInstanceOf(LegalHoldError);
       expect(await getNode(a.db, file.id)).not.toBeNull();
+      expect(await getNode(a.db, folder.id)).toMatchObject({ legalHold: true });
       expect(await a.db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, file.id))).toHaveLength(1);
     });
   }
+});
+
+describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () => {
+  /** folder/ { trashed.bin (due), movable.bin, flagged.jpg }   elsewhere/ */
+  async function family() {
+    const owner = await makeUser(a.db);
+    const folder = await makeFolder(a.db, owner, null, `folder-${rand()}`);
+    const trashed = await makeFile(a.db, owner, folder.id, "trashed.bin", {
+      deletedAt: new Date(Date.now() - 1000),
+      trashedRoot: true,
+    });
+    const movable = await makeFile(a.db, owner, folder.id, "movable.bin");
+    const flagged = await makeFile(a.db, owner, folder.id, "flagged.jpg");
+    const elsewhere = await makeFolder(a.db, owner, null, `elsewhere-${rand()}`);
+    return { owner, folder, trashed, movable, flagged, elsewhere };
+  }
+  const isHeldError = (outcome: Outcome<unknown>) => !outcome.ok && outcome.error instanceof LegalHoldError;
+
+  // A purge that got the tree lock first has finished deciding AND deleting before a hold can be
+  // placed on the folder above: the hold-setter waits for it. (The other order — the hold first,
+  // the purge then refuses and deletes nothing — is "a purge beside a hold being placed" above.)
+  it("a hold cannot land on the folder above between the purge's gate and its delete: the setter waits for the purge", async () => {
+    const f = await family();
+    const setterPid = gate<number>();
+    const purged = gate();
+
+    const purge = settle(
+      a.db.transaction(async (tx) => {
+        const deleted = await deleteSubtreeRows(tx, f.trashed.id);
+        purged.open();
+        // Still inside the purge's transaction: the setter must be waiting for the tree lock.
+        await untilWaitingForLock(await setterPid.opened, "the hold-setter");
+        return deleted;
+      }),
+    );
+    const setter = settle(
+      b.db.transaction(async (tx) => {
+        await purged.opened;
+        setterPid.open(await pidOf(tx));
+        return takedownNode(tx, f.folder.id, { reason: "csam", by: null });
+      }),
+    );
+    const [deleted, set] = await Promise.all([purge, setter]);
+    expect(deleted).toMatchObject({ ok: true, value: { ownerId: f.owner } });
+    expect(set).toEqual({ ok: true, value: true });
+    // The purge was first, whole: the file went before there was a hold. Nothing half-done.
+    expect(await getNode(a.db, f.trashed.id)).toBeNull();
+    expect(await getNode(a.db, f.folder.id)).toMatchObject({ legalHold: true });
+    expect(await getNode(a.db, f.movable.id)).not.toBeNull();
+  });
+
+  // The hold on the folder is written and not committed; a move of a file out of it starts. It
+  // waits for the tree lock, then sees the hold and refuses: the file is still under the folder.
+  it("a move out of a folder beside a hold being placed on it: the move waits, then refuses", async () => {
+    const f = await family();
+    const movePid = gate<number>();
+    const holdWritten = gate();
+
+    const hold = settle(
+      a.db.transaction(async (tx) => {
+        await takedownNode(tx, f.folder.id, { reason: "csam", by: null });
+        holdWritten.open();
+        await untilWaitingForLock(await movePid.opened, "the move");
+      }),
+    );
+    const moving = settle(
+      b.db.transaction(async (tx) => {
+        await holdWritten.opened;
+        movePid.open(await pidOf(tx));
+        return move(tx, f.movable.id, f.elsewhere.id);
+      }),
+    );
+    const [heldNow, moved] = await Promise.all([hold, moving]);
+    expect(heldNow.ok, "the move waited for the hold").toBe(true);
+    expect(isHeldError(moved)).toBe(true);
+    expect(await getNode(a.db, f.movable.id)).toMatchObject({ parentId: f.folder.id });
+  });
+
+  // Pairwise, in both orders: the first has taken ITS first lock and stops; the second runs until
+  // it waits or is done; then the first goes on. Nobody is ended as a deadlock victim, and the
+  // only refusal there can be is the hold's own (a purge or a move after the takedown).
+  type Family = Awaited<ReturnType<typeof family>>;
+  const ops: Record<
+    string,
+    { first: (tx: Tx, f: Family) => Promise<unknown>; run: (tx: Tx, f: Family) => Promise<unknown> }
+  > = {
+    move: {
+      first: (tx, f) => lockOwnerTree(tx, f.owner),
+      run: (tx, f) => move(tx, f.movable.id, f.elsewhere.id),
+    },
+    purge: {
+      first: (tx, f) => lockOwnerTree(tx, f.owner),
+      run: (tx, f) => deleteSubtreeRows(tx, f.trashed.id),
+    },
+    takedown: {
+      first: (tx, f) => lockOwnerTree(tx, f.owner),
+      run: (tx, f) => takedownNode(tx, f.folder.id, { reason: "csam", by: null }),
+    },
+    csamLock: {
+      first: (tx, f) =>
+        tx.select({ id: user.id }).from(user).where(eq(user.id, f.owner)).for("no key update"),
+      run: (tx, f) => lockSuspectedCsam(tx, f.flagged.id, { source: "photodna" }),
+    },
+  };
+  const names = Object.keys(ops);
+  const pairs = names.flatMap((one) => names.filter((two) => two !== one).map((two) => [one, two] as const));
+
+  it.each(pairs)("%s, then %s beside it: no deadlock", async (one, two) => {
+    const f = await family();
+    const secondPid = gate<number>();
+    const firstLockHeld = gate();
+    let secondDone = false;
+    const secondWaitingOrDone = async (pid: number) => {
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        if (secondDone) return;
+        const result = await watch.db.execute<{ waiting: boolean }>(
+          sql`SELECT wait_event_type = 'Lock' AS waiting FROM pg_stat_activity WHERE pid = ${pid}`,
+        );
+        if (result.rows[0]?.waiting === true) return;
+        if (Date.now() > deadline) throw new Error(`${two}: neither waiting nor done`);
+        await new Promise((resolve) => setTimeout(resolve, 15));
+      }
+    };
+
+    const first = settle(
+      a.db.transaction(async (tx) => {
+        await ops[one]!.first(tx, f);
+        firstLockHeld.open();
+        await secondWaitingOrDone(await secondPid.opened);
+        return ops[one]!.run(tx, f);
+      }),
+    );
+    const second = settle(
+      b.db.transaction(async (tx) => {
+        await firstLockHeld.opened;
+        secondPid.open(await pidOf(tx));
+        try {
+          return await ops[two]!.run(tx, f);
+        } finally {
+          secondDone = true;
+        }
+      }),
+    );
+    const [did, also] = await Promise.all([first, second]);
+    for (const [name, outcome] of [
+      [one, did],
+      [two, also],
+    ] as const) {
+      expect(sqlState(outcome), `${name} was not a deadlock victim`).not.toBe("40P01");
+      expect(outcome.ok || isHeldError(outcome), `${name} finished, or was refused by the hold`).toBe(true);
+    }
+    // Whatever the order, the folder is held in the end and the flagged file locked.
+    const involved = [one, two];
+    if (involved.includes("takedown"))
+      expect(await getNode(a.db, f.folder.id)).toMatchObject({ legalHold: true });
+    if (involved.includes("csamLock"))
+      expect(await getNode(a.db, f.flagged.id)).toMatchObject({
+        scanStatus: "suspected_csam",
+        legalHold: true,
+      });
+  });
 });
 
 describe("Replace beside a legal hold on the account", () => {

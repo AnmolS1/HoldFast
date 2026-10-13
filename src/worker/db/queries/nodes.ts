@@ -9,7 +9,7 @@ import { and, asc, desc, eq, getTableColumns, inArray, isNotNull, isNull, sql, t
 import { extOf, nameKeyOf, sanitizeName } from "../../services/filename";
 import type { Executor } from "../client";
 import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
-import { isUniqueViolation, QueryError } from "../errors";
+import { isUniqueViolation, LegalHoldError, QueryError } from "../errors";
 import { isUuid } from "../ids";
 import {
   type Node,
@@ -23,7 +23,8 @@ import {
   uploads,
   user,
 } from "../schema";
-import { isDescendantOrSelf, effectiveTrashed, notEffectivelyTrashedOrHidden } from "./tree";
+import { lostByLeaving } from "./holds";
+import { isDescendantOrSelf, effectiveTrashed, lockOwnerTree, notEffectivelyTrashedOrHidden } from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
 export type SortDir = "asc" | "desc";
@@ -384,17 +385,23 @@ export async function rename(db: Executor, nodeId: string, rawName: string): Pro
 
 /**
  * Moves a node under another folder of the same owner (null = the top level). One transaction:
- * moves of one owner are serialised with a transaction-scoped advisory lock (two concurrent
- * moves could otherwise each pass the cycle check and together build a cycle), then the node and
- * the target are locked `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found`
- * for a missing, trashed (itself or under a trashed folder), system or foreign node or target.
+ * it takes the owner's TREE LOCK first (queries/tree.ts — two concurrent moves could otherwise
+ * each pass the cycle check and together build a cycle, and a purge or a hold being placed
+ * could otherwise decide on a tree that is changing), then the node and the target are locked
+ * `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found` for a missing, trashed
+ * (itself or under a trashed folder), system or foreign node or target.
+ *
+ * `LegalHoldError` — the purge gate's own error, the cause in it, and like there NEVER to be
+ * shown to the caller — when the move would take the node out from under a folder that is on
+ * legal hold or named by an open notice: outside it nothing would protect the node, and it
+ * could be trashed and purged. Nothing is moved.
  */
 export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
   if (!isUuid(nodeId) || (newParentId !== null && !isUuid(newParentId))) throw new QueryError("not_found");
   const peek = await getNode(db, nodeId);
   if (!peek) throw new QueryError("not_found");
   return withNameConflict(db, async (tx) => {
-    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"move:" + peek.ownerId}, 0))`);
+    await lockOwnerTree(tx, peek.ownerId);
     const ids = newParentId === null ? [nodeId] : [nodeId, newParentId];
     const locked = await tx
       .select()
@@ -420,6 +427,11 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
       if (await effectiveTrashed(tx, newParentId)) throw new QueryError("not_found");
     }
     if (node.parentId === newParentId) return node;
+    // A hold or an open notice on a folder above protects this node only while it stays under
+    // it: a move that would take it OUT from under one is refused. Moving within that folder, or
+    // into a protected one, is fine; a hold of the node's own travels with it.
+    const lost = await lostByLeaving(tx, nodeId, newParentId);
+    if (lost.length > 0) throw new LegalHoldError({ [nodeId]: lost });
     const [row] = await tx
       .update(nodes)
       .set({ parentId: newParentId, updatedAt: sql`now()` })

@@ -9,6 +9,7 @@ import { pgError } from "../errors";
 import { isUuid } from "../ids";
 import { dmcaNotices, hashBlocklist, nodes, reports, type ScanStatus, uploadIps, user } from "../schema";
 import { pauseLinks, unpauseLinks } from "./links";
+import { lockOwnerTree } from "./tree";
 
 type ReportCategory = (typeof reports.category.enumValues)[number];
 type ReportSource = (typeof reports.source.enumValues)[number];
@@ -591,8 +592,29 @@ async function releaseBlocklistEntry(
 }
 
 /**
+ * Runs a write that sets or clears something a folder hands DOWN to its content (a legal hold;
+ * the takedown that carries one) under the owner's tree lock — so that a purge or a move that
+ * is deciding on that tree either has finished or sees the change (queries/tree.ts).
+ * The tree lock comes before every row lock: call these first in a transaction.
+ */
+async function underTreeLock<T>(
+  db: Executor,
+  nodeId: string,
+  write: (tx: Executor) => Promise<T>,
+  absent: T,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    const [peek] = await tx.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
+    if (!peek) return absent;
+    await lockOwnerTree(tx, peek.ownerId);
+    return write(tx);
+  });
+}
+
+/**
  * Takes a node down: hidden from every non-admin listing and unservable. It is not "trash" — the
- * owner cannot restore it. For reason `csam` the node is also put on legal hold.
+ * owner cannot restore it. For reason `csam` the node is also put on legal hold — a hold that
+ * protects everything under a folder. Under the owner's tree lock (first in the transaction).
  * Pausing the node's links and filing a report are the caller's separate steps.
  * False when there is no such node.
  */
@@ -602,28 +624,45 @@ export async function takedownNode(
   opts: { reason: TakedownReason; by: string | null },
 ): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
-  const rows = await db
-    .update(nodes)
-    .set({
-      takedownAt: sql`now()`,
-      takedownReason: opts.reason,
-      takedownBy: opts.by,
-      ...(opts.reason === "csam" ? { legalHold: true } : {}),
-    })
-    .where(eq(nodes.id, nodeId))
-    .returning({ id: nodes.id });
-  return rows.length > 0;
+  return underTreeLock(
+    db,
+    nodeId,
+    async (tx) => {
+      const rows = await tx
+        .update(nodes)
+        .set({
+          takedownAt: sql`now()`,
+          takedownReason: opts.reason,
+          takedownBy: opts.by,
+          ...(opts.reason === "csam" ? { legalHold: true } : {}),
+        })
+        .where(eq(nodes.id, nodeId))
+        .returning({ id: nodes.id });
+      return rows.length > 0;
+    },
+    false,
+  );
 }
 
-/** Clears the three takedown columns. A legal hold, if any, stays. False when nothing was down. */
+/**
+ * Clears the three takedown columns. A legal hold, if any, stays. False when nothing was down.
+ * Under the owner's tree lock, like the takedown.
+ */
 export async function restoreTakedown(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
-  const rows = await db
-    .update(nodes)
-    .set({ takedownAt: null, takedownReason: null, takedownBy: null })
-    .where(and(eq(nodes.id, nodeId), sql`${nodes.takedownAt} IS NOT NULL`))
-    .returning({ id: nodes.id });
-  return rows.length > 0;
+  return underTreeLock(
+    db,
+    nodeId,
+    async (tx) => {
+      const rows = await tx
+        .update(nodes)
+        .set({ takedownAt: null, takedownReason: null, takedownBy: null })
+        .where(and(eq(nodes.id, nodeId), sql`${nodes.takedownAt} IS NOT NULL`))
+        .returning({ id: nodes.id });
+      return rows.length > 0;
+    },
+    false,
+  );
 }
 
 /**
@@ -645,15 +684,25 @@ export async function closeNotice(
   return rows.length > 0;
 }
 
-/** Sets or releases the legal hold on one node. False when there is no such node. */
+/**
+ * Sets or releases the legal hold on one node — which, on a folder, protects everything under
+ * it. Under the owner's tree lock (first in the transaction). False when there is no such node.
+ */
 export async function setNodeLegalHold(db: Executor, nodeId: string, held: boolean): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
-  const rows = await db
-    .update(nodes)
-    .set({ legalHold: held })
-    .where(eq(nodes.id, nodeId))
-    .returning({ id: nodes.id });
-  return rows.length > 0;
+  return underTreeLock(
+    db,
+    nodeId,
+    async (tx) => {
+      const rows = await tx
+        .update(nodes)
+        .set({ legalHold: held })
+        .where(eq(nodes.id, nodeId))
+        .returning({ id: nodes.id });
+      return rows.length > 0;
+    },
+    false,
+  );
 }
 
 /** Sets or releases the legal hold on an account. False when there is no such user. */

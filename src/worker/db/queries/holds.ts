@@ -23,6 +23,7 @@
 // key and outlives both the node and the account.
 
 import { sql, type SQL } from "drizzle-orm";
+import type { Executor } from "../client";
 import type { HoldCause } from "../errors";
 import { OPEN_NOTICE_STATUSES } from "./moderation";
 
@@ -118,4 +119,47 @@ export function nodeProtected(nodeId: SQL): SQL {
   return sql`EXISTS (
     SELECT 1 FROM nodes kept_node JOIN "user" kept_owner ON kept_owner.id = kept_node.owner_id
     WHERE kept_node.id = ${nodeId} AND ${anyHoldCause(sql`kept_node`, sql`kept_owner`)})`;
+}
+
+/**
+ * Which inheritable causes protect the node THROUGH A FOLDER ABOVE where it stands now — what it
+ * would lose by being taken out. Empty for a top-level node and for an id that does not exist.
+ * Call it under the owner's tree lock (queries/tree.ts): the answer is about the tree's shape.
+ */
+export async function inheritedHoldCauses(tx: Executor, nodeId: string): Promise<InheritedCause[]> {
+  const inherited = inheritedCauses(sql`n`);
+  const result = await tx.execute<Record<InheritedCause, boolean>>(sql`
+    SELECT ${inherited.node_legal_hold} AS node_legal_hold, ${inherited.open_notice} AS open_notice
+    FROM nodes n WHERE n.id = ${nodeId}`);
+  const row = result.rows[0];
+  return row ? INHERITED_CAUSES.filter((cause) => row[cause] === true) : [];
+}
+
+/**
+ * Which inheritable causes a folder GIVES to whatever is put into it: its own, or those of a
+ * folder above it. Empty for the top level (`null`) and for an id that does not exist.
+ */
+export async function causesGivenBy(tx: Executor, folderId: string | null): Promise<InheritedCause[]> {
+  if (folderId === null) return [];
+  const all = holdCauses(sql`n`, sql`u`);
+  const result = await tx.execute<Record<InheritedCause, boolean>>(sql`
+    SELECT ${all.node_legal_hold} AS node_legal_hold, ${all.open_notice} AS open_notice
+    FROM nodes n JOIN "user" u ON u.id = n.owner_id WHERE n.id = ${folderId}`);
+  const row = result.rows[0];
+  return row ? INHERITED_CAUSES.filter((cause) => row[cause] === true) : [];
+}
+
+/**
+ * The inherited causes the node has where it stands and would NOT have under `newParentId`
+ * (null = the top level): what a re-parenting would strip from it. Empty = the move is safe.
+ */
+export async function lostByLeaving(
+  tx: Executor,
+  nodeId: string,
+  newParentId: string | null,
+): Promise<InheritedCause[]> {
+  const now = await inheritedHoldCauses(tx, nodeId);
+  if (now.length === 0) return [];
+  const then = await causesGivenBy(tx, newParentId);
+  return now.filter((cause) => !then.includes(cause));
 }
