@@ -378,10 +378,8 @@ test.describe("long folders and accessibility", () => {
     await openExplorer(page);
     await expect(page.locator("[data-item-id]")).toHaveCount(50);
     await expectNoA11yViolations(page);
-    // …and with a selection, the bar and the details showing. Two things about the shared
-    // selection bar: it slides in (wait for that, or the half-faded bar is what gets measured), and
-    // its key hints are drawn at 80 % opacity, which is 3.7:1 on the bar's wash — reported as a
-    // seam for the shared component; left out here so that everything else in this state is held.
+    // …and with a selection, the bar and the details showing. The bar slides in: wait for that, or
+    // the half-faded bar is what gets measured.
     if (!isMobile(page)) {
       await page.locator("[data-item-id]").nth(3).click();
       const bar = page.locator("[data-selection-bar]");
@@ -389,7 +387,7 @@ test.describe("long folders and accessibility", () => {
       await bar.evaluate((element) =>
         Promise.all(element.getAnimations().map((animation) => animation.finished)),
       );
-      await expectNoA11yViolations(page, { exclude: ["[data-selection-bar] kbd"] });
+      await expectNoA11yViolations(page);
     }
   });
 
