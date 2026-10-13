@@ -39,7 +39,18 @@ export interface DownloadClaims {
   exp: number;
   /** Thumb tokens only, and mandatory there. */
   sz?: ThumbSize;
+  /**
+   * Link tokens (`st: "l"`) only, and mandatory there: the link's password version when the
+   * token was minted (`linkPwv`). Verification returns it UNCHANGED — this layer cannot know the
+   * link's current value. Comparing it with `linkPwv(link.passwordHash)` is the files host's
+   * re-check of the link: a token minted before a password was set or changed must not serve.
+   */
+  pwv?: string;
 }
+
+/** The password version of a link that has no password. Not the shape of any hashed value. */
+export const NO_PASSWORD_PWV = "-";
+const PWV = /^(?:[0-9a-f]{16}|-)$/;
 
 /** The `sub` of a system token. */
 export const SCANNER_SUBJECT = "scanner";
@@ -142,13 +153,15 @@ function subjectAllowed(kind: TokenKind, st: SubjectType, sub: string): boolean 
   return st === "u" || st === "l";
 }
 
+const isPwv = (value: unknown): value is string => typeof value === "string" && PWV.test(value);
+
 function isThumbSize(value: unknown): value is ThumbSize {
   return (THUMB_SIZES as readonly unknown[]).includes(value);
 }
 
 /** The claims when every field is present, of the right type and a permitted combination. */
 function asClaims(payload: Record<string, unknown>): DownloadClaims | null {
-  const { v, k, n, ver, st, sub, exp, sz } = payload;
+  const { v, k, n, ver, st, sub, exp, sz, pwv } = payload;
   if (v !== 1) return null;
   if (!KINDS.includes(k as TokenKind)) return null;
   if (!isText(n) || !isText(ver)) return null;
@@ -156,8 +169,11 @@ function asClaims(payload: Record<string, unknown>): DownloadClaims | null {
   if (!isExp(exp)) return null;
   if (!subjectAllowed(k as TokenKind, st as SubjectType, sub)) return null;
   if (k === "thumb" ? !isThumbSize(sz) : sz !== undefined) return null;
+  // A link token names the password version it was minted under; nobody else's token has one.
+  if (st === "l" ? !isPwv(pwv) : pwv !== undefined) return null;
   const claims: DownloadClaims = { v: 1, k: k as TokenKind, n, ver, st: st as SubjectType, sub, exp };
   if (k === "thumb") claims.sz = sz as ThumbSize;
+  if (st === "l") claims.pwv = pwv as string;
   return claims;
 }
 
@@ -193,6 +209,7 @@ export async function mintDownloadToken(
     exp,
   };
   if (claims.sz !== undefined) payload.sz = claims.sz;
+  if (claims.pwv !== undefined) payload.pwv = claims.pwv;
   if (!asClaims(payload)) throw new Error("download token: invalid claims");
   const token = await signToken(await keys.get("download-token"), payload);
   return { token, expiresAt: exp };
@@ -206,8 +223,9 @@ export async function mintDownloadToken(
  * kind, wrong node, wrong size, a missing subject, a subject that may not hold that kind. The
  * files host does not tell these apart, and neither does this function.
  *
- * The caller still re-checks the subject against the database (`st` / `sub`) and compares `ver`
- * with the node's current version: a valid token is not yet access.
+ * The caller still re-checks the subject against the database (`st` / `sub`), compares `ver`
+ * with the node's current version and — for a link token — `pwv` with the link's current
+ * password version: a valid token is not yet access.
  */
 export async function verifyDownloadToken(
   keys: Keys,
@@ -229,11 +247,13 @@ export async function verifyDownloadToken(
 // ── link sessions and zip grants ────────────────────────────────────────────────────────────
 
 /**
- * The `pwv` of a link: the first 8 bytes of SHA-256 of its `passwordHash`, as hex — so changing
- * the password ends every open session. A link without a password has the fixed value "-".
+ * The password version (`pwv`) of a link: the first 8 bytes of SHA-256 of its `passwordHash`, as
+ * 16 hex characters — so setting, changing or removing the password ends every open session,
+ * grant and link download token. A link without a password has the constant `NO_PASSWORD_PWV`.
+ * The ONE derivation: sessions, grants, download tokens and the files host all call this.
  */
-export async function passwordVersion(passwordHash: string | null | undefined): Promise<string> {
-  if (!passwordHash) return "-";
+export async function linkPwv(passwordHash: string | null | undefined): Promise<string> {
+  if (!passwordHash) return NO_PASSWORD_PWV;
   return hex((await sha256(passwordHash)).subarray(0, 8));
 }
 
@@ -250,7 +270,7 @@ export async function mintLinkSession(
   keys: Keys,
   binding: LinkSessionBinding,
 ): Promise<{ token: string; expiresAt: number }> {
-  if (!isText(binding.linkId) || !isText(binding.ipHashStable) || !isText(binding.pwv)) {
+  if (!isText(binding.linkId) || !isText(binding.ipHashStable) || !isPwv(binding.pwv)) {
     throw new Error("link session: invalid binding");
   }
   const exp = unixNow() + LINK_SESSION_TTL_SEC;
@@ -281,36 +301,42 @@ export async function verifyLinkSession(
   return { linkId: expect.linkId, expiresAt: payload.exp as number };
 }
 
-const grantBound = (linkId: string) => `zg|${linkId}`;
+type ZipGrantBinding = { linkId: string; n: string; pwv: string };
+
+const grantBound = (g: ZipGrantBinding) => `zg|${g.linkId}|${g.n}|${g.pwv}`;
 
 /**
  * A zip grant: issued by the public zip-manifest call after it consumed the link's one download.
- * `n` is the id of the node the manifest was built for. Valid for one hour.
+ * `n` is the id of the node the manifest was built for; `pwv` the link's password version, bound
+ * into the MAC like a session's. Valid for one hour.
  */
 export async function mintZipGrant(
   keys: Keys,
-  grant: { linkId: string; n: string },
+  grant: ZipGrantBinding,
 ): Promise<{ token: string; expiresAt: number }> {
-  if (!isText(grant.linkId) || !isText(grant.n)) throw new Error("zip grant: invalid claims");
+  if (!isText(grant.linkId) || !isText(grant.n) || !isPwv(grant.pwv))
+    throw new Error("zip grant: invalid claims");
   const exp = unixNow() + ZIP_GRANT_TTL_SEC;
   const payload = { v: 1, t: "zg", l: grant.linkId, n: grant.n, exp };
-  const token = await signToken(await keys.get("link-session"), payload, grantBound(grant.linkId));
+  const token = await signToken(await keys.get("link-session"), payload, grantBound(grant));
   return { token, expiresAt: exp };
 }
 
 /**
- * The grant when it is an unexpired grant for this link; null otherwise. Never throws: a grant is
- * optional, and a request without a valid one is simply counted as a download.
+ * The grant when it is an unexpired grant for this link, this node and the link's CURRENT
+ * password version; null otherwise. Never throws: a grant is optional, and a request without a
+ * valid one is simply counted as a download.
  */
 export async function verifyZipGrant(
   keys: Keys,
   token: string | null | undefined,
-  expect: { linkId: string },
+  expect: ZipGrantBinding,
 ): Promise<{ linkId: string; n: string; expiresAt: number } | null> {
-  const payload = await openToken(await keys.get("link-session"), token, grantBound(expect.linkId));
-  if (!payload || payload.v !== 1 || payload.t !== "zg" || payload.l !== expect.linkId) return null;
-  if (!isText(payload.n) || !isExp(payload.exp) || payload.exp <= unixNow()) return null;
-  return { linkId: expect.linkId, n: payload.n, expiresAt: payload.exp };
+  const payload = await openToken(await keys.get("link-session"), token, grantBound(expect));
+  if (!payload || payload.v !== 1 || payload.t !== "zg") return null;
+  if (payload.l !== expect.linkId || payload.n !== expect.n) return null;
+  if (!isExp(payload.exp) || payload.exp <= unixNow()) return null;
+  return { linkId: expect.linkId, n: expect.n, expiresAt: payload.exp };
 }
 
 // ── link tokens ─────────────────────────────────────────────────────────────────────────────

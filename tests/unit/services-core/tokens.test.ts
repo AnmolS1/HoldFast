@@ -13,7 +13,8 @@ import {
   newLinkToken,
   openIp,
   openLinkToken,
-  passwordVersion,
+  linkPwv,
+  NO_PASSWORD_PWV,
   sealIp,
   sealLinkToken,
   verifyDownloadToken,
@@ -97,10 +98,18 @@ describe("download tokens", () => {
     expect(TOKEN_TTL).toEqual({ download: 300, inline: 900, thumb: 600, scan: 900, zip: 900 });
     const zip = await mintDownloadToken(keys(), userClaims(), { ttlSec: TOKEN_TTL.zip });
     expect(zip.expiresAt).toBe(at + 900);
-    const link = await mintDownloadToken(keys(), { k: "inline", n: NODE, ver: VERSION, st: "l", sub: LINK });
+    const link = await mintDownloadToken(keys(), {
+      k: "inline",
+      n: NODE,
+      ver: VERSION,
+      st: "l",
+      sub: LINK,
+      pwv: NO_PASSWORD_PWV,
+    });
     expect(await verifyDownloadToken(keys(), link.token, { kind: "inline", nodeId: NODE })).toMatchObject({
       st: "l",
       sub: LINK,
+      pwv: NO_PASSWORD_PWV,
     });
     const scan = await mintDownloadToken(keys(), {
       k: "scan",
@@ -384,45 +393,143 @@ describe("link sessions", () => {
     await refused(verifyLinkSession(keys(), token, shifted), "password_required");
   });
 
-  it("passwordVersion is 8 bytes of SHA-256 of the hash, and changes with it", async () => {
-    const one = await passwordVersion("scrypt$made-up-hash-one");
+  it("linkPwv is 8 bytes of SHA-256 of the hash, changes with it, and is a constant without a password", async () => {
+    const one = await linkPwv("scrypt$made-up-hash-one");
     expect(one).toMatch(/^[0-9a-f]{16}$/);
-    expect(await passwordVersion("scrypt$made-up-hash-one")).toBe(one);
-    expect(await passwordVersion("scrypt$made-up-hash-two")).not.toBe(one);
-    expect(await passwordVersion(null)).toBe("-");
+    expect(await linkPwv("scrypt$made-up-hash-one")).toBe(one);
+    expect(await linkPwv("scrypt$made-up-hash-two")).not.toBe(one);
     const digest = new Uint8Array(
       await crypto.subtle.digest("SHA-256", encoder.encode("scrypt$made-up-hash-one")),
     );
     expect(one).toBe([...digest.subarray(0, 8)].map((b) => b.toString(16).padStart(2, "0")).join(""));
+    // No password: the constant — which no hashed value can ever equal (it is not 16 hex characters).
+    expect(NO_PASSWORD_PWV).toBe("-");
+    for (const none of [null, undefined, ""]) expect(await linkPwv(none)).toBe(NO_PASSWORD_PWV);
+    expect(NO_PASSWORD_PWV).not.toMatch(/^[0-9a-f]{16}$/);
+    // A session is minted only for a well-formed version.
+    await expect(mintLinkSession(keys(), { ...binding, pwv: "anything" })).rejects.toThrow("invalid binding");
+  });
+});
+
+describe("link download tokens and the password version", () => {
+  const PWV = "0011223344556677";
+  const linkClaims = { k: "download", n: NODE, ver: VERSION, st: "l", sub: LINK } as const;
+
+  it("a link token without pwv cannot be minted and, validly signed, is refused", async () => {
+    freeze(T0);
+    const exp = Math.floor(T0 / 1000) + 300;
+    await expect(mintDownloadToken(keys(), linkClaims)).rejects.toThrow("invalid claims");
+    const whole = { v: 1, ...linkClaims, pwv: PWV, exp };
+    // The control: with the version, the same forged token verifies.
+    await expect(
+      verifyDownloadToken(keys(), await forge(keys(), whole), { kind: "download", nodeId: NODE }),
+    ).resolves.toBeTruthy();
+    for (const pwv of [undefined, "", 7, null, "0011", "0011223344556677aa", "ZZ11223344556677", "--"]) {
+      const signed = await forge(keys(), { ...whole, pwv });
+      await refused(verifyDownloadToken(keys(), signed, { kind: "download", nodeId: NODE }));
+    }
+  });
+
+  it("verify returns the pwv unchanged — comparing it with the link's current one is the files host's check", async () => {
+    freeze(T0);
+    for (const pwv of [PWV, NO_PASSWORD_PWV, await linkPwv("scrypt$made-up-hash-one")]) {
+      const { token } = await mintDownloadToken(keys(), { ...linkClaims, pwv });
+      const claims = await verifyDownloadToken(keys(), token, { kind: "download", nodeId: NODE });
+      expect(claims.pwv).toBe(pwv);
+      expect(claims).toMatchObject({ st: "l", sub: LINK });
+    }
+    // Two versions are two tokens: the password change is visible in the token itself.
+    const before = await mintDownloadToken(keys(), { ...linkClaims, pwv: NO_PASSWORD_PWV });
+    const after = await mintDownloadToken(keys(), { ...linkClaims, pwv: PWV });
+    expect(after.token).not.toBe(before.token);
+  });
+
+  it("a user or system token with a pwv is refused, and cannot be minted", async () => {
+    freeze(T0);
+    const exp = Math.floor(T0 / 1000) + 300;
+    await expect(mintDownloadToken(keys(), { ...userClaims(), pwv: PWV })).rejects.toThrow("invalid claims");
+    await expect(
+      mintDownloadToken(keys(), { k: "scan", n: NODE, ver: VERSION, st: "s", sub: "scanner", pwv: PWV }),
+    ).rejects.toThrow("invalid claims");
+    const user = { v: 1, ...userClaims(), exp };
+    const scan = { v: 1, k: "scan", n: NODE, ver: VERSION, st: "s", sub: "scanner", exp };
+    // The controls: without it both verify.
+    await expect(
+      verifyDownloadToken(keys(), await forge(keys(), user), { kind: "download", nodeId: NODE }),
+    ).resolves.toBeTruthy();
+    await expect(
+      verifyDownloadToken(keys(), await forge(keys(), scan), { kind: "scan", nodeId: NODE }),
+    ).resolves.toBeTruthy();
+    for (const pwv of [PWV, NO_PASSWORD_PWV]) {
+      await refused(
+        verifyDownloadToken(keys(), await forge(keys(), { ...user, pwv }), {
+          kind: "download",
+          nodeId: NODE,
+        }),
+      );
+      await refused(
+        verifyDownloadToken(keys(), await forge(keys(), { ...scan, pwv }), { kind: "scan", nodeId: NODE }),
+      );
+    }
+  });
+
+  it("a link thumb token stays deterministic within its bucket, and differs across password versions", async () => {
+    const bucketStart = Math.floor(T0 / 1000 / 600) * 600;
+    const claims = { k: "thumb", n: NODE, ver: VERSION, st: "l", sub: LINK, sz: 160, pwv: PWV } as const;
+    freeze(bucketStart * 1000);
+    const first = await mintDownloadToken(keys(), claims);
+    vi.setSystemTime((bucketStart + 599) * 1000);
+    expect((await mintDownloadToken(keys(), claims)).token).toBe(first.token);
+    expect((await mintDownloadToken(keys(), { ...claims, pwv: NO_PASSWORD_PWV })).token).not.toBe(
+      first.token,
+    );
   });
 });
 
 describe("zip grants", () => {
-  it("verify for their link for one hour and return the node they were made for", async () => {
+  const PWV = "0011223344556677";
+  const grant = { linkId: LINK, n: NODE, pwv: PWV };
+
+  it("verify for their link, node and password version, for one hour", async () => {
     freeze(T0);
-    const { token, expiresAt } = await mintZipGrant(keys(), { linkId: LINK, n: NODE });
+    const { token, expiresAt } = await mintZipGrant(keys(), grant);
     expect(ZIP_GRANT_TTL_SEC).toBe(3600);
-    expect(await verifyZipGrant(keys(), token, { linkId: LINK })).toEqual({
-      linkId: LINK,
-      n: NODE,
-      expiresAt,
-    });
-    expect(await verifyZipGrant(keys(), token, { linkId: OTHER_NODE })).toBeNull();
-    expect(await verifyZipGrant(otherKeys(), token, { linkId: LINK })).toBeNull();
+    expect(await verifyZipGrant(keys(), token, grant)).toEqual({ linkId: LINK, n: NODE, expiresAt });
+    expect(await verifyZipGrant(keys(), token, { ...grant, linkId: OTHER_NODE })).toBeNull();
+    expect(await verifyZipGrant(keys(), token, { ...grant, n: OTHER_NODE })).toBeNull();
+    expect(await verifyZipGrant(otherKeys(), token, grant)).toBeNull();
     for (const missing of [undefined, null, "", "x.y", `${token}x`]) {
-      expect(await verifyZipGrant(keys(), missing, { linkId: LINK })).toBeNull();
+      expect(await verifyZipGrant(keys(), missing, grant)).toBeNull();
     }
+    // The password version is not readable from the grant.
+    expect(new TextDecoder().decode(unb64url(token.split(".")[0]!))).not.toContain(PWV);
+    vi.setSystemTime((expiresAt - 1) * 1000);
+    expect(await verifyZipGrant(keys(), token, grant)).not.toBeNull();
     vi.setSystemTime(expiresAt * 1000);
-    expect(await verifyZipGrant(keys(), token, { linkId: LINK })).toBeNull();
+    expect(await verifyZipGrant(keys(), token, grant)).toBeNull();
+  });
+
+  it("a grant minted under the old password does not verify under the new one", async () => {
+    freeze(T0);
+    const { token } = await mintZipGrant(keys(), grant);
+    // The control: under the version it was minted with, it verifies.
+    expect(await verifyZipGrant(keys(), token, grant)).not.toBeNull();
+    expect(await verifyZipGrant(keys(), token, { ...grant, pwv: "ffeeddccbbaa9988" })).toBeNull();
+    // A password added to a link that had none, and a password removed.
+    expect(await verifyZipGrant(keys(), token, { ...grant, pwv: NO_PASSWORD_PWV })).toBeNull();
+    const open = await mintZipGrant(keys(), { ...grant, pwv: NO_PASSWORD_PWV });
+    expect(await verifyZipGrant(keys(), open.token, { ...grant, pwv: NO_PASSWORD_PWV })).not.toBeNull();
+    expect(await verifyZipGrant(keys(), open.token, grant)).toBeNull();
+    await expect(mintZipGrant(keys(), { ...grant, pwv: "" })).rejects.toThrow("invalid claims");
   });
 
   it("a link session is not a zip grant and a zip grant is not a link session (one key, two types)", async () => {
     freeze(T0);
-    const binding = { linkId: LINK, ipHashStable: "a".repeat(64), pwv: "-" };
+    const binding = { linkId: LINK, ipHashStable: "a".repeat(64), pwv: PWV };
     const session = await mintLinkSession(keys(), binding);
-    const grant = await mintZipGrant(keys(), { linkId: LINK, n: NODE });
-    expect(await verifyZipGrant(keys(), session.token, { linkId: LINK })).toBeNull();
-    await refused(verifyLinkSession(keys(), grant.token, binding), "password_required");
+    const issued = await mintZipGrant(keys(), grant);
+    expect(await verifyZipGrant(keys(), session.token, grant)).toBeNull();
+    await refused(verifyLinkSession(keys(), issued.token, binding), "password_required");
     // Even a session payload signed exactly as a grant is signed is refused for its type.
     const exp = Math.floor(T0 / 1000) + 600;
     const sign = async (payload: object, bound: string) => {
@@ -431,28 +538,24 @@ describe("zip grants", () => {
       const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(`${body}.${bound}`)));
       return `${body}.${b64url(mac)}`;
     };
-    const sessionAsGrant = await sign({ v: 1, t: "ls", l: LINK, n: NODE, exp }, `zg|${LINK}`);
-    expect(await verifyZipGrant(keys(), sessionAsGrant, { linkId: LINK })).toBeNull();
-    const grantAsSession = await sign(
-      { v: 1, t: "zg", l: LINK, exp },
-      `ls|${LINK}|${binding.ipHashStable}|-`,
+    const asGrant = `zg|${LINK}|${NODE}|${PWV}`;
+    const asSession = `ls|${LINK}|${binding.ipHashStable}|${PWV}`;
+    expect(
+      await verifyZipGrant(keys(), await sign({ v: 1, t: "ls", l: LINK, n: NODE, exp }, asGrant), grant),
+    ).toBeNull();
+    await refused(
+      verifyLinkSession(keys(), await sign({ v: 1, t: "zg", l: LINK, exp }, asSession), binding),
+      "password_required",
     );
-    await refused(verifyLinkSession(keys(), grantAsSession, binding), "password_required");
     // The controls: the right type under the same signing verifies.
     expect(
-      await verifyZipGrant(keys(), await sign({ v: 1, t: "zg", l: LINK, n: NODE, exp }, `zg|${LINK}`), {
-        linkId: LINK,
-      }),
+      await verifyZipGrant(keys(), await sign({ v: 1, t: "zg", l: LINK, n: NODE, exp }, asGrant), grant),
     ).not.toBeNull();
     await expect(
-      verifyLinkSession(
-        keys(),
-        await sign({ v: 1, t: "ls", l: LINK, exp }, `ls|${LINK}|${binding.ipHashStable}|-`),
-        binding,
-      ),
+      verifyLinkSession(keys(), await sign({ v: 1, t: "ls", l: LINK, exp }, asSession), binding),
     ).resolves.toBeTruthy();
     // And neither is a download token.
-    await refused(verifyDownloadToken(keys(), grant.token, { kind: "download", nodeId: NODE }));
+    await refused(verifyDownloadToken(keys(), issued.token, { kind: "download", nodeId: NODE }));
   });
 });
 
