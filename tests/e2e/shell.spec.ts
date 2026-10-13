@@ -48,8 +48,8 @@ interface Destination {
 // navigation state) and that no placeholder is left. The order is deliberate — lines of different
 // Wave-2 tasks are never neighbours, so two tasks flipping theirs do not meet in a merge.
 const DESTINATIONS: Destination[] = [
-  { path: "/", title: "Files", nav: "files", placeholder: true },
-  { path: "/folder/abc", title: "Files", placeholder: true },
+  { path: "/", title: "Files", nav: "files", placeholder: false },
+  { path: "/folder/abc", title: "Files", placeholder: false },
   { path: "/shared", title: "Shared with me", nav: "shared", placeholder: true },
   { path: "/uploads", title: "Uploads", placeholder: true },
   { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: true },
