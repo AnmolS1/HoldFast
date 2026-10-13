@@ -4,8 +4,10 @@
 //                                         daily ledger it counts on, BEFORE the first byte is sent
 //   settleServe(deps, charge, sent)       after the stream ended: gives the unsent bytes back and
 //                                         adds the sent ones to the link
-//   notifyLinkPausedOnce(deps, id, why)   the "link paused" mail, at most once a day per link
+//   notifyLinkLimitOnce(deps, linkId)    the "this link reached today's limit" mail, once a day
 //   notifyOwnerLinkCapOnce(deps, owner)   the "your links reached today's limit" mail, once a day
+//   notifyLinkPausedOnce(deps, id, why)   the "link paused" mail, at most once a day per link —
+//                                         for whoever really pauses a link; this host never does
 //
 // CHARGED UP FRONT, NEVER CHECKED THEN RECORDED. Every ledger is consumed with the ceilings
 // service's atomic add-if-under, in this order, and the first refusal decides:
@@ -17,16 +19,17 @@
 // BYTES ONLY. No count is consumed here (the per-link download count belongs to the mint), and a
 // response without a body — 304, 412, 416, HEAD — is not charged and writes no row.
 //
-// The two refusals that have a consequence of their own:
-//   download_owner   every link of that owner answers 429 until 00:00 UTC. NO link is paused;
-//                    the owner is told once that day.
-//   download_link    the link is paused with reason `ceiling` (the midnight job lifts it), and
-//                    its owner is told on that transition, at most once a day.
+// A CEILING NEVER PAUSES A LINK. A refused `download_owner` or `download_link` consume is a 429
+// for as long as that ledger is full — every link of the owner, or the one link — and is served
+// again as soon as there is room: a refund, or the day rolling over. Charges are reservations
+// (a download that was opened and not read holds its bytes until it ends), so a pause on a full
+// ledger would let anyone pause a link that had served nothing. The owner is told once that day:
+// one mail per owner for the cap, one per link for its limit.
 
 import type { Context } from "hono";
 import { addBytesServed, accountOf, claimPauseEmail, type ServeAccount } from "../db/queries/files-host";
 import { addUsageIfUnder, utcDay } from "../db/queries/ledger";
-import { pauseLinks } from "../db/queries/links";
+import { getById as linkById } from "../db/queries/links";
 import { getNode } from "../db/queries/nodes";
 import type { PauseReason } from "../db/schema";
 import {
@@ -37,7 +40,7 @@ import {
   type ConsumeReceipt,
 } from "./ceilings";
 import { now } from "./clock";
-import { sendLinkCapReached, sendLinkPaused } from "./email";
+import { sendLinkCapReached, sendLinkLimitReached, sendLinkPaused } from "./email";
 import { metric } from "./metrics";
 import { deps, type AppEnv, type ServiceDeps } from "./request-context";
 
@@ -98,7 +101,7 @@ export async function recordServe(c: Context<AppEnv>, serve: Serve): Promise<Ser
     { bytes },
   );
   if (!linked.ok) {
-    await told(() => pauseForCeiling(deps(c), serve.sub));
+    await told(() => notifyLinkLimitOnce(deps(c), serve.sub, now(c)));
     throw ceilingExceeded(linked);
   }
   charges.push({ kind: "download_link", subjectId: serve.sub, receipt: { day: linked.day } });
@@ -113,12 +116,6 @@ async function told(act: () => Promise<unknown>): Promise<void> {
     metric("ceiling", { outcome: "error", reason: "notice" });
     console.warn("files host: the consequence of a ceiling refusal failed");
   }
-}
-
-/** The link's bytes ran out: pause it, and tell the owner when that is what paused it. */
-async function pauseForCeiling(source: ServiceDeps, linkId: string): Promise<void> {
-  const changed = await pauseLinks(source.db, { linkId }, "ceiling");
-  if (changed.some((change) => change.newlyPaused)) await notifyLinkPausedOnce(source, linkId, "ceiling");
 }
 
 /**
@@ -156,8 +153,8 @@ export async function settleServe(source: ServiceDeps, charge: ServeCharge, sent
  * The "link paused" mail to the link's owner, at most once per link per UTC day: claims the
  * day's stamp atomically (two concurrent calls → one claim) and queues the mail only when it won.
  * True when a mail was queued. `reason` is why the link was paused; the stamp is one per link
- * whatever the reason. Takes `ServiceDeps`, so the task that pauses a link where its download
- * URL is minted calls this same function.
+ * whatever the reason. Takes `ServiceDeps`: it is for the code that really pauses a link (a
+ * report, an admin, the deletion window). A full ledger is not a pause — see the header.
  */
 export async function notifyLinkPausedOnce(
   source: ServiceDeps,
@@ -177,24 +174,48 @@ export async function notifyLinkPausedOnce(
 }
 
 /**
- * The "your links reached today's transfer limit" mail, once per owner per UTC day. The claim is
- * a marker row in the daily ledger under the subject `notice` — never among the `link_owner` rows
- * a byte total is summed from — added only if none exists for that day. True when a mail was
- * queued. `at` decides which day it is (the request's clock; real time by default).
+ * Claims a once-a-day notice: a marker row in the daily ledger under the subject `notice` — never
+ * among the rows a byte total is summed from — added only if none exists for that day. One
+ * statement, so of any number of concurrent calls exactly one wins.
+ */
+function claimNotice(source: ServiceDeps, key: string, at: Date): Promise<boolean> {
+  return addUsageIfUnder(source.db, utcDay(at), "notice", key, { bytes: 0, count: 1 }, { count: 1 });
+}
+
+/**
+ * The "this link reached today's limit — it comes back on its own" mail to the link's owner,
+ * once per link per UTC day, whichever limit of the link was reached: this host calls it when the
+ * link's BYTES run out, the mint when its download COUNT does — together they send one mail.
+ * True when a mail was queued. `at` decides which day it is (real time by default).
+ */
+export async function notifyLinkLimitOnce(
+  source: ServiceDeps,
+  linkId: string,
+  at: Date = new Date(),
+): Promise<boolean> {
+  const link = await linkById(source.db, linkId);
+  if (!link) return false;
+  if (!(await claimNotice(source, `download_link:${link.id}`, at))) return false;
+  const [owner, node] = await Promise.all([
+    accountOf(source.db, link.createdBy),
+    getNode(source.db, link.nodeId),
+  ]);
+  if (!owner || !node) return false;
+  source.defer(sendLinkLimitReached(source, { to: owner.email, name: owner.name, itemName: node.name }));
+  return true;
+}
+
+/**
+ * The "your links reached today's transfer limit" mail, once per owner per UTC day (the marker is
+ * never among the `link_owner` rows a byte total is summed from). True when a mail was queued.
+ * `at` decides which day it is (the request's clock; real time by default).
  */
 export async function notifyOwnerLinkCapOnce(
   source: ServiceDeps,
   ownerId: string,
   at: Date = new Date(),
 ): Promise<boolean> {
-  const won = await addUsageIfUnder(
-    source.db,
-    utcDay(at),
-    "notice",
-    `download_owner:${ownerId}`,
-    { bytes: 0, count: 1 },
-    { count: 1 },
-  );
+  const won = await claimNotice(source, `download_owner:${ownerId}`, at);
   if (!won) return false;
   const owner = await accountOf(source.db, ownerId);
   if (!owner) return false;

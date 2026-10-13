@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { addUsage, utcDay } from "../../../src/worker/db/queries/ledger";
 import { auditLog, downloadLedger } from "../../../src/worker/db/schema";
 import {
+  notifyLinkLimitOnce,
   notifyLinkPausedOnce,
   notifyOwnerLinkCapOnce,
   settleServe,
@@ -232,39 +233,74 @@ describe("gate 5 — the ceilings are consumed atomically, the address first", (
       expect(answer.bytes.byteLength).toBe(MESSAGES.ceiling_exceeded.length);
       expect(spy.cancelled, limit).toBe(1);
       expect((await accessLog(link.id)).map((row) => row.outcome)).toEqual(["denied_cap"]);
+      expect((await linkById(link.id)).pauseReasons, limit).toEqual([]);
     }
   });
 });
 
-describe("a link's own ceiling: the link is paused and its owner told once", () => {
-  it("429, the link paused with `ceiling`, exactly one mail on the transition; after that the link answers 423", async () => {
+describe("a link's own ceiling: a 429 while its ledger is full, one mail that day — and never a pause", () => {
+  it("five downloads opened and never read fill the link; the sixth is 429; when the five are given up the NEXT request is served — the link was never paused, and its owner got one mail", async () => {
+    const { owner, node, link } = await world();
+    const url = await urlFor("download", node, { link });
+    const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE * 5 });
+    const held = [];
+    for (let i = 0; i < 5; i++) held.push(await open(url, limits));
+    expect(held.map((one) => one.response.status)).toEqual([200, 200, 200, 200, 200]);
+    const refused = await ask(url, limits);
+    expect(refused.status).toBe(429);
+    expect(refused.text).toBe(MESSAGES.ceiling_exceeded);
+    expect(Number(refused.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect((await linkById(link.id)).pauseReasons).toEqual([]);
+    expect(await ledgerBytes("link", link.id)).toBe(SIZE * 5);
+    // Still full: refused again, and no second mail.
+    expect((await ask(url, limits)).status).toBe(429);
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
+    expect(mailTo(owner.email, "linkLimitReached")[0]?.text).toMatch(/“p.png”/);
+    expect(mailTo(owner.email, "linkLimitReached")[0]?.text).not.toMatch(/paused/i);
+
+    for (const one of held) {
+      await one.response.body!.cancel();
+      await one.ctx.settle();
+    }
+    expect(await ledgerBytes("link", link.id)).toBe(0);
+    const next = await ask(url, limits);
+    expect(next.status).toBe(200);
+    expect(next.bytes).toHaveLength(SIZE);
+    const row = await linkById(link.id);
+    expect(row.pauseReasons).toEqual([]);
+    expect(row.pausedAt).toBeNull();
+    expect(row.lastPauseEmailAt).toBeNull();
+    expect(row.bytesServed).toBe(SIZE);
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
+    expect(mailTo(owner.email, "linkPaused")).toEqual([]);
+    // The two refused requests each left the owner's cap charged (it is consumed before the
+    // link's): that reservation of bytes never sent is what the task's rule keeps.
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 3);
+    expect((await accessLog(link.id)).map((entry) => entry.outcome)).toEqual(["denied_cap", "denied_cap"]);
+  });
+
+  it("a link really used up answers 429 until the day rolls over, without a pause; a link paused for another reason still answers 423 and is not touched", async () => {
     const { owner, node, link } = await world();
     const url = await urlFor("download", node, { link });
     const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE + 500 });
     expect((await ask(url, limits)).status).toBe(200);
-    const refused = await ask(url, limits);
-    expect(refused.status).toBe(429);
-    expect(refused.text).toBe(MESSAGES.ceiling_exceeded);
-    const paused = await linkById(link.id);
-    expect(paused.pauseReasons).toEqual(["ceiling"]);
-    expect(paused.pausedAt).not.toBeNull();
-    expect(paused.lastPauseEmailAt).not.toBeNull();
-    expect(mailTo(owner.email, "linkPaused")).toHaveLength(1);
-    // The owner's cap was charged before the link refused, and that charge stays.
-    expect(await ledgerBytes("link", link.id)).toBe(SIZE);
-    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 2);
+    for (let i = 0; i < 5; i++) expect((await ask(url, limits)).status).toBe(429);
+    expect((await linkById(link.id)).pauseReasons).toEqual([]);
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
+    // What still fits is served: the refusal is the ledger, not a switch.
+    expect((await ask(url, { ...limits, headers: { range: "bytes=0-99" } })).status).toBe(206);
+    // Tomorrow's ledger is empty.
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    expect((await ask(url, { ...limits, now: tomorrow })).status).toBe(200);
 
-    for (let i = 0; i < 5; i++) {
-      const answer = await ask(url, limits);
-      expect(answer.status).toBe(423);
-      expect(answer.text).toBe(MESSAGES.link_paused);
-    }
-    expect(mailTo(owner.email, "linkPaused")).toHaveLength(1);
-    // A paused link charges nobody: the owner's ledger did not move again.
-    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 2);
+    await updateLink(link.id, { pauseReasons: ["report"], pausedAt: new Date() });
+    const paused = await ask(url, limits);
+    expect(paused.status).toBe(423);
+    expect(paused.text).toBe(MESSAGES.link_paused);
+    expect((await linkById(link.id)).pauseReasons).toEqual(["report"]);
   });
 
-  it("a link that was already paused for another reason gets `ceiling` added and no mail (it is no transition)", async () => {
+  it("a pause that arrives while a request is being refused for the ceiling is left as it is: nothing is added to the link's reasons", async () => {
     const { owner, node, link } = await world();
     const url = await urlFor("download", node, { link });
     const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE - 1 });
@@ -276,8 +312,50 @@ describe("a link's own ceiling: the link is paused and its owner told once", () 
       }) as R2Bucket["get"],
     });
     expect((await ask(url, { ...limits, env: { FILES: racing.bucket } })).status).toBe(429);
-    expect((await linkById(link.id)).pauseReasons).toEqual(["report", "ceiling"]);
+    expect((await linkById(link.id)).pauseReasons).toEqual(["report"]);
     expect(mailTo(owner.email, "linkPaused")).toEqual([]);
+  });
+
+  it("notifyLinkLimitOnce: once per link per UTC day — twenty at once, one mail; another link of the owner has its own; true again the next day; nothing for a link that does not exist", async () => {
+    const { owner, node, link } = await world();
+    const second = await linkOn(node.id, owner.id);
+    const { deps, settle } = serviceDeps();
+    const won = await Promise.all(Array.from({ length: 20 }, () => notifyLinkLimitOnce(deps, link.id)));
+    expect(won.filter(Boolean)).toHaveLength(1);
+    expect(await notifyLinkLimitOnce(deps, link.id)).toBe(false);
+    expect(await notifyLinkLimitOnce(deps, second.id)).toBe(true);
+    await settle();
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(2);
+    expect(await ledgerRow("notice", `download_link:${link.id}`)).toEqual({ bytes: 0, count: 1 });
+    // The marker is no part of the link's own ledger.
+    expect(await ledgerRow("link", link.id)).toBeNull();
+    expect(await notifyLinkLimitOnce(deps, link.id, new Date(Date.now() + 86_400_000))).toBe(true);
+    expect(await notifyLinkLimitOnce(deps, link.id, new Date(Date.now() + 86_400_000))).toBe(false);
+    expect(await notifyLinkLimitOnce(deps, crypto.randomUUID())).toBe(false);
+    expect(await notifyLinkLimitOnce(deps, "not-an-id")).toBe(false);
+    expect(await ledgerRow("notice", "download_link:not-an-id")).toBeNull();
+  });
+
+  it("a link at its limit and an owner at their cap each mail once: two different mails", async () => {
+    const { owner, node, link } = await world();
+    const other = await storedFile(owner.id, { content: pattern(SIZE, 7) });
+    const otherLink = await linkOn(other.node.id, owner.id);
+    const url = await urlFor("download", node, { link });
+    // The link takes one file a day; the owner's links together two.
+    const limits = ceilings({ CEIL_LINK_BYTES_DAY: SIZE + 100, CEIL_OWNER_LINK_BYTES_DAY: SIZE * 2 + 100 });
+    expect((await ask(url, limits)).status).toBe(200);
+    // Refused by the LINK: the owner's cap had room (and was charged for it).
+    expect((await ask(url, limits)).status).toBe(429);
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
+    expect(mailTo(owner.email, "linkCapReached")).toEqual([]);
+    // Now the owner's cap is full: every link of theirs is refused by it, the other one too.
+    for (let i = 0; i < 3; i++) {
+      expect((await ask(url, limits)).status).toBe(429);
+      expect((await ask(await urlFor("download", other.node, { link: otherLink }), limits)).status).toBe(429);
+    }
+    expect(mailTo(owner.email, "linkLimitReached")).toHaveLength(1);
+    expect(mailTo(owner.email, "linkCapReached")).toHaveLength(1);
+    for (const one of [link, otherLink]) expect((await linkById(one.id)).pauseReasons).toEqual([]);
   });
 
   it("notifyLinkPausedOnce: true and one mail the first time that day; false after, whatever the reason; one winner of two at once; true again the next UTC day — with a bare ServiceDeps", async () => {
