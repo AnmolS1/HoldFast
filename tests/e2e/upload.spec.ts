@@ -78,7 +78,8 @@ interface PutSeen {
   contentLength: string | undefined;
 }
 
-type Answer = { status: number; json: unknown };
+/** `lost`: the server does the work and its answer never arrives. */
+type Answer = { status: number; json: unknown } | "lost";
 
 interface UploadApi {
   /** The part size init hands out (the client must follow it, whatever it is). */
@@ -115,6 +116,8 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
   let created = 0;
   let landedBytes = 0;
   const landed = new Map<string, { name: string; polls: number }>();
+  /** Sessions that are done, with the node they became: a repeated complete answers it again. */
+  const done = new Map<string, unknown>();
   const api: UploadApi = {
     partBytes: PART,
     sessions: new Map(),
@@ -178,7 +181,7 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
         const body = request.postDataJSON() as InitBody;
         api.inits.push(body);
         const custom = api.onInit?.(body, api.inits.length);
-        if (custom) return await answer(route, custom.status, custom.json);
+        if (custom && custom !== "lost") return await answer(route, custom.status, custom.json);
         // The resume lookup comes first: the same file for the same place is the same session.
         let session = Array.from(api.sessions.values()).find(
           (s) =>
@@ -233,12 +236,14 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
       }
       const complete = /^\/api\/uploads\/([^/]+)\/complete$/.exec(path);
       if (method === "POST" && complete) {
+        const sent = request.postDataJSON() as { sha256: string; parts: Array<{ n: number; etag: string }> };
+        api.completes.push({ uploadId: complete[1]!, ...sent });
+        // A complete on a session that is done answers the same node again.
+        if (done.has(complete[1]!)) return await answer(route, 200, done.get(complete[1]!));
         const session = api.sessions.get(complete[1]!);
         if (!session) return await answer(route, 404, errorBody("not_found", "Not found."));
-        const sent = request.postDataJSON() as { sha256: string; parts: Array<{ n: number; etag: string }> };
-        api.completes.push({ uploadId: session.uploadId, ...sent });
         const custom = api.onComplete?.(api.completes.length);
-        if (custom) {
+        if (custom && custom !== "lost") {
           if (custom.status === 403) api.sessions.delete(session.uploadId);
           return await answer(route, custom.status, custom.json);
         }
@@ -246,18 +251,17 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
         landedBytes += session.body.size;
         const id = rowId(0x6000 + api.completes.length);
         landed.set(id, { name: session.finalName, polls: 0 });
-        return await answer(
-          route,
-          200,
-          nodeDto({
-            id,
-            name: session.finalName,
-            parentId: session.body.parentId,
-            size: session.body.size,
-            sha256: sent.sha256,
-            scanStatus: api.scan === "clean" ? "clean" : "pending",
-          }),
-        );
+        const node = nodeDto({
+          id,
+          name: session.finalName,
+          parentId: session.body.parentId,
+          size: session.body.size,
+          sha256: sent.sha256,
+          scanStatus: api.scan === "clean" ? "clean" : "pending",
+        });
+        done.set(session.uploadId, node);
+        if (custom === "lost") return await route.abort("connectionreset");
+        return await answer(route, 200, node);
       }
       const session = /^\/api\/uploads\/([^/]+)$/.exec(path);
       if (method === "DELETE" && session) {
@@ -470,6 +474,48 @@ test.describe("uploads (mocked API)", () => {
       Array.from({ length: partCount }, (_, i) => i + 1),
     );
     expect(api.completes[0]!.sha256).toBe(sha256File(files.png));
+  });
+
+  test("the answer to complete is lost: it is asked again, the file is announced once and nothing is uploaded twice", async ({
+    page,
+    origins,
+  }) => {
+    const api = await mockUploadApi(page, origins.port);
+    api.onComplete = (nth) => (nth === 1 ? "lost" : undefined);
+    await openUploads(page);
+    const puts = watchPuts(page);
+    await filesInput(page).setInputFiles(files.text);
+    await expect.poll(() => api.completes.length).toBe(2);
+    await expect(ribbon(page)).toHaveAttribute("data-transfer-ribbon", "idle");
+    expect(api.completes[1]).toEqual(api.completes[0]);
+    expect(api.inits.length).toBe(1);
+    expect(puts).toEqual(["single"]);
+    await expect(live(page).getByText("hello.txt uploaded")).toHaveCount(1);
+    await expect(live(page)).not.toContainText("didn't finish");
+  });
+
+  test("while complete is on its way the row offers no Pause and no Cancel, and says why", async ({
+    page,
+    origins,
+  }) => {
+    const api = await mockUploadApi(page, origins.port);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route("**/api/uploads/*/complete", async (route) => {
+      await held;
+      await route.fallback();
+    });
+    await openUploads(page);
+    await filesInput(page).setInputFiles(files.text);
+    const panel = await openPanel(page);
+    const finishing = row(page, "hello.txt");
+    await expect(finishing).toHaveAttribute("data-upload-row", "completing");
+    await expect(finishing).toContainText("Finishing — this can no longer be paused or cancelled");
+    await expect(finishing.getByRole("button")).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: "Pause all" })).toHaveCount(0);
+    release();
+    await expect.poll(() => api.completes.length).toBe(1);
+    await expect(ribbon(page)).toHaveAttribute("data-transfer-ribbon", "idle");
   });
 
   test("cancel: the session is aborted and the usage is back at its starting value", async ({
