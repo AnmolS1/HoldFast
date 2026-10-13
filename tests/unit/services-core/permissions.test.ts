@@ -3,7 +3,7 @@
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { statementsSent } from "../../../src/worker/db/client";
-import { nodes, shares, user as userTable } from "../../../src/worker/db/schema";
+import { auditLog, nodes, shares, user as userTable } from "../../../src/worker/db/schema";
 import {
   assertContentAccess,
   assertNotTrashed,
@@ -300,6 +300,129 @@ describe("link scope", () => {
       return { before: before?.via, after: await getAccess(c, t.secret.id) };
     });
     expect(seen).toEqual({ before: "owner", after: null });
+  });
+});
+
+describe("a node that listings hide does not exist here either", () => {
+  /** The tree, with the shared file hidden one of the two ways. */
+  async function hidden(how: "taken_down" | "suspected_csam") {
+    const t = await tree();
+    await testDb()
+      .update(nodes)
+      .set(
+        how === "taken_down"
+          ? { takedownAt: new Date(), takedownReason: "dmca" }
+          : { scanStatus: "suspected_csam", legalHold: true },
+      )
+      .where(eq(nodes.id, t.file.id));
+    return t;
+  }
+  const shape = (answer: Awaited<ReturnType<typeof invoke>>) =>
+    answer.ok
+      ? "ok"
+      : {
+          status: answer.status,
+          error: answer.error,
+          message: answer.message,
+          details: answer.details ?? null,
+        };
+  const auditsAbout = async (id: string) =>
+    (await testDb().select().from(auditLog).where(eq(auditLog.targetId, id))).length;
+
+  it.each(["taken_down", "suspected_csam"] as const)(
+    "%s: owner, editor and viewer get the very 404 an unknown id gets — for every question",
+    async (how) => {
+      const t = await hidden(how);
+      const unknown = crypto.randomUUID();
+      const reference = shape(await invoke(t.owner, (c) => requireRole(c, unknown, "viewer")));
+      expect(reference).toEqual({ status: 404, error: "not_found", message: "Not found.", details: null });
+      const points: { blobs: string[] }[] = [];
+      const options = {
+        env: { METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) } },
+      };
+
+      for (const caller of [t.owner, t.editor, t.editorNoUpload, t.viewer, t.stranger, null]) {
+        for (const min of ["viewer", "editor", "owner"] as const) {
+          expect(shape(await invoke(caller, (c) => requireRole(c, t.file.id, min), options))).toEqual(
+            reference,
+          );
+        }
+        expect(await value(caller, (c) => getAccess(c, t.file.id))).toBeNull();
+      }
+      // Nothing recorded tells the two apart either: no audit row about the node, and the same
+      // metrics for the hidden id as for the unknown one.
+      expect(await auditsAbout(t.file.id)).toBe(0);
+      const forHidden = points.map((point) => point.blobs.join("|"));
+      points.length = 0;
+      for (const min of ["viewer", "editor", "owner"] as const) {
+        await invoke(t.owner, (c) => requireRole(c, unknown, min), options);
+      }
+      const perCall = forHidden.length / 18;
+      expect(points.map((point) => point.blobs.join("|"))).toEqual(forHidden.slice(0, 3 * perCall));
+
+      // The control: the same people still reach the folder the file is in, and a sibling.
+      const sibling = await makeFile(t.ids.owner, t.inner.id, { scanStatus: "clean" });
+      expect((await value(t.owner, (c) => getAccess(c, t.inner.id)))?.role).toBe("owner");
+      expect((await value(t.viewer, (c) => getAccess(c, sibling.id)))?.role).toBe("viewer");
+    },
+  );
+
+  it("a hidden FOLDER is not a place to upload into, and is hidden behind a link as well", async () => {
+    const t = await tree();
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "abuse" })
+      .where(eq(nodes.id, t.inner.id));
+    expect(await outcome(t.owner, (c) => requireUpload(c, t.inner.id))).toBe("404 not_found");
+    expect(await outcome(t.editor, (c) => requireUpload(c, t.inner.id))).toBe("404 not_found");
+    const viaLink = await value(null, async (c) => {
+      withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t.shared.id });
+      return { folder: await getAccess(c, t.inner.id), root: await getAccess(c, t.shared.id) };
+    });
+    expect(viaLink.folder).toBeNull();
+    expect(viaLink.root?.via).toBe("link");
+    // A link whose own root is hidden shows nothing.
+    const t2 = await hidden("suspected_csam");
+    const rooted = await value(null, async (c) => {
+      withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t2.file.id });
+      return getAccess(c, t2.file.id);
+    });
+    expect(rooted).toBeNull();
+  });
+
+  it("includeHidden — the admin routes' option — sees the node; the two answers are cached apart", async () => {
+    for (const how of ["taken_down", "suspected_csam"] as const) {
+      const t = await hidden(how);
+      const seen = await value(t.owner, async (c) => ({
+        byDefault: await getAccess(c, t.file.id),
+        asAdminRoute: await getAccess(c, t.file.id, { includeHidden: true }),
+        byDefaultAgain: await getAccess(c, t.file.id),
+        required: await requireRole(c, t.file.id, "owner", { includeHidden: true }),
+      }));
+      expect(seen.byDefault, how).toBeNull();
+      expect(seen.asAdminRoute, how).toMatchObject({ role: "owner", via: "owner" });
+      expect(seen.byDefaultAgain, how).toBeNull();
+      expect(seen.required, how).toMatchObject({ role: "owner" });
+      // The option shows hidden nodes; it grants nothing to someone with no role.
+      expect(await value(t.stranger, (c) => getAccess(c, t.file.id, { includeHidden: true }))).toBeNull();
+      expect(
+        await outcome(t.stranger, (c) => requireRole(c, t.file.id, "viewer", { includeHidden: true })),
+      ).toBe("404 not_found");
+    }
+  });
+
+  it("the other scan states and the trash are not 'hidden': the role still answers", async () => {
+    const t = await tree();
+    for (const scanStatus of ["pending", "infected", "under_review", "skipped", "error"] as const) {
+      await testDb().update(nodes).set({ scanStatus }).where(eq(nodes.id, t.file.id));
+      expect((await value(t.owner, (c) => getAccess(c, t.file.id)))?.role, scanStatus).toBe("owner");
+    }
+    await testDb()
+      .update(nodes)
+      .set({ deletedAt: new Date(), trashedRoot: true })
+      .where(eq(nodes.id, t.file.id));
+    expect((await value(t.owner, (c) => getAccess(c, t.file.id)))?.role).toBe("owner");
+    expect(await outcome(t.owner, (c) => assertNotTrashed(c, t.file.id))).toBe("404 not_found");
   });
 });
 

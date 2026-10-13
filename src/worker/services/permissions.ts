@@ -11,8 +11,20 @@
 //
 // Built on the tree query `effectiveAccess`: ownership, or an ACTIVATED share on the node or an
 // ancestor (the highest role wins) — which already answers "no access" for anyone but the owner
-// when the owner is banned, suspended or scheduled for deletion. Trash, takedown and scan state
-// are NOT part of a role: callers check those separately (`assertNotTrashed`, the scan gates).
+// when the owner is banned, suspended or scheduled for deletion.
+//
+// A NODE THAT LISTINGS HIDE DOES NOT EXIST HERE EITHER. A node that is taken down, or locked as
+// `suspected_csam`, is `not_found` for everyone — its owner included — exactly as an id that was
+// never issued: the same error, thrown the same way, no detail, no audit row, no metric. That an
+// account holder cannot observe either state is a property of this file, not of each route.
+// The one way to see such a node is the explicit option `{ includeHidden: true }`, which ONLY
+// ADMIN ROUTES pass (grep for `includeHidden`). The exports that take it: `getAccess` and
+// `requireRole`. `requireUpload` never does (nobody uploads into a hidden folder), nor does the
+// link scope's answer change with it being absent: a hidden node is hidden behind a link too.
+//
+// Trash and the other scan states are NOT part of a role: callers check those separately
+// (`assertNotTrashed`, the scan gates). A trashed node still exists for its owner (it can be
+// restored); a hidden one does not.
 //
 // REQUEST-ONLY. These functions take the Hono context: they are called from request handlers
 // only (no job or queue consumer decides access), and the answers are cached for the request.
@@ -25,6 +37,7 @@
 // writes that depend on it re-check under their own lock (the tree queries, the upload claim).
 
 import type { Context } from "hono";
+import { getNode } from "../db/queries/nodes";
 import { effectiveAccess, effectiveTrashed, isDescendantOrSelf } from "../db/queries/tree";
 import { forbidImpersonation } from "../middleware/impersonation";
 import { AppError } from "./errors";
@@ -42,6 +55,12 @@ export interface Access {
 }
 
 export type LinkScope = { linkId: string; rootNodeId: string };
+
+/**
+ * `includeHidden: true` — FOR ADMIN ROUTES ONLY — also answers for a node that is taken down or
+ * locked as `suspected_csam`. Without it such a node is `not_found`, like an unknown id.
+ */
+export type AccessOptions = { includeHidden?: true };
 
 const RANK: Record<Role, number> = { viewer: 1, editor: 2, owner: 3 };
 
@@ -70,10 +89,25 @@ export function withLinkScope(c: Context<AppEnv>, scope: LinkScope): void {
   state.cache.clear();
 }
 
-/** The caller's access to a node, or null: no access, or no such node — never told apart. */
-export async function getAccess(c: Context<AppEnv>, nodeId: string): Promise<Access | null> {
+/** True for a node no non-admin may learn exists: taken down, or locked as suspected CSAM. */
+async function isHidden(c: Context<AppEnv>, nodeId: string): Promise<boolean> {
+  const node = await getNode(db(c), nodeId);
+  return !node || node.takedownAt !== null || node.scanStatus === "suspected_csam";
+}
+
+/**
+ * The caller's access to a node, or null: no access, no such node, or a node that is hidden
+ * (taken down, suspected CSAM) — never told apart. `{ includeHidden: true }` is for admin routes.
+ */
+export async function getAccess(
+  c: Context<AppEnv>,
+  nodeId: string,
+  opts: AccessOptions = {},
+): Promise<Access | null> {
   const state = stateOf(c);
-  if (state.cache.has(nodeId)) return state.cache.get(nodeId) ?? null;
+  const includeHidden = opts.includeHidden === true;
+  const cacheKey = `${includeHidden ? "all" : "visible"}:${nodeId}`;
+  if (state.cache.has(cacheKey)) return state.cache.get(cacheKey) ?? null;
 
   let access: Access | null = null;
   if (state.link) {
@@ -86,13 +120,24 @@ export async function getAccess(c: Context<AppEnv>, nodeId: string): Promise<Acc
     const found = user ? await effectiveAccess(db(c), user.id, nodeId) : null;
     if (found) access = { ...found, via: found.role === "owner" ? "owner" : "share" };
   }
-  state.cache.set(nodeId, access);
+  // Asked only for a node the caller could otherwise reach: the answer for everyone else is
+  // already "nothing", and it must stay exactly that.
+  if (access && !includeHidden && (await isHidden(c, nodeId))) access = null;
+  state.cache.set(cacheKey, access);
   return access;
 }
 
-/** The access, when it is at least `min`. None → `404 not_found`; too low → `403 forbidden`. */
-export async function requireRole(c: Context<AppEnv>, nodeId: string, min: Role): Promise<Access> {
-  const access = await getAccess(c, nodeId);
+/**
+ * The access, when it is at least `min`. None — also a hidden node — → `404 not_found`; too low
+ * → `403 forbidden`. `{ includeHidden: true }` is for admin routes.
+ */
+export async function requireRole(
+  c: Context<AppEnv>,
+  nodeId: string,
+  min: Role,
+  opts: AccessOptions = {},
+): Promise<Access> {
+  const access = await getAccess(c, nodeId, opts);
   if (!access) throw new AppError("not_found");
   if (RANK[access.role] < RANK[min]) throw new AppError("forbidden", undefined, { reason: "role" });
   return access;
@@ -115,7 +160,10 @@ export async function requireUpload(c: Context<AppEnv>, parentId: string | null)
   return access;
 }
 
-/** `404 not_found` for a node that is in the trash, itself or by an ancestor — or does not exist. */
+/**
+ * `404 not_found` for a node that is in the trash, itself or by an ancestor — or does not exist.
+ * A separate question from visibility: it says nothing about takedown or scan state.
+ */
 export async function assertNotTrashed(c: Context<AppEnv>, nodeId: string): Promise<void> {
   if (await effectiveTrashed(db(c), nodeId)) throw new AppError("not_found");
 }
