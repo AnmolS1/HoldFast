@@ -7,6 +7,7 @@ import Typography from "@mui/material/Typography";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useSearchParams } from "react-router";
+import { NodeId } from "../../../shared/schemas/common";
 import { EmptyState } from "../../components/EmptyState";
 import { ApiError } from "../../lib/api";
 import { formatBytes } from "../../lib/format";
@@ -20,7 +21,9 @@ import { t } from "./strings";
 
 export function UploadsPage() {
   const [search] = useSearchParams();
-  const parentId = search.get("parent") || null;
+  // The same rule as everywhere: only a well-formed id is a folder; anything else is the top level.
+  const asked = search.get("parent");
+  const parentId = asked !== null && NodeId.safeParse(asked).success ? asked : null;
   const config = usePublicConfig().data;
   const usage = useQuery({ queryKey: ["upload", "usage"], queryFn: ({ signal }) => getUsage(signal) });
   const off = config ? !config.uploadsEnabled || config.readOnly : false;

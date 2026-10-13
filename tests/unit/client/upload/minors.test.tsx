@@ -198,13 +198,13 @@ describe("a row on the device has an end", () => {
     expect(await readResumeRows()).toEqual([]);
   });
 
-  it("a row that came from the server under the session's final name is taken over by the upload that finds that session", async () => {
-    // "Keep both" made the session "report (1).pdf"; the file on disk is still "report.pdf".
-    const session = uploadSession({ uploadId: rowId(0xc7), name: "report (1).pdf", size: 400 });
+  it("an open session is listed under the name that was asked for: the file selected again is that one row, not a second", async () => {
+    // "Keep both" stored it as "report (1).pdf"; the session's name is still what init asked for.
+    const session = uploadSession({ uploadId: rowId(0xc7), name: "report.pdf", size: 400 });
     server.onJson = (call) =>
       call.path === "/api/uploads/open" ? json(openUploadsResponse([session])) : undefined;
     await restoreUploads({ server: true });
-    expect(items().map((item) => item.name)).toEqual(["report (1).pdf"]);
+    expect(items().map((item) => item.name)).toEqual(["report.pdf"]);
 
     server.hold = true;
     server.partBytes = 100;
@@ -212,11 +212,18 @@ describe("a row on the device has an end", () => {
       json(initResponse(body.size, { uploadId: rowId(0xc7), partBytes: 100, finalName: "report (1).pdf" }));
     await addFiles([{ file: bigFile("report.pdf", 400, Date.parse(AT)) }], null);
     await settle();
-    // One row for one session — the waiting one is gone, on the device too.
     expect(items().map((item) => [item.name, item.file !== null, item.uploadId])).toEqual([
       ["report.pdf", true, rowId(0xc7)],
     ]);
     expect((await readResumeRows()).map((kept) => kept.uploadId)).toEqual([rowId(0xc7)]);
+  });
+
+  it("a row waiting for its file is titled with the name the user has on disk, not the stored one", async () => {
+    await saveResumeRow(row({ finalName: "video (1).mp4" }));
+    renderShell(<UploadPanel />);
+    await act(() => restoreUploads());
+    expect(screen.getByText("Select video.mp4 again to resume")).toBeTruthy();
+    expect(document.querySelector("[data-upload-row]")!.getAttribute("data-upload-name")).toBe("video.mp4");
   });
 
   it("after an account change without a reload, the next account's own rows are restored by the host", async () => {

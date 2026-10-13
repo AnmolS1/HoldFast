@@ -26,7 +26,14 @@ export const COMPLETE_WAIT_LIMIT_MS = 120_000;
  * many files wait, each file for at most `SCAN_FOLLOW_LIMIT_MS`.
  */
 export const SCAN_INTERVAL_MS = 1_000;
+/** One file is asked about again after these waits (the last repeats): a stuck file costs little. */
+export const SCAN_FILE_WAIT_MS = [1_000, 1_000, 2_000, 2_000, 3_000, 5_000] as const;
+/**
+ * A file is given up ("still being checked") once it has waited this long AND has been asked
+ * about at least `SCAN_MIN_ASKS` times — so in a long queue no file is given up unasked.
+ */
 export const SCAN_FOLLOW_LIMIT_MS = 5 * 60_000;
+export const SCAN_MIN_ASKS = 3;
 export const SCAN_BACKOFF_MAX_MS = 60_000;
 
 /** A rate limit pauses the queue for its `Retry-After`: this when none is given, and never longer than the cap. */

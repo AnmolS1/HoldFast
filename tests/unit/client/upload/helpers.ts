@@ -64,7 +64,7 @@ export interface Server {
   scanStatus: "pending" | "clean" | "infected" | "error" | "skipped";
   /** Overrides, asked first; `undefined` falls through to the default answer. */
   onInit?: (body: InitUploadBody, nth: number) => JsonAnswer;
-  onComplete?: (body: CompleteUploadBody, nth: number) => JsonAnswer;
+  onComplete?: (body: CompleteUploadBody, nth: number) => JsonAnswer | Promise<Response>;
   onPut?: (call: PutCall, nth: number) => ApiError | undefined;
   onJson?: (call: MockCall) => JsonAnswer | Promise<Response>;
   /** Hash workers: started, stopped before they finished, running now, and the most at once. */

@@ -2,7 +2,7 @@
 // `File` cannot be kept. A row holds: the queue item's id, the user id, the upload session's id
 // and expiry, the init body as sent (folder id, file name, size, declared type, the file's date,
 // the conflict choice and the replaced file's id), the folder path inside a folder upload and the
-// final name. No bytes, no token. A row goes when its upload lands, is cancelled, removed or
+// final name; and, once `complete` was sent, the digest and part list it was sent with. No bytes, no token. A row goes when its upload lands, is cancelled, removed or
 // refused, when its session is gone or past its expiry, and with the account (the purger). It lives in the browser's database, reached through `idb-keyval` in a
 // store of this feature's own. It belongs to the account: every row carries the user id, and the
 // manager's purger empties it.
@@ -11,7 +11,7 @@
 // DOM) the list is simply empty and nothing is kept.
 import { clear, createStore, del, entries, set, type UseStore } from "idb-keyval";
 import { z } from "zod";
-import { InitUploadBody } from "../../../shared/schemas/upload";
+import { CompleteUploadBody, InitUploadBody } from "../../../shared/schemas/upload";
 
 export const ResumeRow = z.object({
   /** The queue item's id; also the key. */
@@ -24,6 +24,11 @@ export const ResumeRow = z.object({
   finalName: z.string(),
   /** When the server's session ends. A row past it is deleted, wherever it is met. */
   expiresAt: z.iso.datetime(),
+  /**
+   * Set once `complete` has been sent: the body it was sent with. Such a row is no longer an
+   * upload to resume — its file may have landed — but a question to ask the server again.
+   */
+  complete: CompleteUploadBody.optional(),
 });
 export type ResumeRow = z.infer<typeof ResumeRow>;
 

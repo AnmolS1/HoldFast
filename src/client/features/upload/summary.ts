@@ -1,7 +1,7 @@
 // The queue as the transfer ribbon shows it: one fraction, one sentence in user units, one status.
 import type { RibbonState } from "../../components/TransferRibbon";
 import { formatBytes } from "../../lib/format";
-import type { PauseReason, UploadItem, UploadSnapshot } from "./store";
+import { isRestored, type PauseReason, type UploadItem, type UploadSnapshot } from "./store";
 import { t } from "./strings";
 
 /** "40 s", "3 min", "2 h". */
@@ -45,7 +45,7 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
   }
 
   // The batch: every file that is or was on its way. A restored row has no file yet.
-  const batch = items.filter((item) => item.file !== null && item.state !== "cancelled");
+  const batch = items.filter((item) => !isRestored(item) && item.state !== "cancelled");
   const total = batch.length;
   const bytes = batch.reduce((sum, item) => sum + item.size, 0);
   const sent = batch.reduce((sum, item) => sum + Math.min(item.size, item.sentBytes), 0);
@@ -96,7 +96,7 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  const waiting = items.filter((item) => item.file === null && item.state === "paused").length;
+  const waiting = items.filter((item) => isRestored(item) && item.state === "paused").length;
   if (waiting > 0) {
     return {
       progress: 0,
@@ -168,6 +168,10 @@ const PAUSED: Record<PauseReason, Parameters<typeof t>[0]> = {
 
 /** The row's state in words. Null when the scan status says it instead. */
 export function describeItem(item: UploadItem): string | null {
+  if (item.kind === "folder") {
+    if (item.state === "uploading") return t("row.folderCreating");
+    if (item.state === "done") return t("row.folderDone");
+  }
   switch (item.state) {
     case "queued":
       return item.waitingFolder ? t("row.waitingFolder") : t("row.waiting");
@@ -191,7 +195,7 @@ export function describeItem(item: UploadItem): string | null {
     case "cancelled":
       return t("row.cancelled");
     case "paused":
-      if (item.file === null) return t("row.selectAgain", { name: item.name });
+      if (isRestored(item)) return t("row.selectAgain", { name: item.name });
       return t(PAUSED[item.pauseReason ?? "user"]);
     case "conflict":
       return t("row.conflict");
@@ -200,4 +204,42 @@ export function describeItem(item: UploadItem): string | null {
     case "error":
       return item.message ?? t("row.failed");
   }
+}
+
+/**
+ * Which rows the panel draws when the queue is longer than `cap`. Rows in flight and rows that
+ * failed are always drawn — they are the ones a person can act on; then, up to the cap, paused
+ * rows, waiting rows and finished rows, in that order of claim. The queue's own order is kept.
+ */
+export function rowsToDraw(items: readonly UploadItem[], cap: number): UploadItem[] {
+  if (items.length <= cap) return [...items];
+  const rank = (item: UploadItem): number => {
+    switch (item.state) {
+      case "uploading":
+      case "hashing":
+      case "completing":
+      case "scanning":
+      case "error":
+      case "refused":
+      case "conflict":
+        return 0;
+      case "paused":
+        return 1;
+      case "queued":
+        return 2;
+      case "done":
+        return item.scanStatus === null || item.scanStatus === "clean" ? 3 : 0;
+      case "cancelled":
+        return 3;
+    }
+  };
+  const chosen = new Set<string>();
+  for (const item of items) if (rank(item) === 0) chosen.add(item.id);
+  for (let wanted = 1; wanted <= 3 && chosen.size < cap; wanted += 1) {
+    for (const item of items) {
+      if (chosen.size >= cap) break;
+      if (rank(item) === wanted) chosen.add(item.id);
+    }
+  }
+  return items.filter((item) => chosen.has(item.id));
 }

@@ -133,8 +133,8 @@ describe("folder upload", () => {
       expect(item.message).toBe(
         "Couldn't create the folder day1 — something else already has that name. Nothing in it was uploaded.",
       );
-      // Something else has the name now; it may not later: the file can be tried again.
-      expect(item.canRetry).toBe(true);
+      // The answer will be the same next time: no new try is offered.
+      expect(item.canRetry).toBe(false);
     }
     expect(childrenRequests()).toEqual([]);
   });

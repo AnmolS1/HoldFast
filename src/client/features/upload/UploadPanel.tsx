@@ -23,9 +23,9 @@ import {
 } from "./manager";
 import { openPicker } from "./picker";
 import { PANEL_ROWS } from "./plan";
-import { useUploads, type UploadItem } from "./store";
+import { isRestored, useUploads, type UploadItem } from "./store";
 import { t } from "./strings";
-import { describeItem } from "./summary";
+import { describeItem, rowsToDraw } from "./summary";
 
 const touch = `@media ${TOUCH_QUERY}`;
 
@@ -56,8 +56,8 @@ const Row = memo(function Row({ item, onGone }: { item: UploadItem; onGone(): vo
   const pausable =
     !item.completeSent && (item.state === "uploading" || item.state === "hashing" || item.state === "queued");
   const resumable =
-    item.state === "paused" && item.file !== null && item.pauseReason !== null && item.pauseReason !== "auth";
-  const waitsForFile = item.state === "paused" && item.file === null;
+    item.state === "paused" && !isRestored(item) && item.pauseReason !== null && item.pauseReason !== "auth";
+  const waitsForFile = item.state === "paused" && isRestored(item);
   const removable =
     item.state === "error" || item.state === "refused" || waitsForFile || item.state === "done";
   const cancellable = canCancel(item) && item.state !== "error";
@@ -130,7 +130,7 @@ const Row = memo(function Row({ item, onGone }: { item: UploadItem; onGone(): vo
           {pausable ? <Pause size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
         </RowButton>
       ) : null}
-      {item.state === "error" && item.canRetry && item.file !== null ? (
+      {item.state === "error" && item.canRetry && !isRestored(item) ? (
         <RowButton label={t("action.retry", { name })} onClick={() => retryItem(item.id)}>
           <RotateCw size={16} aria-hidden="true" />
         </RowButton>
@@ -178,7 +178,7 @@ export function UploadPanel() {
       (item.state === "queued" || item.state === "uploading" || item.state === "hashing"),
   );
   const anyPausedByHand = items.some(
-    (item) => item.state === "paused" && item.pauseReason === "user" && item.file !== null,
+    (item) => item.state === "paused" && item.pauseReason === "user" && !isRestored(item),
   );
   // A row that goes takes the focus with it: put it on the panel's heading, never on <body>.
   const focusTitle = useCallback(() => title.current?.focus(), []);
@@ -194,8 +194,9 @@ export function UploadPanel() {
       }
     };
   }, []);
-  // A drop of thousands of files is counted, not drawn: the first rows, then one line.
-  const shown = items.length > PANEL_ROWS ? items.slice(0, PANEL_ROWS) : items;
+  // A drop of thousands of files is counted, not drawn — but every row that is moving or has
+  // failed is drawn, wherever it stands in the queue: those are the ones to act on.
+  const shown = rowsToDraw(items, PANEL_ROWS);
   const more = items.length - shown.length;
 
   return (

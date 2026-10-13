@@ -2,7 +2,7 @@
 // `manager.ts` is the only writer; components read it with `useUploads()`.
 import { useSyncExternalStore } from "react";
 import type { ScanReason, ScanStatus } from "../../../shared/schemas/common";
-import type { InitUploadBody, UploadedPart } from "../../../shared/schemas/upload";
+import type { CompleteUploadBody, InitUploadBody, UploadedPart } from "../../../shared/schemas/upload";
 
 /**
  * `refused` is final (blocked content): never retried, never resumable. `conflict` waits for the
@@ -38,6 +38,8 @@ export interface UploadConflict {
 
 export interface UploadItem {
   id: string;
+  /** A file, or a folder of a folder upload that holds no file (it has no bytes, only a name to create). */
+  kind: "file" | "folder";
   /** The `addFiles` call it came in with: its folders and its "do the same for every other". */
   batchId: string;
   /** Null for a row restored after a reload, until the file is selected again. */
@@ -87,8 +89,15 @@ export interface UploadItem {
    * never paused or cancelled, and a new try asks `complete` again before anything else.
    */
   completeSent: boolean;
+  /** The body `complete` was sent with: the same one is asked again, every time. */
+  completeBody: CompleteUploadBody | null;
   /** An `error` that is not a failure: nobody could say whether the file landed. */
   unconfirmed: boolean;
+}
+
+/** A row put back after a reload that still waits for its file to be selected again. */
+export function isRestored(item: UploadItem): boolean {
+  return item.kind === "file" && item.file === null;
 }
 
 export interface Announcement {

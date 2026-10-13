@@ -5,7 +5,7 @@ import { act, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getRibbonSnapshot } from "../../../../src/client/components/TransferRibbon";
 import { UploadDropOverlay } from "../../../../src/client/features/upload";
-import { addFiles } from "../../../../src/client/features/upload/manager";
+import { addFiles, resumeItem } from "../../../../src/client/features/upload/manager";
 import { readResumeRows } from "../../../../src/client/features/upload/resume-list";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
@@ -388,11 +388,12 @@ describe("a page opened offline", () => {
 });
 
 describe("limits and switches", () => {
-  it("429 ceiling_exceeded pauses the queue with its sentence and resumes when Retry-After has passed", async () => {
+  it("429 ceiling_exceeded stops the queue with its sentence until the user resumes it — whatever Retry-After says", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     let over = true;
+    // A zero, as the last second before midnight would give: no clock of the server's starts it again.
     server.onInit = () =>
-      over ? envelope("ceiling_exceeded", 429, undefined, { "retry-after": "3600" }) : undefined;
+      over ? envelope("ceiling_exceeded", 429, undefined, { "retry-after": "0" }) : undefined;
     await addFiles([{ file: smallFile("a.txt") }, { file: smallFile("b.txt") }], null);
     await settle(0);
     expect(items().map((item) => [item.state, item.pauseReason])).toEqual([
@@ -401,10 +402,12 @@ describe("limits and switches", () => {
     ]);
     expect(sentence()).toBe("Daily upload limit reached — resumes after midnight UTC");
     const inits = server.inits.length;
-    await settle(3_599_000);
+    expect(inits).toBeLessThanOrEqual(2);
+    await settle(3_600_000);
     expect(server.inits.length).toBe(inits);
     over = false;
-    await settle(1_000);
+    resumeItem(items()[0]!.id);
+    await settle(0);
     expect(server.completes.length).toBe(2);
   });
 
