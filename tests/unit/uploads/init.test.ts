@@ -60,9 +60,9 @@ describe("who may call", () => {
     // The one admission call, and it is the first statement of its transaction.
     expect(code.match(/enforceUploadCeilings\(/g)).toHaveLength(1);
     expect(code).toMatch(/retryOnDeadlock\(db\(c\), async \(tx\) => \{\s*await enforceUploadCeilings\(/);
-    // The transactions of this route: one plain (an abort), two that are run again on a deadlock.
+    // The transactions of this route: one plain (an abort), three that are run again on a deadlock.
     expect(code.match(/\.transaction\(/g)).toHaveLength(1); // releaseAndAbort
-    expect(code.match(/retryOnDeadlock\(/g)).toHaveLength(2); // the admission, complete
+    expect(code.match(/retryOnDeadlock\(/g)).toHaveLength(3); // the admission, complete, preserved evidence
   });
 });
 
