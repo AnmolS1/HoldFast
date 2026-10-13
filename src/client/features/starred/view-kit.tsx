@@ -3,14 +3,13 @@
 // nodes that Recent, Starred and Search show.
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
-import { Fragment, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { EmptyState } from "../../components/EmptyState";
 import { FileList } from "../../components/FileList";
 import type { FileListItem } from "../../components/types";
 import { ApiError } from "../../lib/api";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { useSession } from "../../lib/query";
 import { MOBILE_QUERY } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { useOpenNode } from "./open-node";
@@ -19,20 +18,11 @@ import {
   isWaitingOffline,
   retryNotBefore,
   useBlockedUntil,
-  type PagedQueryLike,
+  type ListProblem,
   type QueryLike,
 } from "./view-state";
 
 export type ViewName = "trash" | "recent" | "starred" | "search" | "usage";
-
-/**
- * A page's own state (an open dialog, a selection, half-typed text) belongs to the account that
- * made it: when the signed-in account changes without a navigation, the page starts again.
- */
-export function PerAccount({ children }: { children: ReactNode }) {
-  const account = useSession().data?.user.id ?? "";
-  return <Fragment key={account}>{children}</Fragment>;
-}
 
 export function ViewPage({ view, children }: { view: ViewName; children: ReactNode }) {
   return (
@@ -50,15 +40,18 @@ export function ViewPage({ view, children }: { view: ViewName; children: ReactNo
  * button stays off until that time has passed, and says why.
  */
 function RetryButton({
-  query,
+  error,
+  since,
   onRetry,
   variant,
 }: {
-  query: QueryLike;
-  onRetry(): void;
+  error: unknown;
+  since: number;
+  /** `hadFocus`: the button had the keyboard focus when it was pressed. */
+  onRetry(hadFocus: boolean): void;
   variant?: "contained";
 }) {
-  const blocked = useBlockedUntil(retryNotBefore(query.error, query.errorUpdatedAt));
+  const blocked = useBlockedUntil(retryNotBefore(error, since));
   return (
     <Box sx={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
       {blocked ? (
@@ -66,7 +59,11 @@ function RetryButton({
           {t("view.retry.wait")}
         </Box>
       ) : null}
-      <Button variant={variant} onClick={onRetry} disabled={blocked}>
+      <Button
+        variant={variant}
+        onClick={(event) => onRetry(document.activeElement === event.currentTarget)}
+        disabled={blocked}
+      >
         {t("view.error.retry")}
       </Button>
     </Box>
@@ -78,13 +75,15 @@ export interface ViewErrorProps {
   /** What could not be loaded: "Couldn't load the trash". */
   title: string;
   query: QueryLike;
+  /** Read it again (the page's `refresh`: the focus follows when it works). */
+  onRetry(hadFocus: boolean): void;
 }
 
 /**
  * The page has nothing to show: its request failed (say so, show the request id, offer another
  * try) or the browser is offline (say that instead of loading for ever). Never thrown.
  */
-export function ViewError({ view, title, query }: ViewErrorProps) {
+export function ViewError({ view, title, query, onRetry }: ViewErrorProps) {
   const offline = isWaitingOffline(query);
   return (
     <Box
@@ -98,7 +97,14 @@ export function ViewError({ view, title, query }: ViewErrorProps) {
         title={offline ? t("view.offline.title") : title}
         body={offline ? t("view.offline.body") : t("view.error.body")}
         requestId={!offline && query.error instanceof ApiError ? query.error.requestId : undefined}
-        actions={<RetryButton query={query} onRetry={() => void query.refetch()} variant="contained" />}
+        actions={
+          <RetryButton
+            error={offline ? null : query.error}
+            since={query.errorUpdatedAt}
+            onRetry={onRetry}
+            variant="contained"
+          />
+        }
       />
     </Box>
   );
@@ -108,10 +114,9 @@ export function ViewError({ view, title, query }: ViewErrorProps) {
  * Under a list that is showing what it has: the next page, or a refresh, failed. The rows stay;
  * nothing more is asked until "Try again".
  */
-export function ListNotice({ view, query }: { view: ViewName; query: QueryLike | PagedQueryLike }) {
-  if (!query.isError || query.data === undefined) return null;
-  const paged = "isFetchNextPageError" in query && query.isFetchNextPageError ? query : null;
-  const requestId = query.error instanceof ApiError ? query.error.requestId : undefined;
+export function ListNotice({ view, problem }: { view: ViewName; problem: ListProblem | null }) {
+  if (!problem) return null;
+  const requestId = problem.error instanceof ApiError ? problem.error.requestId : undefined;
   return (
     <Box
       role="alert"
@@ -131,7 +136,7 @@ export function ListNotice({ view, query }: { view: ViewName; query: QueryLike |
       }}
     >
       <Box sx={{ flex: "1 1 auto", minWidth: 0 }}>
-        {t(paged ? "view.more.failed" : "view.refresh.failed")}
+        {t(problem.kind === "more" ? "view.more.failed" : "view.refresh.failed")}
         {requestId ? (
           <>
             {" "}
@@ -141,7 +146,7 @@ export function ListNotice({ view, query }: { view: ViewName; query: QueryLike |
           </>
         ) : null}
       </Box>
-      <RetryButton query={query} onRetry={() => void (paged ? paged.fetchNextPage() : query.refetch())} />
+      <RetryButton error={problem.error} since={problem.since} onRetry={problem.retry} />
     </Box>
   );
 }

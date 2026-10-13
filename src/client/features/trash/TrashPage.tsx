@@ -21,14 +21,21 @@ import { emitNodesChanged } from "../../lib/contracts";
 import { formatDate } from "../../lib/format";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { accountEpoch, queryClient, sameAccount, useSession } from "../../lib/query";
+import { accountEpoch, sameAccount, useSession } from "../../lib/query";
 import { shortcutLabel, useShortcut } from "../../lib/shortcuts";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ListNotice, ViewError, ViewPage } from "../starred/view-kit";
-import { canLoadMore, hasFailed, isWaitingOffline, useLoadMore } from "../starred/view-state";
-import { viewKeys } from "../starred/view-queries";
+import { refreshQueries, viewKeys } from "../starred/view-queries";
+import {
+  hasFailed,
+  isWaitingOffline,
+  retryNotBefore,
+  useBlockedUntil,
+  usePagedView,
+} from "../starred/view-state";
 import { EmptyTrashAction } from "./EmptyTrashAction";
+import { usePreConfirmRead } from "./empty-run";
 import { deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
 import { t } from "./strings";
 
@@ -41,6 +48,24 @@ interface MenuTarget {
   item: TrashRow;
   /** The button the menu hangs from, or where the pointer was (context menu). */
   anchor: HTMLElement | { x: number; y: number };
+}
+
+/** A batch that was cut short: what it did, what is left, and until when the API asked for quiet. */
+interface BatchStop {
+  action: "restore" | "delete";
+  done: number;
+  left: number;
+  retryAt: number;
+  requestId: string | undefined;
+}
+
+/**
+ * Does this failure say something about the API rather than about the one item? A `429`, a `5xx`
+ * or no answer at all: the next item would meet the same — the batch stops there. (A `409` or a
+ * `404` is about the item; the batch goes on.)
+ */
+function stopsBatch(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status === 429 || error.status >= 500 || error.status === 0;
 }
 
 function deleteConsequence(items: readonly TrashRow[]): string {
@@ -61,6 +86,12 @@ export function TrashPage() {
   const [deleting, setDeleting] = useState<TrashRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [conflict, setConflict] = useState(false);
+  const [stopped, setStopped] = useState<BatchStop | null>(null);
+  // After a `429` the two actions are not offered again before the time the API named.
+  const batchWait = useBlockedUntil(stopped?.retryAt ?? 0);
+  // The read before "Empty the trash?" is out: nothing else destructive starts meanwhile.
+  const preConfirm = usePreConfirmRead();
+  const blocked = busy || batchWait || preConfirm;
 
   const items = useMemo<TrashRow[]>(
     () =>
@@ -79,20 +110,36 @@ export function TrashPage() {
     setSelection((current) => new Set(Array.from(current).filter((id) => !ids.has(id))));
   };
 
+  const stop = (action: BatchStop["action"], done: number, left: number, error: unknown) =>
+    setStopped({
+      action,
+      done,
+      left,
+      retryAt: retryNotBefore(error, Date.now()),
+      requestId: error instanceof ApiError ? error.requestId : undefined,
+    });
+
+  // Both batches send ONE request at a time, and stop at the first answer that is about the API
+  // (see `stopsBatch`): what is left stays selected, one notice says how far it got, and after
+  // a `429` the actions stay off until the time the API named.
   const restore = async (targets: readonly TrashRow[]) => {
     setMenu(null);
     setConflict(false);
+    setStopped(null);
     setBusy(true);
     let reread = false;
+    let done = 0;
+    let itemFailure: unknown;
     // Whose rows these are. If the account's state is purged while a request is out (sign-out,
     // another account), what comes back is nobody's: nothing is written, said or sent after it.
     const account = accountEpoch();
     try {
-      for (const target of targets) {
+      for (const [index, target] of targets.entries()) {
         if (!sameAccount(account)) return;
         try {
           const restored = await restoreNode(target.id);
           if (!sameAccount(account)) return;
+          done += 1;
           forget(new Set([target.id]));
           toast({ message: t("trash.restored", { name: restored.name }), key: "trash-restored" });
           // Where it came back to: its folder, or the top level (`null`).
@@ -101,33 +148,46 @@ export function TrashPage() {
           if (!sameAccount(account)) return;
           // One sentence for every refusal: the API gives no reason and none is guessed.
           if (error instanceof ApiError && error.status === 409) setConflict(true);
-          else {
-            toastApiError(error);
-            // Whatever else went wrong, the row may no longer be what the server has (purged
-            // in another tab, restored elsewhere): read the trash again.
+          else if (stopsBatch(error)) {
+            stop("restore", done, targets.length - index, error);
+            break;
+          } else {
+            itemFailure ??= error;
+            // The row may no longer be what the server has (purged in another tab, restored
+            // elsewhere): read the trash again.
             reread = true;
           }
         }
       }
     } finally {
       setBusy(false);
-      if (reread && sameAccount(account)) void queryClient.invalidateQueries({ queryKey: viewKeys.trash });
+      if (sameAccount(account)) {
+        // One toast for the batch, never one per item.
+        if (itemFailure !== undefined) toastApiError(itemFailure);
+        if (reread) void refreshQueries(viewKeys.trash);
+      }
     }
   };
 
   const purge = async (targets: readonly TrashRow[]) => {
+    setStopped(null);
     setBusy(true);
     const gone = new Set<string>();
-    let failure: unknown;
+    let itemFailure: unknown;
     const account = accountEpoch();
     try {
-      for (const target of targets) {
+      for (const [index, target] of targets.entries()) {
         if (!sameAccount(account)) break;
         try {
           await deleteForever(target.id);
           gone.add(target.id);
         } catch (error) {
-          failure ??= error;
+          if (!sameAccount(account)) break;
+          if (stopsBatch(error)) {
+            stop("delete", gone.size, targets.length - index, error);
+            break;
+          }
+          itemFailure ??= error;
         }
       }
     } finally {
@@ -145,21 +205,26 @@ export function TrashPage() {
         key: "trash-deleted",
       });
     }
-    if (failure !== undefined) toastApiError(failure);
+    if (itemFailure !== undefined) toastApiError(itemFailure);
     // No live listing changed; this feature's own trash and storage numbers did.
     emitNodesChanged([]);
   };
 
   const askDelete = (targets: readonly TrashRow[]) => {
     setMenu(null);
+    if (blocked) return;
     if (targets.length > 0) setDeleting([...targets]);
   };
   // Delete / Backspace asks for the selection — unless something is open above the list. A
   // dialog (this page's confirmation, "Empty the trash?", the mobile sheet, the palette) is the
   // shell's rule: `useShortcut` ignores a page's key under one. The row menu is not a dialog, so
   // that one is this page's to rule out.
-  useShortcut("trash", () => askDelete(selected), selected.length > 0 && deleting === null && menu === null);
-  const loadMore = useLoadMore(trash.fetchNextPage);
+  useShortcut(
+    "trash",
+    () => askDelete(selected),
+    selected.length > 0 && deleting === null && menu === null && !blocked,
+  );
+  const paging = usePagedView(trash, viewKeys.trash, items.length);
 
   const onOpen = useCallback(() => {
     toast({ message: t("trash.openHint"), key: "trash-open" });
@@ -185,7 +250,7 @@ export function TrashPage() {
   if (hasFailed(trash) || isWaitingOffline(trash)) {
     return (
       <ViewPage view="trash">
-        <ViewError view="trash" title={t("trash.error.title")} query={trash} />
+        <ViewError view="trash" title={t("trash.error.title")} query={trash} onRetry={paging.refresh} />
       </ViewPage>
     );
   }
@@ -200,10 +265,10 @@ export function TrashPage() {
   const deletingOne = deleting?.length === 1 ? deleting[0] : undefined;
   const menuActions = menu ? (
     <>
-      <MenuItem onClick={() => void restore([menu.item])} disabled={busy} data-trash-action="restore">
+      <MenuItem onClick={() => void restore([menu.item])} disabled={blocked} data-trash-action="restore">
         {t("trash.restore")}
       </MenuItem>
-      <MenuItem onClick={() => askDelete([menu.item])} disabled={busy} data-trash-action="delete">
+      <MenuItem onClick={() => askDelete([menu.item])} disabled={blocked} data-trash-action="delete">
         <Box component="span" sx={{ flex: "1 1 auto" }}>
           {t("trash.deleteForever")}
         </Box>
@@ -255,6 +320,40 @@ export function TrashPage() {
           </IconButton>
         </Box>
       ) : null}
+      {stopped ? (
+        <Box
+          role="alert"
+          data-trash-stopped={stopped.action}
+          sx={{
+            display: "flex",
+            alignItems: "center",
+            gap: 2,
+            padding: desktop ? "4px 8px 4px 20px" : "0 4px 0 16px",
+            borderBottom: `1px solid ${hf.hairline}`,
+            backgroundColor: hf.surface2,
+            flex: "none",
+          }}
+        >
+          <Box sx={{ flex: "1 1 auto" }}>
+            {t(stopped.action === "restore" ? "trash.batch.restore" : "trash.batch.delete", {
+              done: stopped.done,
+              left: stopped.left,
+            })}
+            {batchWait ? ` ${t("trash.batch.wait")}` : ""}
+            {stopped.requestId ? (
+              <>
+                {" "}
+                <Box component="span" className="mono" sx={{ color: hf.textSecondary }}>
+                  {shellT("app.requestId", { id: stopped.requestId })}
+                </Box>
+              </>
+            ) : null}
+          </Box>
+          <IconButton aria-label={t("trash.dismiss")} onClick={() => setStopped(null)} disabled={batchWait}>
+            <X size={16} aria-hidden="true" />
+          </IconButton>
+        </Box>
+      ) : null}
       <SelectionBar
         count={selected.length}
         onClear={() => setSelection(NO_SELECTION)}
@@ -263,13 +362,13 @@ export function TrashPage() {
             <SelectionBarAction
               label={t("trash.restore")}
               onClick={() => void restore(selected)}
-              disabled={busy}
+              disabled={blocked}
             />
             <SelectionBarAction
               label={t("trash.deleteForever")}
               onClick={() => askDelete(selected)}
               shortcut={desktop ? "trash" : undefined}
-              disabled={busy}
+              disabled={blocked}
             />
           </>
         }
@@ -284,13 +383,13 @@ export function TrashPage() {
         onOpen={onOpen}
         rowMenu={rowMenu}
         onContextMenu={desktop ? onContextMenu : undefined}
-        hasMore={canLoadMore(trash)}
-        onLoadMore={loadMore}
+        hasMore={paging.hasMore}
+        onLoadMore={paging.loadMore}
         loading={trash.isPending || trash.isFetchingNextPage}
         emptyState={<EmptyState type="cleared" title={t("trash.empty.title")} body={t("trash.empty.body")} />}
         ariaLabel={t("trash.list")}
       />
-      <ListNotice view="trash" query={trash} />
+      <ListNotice view="trash" problem={paging.problem} />
       {desktop ? (
         <Menu
           open={menu !== null}

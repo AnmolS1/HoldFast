@@ -11,6 +11,7 @@ import { api } from "../../lib/api";
 import { registerUserStatePurger } from "../../lib/contracts";
 import { queryClient } from "../../lib/query";
 import { viewKeys } from "../starred/view-queries";
+import { AUTO_REFETCH } from "../starred/view-state";
 
 /** The most one request may ask for: the list then knows "100 or 101" from its first page. */
 export const TRASH_PAGE = 200;
@@ -32,6 +33,7 @@ export function useTrash() {
       }),
     initialPageParam: null as string | null,
     getNextPageParam: (page) => page.nextCursor,
+    ...AUTO_REFETCH,
   });
 }
 
@@ -108,6 +110,8 @@ registerUserStatePurger(() => {
 export async function emptyTrash(
   onProgress: (remaining: number) => void,
   signal?: AbortSignal,
+  /** Awaited before every request (0 for the first); a rejection ends the loop with it. */
+  beforeBatch?: (round: number) => Promise<void>,
 ): Promise<void> {
   const controller = new AbortController();
   const abort = () => controller.abort();
@@ -117,7 +121,9 @@ export async function emptyTrash(
   try {
     let least = Number.POSITIVE_INFINITY;
     let stalled = 0;
-    for (;;) {
+    for (let round = 0; ; round++) {
+      controller.signal.throwIfAborted();
+      await beforeBatch?.(round);
       controller.signal.throwIfAborted();
       const answer = (await api("/api/trash", {
         method: "DELETE",

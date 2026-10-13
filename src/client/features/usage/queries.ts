@@ -3,12 +3,14 @@ import { UsageDto } from "../../../shared/schemas/account";
 import { ALMOST_FULL } from "../../components/StorageBar";
 import { api } from "../../lib/api";
 import { viewKeys } from "../starred/view-queries";
+import { AUTO_REFETCH } from "../starred/view-state";
 
 /** `GET /api/account/usage`: one query for the sidebar's bar and the Storage page. */
 export function useUsage() {
   return useQuery({
     queryKey: viewKeys.usage,
     queryFn: ({ signal }) => api("/api/account/usage", { schema: UsageDto, signal }),
+    ...AUTO_REFETCH,
   });
 }
 

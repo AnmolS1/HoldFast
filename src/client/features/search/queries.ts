@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { SearchResponse } from "../../../shared/schemas/search";
 import { api } from "../../lib/api";
 import { viewKeys } from "../starred/view-queries";
+import { AUTO_REFETCH } from "../starred/view-state";
 import { isSearchable, Q_MIN, type SearchState } from "./url-state";
 
 export const DEBOUNCE_MS = 250;
@@ -34,6 +35,7 @@ export function useSearch(state: SearchState) {
     getNextPageParam: (page) => page.nextCursor,
     enabled: isSearchable(state),
     placeholderData: keepPreviousData,
+    ...AUTO_REFETCH,
   });
 }
 
@@ -46,5 +48,6 @@ export function useSuggestions(q: string) {
       return api(`/api/search?${params.toString()}`, { schema: SearchResponse, signal });
     },
     enabled: q.length >= Q_MIN,
+    ...AUTO_REFETCH,
   });
 }

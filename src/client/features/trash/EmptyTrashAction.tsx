@@ -2,17 +2,30 @@
 // on the Trash page and as the shortcut on the Storage page.
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
+import IconButton from "@mui/material/IconButton";
 import { onlineManager } from "@tanstack/react-query";
-import { useState } from "react";
+import { X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { accountEpoch, sameAccount } from "../../lib/query";
+import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { hf } from "../../theme/tokens";
-import { useBlockedUntil } from "../starred/view-state";
-import { startEmptyTrash, stoppedMessage, useEmptyRun } from "./empty-run";
+import { viewKeys } from "../starred/view-queries";
+import { isHeld, useBlockedUntil } from "../starred/view-state";
+import {
+  dismissStopped,
+  setPreConfirmRead,
+  startEmptyTrash,
+  stoppedMessage,
+  useEmptyRun,
+  usePreConfirmRead,
+} from "./empty-run";
 import { CONFIRM_WORD, needsTypedConfirm, useTrash, type TrashSize } from "./queries";
 import { t } from "./strings";
 
 const UNKNOWN: TrashSize = { count: null, more: false };
+
+/** What a user does that is not "waiting for the dialog I asked for". */
+const OTHER_ACTS = ["pointerdown", "keydown", "click"] as const;
 
 function consequence(size: TrashSize): string {
   const folders = t("trash.delete.folders");
@@ -29,9 +42,16 @@ function consequence(size: TrashSize): string {
 export function EmptyTrashAction() {
   const trash = useTrash();
   const run = useEmptyRun();
-  const [checking, setChecking] = useState(false);
+  const checking = usePreConfirmRead();
   // What the dialog was opened with: the trash as the server had it at that moment.
   const [asked, setAsked] = useState<TrashSize | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const cached: TrashSize = trash.data
     ? {
@@ -46,18 +66,32 @@ export function EmptyTrashAction() {
   // The count decides whether the word must be typed, so it is read again first: the list in
   // memory may be seconds old, or from before another device filled the trash.
   const ask = async () => {
-    // Offline that read would wait for the connection and the dialog would open out of nowhere
-    // later: ask now, with the size unknown (which asks for the word).
-    if (!onlineManager.isOnline()) {
+    // No read is possible (offline) or allowed (the API named a wait for this list): ask now,
+    // with the size unknown — which asks for the word.
+    const cachedQuery = queryClient.getQueryCache().find({ queryKey: viewKeys.trash });
+    if (!onlineManager.isOnline() || (cachedQuery && isHeld(cachedQuery))) {
       setAsked(UNKNOWN);
       return;
     }
-    setChecking(true);
+    // A destructive confirmation may open only as the direct continuation of the click that
+    // asked for it. While the read is out, anything else the user does — a key, a press, a
+    // click anywhere, leaving the page — withdraws the question: the answer is then dropped
+    // and nothing opens. (The click that started this is already past the document's capture
+    // phase, so it does not count.)
+    let withdrawn = false;
+    const withdraw = () => {
+      withdrawn = true;
+      setPreConfirmRead(false);
+    };
+    for (const type of OTHER_ACTS) document.addEventListener(type, withdraw, true);
+    setPreConfirmRead(true);
     const account = accountEpoch();
     try {
       const fresh = await trash.refetch();
-      // Another account since the click: no dialog about the previous one's trash.
-      if (!sameAccount(account)) return;
+      // Another account since the click, or the user has moved on: no dialog.
+      if (!sameAccount(account) || withdrawn || !mounted.current) return;
+      // Never a second dialog, whatever opened meanwhile.
+      if (document.querySelector('[role="dialog"], [role="menu"]')) return;
       const pages = fresh.isSuccess ? fresh.data.pages : null;
       setAsked(
         pages
@@ -68,20 +102,23 @@ export function EmptyTrashAction() {
           : UNKNOWN,
       );
     } finally {
-      setChecking(false);
+      for (const type of OTHER_ACTS) document.removeEventListener(type, withdraw, true);
+      if (sameAccount(account)) setPreConfirmRead(false);
     }
   };
   const size = asked ?? UNKNOWN;
   const typed = needsTypedConfirm(size);
+  const showStopped = run.state === "stopped" && !run.dismissed && !knownEmpty;
 
   return (
     <Box data-empty-trash sx={{ display: "inline-flex", flexWrap: "wrap", alignItems: "center", gap: 3 }}>
       <Button
         onClick={() => void ask()}
         disabled={run.state === "running" || checking || knownEmpty || waiting}
+        aria-busy={checking || undefined}
         data-empty-trash-button
       >
-        {t("trash.emptyTrash")}
+        {checking ? t("trash.emptyTrash.checking") : t("trash.emptyTrash")}
       </Button>
       <Box
         role="status"
@@ -96,9 +133,13 @@ export function EmptyTrashAction() {
             ? t("trash.emptyTrash.starting")
             : t("trash.emptyTrash.progress", { remaining: run.remaining })}
       </Box>
-      {run.state === "stopped" ? (
-        <Box role="alert" data-empty-trash-stopped>
+      {showStopped ? (
+        // Not a live region: the stop was announced once already, by a toast.
+        <Box data-empty-trash-stopped sx={{ display: "inline-flex", alignItems: "center", gap: 1 }}>
           {stoppedMessage(run.remaining)}
+          <IconButton aria-label={t("trash.dismiss")} onClick={dismissStopped}>
+            <X size={16} aria-hidden="true" />
+          </IconButton>
         </Box>
       ) : null}
       <ConfirmDialog

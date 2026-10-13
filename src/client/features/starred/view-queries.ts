@@ -3,8 +3,10 @@
 // one listener does exactly that whenever any feature says the tree changed.
 //
 // The data is TanStack Query's: `purgeUserState()` drops these queries with the rest of the cache.
+import type { QueryKey } from "@tanstack/react-query";
 import { onNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { queryClient } from "../../lib/query";
+import { isHeld } from "./view-state";
 
 export const VIEWS_KEY = "views";
 
@@ -24,27 +26,48 @@ export const viewKeys = {
   suggestions: (q: string) => [VIEWS_KEY, "suggestions", q] as const,
 };
 
-/** Mark every view query stale; the mounted ones are fetched again. */
-export function invalidateViews(): Promise<void> {
-  return queryClient.invalidateQueries({ queryKey: viewKeys.all });
+/**
+ * Read these queries again (the mounted ones at once, the others when next shown) — except any
+ * that is inside a wait the API named (`isHeld`), and without cutting off a read in flight: a
+ * round that is under way finishes, so a stream of refreshes can never starve the view.
+ */
+export function refreshQueries(queryKey: QueryKey): Promise<void> {
+  return queryClient.invalidateQueries(
+    { queryKey, predicate: (query) => !isHeld(query) },
+    { cancelRefetch: false },
+  );
 }
 
-/** How long tree-changed events are gathered before the views are read again, once. */
+/** Refresh every view query. */
+export function invalidateViews(): Promise<void> {
+  return refreshQueries(viewKeys.all);
+}
+
+/**
+ * Tree-changed events are gathered. A round of reads starts `INVALIDATE_WAIT_MS` after the first
+ * event; events that arrive while a round is waiting or being read are answered by ONE further
+ * round, started `INVALIDATE_WAIT_MS` after the one in flight has finished. So while events keep
+ * coming the views are refreshed at least every `INVALIDATE_WAIT_MS` + the time the API takes,
+ * and once more after the last event — never one round per event, never a round cut short.
+ */
 export const INVALIDATE_WAIT_MS = 250;
 
 let waiting: ReturnType<typeof setTimeout> | null = null;
 
-/**
- * Read the views again soon — ONCE, however many events arrive meanwhile. The wait starts at the
- * first event and is not pushed back by later ones, so a steady stream (an upload of 500 files
- * emits 500 times) costs one round of reads per wait, not one per event and not none.
- */
+function round(): void {
+  // A round is still being read: let it finish (cutting it off is what starves a slow API),
+  // then read once more for whatever arrived meanwhile.
+  if (queryClient.isFetching({ queryKey: viewKeys.all }) > 0) {
+    waiting = setTimeout(round, INVALIDATE_WAIT_MS);
+    return;
+  }
+  waiting = null;
+  void invalidateViews();
+}
+
 export function scheduleInvalidateViews(): void {
   if (waiting !== null) return;
-  waiting = setTimeout(() => {
-    waiting = null;
-    void invalidateViews();
-  }, INVALIDATE_WAIT_MS);
+  waiting = setTimeout(round, INVALIDATE_WAIT_MS);
 }
 
 // A star toggle, an upload, a move, a restore: whatever changed, these lists and the storage

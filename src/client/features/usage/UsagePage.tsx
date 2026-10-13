@@ -5,7 +5,7 @@ import { StorageBar } from "../../components/StorageBar";
 import { formatBytes } from "../../lib/format";
 import { hf, layout } from "../../theme/tokens";
 import { ViewError, ViewPage } from "../starred/view-kit";
-import { hasFailed, isWaitingOffline } from "../starred/view-state";
+import { hasFailed, isWaitingOffline, useRefresh } from "../starred/view-state";
 import { EmptyTrashAction } from "../trash/EmptyTrashAction";
 import { usageBreakdown, useUsage, type UsagePart } from "./queries";
 import { t } from "./strings";
@@ -19,10 +19,11 @@ const PART_LABEL = {
 
 export function UsagePage() {
   const usage = useUsage();
+  const refresh = useRefresh(usage);
   if (hasFailed(usage) || isWaitingOffline(usage)) {
     return (
       <ViewPage view="usage">
-        <ViewError view="usage" title={t("usage.error.title")} query={usage} />
+        <ViewError view="usage" title={t("usage.error.title")} query={usage} onRetry={refresh} />
       </ViewPage>
     );
   }

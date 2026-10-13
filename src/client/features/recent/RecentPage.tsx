@@ -2,7 +2,7 @@ import { useCallback, useMemo } from "react";
 import { EmptyState } from "../../components/EmptyState";
 import { useSession } from "../../lib/query";
 import { ListNotice, NodeList, ViewError, ViewPage } from "../starred/view-kit";
-import { hasFailed, isWaitingOffline } from "../starred/view-state";
+import { hasFailed, isWaitingOffline, refreshProblem, useRefresh } from "../starred/view-state";
 import { recentGroup, type RecentGroup } from "./grouping";
 import { useRecent } from "./queries";
 import { t } from "./strings";
@@ -31,10 +31,11 @@ export function RecentPage() {
     (item: { id: string }) => t(GROUP_LABEL[groups.get(item.id) ?? "earlier"]),
     [groups],
   );
+  const refresh = useRefresh(recent);
   if (hasFailed(recent) || isWaitingOffline(recent)) {
     return (
       <ViewPage view="recent">
-        <ViewError view="recent" title={t("recent.error.title")} query={recent} />
+        <ViewError view="recent" title={t("recent.error.title")} query={recent} onRetry={refresh} />
       </ViewPage>
     );
   }
@@ -49,7 +50,7 @@ export function RecentPage() {
           <EmptyState type="cleared" title={t("recent.empty.title")} body={t("recent.empty.body")} />
         }
       />
-      <ListNotice view="recent" query={recent} />
+      <ListNotice view="recent" problem={refreshProblem(recent, refresh)} />
     </ViewPage>
   );
 }

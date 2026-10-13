@@ -11,7 +11,8 @@ import { EmptyState } from "../../components/EmptyState";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ListNotice, NodeList, ViewError, ViewPage } from "../starred/view-kit";
-import { canLoadMore, hasFailed, isWaitingOffline, useLoadMore } from "../starred/view-state";
+import { viewKeys } from "../starred/view-queries";
+import { hasFailed, isWaitingOffline, usePagedView } from "../starred/view-state";
 import { DEBOUNCE_MS, useSearch } from "./queries";
 import { t } from "./strings";
 import {
@@ -109,7 +110,6 @@ export function SearchPage() {
   const search = useSearch(state);
   const location = useLocation();
   const navigationType = useNavigationType();
-  const loadMore = useLoadMore(search.fetchNextPage);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [sheet, setSheet] = useState(false);
 
@@ -157,6 +157,11 @@ export function SearchPage() {
       })),
     [search.data],
   );
+  const paging = usePagedView(
+    search,
+    viewKeys.search({ q: state.q, category: state.category, scope: state.scope }),
+    items.length,
+  );
   const searchable = isSearchable(state);
   const count = search.hasNextPage
     ? items.length === 1
@@ -170,7 +175,9 @@ export function SearchPage() {
   if (!searchable) {
     body = <EmptyState type="no-results" title={t("search.prompt.title")} body={t("search.prompt.body")} />;
   } else if (hasFailed(search) || isWaitingOffline(search)) {
-    body = <ViewError view="search" title={t("search.error.title")} query={search} />;
+    body = (
+      <ViewError view="search" title={t("search.error.title")} query={search} onRetry={paging.refresh} />
+    );
   } else {
     body = (
       <>
@@ -178,13 +185,13 @@ export function SearchPage() {
           items={items}
           ariaLabel={t("search.results")}
           loading={search.isPending || search.isFetchingNextPage}
-          hasMore={canLoadMore(search)}
-          onLoadMore={loadMore}
+          hasMore={paging.hasMore}
+          onLoadMore={paging.loadMore}
           emptyState={
             <EmptyState type="no-results" title={t("search.none.title")} body={t("search.none.body")} />
           }
         />
-        <ListNotice view="search" query={search} />
+        <ListNotice view="search" problem={paging.problem} />
       </>
     );
   }
