@@ -50,6 +50,13 @@ describe("workers project", () => {
     expect(env.HYPERDRIVE.connectionString).toContain(`/${inject("holdfastDb")}`);
   });
 
+  it("is told whether the cap-sized tests were asked for (the process environment does not reach a Worker test)", () => {
+    // `process.env.HOLDFAST_CAP_TESTS` is undefined in here whatever the shell exported: a file
+    // gated on it would skip always and report green. The config provides the answer instead.
+    expect(typeof inject("capTests")).toBe("boolean");
+    expect(process.env.HOLDFAST_CAP_TESTS).toBeUndefined();
+  });
+
   it("stores and reads an object in local R2", async () => {
     const key = `harness/${crypto.randomUUID()}`;
     await env.FILES.put(key, "hello");
