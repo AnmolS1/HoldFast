@@ -139,20 +139,35 @@ export async function effectiveTrashed(db: Executor, nodeId: string): Promise<bo
  * down, or it is itself locked as suspected CSAM (a state of one file: it is not inherited) —
  * and for an id that does not exist, so a caller that only asks "may this be shown?" fails
  * closed. One statement, whatever the answer.
+ *
+ * The takedown half IS `notEffectivelyHidden` (the listings' predicate), so the by-id answer and
+ * the listings cannot drift apart.
  */
 export async function effectiveHidden(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return true;
   const result = await db.execute<{ found: boolean; hidden: boolean }>(sql`
-    WITH RECURSIVE up(id, parent_id, takedown_at, locked) AS (
-      SELECT n.id, n.parent_id, n.takedown_at, n.scan_status = 'suspected_csam'
-      FROM nodes n WHERE n.id = ${nodeId}
-      UNION ALL
-      SELECT p.id, p.parent_id, p.takedown_at, false FROM nodes p JOIN up ON p.id = up.parent_id
-    ) CYCLE id SET is_cycle USING path
-    SELECT EXISTS (SELECT 1 FROM up) AS found,
-           EXISTS (SELECT 1 FROM up WHERE takedown_at IS NOT NULL OR locked) AS hidden`);
+    SELECT EXISTS (SELECT 1 FROM nodes n WHERE n.id = ${nodeId}) AS found,
+           EXISTS (
+             SELECT 1 FROM nodes n
+             WHERE n.id = ${nodeId}
+               AND (n.scan_status = 'suspected_csam' OR NOT ${notEffectivelyHidden("n")})) AS hidden`);
   const row = result.rows[0];
   return !row || !row.found || row.hidden;
+}
+
+/**
+ * No ancestor of the row `t` has `column` set: the walk up `parent_id` from the row's parent.
+ * The one ancestor walk the two predicates below share.
+ */
+function noAncestorWith(t: SQL, column: "deleted_at" | "takedown_at"): SQL {
+  const c = sql.raw(column);
+  return sql`NOT EXISTS (
+    WITH RECURSIVE up(id, parent_id, ${c}) AS (
+      SELECT a.id, a.parent_id, a.${c} FROM nodes a WHERE a.id = ${t}.parent_id
+      UNION ALL
+      SELECT p.id, p.parent_id, p.${c} FROM nodes p JOIN up ON p.id = up.parent_id
+    ) CYCLE id SET is_cycle USING path
+    SELECT 1 FROM up WHERE ${c} IS NOT NULL)`;
 }
 
 /**
@@ -161,13 +176,20 @@ export async function effectiveHidden(db: Executor, nodeId: string): Promise<boo
  */
 export function notEffectivelyTrashed(alias: string = "nodes"): SQL {
   const t = sql.identifier(alias);
-  return sql`(${t}.deleted_at IS NULL AND NOT EXISTS (
-    WITH RECURSIVE up(id, parent_id, deleted_at) AS (
-      SELECT a.id, a.parent_id, a.deleted_at FROM nodes a WHERE a.id = ${t}.parent_id
-      UNION ALL
-      SELECT p.id, p.parent_id, p.deleted_at FROM nodes p JOIN up ON p.id = up.parent_id
-    ) CYCLE id SET is_cycle USING path
-    SELECT 1 FROM up WHERE deleted_at IS NOT NULL))`;
+  return sql`(${t}.deleted_at IS NULL AND ${noAncestorWith(t, "deleted_at")})`;
+}
+
+/**
+ * A predicate for a query over `nodes`: the row is not taken down, directly or by ancestry — a
+ * takedown marks ONE node and hides everything under it, like trash. `alias` as above (inside,
+ * the names `a`, `p` and `up` are taken).
+ *
+ * `suspected_csam` is NOT part of this: it is a state of one file, not inherited, and stays the
+ * caller's per-row test (its `visibleStatuses`).
+ */
+export function notEffectivelyHidden(alias: string = "nodes"): SQL {
+  const t = sql.identifier(alias);
+  return sql`(${t}.takedown_at IS NULL AND ${noAncestorWith(t, "takedown_at")})`;
 }
 
 export type Role = "owner" | "editor" | "viewer";

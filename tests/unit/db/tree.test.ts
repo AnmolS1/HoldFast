@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -9,6 +9,7 @@ import {
   effectiveRole,
   effectiveTrashed,
   isDescendantOrSelf,
+  notEffectivelyHidden,
   ownedRoots,
   subtree,
 } from "../../../src/worker/db/queries/tree";
@@ -144,6 +145,88 @@ describe("effectiveHidden", () => {
     // In the trash is not hidden: that is `effectiveTrashed`'s question.
     await db.update(nodes).set({ deletedAt: new Date(), trashedRoot: true }).where(eq(nodes.id, f.alpha.id));
     expect(await effectiveHidden(db, f.alpha.id)).toBe(false);
+  });
+});
+
+describe("notEffectivelyHidden", () => {
+  /** The ids of `among` the predicate lets through. */
+  const shown = async (among: Node[]): Promise<Set<string>> => {
+    const rows = await db
+      .select({ id: nodes.id })
+      .from(nodes)
+      .where(
+        and(
+          inArray(
+            nodes.id,
+            among.map((n) => n.id),
+          ),
+          notEffectivelyHidden(),
+        ),
+      );
+    return new Set(rows.map((r) => r.id));
+  };
+  const takeDown = (id: string) =>
+    db.update(nodes).set({ takedownAt: new Date(), takedownReason: "abuse" }).where(eq(nodes.id, id));
+  const restore = (id: string) =>
+    db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, id));
+
+  it("excludes a taken-down row and everything under it — parent or grandparent — and nothing else; a restored ancestor shows its content again", async () => {
+    const f = await fixture();
+    const all = [f.root, f.a, f.b, f.deep, f.zeta, f.alpha];
+    const ids = (list: Node[]) => new Set(list.map((n) => n.id));
+    // The control: nothing is taken down, everything is let through.
+    expect(await shown(all)).toEqual(ids(all));
+
+    await takeDown(f.a.id);
+    // `a` itself, `zeta` (parent), `b` (parent) and `deep` (grandparent) are out; the folder
+    // above and the sibling outside are in.
+    expect(await shown(all)).toEqual(ids([f.root, f.alpha]));
+
+    await restore(f.a.id);
+    expect(await shown(all)).toEqual(ids(all));
+
+    // A file taken down by itself hides nothing else.
+    await takeDown(f.deep.id);
+    expect(await shown(all)).toEqual(ids([f.root, f.a, f.b, f.zeta, f.alpha]));
+  });
+
+  it("works under another alias, and suspected CSAM is not its business", async () => {
+    const f = await fixture();
+    await takeDown(f.b.id);
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.zeta.id));
+    const result = await db.execute<{ id: string }>(
+      sql`SELECT n.id FROM nodes n WHERE n.owner_id = ${f.owner} AND ${notEffectivelyHidden("n")}`,
+    );
+    // `zeta` is locked, not taken down: the predicate lets it through (the status list hides it).
+    expect(new Set(result.rows.map((r) => r.id))).toEqual(
+      new Set([f.root.id, f.a.id, f.zeta.id, f.alpha.id]),
+    );
+  });
+
+  it("agrees with effectiveHidden on every node, suspected CSAM aside", async () => {
+    const f = await fixture();
+    const all = [f.root, f.a, f.b, f.deep, f.zeta, f.alpha];
+    const agree = async (label: string) => {
+      const letThrough = await shown(all);
+      for (const node of all) {
+        expect(await effectiveHidden(db, node.id), `${label}: ${node.name}`).toBe(!letThrough.has(node.id));
+      }
+      return letThrough.size;
+    };
+    expect(await agree("nothing down")).toBe(6);
+    await takeDown(f.b.id);
+    expect(await agree("b down")).toBe(4);
+    await takeDown(f.root.id);
+    expect(await agree("root and b down")).toBe(0);
+    await restore(f.root.id);
+    expect(await agree("root restored, b still down")).toBe(4);
+    await restore(f.b.id);
+    expect(await agree("all restored")).toBe(6);
+
+    // The one place they differ, by design: a locked file is hidden by id and let through here.
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.alpha.id));
+    expect(await effectiveHidden(db, f.alpha.id)).toBe(true);
+    expect((await shown(all)).has(f.alpha.id)).toBe(true);
   });
 });
 
