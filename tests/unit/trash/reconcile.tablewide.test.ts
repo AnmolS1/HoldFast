@@ -514,5 +514,5 @@ describe("reconcile: the orphan sweep", () => {
     const below = await sweepOrphans(jobContext().bg, { from: START, stopAt: FAR, now: inHours(49) });
     expect(below).toMatchObject({ outcome: "swept", listed: 900, candidates: 500, deleted: 500, done: true });
     expect(await keysUnder("u/")).toEqual(referenced.map((row) => row.r2Key).sort());
-  }, 120_000);
+  });
 });
