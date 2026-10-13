@@ -357,46 +357,90 @@ export async function ensureCsamAlerted(
 }
 
 /**
- * Tells the operators about every OPEN suspected-CSAM report they have not been told about today
- * (oldest first, at most `limit`). A scheduled job calls it: an alert that was lost with its
- * invocation goes out within the job's interval, and a report nobody handles is announced again
- * once a day. One failing report does not stop the rest.
+ * Records THE LOCK of a report, once: claims the report's lock marker for today and, when it
+ * claimed, writes the audit row `scan.suspected_csam` and the metric. True when it wrote.
+ */
+async function recordCsamLock(
+  deps: ServiceDeps,
+  report: { reportId: string; nodeId: string | null; source: string },
+  recovered: boolean,
+): Promise<boolean> {
+  const marker = csamLockMarker(report.reportId);
+  if (!(await addUsageIfUnder(deps.db, utcDay(), "notice", marker, ONCE.amount, ONCE.limit))) return false;
+  audit(
+    deps,
+    "scan.suspected_csam",
+    report.nodeId ? { type: "node", id: report.nodeId } : { type: "report", id: report.reportId },
+    recovered
+      ? { source: report.source, reportId: report.reportId, recoveredBy: "sweep" }
+      : { source: report.source, reportId: report.reportId },
+  );
+  writeMetric(deps.env, "scan", { outcome: "suspected_csam", kind: report.source });
+  return true;
+}
+
+/** One step of the after-lock work: it never throws — a failure is reported and counted. */
+async function attempt(deps: ServiceDeps, reason: string, step: () => Promise<unknown>): Promise<void> {
+  try {
+    await step();
+  } catch (error) {
+    captureError(error, { kind: "csam_alert" });
+    writeMetric(deps.env, "error", { kind: "csam_alert", reason });
+  }
+}
+
+/**
+ * Settles what is still owed for OPEN suspected-CSAM reports (oldest first, at most `limit`):
+ *   - a lock that was NEVER recorded (its marker unclaimed on every day — the invocation that
+ *     locked died before its deferred work ran) gets its audit row `scan.suspected_csam` now,
+ *     with the source the REPORT carries and `recoveredBy: "sweep"`;
+ *   - a report nobody was told about today gets `ensureCsamAlerted`.
+ * A scheduled job calls it: what was lost with an invocation is made good within the job's
+ * interval, and a report nobody handles is announced again once a day. One failing report does
+ * not stop the rest. `alerted` counts mails that reached someone, `recorded` recovered lock rows.
  */
 export async function sweepCsamAlerts(
   deps: ServiceDeps,
   opts: { limit?: number } = {},
-): Promise<{ checked: number; alerted: number }> {
+): Promise<{ checked: number; alerted: number; recorded: number }> {
   const limit = Math.max(1, Math.min(opts.limit ?? CSAM_SWEEP_DEFAULT_LIMIT, 1_000));
   const due = await csamReportsToAnnounce(deps.db, limit);
   let alerted = 0;
+  let recorded = 0;
   for (const report of due) {
-    try {
+    if (!report.lockRecorded) {
+      await attempt(deps, "sweep", async () => {
+        if (await recordCsamLock(deps, report, true)) recorded += 1;
+      });
+    }
+    await attempt(deps, "sweep", async () => {
       if (await ensureCsamAlerted(deps, report.reportId, { via: "sweep", nodeId: report.nodeId }))
         alerted += 1;
-    } catch (error) {
-      captureError(error, { kind: "csam_alert" });
-      writeMetric(deps.env, "error", { kind: "csam_alert", reason: "sweep" });
-    }
+    });
   }
-  return { checked: due.length, alerted };
+  return { checked: due.length, alerted, recorded };
 }
 
 /**
  * The one handler for suspected CSAM — the upload route (blocklist hit), the scan consumer and
  * the admin console all call this, so there is one code path.
  *
- * The database half (db/queries/moderation.ts): the node becomes `suspected_csam`, the node and
- * its owner go on legal hold, the node's links are paused, its upload addresses are held, its
- * hash is blocklisted and a report is filed. Then, here, ON EVERY CALL and whatever state the
- * node was found in, two separate facts:
+ * AWAITED: only the database half (db/queries/moderation.ts) — the node becomes
+ * `suspected_csam`, the node and its owner go on legal hold, the node's links are paused, its
+ * upload addresses are held, its hash is blocklisted and a report is filed. When this function
+ * resolves the node IS locked; nothing after the lock can reject it, and the caller's answer
+ * takes no longer for this reason than for another (no mail is waited for).
+ *
+ * DEFERRED (`deps.defer`), ON EVERY CALL and whatever state the node was found in — two
+ * separate facts, each with its errors captured:
  *   - THE LOCK is recorded: the audit row `scan.suspected_csam` (`{ source, reportId }`, the
  *     caller's own source) and a metric, once per report per UTC day behind a marker of its own.
  *     It does not depend on any mail. A redelivery the same day writes nothing; one on a LATER
- *     day writes a second row (accepted: the marker is a day's). The marker is claimed before the
- *     row is handed to the deferred work, so a crash exactly between the two loses that row.
+ *     day writes a second row (accepted: the marker is a day's).
  *   - THE ALERT: `ensureCsamAlerted` (the critical operator mail, its own audit action).
- * A redelivery that finds the node already locked therefore still records the lock and still
- * makes sure the operators were told; nothing hangs on having been the call that locked.
+ * Deferred work can be lost with its invocation. It is re-established two ways: a redelivery
+ * repeats it (this function, again), and `sweepCsamAlerts` records a lock whose marker was never
+ * claimed and tells the operators about a report nobody was told about.
  *
  * It never deletes anything, never notifies the owner and issues no strike. Safe to repeat: the
  * same report is returned. `404 not_found` when there is no such node.
@@ -409,10 +453,13 @@ export async function lockSuspectedCsam(
   const locked = await lockRows(deps.db, nodeId, opts);
   if (!locked) throw new AppError("not_found");
   const { reportId } = locked;
-  if (await addUsageIfUnder(deps.db, utcDay(), "notice", csamLockMarker(reportId), ONCE.amount, ONCE.limit)) {
-    audit(deps, "scan.suspected_csam", { type: "node", id: nodeId }, { source: opts.source, reportId });
-    writeMetric(deps.env, "scan", { outcome: "suspected_csam", kind: opts.source });
-  }
-  await ensureCsamAlerted(deps, reportId, { via: "lock", nodeId });
+  deps.defer(
+    (async () => {
+      await attempt(deps, "lock_record", () =>
+        recordCsamLock(deps, { reportId, nodeId, source: opts.source }, false),
+      );
+      await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via: "lock", nodeId }));
+    })(),
+  );
   return { reportId };
 }

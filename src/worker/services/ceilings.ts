@@ -139,7 +139,7 @@ export type AmountOf<K extends CeilingKind> = K extends BytesOnlyKind
     : { bytes: number; count?: number } | { count: number; bytes?: number };
 
 /** What one new upload session asks for: its bytes, and `count: 1` for the file. */
-export type UploadAmount = { bytes: number; count?: number };
+export type UploadAmount = { bytes: number; count: number };
 
 export type CeilingRefusal = {
   ok: false;
@@ -437,7 +437,8 @@ async function lockUsers(tx: Tx, userIds: string[]): Promise<void> {
  * INSERTS ITS `uploads` ROW IN THE SAME TRANSACTION — that row is what the next admission counts.
  * Call it first in the transaction; then reserve quota and insert the row.
  *
- * `amount`: the session's bytes, and `count: 1` for the file. (The editor's ceiling has no count.)
+ * `amount`: the session's bytes AND `count: 1` for the file — both are required, by the type and
+ * at run time (`400 validation`). (The editor's ceiling has no count.)
  * There is no single-kind call: two calls would leave the lock order to the caller.
  */
 export async function enforceUploadCeilings(
@@ -447,6 +448,11 @@ export async function enforceUploadCeilings(
   opts: { tx: Tx },
 ): Promise<void> {
   const tx = requireTx("upload_user", opts);
+  // Both dimensions, always: an upload that names no count would pass the file-count ceiling.
+  const given = (amount ?? {}) as Amount;
+  if (given.bytes === undefined || given.count === undefined) {
+    throw new AppError("validation", "Invalid amount.");
+  }
   const at = now(c);
   const editor = subjects.editor && subjects.editor.id !== subjects.owner.id ? subjects.editor : null;
   await lockUsers(tx, editor ? [subjects.owner.id, editor.id] : [subjects.owner.id]);

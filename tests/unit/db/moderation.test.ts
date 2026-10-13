@@ -262,14 +262,19 @@ describe("csamReportsToAnnounce", () => {
       .update(reports)
       .set({ createdAt: sql`(now() AT TIME ZONE 'UTC') - make_interval(mins => ${ageMinutes})` })
       .where(eq(reports.id, reportId));
-    return { reportId, nodeId: file.id };
+    return { reportId, nodeId: file.id, source: "system" as const, lockRecorded: false };
   }
   /** The alert marker of a report, claimed `daysAgo` days ago (0 = today, the database's day). */
-  const mark = (reportId: string, daysAgo: number, count = 1) =>
+  const mark = (
+    reportId: string,
+    daysAgo: number,
+    count = 1,
+    what: "csam_alert" | "csam_locked" = "csam_alert",
+  ) =>
     db.insert(downloadLedger).values({
       day: sql`((now() AT TIME ZONE 'UTC')::date - ${daysAgo}::int)`,
       subjectType: "notice",
-      subjectId: `csam_alert:${reportId}`,
+      subjectId: `${what}:${reportId}`,
       bytes: 0,
       count,
     });
@@ -311,9 +316,13 @@ describe("csamReportsToAnnounce", () => {
 
   it("today's claimed marker takes a report off the list; yesterday's, another report's, or an unclaimed one does not", async () => {
     const toldToday = await lockedReport(5);
-    const toldYesterday = await lockedReport(4);
-    const unclaimed = await lockedReport(3);
-    const untold = await lockedReport(2);
+    const toldYesterday = { ...(await lockedReport(4)), lockRecorded: true };
+    const unclaimed = { ...(await lockedReport(3)), lockRecorded: true };
+    const untold = { ...(await lockedReport(2)), lockRecorded: true };
+    // Every lock here was recorded (on some earlier day), so only the alert decides.
+    for (const report of [toldToday, toldYesterday, unclaimed, untold]) {
+      await mark(report.reportId, 3, 1, "csam_locked");
+    }
     await mark(toldToday.reportId, 0);
     await mark(toldYesterday.reportId, 1);
     await mark(unclaimed.reportId, 0, 0);
@@ -321,6 +330,26 @@ describe("csamReportsToAnnounce", () => {
       toldYesterday,
       unclaimed,
       untold,
+    ]);
+  });
+
+  it("a lock that was NEVER recorded keeps a report listed even when the operators were told today; a lock recorded on any day does not", async () => {
+    const neverRecorded = await lockedReport(4);
+    const recordedDaysAgo = await lockedReport(3);
+    const zeroCountRow = await lockedReport(2);
+    for (const report of [neverRecorded, recordedDaysAgo, zeroCountRow]) await mark(report.reportId, 0);
+    await mark(recordedDaysAgo.reportId, 9, 1, "csam_locked");
+    await mark(zeroCountRow.reportId, 0, 0, "csam_locked");
+    // Told today, all three: what is still owed is the lock's record, for two of them.
+    expect(await dueAmong([neverRecorded, recordedDaysAgo, zeroCountRow])).toEqual([
+      neverRecorded,
+      zeroCountRow,
+    ]);
+    // The row carries the report's own source.
+    const { file } = await reported("pending");
+    const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "photodna" }))!;
+    expect(await dueAmong([{ reportId }])).toEqual([
+      { reportId, nodeId: file.id, source: "photodna", lockRecorded: false },
     ]);
   });
 

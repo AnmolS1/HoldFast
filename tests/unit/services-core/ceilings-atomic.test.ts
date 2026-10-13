@@ -335,6 +335,8 @@ describe("the amount is typed per kind", () => {
       await recordUsage(c, "download_user", subject.id, { count: 1 });
       // @ts-expect-error an upload names its bytes
       await enforceUploadCeilings(c, { owner: subject }, { count: 1 }, { tx });
+      // @ts-expect-error and its count: both dimensions are required
+      await enforceUploadCeilings(c, { owner: subject }, { bytes: 1 }, { tx });
       // What exists: bytes, a count, or — for the two kinds with both — either or both.
       await consumeCeiling(c, "download_link", subject, { bytes: 1 });
       await consumeCeiling(c, "download_link", subject, { count: 1 });
@@ -342,6 +344,30 @@ describe("the amount is typed per kind", () => {
       await checkCeiling(c, "upload_user", subject, { bytes: 1, count: 1 });
     };
     expect(typeof neverRun).toBe("function");
+  });
+
+  it("run time: an upload that does not name BOTH its bytes and its count is a validation error — never a pass", async () => {
+    const user = await makeUser();
+    const editor = await makeUser();
+    const subject = { id: user.id, account: oldAccount };
+    const loose = enforceUploadCeilings as unknown as (...args: unknown[]) => Promise<void>;
+    const outcome = async (amount: unknown, subjects: unknown = { owner: subject }) => {
+      const invoked = await invoke(
+        null,
+        (c) => db(c).transaction((tx) => loose(c, subjects, amount, { tx })),
+        small,
+      );
+      return invoked.ok ? "ok" : `${invoked.status} ${invoked.error}`;
+    };
+    for (const amount of [{ bytes: 1 }, { count: 1 }, {}, undefined, null, { bytes: 1, count: undefined }]) {
+      expect(await outcome(amount), JSON.stringify(amount)).toBe("400 validation");
+      expect(
+        await outcome(amount, { owner: subject, editor: { id: editor.id, account: oldAccount } }),
+        JSON.stringify(amount),
+      ).toBe("400 validation");
+    }
+    // The control: with both, the same call is admitted.
+    expect(await outcome({ bytes: 1, count: 1 })).toBe("ok");
   });
 
   it("run time: an empty amount, and a dimension the kind does not have, are validation errors — never a pass", async () => {

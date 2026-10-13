@@ -611,12 +611,14 @@ describe("lockSuspectedCsam", () => {
    * addresses in `reachable` (made-up addresses) and answers 500 for everyone else. `finish`
    * runs the deferred retries out under a fake timer.
    */
-  function mailApiDeps(operators: string[], reachable: string[]) {
+  function mailApiDeps(operators: string[], reachable: string[], fault: "500" | "throw" = "500") {
     const outbound = testOutbound()!;
     const accepted: string[] = [];
     outbound.answer("api.resend.com", async (request) => {
       const { to } = (await request.json()) as { to: string | string[] };
       const address = String(Array.isArray(to) ? to[0] : to);
+      if (!reachable.includes(address) && fault === "throw")
+        throw new Error("the mail API cannot be reached");
       if (!reachable.includes(address))
         return Response.json(
           { name: "internal_server_error", message: "down", statusCode: 500 },
@@ -639,6 +641,13 @@ describe("lockSuspectedCsam", () => {
       accepted,
       errors: () =>
         points.filter((point) => point.blobs[0] === "error").map((point) => point.blobs.slice(2, 4)),
+      /**
+       * Waits for the work handed to `defer` SO FAR (the lock's after-work) — an event, not a
+       * time: once it has ended, the mail retries it started are waiting on their timers.
+       */
+      async started() {
+        await Promise.allSettled([...made.deferred]);
+      },
       async finish() {
         try {
           await vi.advanceTimersByTimeAsync(CRITICAL_RETRY_WAITS_MS[0] + CRITICAL_RETRY_WAITS_MS[1] + 100);
@@ -686,6 +695,7 @@ describe("lockSuspectedCsam", () => {
     const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
     const first = serviceDeps();
     const { reportId } = await lockSuspectedCsam(first.deps, file.id, { source: "admin" });
+    await first.settle();
     expect(await ensureCsamAlerted(first.deps, reportId, { via: "lock", nodeId: file.id })).toBe(false);
     expect(await lockSuspectedCsam(first.deps, file.id, { source: "system" })).toEqual({ reportId });
     await first.settle();
@@ -711,7 +721,9 @@ describe("lockSuspectedCsam", () => {
     const down = mailApiDeps(operators, []);
     let reportId: string;
     try {
+      // Resolves although nobody can be told: the lock does not wait for the mail.
       ({ reportId } = await lockSuspectedCsam(down.deps, file.id, { source: "photodna" }));
+      await down.started();
       expect(await ensureCsamAlerted(down.deps, reportId, { via: "lock", nodeId: file.id })).toBe(false);
     } finally {
       await down.finish();
@@ -752,6 +764,111 @@ describe("lockSuspectedCsam", () => {
     });
   });
 
+  it("resolves when the node is locked — before the mail is sent, and whatever the mail does", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+    // A made-up operator address; the stand-in for the mail API holds the request at a gate.
+    const operator = `op-${rand(4)}@example.test`;
+    const outbound = testOutbound()!;
+    const reached = gate();
+    const release = gate();
+    let delivered = 0;
+    outbound.answer("api.resend.com", async () => {
+      reached.open();
+      await release.opened;
+      delivered += 1;
+      return Response.json({ id: "sent" });
+    });
+    const { deps, settle } = serviceDeps({
+      ADMIN_EMAILS: operator,
+      EMAIL_TRANSPORT: "resend",
+      // A made-up key: the stand-in above answers, nothing leaves the test.
+      RESEND_API_KEY: "re_test_key",
+    });
+    let resolved: { reportId: string } | null = null;
+    try {
+      const locking = lockSuspectedCsam(deps, file.id, { source: "system" }).then(
+        (value) => (resolved = value),
+      );
+      // The mail request is in flight and held — and the caller already has its answer.
+      await reached.opened;
+      expect(resolved, "the lock waited for the mail").not.toBeNull();
+      expect(delivered).toBe(0);
+      expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+      expect(await sentRowsOf(file.id)).toEqual([]);
+      release.open();
+      await locking;
+      await settle();
+    } finally {
+      release.open();
+      outbound.answer("api.resend.com", null);
+    }
+    expect(delivered).toBe(1);
+    expect(await viaOf(file.id)).toEqual(["lock"]);
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "system" } }]);
+  });
+
+  it("a mail transport that throws does not reject the caller: the node is locked, the failure is counted", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+    const broken = mailApiDeps([`op-${rand(4)}@example.test`], [], "throw");
+    let reportId: string;
+    try {
+      ({ reportId } = await lockSuspectedCsam(broken.deps, file.id, { source: "admin" }));
+      await broken.started();
+    } finally {
+      await broken.finish();
+    }
+    expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "admin", reportId } }]);
+    expect(await sentRowsOf(file.id)).toEqual([]);
+    expect(broken.errors()).toContainEqual(["csam_alert", "send_failed"]);
+    expect(await markerOf(reportId), "unclaimed: the sweep tries again").toEqual({ bytes: 0, count: 0 });
+  });
+
+  it("the after-lock work never rejects: a failure in it is captured and counted, and the caller has its answer", async () => {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+    const points: { blobs: string[] }[] = [];
+    const made = serviceDeps({
+      METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) },
+    });
+    // From the moment work is handed to `defer`, every plain read through this handle fails —
+    // the alert's first step is such a read (today's marker).
+    let broken = false;
+    const db = new Proxy(made.deps.db, {
+      get(target, property, receiver) {
+        if (property === "select" && broken) {
+          return () => {
+            throw new Error("the database went away");
+          };
+        }
+        const value: unknown = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const handed: Promise<unknown>[] = [];
+    const deps = {
+      ...made.deps,
+      db,
+      defer: (promise: Promise<unknown>) => {
+        broken = true;
+        handed.push(promise);
+      },
+    };
+    const { reportId } = await lockSuspectedCsam(deps, file.id, { source: "system" });
+    expect(handed).toHaveLength(1);
+    expect((await Promise.allSettled(handed)).map((result) => result.status)).toEqual(["fulfilled"]);
+    await made.settle();
+    expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+    expect(
+      points.filter((point) => point.blobs[0] === "error").map((point) => point.blobs.slice(2, 4)),
+    ).toContainEqual(["csam_alert", "alert"]);
+    expect(alertsFor(reportId)).toHaveLength(0);
+    // The lock's own record did not depend on the step that failed.
+    expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
+  });
+
   it("one operator reached and two not: claimed, true, and the row counts the one", async () => {
     const { file, reportId } = await lockedButSilent();
     const operators = [1, 2, 3].map((n) => `op${n}-${rand(4)}@example.test`);
@@ -783,8 +900,12 @@ describe("lockSuspectedCsam", () => {
     expect(swept.checked).toBeGreaterThanOrEqual(1);
     expect(swept.alerted).toBeGreaterThanOrEqual(1);
     expect(alertsFor(silent.reportId)).toHaveLength(1);
-    // The sweep records an ALERT, never a lock: it does not know who locked.
-    expect(await lockRowsOf(silent.file.id)).toEqual([]);
+    // The lock's deferred work was lost with its invocation: the sweep records BOTH facts — the
+    // lock, with the source the report carries, marked as recovered; and the alert.
+    expect(await lockRowsOf(silent.file.id)).toMatchObject([
+      { actorType: "system", meta: { source: "photodna", reportId: silent.reportId, recoveredBy: "sweep" } },
+    ]);
+    expect(swept.recorded).toBeGreaterThanOrEqual(1);
     expect(await sentRowsOf(silent.file.id)).toMatchObject([
       { meta: { reportId: silent.reportId, via: "sweep", recipients: 1 } },
     ]);
@@ -797,6 +918,7 @@ describe("lockSuspectedCsam", () => {
     expect(due).not.toContain(handled.reportId);
     await sweepCsamAlerts(serviceDeps().deps, { limit: 1000 });
     expect(alertsFor(silent.reportId)).toHaveLength(1);
+    expect(await lockRowsOf(silent.file.id)).toHaveLength(1);
   });
 
   it("an empty operator list is not silent: an error line, a metric, and the marker stays unclaimed", async () => {

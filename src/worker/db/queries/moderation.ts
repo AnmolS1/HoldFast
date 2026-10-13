@@ -254,26 +254,49 @@ export async function setUserLegalHold(db: Executor, userId: string, held: boole
 }
 
 /**
- * Open suspected-CSAM reports that nobody has been told about TODAY: reports of category `csam`
- * with status `open` for which today's alert marker (ledger subject `notice`, id
- * `csam_alert:<report id>`) has not been claimed. Oldest first, at most `limit`. Read-only.
- * (A report someone is handling — `reviewing` — or has closed is not announced again.)
+ * Open suspected-CSAM reports with something still owed: reports of category `csam` with status
+ * `open` for which
+ *   - nobody has been told TODAY — today's alert marker (ledger subject `notice`, id
+ *     `csam_alert:<report id>`) has not been claimed; or
+ *   - the lock was NEVER recorded — no `csam_locked:<report id>` marker has been claimed on any
+ *     day (`lockRecorded: false`).
+ * Each row carries the report's own `source`. Oldest first, at most `limit`. Read-only.
+ * (A report someone is handling — `reviewing` — or has closed is not listed.)
  */
 export async function csamReportsToAnnounce(
   db: Executor,
   limit: number,
-): Promise<{ reportId: string; nodeId: string | null }[]> {
-  const result = await db.execute<{ id: string; node_id: string | null }>(sql`
-    SELECT r.id, r.node_id
-    FROM reports r
-    WHERE r.category = 'csam' AND r.status = 'open'
-      AND NOT EXISTS (
-        SELECT 1 FROM download_ledger l
-        WHERE l.day = (now() AT TIME ZONE 'UTC')::date
-          AND l.subject_type = 'notice'
-          AND l.subject_id = 'csam_alert:' || r.id::text
-          AND l.count > 0)
-    ORDER BY r.created_at, r.id
+): Promise<{ reportId: string; nodeId: string | null; source: ReportSource; lockRecorded: boolean }[]> {
+  const result = await db.execute<{
+    id: string;
+    node_id: string | null;
+    source: ReportSource;
+    lock_recorded: boolean;
+  }>(sql`
+    SELECT o.id, o.node_id, o.source, o.lock_recorded
+    FROM (
+      SELECT r.id, r.node_id, r.source, r.created_at,
+        EXISTS (
+          SELECT 1 FROM download_ledger l
+          WHERE l.day = (now() AT TIME ZONE 'UTC')::date
+            AND l.subject_type = 'notice'
+            AND l.subject_id = 'csam_alert:' || r.id::text
+            AND l.count > 0) AS told_today,
+        EXISTS (
+          SELECT 1 FROM download_ledger k
+          WHERE k.subject_type = 'notice'
+            AND k.subject_id = 'csam_locked:' || r.id::text
+            AND k.count > 0) AS lock_recorded
+      FROM reports r
+      WHERE r.category = 'csam' AND r.status = 'open'
+    ) o
+    WHERE NOT o.told_today OR NOT o.lock_recorded
+    ORDER BY o.created_at, o.id
     LIMIT ${limit}`);
-  return result.rows.map((row) => ({ reportId: row.id, nodeId: row.node_id }));
+  return result.rows.map((row) => ({
+    reportId: row.id,
+    nodeId: row.node_id,
+    source: row.source,
+    lockRecorded: row.lock_recorded === true,
+  }));
 }

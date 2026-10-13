@@ -23,8 +23,9 @@
 // (One difference in work is not this file's: for a GRANTEE the access query reads the owner's
 // state in a second statement — for a node shared with them, hidden or not.)
 // The one way to see such a node is the explicit option `{ includeHidden: true }`, which ONLY
-// ADMIN ROUTES pass (grep for `includeHidden`). The exports that take it: `getAccess` and
-// `requireRole`. `requireUpload` never does (nobody uploads into a hidden folder), nor does the
+// ADMIN ROUTES pass (grep for `includeHidden`) and which is honoured ONLY for an admin's own
+// request with no link scope — passed by anyone else it does nothing. The exports that take it:
+// `getAccess` and `requireRole`. `requireUpload` never does (nobody uploads into a hidden folder), nor does the
 // link scope's answer change with it being absent: a hidden node is hidden behind a link too.
 //
 // Trash and the other scan states are NOT part of a role: callers check those separately
@@ -43,6 +44,7 @@
 
 import type { Context } from "hono";
 import { effectiveAccess, effectiveHidden, effectiveTrashed, isDescendantOrSelf } from "../db/queries/tree";
+import { requireAdmin } from "../middleware/guards";
 import { forbidImpersonation } from "../middleware/impersonation";
 import { AppError } from "./errors";
 import { db, type AppEnv } from "./request-context";
@@ -64,6 +66,11 @@ export type LinkScope = { linkId: string; rootNodeId: string };
  * `includeHidden: true` — FOR ADMIN ROUTES ONLY — also answers for a node that is taken down
  * (itself or by an ancestor) or locked as `suspected_csam`. Without it such a node is
  * `not_found`, like an unknown id.
+ *
+ * THE OPTION IS NOT TRUSTED: it takes effect only when the request is an ADMIN's — exactly what
+ * `requireAdmin` (middleware/guards.ts) accepts: the role, two-factor, a session that passed it,
+ * not impersonating — AND no link scope is set. Passed by anyone else, or behind a link, it is
+ * ignored: the node stays `not_found` and the same work is done as without it.
  */
 export type AccessOptions = { includeHidden?: true };
 
@@ -94,6 +101,16 @@ export function withLinkScope(c: Context<AppEnv>, scope: LinkScope): void {
   state.cache.clear();
 }
 
+/** Is this request what the admin routes' guard accepts? The guard itself decides, not a copy. */
+function isAdminRequest(c: Context<AppEnv>): boolean {
+  try {
+    requireAdmin(c);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** What the session or the link alone says, hidden or not. One access query (none: signed out). */
 async function reach(c: Context<AppEnv>, link: LinkScope | null, nodeId: string): Promise<Access | null> {
   if (link) {
@@ -119,7 +136,7 @@ export async function getAccess(
   opts: AccessOptions = {},
 ): Promise<Access | null> {
   const state = stateOf(c);
-  const includeHidden = opts.includeHidden === true;
+  const includeHidden = opts.includeHidden === true && state.link === null && isAdminRequest(c);
   const cacheKey = `${includeHidden ? "all" : "visible"}:${nodeId}`;
   if (state.cache.has(cacheKey)) return state.cache.get(cacheKey) ?? null;
 

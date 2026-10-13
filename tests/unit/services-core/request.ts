@@ -15,7 +15,8 @@ import type { AppEnv, CoreDeps } from "../../../src/worker/services/request-cont
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 import { realCore } from "../auth/helpers";
 
-export type Caller = { user: SessionUser; impersonatedBy?: string } | null;
+/** `secondFactor: true` — the session passed a second factor just now (what an admin route asks). */
+export type Caller = { user: SessionUser; impersonatedBy?: string; secondFactor?: boolean } | null;
 
 export type InvokeOptions = {
   settings?: Settings;
@@ -56,6 +57,7 @@ function sessionFor(caller: NonNullable<Caller>): SessionInfo {
     createdAt: new Date(),
     updatedAt: new Date(),
     impersonatedBy: caller.impersonatedBy ?? null,
+    secondFactorAt: caller.secondFactor ? new Date() : null,
   };
 }
 

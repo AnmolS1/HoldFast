@@ -54,6 +54,16 @@ async function tree() {
   };
 }
 
+/**
+ * The same person on an ADMIN's request: the role, two-factor on the account, and a session that
+ * passed it — what `requireAdmin` accepts. (How a session comes to carry these is tested where
+ * sessions are made.)
+ */
+const asAdmin = (caller: Caller): Caller => ({
+  user: { ...caller!.user, role: "admin", twoFactorEnabled: true },
+  secondFactor: true,
+});
+
 const outcome = async (caller: Caller, work: Parameters<typeof invoke>[1]) => {
   const invoked = await invoke(caller, work);
   return invoked.ok ? "ok" : `${invoked.status} ${invoked.error}`;
@@ -428,10 +438,12 @@ describe("a node that listings hide does not exist here either", () => {
     }
 
     // The admin routes' option still sees it — and grants nothing to someone with no role.
-    expect((await value(t.owner, (c) => getAccess(c, t.file.id, { includeHidden: true })))?.role).toBe(
-      "owner",
-    );
-    expect(await value(t.stranger, (c) => getAccess(c, t.file.id, { includeHidden: true }))).toBeNull();
+    expect(
+      (await value(asAdmin(t.owner), (c) => getAccess(c, t.file.id, { includeHidden: true })))?.role,
+    ).toBe("owner");
+    expect(
+      await value(asAdmin(t.stranger), (c) => getAccess(c, t.file.id, { includeHidden: true })),
+    ).toBeNull();
     // A sibling outside the folder is unaffected, for a role and through the link above.
     expect((await value(t.owner, (c) => getAccess(c, sibling.id)))?.role).toBe("owner");
     expect((await value(t.viewer, (c) => getAccess(c, sibling.id)))?.role).toBe("viewer");
@@ -501,7 +513,7 @@ describe("a node that listings hide does not exist here either", () => {
   it("includeHidden — the admin routes' option — sees the node; the two answers are cached apart", async () => {
     for (const how of ["taken_down", "suspected_csam"] as const) {
       const t = await hidden(how);
-      const seen = await value(t.owner, async (c) => ({
+      const seen = await value(asAdmin(t.owner), async (c) => ({
         byDefault: await getAccess(c, t.file.id),
         asAdminRoute: await getAccess(c, t.file.id, { includeHidden: true }),
         byDefaultAgain: await getAccess(c, t.file.id),
@@ -512,10 +524,66 @@ describe("a node that listings hide does not exist here either", () => {
       expect(seen.byDefaultAgain, how).toBeNull();
       expect(seen.required, how).toMatchObject({ role: "owner" });
       // The option shows hidden nodes; it grants nothing to someone with no role.
-      expect(await value(t.stranger, (c) => getAccess(c, t.file.id, { includeHidden: true }))).toBeNull();
-      expect(
-        await outcome(t.stranger, (c) => requireRole(c, t.file.id, "viewer", { includeHidden: true })),
-      ).toBe("404 not_found");
+      const admin = asAdmin(t.stranger);
+      expect(await value(admin, (c) => getAccess(c, t.file.id, { includeHidden: true }))).toBeNull();
+      expect(await outcome(admin, (c) => requireRole(c, t.file.id, "viewer", { includeHidden: true }))).toBe(
+        "404 not_found",
+      );
+    }
+  });
+
+  it("includeHidden is not trusted: it works for an admin's own request only, and never behind a link", async () => {
+    for (const how of ["taken_down", "suspected_csam"] as const) {
+      const t = await hidden(how);
+      const unknown = crypto.randomUUID();
+      const reference = shape(await invoke(t.owner, (c) => requireRole(c, unknown, "viewer")));
+      const flag = { includeHidden: true } as const;
+      const owner = t.owner!.user;
+      const notAdmins: [string, Caller][] = [
+        ["the owner, not an admin", t.owner],
+        ["an editor", t.editor],
+        [
+          "the role without two-factor on the account",
+          { user: { ...owner, role: "admin" }, secondFactor: true },
+        ],
+        [
+          "an admin whose SESSION has not passed a second factor",
+          { user: { ...owner, role: "admin", twoFactorEnabled: true } },
+        ],
+        ["an admin impersonating the owner", { ...asAdmin(t.owner)!, impersonatedBy: "a".repeat(32) }],
+      ];
+      for (const [who, caller] of notAdmins) {
+        expect(await value(caller, (c) => getAccess(c, t.file.id, flag)), `${how}: ${who}`).toBeNull();
+        expect(shape(await invoke(caller, (c) => requireRole(c, t.file.id, "viewer", flag))), who).toEqual(
+          reference,
+        );
+        // Ignored means ignored: the same work as without it (the hidden query is still sent).
+        const sent = await value(caller, async (c) => {
+          const before = statementsSent(db(c));
+          await getAccess(c, t.file.id, flag);
+          return statementsSent(db(c)) - before;
+        });
+        expect(sent, who).toBe(caller === t.editor ? 3 : 2);
+      }
+      // The control: the admin's own request sees it — with one statement, the access query.
+      const admin = await value(asAdmin(t.owner), async (c) => {
+        const before = statementsSent(db(c));
+        const access = await getAccess(c, t.file.id, flag);
+        return { role: access?.role, sent: statementsSent(db(c)) - before };
+      });
+      expect(admin, how).toEqual({ role: "owner", sent: 1 });
+
+      // Behind a link the option does nothing, whoever is signed in — an admin included.
+      for (const caller of [null, t.owner, asAdmin(t.owner)]) {
+        const scoped = await value(caller, async (c) => {
+          withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t.shared.id });
+          return {
+            hidden: await getAccess(c, t.file.id, flag),
+            visible: (await getAccess(c, t.inner.id, flag))?.via,
+          };
+        });
+        expect(scoped, how).toEqual({ hidden: null, visible: "link" });
+      }
     }
   });
 
