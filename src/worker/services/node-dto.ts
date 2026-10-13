@@ -22,6 +22,8 @@
 //    is refused with a plain `Error`: the caller's listing or `requireRole` should have dropped
 //    it, so its arrival here is a programming error and must not become an answer. (A takedown
 //    inherited from a folder above cannot be seen on the row; that stays the caller's check.)
+//    The one system node that is ever answered is the viewer's OWN avatar, and only through
+//    `toOwnAvatarDto`, which takes nothing else.
 //  - Nothing is parsed here; the tests check every output against the shared schemas.
 //
 // BATCHED. A page costs one names read and one `sharingSummary` call (none when the viewer owns
@@ -98,12 +100,13 @@ function sharingOf(summary: SharingSummary | undefined): NodeSharing {
 
 type Lookups = { names: Map<string, string>; sharing: Map<string, SharingSummary> };
 
-type Viewer = { viewerId: string; role: Role; isShareRoot: boolean };
+/** `system`: the value `nodes.system` must have — null everywhere but in `toOwnAvatarDto`. */
+type Viewer = { viewerId: string; role: Role; isShareRoot: boolean; system?: "avatar" };
 
 function mapRow(row: NodeRow, viewer: Viewer, lookups: Lookups): NodeDto {
   const { viewerId, role } = viewer;
   const { scanStatus } = row;
-  if (scanStatus === "suspected_csam" || row.takedownAt !== null || row.system !== null) {
+  if (scanStatus === "suspected_csam" || row.takedownAt !== null || row.system !== (viewer.system ?? null)) {
     throw new Error("node-dto: a hidden or system node was handed to the mapper");
   }
   const isOwner = row.ownerId === viewerId;
@@ -245,4 +248,23 @@ export async function toSearchResultDtos(
     ),
     pathHint: hit.pathHint ?? "",
   }));
+}
+
+/**
+ * The viewer's own avatar — the one system node an answer ever carries (the avatar upload's).
+ * Only a row with `system = 'avatar'` that the viewer owns; anything else throws: another
+ * user's avatar, any other system node, a plain node (that is `toNodeDto`'s), and an avatar that
+ * is taken down or `suspected_csam`. Mapped as the owner's view of any node.
+ */
+export async function toOwnAvatarDto(
+  db: Executor,
+  row: NodeRow,
+  view: { viewerId: string },
+): Promise<NodeDto> {
+  const lookups = await lookupsFor(db, [row], view.viewerId);
+  return mapRow(
+    row,
+    { viewerId: view.viewerId, role: "owner", isShareRoot: false, system: "avatar" },
+    lookups,
+  );
 }

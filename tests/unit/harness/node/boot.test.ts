@@ -24,9 +24,18 @@ describe("node project", () => {
 describe("local-env", () => {
   it("derives the local connection string from HOLDFAST_DB alone", () => {
     delete process.env.HOLDFAST_DB;
-    expect(localDbUrl()).toBe("postgres://postgres:postgres@localhost:5432/holdfast");
+    // The default belongs to the main checkout only (named here, so this passes in any checkout).
+    expect(localDbUrl(localDbName("/repo"))).toBe("postgres://postgres:postgres@localhost:5432/holdfast");
     process.env.HOLDFAST_DB = "holdfast_t05";
     expect(localDbUrl()).toBe("postgres://postgres:postgres@localhost:5432/holdfast_t05");
+  });
+
+  it("a worktree checkout without HOLDFAST_DB stops instead of using the main checkout's database", () => {
+    delete process.env.HOLDFAST_DB;
+    expect(() => localDbName("/repo/.claude/worktrees/t05")).toThrow(/HOLDFAST_DB is not set in a worktree/);
+    expect(localDbName("/repo")).toBe("holdfast");
+    process.env.HOLDFAST_DB = "holdfast_t05";
+    expect(localDbName("/repo/.claude/worktrees/t05")).toBe("holdfast_t05");
   });
 
   it.each(["neondb", "holdfast-t05", "holdfast_T05", 'holdfast"; drop', "holdfast_x@neon.tech/neondb"])(

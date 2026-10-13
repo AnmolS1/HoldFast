@@ -14,41 +14,21 @@
 
 import { fileTypeFromBuffer } from "file-type";
 import {
+  INLINE_TYPES,
   MIME_CATEGORIES,
   PREVIEW_TEXT_MAX_BYTES,
+  PREVIEW_TEXT_TYPES,
   THUMB_INPUT_MAX_BYTES,
   type MimeCategoryName,
 } from "../../shared/constants";
+
+// The two lists live in `src/shared/constants.ts` (the SPA asks the same lists).
+export { INLINE_TYPES, PREVIEW_TEXT_TYPES };
 
 /** How many leading bytes of an object `sniff` is given. A shorter object passes all of it. */
 export const SNIFF_PREFIX_BYTES = 8_192;
 
 export const OCTET_STREAM = "application/octet-stream";
-
-/**
- * Media a browser may render in place. The strings are the ones the detector emits: an .m4a is
- * `audio/x-m4a` and an .m4v `video/x-m4v` (the MP4 container under the detector's names).
- */
-export const INLINE_TYPES: readonly string[] = Object.freeze([
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
-  "image/avif",
-  "image/bmp",
-  "image/heic",
-  "image/heif",
-  "video/mp4",
-  "video/webm",
-  "video/quicktime",
-  "video/x-m4v",
-  "audio/mpeg",
-  "audio/ogg",
-  "audio/wav",
-  "audio/flac",
-  "audio/mp4",
-  "audio/x-m4a",
-]);
 
 /**
  * Images the thumbnailer is asked to transform. AVIF and BMP are inline types but not here (the
@@ -62,9 +42,6 @@ const THUMB_TYPES: readonly string[] = Object.freeze([
   "image/heic",
   "image/heif",
 ]);
-
-/** Text the SPA's text viewer may fetch, besides whatever `categoryOf` calls code. */
-const PREVIEW_TEXT_TYPES: readonly string[] = Object.freeze(["text/plain", "text/markdown", "text/csv"]);
 
 /** Extensions that get a warning page before a public-link download. */
 const DANGEROUS_EXTS: readonly string[] = Object.freeze([

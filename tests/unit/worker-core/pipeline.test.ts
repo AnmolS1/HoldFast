@@ -130,8 +130,8 @@ describe("csrf", () => {
       { origin: TEST_APP_ORIGIN },
     ];
     for (const headers of cases) {
-      const answer = await send("/api/nodes/folder", { method: "POST", headers });
-      expect(answer.body.reached, JSON.stringify(headers)).toBe("/api/nodes/folder");
+      const answer = await send("/api/_probe/change", { method: "POST", headers });
+      expect(answer.body.reached, JSON.stringify(headers)).toBe("/api/_probe/change");
     }
   });
 
@@ -636,7 +636,8 @@ describe("impersonation is read-only", () => {
     const app = appWith(fake, { extraRouters: [router] });
     // The two routes this test adds (the real routers have parameterised routes of their own).
     const routes = app.routes.filter(
-      (route) => route.path.includes(":") && /^\/api\/(nodes|account\/sessions)\//.test(route.path),
+      (route) =>
+        route.path.includes(":") && /^\/api\/(nodes\/[^/]+\/copy$|account\/sessions\/)/.test(route.path),
     );
     expect(routes.map((route) => `${route.method} ${concrete(route.path)}`)).toEqual([
       "POST /api/nodes/0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e/copy",
@@ -700,7 +701,7 @@ describe("impersonation is read-only", () => {
   it("does not affect an ordinary session", async () => {
     const { fake, post } = setup();
     signIn(fake);
-    expect((await post("/api/nodes/folder")).body.reached).toBe("/api/nodes/folder");
+    expect((await post("/api/_probe/change")).body.reached).toBe("/api/_probe/change");
   });
 
   it("forbidImpersonation refuses a GET that mints content access", async () => {
@@ -756,7 +757,7 @@ describe("terms gate", () => {
     const { fake, post } = setup();
     signIn(fake, { termsVersion: "2025-01-01" });
     fake.state.termsVersionInDb = "2026-10-01";
-    const answer = await post("/api/nodes/folder");
+    const answer = await post("/api/_probe/change");
     expect(answer.status).toBe(200);
     expect(answer.body.termsStale).toBe(false);
     expect(fake.calls).toContain("termsVersionOf");
@@ -765,7 +766,7 @@ describe("terms gate", () => {
   it("does not read the database when the terms are current", async () => {
     const { fake, post } = setup();
     signIn(fake);
-    await post("/api/nodes/folder");
+    await post("/api/_probe/change");
     expect(fake.calls).not.toContain("termsVersionOf");
   });
 });
