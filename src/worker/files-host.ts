@@ -23,9 +23,9 @@
 // `Range` is parsed from the size in the database before the store is asked, the store gets
 // parsed forms only (never the request's headers), and `If-Range` is compared here.
 //
-// NOTHING IS BUFFERED, AND WHAT IS NOT SENT IS GIVEN BACK. The body is piped through a counting
-// pass-through; when the stream ends — completed, cancelled or failed — the bytes that were
-// charged and not sent are refunded on every ledger (`settle`). No URL, `Referer` or token is
+// NOTHING IS BUFFERED, AND WHAT IS NOT SENT IS GIVEN BACK. The body passes through a counting
+// pump, chunk by chunk; when the stream ends — completed, cancelled or failed — the bytes that
+// were charged and not sent are refunded on every ledger (`settleLater`). No URL, `Referer` or token is
 // ever logged here.
 
 import { canonicalRequest, isHeadRequest, requestPath } from "./middleware/canonical";
@@ -464,26 +464,37 @@ function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
   };
 }
 
-/** The body, counted: `ended` is called once with the bytes that passed, whatever ended it. */
+/**
+ * The body, counted. Each chunk is written to a fixed-length stream — so the response carries
+ * its `Content-Length` — and a write resolves only when the reader of the response has taken the
+ * chunk: `sent` is what was really handed over, never what was merely read from the store.
+ * `ended` is called exactly once with it, whatever ended the stream: its end, a reader that went
+ * away (the pending write fails), or the store failing. Nothing is buffered beyond one chunk.
+ */
 function counted(body: ReadableStream<Uint8Array>, total: number, ended: (sent: number) => void) {
+  const fixed = new FixedLengthStream(total);
+  const writer = fixed.writable.getWriter();
+  const reader = body.getReader();
   let sent = 0;
-  let over = false;
-  const end = () => {
-    if (over) return;
-    over = true;
-    ended(sent);
+  const pump = async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+        sent += value.byteLength;
+      }
+      await writer.close();
+    } catch (error) {
+      // Give up both ends: the store's body is never left open behind a reader that is gone.
+      await reader.cancel(error).catch(() => {});
+      await writer.abort(error).catch(() => {});
+    } finally {
+      ended(sent);
+    }
   };
-  const counter = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      sent += chunk.byteLength;
-      controller.enqueue(chunk);
-    },
-    flush: end,
-  });
-  // A reader that goes away cancels the readable side, which fails this pipe: that is an end too.
-  body.pipeTo(counter.writable).then(end, end);
-  // The length is known, so the response carries it instead of being chunked.
-  return counter.readable.pipeThrough(new FixedLengthStream(total));
+  void pump().catch(() => {});
+  return fixed.readable;
 }
 
 async function ipSubject(c: Ctx): Promise<string> {
@@ -598,9 +609,16 @@ async function serveObject(
     conditions = { match: null, noneMatch: null, unmodifiedSince: null, modifiedSince: null };
   }
 
-  // 1 — the range, from the size in hand, before the store is asked.
-  const range = size === null ? null : parseRange(rangeHeader, size);
-  if (range === "unsatisfiable") return unsatisfiable(size ?? 0);
+  // 1 — the range, from the size in hand, before the store is asked. (A thumbnail's size is its
+  // cached object's: asked for only when a range was sent.)
+  let known = size;
+  if (known === null && rangeHeader !== undefined) {
+    const meta = await store.head(key);
+    if (!meta) return null;
+    known = meta.size;
+  }
+  const range = known === null ? null : parseRange(rangeHeader, known);
+  if (range === "unsatisfiable") return unsatisfiable(known ?? 0);
 
   // 2, 3 — the store, with parsed forms only.
   let found: GetResult = await store.get(key, {

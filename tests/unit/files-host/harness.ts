@@ -50,13 +50,23 @@ export const keys = createKeys(env.FILES_TOKEN_SECRET);
 
 // ── requests ────────────────────────────────────────────────────────────────────────────────
 
-export type Ctx = ExecutionContext & { pending: Promise<unknown>[]; settle(): Promise<void> };
+export type Ctx = ExecutionContext & {
+  pending: Promise<unknown>[];
+  settle(): Promise<void>;
+  /** Resolves when the next promise is handed to `waitUntil` — an event to wait for, not a time. */
+  next(): Promise<void>;
+};
 
 function newCtx(): Ctx {
   const pending: Promise<unknown>[] = [];
+  const waiting: Array<() => void> = [];
   return {
     pending,
-    waitUntil: (promise: Promise<unknown>) => void pending.push(promise),
+    next: () => new Promise<void>((resolve) => waiting.push(resolve)),
+    waitUntil: (promise: Promise<unknown>) => {
+      pending.push(promise);
+      for (const resolve of waiting.splice(0)) resolve();
+    },
     passThroughOnException() {},
     props: {},
     async settle() {
@@ -317,12 +327,13 @@ export type BucketSpy = {
 
 /**
  * The real bucket, with every read recorded and every body watched for a cancel.
- * `stallAfter: n` — a body hands out its first `n` bytes and then nothing more, until it is
- * cancelled: a download whose reader stops, without a sleep and whatever the chunk sizes are.
+ * `splitAt: n` — a body arrives as two chunks, its first `n` bytes and the rest: a reader that
+ * takes the first chunk and goes away has received exactly `n` bytes, whatever sizes the store
+ * would have chosen and without a sleep.
  */
 export function spyBucket(
   overrides: Partial<R2Bucket> = {},
-  options: { stallAfter?: number } = {},
+  behaviour: { splitAt?: number } = {},
 ): BucketSpy {
   const real = env.FILES;
   const spy: BucketSpy = { bucket: null as unknown as R2Bucket, gets: [], heads: [], puts: [], cancelled: 0 };
@@ -336,13 +347,16 @@ export function spyBucket(
       const found = await real.get(key, options);
       if (!found || !("body" in found)) return found;
       let watched: ReadableStream<Uint8Array>;
-      if (options.stallAfter !== undefined) {
+      if (behaviour.splitAt !== undefined) {
         const whole = new Uint8Array(await new Response(found.body).arrayBuffer());
-        const first = whole.subarray(0, options.stallAfter);
+        const chunks = [whole.subarray(0, behaviour.splitAt), whole.subarray(behaviour.splitAt)].filter(
+          (chunk) => chunk.byteLength > 0,
+        );
         watched = new ReadableStream<Uint8Array>({
-          start(controller) {
-            if (first.byteLength > 0) controller.enqueue(first);
-            if (first.byteLength === whole.byteLength) controller.close();
+          pull(controller) {
+            const chunk = chunks.shift();
+            if (chunk) controller.enqueue(chunk);
+            else controller.close();
           },
           cancel() {
             spy.cancelled += 1;
