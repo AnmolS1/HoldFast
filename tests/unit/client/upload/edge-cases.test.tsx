@@ -375,6 +375,20 @@ describe("the connection drops", () => {
   });
 });
 
+describe("a page opened offline", () => {
+  it("queues what is added and sends it once the connection is back", async () => {
+    const onLine = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    await addFiles([{ file: smallFile("a.txt") }], null);
+    await settle();
+    expect(items()[0]).toMatchObject({ state: "paused", pauseReason: "offline" });
+    expect(server.inits).toEqual([]);
+    onLine.mockReturnValue(true);
+    window.dispatchEvent(new Event("online"));
+    await settle();
+    expect(server.completes.length).toBe(1);
+  });
+});
+
 describe("limits and switches", () => {
   it("429 ceiling_exceeded pauses the queue with its sentence and resumes when Retry-After has passed", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });

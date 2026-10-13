@@ -1000,6 +1000,8 @@ export async function addFiles(
   folders: readonly string[] = [],
 ): Promise<void> {
   const addEpoch = epoch;
+  // A page that was opened offline never saw the event.
+  if (typeof navigator !== "undefined" && navigator.onLine === false) queuePauses.add("offline");
   const fresh = incoming.filter((entry) => !rejoin(entry.file) && !refusedBefore(entry.file));
   pump();
   if (fresh.length === 0 && folders.length === 0) return;

@@ -77,7 +77,6 @@ export const messages = {
   "row.failed": "Didn't finish. Try again.",
   "row.unreadable": "Couldn't read this file. It may have been moved or changed.",
   "row.refused": "Refused — this file can't be stored here.",
-  "row.ownerFull": "The owner's storage is full.",
   "action.pause": "Pause {name}",
   "action.resume": "Resume {name}",
   "action.cancel": "Cancel {name}",
