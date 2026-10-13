@@ -10,7 +10,7 @@
 // from now everything planted is still young, 49 hours from now it is old.
 import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import { trash as trashQuery } from "../../../src/worker/db/queries/trash";
@@ -27,7 +27,9 @@ import {
 } from "../../../src/worker/jobs/reconcile";
 import { nameKeyOf } from "../../../src/worker/services/filename";
 import { captureError } from "../../../src/worker/sentry";
+import { registerCoreDeps } from "../../../src/worker/services/request-context";
 import { avatarKey, keyFor, thumbKey } from "../../../src/worker/services/storage";
+import { realCore } from "../auth/helpers";
 import {
   audits,
   cronEvent,
@@ -70,6 +72,7 @@ beforeAll(async () => {
   hadCursor = "reconcileCursor" in stored;
   found = stored.reconcileCursor;
 });
+afterEach(() => registerCoreDeps(realCore));
 afterAll(async () => {
   if (hadCursor) await setSetting(testDb(), "reconcileCursor", found, null);
   else await testDb().delete(settingsTable).where(eq(settingsTable.key, "reconcileCursor"));
@@ -285,6 +288,26 @@ describe("reconcile: the orphan sweep", () => {
       deleted: 3,
     });
     expect(await present(p.orphans)).toEqual([]);
+    await env.FILES.delete(p.odd);
+  });
+
+  it("guard (a), the other reading: the TABLE says off while the run was given on — nothing is deleted", async () => {
+    const p = await planted();
+    // The run's own settings (read up to 60 s ago) still say on; the table, read now, says off:
+    // the restore runbook switched it a moment ago.
+    const stale = jobContext({ settings: { orphanDeleteEnabled: true } });
+    registerCoreDeps({ ...realCore, getSettings: async () => ({ orphanDeleteEnabled: false }) });
+    const result = await sweepOrphans(stale.bg, { from: START, stopAt: FAR, now: inHours(1000) });
+    registerCoreDeps(realCore);
+    expect(result).toMatchObject({ outcome: "disabled", deleted: 0 });
+    expect(await present(p.orphans)).toEqual(p.orphans);
+    expect(stale.outcomes("reconcile")).toEqual(["orphan_disabled"]);
+    // Control: the table read saying on (as the real one does here), the same sweep deletes them.
+    const on = jobContext({ settings: { orphanDeleteEnabled: true } });
+    expect(await sweepOrphans(on.bg, { from: START, stopAt: FAR, now: inHours(1000) })).toMatchObject({
+      outcome: "swept",
+      deleted: 3,
+    });
     await env.FILES.delete(p.odd);
   });
 

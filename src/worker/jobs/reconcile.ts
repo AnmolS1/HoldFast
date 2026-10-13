@@ -40,7 +40,7 @@ import { reconcileUsedBytes } from "../db/queries/quota";
 import { knownVersions, referencedKeys, userIdsAfter } from "../db/queries/trash-jobs";
 import { captureError } from "../sentry";
 import { auditInTx } from "../services/audit";
-import type { BackgroundContext } from "../services/request-context";
+import { coreFor, type BackgroundContext } from "../services/request-context";
 import { AVATAR_PREFIX, type ListedObject, storage, THUMB_PREFIX, UPLOAD_PREFIX } from "../services/storage";
 import type { Job } from "./index";
 
@@ -251,7 +251,8 @@ export async function sweepOrphans(
   const idle = { listed: 0, candidates: 0, deleted: 0, ...start, done: false };
   // Guard (a), read both ways: what this run was given, and the table as it is this instant.
   const given = await bg.settings();
-  const fresh = await getSettings(bg.db, { fresh: true });
+  // (Through the injected reader, like every other setting: a test can then say what the table says.)
+  const fresh = await coreFor(bg).getSettings(bg.db, { fresh: true });
   if (given.orphanDeleteEnabled === false || fresh.orphanDeleteEnabled === false) {
     bg.metric("job", { kind: "reconcile", outcome: "orphan_disabled" });
     return { outcome: "disabled", ...idle };
