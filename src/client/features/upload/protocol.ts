@@ -3,6 +3,7 @@
 // and fail with the same `ApiError`.
 import type { ZodType } from "zod";
 import { UsageDto } from "../../../shared/schemas/account";
+import { NodeId } from "../../../shared/schemas/common";
 import { NodeDetailDto, NodeDto, type CreateFolderBody } from "../../../shared/schemas/node";
 import {
   CompleteUploadResponse,
@@ -47,7 +48,11 @@ export function getUsage(signal?: AbortSignal): Promise<UsageDto> {
   return api("/api/account/usage", { schema: UsageDto, signal });
 }
 
+/** Only for a well-formed id: the id becomes part of the request path. */
 export function getNode(nodeId: string, signal?: AbortSignal): Promise<NodeDetailDto> {
+  if (!NodeId.safeParse(nodeId).success) {
+    return Promise.reject(new ApiError({ status: 404, code: "not_found", message: t("row.failed") }));
+  }
   return api(`/api/nodes/${nodeId}`, { schema: NodeDetailDto, signal });
 }
 
