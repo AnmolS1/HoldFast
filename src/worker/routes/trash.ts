@@ -28,11 +28,12 @@
 import { Hono, type Context } from "hono";
 import { UUID_PARAM } from "../../shared/ids";
 import { type EmptyTrashResponse, TrashQuery, type TrashResponse } from "../../shared/schemas/node";
+import type { Tx } from "../db/client";
 import { LegalHoldError, QueryError } from "../db/errors";
 import { getNode } from "../db/queries/nodes";
 import { listTrash, restore, trash } from "../db/queries/trash";
 import { countTrash, purgeWasRequested, requestPurge } from "../db/queries/trash-jobs";
-import { effectiveTrashed } from "../db/queries/tree";
+import { effectiveAccess, effectiveTrashed, lockOwnerTree } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node } from "../db/schema";
 import { purgeRoot, recordPurgeRequest } from "../jobs/purge";
@@ -78,6 +79,23 @@ async function knownNode(c: Context<AppEnv>, id: string): Promise<Node> {
   const node = await getNode(db(c), id);
   if (!node || node.system !== null) throw new AppError("not_found");
   return node;
+}
+
+/**
+ * An editor's right to restore, decided again where the restore happens: under the owner's tree
+ * lock (the first lock `restore` takes too), from the row and the share as they are then. What
+ * the route read before its transaction may be stale — the file restored and trashed again by
+ * someone else, the editor's share lowered — and a restore must not ride on it.
+ * (Share rows are not locked by anything: a change in the same instant is seen or not.)
+ */
+async function assertStillTheirs(tx: Tx, node: Node, userId: string): Promise<void> {
+  await lockOwnerTree(tx, node.ownerId);
+  const current = await getNode(tx, node.id);
+  const parent =
+    current && current.parentId !== null ? await effectiveAccess(tx, userId, current.parentId) : null;
+  if (!current || current.trashedBy !== userId || !parent || parent.role === "viewer") {
+    throw new AppError("forbidden", undefined, { reason: "role" });
+  }
 }
 
 const isTrashedRoot = (node: Node) => node.trashedRoot && node.deletedAt !== null;
@@ -170,7 +188,10 @@ router.post(`/nodes/${ID}/restore`, async (c) => {
 
   let row: Node | null;
   try {
-    row = await retryOnDeadlock(db(c), (tx) => restore(tx, id, { toRoot }));
+    row = await retryOnDeadlock(db(c), async (tx) => {
+      if (access.role !== "owner") await assertStillTheirs(tx, node, user.id);
+      return restore(tx, id, { toRoot });
+    });
   } catch (error) {
     // Out from under a folder that protects it, or its folder was trashed in this instant: the
     // same answer as above, and nothing that says which.

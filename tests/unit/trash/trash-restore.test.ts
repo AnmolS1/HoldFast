@@ -19,6 +19,7 @@ import {
   closeNotice,
   deadlockingDb,
   envelope,
+  hookedDb,
   makeFile,
   makeFolder,
   makeShare,
@@ -223,6 +224,54 @@ describe("POST /nodes/:id/restore", () => {
       .where(and(eq(shares.nodeId, t.shared.id), eq(shares.granteeUserId, t.ids.editor)));
     expect(envelope(await restore(t.editor, t.inner.id))).toMatchObject({ status: 403, error: "forbidden" });
     expect((await nodeById(t.inner.id))!.trashedRoot).toBe(true);
+  });
+
+  it("the editor's right is decided again inside the transaction: lowered, or the file re-trashed by someone else, in between → 403", async () => {
+    // The share is lowered after the route has looked and before its transaction starts.
+    const t = await tree();
+    await trash(t.editor, t.inner.id);
+    let done = false;
+    const lowered = hookedDb(async () => {
+      if (done) return;
+      done = true;
+      await testDb()
+        .update(shares)
+        .set({ role: "viewer" })
+        .where(and(eq(shares.nodeId, t.shared.id), eq(shares.granteeUserId, t.ids.editor)));
+    });
+    const refusal = await api(t.editor, `/nodes/${t.inner.id}/restore`, {
+      ...POST,
+      core: { createDb: () => lowered },
+    });
+    expect(done).toBe(true);
+    expect(envelope(refusal)).toMatchObject({ status: 403, error: "forbidden", details: { reason: "role" } });
+    expect((await nodeById(t.inner.id))!.trashedRoot).toBe(true);
+    expect(await audits("node.restore", t.inner.id)).toEqual([]);
+
+    // Someone else restored it and trashed it again in between: it is their trash now.
+    const u = await tree();
+    await trash(u.editor, u.inner.id);
+    let swapped = false;
+    const retrashed = hookedDb(async () => {
+      if (swapped) return;
+      swapped = true;
+      await setNode(u.inner.id, { trashedBy: u.ids.owner });
+    });
+    const second = await api(u.editor, `/nodes/${u.inner.id}/restore`, {
+      ...POST,
+      core: { createDb: () => retrashed },
+    });
+    expect(second.status).toBe(403);
+    expect((await nodeById(u.inner.id))!.trashedRoot).toBe(true);
+
+    // Control: nothing changed in between — the same request restores.
+    const v = await tree();
+    await trash(v.editor, v.inner.id);
+    const untouched = hookedDb(async () => {});
+    expect(
+      (await api(v.editor, `/nodes/${v.inner.id}/restore`, { ...POST, core: { createDb: () => untouched } }))
+        .status,
+    ).toBe(200);
   });
 
   it("under a trashed folder: the owner gets it back at the top level, renamed when the name is taken; an editor is refused", async () => {
