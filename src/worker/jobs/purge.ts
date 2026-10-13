@@ -7,8 +7,9 @@
 //   purgeRoot(bg, id, "cron")       the purge job                        audit `system.purge`
 //   purgeRoot(bg, id, "account")    the account purge's roots            audit `system.purge`
 //
-// One transaction: the rows go, the bytes are given back and the audit row is written — all three
-// or none (no purge without its record). The objects go AFTER the commit: a crash in between
+// One transaction: the owner's tree lock, the root re-read under it (still trashed? still due? —
+// its owner may have restored it since the caller looked), the rows, the bytes given back and
+// the audit row — all or none (no purge without its record). The objects go AFTER the commit: a crash in between
 // leaves objects nothing references, which the reconcile job's orphan sweep removes; no row ever
 // points at a missing object.
 //
@@ -20,6 +21,7 @@ import type { Context } from "hono";
 import type { Db, Tx } from "../db/client";
 import { LegalHoldError, pgError } from "../db/errors";
 import { release } from "../db/queries/quota";
+import { lockTreeForPurge, type PurgeRule } from "../db/queries/trash-jobs";
 import {
   type DeletedRows,
   deleteSubtreeRows,
@@ -40,14 +42,20 @@ export type PurgeReason = "user" | "cron" | "account";
 
 /**
  * `purged`: rows and record committed (`cleaned: false` when an object could not be removed —
- * the orphan sweep will); `held`: refused by the gate, nothing changed; `missing`: no such root;
- * `retry`: a job's transaction was ended by Postgres (deadlock, serialization) — next tick.
+ * the orphan sweep will); `held`: refused by the gate, nothing changed; `skipped`: the root is no
+ * longer what this caller may purge (it was restored meanwhile), nothing changed; `missing`: no
+ * such root; `retry`: a job's transaction was ended by Postgres (deadlock, serialization) — next
+ * tick.
  */
 export type PurgeResult =
   | { outcome: "purged"; freedBytes: number; objects: number; cleaned: boolean }
   | { outcome: "held" }
+  | { outcome: "skipped" }
   | { outcome: "missing" }
   | { outcome: "retry" };
+
+/** What each caller may purge. The list or the read it acted on is advice; this is re-asked under the lock. */
+const RULES: Record<PurgeReason, PurgeRule> = { cron: "due", user: "trashed", account: "any" };
 
 /** Roots and versions taken from the queue at once. */
 export const PURGE_BATCH = 200;
@@ -95,14 +103,14 @@ async function removeObjects(env: Env, deleted: DeletedRows): Promise<boolean> {
 
 async function purge(
   source: PurgeSource,
-  rows: (tx: Tx) => Promise<DeletedRows>,
+  rows: (tx: Tx) => Promise<DeletedRows | null>,
   record: (tx: Tx, deleted: DeletedRows) => Promise<void>,
 ): Promise<PurgeResult> {
-  let deleted: DeletedRows;
+  let deleted: DeletedRows | null;
   try {
     deleted = await inTransaction(source, async (tx) => {
       const gone = await rows(tx);
-      if (gone.ownerId === null) return gone;
+      if (gone === null || gone.ownerId === null) return gone;
       await release(tx, gone.ownerId, gone.freedBytes);
       await record(tx, gone);
       return gone;
@@ -112,14 +120,18 @@ async function purge(
     if (!isContext(source) && RETRYABLE.has(pgError(error)?.code ?? "")) return { outcome: "retry" };
     throw error;
   }
+  if (deleted === null) return { outcome: "skipped" };
   if (deleted.ownerId === null) return { outcome: "missing" };
+  // Only now, and only what the committed transaction returned.
   const cleaned = await removeObjects(source.env, deleted);
   return { outcome: "purged", freedBytes: deleted.freedBytes, objects: deleted.r2Keys.length, cleaned };
 }
 
 /**
- * Deletes the root and everything under it — any root, trashed or not; the CALLER decides that
- * it may go (a trashed root, an account being purged). See the header for what one call does.
+ * Deletes the root and everything under it. Whether it may go is decided HERE, inside the
+ * transaction and under the owner's tree lock, from the root as it is then — not from the list
+ * or the read the caller acted on: a root that was restored in between is `skipped`.
+ * See the header for what one call does.
  */
 export async function purgeRoot(
   source: PurgeSource,
@@ -129,7 +141,8 @@ export async function purgeRoot(
   const action = reason === "user" ? "node.purge" : "system.purge";
   return purge(
     source,
-    (tx) => deleteSubtreeRows(tx, rootId),
+    async (tx) =>
+      (await lockTreeForPurge(tx, rootId, RULES[reason])) ? deleteSubtreeRows(tx, rootId) : null,
     (tx, gone) =>
       // Short facts only: how much went. No name, no key.
       auditInTx(

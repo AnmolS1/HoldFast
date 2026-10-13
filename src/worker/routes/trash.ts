@@ -76,10 +76,15 @@ async function knownNode(c: Context<AppEnv>, id: string): Promise<Node> {
 
 const isTrashedRoot = (node: Node) => node.trashedRoot && node.deletedAt !== null;
 
-/** Deletes one trashed root for good — or, when it is held, records that its owner asked. */
-async function purgeOne(c: Context<AppEnv>, rootId: string): Promise<void> {
+/**
+ * Deletes one trashed root for good — or, when it is held, records that its owner asked.
+ * False when it was no trashed root any more by the time the purge held its lock (restored in
+ * this instant): nothing was deleted.
+ */
+async function purgeOne(c: Context<AppEnv>, rootId: string): Promise<boolean> {
   const result = await purgeRoot(c, rootId, "user");
   if (result.outcome === "held") await requestPurge(db(c), [rootId]);
+  return result.outcome !== "skipped";
 }
 
 router.get("/trash", async (c) => {
@@ -169,6 +174,6 @@ router.delete(`/nodes/${ID}`, async (c) => {
   await requireRole(c, id, "owner");
   const node = await knownNode(c, id);
   if (!isTrashedRoot(node)) throw refused();
-  await purgeOne(c, id);
+  if (!(await purgeOne(c, id))) throw refused();
   return c.body(null, 204);
 });

@@ -24,8 +24,10 @@ import {
   user,
 } from "../schema";
 import { nodeProtected, userHeld } from "./holds";
-import { notEffectivelyHidden } from "./tree";
+import { lockOwnerTree, notEffectivelyHidden } from "./tree";
 import { COMPLETING_STALE_MINUTES } from "./uploads";
+import { markStarted } from "./user-purge";
+import { lockUser } from "./users";
 
 // ── the trash routes ────────────────────────────────────────────────────────────────────────
 
@@ -60,6 +62,44 @@ export async function purgeWasRequested(db: Executor, nodeId: string): Promise<b
     ) CYCLE id SET is_cycle USING path
     SELECT EXISTS (SELECT 1 FROM up WHERE purge_requested_at IS NOT NULL) AS requested`);
   return result.rows[0]?.requested === true;
+}
+
+/**
+ * Which roots a caller may delete for good: `due` — the purge job's (a trashed root past its
+ * date, or one whose purge was requested); `trashed` — a user's (any trashed root); `any` — the
+ * account purge's (every root of the account, trashed or not).
+ */
+export type PurgeRule = "due" | "trashed" | "any";
+
+/**
+ * Takes the owner's tree lock and says whether the root is STILL what the caller may purge.
+ *
+ * The caller found the root in a list, or read it before its transaction — and its owner (or
+ * the editor who trashed it) may have RESTORED it since. `trash.deleteSubtreeRows` deletes any
+ * root it is given, so this is asked first, in the same transaction, under the lock `restore`
+ * takes too: a restore either committed before (the answer is false, nothing is deleted) or
+ * waits until the purge is over (and finds nothing to restore).
+ *
+ * The tree lock is the first lock `deleteSubtreeRows` takes itself; taking it here keeps the
+ * lock order (it is re-entrant within the transaction) and the two reads take no row lock.
+ * True for an id that does not exist: the delete then finds nothing, and says so.
+ */
+export async function lockTreeForPurge(tx: Executor, rootId: string, rule: PurgeRule): Promise<boolean> {
+  if (!isUuid(rootId)) return true;
+  const [peek] = await tx.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, rootId));
+  if (!peek) return true;
+  await lockOwnerTree(tx, peek.ownerId);
+  if (rule === "any") return true;
+  const [row] = await tx
+    .select({
+      trashed: sql<boolean>`(${nodes.trashedRoot} AND ${nodes.deletedAt} IS NOT NULL)`,
+      due: sql<boolean>`(${nodes.trashedRoot} AND ${nodes.deletedAt} IS NOT NULL AND ${nodes.purgeAfter} <= now())`,
+      requested: sql<boolean>`(${nodes.purgeRequestedAt} IS NOT NULL)`,
+    })
+    .from(nodes)
+    .where(eq(nodes.id, rootId));
+  if (!row) return true;
+  return rule === "trashed" ? row.trashed : row.due || row.requested;
 }
 
 /** How many roots `trash.listTrash` would list for the owner — the same rows, counted. */
@@ -268,23 +308,65 @@ export async function lockStaleUpload(tx: Executor, uploadId: string): Promise<U
 
 // ── the account purge ───────────────────────────────────────────────────────────────────────
 
-/** What the purge job needs of the account. Null when the `user` row is gone. */
-export async function purgeSubject(
-  db: Executor,
-  userId: string,
-): Promise<{ deleteScheduledAt: Date | null } | null> {
-  const [row] = await db
-    .select({ deleteScheduledAt: user.deleteScheduledAt })
-    .from(user)
-    .where(eq(user.id, userId));
-  return row ?? null;
+/**
+ * `claimed` — the purge may run, and from here on a cancel is refused; `gone` — no pending row
+ * (cancelled, or another run finished it); `dropped` — the account is gone or its deletion was
+ * cancelled, and the stale pending row was removed; `held` — the account is on legal hold: left
+ * exactly as it is; `early` — not due yet.
+ */
+export type PurgeClaim = "claimed" | "gone" | "dropped" | "held" | "early";
+
+/**
+ * Decides, under the `user` row's lock, whether this account's purge may start — and starts it.
+ * The job's list (`user-purge.due`) is advice: between that read and this call the user may have
+ * cancelled, and a hold may have been placed. `schedule` and `cancel` take the same lock first
+ * (queries/user-purge.ts), then the pending row, as this does; once this has committed with
+ * `claimed`, `cancel` refuses.
+ */
+export async function claimAccountPurge(tx: Executor, userId: string): Promise<PurgeClaim> {
+  const exists = await lockUser(tx, userId);
+  const [pending] = await tx
+    .select({
+      finishedAt: pendingUserPurges.finishedAt,
+      due: sql<boolean>`(${pendingUserPurges.scheduledFor} <= now())`,
+    })
+    .from(pendingUserPurges)
+    .where(eq(pendingUserPurges.userId, userId))
+    .for("update");
+  if (!pending || pending.finishedAt !== null) return "gone";
+  const [subject] = exists
+    ? await tx
+        .select({ deleteScheduledAt: user.deleteScheduledAt, legalHold: user.legalHold })
+        .from(user)
+        .where(eq(user.id, userId))
+    : [];
+  if (!subject || subject.deleteScheduledAt === null) {
+    await tx.delete(pendingUserPurges).where(eq(pendingUserPurges.userId, userId));
+    return "dropped";
+  }
+  if (subject.legalHold) return "held";
+  if (!pending.due) return "early";
+  await markStarted(tx, userId);
+  return "claimed";
 }
 
-/** Removes a pending purge that has nothing left to do (the account is gone, or it was cancelled). */
-export async function dropPendingPurge(db: Executor, userId: string): Promise<void> {
-  await db
-    .delete(pendingUserPurges)
-    .where(and(eq(pendingUserPurges.userId, userId), isNull(pendingUserPurges.finishedAt)));
+/**
+ * Locks the account's `user` row for its hard delete and says whether it may still go: `gone` —
+ * another run deleted it; `held` — a hold was placed while the purge was running (the writers
+ * that set one lock this row too, so the answer cannot change before the delete commits).
+ * Call it first in the transaction that deletes the account.
+ */
+export async function lockAccountForDelete(tx: Executor, userId: string): Promise<"ok" | "gone" | "held"> {
+  if (!(await lockUser(tx, userId))) return "gone";
+  const [subject] = await tx.select({ legalHold: user.legalHold }).from(user).where(eq(user.id, userId));
+  if (!subject) return "gone";
+  return subject.legalHold ? "held" : "ok";
+}
+
+/** Is the account on legal hold now? False when there is no such account. */
+export async function accountHeld(db: Executor, userId: string): Promise<boolean> {
+  const [subject] = await db.select({ legalHold: user.legalHold }).from(user).where(eq(user.id, userId));
+  return subject?.legalHold === true;
 }
 
 // ── reconcile ───────────────────────────────────────────────────────────────────────────────
