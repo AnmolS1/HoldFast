@@ -252,3 +252,28 @@ export async function setUserLegalHold(db: Executor, userId: string, held: boole
     .returning({ id: user.id });
   return rows.length > 0;
 }
+
+/**
+ * Open suspected-CSAM reports that nobody has been told about TODAY: reports of category `csam`
+ * with status `open` for which today's alert marker (ledger subject `notice`, id
+ * `csam_alert:<report id>`) has not been claimed. Oldest first, at most `limit`. Read-only.
+ * (A report someone is handling — `reviewing` — or has closed is not announced again.)
+ */
+export async function csamReportsToAnnounce(
+  db: Executor,
+  limit: number,
+): Promise<{ reportId: string; nodeId: string | null }[]> {
+  const result = await db.execute<{ id: string; node_id: string | null }>(sql`
+    SELECT r.id, r.node_id
+    FROM reports r
+    WHERE r.category = 'csam' AND r.status = 'open'
+      AND NOT EXISTS (
+        SELECT 1 FROM download_ledger l
+        WHERE l.day = (now() AT TIME ZONE 'UTC')::date
+          AND l.subject_type = 'notice'
+          AND l.subject_id = 'csam_alert:' || r.id::text
+          AND l.count > 0)
+    ORDER BY r.created_at, r.id
+    LIMIT ${limit}`);
+  return result.rows.map((row) => ({ reportId: row.id, nodeId: row.node_id }));
+}

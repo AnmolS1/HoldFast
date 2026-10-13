@@ -1,19 +1,36 @@
 // The scanning interface: message shapes, the stub scanner, sending, rescans and the
 // suspected-CSAM handler. The consumer has its own file.
 import { env } from "cloudflare:workers";
-import { eq, sql } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
-import { hashBlocklist, nodes, reports, shareLinks, uploadIps, user } from "../../../src/worker/db/schema";
+import { and, eq, sql } from "drizzle-orm";
+import { describe, expect, it, vi } from "vitest";
+import { todayTotals } from "../../../src/worker/db/queries/ledger";
+import {
+  csamReportsToAnnounce,
+  lockSuspectedCsam as lockRows,
+} from "../../../src/worker/db/queries/moderation";
+import {
+  downloadLedger,
+  hashBlocklist,
+  nodes,
+  reports,
+  shareLinks,
+  uploadIps,
+  user,
+} from "../../../src/worker/db/schema";
 import { AppError } from "../../../src/worker/services/errors";
 import {
+  csamAlertMarker,
   enqueueRescan,
   enqueueScan,
+  ensureCsamAlerted,
   getScanner,
   lockSuspectedCsam,
+  NO_OPERATOR_MESSAGE,
   normalizeScanMessage,
   scanSmallObject,
   STUB_SCAN_MAX_BYTES,
   stubEnabled,
+  sweepCsamAlerts,
 } from "../../../src/worker/services/scanning";
 import { eicarBytes, nestedEicarZipBytes } from "../../setup/fixture-bytes";
 import { makeLink } from "../auth/helpers";
@@ -314,13 +331,15 @@ describe("enqueueRescan", () => {
       expect(after, status).toMatchObject({ scanStatus: "pending", scannedAt: null, scanDetail: null });
       expect(sent, status).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
       expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toMatchObject([
-        { meta: { by: "owner", force: true } },
+        { meta: { by: "owner" } },
       ]);
     }
+    // There is no unforced rescan: the option does not exist, and one smuggled past the type is ignored.
     const file = await makeFile(owner.id, null, { scanStatus: "clean" });
     const { deps, sent } = recordingDeps();
+    // @ts-expect-error a rescan has no force option
     await enqueueRescan(deps, file.id, { by: "admin", force: false });
-    expect(sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: false }]);
+    expect(sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
   });
 
   it("taken down, whatever the status: nothing changes, nothing is sent, { queued: false, reason: 'taken_down' }", async () => {
@@ -329,7 +348,7 @@ describe("enqueueRescan", () => {
     for (const status of ["clean", "infected", "pending", "under_review", "suspected_csam"] as const) {
       const before = await makeFile(owner.id, null, { scanStatus: status, ...down });
       const { deps, sent, settle } = recordingDeps();
-      expect(await enqueueRescan(deps, before.id, { by: "admin", force: true }), status).toEqual({
+      expect(await enqueueRescan(deps, before.id, { by: "admin" }), status).toEqual({
         queued: false,
         reason: "taken_down",
       });
@@ -348,7 +367,7 @@ describe("enqueueRescan", () => {
       scannedAt: new Date(),
     });
     const { deps, sent, settle } = recordingDeps();
-    expect(await enqueueRescan(deps, before.id, { by: "admin", force: true })).toEqual({
+    expect(await enqueueRescan(deps, before.id, { by: "admin" })).toEqual({
       queued: false,
       reason: "locked",
     });
@@ -371,9 +390,7 @@ describe("enqueueRescan", () => {
     const errors: AppError[] = [];
     for (const id of [down.id, locked.id, crypto.randomUUID(), folder.id]) {
       const { deps, sent, settle } = recordingDeps();
-      const error = await enqueueRescan(deps, id, { by: "owner", force: true }).catch(
-        (thrown: unknown) => thrown,
-      );
+      const error = await enqueueRescan(deps, id, { by: "owner" }).catch((thrown: unknown) => thrown);
       await settle();
       expect(error).toBeInstanceOf(AppError);
       errors.push(error as AppError);
@@ -551,6 +568,134 @@ describe("lockSuspectedCsam", () => {
     expect(mailTo(ADMIN_EMAIL).filter((mail) => String(mail.text).includes(reportId))).toHaveLength(1);
     expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toHaveLength(1);
     expect(await testDb().select().from(reports).where(eq(reports.nodeId, file.id))).toHaveLength(1);
+  });
+
+  /** A locked node whose database half committed and whose invocation then died: nobody was told. */
+  async function lockedButSilent() {
+    const owner = await makeUser();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+    const locked = await lockRows(testDb(), file.id, { source: "photodna" });
+    return { owner, file, reportId: locked!.reportId };
+  }
+  const alertsFor = (reportId: string) =>
+    mailTo(ADMIN_EMAIL).filter((mail) => String(mail.text).includes(reportId));
+  const markerOf = (reportId: string) => todayTotals(testDb(), "notice", csamAlertMarker(reportId));
+
+  it("the database half committed and the invocation died: the redelivery alerts", async () => {
+    const { file, reportId } = await lockedButSilent();
+    expect(alertsFor(reportId)).toHaveLength(0);
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toEqual([]);
+    expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
+
+    // The message is delivered again: the node is ALREADY locked, and the operators are told now.
+    const { deps, settle } = serviceDeps();
+    expect(await lockSuspectedCsam(deps, file.id, { source: "photodna" })).toEqual({ reportId });
+    await settle();
+    expect(alertsFor(reportId)).toHaveLength(1);
+    expect(alertsFor(reportId)[0]!.template).toBe("operatorCritical");
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toMatchObject([
+      { actorType: "system", meta: { source: "photodna", reportId } },
+    ]);
+    expect(await markerOf(reportId)).toEqual({ bytes: 0, count: 1 });
+  });
+
+  it("two calls the same day are one mail; the next day the open report is announced again", async () => {
+    const { file, reportId } = await lockedButSilent();
+    const first = serviceDeps();
+    expect(await ensureCsamAlerted(first.deps, reportId, { nodeId: file.id, source: "system" })).toBe(true);
+    expect(await ensureCsamAlerted(first.deps, reportId, { nodeId: file.id, source: "system" })).toBe(false);
+    expect(await lockSuspectedCsam(first.deps, file.id, { source: "system" })).toEqual({ reportId });
+    await first.settle();
+    expect(alertsFor(reportId)).toHaveLength(1);
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toHaveLength(1);
+
+    // "Tomorrow": today's marker is yesterday's.
+    await testDb()
+      .update(downloadLedger)
+      .set({ day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10) })
+      .where(
+        and(
+          eq(downloadLedger.subjectType, "notice"),
+          eq(downloadLedger.subjectId, csamAlertMarker(reportId)),
+        ),
+      );
+    const next = serviceDeps();
+    expect(await ensureCsamAlerted(next.deps, reportId)).toBe(true);
+    await next.settle();
+    expect(alertsFor(reportId)).toHaveLength(2);
+  });
+
+  it("the sweep finds a report nobody was told about, tells them once, and leaves handled reports alone", async () => {
+    const silent = await lockedButSilent();
+    const handled = await lockedButSilent();
+    await testDb().update(reports).set({ status: "reviewing" }).where(eq(reports.id, handled.reportId));
+    const closed = await lockedButSilent();
+    await testDb().update(reports).set({ status: "dismissed" }).where(eq(reports.id, closed.reportId));
+    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(
+      silent.reportId,
+    );
+
+    const sweep = serviceDeps();
+    const swept = await sweepCsamAlerts(sweep.deps, { limit: 1000 });
+    await sweep.settle();
+    expect(swept.checked).toBeGreaterThanOrEqual(1);
+    expect(swept.alerted).toBeGreaterThanOrEqual(1);
+    expect(alertsFor(silent.reportId)).toHaveLength(1);
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: silent.file.id })).toMatchObject([
+      { meta: { source: "sweep", reportId: silent.reportId } },
+    ]);
+    expect(alertsFor(handled.reportId)).toHaveLength(0);
+    expect(alertsFor(closed.reportId)).toHaveLength(0);
+
+    // Swept again the same day: it is no longer due, and nobody is told twice.
+    const due = (await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId);
+    expect(due).not.toContain(silent.reportId);
+    expect(due).not.toContain(handled.reportId);
+    await sweepCsamAlerts(serviceDeps().deps, { limit: 1000 });
+    expect(alertsFor(silent.reportId)).toHaveLength(1);
+  });
+
+  it("an empty operator list is not silent: an error line, a metric, and the marker stays unclaimed", async () => {
+    const { file, reportId } = await lockedButSilent();
+    const points: { blobs: string[] }[] = [];
+    const nobody = serviceDeps({
+      ADMIN_EMAILS: "",
+      METRICS: { writeDataPoint: (point: { blobs: string[] }) => void points.push(point) },
+    });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await ensureCsamAlerted(nobody.deps, reportId, { nodeId: file.id })).toBe(false);
+      expect(await lockSuspectedCsam(nobody.deps, file.id, { source: "system" })).toEqual({ reportId });
+      await nobody.settle();
+      expect(logged.mock.calls.map((call) => call[0])).toEqual([NO_OPERATOR_MESSAGE, NO_OPERATOR_MESSAGE]);
+      // A fixed text: no address, no id.
+      expect(NO_OPERATOR_MESSAGE).not.toMatch(/@|[0-9a-f]{8}-/);
+    } finally {
+      logged.mockRestore();
+    }
+    // blobs: [name, outcome, kind, reason, …]
+    expect(
+      points.filter((point) => point.blobs[0] === "error").map((point) => point.blobs.slice(2, 4)),
+    ).toEqual([
+      ["csam_alert", "no_recipient"],
+      ["csam_alert", "no_recipient"],
+    ]);
+    expect(await markerOf(reportId), "unclaimed: the sweep keeps trying").toEqual({ bytes: 0, count: 0 });
+    expect(await auditRows({ action: "scan.suspected_csam", targetId: file.id })).toEqual([]);
+    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+
+    // Once there is someone to tell, the very next call tells them.
+    const fixed = serviceDeps();
+    expect(await ensureCsamAlerted(fixed.deps, reportId, { nodeId: file.id })).toBe(true);
+    await fixed.settle();
+    expect(alertsFor(reportId)).toHaveLength(1);
+  });
+
+  it("ensureCsamAlerted for something that is not a report id does nothing", async () => {
+    const { deps } = serviceDeps();
+    for (const id of ["", "nope", "csam_alert:x", 7 as unknown as string]) {
+      expect(await ensureCsamAlerted(deps, id)).toBe(false);
+    }
   });
 
   it("is a 404 for an id that does not exist", async () => {
