@@ -407,10 +407,11 @@ describe("runBackground: queue and scheduled", () => {
 });
 
 describe("the Worker's own queue and scheduled exports", () => {
-  // The real entry with the real modules. Neither placeholder asks for the database, so no pool
-  // is opened; the real-pool lifetime of runBackground is proven in integration.test.ts.
-  it("scheduled() runs the stub through runBackground without error", async () => {
-    const controller = createScheduledController({ cron: "3 * * * *", scheduledTime: new Date() });
+  // The real entry with the real modules. Neither call here asks for the database — the cron
+  // expression is one no job listens to, the batch holds no scan message — so no pool is opened;
+  // the real-pool lifetime of runBackground is proven in integration.test.ts.
+  it("scheduled() runs through runBackground without error (an expression no job listens to)", async () => {
+    const controller = createScheduledController({ cron: "59 23 31 12 *", scheduledTime: new Date() });
     const ctx = createExecutionContext();
     await expect(worker.scheduled?.(controller, testEnv(), ctx)).resolves.toBeUndefined();
   });
