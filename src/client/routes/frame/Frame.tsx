@@ -2,7 +2,7 @@
 //   Desktop (>= 1024): sidebar 232 · content (ribbon, header 56, banners, page) · details 320.
 //   Mobile  (<  1024): header · title row · page · FAB · ribbon · three-item bottom nav.
 import Box from "@mui/material/Box";
-import { useEffect, useState, type ReactElement } from "react";
+import { Fragment, useEffect, useState, type ReactElement, type ReactNode } from "react";
 import { useLocation, useMatches, useOutlet, useRoutes, type RouteObject } from "react-router";
 import { CommandPalette } from "../../components/CommandPalette";
 import { DetailsPanel, DetailsSheet } from "../../components/DetailsPanel";
@@ -11,6 +11,7 @@ import type { RouteHandle } from "../../components/slots";
 import { TransferRibbon } from "../../components/TransferRibbon";
 import { UploadDropOverlay } from "../../features/upload";
 import { t } from "../../lib/i18n";
+import { useSession } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ShortcutsDialog } from "../help";
@@ -42,7 +43,27 @@ function ColdBackground({ routes, from }: { routes: RouteObject[]; from: string 
   return useRoutes(routes, from);
 }
 
-export function Frame({ backgroundRoutes }: FrameProps) {
+/**
+ * Everything inside is REMOUNTED when the signed-in account changes. `purgeUserState` empties
+ * the caches and stores, but a component's own state (`useState`, refs, a dialog showing a file)
+ * outlives it: when a session re-read names another account without a navigation, a page that
+ * was open would go on showing the previous account's data under the new one. A new key throws
+ * that state away with the component.
+ */
+export function AccountKeyed({ children }: { children: ReactNode }) {
+  const userId = useSession().data?.user.id ?? "signed-out";
+  return <Fragment key={userId}>{children}</Fragment>;
+}
+
+export function Frame(props: FrameProps) {
+  return (
+    <AccountKeyed>
+      <FrameBody {...props} />
+    </AccountKeyed>
+  );
+}
+
+function FrameBody({ backgroundRoutes }: FrameProps) {
   const desktop = useIsDesktop();
   const location = useLocation();
   const matches = useMatches();

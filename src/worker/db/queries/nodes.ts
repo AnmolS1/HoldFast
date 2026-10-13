@@ -40,6 +40,40 @@ export const OWNER_VISIBLE_STATUSES: ScanStatus[] = [
   "under_review",
 ];
 
+/**
+ * WHAT ANYONE BUT THE OWNER SEES OF A FILE — the one definition, for the listings and for the
+ * by-id answer (`permissions.getAccess`) alike. A share partner and a link visitor are both
+ * "not the owner".
+ *
+ * A listing for a non-owner passes `SHARED_VISIBLE_STATUSES`: scanned and clean, nothing else.
+ */
+export const SHARED_VISIBLE_STATUSES: readonly ScanStatus[] = ["clean"];
+
+/**
+ * BY ID only, and only for the partner who uploaded the file's CURRENT version (`created_by`,
+ * which `replaceVersion` rewrites): they can watch their own upload be scanned and blocked.
+ * Never `under_review` — that somebody reported a file is nobody's to learn but the owner's.
+ * These are not listed for them: a non-owner's listing is `SHARED_VISIBLE_STATUSES`.
+ */
+export const UPLOADER_VISIBLE_STATUSES: readonly ScanStatus[] = ["pending", "infected", "skipped", "error"];
+
+/**
+ * May someone who is NOT the owner see this node by id? A folder: yes. A file: when their listing
+ * would show it (`SHARED_VISIBLE_STATUSES`), or when they uploaded its current version and it is
+ * in one of `UPLOADER_VISIBLE_STATUSES`. `viewerId` null = nobody in particular (a link visitor):
+ * no upload is theirs, and a file whose uploader is gone (`createdBy` null) is nobody's.
+ * Role, takedown, trash and the owner's own view are not decided here.
+ */
+export function partnerSees(
+  node: { kind: Kind; scanStatus: ScanStatus; createdBy: string | null },
+  viewerId: string | null,
+): boolean {
+  if (node.kind !== "file" || SHARED_VISIBLE_STATUSES.includes(node.scanStatus)) return true;
+  return (
+    viewerId !== null && node.createdBy === viewerId && UPLOADER_VISIBLE_STATUSES.includes(node.scanStatus)
+  );
+}
+
 /** Replaced versions are kept this long before the purge job removes them. */
 export const VERSION_RETENTION_DAYS = 30;
 

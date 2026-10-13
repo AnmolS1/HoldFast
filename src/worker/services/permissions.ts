@@ -29,9 +29,21 @@
 // `getAccess` and `requireRole`. `requireUpload` never does (nobody uploads into a hidden folder), nor does the
 // link scope's answer change with it being absent: a hidden node is hidden behind a link too.
 //
-// Trash and the other scan states are NOT part of a role: callers check those separately
-// (`assertNotTrashed`, the scan gates). A trashed node still exists for its owner (it can be
-// restored); a hidden one does not.
+// A FILE THE SCANNER HAS NOT PASSED EXISTS FOR ITS OWNER ONLY. For anyone who is not the owner —
+// a share partner, a link visitor — a FILE is there by id only when their listing would show it
+// (`clean`), or when they uploaded its CURRENT version and it is `pending`, `infected`, `skipped`
+// or `error`; never `under_review` (that a file was reported is the owner's to know alone). The
+// definition is `partnerSees` in db/queries/nodes.ts, which the listings' status list comes from
+// too. Not visible is exactly `not_found`, like a hidden node and like an id that was never
+// issued — and for the same work: the node's state is read by the ONE statement that answers
+// "hidden", for every question. Folders are unaffected, the owner's view is unchanged, and
+// `includeHidden` (an admin's request) is not subject to it.
+//
+// Trash is NOT part of a role: a trashed node still exists for its owner (it can be restored);
+// a hidden one does not. A route for which a trashed node does not exist passes
+// `{ notTrashed: true }` and gets the same `not_found` from the same statements (or asks
+// `assertNotTrashed` separately, which is one statement more). What a file's scan state allows
+// (download, preview, replace) stays the caller's scan gate.
 //
 // REQUEST-ONLY. These functions take the Hono context: they are called from request handlers
 // only (no job or queue consumer decides access), and the answers are cached for the request.
@@ -44,7 +56,14 @@
 // writes that depend on it re-check under their own lock (the tree queries, the upload claim).
 
 import type { Context } from "hono";
-import { effectiveAccess, effectiveHidden, effectiveTrashed, isDescendantOrSelf } from "../db/queries/tree";
+import { partnerSees } from "../db/queries/nodes";
+import {
+  effectiveAccess,
+  effectiveTrashed,
+  isDescendantOrSelf,
+  nodeVisibility,
+  type NodeVisibility,
+} from "../db/queries/tree";
 import { requireAdmin } from "../middleware/guards";
 import { forbidImpersonation } from "../middleware/impersonation";
 import { AppError } from "./errors";
@@ -72,12 +91,18 @@ export type LinkScope = { linkId: string; rootNodeId: string };
  * `requireAdmin` (middleware/guards.ts) accepts: the role, two-factor, a session that passed it,
  * not impersonating — AND no link scope is set. Passed by anyone else, or behind a link, it is
  * ignored: the node stays `not_found` and the same work is done as without it.
+ *
+ * `notTrashed: true` — for a route to which a node in the trash (itself or by a folder above it)
+ * does not exist: it is `not_found` as well, decided from the statements that are sent anyway.
  */
-export type AccessOptions = { includeHidden?: true };
+export type AccessOptions = { includeHidden?: true; notTrashed?: true };
 
 const RANK: Record<Role, number> = { viewer: 1, editor: 2, owner: 3 };
 
-type State = { cache: Map<string, Access | null>; link: LinkScope | null };
+/** What was read about a node: the reach, and its state (null: not asked). The options decide on it. */
+type Found = { reached: Access | null; seen: NodeVisibility | null };
+
+type State = { cache: Map<string, Found>; link: LinkScope | null };
 
 // Per request, keyed on the context object (`c.var` cannot hold it: its shape is fixed).
 const states = new WeakMap<object, State>();
@@ -126,10 +151,12 @@ async function reach(c: Context<AppEnv>, link: LinkScope | null, nodeId: string)
 }
 
 /**
- * The caller's access to a node, or null: no access, no such node, or a node that is hidden
- * (taken down itself or by an ancestor, suspected CSAM) — never told apart, by the answer or by
- * the work. Behind a link the same holds for the target: a hidden node anywhere on its chain —
- * the link's root included — hides it. `{ includeHidden: true }` is for admin routes.
+ * The caller's access to a node, or null: no access, no such node, a node that is hidden (taken
+ * down itself or by an ancestor, suspected CSAM), or — for anyone but the owner — a file they may
+ * not see (`partnerSees`) — never told apart, by the answer or by the work. Behind a link the
+ * same holds for the target: a hidden node anywhere on its chain — the link's root included —
+ * hides it. `{ includeHidden: true }` is for admin routes; `{ notTrashed: true }` adds "in the
+ * trash" to what does not exist.
  */
 export async function getAccess(
   c: Context<AppEnv>,
@@ -138,24 +165,39 @@ export async function getAccess(
 ): Promise<Access | null> {
   const state = stateOf(c);
   const includeHidden = opts.includeHidden === true && state.link === null && isAdminRequest(c);
-  const cacheKey = `${includeHidden ? "all" : "visible"}:${nodeId}`;
-  if (state.cache.has(cacheKey)) return state.cache.get(cacheKey) ?? null;
+  const notTrashed = opts.notTrashed === true;
+  // An admin's question reads the node's state only when it asks about the trash.
+  const mode = !includeHidden ? "visible" : notTrashed ? "all-live" : "all";
+  const cacheKey = `${mode}:${nodeId}`;
+  let found = state.cache.get(cacheKey);
+  if (!found) {
+    // A caller with neither a session nor a link reaches nothing, and nothing is asked.
+    const anyone = state.link !== null || Boolean(c.get("user"));
+    // ALWAYS BOTH, never "the state only when reachable": the work must not depend on the answer.
+    const [reached, seen] = await Promise.all([
+      reach(c, state.link, nodeId),
+      anyone && mode !== "all" ? nodeVisibility(db(c), nodeId) : null,
+    ]);
+    found = { reached, seen };
+    state.cache.set(cacheKey, found);
+  }
 
-  // A caller with neither a session nor a link reaches nothing, and nothing is asked.
-  const anyone = state.link !== null || Boolean(c.get("user"));
-  // ALWAYS BOTH, never "hidden only when reachable": the work must not depend on the answer.
-  const [reached, hidden] = await Promise.all([
-    reach(c, state.link, nodeId),
-    anyone && !includeHidden ? effectiveHidden(db(c), nodeId) : false,
-  ]);
-  const access = hidden ? null : reached;
-  state.cache.set(cacheKey, access);
-  return access;
+  const { reached, seen } = found;
+  if (!reached) return null;
+  if (notTrashed && seen?.trashed !== false) return null;
+  if (includeHidden) return reached;
+  if (!seen || seen.hidden || seen.kind === null || seen.scanStatus === null) return null;
+  if (reached.role === "owner") return reached;
+  // Not the owner. Behind a link nobody is the uploader: a signed-in visitor gets no more.
+  const viewerId = state.link ? null : (c.get("user")?.id ?? null);
+  const node = { kind: seen.kind, scanStatus: seen.scanStatus, createdBy: seen.createdBy };
+  return partnerSees(node, viewerId) ? reached : null;
 }
 
 /**
- * The access, when it is at least `min`. None — also a hidden node — → `404 not_found`; too low
- * → `403 forbidden`. `{ includeHidden: true }` is for admin routes.
+ * The access, when it is at least `min`. None — also a hidden node, and a file a partner may not
+ * see — → `404 not_found`; too low → `403 forbidden`. `{ includeHidden: true }` is for admin
+ * routes; `{ notTrashed: true }` makes a trashed node `not_found` too.
  */
 export async function requireRole(
   c: Context<AppEnv>,
