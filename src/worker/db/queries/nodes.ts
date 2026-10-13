@@ -28,6 +28,7 @@ import {
   effectiveHidden,
   isDescendantOrSelf,
   lockOwnerTree,
+  NO_SUCH_OWNER_ID,
   nodeVisibility,
   notEffectivelyTrashedOrHidden,
   notHiddenRow,
@@ -377,6 +378,8 @@ async function withNameConflict<T>(db: Executor, write: (tx: Executor) => Promis
  *
  * The parent's state is read before the insert, not under a lock: a folder created in the
  * instant its parent is trashed or taken down is inside it, and is trashed or hidden with it.
+ * Every `not_found` costs the same two reads, whatever its reason. (`conflict` is the unique
+ * index's answer, and the index knows every live name in the folder — a hidden sibling's too.)
  */
 export async function createFolder(
   db: Executor,
@@ -384,12 +387,19 @@ export async function createFolder(
 ): Promise<Node> {
   const name = sanitizeName(args.name);
   if (args.parentId !== null) {
+    // Both reads, then the decision: a hidden parent costs what an id that was never issued costs.
     const parent = await getNode(db, args.parentId);
-    if (!parent || parent.kind !== "folder" || parent.ownerId !== args.ownerId || parent.system !== null) {
+    const place = await nodeVisibility(db, args.parentId);
+    if (
+      !parent ||
+      parent.kind !== "folder" ||
+      parent.ownerId !== args.ownerId ||
+      parent.system !== null ||
+      place.trashed ||
+      place.hidden
+    ) {
       throw new QueryError("not_found");
     }
-    const place = await nodeVisibility(db, parent.id);
-    if (place.trashed || place.hidden) throw new QueryError("not_found");
   }
   return withNameConflict(db, async (tx) => {
     const [row] = await tx
@@ -462,15 +472,22 @@ export type Moved = {
  * legal hold or named by an open notice: outside it nothing would protect the node, and it
  * could be trashed and purged. Nothing is moved.
  *
+ * THE SAME WORK FOR EVERY `not_found`: whatever makes it one — no such node, a foreign, system,
+ * trashed or hidden node, or any of those for the target — the same statements have been sent
+ * (the tree lock of an owner no account has, when there is no node to read one from), and all of
+ * them are answered before the cycle is looked for: a hidden node or target is `not_found`
+ * exactly as an id that was never issued, never a `conflict`. What is NOT hidden by this: the
+ * name. A `conflict` on the name comes from the unique index, which knows every live name in
+ * the destination — a hidden sibling's included.
+ *
  * Returns where the node was as well: the caller's own earlier read of the parent is not the
  * move's (two moves racing), and `changed: false` is a move that did nothing.
  */
 export async function moveNode(db: Executor, nodeId: string, newParentId: string | null): Promise<Moved> {
   if (!isUuid(nodeId) || (newParentId !== null && !isUuid(newParentId))) throw new QueryError("not_found");
   const peek = await getNode(db, nodeId);
-  if (!peek) throw new QueryError("not_found");
   return withNameConflict(db, async (tx) => {
-    await lockOwnerTree(tx, peek.ownerId);
+    await lockOwnerTree(tx, peek ? peek.ownerId : NO_SUCH_OWNER_ID);
     const ids = newParentId === null ? [nodeId] : [nodeId, newParentId];
     const locked = await tx
       .select()
@@ -478,26 +495,40 @@ export async function moveNode(db: Executor, nodeId: string, newParentId: string
       .where(inArray(nodes.id, ids))
       .orderBy(nodes.id)
       .for("update");
-    const node = locked.find((row) => row.id === nodeId);
-    if (!node || node.system !== null || node.deletedAt !== null || node.ownerId !== peek.ownerId) {
-      throw new QueryError("not_found");
-    }
+    // Read now, under the locks — and read for every question, before anything is decided.
     // Trashed by ancestry too: moving a node out of a trashed folder would be a restore that
     // skips `restore` (and takes content out of a folder whose purge may already be requested).
     // Hidden, itself or by ancestry: at its new place it would no longer be under the folder
-    // that hides it. Both read now, under the locks.
+    // that hides it.
     const here = await nodeVisibility(tx, nodeId);
-    if (here.trashed || here.hidden) throw new QueryError("not_found");
+    const there = newParentId === null ? null : await nodeVisibility(tx, newParentId);
+    const node = locked.find((row) => row.id === nodeId);
+    if (
+      !peek ||
+      !node ||
+      node.system !== null ||
+      node.ownerId !== peek.ownerId ||
+      here.trashed ||
+      here.hidden
+    ) {
+      throw new QueryError("not_found");
+    }
     if (newParentId !== null) {
       const target = locked.find((row) => row.id === newParentId);
-      if (!target || target.kind !== "folder" || target.system !== null || target.ownerId !== node.ownerId) {
+      if (
+        !target ||
+        target.kind !== "folder" ||
+        target.system !== null ||
+        target.ownerId !== node.ownerId ||
+        !there ||
+        there.trashed ||
+        there.hidden
+      ) {
         throw new QueryError("not_found");
       }
       if (await isDescendantOrSelf(tx, newParentId, nodeId)) {
         throw new QueryError("conflict", "a folder cannot be moved into itself");
       }
-      const there = await nodeVisibility(tx, newParentId);
-      if (there.trashed || there.hidden) throw new QueryError("not_found");
     }
     if (node.parentId === newParentId) return { node, previousParentId: node.parentId, changed: false };
     // A hold or an open notice on a folder above protects this node only while it stays under
@@ -712,18 +743,26 @@ export async function replaceVersion(
     // Lock order: the owner's `user` row FIRST, then the node (the order of the purge, the
     // reconcile and the CSAM lock — see queries/quota.ts). Locked, not just read: a legal hold
     // being placed on the account either is seen here or waits for this Replace to commit.
+    // THE SAME READS FOR EVERY `not_found` — no such node, a folder, a system node, a locked,
+    // held or hidden one: all four are sent before anything is decided (the row of an owner no
+    // account has, when there is no node to read one from).
     const [peek] = await sp.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
-    if (!peek) throw new QueryError("not_found");
     const [owner] = await sp
       .select({ legalHold: user.legalHold })
       .from(user)
-      .where(eq(user.id, peek.ownerId))
+      .where(eq(user.id, peek ? peek.ownerId : NO_SUCH_OWNER_ID))
       .for("update");
     const [node] = await sp.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
-    if (!node || node.kind !== "file" || node.system !== null || node.ownerId !== peek.ownerId) {
+    // By ancestry too, read with the row held: a file inside a taken-down folder is as hidden as
+    // one taken down itself. (No tree lock here — the owner's row is already held, and the tree
+    // lock comes before every row lock: a takedown of a folder above that commits after this
+    // read is the same as the Replace having come first.)
+    const hidden = await effectiveHidden(sp, nodeId);
+    if (!peek || !node || node.kind !== "file" || node.system !== null || node.ownerId !== peek.ownerId) {
       throw new QueryError("not_found");
     }
     if (
+      hidden ||
       node.scanStatus === "suspected_csam" ||
       node.legalHold ||
       node.takedownAt !== null ||
@@ -732,11 +771,6 @@ export async function replaceVersion(
     ) {
       throw new QueryError("not_found");
     }
-    // By ancestry too, read with the row held: a file inside a taken-down folder is as hidden as
-    // one taken down itself. (No tree lock here — the owner's row is already held, and the tree
-    // lock comes before every row lock: a takedown of a folder above that commits after this
-    // read is the same as the Replace having come first.)
-    if (await effectiveHidden(sp, nodeId)) throw new QueryError("not_found");
     if (node.scanStatus === "pending") throw new QueryError("scan_pending");
     if (node.scanStatus === "infected" || node.scanStatus === "under_review")
       throw new QueryError("scan_blocked");
