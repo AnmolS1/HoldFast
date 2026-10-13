@@ -2,6 +2,10 @@
 // may not leave.
 import { describe, expect, it } from "vitest";
 import { NodeDto } from "../../../src/shared/schemas/node";
+import type { Tx } from "../../../src/worker/db/client";
+import { move as moveQuery } from "../../../src/worker/db/queries/nodes";
+import { lockOwnerTree } from "../../../src/worker/db/queries/tree";
+import { backendPid, gate, untilBlockedBy } from "../services-core/helpers";
 import {
   api,
   auditFor,
@@ -14,6 +18,8 @@ import {
   person,
   setLegalHold,
   sharedTree,
+  testDb,
+  type Answer,
   type Caller,
 } from "./helpers";
 
@@ -38,8 +44,8 @@ describe("POST /nodes/:id/move", () => {
     const rows = await auditFor("node.move", t.notes.id);
     expect(rows.map((row) => [row.actorUserId, row.meta])).toEqual(
       expect.arrayContaining([
-        [t.owner.id, { from: t.inner.id, to: t.dest.id }],
-        [t.owner.id, { from: t.dest.id, to: null }],
+        [t.owner.id, { to: t.dest.id }],
+        [t.owner.id, { to: null }],
       ]),
     );
     expect(rows).toHaveLength(2);
@@ -55,7 +61,7 @@ describe("POST /nodes/:id/move", () => {
     const again = await move(t.owner.as, t.notes.id, t.dest.id);
     expect([again.status, again.body.parentId]).toEqual([200, t.dest.id]);
     const rows = await auditFor("node.move", t.notes.id);
-    expect(rows.map((row) => row.meta)).toEqual([{ from: t.inner.id, to: t.dest.id }]);
+    expect(rows.map((row) => row.meta)).toEqual([{ to: t.dest.id }]);
     // At the top level too.
     const top = await makeFile(t.owner.id, null, { scanStatus: "clean" });
     expect((await move(t.owner.as, top.id, null)).status).toBe(200);
@@ -114,6 +120,74 @@ describe("POST /nodes/:id/move", () => {
     expect(await parentOf(t.notes.id)).toBe(t.inner.id);
     expect(await auditFor("node.move", t.inner.id)).toEqual([]);
     expect(await auditFor("node.move", t.notes.id)).toEqual([]);
+  });
+});
+
+/**
+ * Lets another move of the same tree land BETWEEN a request's own read of the node and its move:
+ * the owner's tree lock is held until the request is seen waiting for it (its reads have gone
+ * through by then), `other` runs in the holding transaction, and the lock is released.
+ */
+async function overtakenBy(
+  ownerId: string,
+  other: (tx: Tx) => Promise<unknown>,
+  request: () => Promise<Answer>,
+) {
+  const locked = gate<number>();
+  const release = gate();
+  const holder = testDb().transaction(async (tx) => {
+    await lockOwnerTree(tx, ownerId);
+    locked.open(await backendPid(tx));
+    await release.opened;
+    await other(tx);
+  });
+  const answer = request();
+  expect(await untilBlockedBy(await locked.opened)).toBe("blocked");
+  release.open();
+  await holder;
+  return answer;
+}
+
+describe("two moves of one node, raced: each real move is one node.move row, a move that did nothing is none", () => {
+  it("overtaken by a move elsewhere, a request for the parent it READ still moves the node back — and is recorded", async () => {
+    const t = await sharedTree();
+    // The request reads the node under `inner`; before it gets the lock, the node goes to `dest`.
+    const answer = await overtakenBy(
+      t.owner.id,
+      (tx) => moveQuery(tx, t.notes.id, t.dest.id),
+      () => move(t.owner.as, t.notes.id, t.inner.id),
+    );
+    expect([answer.status, answer.body.parentId]).toEqual([200, t.inner.id]);
+    expect(await parentOf(t.notes.id)).toBe(t.inner.id);
+    // It did move (dest → inner): one row for it. (The overtaking move was made by the test, not a request.)
+    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([{ to: t.inner.id }]);
+  });
+
+  it("overtaken by the very move it asks for, a request moves nothing — and records nothing", async () => {
+    const t = await sharedTree();
+    const answer = await overtakenBy(
+      t.owner.id,
+      (tx) => moveQuery(tx, t.notes.id, t.dest.id),
+      () => move(t.owner.as, t.notes.id, t.dest.id),
+    );
+    expect([answer.status, answer.body.parentId]).toEqual([200, t.dest.id]);
+    expect(await auditFor("node.move", t.notes.id)).toEqual([]);
+  });
+
+  it("two requests for the same move, one waiting for the other: one row between them", async () => {
+    const t = await sharedTree();
+    let first!: Promise<Answer>;
+    const second = await overtakenBy(
+      t.owner.id,
+      async () => {},
+      () => {
+        first = move(t.owner.as, t.notes.id, t.dest.id);
+        return move(t.owner.as, t.notes.id, t.dest.id);
+      },
+    );
+    expect([(await first).status, second.status]).toEqual([200, 200]);
+    expect(await parentOf(t.notes.id)).toBe(t.dest.id);
+    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([{ to: t.dest.id }]);
   });
 });
 

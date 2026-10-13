@@ -59,6 +59,7 @@ import {
 } from "../db/queries/nodes";
 import {
   liveNameHolder,
+  movedInThisTransaction,
   ownEditorShares,
   releaseRescan,
   zipManifest,
@@ -451,9 +452,18 @@ router.patch(`/nodes/${ID}`, async (c) => {
  * none of the three can be told from the others. `LegalHoldError` is caught here because
  * nothing may ever show it: not its causes, not that it happened.
  */
-async function moveNode(c: Ctx, nodeId: string, parentId: string | null): Promise<Node> {
+async function moveNode(
+  c: Ctx,
+  nodeId: string,
+  parentId: string | null,
+): Promise<{ node: Node; changed: boolean }> {
   try {
-    return await retryOnDeadlock(deps(c).db, (tx) => move(tx, nodeId, parentId));
+    return await retryOnDeadlock(deps(c).db, async (tx) => {
+      const node = await move(tx, nodeId, parentId);
+      // Whether anything moved is decided HERE, under the lock `move` holds — not from what the
+      // request read before the transaction, which another move may have overtaken.
+      return { node, changed: await movedInThisTransaction(tx, nodeId) };
+    });
   } catch (error) {
     if (error instanceof LegalHoldError) {
       metric("node", { kind: "move", outcome: "refused" });
@@ -468,7 +478,7 @@ router.post(`/nodes/${ID}/move`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
   const body = parse(MoveBody, await jsonBody(c));
-  const { node, access } = await visibleNode(c, id, "editor");
+  const { access } = await visibleNode(c, id, "editor");
   if (access.shareRootId === id) throw new AppError("forbidden");
   if (body.parentId === null) {
     // The top level of a tree is its owner's alone: no share reaches it.
@@ -476,11 +486,12 @@ router.post(`/nodes/${ID}/move`, async (c) => {
   } else {
     await visibleNode(c, body.parentId, "editor");
   }
-  const moved = await moveNode(c, id, body.parentId);
-  // A move to where the node already is changes nothing and is not recorded as one (the same
-  // request sent twice is one move). `from` is what this request read before the transaction.
-  if (moved.parentId !== node.parentId) {
-    audit(c, "node.move", target(id), { from: node.parentId, to: moved.parentId });
+  const { node: moved, changed } = await moveNode(c, id, body.parentId);
+  // A move to where the node already is changes nothing and is not recorded as one: the same
+  // request sent twice, or raced, is one move and one row. Where it came FROM is not recorded:
+  // the only parent this request knows is the one it read before the lock.
+  if (changed) {
+    audit(c, "node.move", target(id), { to: moved.parentId });
     metric("node", { kind: "move", outcome: "ok" });
   }
   return c.json(await toNodeDto(db(c), moved, viewOf(user, access)));
