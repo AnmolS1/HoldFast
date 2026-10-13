@@ -15,8 +15,17 @@ import type { Executor } from "../client";
 import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { type HoldCause, isUniqueViolation, LegalHoldError, QueryError } from "../errors";
 import { isUuid } from "../ids";
-import { type Node, nodes, nodeVersions, uploads, user } from "../schema";
-import { anyHoldCause, holdCauses } from "./holds";
+import { type Node, nodes, nodeVersions, uploadParts, uploads, user } from "../schema";
+import {
+  anyHoldCause,
+  holdCauses,
+  INHERITED_CAUSES,
+  type InheritedCause,
+  inheritedCauses,
+  nodeProtected,
+  ownCauses,
+  userHeld,
+} from "./holds";
 import { effectiveTrashed, notEffectivelyHidden } from "./tree";
 
 export { LegalHoldError };
@@ -243,16 +252,30 @@ const HOLD_CAUSES = Object.keys(holdCauses(sql`n`, sql`u`)) as HoldCause[];
  *   - is `suspected_csam` or `under_review`,
  *   - is named by a DMCA notice that is still open (`received`, `incomplete`, `actioned`,
  *     `counter_received` — the content must survive the counter-notice window),
- * or when the subtree's owner has `user.legalHold`. Throws `LegalHoldError` naming every held
+ * when the subtree's owner has `user.legalHold`, or when a folder ABOVE the root has `legalHold`
+ * or is named by an open notice: those two reach down (a folder taken down as `csam` is held as
+ * one row; a file inside it is not purged on its own). The causes are queries/holds.ts. Throws `LegalHoldError` naming every held
  * root; a root is held or purgeable as a whole. Ids that do not exist are ignored.
  */
 export async function assertPurgeable(tx: Executor, rootIds: readonly string[]): Promise<void> {
   const ids = [...new Set(rootIds.filter(isUuid))];
   if (ids.length === 0) return;
   // The causes are the shared definition (queries/holds.ts): one column per cause, by its name.
+  // Every row of the subtree is tested for its OWN causes; what reaches down from above the
+  // subtree is tested ONCE per root (`above`), not once per row — the ancestors of a row inside
+  // are rows of the subtree or ancestors of its root.
+  const inherited = inheritedCauses(sql`r`);
+  const aboveColumns = sql.join(
+    INHERITED_CAUSES.map((cause) => sql`${inherited[cause]} AS ${sql.identifier(cause)}`),
+    sql`, `,
+  );
+  const isInherited = (cause: string): cause is InheritedCause =>
+    (INHERITED_CAUSES as readonly string[]).includes(cause);
   const causeColumns = sql.join(
-    Object.entries(holdCauses(sql`n`, sql`u`)).map(
-      ([cause, test]) => sql`bool_or(${test}) AS ${sql.identifier(cause)}`,
+    Object.entries(ownCauses(sql`n`, sql`u`)).map(([cause, test]) =>
+      isInherited(cause)
+        ? sql`(bool_or(${test}) OR bool_or(above.${sql.identifier(cause)})) AS ${sql.identifier(cause)}`
+        : sql`bool_or(${test}) AS ${sql.identifier(cause)}`,
     ),
     sql`, `,
   );
@@ -261,9 +284,13 @@ export async function assertPurgeable(tx: Executor, rootIds: readonly string[]):
       SELECT n.id, n.id FROM nodes n WHERE n.id = ANY(${uuidArray(ids)})
       UNION ALL
       SELECT sub.root_id, c.id FROM nodes c JOIN sub ON c.parent_id = sub.id
-    ) CYCLE root_id, id SET is_cycle USING path
+    ) CYCLE root_id, id SET is_cycle USING path,
+    above AS MATERIALIZED (
+      SELECT r.id AS root_id, ${aboveColumns} FROM nodes r WHERE r.id = ANY(${uuidArray(ids)})
+    )
     SELECT sub.root_id, ${causeColumns}
     FROM sub
+    JOIN above ON above.root_id = sub.root_id
     JOIN nodes n ON n.id = sub.id
     JOIN "user" u ON u.id = n.owner_id
     WHERE NOT sub.is_cycle
@@ -274,6 +301,23 @@ export async function assertPurgeable(tx: Executor, rootIds: readonly string[]):
     if (found.length > 0) causes[row.root_id] = found;
   }
   if (Object.keys(causes).length > 0) throw new LegalHoldError(causes);
+}
+
+/**
+ * Locks every folder ABOVE the node `FOR SHARE`, lowest id first, for the rest of the
+ * transaction. The gate reads their holds and notices; with them locked, a hold that is being
+ * placed on one of them (an UPDATE of that row) either has committed and is seen, or waits for
+ * the delete. Shared: two purges under one folder do not block each other.
+ */
+async function lockAncestors(sp: Executor, nodeId: string): Promise<void> {
+  await sp.execute(sql`
+    WITH RECURSIVE up(id, parent_id) AS (
+      SELECT a.id, a.parent_id FROM nodes a
+      WHERE a.id = (SELECT s.parent_id FROM nodes s WHERE s.id = ${nodeId})
+      UNION ALL
+      SELECT p.id, p.parent_id FROM nodes p JOIN up ON p.id = up.parent_id
+    ) CYCLE id SET is_cycle USING path
+    SELECT n.id FROM nodes n WHERE n.id IN (SELECT id FROM up) ORDER BY n.id FOR SHARE OF n`);
 }
 
 export type DeletedRows = {
@@ -304,9 +348,10 @@ const emptyDeleted = (ownerId: string | null): DeletedRows => ({
  * Deletes a whole subtree's rows — any root, trashed or not — after `assertPurgeable`. One
  * transaction (a savepoint inside the caller's): it locks the owner's `user` row, then every node
  * of the subtree, so a hold set concurrently either is seen or waits for this delete.
- * Upload sessions that point into the subtree are deleted too, finished ones included (their
- * `parent_id` reference would block the delete); shares, links, old versions and scan jobs go
- * with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
+ * It also locks the folders above the root (shared), whose holds reach down. Upload sessions
+ * that point into the subtree are deleted too, finished ones included (their `parent_id`
+ * reference would block the delete) — except one a hold protects (a held uploader's), which is
+ * kept, detached from the folder; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
  */
 export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<DeletedRows> {
   if (!isUuid(rootId)) return emptyDeleted(null);
@@ -314,6 +359,7 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
     const [root] = await sp.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, rootId));
     if (!root) return emptyDeleted(null);
     await sp.select({ id: user.id }).from(user).where(eq(user.id, root.ownerId)).for("update");
+    await lockAncestors(sp, rootId);
 
     const locked = await sp.execute<{
       id: string;
@@ -360,21 +406,56 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
       if (counted.has(version.nodeId)) out.freedBytes += version.size;
     }
 
+    // The sessions that point into the subtree. One that a hold protects — in practice a held
+    // UPLOADER's (the gate has already refused a held owner or a protected node of the subtree)
+    // — is a record that must outlive the folder: it is KEPT, detached from the folder that is
+    // going (`parent_id` null; `replace_node_id` is nulled by its foreign key), and if it was
+    // unfinished it is ended as `aborted`. Every other one is deleted, as before. An unfinished
+    // session is aborted in storage and its reservation given back either way: there is nowhere
+    // left for it to complete into.
     const sessions = await sp
-      .delete(uploads)
-      .where(or(inArray(uploads.parentId, ids), inArray(uploads.replaceNodeId, ids)))
-      .returning({
+      .select({
+        id: uploads.id,
         status: uploads.status,
         purpose: uploads.purpose,
         size: uploads.size,
         r2Key: uploads.r2Key,
         r2UploadId: uploads.r2UploadId,
-      });
+        kept: sql<boolean>`(${userHeld(sql`${uploads.ownerId}`)} OR ${userHeld(sql`${uploads.uploaderId}`)}
+          OR ${nodeProtected(sql`${uploads.nodeId}`)})`,
+      })
+      .from(uploads)
+      .where(or(inArray(uploads.parentId, ids), inArray(uploads.replaceNodeId, ids)))
+      .orderBy(uploads.id)
+      .for("update");
+    const unfinished = (s: { status: string }) => s.status === "open" || s.status === "completing";
     for (const session of sessions) {
-      if (session.status !== "open" && session.status !== "completing") continue;
+      if (!unfinished(session)) continue;
       out.uploadsToAbort.push({ r2Key: session.r2Key, r2UploadId: session.r2UploadId });
       if (session.purpose === "file") out.freedBytes += session.size;
     }
+    const kept = sessions.filter((s) => s.kept === true);
+    const gone = sessions.filter((s) => s.kept !== true).map((s) => s.id);
+    if (kept.length > 0) {
+      const ended = kept.filter(unfinished).map((s) => s.id);
+      if (ended.length > 0) {
+        await sp
+          .update(uploads)
+          .set({ status: "aborted", completedAt: sql`now()` })
+          .where(inArray(uploads.id, ended));
+        await sp.delete(uploadParts).where(inArray(uploadParts.uploadId, ended));
+      }
+      await sp
+        .update(uploads)
+        .set({ parentId: null })
+        .where(
+          inArray(
+            uploads.id,
+            kept.map((s) => s.id),
+          ),
+        );
+    }
+    if (gone.length > 0) await sp.delete(uploads).where(inArray(uploads.id, gone));
 
     // One statement for the whole subtree: the self-reference is checked at its end.
     await sp.delete(nodes).where(inArray(nodes.id, ids));
@@ -399,6 +480,7 @@ export async function deleteVersionRows(
       .where(eq(nodes.id, nodeId));
     if (!node) return emptyDeleted(null);
     await sp.select({ id: user.id }).from(user).where(eq(user.id, node.ownerId)).for("update");
+    await lockAncestors(sp, nodeId);
     await sp.select({ id: nodes.id }).from(nodes).where(eq(nodes.id, nodeId)).for("update");
     await assertPurgeable(sp, [nodeId]);
 

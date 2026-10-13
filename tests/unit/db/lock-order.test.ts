@@ -14,14 +14,16 @@ import { lookup } from "../../../src/worker/db/queries/blocklist";
 import {
   clearSuspectedCsam,
   lockSuspectedCsam,
+  setNodeLegalHold,
   setUserLegalHold,
 } from "../../../src/worker/db/queries/moderation";
 import { getNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
-import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
+import { deleteSubtreeRows, deleteVersionRows } from "../../../src/worker/db/queries/trash";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
 import {
   nodes,
+  nodeVersions,
   pendingUserPurges,
   reports,
   shareLinks,
@@ -601,6 +603,55 @@ describe("clearing a lock beside the filing of a report", () => {
     });
     expect(await lookup(a.db, sha256)).toEqual({ reason: "csam", sourceNodeId: file.id });
   });
+});
+
+describe("a purge beside a hold being placed on a folder above", () => {
+  // The hold on the FOLDER has been written and not committed. A purge of a file inside it
+  // starts: the gate would read the folder as not held. The purge takes a shared lock on every
+  // folder above its root first, so it waits for the hold — and then refuses.
+  for (const what of ["the file itself", "an old version of it"] as const) {
+    it(`${what}: the purge waits for the hold, then refuses — nothing is deleted`, async () => {
+      const owner = await makeUser(a.db);
+      const folder = await makeFolder(a.db, owner, null, `above-${rand()}`);
+      const sub = await makeFolder(a.db, owner, folder.id, "sub");
+      const file = await makeFile(a.db, owner, sub.id, `inside-${rand()}.jpg`, {
+        deletedAt: new Date(Date.now() - 1000),
+        trashedRoot: true,
+      });
+      await a.db.insert(nodeVersions).values({
+        nodeId: file.id,
+        versionId: "old",
+        r2Key: `k/${rand()}`,
+        size: 1,
+        purgeAfter: new Date(Date.now() - 1000),
+      });
+      const purgePid = gate<number>();
+      const holdWritten = gate();
+
+      const hold = settle(
+        a.db.transaction(async (tx) => {
+          await setNodeLegalHold(tx, folder.id, true);
+          holdWritten.open();
+          await untilWaitingForLock(await purgePid.opened, "the purge");
+        }),
+      );
+      const purge = settle(
+        b.db.transaction(async (tx) => {
+          await holdWritten.opened;
+          purgePid.open(await pidOf(tx));
+          return what === "the file itself"
+            ? deleteSubtreeRows(tx, file.id)
+            : deleteVersionRows(tx, file.id, ["old"]);
+        }),
+      );
+      const [heldNow, purged] = await Promise.all([hold, purge]);
+      expect(heldNow.ok, "the purge waited for the hold").toBe(true);
+      expect(purged.ok).toBe(false);
+      expect(purged.ok ? null : purged.error).toBeInstanceOf(LegalHoldError);
+      expect(await getNode(a.db, file.id)).not.toBeNull();
+      expect(await a.db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, file.id))).toHaveLength(1);
+    });
+  }
 });
 
 describe("Replace beside a legal hold on the account", () => {

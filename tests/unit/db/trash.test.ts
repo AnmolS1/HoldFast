@@ -4,7 +4,12 @@ import type { Db } from "../../../src/worker/db/client";
 import { LegalHoldError, QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { holdCauses, nodeProtected } from "../../../src/worker/db/queries/holds";
-import { closeNotice, restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
+import {
+  closeNotice,
+  restoreTakedown,
+  setNodeLegalHold,
+  takedownNode,
+} from "../../../src/worker/db/queries/moderation";
 import { getNode, OWNER_VISIBLE_STATUSES, listChildren } from "../../../src/worker/db/queries/nodes";
 import { release } from "../../../src/worker/db/queries/quota";
 import {
@@ -496,6 +501,177 @@ describe("assertPurgeable: each hold cause", () => {
     const error = await held(assertPurgeable(db, [a.root.id, b.root.id, c.root.id]));
     expect(error.heldRootIds).toEqual([b.root.id]);
     expect(error.causes[b.root.id]).toEqual(["node_legal_hold", "under_review"]);
+  });
+});
+
+describe("a hold reaches down from a folder", () => {
+  const past = new Date(Date.now() - 60_000);
+  const trashedDue = { deletedAt: past, trashedRoot: true, purgeAfter: past };
+  const isProtected = async (nodeId: string) =>
+    (await db.execute<{ kept: boolean }>(sql`SELECT ${nodeProtected(sql`${nodeId}::uuid`)} AS kept`)).rows[0]!
+      .kept;
+  const dueIds = async () => new Set((await purgeDue(db, 100_000)).map((row) => row.id));
+
+  /** held/ { sub/ { deep.bin (trashed, due) } }   plain/ { free.bin (trashed, due) } */
+  async function twoFolders() {
+    const owner = await makeUser(db);
+    const held = await makeFolder(db, owner, null, `held-${rand()}`);
+    const sub = await makeFolder(db, owner, held.id, "sub");
+    const deep = await makeFile(db, owner, sub.id, "deep.bin", { size: 40, ...trashedDue });
+    const plain = await makeFolder(db, owner, null, `plain-${rand()}`);
+    const free = await makeFile(db, owner, plain.id, "free.bin", { size: 60, ...trashedDue });
+    return { owner, held, sub, deep, plain, free };
+  }
+
+  it("a trashed file inside a folder on legal hold is not purged; one inside an un-held folder is, in the same run", async () => {
+    const t = await twoFolders();
+    // The control: before the hold both are due and both pass the gate.
+    expect((await dueIds()).has(t.deep.id)).toBe(true);
+    await expect(assertPurgeable(db, [t.deep.id, t.free.id])).resolves.toBeUndefined();
+
+    // A takedown as `csam` holds the FOLDER row only.
+    await takedownNode(db, t.held.id, { reason: "csam", by: null });
+    expect(await getNode(db, t.held.id)).toMatchObject({ legalHold: true });
+    expect(await getNode(db, t.deep.id)).toMatchObject({ legalHold: false });
+
+    const due = await dueIds();
+    expect(due.has(t.deep.id)).toBe(false);
+    expect(due.has(t.free.id)).toBe(true);
+    const error = await held(assertPurgeable(db, [t.deep.id, t.free.id]));
+    expect(error.causes).toEqual({ [t.deep.id]: ["node_legal_hold"] });
+    expect((await held(deleteSubtreeRows(db, t.deep.id))).heldRootIds).toEqual([t.deep.id]);
+    expect(await getNode(db, t.deep.id)).not.toBeNull();
+    expect(await deleteSubtreeRows(db, t.free.id)).toMatchObject({ ownerId: t.owner, freedBytes: 60 });
+    expect(await getNode(db, t.free.id)).toBeNull();
+    // The records about it are kept too: the same definition.
+    expect(await isProtected(t.deep.id)).toBe(true);
+    expect(await isProtected(t.sub.id)).toBe(true);
+    expect(await isProtected(t.plain.id)).toBe(false);
+
+    // The hold released: it is due and purgeable again.
+    await setNodeLegalHold(db, t.held.id, false);
+    expect((await dueIds()).has(t.deep.id)).toBe(true);
+    expect(await isProtected(t.deep.id)).toBe(false);
+    expect(await deleteSubtreeRows(db, t.deep.id)).toMatchObject({ freedBytes: 40 });
+  });
+
+  it("an open DMCA notice on a folder protects what is under it; a closed one does not", async () => {
+    const t = await twoFolders();
+    const [notice] = await db
+      .insert(dmcaNotices)
+      .values({ receivedVia: "form", status: "actioned" })
+      .returning();
+    await db
+      .insert(dmcaNoticeNodes)
+      .values({ noticeId: notice!.id, nodeId: t.held.id, nodeName: t.held.name });
+
+    expect((await dueIds()).has(t.deep.id)).toBe(false);
+    expect((await held(assertPurgeable(db, [t.deep.id]))).causes[t.deep.id]).toEqual(["open_notice"]);
+    expect(await isProtected(t.deep.id)).toBe(true);
+    // The control: the sibling folder's file, and this one once the notice is closed.
+    await expect(assertPurgeable(db, [t.free.id])).resolves.toBeUndefined();
+    await closeNotice(db, notice!.id, "closed");
+    expect((await dueIds()).has(t.deep.id)).toBe(true);
+    await expect(assertPurgeable(db, [t.deep.id])).resolves.toBeUndefined();
+    expect(await isProtected(t.deep.id)).toBe(false);
+  });
+
+  it("under_review and suspected_csam are states of one file: on a folder above they protect nothing below", async () => {
+    for (const scanStatus of ["under_review", "suspected_csam"] as const) {
+      const t = await twoFolders();
+      await db.update(nodes).set({ scanStatus }).where(eq(nodes.id, t.held.id));
+      // The folder itself is held by its own state…
+      expect((await held(assertPurgeable(db, [t.held.id]))).causes[t.held.id], scanStatus).toEqual([
+        scanStatus,
+      ]);
+      // …the file under it is not.
+      await expect(assertPurgeable(db, [t.deep.id]), scanStatus).resolves.toBeUndefined();
+      expect(await isProtected(t.deep.id), scanStatus).toBe(false);
+      expect((await dueIds()).has(t.deep.id), scanStatus).toBe(true);
+    }
+  });
+
+  it("the old versions of a file inside a held folder are neither listed nor deleted", async () => {
+    const owner = await makeUser(db);
+    const heldFolder = await makeFolder(db, owner, null, `held-${rand()}`, { legalHold: true });
+    const plainFolder = await makeFolder(db, owner, null, `plain-${rand()}`);
+    const inside = await makeFile(db, owner, heldFolder.id, "inside.bin");
+    const outside = await makeFile(db, owner, plainFolder.id, "outside.bin");
+    for (const file of [inside, outside]) {
+      await db
+        .insert(nodeVersions)
+        .values({ nodeId: file.id, versionId: "old", r2Key: `k/${rand()}`, size: 7, purgeAfter: past });
+    }
+    const listed = new Set((await versionsDue(db, 100_000)).map((v) => v.nodeId));
+    expect(listed.has(inside.id)).toBe(false);
+    expect(listed.has(outside.id)).toBe(true);
+
+    expect((await held(deleteVersionRows(db, inside.id, ["old"]))).causes[inside.id]).toEqual([
+      "node_legal_hold",
+    ]);
+    expect(await db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, inside.id))).toHaveLength(1);
+    // The control, in the same run.
+    expect(await deleteVersionRows(db, outside.id, ["old"])).toMatchObject({ freedBytes: 7 });
+  });
+
+  it("a root that sits under a held folder is held as a whole, with the causes of both: above it and inside it", async () => {
+    const owner = await makeUser(db);
+    const top = await makeFolder(db, owner, null, `top-${rand()}`, { legalHold: true });
+    const root = await makeFolder(db, owner, top.id, "root");
+    const reviewed = await makeFile(db, owner, root.id, "reviewed.bin", { scanStatus: "under_review" });
+    const error = await held(assertPurgeable(db, [root.id]));
+    expect(error.causes[root.id]).toEqual(["node_legal_hold", "under_review"]);
+    // The file's own cause alone, once the folder above is released.
+    await setNodeLegalHold(db, top.id, false);
+    expect((await held(assertPurgeable(db, [root.id]))).causes[root.id]).toEqual(["under_review"]);
+    expect(reviewed.parentId).toBe(root.id);
+  });
+
+  it("the gate and the retention predicate agree about what is inherited", async () => {
+    const t = await twoFolders();
+    const refuses = async (id: string) =>
+      (await rejection(assertPurgeable(db, [id]).then(() => Promise.reject(new Error("passed"))))) instanceof
+      LegalHoldError;
+    for (const node of [t.held, t.sub, t.deep, t.plain, t.free]) {
+      expect(await isProtected(node.id), node.name).toBe(await refuses(node.id));
+    }
+    await setNodeLegalHold(db, t.held.id, true);
+    for (const node of [t.held, t.sub, t.deep, t.plain, t.free]) {
+      expect(await isProtected(node.id), node.name).toBe(await refuses(node.id));
+    }
+    expect(await isProtected(t.deep.id)).toBe(true);
+    expect(await isProtected(t.free.id)).toBe(false);
+  });
+});
+
+describe("the purge keeps a held uploader's upload sessions", () => {
+  it("a session a hold protects is kept — detached from the folder, ended if it was unfinished — and every other one goes", async () => {
+    const t = await tree();
+    const heldEditor = await makeUser(db, { legalHold: true });
+    const editor = await makeUser(db);
+    const session = async (uploaderId: string, extra: Partial<typeof uploads.$inferInsert>) =>
+      (await makeUpload(db, t.owner, uploaderId, { parentId: t.sub.id, ...extra })).id;
+    const keptDone = await session(heldEditor, { status: "done", size: 500 });
+    const keptOpen = await session(heldEditor, { status: "open", size: 300, r2UploadId: "mpu-held" });
+    await db.insert(uploadParts).values({ uploadId: keptOpen, partNumber: 1, etag: "e", size: 300 });
+    // The controls, in the same purge: the same two sessions of an editor who is not held.
+    const goneDone = await session(editor, { status: "done", size: 500 });
+    const goneOpen = await session(editor, { status: "open", size: 200, r2UploadId: "mpu-free" });
+    const row = async (id: string) => (await db.select().from(uploads).where(eq(uploads.id, id)))[0] ?? null;
+
+    const deleted = await deleteSubtreeRows(db, t.root.id);
+    // Both unfinished sessions are aborted in storage and their reservations given back.
+    expect(deleted.uploadsToAbort.map((u) => u.r2UploadId).sort()).toEqual(["mpu-free", "mpu-held"]);
+    expect(deleted.freedBytes).toBe(60 + 40 + 300 + 200);
+    expect(await getNode(db, t.root.id)).toBeNull();
+
+    expect(await row(goneDone)).toBeNull();
+    expect(await row(goneOpen)).toBeNull();
+    expect(await row(keptDone)).toMatchObject({ status: "done", parentId: null, uploaderId: heldEditor });
+    const ended = (await row(keptOpen))!;
+    expect(ended).toMatchObject({ status: "aborted", parentId: null, uploaderId: heldEditor });
+    expect(ended.completedAt).toBeInstanceOf(Date);
+    expect(await db.select().from(uploadParts).where(eq(uploadParts.uploadId, keptOpen))).toEqual([]);
   });
 });
 
