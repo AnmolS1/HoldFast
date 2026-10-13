@@ -12,14 +12,13 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { hf } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
-import { fetchPreview, usePreviewUrl } from "../usePreviewUrl";
+import { fetchLimitFor } from "../renderer-map";
+import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import { NoPreview } from "./NoPreview";
+import { PDF_MAX_PAGES, pixelRatioFor } from "./pdf-limits";
 import { safeExternalUrl } from "./pdf-links";
 import { openPdf, PdfLockedError, type PdfDocument, type PdfLink, type PdfPage } from "./pdf-engine";
 import type { RendererProps } from "./types";
-
-/** Pages shown at most; the rest is the download's. */
-export const PDF_MAX_PAGES = 500;
 
 const PAGE_GAP = 12;
 const PADDING = 16;
@@ -27,16 +26,7 @@ const MIN_SCALE = 0.25;
 const MAX_SCALE = 4;
 const AUTO_MAX_SCALE = 1.5;
 const STEP = 1.25;
-/** Canvas pixels per page at most: a huge page is drawn less sharply, not refused. */
-const MAX_CANVAS_PIXELS = 16_000_000;
-
 const clampScale = (value: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
-
-function pixelRatioFor(width: number, height: number): number {
-  const wanted = Math.min(window.devicePixelRatio || 1, 2);
-  const most = Math.sqrt(MAX_CANVAS_PIXELS / Math.max(1, width * height));
-  return Math.max(0.5, Math.min(wanted, most));
-}
 
 // What pdf.js's text layer needs to line its (transparent) text up with the canvas: structure
 // only. The selection colour is the system's own.
@@ -146,7 +136,7 @@ function PageView(props: PageViewProps) {
   useEffect(() => {
     if (!page || !canvas.current || !textLayer.current) return;
     let cancelled = false;
-    const ratio = pixelRatioFor(page.width * scale, page.height * scale);
+    const ratio = pixelRatioFor(page.width * scale, page.height * scale, window.devicePixelRatio);
     const render = page.render(canvas.current, textLayer.current, scale, ratio);
     // A cancelled render rejects; that is not a failure.
     render.done.catch(() => {});
@@ -452,6 +442,7 @@ export default function PdfPreview({ source, item, download }: RendererProps) {
   const preview = usePreviewUrl(source, item.id, "inline");
   const [opened, setOpened] = useState<Opened | null>(null);
   const [locked, setLocked] = useState(false);
+  const [tooLarge, setTooLarge] = useState(false);
 
   // The bytes are fetched once, starting from the first URL; a refused one is re-minted inside.
   const [firstUrl, setFirstUrl] = useState<string | null>(null);
@@ -465,8 +456,14 @@ export default function PdfPreview({ source, item, download }: RendererProps) {
       const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
       if (!response) return;
       try {
-        const bytes = new Uint8Array(await response.arrayBuffer());
+        // Counted as it arrives: a file larger than the viewer takes is dropped mid-transfer.
+        const bytes = await readLimited(response, fetchLimitFor("pdf"));
         if (abort.signal.aborted) return;
+        if (bytes === TOO_LARGE) {
+          abort.abort();
+          settle();
+          return setTooLarge(true);
+        }
         // pdf.js holds the whole file from here on: no URL is needed any more.
         settle();
         doc = await openPdf(bytes);
@@ -488,6 +485,7 @@ export default function PdfPreview({ source, item, download }: RendererProps) {
     };
   }, [firstUrl, reportFailure, fail, settle]);
 
+  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} download={download} />;
   if (locked) return <NoPreview item={item} message={t("pdf.locked")} download={download} />;
   if (preview.failure) return <ErrorState failure={preview.failure} actions={download} />;
   if (!opened) return <PreviewSkeleton />;

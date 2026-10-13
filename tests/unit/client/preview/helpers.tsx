@@ -15,6 +15,8 @@ export interface Call {
   method: string;
   url: URL;
   body: unknown;
+  /** The request's abort signal, when it has one. */
+  signal: AbortSignal | undefined;
 }
 
 export type Handler = (call: Call) => Response | Promise<Response> | undefined;
@@ -43,7 +45,12 @@ export function installFetch(handlers: { api?: Handler; files?: Handler } = {}):
         // not JSON
       }
     }
-    const call: Call = { method: (init.method ?? "GET").toUpperCase(), url, body };
+    const call: Call = {
+      method: (init.method ?? "GET").toUpperCase(),
+      url,
+      body,
+      signal: init.signal ?? undefined,
+    };
     calls.push(call);
     if (init.signal?.aborted) throw new DOMException("aborted", "AbortError");
     if (url.origin === FILES_ORIGIN) {

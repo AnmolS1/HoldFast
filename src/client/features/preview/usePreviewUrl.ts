@@ -200,3 +200,43 @@ export async function fetchPreview(
   }
   return null;
 }
+
+/** A file turned out larger than its viewer takes. */
+export const TOO_LARGE = Symbol("too large");
+
+/**
+ * Read a response's body, giving up — and cancelling the transfer — as soon as more than `limit`
+ * bytes have arrived. The count is of what actually came: `Content-Length` and the size the API
+ * reported are not trusted.
+ */
+export async function readLimited(response: Response, limit: number): Promise<Uint8Array | typeof TOO_LARGE> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > limit) {
+    void response.body?.cancel().catch(() => {});
+    return TOO_LARGE;
+  }
+  if (!response.body) {
+    const all = new Uint8Array(await response.arrayBuffer());
+    return all.byteLength > limit ? TOO_LARGE : all;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      void reader.cancel().catch(() => {});
+      return TOO_LARGE;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return all;
+}

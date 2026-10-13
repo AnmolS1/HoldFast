@@ -9,8 +9,10 @@ import { useEffect, useMemo, useState } from "react";
 import { fontMono, hf } from "../../../theme/tokens";
 import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
-import { fetchPreview, usePreviewUrl } from "../usePreviewUrl";
+import { fetchLimitFor } from "../renderer-map";
+import { fetchPreview, readLimited, TOO_LARGE, usePreviewUrl } from "../usePreviewUrl";
 import type { Line } from "./highlight";
+import { NoPreview } from "./NoPreview";
 import { decodeText, HIGHLIGHT_MAX_CHARS, TEXT_MAX_LINES } from "./text";
 import type { RendererProps } from "./types";
 
@@ -28,6 +30,7 @@ export default function TextPreview({ source, item, download }: RendererProps) {
   const [text, setText] = useState<string | null>(null);
   const [highlighted, setHighlighted] = useState<Line[] | null>(null);
   const [wrap, setWrap] = useState(false);
+  const [tooLarge, setTooLarge] = useState(false);
 
   // The bytes are fetched once, starting from the first URL; a refused one is re-minted inside.
   const [firstUrl, setFirstUrl] = useState<string | null>(null);
@@ -40,9 +43,16 @@ export default function TextPreview({ source, item, download }: RendererProps) {
       const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
       if (!response) return;
       try {
-        // A file's final line break ends its last line; it is not one more (empty) line.
-        const decoded = decodeText(await response.arrayBuffer()).replace(/(\r\n|\r|\n)$/, "");
+        // The server refuses a URL for a larger file; the count here is of what really arrives.
+        const bytes = await readLimited(response, fetchLimitFor("text"));
         if (abort.signal.aborted) return;
+        if (bytes === TOO_LARGE) {
+          abort.abort();
+          settle();
+          return setTooLarge(true);
+        }
+        // A file's final line break ends its last line; it is not one more (empty) line.
+        const decoded = decodeText(bytes).replace(/(\r\n|\r|\n)$/, "");
         // The text is in hand: no URL is needed any more.
         settle();
         setText(decoded);
@@ -77,6 +87,7 @@ export default function TextPreview({ source, item, download }: RendererProps) {
     };
   }, [text, item.ext]);
 
+  if (tooLarge) return <NoPreview item={item} message={t("none.tooLarge")} download={download} />;
   if (preview.failure) return <ErrorState failure={preview.failure} actions={download} />;
   if (text === null) return <PreviewSkeleton />;
 

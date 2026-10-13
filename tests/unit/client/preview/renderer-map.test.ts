@@ -1,8 +1,18 @@
 // Which renderer a file gets — decided from the detected type and the allow-lists, never from
 // the name or from "it is only XML".
 import { describe, expect, it } from "vitest";
-import { rendererFor, type RendererKind } from "../../../../src/client/features/preview/renderer-map";
-import { MIME_CATEGORIES, PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
+import {
+  IMAGE_PREVIEW_MAX_BYTES,
+  PDF_PREVIEW_MAX_BYTES,
+  rendererFor,
+  type RendererKind,
+} from "../../../../src/client/features/preview/renderer-map";
+import {
+  INLINE_TYPES,
+  MIME_CATEGORIES,
+  PREVIEW_TEXT_MAX_BYTES,
+  PREVIEW_TEXT_TYPES,
+} from "../../../../src/shared/constants";
 import type { MimeCategory } from "../../../../src/shared/schemas/common";
 
 const kind = (mimeCategory: MimeCategory, mimeSniffed: string | null | undefined, size = 1000) =>
@@ -90,9 +100,40 @@ describe("renderer map", () => {
       kind: "none",
       reason: "tooLarge",
     });
-    // The limit is the text viewer's only: a large PDF or film is still previewed.
-    expect(kind("pdf", "application/pdf", PREVIEW_TEXT_MAX_BYTES * 100)).toBe("pdf");
-    expect(kind("video", "video/mp4", PREVIEW_TEXT_MAX_BYTES * 100)).toBe("video");
+  });
+
+  it("a PDF and an image have their own size limit; video and audio have none", () => {
+    expect(PDF_PREVIEW_MAX_BYTES).toBe(50_000_000);
+    expect(IMAGE_PREVIEW_MAX_BYTES).toBe(50_000_000);
+    expect(rendererFor({ mimeCategory: "pdf", mimeSniffed: "application/pdf", size: 50_000_000 })).toEqual({
+      kind: "pdf",
+    });
+    expect(rendererFor({ mimeCategory: "pdf", mimeSniffed: "application/pdf", size: 50_000_001 })).toEqual({
+      kind: "none",
+      reason: "tooLarge",
+    });
+    for (const type of ["image/jpeg", "image/png", "image/avif", "image/bmp", "image/gif", "image/webp"]) {
+      expect(kind("image", type, 50_000_000), type).toBe("image");
+      expect(rendererFor({ mimeCategory: "image", mimeSniffed: type, size: 50_000_001 }), type).toEqual({
+        kind: "none",
+        reason: "tooLarge",
+      });
+    }
+    // Played in ranges by the browser's own element: the product's largest file is still a film.
+    expect(kind("video", "video/mp4", 2_000_000_000)).toBe("video");
+    expect(kind("audio", "audio/flac", 2_000_000_000)).toBe("audio");
+    // HEIC is shown through its thumbnail, whose limit is the server's (`thumb`).
+    expect(kind("image", "image/heic", 60_000_000)).toBe("heic");
+    // A size that is not a number is not "small".
+    expect(kind("pdf", "application/pdf", Number.NaN)).toBe("none");
+    expect(kind("image", "image/png", Number.POSITIVE_INFINITY)).toBe("none");
+  });
+
+  it("the lists are the product's own (src/shared), not a copy", () => {
+    for (const type of INLINE_TYPES) {
+      expect(kind("other", type), type).not.toBe("none");
+    }
+    for (const type of PREVIEW_TEXT_TYPES) expect(kind("document", type), type).toBe("text");
   });
 
   it("every type and extension the product lists maps to a renderer or to none — nothing throws", () => {

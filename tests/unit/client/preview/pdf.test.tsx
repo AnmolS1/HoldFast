@@ -7,7 +7,7 @@ import type { PublicPreviewSource } from "../../../../src/client/components/slot
 import { PreviewDialog } from "../../../../src/client/features/preview";
 import { safeExternalUrl } from "../../../../src/client/features/preview/renderers/pdf-links";
 import type { PdfDocument, PdfLink } from "../../../../src/client/features/preview/renderers/pdf-engine";
-import { PDF_MAX_PAGES } from "../../../../src/client/features/preview/renderers/PdfPreview";
+import { PDF_MAX_PAGES } from "../../../../src/client/features/preview/renderers/pdf-limits";
 import { intersect } from "../shell/helpers";
 import { filesUrl, ID, NODES } from "./fixtures";
 import {

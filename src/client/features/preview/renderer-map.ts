@@ -1,7 +1,7 @@
-// Which renderer a file gets. Decided from the DETECTED type (`mimeSniffed`) and the allow-lists
-// below — never from the name, and never because a type "is only XML". Whatever is not listed
-// gets no preview: the files host would refuse an inline URL for it anyway.
-import { PREVIEW_TEXT_MAX_BYTES } from "../../../shared/constants";
+// Which renderer a file gets. Decided from the DETECTED type (`mimeSniffed`) and the product's
+// allow-lists — never from the name, and never because a type "is only XML". Whatever is not
+// listed gets no preview: the files host would refuse an inline URL for it anyway.
+import { INLINE_TYPES, PREVIEW_TEXT_MAX_BYTES, PREVIEW_TEXT_TYPES } from "../../../shared/constants";
 import type { PreviewItem } from "../../components/slots";
 
 export type RendererKind = "image" | "heic" | "pdf" | "text" | "video" | "audio" | "none";
@@ -14,29 +14,16 @@ export interface RendererChoice {
   reason?: NoPreviewReason;
 }
 
-// The Worker's inline list (`INLINE_TYPES`, src/worker/services/mime.ts) and its text-viewer
-// types, as the detector spells them. A copy, because the SPA cannot import Worker code; the
-// renderer-map test proves the two agree for every type and extension the product knows.
-const INLINE_IMAGE_TYPES: readonly string[] = [
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
-  "image/avif",
-  "image/bmp",
-];
-/** Inline types no browser decodes: shown through their thumbnail. */
+/**
+ * The largest PDF the viewer opens. pdf.js is handed the whole file, so its size is memory in
+ * the tab: above this there is Download. The fetch itself stops at the same number.
+ */
+export const PDF_PREVIEW_MAX_BYTES = 50_000_000;
+/** The largest image put in an <img>: decoding a larger one can exhaust a phone. */
+export const IMAGE_PREVIEW_MAX_BYTES = 50_000_000;
+
+/** Inline images no browser decodes: shown through their thumbnail, which has its own limit. */
 const THUMB_ONLY_IMAGE_TYPES: readonly string[] = ["image/heic", "image/heif"];
-const INLINE_VIDEO_TYPES: readonly string[] = ["video/mp4", "video/webm", "video/quicktime", "video/x-m4v"];
-const INLINE_AUDIO_TYPES: readonly string[] = [
-  "audio/mpeg",
-  "audio/ogg",
-  "audio/wav",
-  "audio/flac",
-  "audio/mp4",
-  "audio/x-m4a",
-];
-const TEXT_TYPES: readonly string[] = ["text/plain", "text/markdown", "text/csv"];
 const OCTET_STREAM = "application/octet-stream";
 
 /** HTML, SVG and every XML type: they can run script when a browser opens them. */
@@ -44,23 +31,36 @@ function isActiveType(type: string): boolean {
   return type === "text/html" || type.endsWith("+xml") || type.endsWith("/xml");
 }
 
+const within = (size: number, limit: number) => Number.isFinite(size) && size <= limit;
+const TOO_LARGE: RendererChoice = { kind: "none", reason: "tooLarge" };
+
 /** The renderer for a file. Pure; table-tested. */
 export function rendererFor(
   item: Pick<PreviewItem, "mimeCategory" | "mimeSniffed" | "size">,
 ): RendererChoice {
   const type = (item.mimeSniffed ?? "").trim().toLowerCase();
   if (type === "" || type === OCTET_STREAM || isActiveType(type)) return { kind: "none", reason: "type" };
-  if (INLINE_IMAGE_TYPES.includes(type)) return { kind: "image" };
-  if (THUMB_ONLY_IMAGE_TYPES.includes(type)) return { kind: "heic" };
-  if (INLINE_VIDEO_TYPES.includes(type)) return { kind: "video" };
-  if (INLINE_AUDIO_TYPES.includes(type)) return { kind: "audio" };
-  if (type === "application/pdf") return { kind: "pdf" };
-  if (TEXT_TYPES.includes(type) || item.mimeCategory === "code") {
-    // Above the limit the server refuses the URL; do not ask.
-    if (!Number.isFinite(item.size) || item.size > PREVIEW_TEXT_MAX_BYTES) {
-      return { kind: "none", reason: "tooLarge" };
+  if (INLINE_TYPES.includes(type)) {
+    if (THUMB_ONLY_IMAGE_TYPES.includes(type)) return { kind: "heic" };
+    if (type.startsWith("image/")) {
+      return within(item.size, IMAGE_PREVIEW_MAX_BYTES) ? { kind: "image" } : TOO_LARGE;
     }
-    return { kind: "text" };
+    // Played by the browser's own element in ranges: the file's size is not memory in the tab.
+    if (type.startsWith("video/")) return { kind: "video" };
+    if (type.startsWith("audio/")) return { kind: "audio" };
+    return { kind: "none", reason: "type" };
+  }
+  if (type === "application/pdf") {
+    return within(item.size, PDF_PREVIEW_MAX_BYTES) ? { kind: "pdf" } : TOO_LARGE;
+  }
+  if (PREVIEW_TEXT_TYPES.includes(type) || item.mimeCategory === "code") {
+    // Above the limit the server refuses the URL; do not ask.
+    return within(item.size, PREVIEW_TEXT_MAX_BYTES) ? { kind: "text" } : TOO_LARGE;
   }
   return { kind: "none", reason: "type" };
+}
+
+/** The most bytes a viewer that reads a file itself will take from the files host. */
+export function fetchLimitFor(kind: "pdf" | "text"): number {
+  return kind === "pdf" ? PDF_PREVIEW_MAX_BYTES : PREVIEW_TEXT_MAX_BYTES;
 }

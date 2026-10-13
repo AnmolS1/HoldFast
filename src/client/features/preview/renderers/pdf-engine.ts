@@ -15,6 +15,7 @@ import {
   type PDFPageProxy,
 } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { PAGE_MAX_LINKS, PDF_MAX_IMAGE_PIXELS, TEXT_LAYER_MAX_ITEMS } from "./pdf-limits";
 import { safeExternalUrl } from "./pdf-links";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
@@ -80,17 +81,22 @@ function wrapPage(page: PDFPageProxy): PdfPage {
         annotationMode: AnnotationMode.ENABLE,
       });
       textLayer.replaceChildren();
-      const text = new TextLayer({
-        textContentSource: page.streamTextContent(),
-        container: textLayer,
-        viewport,
+      let cancelled = false;
+      let text: TextLayer | null = null;
+      const layer = page.getTextContent().then((content) => {
+        // A page of a hundred thousand text runs would be a hundred thousand elements: such a
+        // page is shown as its picture only.
+        if (cancelled || content.items.length > TEXT_LAYER_MAX_ITEMS) return undefined;
+        text = new TextLayer({ textContentSource: content, container: textLayer, viewport });
+        return text.render();
       });
-      const done = Promise.all([task.promise, text.render()]).then(() => undefined);
+      const done = Promise.all([task.promise, layer]).then(() => undefined);
       return {
         done,
         cancel() {
+          cancelled = true;
           task.cancel();
-          text.cancel();
+          text?.cancel();
         },
       };
     },
@@ -99,6 +105,7 @@ function wrapPage(page: PDFPageProxy): PdfPage {
       const annotations = (await page.getAnnotations({ intent: "display" })) as RawAnnotation[];
       const links: PdfLink[] = [];
       for (const annotation of annotations) {
+        if (links.length >= PAGE_MAX_LINKS) break;
         if (annotation.subtype !== "Link" || !annotation.rect) continue;
         const url = safeExternalUrl(annotation.url);
         if (!url && annotation.dest === undefined) continue;
@@ -144,8 +151,10 @@ export async function openPdf(data: Uint8Array): Promise<PdfDocument> {
     disableRange: true,
     disableStream: true,
     disableAutoFetch: true,
+    // No forms engine, and nothing fetched by pdf.js: no CMap, font or decoder URL is configured.
     enableXfa: false,
     useWorkerFetch: false,
+    maxImageSize: PDF_MAX_IMAGE_PIXELS,
   });
   let doc: PDFDocumentProxy;
   try {

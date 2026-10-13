@@ -4,7 +4,7 @@ export const TEXT_MAX_LINES = 5_000;
 export const HIGHLIGHT_MAX_CHARS = 200_000;
 
 /** UTF-8, or — when the bytes are not valid UTF-8 — Latin-1. */
-export function decodeText(bytes: ArrayBuffer): string {
+export function decodeText(bytes: ArrayBuffer | Uint8Array): string {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
