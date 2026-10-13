@@ -154,8 +154,10 @@ export function describeItem(item: UploadItem): string | null {
     case "uploading": {
       const params = { sent: formatBytes(item.sentBytes), size: formatBytes(item.size) };
       if (item.speed <= 0) return t("row.uploading", params);
-      const speed = t("row.uploadingSpeed", { ...params, speed: formatBytes(item.speed) });
-      return item.eta === null ? speed : `${speed} · ~${formatEta(item.eta)}`;
+      const speed = formatBytes(item.speed);
+      return item.eta === null
+        ? t("row.uploadingSpeed", { ...params, speed })
+        : t("row.uploadingEta", { ...params, speed, eta: formatEta(item.eta) });
     }
     case "hashing":
       return t("row.verifying");

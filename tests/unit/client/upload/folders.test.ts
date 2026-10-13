@@ -1,7 +1,7 @@
 // Folder upload: folders first, each once; a folder that is already there is used, a name that
 // something else holds fails its subtree only — and the folder's children are never listed.
 import { beforeEach, describe, expect, it } from "vitest";
-import { fromFileList } from "../../../../src/client/features/upload/intake";
+import { carriesFiles, fromDrop, fromFileList } from "../../../../src/client/features/upload/intake";
 import { addFiles } from "../../../../src/client/features/upload/manager";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
@@ -145,5 +145,88 @@ describe("what a folder picker hands over", () => {
       ["x", ""],
     ]);
     expect(intake.folders.sort()).toEqual(["trip", "trip/day1"]);
+  });
+});
+
+describe("what a drop hands over", () => {
+  type Entry = { isFile: boolean; isDirectory: boolean; fullPath: string };
+  const fileEntry = (fullPath: string, broken = false): Entry & { file: unknown } => ({
+    isFile: true,
+    isDirectory: false,
+    fullPath,
+    file: (done: (file: File) => void, failed: (error: Error) => void) =>
+      broken ? failed(new Error("unreadable")) : done(smallFile(fullPath.split("/").pop()!)),
+  });
+  /** A directory whose reader hands its children over in batches of `size`, then an empty batch. */
+  const dirEntry = (fullPath: string, children: Entry[], size = 2): Entry & { createReader: unknown } => ({
+    isFile: false,
+    isDirectory: true,
+    fullPath,
+    createReader: () => {
+      let at = 0;
+      return {
+        readEntries: (done: (batch: Entry[]) => void) => {
+          const batch = children.slice(at, at + size);
+          at += size;
+          done(batch);
+        },
+      };
+    },
+  });
+  const dropped = (entries: Array<Entry | null>, loose: File[] = []) =>
+    ({
+      types: ["Files"],
+      files: loose,
+      items: entries.map((entry, index) => ({
+        kind: "file",
+        webkitGetAsEntry: () => entry,
+        getAsFile: () => loose[index] ?? null,
+      })),
+    }) as unknown as DataTransfer;
+
+  it("walks a dropped folder to the end — a reader answers in batches — and keeps each file's folder", async () => {
+    const trip = dirEntry("/trip", [
+      fileEntry("/trip/a.jpg"),
+      fileEntry("/trip/b.jpg"),
+      // In the second batch: missed by a walk that reads only once.
+      fileEntry("/trip/c.jpg"),
+      dirEntry("/trip/day1", [
+        fileEntry("/trip/day1/d.jpg"),
+        fileEntry("/trip/day1/e.jpg"),
+        fileEntry("/trip/day1/f.jpg"),
+      ]),
+      dirEntry("/trip/empty", []),
+    ]);
+    const intake = await fromDrop(dropped([trip, fileEntry("/loose.txt")]));
+    expect(intake.files.map((entry) => [entry.file.name, entry.path])).toEqual([
+      ["a.jpg", "trip"],
+      ["b.jpg", "trip"],
+      ["c.jpg", "trip"],
+      ["d.jpg", "trip/day1"],
+      ["e.jpg", "trip/day1"],
+      ["f.jpg", "trip/day1"],
+      ["loose.txt", ""],
+    ]);
+    // No leading slash, and the empty folder is there.
+    expect(intake.folders).toEqual(["trip", "trip/day1", "trip/empty"]);
+  });
+
+  it("an entry that cannot be read is left out; the rest of the drop goes on", async () => {
+    const intake = await fromDrop(dropped([fileEntry("/gone.txt", true), fileEntry("/fine.txt")]));
+    expect(intake.files.map((entry) => entry.file.name)).toEqual(["fine.txt"]);
+  });
+
+  it("where the browser gives no entries, the plain files are taken", async () => {
+    const plain = smallFile("plain.txt");
+    const intake = await fromDrop(dropped([null], [plain]));
+    expect(intake.files).toEqual([{ file: plain, path: "" }]);
+    const bare = await fromDrop({ types: ["Files"], files: [plain], items: [] } as unknown as DataTransfer);
+    expect(bare.files).toEqual([{ file: plain, path: "" }]);
+  });
+
+  it("only a drag of files from the system counts", () => {
+    expect(carriesFiles({ types: ["Files"] } as unknown as DataTransfer)).toBe(true);
+    expect(carriesFiles({ types: ["text/plain", "text/uri-list"] } as unknown as DataTransfer)).toBe(false);
+    expect(carriesFiles(null)).toBe(false);
   });
 });

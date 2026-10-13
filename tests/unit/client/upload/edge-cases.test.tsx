@@ -440,6 +440,24 @@ describe("limits and switches", () => {
     expect(server.inits.length).toBe(inits);
   });
 
+  it("503 read_only (maintenance) pauses the queue the same way", async () => {
+    server.onInit = () => envelope("read_only", 503);
+    await addFiles([{ file: smallFile("a.txt") }], null);
+    await settle();
+    expect(items()[0]).toMatchObject({ state: "paused", pauseReason: "disabled" });
+    expect(server.inits.length).toBe(1);
+  });
+
+  it("429 rate_limited is an answer, not a blip: no retry on the schedule, an error that can be tried again", async () => {
+    vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
+    server.onPut = () => apiError(429, "rate_limited");
+    await addFiles([{ file: smallFile("a.txt") }], null);
+    await settle(0);
+    await settle(120_000);
+    expect(server.puts.length).toBe(1);
+    expect(items()[0]).toMatchObject({ state: "error", canRetry: true, message: "rate_limited message" });
+  });
+
   it("a session that is gone (404 at a part) is forgotten: the new try starts from init", async () => {
     server.partBytes = 100;
     server.onPut = (_call, nth) => (nth === 1 ? apiError(404, "not_found") : undefined);

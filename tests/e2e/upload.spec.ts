@@ -627,6 +627,14 @@ test.describe("uploads (mocked API)", () => {
     await page.keyboard.press("Enter");
     await expect(rows(page)).toHaveCount(1);
     await expect(panel.getByRole("heading", { name: "Uploads" })).toBeFocused();
+    // The last row takes the panel with it: the focus goes to the page, not to nowhere.
+    await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: "Try page.html again" })).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: "Remove page.html from the list" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(panel).toHaveCount(0);
+    await expect(page.locator("[data-main]")).toBeFocused();
   });
 
   test("blocked content is refused for good: Remove is the only control, and nothing more is sent", async ({

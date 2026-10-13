@@ -7,7 +7,8 @@ import { getRibbonSnapshot, TransferRibbon } from "../../../../src/client/compon
 import { requestUpload, routes, UploadDropOverlay } from "../../../../src/client/features/upload";
 import { addFiles } from "../../../../src/client/features/upload/manager";
 import { targetFromLocation } from "../../../../src/client/features/upload/picker";
-import { getUploads } from "../../../../src/client/features/upload/store";
+import { getUploads, type UploadItem } from "../../../../src/client/features/upload/store";
+import { describeItem } from "../../../../src/client/features/upload/summary";
 import { renderRoutes, renderShell, seedConfig, setupShell } from "../shell/helpers";
 import { FOLDER_ID, nodeDetail, OTHER_USER_ID, usageDto } from "./fixtures";
 import {
@@ -65,9 +66,9 @@ describe("the transfer ribbon", () => {
     for (const call of server.held.filter((entry) => entry.size === 100_000_000).slice(0, 3)) {
       call.progress(100_000_000);
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // Progress samples are published a moment later, coalesced.
+    await vi.waitFor(() => expect(ribbon().current!.sentence).toMatch(/^Uploading 1 of 2 · 900 MB left/));
     expect(ribbon().current!.progress).toBeGreaterThan(0.2);
-    expect(ribbon().current!.sentence).toMatch(/^Uploading 1 of 2 · 900 MB left/);
 
     server.hold = false;
     for (const call of [...server.held]) call.resolve();
@@ -113,6 +114,38 @@ describe("the transfer ribbon", () => {
     await act(async () => within(panel).getByRole("button", { name: "Resume all" }).click());
     await settled();
     expect(items()[0]!.state).toBe("uploading");
+  });
+
+  it("when the last row is removed the panel goes, and the focus goes to the page — not to nowhere", async () => {
+    server.onInit = () => envelope("validation", 400);
+    renderShell(
+      <>
+        <main data-main tabIndex={-1} />
+        <UploadDropOverlay />
+        <TransferRibbon />
+      </>,
+    );
+    await act(() => addFiles([{ file: smallFile("a.txt") }], null));
+    await settled();
+    await act(async () => screen.getByRole("button", { name: /1 upload didn't finish/ }).click());
+    const remove = screen.getByRole("button", { name: "Remove a.txt from the list" });
+    remove.focus();
+    await act(async () => remove.click());
+    expect(document.querySelector("[data-upload-panel]")).toBeNull();
+    expect(document.activeElement).toBe(document.querySelector("[data-main]"));
+  });
+
+  it("a row in flight says how much, how fast and how long", () => {
+    const item = {
+      state: "uploading",
+      sentBytes: 100_000_000,
+      size: 300_000_000,
+      speed: 10_000_000,
+      eta: 20,
+    } as UploadItem;
+    expect(describeItem(item)).toBe("100 MB of 300 MB · 10 MB/s · ~20 s");
+    expect(describeItem({ ...item, eta: null })).toBe("100 MB of 300 MB · 10 MB/s");
+    expect(describeItem({ ...item, speed: 0, eta: null })).toBe("100 MB of 300 MB");
   });
 
   it("there is no second surface: the host renders no row and no progress bar of its own", async () => {

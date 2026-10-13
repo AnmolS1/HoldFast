@@ -164,7 +164,6 @@ function abortError(): DOMException {
 function isRetryable(cause: unknown): boolean {
   if (!(cause instanceof ApiError)) return false;
   if (cause.code === "network") return true;
-  if (cause.code === "rate_limited") return true;
   if (cause.status < 500) return false;
   // A kill switch is an answer, not a blip.
   return cause.code !== "feature_disabled" && cause.code !== "read_only";
@@ -656,7 +655,8 @@ function fail(id: string, cause: unknown): void {
     }
     return;
   }
-  if (cause.code === "feature_disabled") {
+  // The upload switch, and the maintenance switch that stops every write: the queue waits.
+  if (cause.code === "feature_disabled" || cause.code === "read_only") {
     patchItem(id, { state: "paused", pauseReason: "disabled" });
     pauseQueue("disabled");
     return;

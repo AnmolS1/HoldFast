@@ -4,7 +4,7 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
 import { Pause, Play, RotateCw, X } from "lucide-react";
-import { useRef, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { ProgressUnderline } from "../../components/ProgressUnderline";
 import { StatusDot } from "../../components/StatusDot";
 import { t as shellT } from "../../lib/i18n";
@@ -136,9 +136,13 @@ function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
         </RowButton>
       ) : null}
       {moving ? (
-        <ProgressUnderline key={item.id} value={item.progress} label={`${name}: ${status ?? ""}`} />
+        <ProgressUnderline
+          key={item.id}
+          value={item.progress}
+          label={t("row.progress", { name, status: status ?? "" })}
+        />
       ) : item.state === "scanning" ? (
-        <ProgressUnderline key={`${item.id}-scan`} value={null} label={`${t("row.scanning")} ${name}`} />
+        <ProgressUnderline key={`${item.id}-scan`} value={null} label={t("row.scanningNamed", { name })} />
       ) : null}
     </Box>
   );
@@ -159,9 +163,21 @@ export function UploadPanel() {
   );
   // A row that goes takes the focus with it: put it on the panel's heading, never on <body>.
   const focusTitle = () => title.current?.focus();
+  const root = useRef<HTMLDivElement>(null);
+  // And when the panel itself goes (its last row was removed, or the queue finished) while the
+  // focus is inside it, the focus moves to the page — a layout effect, so it runs while the
+  // panel is still in the document.
+  useLayoutEffect(() => {
+    const panel = root.current;
+    return () => {
+      if (panel?.contains(document.activeElement)) {
+        document.querySelector<HTMLElement>("[data-main]")?.focus();
+      }
+    };
+  }, []);
 
   return (
-    <Box data-upload-panel>
+    <Box data-upload-panel ref={root}>
       <Box
         sx={{
           display: "flex",
