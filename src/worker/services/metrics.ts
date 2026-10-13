@@ -13,6 +13,7 @@ import { env as workerEnv } from "cloudflare:workers";
 export type MetricName =
   | "request"
   | "auth"
+  | "node"
   | "upload"
   | "download"
   | "thumb"
