@@ -51,8 +51,10 @@ export function actionsFor(node: NodeDto, context: ActionContext): ReadonlySet<E
       if (node.role === "viewer") return false;
       return node.role === "owner" || !context.isShareRoot;
     }
-    // An unscanned file is the owner's to download, nobody else's.
-    if (action === "download" && node.scanStatus !== "clean") return node.role === "owner";
+    // An unscanned file is the owner's to download — and to open: nobody else is offered a
+    // preview the server would refuse.
+    if ((action === "download" || action === "open") && node.kind === "file" && node.scanStatus !== "clean")
+      return node.role === "owner";
     return true;
   });
   return new Set(allowed);

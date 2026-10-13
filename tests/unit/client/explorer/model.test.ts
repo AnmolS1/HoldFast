@@ -93,6 +93,13 @@ describe("row states → available actions", () => {
   it("only the owner downloads an unscanned file", () => {
     const theirs = fileNode(1, { scanStatus: "skipped", role: "editor", owner: OTHER });
     expect(actionsFor(theirs, { isShareRoot: false }).has("download")).toBe(false);
+    // …and only the owner is offered to open it: a preview the server refuses is not offered.
+    expect(actionsFor(theirs, { isShareRoot: false }).has("open")).toBe(false);
+    expect(
+      actionsFor(fileNode(1, { scanStatus: "error", role: "viewer", owner: OTHER }), { isShareRoot: false })
+        .size,
+    ).toBe(0);
+    expect(actionsFor(fileNode(1, { scanStatus: "skipped" }), { isShareRoot: false }).has("open")).toBe(true);
     expect(actionsFor(fileNode(1, { scanStatus: "skipped" }), { isShareRoot: false }).has("download")).toBe(
       true,
     );

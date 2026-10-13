@@ -101,11 +101,11 @@ describe("row states for people the file is shared with", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("an unscanned file is not downloadable by an editor", async () => {
+  it("an unscanned file is neither downloadable nor opened by an editor (the server would refuse both)", async () => {
     const file = fileNode(1, { name: "big.iso", scanStatus: "skipped", role: "editor", owner: OTHER });
     serveDrive(new FakeDrive([file]));
     renderExplorer("/");
     await waitForRows(1);
-    expect((await openMenu(file.id)).ids).toEqual(["open", "rename", "move", "trash"]);
+    expect((await openMenu(file.id)).ids).toEqual(["rename", "move", "trash"]);
   });
 });

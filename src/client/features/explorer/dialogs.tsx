@@ -6,6 +6,7 @@ import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import TextField from "@mui/material/TextField";
+import type { Theme } from "@mui/material/styles";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
@@ -15,7 +16,8 @@ import { FolderGlyph } from "../../components/FileBadge";
 import { t as shellT } from "../../lib/i18n";
 import { hf, layout } from "../../theme/tokens";
 import type { MoveTarget } from "./actions";
-import { explorerKeys, fetchFolders } from "./queries";
+import { explorerKeys, fetchFolders, MAX_FOLDER_PAGES } from "./queries";
+import { PAGE_LIMIT } from "./api";
 import { t } from "./strings";
 
 export interface NameDialogProps {
@@ -225,7 +227,7 @@ function TreeItem({
           alignItems: "center",
           gap: 2,
           minHeight: "var(--hf-row-h)",
-          paddingLeft: `${(level - 1) * 16 + 4}px`,
+          paddingLeft: indent(level - 1, 1),
           paddingRight: 2,
           borderRadius: `${layout.radius.control}px`,
           cursor: blocked ? "not-allowed" : "default",
@@ -246,7 +248,7 @@ function TreeItem({
             display: "inline-flex",
             alignItems: "center",
             justifyContent: "center",
-            width: 24,
+            width: (theme) => theme.spacing(6),
             height: "var(--hf-row-h)",
             flex: "none",
             color: hf.textSecondary,
@@ -263,19 +265,19 @@ function TreeItem({
       {open ? (
         <Box component="ul" role="group" sx={{ margin: 0, padding: 0 }}>
           {children.isPending ? (
-            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: `${level * 16 + 32}px` }}>
+            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: indent(level, 8) }}>
               {shellT("app.loading")}
             </Box>
           ) : children.isError ? (
-            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: `${level * 16 + 32}px` }}>
+            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: indent(level, 8) }}>
               {t("explorer.move.loadFailed")}
             </Box>
-          ) : children.data.length === 0 ? (
-            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: `${level * 16 + 32}px` }}>
+          ) : children.data.folders.length === 0 ? (
+            <Box component="li" role="none" sx={{ ...noteSx, paddingLeft: indent(level, 8) }}>
               {t("explorer.move.noFolders")}
             </Box>
           ) : (
-            children.data.map((child) => (
+            children.data.folders.map((child) => (
               <TreeItem
                 key={child.id}
                 folder={{ id: child.id, name: child.name }}
@@ -286,11 +288,19 @@ function TreeItem({
               />
             ))
           )}
+          {children.data?.more ? (
+            <Box component="li" role="none" data-tree-more sx={{ ...noteSx, paddingLeft: indent(level, 8) }}>
+              {t("explorer.move.more", { count: (MAX_FOLDER_PAGES * PAGE_LIMIT).toLocaleString("en") })}
+            </Box>
+          ) : null}
         </Box>
       ) : null}
     </Box>
   );
 }
+
+/** Indentation in the theme's spacing: four units a level, plus `extra`. */
+const indent = (level: number, extra: number) => (theme: Theme) => theme.spacing(level * 4 + extra);
 
 const noteSx = {
   listStyle: "none",
@@ -298,7 +308,7 @@ const noteSx = {
   alignItems: "center",
   minHeight: "var(--hf-row-h)",
   color: hf.textSecondary,
-  fontSize: 12,
+  typography: "body2",
 } as const;
 
 function MoveForm({ nodes, root, onMove, onCancel }: Omit<MoveDialogProps, "open">) {
@@ -327,7 +337,7 @@ function MoveForm({ nodes, root, onMove, onCancel }: Omit<MoveDialogProps, "open
           sx={{
             margin: 0,
             padding: 1,
-            height: 280,
+            height: layout.rowHeight * 8,
             overflowY: "auto",
             border: `1px solid ${hf.hairline}`,
             borderRadius: `${layout.radius.control}px`,

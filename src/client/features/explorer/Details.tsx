@@ -16,7 +16,7 @@ import { t } from "./strings";
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 }}>
-      <Box component="dt" sx={{ color: hf.textSecondary, fontSize: 12, lineHeight: "16px" }}>
+      <Box component="dt" sx={{ color: hf.textSecondary, typography: "body2" }}>
         {label}
       </Box>
       <Box component="dd" sx={{ margin: 0, minWidth: 0, overflowWrap: "anywhere" }}>
@@ -46,10 +46,7 @@ export function NodeDetails({ node, onRecheck }: NodeDetailsProps) {
         ) : (
           <FolderGlyph size={24} />
         )}
-        <Typography
-          component="h2"
-          sx={{ margin: 0, fontSize: 15, fontWeight: 600, overflowWrap: "anywhere" }}
-        >
+        <Typography component="h2" sx={{ margin: 0, typography: "h2", overflowWrap: "anywhere" }}>
           {node.name}
         </Typography>
       </Box>
@@ -104,7 +101,7 @@ export function SelectionDetails({ nodes }: { nodes: readonly NodeDto[] }) {
   const bytes = files.reduce((sum, node) => sum + node.size, 0);
   return (
     <Box data-explorer-details="selection" sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
-      <Typography component="h2" sx={{ margin: 0, fontSize: 15, fontWeight: 600 }}>
+      <Typography component="h2" sx={{ margin: 0, typography: "h2" }}>
         {t("explorer.item.count", { count: nodes.length })}
       </Typography>
       <Box sx={{ color: hf.textSecondary }}>

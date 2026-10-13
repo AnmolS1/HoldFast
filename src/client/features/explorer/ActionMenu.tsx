@@ -44,7 +44,7 @@ function Label({ entry }: { entry: MenuEntry }) {
     <Box component="span" sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto", minWidth: 0 }}>
       {entry.label}
       {entry.hint ? (
-        <Box component="span" sx={{ fontSize: 12, color: hf.textSecondary }}>
+        <Box component="span" sx={{ typography: "body2", color: hf.textSecondary }}>
           {entry.hint}
         </Box>
       ) : null}
@@ -89,7 +89,7 @@ export function ActionMenu({ open, title, entries, anchor, sheet, onClose }: Act
                 onClick={() => pick(entry)}
                 sx={{
                   minHeight: layout.touchRowHeight,
-                  fontSize: 14,
+                  typography: "body1",
                   color: entry.destructive ? hf.danger : "inherit",
                 }}
               >

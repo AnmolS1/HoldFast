@@ -59,7 +59,7 @@ export function Toolbar(props: ToolbarProps) {
         gap: 2,
         minHeight: height,
         boxSizing: "border-box",
-        padding: desktop ? "0 20px" : "0 12px",
+        paddingX: desktop ? 5 : 3,
         flex: "none",
       }}
     >
@@ -67,7 +67,7 @@ export function Toolbar(props: ToolbarProps) {
         component="span"
         className="num"
         data-item-count
-        sx={{ color: hf.textSecondary, fontSize: 12, marginRight: 2, whiteSpace: "nowrap" }}
+        sx={{ color: hf.textSecondary, typography: "body2", marginRight: 2, whiteSpace: "nowrap" }}
       >
         {showCount ? countText : ""}
       </Box>

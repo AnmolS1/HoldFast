@@ -58,7 +58,7 @@ import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
 import { queryClient } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
-import { hf } from "../../theme/tokens";
+import { hf, layout } from "../../theme/tokens";
 import { ShareDialog } from "../share";
 import { requestUpload } from "../upload";
 import { ActionMenu, type MenuAnchor, type MenuEntry } from "./ActionMenu";
@@ -93,10 +93,12 @@ import {
 } from "./model";
 import {
   patchInListings,
+  reloadListing,
   removeFromListings,
   setSort,
   useFolderDetail,
   useListing,
+  useListingChanged,
   useSort,
 } from "./queries";
 import { useScanPolling } from "./scan-poll";
@@ -173,10 +175,11 @@ function focusRow(id?: string | null): void {
 }
 
 /**
- * The height of the selection bar as the shared component draws it on one line (its padding, its
- * tallest control, its rule): the toolbar that it replaces is given the same.
+ * The row above the list has one height, from the layout tokens, whatever is in it. The selection
+ * bar is laid OVER that row, not into it — so nothing measured from the shared bar is repeated
+ * here, and selecting a row cannot move the row under the pointer.
  */
-const BAR_HEIGHT = { desktop: 41, mobile: 57 } as const;
+const barHeight = (desktop: boolean) => (desktop ? layout.touchTarget : layout.header);
 
 // A folder opened from the list: the folder that arrives takes the focus the row had.
 let focusOnArrival = false;
@@ -213,7 +216,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
   const announcement = useSyncExternalStore(subscribeAnnouncement, getAnnouncement, getAnnouncement);
   const detail = useFolderDetail(folderId);
   const listing = useListing(folderId, sort, dir);
-  const { setContent, open: openDetails } = useDetailsPanel();
+  const { setContent, open: openDetails, isOpen: detailsSheetOpen } = useDetailsPanel();
   const zipJobs = useZipJobs();
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -240,6 +243,10 @@ function Explorer({ folderId }: { folderId: string | null }) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [dialog, setDialog] = useState<DialogState>(null);
   const [share, setShare] = useState<string | null>(null);
+  // Anything of this page's that is open over the list: a dialog, a menu, the share dialog, and on
+  // the mobile layout the details sheet.
+  const modal = dialog !== null || menu !== null || share !== null || (!desktop && detailsSheetOpen);
+  const changedSince = useListingChanged(folderId);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [marquee, setMarquee] = useState<Rect | null>(null);
   const dragging = useRef<NodeDto[]>([]);
@@ -459,7 +466,9 @@ function Explorer({ folderId }: { folderId: string | null }) {
   // ---- commands: the frame's New menu, FAB and the ⇧N / F2 / Del keys run these by id ----------
 
   useEffect(() => {
-    if (!inFront) return;
+    // Withdrawn while the page is not the one in front, and while a dialog, menu or sheet of its
+    // own is open: a key or a palette command must not act on the selection behind it.
+    if (!inFront || modal) return;
     const run = (id: string) => () =>
       entriesFor(targets())
         .find((entry) => entry.id === id && !entry.disabled)
@@ -503,7 +512,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
         })),
     ];
     return registerCommands("explorer", commands);
-  }, [inFront, canAdd, role, selected, entriesFor, targets, newFolder]);
+  }, [inFront, modal, canAdd, role, selected, entriesFor, targets, newFolder]);
 
   // ---- details -------------------------------------------------------------------------------
 
@@ -530,21 +539,43 @@ function Explorer({ folderId }: { folderId: string | null }) {
       nodes.filter((node) => node.kind === "file" && node.scanStatus === "pending").map((node) => node.id),
     [nodes],
   );
-  const stillScanning = useScanPolling(pendingIds, {
-    onSettled: (node) => {
-      patchInListings(queryClient, folderId, node.id, () => node);
-      // A scan that ended is said once: ready, or what the row now says.
-      const sentence = statusSentence(node.scanStatus, node.scanReason);
-      announce(
-        sentence === null
-          ? t("explorer.done.scanned", { name: node.name })
-          : t("explorer.done.scanEnded", { name: node.name, status: sentence }),
-      );
+  const stillScanning = useScanPolling(
+    pendingIds,
+    {
+      onSettled: (node) => {
+        patchInListings(queryClient, folderId, node.id, () => node);
+        // A scan that ended is said once: ready, or what the row now says.
+        const sentence = statusSentence(node.scanStatus, node.scanReason);
+        announce(
+          sentence === null
+            ? t("explorer.done.scanned", { name: node.name })
+            : t("explorer.done.scanEnded", { name: node.name, status: sentence }),
+        );
+      },
+      onGone: (id) => void removeFromListings(queryClient, folderId, [id]),
     },
-    onGone: (id) => removeFromListings(queryClient, folderId, [id]),
-  });
+    // Not while a preview covers the page.
+    inFront,
+  );
 
   // ---- drag and drop -------------------------------------------------------------------------
+
+  // A drag ends on the window even when its source row is no longer drawn (a virtualised row
+  // scrolled away never delivers its own `dragend`): what was being dragged is forgotten here.
+  useEffect(() => {
+    const forget = () => {
+      dragging.current = [];
+      setDropTarget(null);
+    };
+    // After the drop target's own handler, which reads the ref.
+    const later = () => setTimeout(forget, 0);
+    window.addEventListener("dragend", later);
+    window.addEventListener("drop", later);
+    return () => {
+      window.removeEventListener("dragend", later);
+      window.removeEventListener("drop", later);
+    };
+  }, []);
 
   const dropOn = useCallback(
     (target: MoveTarget) => {
@@ -706,7 +737,11 @@ function Explorer({ folderId }: { folderId: string | null }) {
   const failure =
     (folderId !== null && detail.isError ? detail.error : null) ?? (listing.isError ? listing.error : null);
   const failed = failure !== null && (detail.isError || nodes.length === 0);
-  const missing = failure instanceof ApiError && failure.status === 404;
+  // "This folder isn't available" is said of a folder; the top level is never missing.
+  const missing = folderId !== null && failure instanceof ApiError && failure.status === 404;
+  // Rows are shown, but the last attempt to read them again failed: say that they may be old.
+  const refreshFailed =
+    !failed && nodes.length > 0 && listing.isRefetchError && !listing.isFetchNextPageError;
   const loading = listing.isPending || listing.isFetchingNextPage;
   // A page that failed is asked for again by the user, not by the scroll position.
   const moreFailed = listing.isFetchNextPageError;
@@ -754,59 +789,57 @@ function Explorer({ folderId }: { folderId: string | null }) {
           {t("explorer.offline")}
         </FrameBanner>
       )}
-      {/* One slot, one height: selecting a row must not move the row under the pointer. */}
-      <Box
-        data-explorer-bar
-        sx={{ flex: "none", minHeight: desktop ? BAR_HEIGHT.desktop : BAR_HEIGHT.mobile }}
-      >
-        <SelectionBar
-          count={selected.length}
-          onClear={() => dispatch({ type: "clear" })}
-          actions={
-            <>
-              {(desktop && !narrow ? ["download", "zip", "move", "star"] : []).map((id) => {
-                const entry = barEntry(id);
-                return entry ? (
+      <Box data-explorer-bar sx={{ position: "relative", flex: "none", minHeight: barHeight(desktop) }}>
+        <Box sx={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 2 }}>
+          <SelectionBar
+            count={selected.length}
+            onClear={() => dispatch({ type: "clear" })}
+            actions={
+              <>
+                {(desktop && !narrow ? ["download", "zip", "move", "star"] : []).map((id) => {
+                  const entry = barEntry(id);
+                  return entry ? (
+                    <SelectionBarAction
+                      key={id}
+                      label={entry.label}
+                      onClick={entry.run}
+                      shortcut={entry.shortcut}
+                      disabled={entry.disabled}
+                    />
+                  ) : null;
+                })}
+                {barEntry("trash") ? (
                   <SelectionBarAction
-                    key={id}
-                    label={entry.label}
-                    onClick={entry.run}
-                    shortcut={entry.shortcut}
-                    disabled={entry.disabled}
+                    label={t("explorer.action.trash")}
+                    onClick={barEntry("trash")!.run}
+                    shortcut={desktop ? "trash" : undefined}
+                    destructive
                   />
-                ) : null;
-              })}
-              {barEntry("trash") ? (
+                ) : null}
+                {/* Everything else — and, where the bar is narrow, everything but trash — is one step away. */}
                 <SelectionBarAction
-                  label={t("explorer.action.trash")}
-                  onClick={barEntry("trash")!.run}
-                  shortcut={desktop ? "trash" : undefined}
-                  destructive
+                  label={shellT("app.more")}
+                  onClick={() => {
+                    const focused = document.activeElement;
+                    const bar = document.querySelector<HTMLElement>("[data-selection-bar]");
+                    const anchor = focused instanceof HTMLElement && bar?.contains(focused) ? focused : bar;
+                    if (anchor) setMenu({ ids: selected.map((node) => node.id), anchor });
+                  }}
                 />
-              ) : null}
-              {/* Everything else — and, where the bar is narrow, everything but trash — is one step away. */}
-              <SelectionBarAction
-                label={shellT("app.more")}
-                onClick={() => {
-                  const focused = document.activeElement;
-                  const bar = document.querySelector<HTMLElement>("[data-selection-bar]");
-                  const anchor = focused instanceof HTMLElement && bar?.contains(focused) ? focused : bar;
-                  if (anchor) setMenu({ ids: selected.map((node) => node.id), anchor });
-                }}
-              />
-              {zip ? (
-                <Box
-                  component="span"
-                  data-zip-count
-                  sx={{ display: "inline-flex", alignItems: "center", gap: 1, color: hf.textSecondary }}
-                >
-                  <span className="num">{zip.label}</span>
-                  <SelectionBarAction label={t("explorer.zip.stop")} onClick={() => cancelZip(zip.id)} />
-                </Box>
-              ) : null}
-            </>
-          }
-        />
+                {zip ? (
+                  <Box
+                    component="span"
+                    data-zip-count
+                    sx={{ display: "inline-flex", alignItems: "center", gap: 1, color: hf.textSecondary }}
+                  >
+                    <span className="num">{zip.label}</span>
+                    <SelectionBarAction label={t("explorer.zip.stop")} onClick={() => cancelZip(zip.id)} />
+                  </Box>
+                ) : null}
+              </>
+            }
+          />
+        </Box>
         {selected.length === 0 ? (
           <Toolbar
             count={nodes.length}
@@ -815,7 +848,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
             sort={sort}
             dir={dir}
             onSort={(nextSort, nextDir) => setSort({ sort: nextSort, dir: nextDir })}
-            height={desktop ? BAR_HEIGHT.desktop : BAR_HEIGHT.mobile}
+            height={barHeight(desktop)}
             desktop={desktop}
             viewMode={prefs.viewMode}
             onViewMode={prefs.setViewMode}
@@ -825,6 +858,31 @@ function Explorer({ folderId }: { folderId: string | null }) {
           />
         ) : null}
       </Box>
+      {refreshFailed ? (
+        <FrameBanner
+          name="refresh-failed"
+          tone="attention"
+          action={
+            <Button onClick={() => void listing.refetch()} data-retry-refresh>
+              {shellT("app.retry")}
+            </Button>
+          }
+        >
+          {t("explorer.error.refresh")}
+        </FrameBanner>
+      ) : null}
+      {changedSince && !failed ? (
+        <FrameBanner
+          name="changed"
+          action={
+            <Button onClick={() => reloadListing(queryClient, folderId)} data-reload>
+              {t("explorer.reload")}
+            </Button>
+          }
+        >
+          {t("explorer.changed")}
+        </FrameBanner>
+      ) : null}
       {moreFailed && !failed ? (
         <FrameBanner
           name="more-failed"
@@ -842,7 +900,11 @@ function Explorer({ folderId }: { folderId: string | null }) {
         <EmptyState
           type="unavailable"
           title={missing ? t("explorer.error.missing.title") : shellT("empty.unavailable.title")}
-          body={missing ? t("explorer.error.missing.body") : t("explorer.error.load.body")}
+          body={
+            missing
+              ? t("explorer.error.missing.body")
+              : t(folderId === null ? "explorer.error.top.body" : "explorer.error.load.body")
+          }
           requestId={failure instanceof ApiError ? failure.requestId : undefined}
           actions={
             <>

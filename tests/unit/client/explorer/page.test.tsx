@@ -18,8 +18,13 @@ import {
   shellFetch,
   type MockCall,
 } from "../shell/helpers";
+import {
+  fetchFolders,
+  MAX_FOLDER_PAGES,
+  MAX_REFETCH_PAGES,
+} from "../../../../src/client/features/explorer/queries";
 import { FakeDrive } from "./fixtures/drive";
-import { fileNode, folderNode, manyNodes, nodeId, OTHER } from "./fixtures/nodes";
+import { fileNode, folderNode, manyNodes, nodeId, OTHER, pageOf } from "./fixtures/nodes";
 import {
   deferred,
   openMenu,
@@ -136,6 +141,35 @@ describe("listing", () => {
     expect(errorState()).toBeNull();
   });
 
+  it("grid: no thumbnail is asked for a file that is not clean, even when the node says it has one", async () => {
+    // A row the API should never send (thumb: true on a blocked file): the page still asks for nothing.
+    const blocked = fileNode(8, {
+      name: "bad.png",
+      mimeCategory: "image",
+      thumb: true,
+      scanStatus: "infected",
+    });
+    const pending = fileNode(9, {
+      name: "new.png",
+      mimeCategory: "image",
+      thumb: true,
+      scanStatus: "pending",
+    });
+    const calls = serveDrive(new FakeDrive([PHOTO, blocked, pending]));
+    setPrefs({ viewMode: "grid" });
+    renderExplorer("/");
+    await waitForRows(3);
+    act(() => intersect());
+    await waitFor(() =>
+      expect(paths(calls).some((path) => path.includes(`${PHOTO.id}/thumb-url`))).toBe(true),
+    );
+    expect(paths(calls).filter((path) => path.includes("thumb-url"))).toEqual([
+      `/api/nodes/${PHOTO.id}/thumb-url?size=320`,
+    ]);
+    expect(rowOf(blocked.id)!.querySelector("[data-thumb]")).toBeNull();
+    expect(rowOf(pending.id)!.querySelector("[data-thumb]")).toBeNull();
+  });
+
   it("the next page is asked for with the cursor; a change of sort or direction starts without one", async () => {
     const drive = new FakeDrive(manyNodes(250));
     const calls = serveDrive(drive);
@@ -189,6 +223,9 @@ describe("a request that fails ends in the error state or a toast — the page n
     renderExplorer("/");
     await waitFor(() => expect(errorState()).not.toBeNull());
     expect(errorState()!.textContent).toContain("req req-fake");
+    // The top level is never "a folder that isn't available" — whatever the status.
+    expect(errorState()!.textContent).toContain("Your files didn't load.");
+    expect(errorState()!.textContent).not.toContain("This folder isn't available");
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
     expect(screen.queryByText(/Unexpected Application Error/)).toBeNull();
     expect(rows()).toHaveLength(0);
@@ -726,12 +763,12 @@ describe("details", () => {
 });
 
 describe("downloading one file", () => {
-  it("asks for a download URL and hands it to a hidden <a download>", async () => {
+  it("asks for a download URL and opens it in a tab of its own, through a hidden link", async () => {
     const drive = top();
     serveDrive(drive);
-    const clicked: Array<{ href: string; download: string | null }> = [];
+    const clicked: Array<{ href: string; target: string; rel: string }> = [];
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
-      clicked.push({ href: this.href, download: this.getAttribute("download") });
+      clicked.push({ href: this.href, target: this.target, rel: this.rel });
     });
     renderExplorer("/");
     await waitForRows(4);
@@ -739,9 +776,33 @@ describe("downloading one file", () => {
     await waitFor(() => expect(clicked).toHaveLength(1));
     expect(drive.callsTo("POST", /\/download-url$/)[0]!.body).toEqual({ kind: "download" });
     expect(clicked[0]!.href).toMatch(new RegExp(`^http://files\\.localhost:3000/d/${NOTES.id}/token-`));
-    expect(clicked[0]!.download).toBe("");
+    // Its own tab: an error page from the files host never replaces the app, and the token never
+    // enters this tab's history. No opener, no referrer.
+    expect(clicked[0]!.target).toBe("_blank");
+    expect(clicked[0]!.rel).toBe("noopener noreferrer");
     // Nothing of the URL stays in the document.
     expect(document.querySelector(`a[href*="token-"]`)).toBeNull();
+  });
+
+  it.each([
+    ["another host", "https://evil.example/d/x/y"],
+    ["a script URL", "javascript:alert(1)"],
+    ["a data URL", "data:text/html,hi"],
+    ["not a URL", "//"],
+  ])("a download URL that is %s is not followed, whatever the API said", async (_what, url) => {
+    serveDrive(top(), (call) =>
+      call.path.endsWith("/download-url") ? json({ url, expiresAt: "2026-10-02T12:00:00.000Z" }) : undefined,
+    );
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    renderExplorer("/");
+    await waitForRows(4);
+    await menuAction(NOTES.id, "download");
+    await waitFor(() =>
+      expect(toastMessages()).toEqual([
+        "The download link wasn't one of ours, so it wasn't opened. Try again.",
+      ]),
+    );
+    expect(click).not.toHaveBeenCalled();
   });
 
   it("an unscanned file downloads for its owner with the warning", async () => {
@@ -758,6 +819,92 @@ describe("downloading one file", () => {
         "This file couldn't be scanned. Open it only if you trust where it came from.",
       ]),
     );
+  });
+});
+
+describe("reading again is bounded (m7, m8, m9)", () => {
+  it("a long listing is not refetched page by page when the tree changes: it says so and offers Reload", async () => {
+    const drive = new FakeDrive(manyNodes(900));
+    const calls = serveDrive(drive);
+    renderExplorer("/");
+    const count = () => document.querySelector("[data-item-count]")!.textContent;
+    await waitFor(() => expect(count()).toMatch(/^200 items/));
+    for (const loaded of [400, 600, 800, 900]) {
+      act(() => intersect((element) => element.hasAttribute("data-load-more-sentinel")));
+      await waitFor(() => expect(count()).toMatch(new RegExp(`^${loaded} items`)));
+    }
+    expect(paths(calls)).toHaveLength(5);
+    expect(5).toBeGreaterThan(MAX_REFETCH_PAGES);
+
+    act(() => emitNodesChanged([null]));
+    await waitFor(() => expect(document.querySelector('[data-banner="changed"]')).not.toBeNull());
+    await act(async () => {});
+    // Not one request: five pages would have been five.
+    expect(paths(calls)).toHaveLength(5);
+    expect(document.querySelector('[data-banner="changed"]')!.textContent).toContain(
+      "This folder has changed since it was loaded.",
+    );
+    // Reload starts from the first page — one request.
+    fireEvent.click(document.querySelector("[data-reload]")!);
+    await waitFor(() => expect(paths(calls)).toHaveLength(6));
+    expect(paths(calls)[5]).toBe("/api/nodes/root?sort=name&dir=asc&limit=200");
+    await waitFor(() => expect(count()).toMatch(/^200 items/));
+    expect(document.querySelector('[data-banner="changed"]')).toBeNull();
+  });
+
+  it("a short listing is simply read again (one request a page, at most three)", async () => {
+    const calls = serveDrive(top());
+    renderExplorer("/");
+    await waitForRows(4);
+    act(() => emitNodesChanged([null]));
+    await waitFor(() => expect(paths(calls)).toHaveLength(2));
+    expect(document.querySelector('[data-banner="changed"]')).toBeNull();
+  });
+
+  it("a refetch that fails while rows are shown says they may be out of date; Try again clears it", async () => {
+    const drive = top();
+    const calls = serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    drive.fail("GET", /\/nodes\/root$/, 500, 1);
+    act(() => emitNodesChanged([null]));
+    await waitFor(() => expect(document.querySelector('[data-banner="refresh-failed"]')).not.toBeNull());
+    // The rows stay, and nothing retries by itself.
+    expect(rows()).toHaveLength(4);
+    const settled = paths(calls).length;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(paths(calls)).toHaveLength(settled);
+    fireEvent.click(document.querySelector("[data-retry-refresh]")!);
+    await waitFor(() => expect(document.querySelector('[data-banner="refresh-failed"]')).toBeNull());
+    expect(errorState()).toBeNull();
+  });
+
+  it("the move picker reads a bounded number of pages for a level, and says when there are more", async () => {
+    let asked = 0;
+    serveDrive(new FakeDrive(), (call) => {
+      if (!call.path.startsWith("/api/nodes/root")) return undefined;
+      asked += 1;
+      return json(pageOf([folderNode(1000 + asked, { name: `F${asked}` })], `cursor-${asked}`));
+    });
+    const level = await fetchFolders(null);
+    expect(MAX_FOLDER_PAGES).toBe(5);
+    expect(asked).toBe(5);
+    expect(level.more).toBe(true);
+    expect(level.folders).toHaveLength(MAX_FOLDER_PAGES);
+  });
+
+  it("a cursor that comes back a second time ends the reading", async () => {
+    let asked = 0;
+    serveDrive(new FakeDrive(), (call) => {
+      if (!call.path.startsWith("/api/nodes/root")) return undefined;
+      asked += 1;
+      return json(pageOf([folderNode(2000 + asked)], "same-cursor"));
+    });
+    const level = await fetchFolders(null);
+    expect(asked).toBe(2);
+    expect(level.more).toBe(false);
   });
 });
 
@@ -844,6 +991,26 @@ describe("drag and drop", () => {
     await waitFor(() => expect(drive.nodes.get(inside.id)!.parentId).toBeNull());
     expect(drive.callsTo("POST", /\/move$/)[0]!.body).toEqual({ parentId: null });
     await waitForRows(0);
+  });
+
+  it("a drag that ends anywhere forgets what was dragged: a later drop of this app's type moves nothing", async () => {
+    const drive = top();
+    serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    fireEvent.dragStart(rowOf(NOTES.id)!, { dataTransfer: transfer() });
+    // The source row's own dragend never arrives (a virtualised row scrolled away): the window's does.
+    await act(async () => {
+      window.dispatchEvent(new Event("dragend"));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    });
+    // A drag from another tab of the app carries the same type, but nothing of this page's.
+    const foreign = transfer(["application/x-holdfast-nodes"]);
+    fireEvent.dragOver(rowOf(ALPHA.id)!, { dataTransfer: foreign });
+    fireEvent.drop(rowOf(ALPHA.id)!, { dataTransfer: foreign });
+    await act(async () => {});
+    expect(drive.callsTo("POST", /\/move$/)).toHaveLength(0);
+    expect(drive.nodes.get(NOTES.id)!.parentId).toBeNull();
   });
 
   it("files dragged in from the desktop are not this feature's: no ring, no move", async () => {
