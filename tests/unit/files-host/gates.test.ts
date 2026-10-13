@@ -275,48 +275,136 @@ describe("gate 3a — taken down, itself or by any ancestor", () => {
   });
 });
 
-describe("gates 3b–3e — the scan state, by subject", () => {
-  it("3b–3d for a user: suspected_csam → 404, pending → 409, infected / under_review → 403 scan_blocked", async () => {
+describe("gates 3b–3f — the scan state, by subject", () => {
+  it("3b–3d for the owner: suspected_csam → 404, pending → 409, infected / under_review → 403 scan_blocked", async () => {
     for (const [scanStatus, status, code] of [
       ["suspected_csam", 404, "not_found"],
       ["pending", 409, "scan_pending"],
       ["infected", 403, "scan_blocked"],
       ["under_review", 403, "scan_blocked"],
     ] as const) {
-      const { node, owner, partner } = await shared({ scanStatus });
+      const { node, owner } = await shared({ scanStatus });
       for (const kind of ROUTES) {
         await refused(await urlFor(kind, node, { user: owner.id }), status, code, {}, scanStatus);
-        await refused(await urlFor(kind, node, { user: partner.id }), status, code, {}, scanStatus);
       }
     }
   });
 
-  it("3b–3e for a link: pending → 409 scan_pending; every other non-clean state → the missing file's 404, never 403", async () => {
-    const ghostText = MESSAGES.not_found;
-    for (const scanStatus of ["infected", "under_review", "suspected_csam", "skipped", "error"] as const) {
+  it("3f: for a share partner a file that is not clean is a missing file — 404, byte for byte an unknown id's — unless they uploaded this version of it; one under review, never", async () => {
+    const ghost = crypto.randomUUID();
+    const stranger = await makeAccount();
+    const missing = await ask(
+      pathOf(
+        "download",
+        ghost,
+        await signRaw({
+          v: 1,
+          k: "download",
+          n: ghost,
+          ver: "v",
+          st: "u",
+          sub: stranger.id,
+          exp: inAnHour(),
+        }),
+      ),
+    );
+    expect(missing.status).toBe(404);
+    for (const scanStatus of [
+      "pending",
+      "infected",
+      "under_review",
+      "skipped",
+      "error",
+      "suspected_csam",
+    ] as const) {
+      const { node, partner } = await shared({ scanStatus });
+      for (const kind of ROUTES) {
+        const answer = await refused(
+          await urlFor(kind, node, { user: partner.id }),
+          404,
+          "not_found",
+          {},
+          scanStatus,
+        );
+        expect(answer.bytes).toEqual(missing.bytes);
+        expect([...answer.headers].sort()).toEqual([...missing.headers].sort());
+      }
+    }
+    // The partner who uploaded this version keeps the scan's own answer — it is their upload.
+    for (const [scanStatus, status, code] of [
+      ["pending", 409, "scan_pending"],
+      ["infected", 403, "scan_blocked"],
+      ["skipped", 403, "scan_blocked"],
+      ["error", 403, "scan_blocked"],
+      ["under_review", 404, "not_found"],
+      ["suspected_csam", 404, "not_found"],
+    ] as const) {
+      const base = await shared();
+      const uploaded = await storedFile(base.owner.id, {
+        mime: "image/png",
+        name: "theirs.png",
+        scanStatus,
+        node: { createdBy: base.partner.id },
+      });
+      await makeShare(uploaded.node.id, base.owner.id, base.partner.id);
+      for (const kind of ROUTES) {
+        await refused(
+          await urlFor(kind, uploaded.node, { user: base.partner.id }),
+          status,
+          code,
+          {},
+          scanStatus,
+        );
+      }
+    }
+    // A clean file is served to the partner, whoever uploaded it.
+    const clean = await shared();
+    await served(await urlFor("download", clean.node, { user: clean.partner.id }));
+  });
+
+  it("3f for a link: every state but clean — pending too — is the missing file's 404, never 403 or 409; the log says why, the response does not", async () => {
+    const ghost = crypto.randomUUID();
+    const anyLink = await shared();
+    const missing = await ask(
+      await urlFor("download", { id: ghost, versionId: "v" }, { link: anyLink.link }),
+    );
+    expect(missing.status).toBe(404);
+    for (const scanStatus of [
+      "pending",
+      "infected",
+      "under_review",
+      "suspected_csam",
+      "skipped",
+      "error",
+    ] as const) {
       const { node, link } = await shared({ scanStatus });
       for (const kind of ROUTES) {
         const answer = await refused(await urlFor(kind, node, { link }), 404, "not_found", {}, scanStatus);
-        expect(answer.text).toBe(ghostText);
+        expect(answer.bytes).toEqual(missing.bytes);
+        expect([...answer.headers].sort()).toEqual([...missing.headers].sort());
       }
-      // The log is internal: it says why, the response does not.
       expect((await accessLog(link.id)).map((row) => row.outcome)).toEqual(ROUTES.map(() => "denied_scan"));
     }
-    const { node, link } = await shared({ scanStatus: "pending" });
-    for (const kind of ROUTES) await refused(await urlFor(kind, node, { link }), 409, "scan_pending");
   });
 
-  it("3e: skipped / error — the owner's own download is served with the warning header; inline, a thumbnail and anyone else are 403", async () => {
+  it("3e: skipped / error — the owner's own download is served with the warning header; inline and a thumbnail are 403 for them", async () => {
     for (const scanStatus of ["skipped", "error"] as const) {
-      const { node, owner, partner } = await shared({ scanStatus });
+      const { node, owner } = await shared({ scanStatus });
       const own = await served(await urlFor("download", node, { user: owner.id }));
       expect(own.headers.get("x-holdfast-warning")).toBe("unscanned");
       expect(own.headers.get("access-control-expose-headers")).toContain("X-Holdfast-Warning");
       await refused(await urlFor("inline", node, { user: owner.id }), 403, "scan_blocked", {}, scanStatus);
       await refused(await urlFor("thumb", node, { user: owner.id }), 403, "scan_blocked", {}, scanStatus);
-      for (const kind of ROUTES) {
-        await refused(await urlFor(kind, node, { user: partner.id }), 403, "scan_blocked", {}, scanStatus);
-      }
+      // The partner who uploaded it may not take it either: only the owner, only as a download.
+      const theirs = await shared();
+      const uploaded = await storedFile(theirs.owner.id, {
+        scanStatus,
+        node: { createdBy: theirs.partner.id },
+      });
+      await makeShare(uploaded.node.id, theirs.owner.id, theirs.partner.id);
+      const answer = await ask(await urlFor("download", uploaded.node, { user: theirs.partner.id }));
+      expect(answer.status).toBe(403);
+      expect(answer.headers.get("x-holdfast-warning")).toBeNull();
     }
     // A clean file carries no warning.
     const clean = await picture();
@@ -564,18 +652,14 @@ describe("the order of the gates", () => {
     await refused(await urlFor("download", down.node, { link: down.link }), 423, "link_paused");
   });
 
-  it("a user: the same three keep the scan answer (node state first)", async () => {
+  it("a user: node state first — a suspended or banned owner asking for their own blocked file gets the scan's answer, not the account's", async () => {
     const review = await shared({ scanStatus: "under_review" });
     await updateUser(review.owner.id, { suspendedAt: new Date() });
-    await refused(await urlFor("download", review.node, { user: review.partner.id }), 403, "scan_blocked");
+    await refused(await urlFor("download", review.node, { user: review.owner.id }), 403, "scan_blocked");
 
     const infected = await shared({ scanStatus: "infected" });
-    await updateUser(infected.partner.id, { banned: true });
-    await refused(
-      await urlFor("download", infected.node, { user: infected.partner.id }),
-      403,
-      "scan_blocked",
-    );
+    await updateUser(infected.owner.id, { banned: true });
+    await refused(await urlFor("download", infected.node, { user: infected.owner.id }), 403, "scan_blocked");
 
     const pending = await shared({ scanStatus: "pending" });
     await updateUser(pending.owner.id, { suspendedAt: new Date() });
@@ -586,6 +670,10 @@ describe("the order of the gates", () => {
     const trashed = await shared({ scanStatus: "pending" });
     await updateNode(trashed.node.id, { deletedAt: new Date() });
     await refused(await urlFor("download", trashed.node, { user: trashed.owner.id }), 404, "not_found");
+
+    // A partner never learns either: a file they may not see is a missing file whatever the
+    // owner's account state is.
+    await refused(await urlFor("download", review.node, { user: review.partner.id }), 404, "not_found");
   });
 
   it("a hidden file behind a link without previews is a missing file (404), not 4j's 403", async () => {

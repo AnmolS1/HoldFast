@@ -27,25 +27,33 @@
 // total is summed from). A request that does not get the claim answers "no thumbnail" at once:
 // no unit, no call, nothing written — the page's next load finds the cached thumbnail or the
 // marker.
-//   `count`   attempts made today, at most THUMB_ATTEMPTS_PER_DAY — whatever became of them. A
-//             failure WITHOUT a code (a lost connection — which is also how the service answers
-//             an oversize input: the two cannot be told apart) is simply one attempt used.
-//   `bytes`   1 once it is known that this thumbnail cannot be made today: a failure the service
+//   `bytes`   attempts HELD today, at most THUMB_ATTEMPTS_PER_DAY. An attempt is given back
+//             when it is not the image that failed: the thumbnail was made (whether or not the
+//             cache write then worked), or the owner's unit could not be taken. It stays used
+//             when the image service failed WITHOUT a code (a lost connection — which is also
+//             how the service answers an oversize input: the two cannot be told apart).
+//   `count`   1 once it is known that this thumbnail cannot be made today: a failure the service
 //             gave a CODE for (its quota, an input it cannot decode), an empty output, a missing
 //             source object. The claim's own ceiling refuses every attempt after that.
-// So one thumbnail costs its owner at most three units and three calls a day however many ask,
-// and however many ask AT ONCE; a known failure costs one. A new version of the file has a new
-// key and so fresh attempts; so has another size; so has the next UTC day. A thumbnail that was
-// made is found in the cache and never comes here again.
+// So: at most three transforms of one thumbnail are in flight at once, however many ask; a
+// known failure costs its owner one unit and one call a day (three in a burst), a failure
+// without a code three; a thumbnail that can be made is never held back by its marker. A new
+// version of the file has a new key and so fresh attempts; so has another size; so has the next
+// UTC day.
+//
+// THE ATTEMPT DOES NOT DEPEND ON THE ASKER STAYING. Once claimed, the transform and its cache
+// write are handed to the request's deferred work as well as awaited: an asker who goes away
+// mid-transform leaves a cached thumbnail behind, not a used-up attempt.
 //
 // NO LOCK. Concurrent misses that hold a claim each transform and each write the same bytes to
 // the same key — two writers of one key are harmless.
+
 import type { Context } from "hono";
 import { THUMB_INPUT_MAX_BYTES, type ThumbSize } from "../../shared/constants";
-import { addUsageIfUnder, utcDay } from "../db/queries/ledger";
+import { addUsageIfUnder, subtractUsage, utcDay } from "../db/queries/ledger";
 import { tryConsumeCeiling } from "./ceilings";
 import { now } from "./clock";
-import { db, type AppEnv } from "./request-context";
+import { db, defer, type AppEnv } from "./request-context";
 import { storage, thumbKey } from "./storage";
 
 /** The one content type a thumbnail is stored and served with. */
@@ -75,9 +83,9 @@ const hasCode = (error: unknown): boolean => {
 };
 
 /**
- * Claims one of today's attempts: true exactly THUMB_ATTEMPTS_PER_DAY times a day per marker,
- * and never once the thumbnail was given up on. One statement, so any number of requests at once
- * get at most that many claims between them.
+ * Claims one of today's attempts: true while fewer than THUMB_ATTEMPTS_PER_DAY are held, and
+ * never once the thumbnail was given up on. One statement, so any number of requests at once get
+ * at most that many claims between them.
  */
 function claimAttempt(c: Context<AppEnv>, marker: string, day: string): Promise<boolean> {
   return addUsageIfUnder(
@@ -85,15 +93,24 @@ function claimAttempt(c: Context<AppEnv>, marker: string, day: string): Promise<
     day,
     "notice",
     marker,
-    { bytes: 0, count: 1 },
-    { bytes: 0, count: THUMB_ATTEMPTS_PER_DAY },
+    { bytes: 1, count: 0 },
+    { bytes: THUMB_ATTEMPTS_PER_DAY, count: 0 },
   );
+}
+
+/** Gives an attempt back: it ended for a reason that says nothing against the image. Never throws. */
+async function release(c: Context<AppEnv>, marker: string, day: string): Promise<void> {
+  try {
+    await subtractUsage(db(c), day, "notice", marker, 1);
+  } catch {
+    // Not given back: one attempt fewer today.
+  }
 }
 
 /** No further attempt today. Never throws: the answer is a 404 either way. */
 async function giveUp(c: Context<AppEnv>, marker: string, day: string): Promise<void> {
   try {
-    await addUsageIfUnder(db(c), day, "notice", marker, { bytes: 1, count: 0 }, { bytes: 1 });
+    await addUsageIfUnder(db(c), day, "notice", marker, { bytes: 0, count: 1 }, { count: 1 });
   } catch {
     // Not recorded: the attempts that are left may still be used.
   }
@@ -124,8 +141,30 @@ export async function makeThumbnail(
   if (!(await claimAttempt(c, marker, day))) return none("attempted_today");
 
   const unit = await tryConsumeCeiling(c, "transform_user", owner, { count: 1 });
-  if (!unit.ok) return none("ceiling");
+  if (!unit.ok) {
+    // Nothing was asked of the image service: the attempt is not the thumbnail's to lose.
+    await release(c, marker, day);
+    return none("ceiling");
+  }
 
+  const work = attempt(c, node, size, marker, day);
+  try {
+    // Also the request's deferred work: it finishes — and caches — if the asker goes away.
+    defer(c, work);
+  } catch {
+    // The request's deferred work is full: the attempt runs with the request alone.
+  }
+  return work;
+}
+
+/** The transform and its cache write, with what becomes of the claim. Never rejects. */
+async function attempt(
+  c: Context<AppEnv>,
+  node: ThumbSource,
+  size: ThumbSize,
+  marker: string,
+  day: string,
+): Promise<MadeThumbnail> {
   const store = storage(c.env);
   let buffer: ArrayBuffer;
   try {
@@ -140,6 +179,7 @@ export async function makeThumbnail(
     // Read whole: the store takes no stream of unknown length, and a thumbnail is small.
     buffer = await result.response().arrayBuffer();
   } catch (error) {
+    // With a code: the service says it cannot. Without one, the attempt simply stays used.
     if (hasCode(error)) await giveUp(c, marker, day);
     return none(reasonOf(error));
   }
@@ -157,5 +197,7 @@ export async function makeThumbnail(
   } catch {
     stored = null;
   }
+  // Made: whatever became of the cache write, nothing is held against this thumbnail.
+  await release(c, marker, day);
   return { ok: true, buffer, stored };
 }

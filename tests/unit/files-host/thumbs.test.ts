@@ -17,6 +17,7 @@ import {
   FAKE_WEBP,
   freshIp,
   gate,
+  newCtx,
   imagesMock,
   ipSubject,
   ledgerRow,
@@ -481,9 +482,9 @@ describe("a thumbnail is attempted at most three times a day, and not again once
       });
       expect(answer.status).toBe(200);
     }
-    // Five of the six were cache hits: they claimed nothing.
+    // Five of the six were cache hits: they claimed nothing. The one attempt was given back.
     expect(fine.calls).toHaveLength(1);
-    expect(await ledgerRow("notice", failureMarker(good, 320))).toEqual({ bytes: 0, count: 1 });
+    expect(await ledgerRow("notice", failureMarker(good, 320))).toEqual({ bytes: 0, count: 0 });
 
     const gone = await picture(owner.id, { content: null, node: { size: 2000 } });
     const empty = await picture(owner.id);
@@ -514,7 +515,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(THUMB_ATTEMPTS_PER_DAY).toBe(3);
     expect(images.calls).toHaveLength(3);
     expect(await units(owner.id)).toBe(3);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 3 });
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 3, count: 0 });
     // A connection that comes back within the three attempts is not held against the thumbnail.
     const flaky = await picture(owner.id);
     let failures = 2;
@@ -552,7 +553,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     hold.open();
     expect((await Promise.all(both)).map((answer) => answer.status)).toEqual([404, 404]);
     expect(images.calls).toHaveLength(2);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 1, count: 2 });
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 2, count: 1 });
     for (let i = 0; i < 5; i++) expect((await ask(url, { env })).status).toBe(404);
     expect(images.calls).toHaveLength(2);
     expect(await units(owner.id)).toBe(2);
@@ -583,7 +584,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(statuses).toEqual(Array.from({ length: 20 }, () => 404));
     expect(images.calls).toHaveLength(THUMB_ATTEMPTS_PER_DAY);
     expect(await units(owner.id)).toBe(THUMB_ATTEMPTS_PER_DAY);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 1, count: 3 });
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 3, count: 1 });
     for (let i = 0; i < 5; i++) {
       expect((await ask(await urlFor("thumb", node, { link }), { env })).status).toBe(404);
     }
@@ -627,11 +628,73 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(await units(owner.id)).toBe(3);
     // Three writers of one key, the same bytes: one object.
     expect(spy.puts).toEqual(Array.from({ length: 3 }, () => thumbKey(node.id, node.versionId, 320)));
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 3 });
+    // All three were made: all three attempts were given back.
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
     const after = await ask(url, { env });
     expect(after.status).toBe(200);
     expect(after.bytes).toEqual(FAKE_WEBP);
     expect(images.calls).toHaveLength(3);
     expect(await units(owner.id)).toBe(3);
+  });
+
+  it("an attempt that ends for a reason that is not the image's is given back: the owner's unit refused five times does not cost the thumbnail its day", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const url = await urlFor("thumb", node, { user: owner.id });
+    const none = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: 0 } } };
+    for (let i = 0; i < 5; i++) expect((await ask(url, none)).status).toBe(404);
+    expect(images.calls).toHaveLength(0);
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
+    // With a unit to spend, it is made.
+    expect((await ask(url, { env: { IMAGES: images.binding } })).status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+  });
+
+  it("a thumbnail that is made is never held back by its marker, even when the cache write fails every time: five requests, five thumbnails", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const broken = spyBucket({
+      put: (async () => {
+        throw new Error("the store is down");
+      }) as unknown as R2Bucket["put"],
+    });
+    const env = { IMAGES: images.binding, FILES: broken.bucket };
+    const url = await urlFor("thumb", node, { user: owner.id });
+    for (let i = 0; i < 5; i++) {
+      const answer = await ask(url, { env });
+      expect(answer.status).toBe(200);
+      expect(answer.bytes).toEqual(FAKE_WEBP);
+    }
+    expect(images.calls).toHaveLength(5);
+    expect(await units(owner.id)).toBe(5);
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
+  });
+
+  it("the attempt is handed to the request's deferred work before the image service is asked: it does not depend on the asker staying", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const ctx = newCtx();
+    let deferredBefore = -1;
+    let deferredDuring = -1;
+    const images = imagesMock(() => {
+      deferredDuring = ctx.pending.length;
+      return FAKE_WEBP;
+    });
+    const watching = spyBucket({
+      get: (async (key: string, options?: R2GetOptions) => {
+        // The cache lookup: nothing of the attempt exists yet.
+        if (key.startsWith("t/")) deferredBefore = ctx.pending.length;
+        return spyBucket().bucket.get(key, options);
+      }) as R2Bucket["get"],
+    });
+    const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      ctx,
+      env: { IMAGES: images.binding, FILES: watching.bucket },
+    });
+    expect(answer.status).toBe(200);
+    expect(deferredBefore).toBe(0);
+    expect(deferredDuring).toBe(1);
   });
 });

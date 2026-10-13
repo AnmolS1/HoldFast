@@ -32,7 +32,7 @@ import { canonicalRequest, isHeadRequest, requestPath } from "./middleware/canon
 import { Hono, type Context } from "hono";
 import { getById as linkById, logAccess } from "./db/queries/links";
 import { accountOf, type ServeAccount } from "./db/queries/files-host";
-import { getNode, touchAccessed } from "./db/queries/nodes";
+import { getNode, partnerSees, touchAccessed } from "./db/queries/nodes";
 import { effectiveHidden, effectiveRole, effectiveTrashed, isDescendantOrSelf } from "./db/queries/tree";
 import { userState, type UserState } from "./db/queries/users";
 import type { Node, ShareLink } from "./db/schema";
@@ -155,8 +155,11 @@ function kindGate(node: Node, kind: TokenKind): Refusal | null {
  * rate limiter, 1a–1d the token — both before this — and gate 5 charges, after the store was
  * asked.) The order depends on who the token was minted for:
  *
- *   a user (`st: "u"`)   2 → 3a–3e → 4a–4d → 6
- *   a link (`st: "l"`)   2 → 4a, 4b, 4e–4h, 4k, 4i, 4j → 3a–3e → 6
+ *   a user (`st: "u"`)   2 → 3a, 3f, 3b–3e → 4a–4d → 6
+ *   a link (`st: "l"`)   2 → 4a, 4b, 4e–4h, 4k, 4i (with 3a and 3f) → 4j → 6
+ *
+ * 3f is the shared rule of who sees a file by id (`partnerSees`): for anyone but the owner a
+ * file that is not clean — and that they did not upload themselves — is a missing file.
  *
  * For a link, LINK STATE COMES BEFORE NODE STATE — a paused link to a reported or trashed file
  * answers "paused", as the public API does — so "not in the trash" (part of gate 2 for a user)
@@ -177,6 +180,9 @@ async function gates(c: Ctx, claims: DownloadClaims, kind: TokenKind): Promise<P
     if (await effectiveTrashed(handle, node.id)) return refuse("2", "not_found");
     // 3a — taken down, itself or by ANY ancestor (and the lock of 3b): as if it did not exist.
     if (await effectiveHidden(handle, node.id)) return refuse("3a", "not_found");
+    // 3f — someone who is not the owner sees a file by id only when it is clean, or when they
+    // uploaded this version of it (never one under review): otherwise it is a missing file.
+    if (!ownedBySubject && !partnerSees(node, claims.sub)) return refuse("3f", "not_found");
     const scan = scanGate(node, claims, kind);
     if (scan && scan !== "unscanned") return scan;
 
@@ -232,6 +238,8 @@ async function gates(c: Ctx, claims: DownloadClaims, kind: TokenKind): Promise<P
   if (await effectiveHidden(handle, node.id)) {
     return refuse("3a", "not_found", { linkId: link.id, outcome: "denied_scan" });
   }
+  // 3f — a link's visitor uploaded nothing: only a clean file exists for them.
+  if (!partnerSees(node, null)) return refuse("3f", "not_found", { linkId: link.id, outcome: "denied_scan" });
   // 4j
   if (kind !== "download" && !link.allowPreview) return refuse("4j", "forbidden");
   const scan = scanGate(node, claims, kind);

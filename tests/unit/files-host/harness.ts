@@ -57,7 +57,7 @@ export type Ctx = ExecutionContext & {
   next(): Promise<void>;
 };
 
-function newCtx(): Ctx {
+export function newCtx(): Ctx {
   const pending: Promise<unknown>[] = [];
   const waiting: Array<() => void> = [];
   return {
@@ -88,6 +88,8 @@ export type AskOptions = {
   now?: Date;
   /** Overrides of the drain bounds (the settle's two paths). */
   limits?: Partial<DeferLimits>;
+  /** The request's context, when the test must look at it WHILE the request runs. */
+  ctx?: Ctx;
 };
 
 const allow = { limit: async () => ({ success: true }) };
@@ -113,7 +115,7 @@ function coreFor(options: AskOptions): CoreDeps {
  * that would wait for a stream nobody reads).
  */
 export async function open(path: string, options: AskOptions = {}) {
-  const ctx = newCtx();
+  const ctx = options.ctx ?? newCtx();
   const headers = new Headers({ "cf-connecting-ip": options.ip ?? freshIp(), ...options.headers });
   if (options.now) headers.set("x-holdfast-test-now", options.now.toISOString());
   const request = new Request(`${TEST_FILES_ORIGIN}${path}`, { method: options.method ?? "GET", headers });
