@@ -1,12 +1,11 @@
-// PLACEHOLDER — taken over by the uploader task (T17), which replaces this module and keeps the `routes` export.
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
+import { UploadsPage } from "./UploadsPage";
 
 export const routes: RouteObject[] = [
   {
     path: "uploads",
-    element: <PlaceholderPage name={t("nav.uploads")} />,
+    element: <UploadsPage />,
     handle: { title: t("nav.uploads"), details: false },
   },
 ];
