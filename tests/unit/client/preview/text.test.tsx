@@ -5,14 +5,15 @@ import type { PublicPreviewSource } from "../../../../src/client/components/slot
 import { PreviewDialog } from "../../../../src/client/features/preview";
 import {
   highlight,
+  HIGHLIGHT_LINE_TIME_MS,
   HIGHLIGHT_MAX_LINE_LENGTH,
-  HIGHLIGHT_SLICE_LINES,
+  HIGHLIGHT_SLICE_MS,
+  HIGHLIGHT_TOTAL_MS,
   languageFor,
 } from "../../../../src/client/features/preview/renderers/highlight";
 import {
   canHighlight,
   decodeText,
-  fewEnoughPieces,
   HIGHLIGHT_MAX_CHARS,
   HIGHLIGHT_MAX_LINE,
   HIGHLIGHT_MAX_LINES,
@@ -162,6 +163,28 @@ describe("TextPreview — refusals", () => {
     expect(network.files().length).toBe(2);
   });
 
+  it("the error state has Try again: it starts a NEW view — a new mint, a new fetch — and nothing does so by itself", async () => {
+    await preloadRenderers();
+    const api = ownerApi([txt]);
+    let refuse = true;
+    const network = installFetch({
+      api: api.handler,
+      files: () => (refuse ? unreadable(403).response : new Response("now it works")),
+    });
+    renderPreview(<PreviewDialog open nodeId={txt.id} onClose={noop} source="owner" />);
+    await waitFor(() => expect(state()).toBe("error"));
+    expect(api.minted.length).toBe(2);
+    // Left alone, it stays where it is.
+    await settle(50);
+    expect(api.minted.length).toBe(2);
+    expect(network.files().length).toBe(2);
+    refuse = false;
+    fireEvent.click(within(dialog()!).getByRole("button", { name: "Try again" }));
+    await waitFor(() => expect(pre()?.textContent).toBe("now it works"));
+    expect(api.minted.length).toBe(3);
+    expect(network.files().length).toBe(3);
+  });
+
   it("a 403 and then the text → the text", async () => {
     await preloadRenderers();
     const api = ownerApi([txt]);
@@ -272,6 +295,8 @@ describe("highlighting", () => {
 describe("highlighting — its bounds are decided before it starts", () => {
   beforeAll(async () => {
     await highlight("const warm = 1;", "typescript");
+    await highlight("warm", "markdown");
+    await highlight("warm", "shellscript");
   });
 
   it("the constants", () => {
@@ -282,7 +307,7 @@ describe("highlighting — its bounds are decided before it starts", () => {
       TEXT_MAX_LINES,
       TEXT_MAX_PIECES,
     ]).toEqual([200_000, 5_000, 2_000, 5_000, 50_000]);
-    expect(HIGHLIGHT_SLICE_LINES).toBe(200);
+    expect([HIGHLIGHT_SLICE_MS, HIGHLIGHT_LINE_TIME_MS, HIGHLIGHT_TOTAL_MS]).toEqual([8, 8, 2_000]);
   });
 
   it("characters AND line count AND longest line — each alone refuses", () => {
@@ -299,9 +324,6 @@ describe("highlighting — its bounds are decided before it starts", () => {
     // Longest line: one line over the limit in an otherwise tiny file.
     expect(canHighlight(["ok", "x".repeat(HIGHLIGHT_MAX_LINE)], 2_003)).toBe(true);
     expect(canHighlight(["ok", "x".repeat(HIGHLIGHT_MAX_LINE + 1)], 2_004)).toBe(false);
-    // And a highlighted result of too many pieces is not drawn.
-    expect(fewEnoughPieces(Array.from({ length: 5_000 }, () => new Array(10).fill(0)))).toBe(true);
-    expect(fewEnoughPieces([...Array.from({ length: 5_000 }, () => new Array(10).fill(0)), [0]])).toBe(false);
   });
 
   it.each([
@@ -336,45 +358,126 @@ describe("highlighting — its bounds are decided before it starts", () => {
     ).toBeTruthy();
   });
 
-  it("slices carry the grammar's state: a comment that spans two slices is a comment on both sides", async () => {
-    const before = Array.from(
-      { length: HIGHLIGHT_SLICE_LINES - 1 },
-      (_, index) => `const v${index} = ${index};`,
-    );
-    const source = [
-      ...before,
-      "/* opens on the last line of slice one",
-      "still inside, first line of slice two",
-      "*/ const after = 1;",
-    ];
+  it("the grammar's state is carried from line to line: the middle of a block comment is a comment", async () => {
+    const source = ["const a = 1; /* opens here", "still inside", "*/ const after = 1;"];
     const lines = (await highlight(source.join("\n"), "typescript"))!;
-    expect(lines.length).toBe(source.length);
     expect(lines.map((line) => line.map((piece) => piece.text).join(""))).toEqual(source);
-    expect(lines[HIGHLIGHT_SLICE_LINES]!.every((piece) => piece.token === "comment")).toBe(true);
-    expect(lines[HIGHLIGHT_SLICE_LINES + 1]!.some((piece) => piece.token === "keyword")).toBe(true);
+    expect(lines[1]!.every((piece) => piece.token === "comment")).toBe(true);
+    expect(lines[2]!.some((piece) => piece.token === "keyword")).toBe(true);
+  });
+});
+
+describe("highlighting — bounded in time, and stopped promptly", () => {
+  // The round-2 review's crafted files: 200 lines of 999 characters, inside every size bound.
+  const crafted = (unit: string) =>
+    Array.from({ length: 200 }, () => unit.repeat(Math.floor(999 / unit.length))).join("\n");
+
+  beforeAll(async () => {
+    await highlight("const warm = 1;", "typescript");
+    await highlight("warm", "markdown");
+    await highlight("warm", "shellscript");
   });
 
-  it("an aborted run stops at the next slice and gives nothing; closing the preview aborts it", async () => {
-    const source = "const a = 1;\n".repeat(3 * HIGHLIGHT_SLICE_LINES);
+  /** A clock on which every look at the time finds `step` ms gone. */
+  const ticking = (step: number) => {
+    let at = 0;
+    return () => (at += step);
+  };
+
+  it("the run yields after 8 ms of work, however many lines that is — a slice is time, not lines", async () => {
+    const source = "const a = 1;\n".repeat(100);
+    const slices: number[] = [];
+    // The clock moves 1 ms at every look, three looks a line: a slice is over after a few lines.
+    const lines = await highlight(source, "typescript", {
+      now: ticking(1),
+      onSlice: (ms) => slices.push(ms),
+    });
+    expect(lines!.length).toBe(101);
+    expect(slices.length).toBeGreaterThanOrEqual(25);
+    expect(Math.max(...slices)).toBeLessThanOrEqual(HIGHLIGHT_SLICE_MS + 3);
+    // On a clock that never moves there is nothing to yield for.
+    const none: number[] = [];
+    await highlight(source, "typescript", { now: () => 0, onSlice: (ms) => none.push(ms) });
+    expect(none).toEqual([]);
+  });
+
+  it("a run that has used its two seconds of work gives up: the text stays plain", async () => {
+    const slices: number[] = [];
+    const lines = await highlight("const a = 1;\n".repeat(300), "typescript", {
+      now: ticking(60),
+      onSlice: (ms) => slices.push(ms),
+    });
+    expect(lines).toBeNull();
+    expect(slices.reduce((sum, ms) => sum + ms, 0)).toBeGreaterThan(HIGHLIGHT_TOTAL_MS);
+    expect(slices.length).toBeLessThan(40);
+  });
+
+  it("an aborted run ends at its next yield — not at the end of the file", async () => {
     const gone = new AbortController();
     gone.abort();
-    expect(await highlight(source, "typescript", gone.signal)).toBeNull();
-    const midway = new AbortController();
-    const run = highlight(source, "typescript", midway.signal);
-    midway.abort();
-    expect(await run).toBeNull();
+    expect(await highlight("const a = 1;", "typescript", { signal: gone.signal })).toBeNull();
 
+    const midway = new AbortController();
+    const slices: number[] = [];
+    const lines = await highlight("const a = 1;\n".repeat(300), "typescript", {
+      signal: midway.signal,
+      now: ticking(10),
+      onSlice: (ms) => {
+        slices.push(ms);
+        midway.abort();
+      },
+    });
+    expect(lines).toBeNull();
+    // One line was done, the run yielded, found the signal aborted and stopped.
+    expect(slices.length).toBe(1);
+  });
+
+  it.each([
+    ["typescript", "a<"],
+    ["markdown", "*_"],
+    ["shellscript", "$(( `"],
+  ])(
+    "the crafted %s file (%j × 200 lines): no stretch of work on the main thread is long",
+    async (lang, unit) => {
+      const slices: number[] = [];
+      const started = performance.now();
+      const lines = await highlight(crafted(unit), lang, { onSlice: (ms) => slices.push(ms) });
+      const took = performance.now() - started;
+      // It was 5.6–12.9 s in ONE uninterruptible slice. Now: the longest stretch between two
+      // yields is a slice (8 ms) plus at most one line's limit (8 ms) — measured, with room for a
+      // loaded machine — and the whole run is over, one way or the other, within its total budget.
+      expect(Math.max(0, ...slices)).toBeLessThan(100);
+      expect(took).toBeLessThan(HIGHLIGHT_TOTAL_MS + 1_000);
+      if (lines !== null) expect(lines.length).toBe(200);
+    },
+  );
+
+  it("a file that cuts into more pieces than are drawn stops early and stays plain — in the function and in the viewer", async () => {
+    // `a<` × 499 per line: about a thousand pieces a line, so the cap is passed near line 50.
+    const source = crafted("a<");
+    const slices: number[] = [];
+    expect(await highlight(source, "typescript", { onSlice: (ms) => slices.push(ms) })).toBeNull();
+    await openText(nodeOf({ ...NODES.ts, size: source.length }), source);
+    await waitFor(() => expect(pre()).not.toBeNull());
+    await settle(300);
+    expect(dialog()!.querySelector('[data-preview-renderer="text"]')!.getAttribute("data-highlighted")).toBe(
+      "false",
+    );
+    expect(pre()!.querySelector("[data-token]")).toBeNull();
+    expect(pre()!.querySelectorAll("*").length).toBeLessThanOrEqual(2 * 200 + 1);
+  });
+
+  it("closing the preview aborts the run it started", async () => {
     const module = await import("../../../../src/client/features/preview/renderers/highlight");
     const spy = vi.spyOn(module, "highlight");
     await preloadRenderers();
     const api = ownerApi([NODES.ts]);
-    installFetch({ api: api.handler, files: () => new Response(source) });
+    installFetch({ api: api.handler, files: () => new Response("const a = 1;\n".repeat(600)) });
     const view = renderPreview(<PreviewDialog open nodeId={NODES.ts.id} onClose={noop} source="owner" />);
     await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
-    const signal = spy.mock.calls[0]![2]!;
+    const signal = spy.mock.calls[0]![2]!.signal!;
     expect(signal.aborted).toBe(false);
     view.unmount();
-    // The run was handed the signal that closing aborts (what an aborted run does is above).
     expect(signal.aborted).toBe(true);
   });
 });
