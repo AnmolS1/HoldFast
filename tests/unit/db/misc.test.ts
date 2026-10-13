@@ -317,16 +317,14 @@ describe("blocklist", () => {
     expect(await entry(other)).toMatchObject({ ...detached, addedBy: null, note: null });
     expect(await blocklist.confirmCsam(db, other)).toBe(false);
     const raised = rand(32);
-    await db
-      .insert(hashBlocklist)
-      .values({
-        sha256: raised,
-        reason: "csam",
-        sourceNodeId: uuidv7(),
-        raisedFrom: "dmca",
-        raisedByNodeId: uuidv7(),
-        note: "n",
-      });
+    await db.insert(hashBlocklist).values({
+      sha256: raised,
+      reason: "csam",
+      sourceNodeId: uuidv7(),
+      raisedFrom: "dmca",
+      raisedByNodeId: uuidv7(),
+      note: "n",
+    });
     expect(await blocklist.confirmCsam(db, raised)).toBe(true);
     expect(await entry(raised)).toMatchObject({ ...detached, note: "n" });
 
