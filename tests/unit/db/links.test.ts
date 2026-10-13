@@ -16,9 +16,11 @@ import {
   recordPasswordFailure,
   unpauseLinks,
 } from "../../../src/worker/db/queries/links";
+import { restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
 import {
   linkAccessLog,
   linkPasswordAttempts,
+  nodes,
   type PauseReason,
   shareLinks,
 } from "../../../src/worker/db/schema";
@@ -242,6 +244,141 @@ describe("the pause set", () => {
     expect((await state(onFile.id)).reasons).toEqual(["report"]);
     expect(await pauseLinks(db, { linkId: "junk" }, "report")).toEqual([]);
     expect(await unpauseLinks(db, { nodeId: "junk" }, "report")).toEqual([]);
+  });
+
+  /**
+   * top/
+   *   folder/            ← link
+   *     file.txt         ← link
+   *     sibling.txt      ← link
+   *     sub/             ← link
+   *       deep.txt       ← link
+   *   outside.txt        ← link
+   */
+  async function subtreeFixture() {
+    const owner = await makeUser(db);
+    const top = await makeFolder(db, owner, null, `top-${rand()}`);
+    const folder = await makeFolder(db, owner, top.id, "folder");
+    const file = await makeFile(db, owner, folder.id, "file.txt");
+    const sibling = await makeFile(db, owner, folder.id, "sibling.txt");
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const deep = await makeFile(db, owner, sub.id, "deep.txt");
+    const outside = await makeFile(db, owner, top.id, "outside.txt");
+    const link = (nodeId: string, reasons: PauseReason[] = []) =>
+      makeLink(db, nodeId, owner, { pauseReasons: reasons });
+    return {
+      owner,
+      top,
+      folder,
+      file,
+      sibling,
+      sub,
+      deep,
+      outside,
+      links: {
+        folder: await link(folder.id),
+        file: await link(file.id),
+        sibling: await link(sibling.id),
+        sub: await link(sub.id),
+        deep: await link(deep.id),
+        outside: await link(outside.id),
+      },
+    };
+  }
+  const reasonsOf = async (linkId: string) => (await state(linkId)).reasons;
+
+  it("{ subtreeOf } pauses links on the folder, on a file inside and in a nested subfolder — not one outside; an invalid or unknown id matches nothing", async () => {
+    const f = await subtreeFixture();
+    const inside = [f.links.folder, f.links.file, f.links.sibling, f.links.sub, f.links.deep];
+    const paused = await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    expect(paused.map((c) => c.linkId).sort()).toEqual(inside.map((l) => l.id).sort());
+    expect(paused.every((c) => c.newlyPaused)).toBe(true);
+    for (const link of inside) expect(await reasonsOf(link.id)).toEqual(["moderation"]);
+    // The control: the link beside the folder is untouched (and `{ nodeId }` would have paused
+    // the folder's own link only — the test above this one).
+    expect(await reasonsOf(f.links.outside.id)).toEqual([]);
+    // A second call changes nothing.
+    expect(await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation")).toEqual([]);
+
+    expect(await pauseLinks(db, { subtreeOf: "junk" }, "moderation")).toEqual([]);
+    expect(await unpauseLinks(db, { subtreeOf: "junk" }, "moderation")).toEqual([]);
+    expect(await pauseLinks(db, { subtreeOf: uuidv7() }, "moderation")).toEqual([]);
+    expect(await unpauseLinks(db, { subtreeOf: uuidv7() }, "moderation")).toEqual([]);
+    // A file is a subtree of one.
+    expect((await pauseLinks(db, { subtreeOf: f.outside.id }, "report")).map((c) => c.linkId)).toEqual([
+      f.links.outside.id,
+    ]);
+  });
+
+  it("unpauseLinks({ subtreeOf }, 'moderation') removes only that reason: a link also paused by its owner stays paused", async () => {
+    const f = await subtreeFixture();
+    await pauseLinks(db, { linkId: f.links.file.id }, "owner");
+    await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    await pauseLinks(db, { linkId: f.links.outside.id }, "moderation");
+    expect(await reasonsOf(f.links.file.id)).toEqual(["owner", "moderation"]);
+
+    const back = await unpauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    expect(back.map((c) => c.linkId).sort()).toEqual(
+      [f.links.folder, f.links.file, f.links.sibling, f.links.sub, f.links.deep].map((l) => l.id).sort(),
+    );
+    expect(back.find((c) => c.linkId === f.links.file.id)!.nowLive).toBe(false);
+    expect(back.find((c) => c.linkId === f.links.sibling.id)!.nowLive).toBe(true);
+    expect(await state(f.links.file.id)).toMatchObject({ reasons: ["owner"] });
+    expect((await state(f.links.file.id)).pausedAt).not.toBeNull();
+    expect(await state(f.links.deep.id)).toEqual({ reasons: [], pausedAt: null });
+    // Outside the subtree: still paused.
+    expect(await reasonsOf(f.links.outside.id)).toEqual(["moderation"]);
+  });
+
+  it("restoring a folder's takedown: a file inside that is taken down by itself keeps its moderation pause; the folder's and a sibling's links are live", async () => {
+    const f = await subtreeFixture();
+    // The folder is taken down (its subtree paused), and `file` inside it by itself as well.
+    await takedownNode(db, f.folder.id, { reason: "abuse", by: null });
+    await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    await takedownNode(db, f.file.id, { reason: "dmca", by: null });
+    await pauseLinks(db, { nodeId: f.file.id }, "moderation");
+
+    // While the folder is still down nothing in it resumes.
+    expect(await unpauseLinks(db, { subtreeOf: f.folder.id }, "moderation")).toEqual([]);
+
+    await db.transaction(async (tx) => {
+      expect(await restoreTakedown(tx, f.folder.id)).toBe(true);
+      const back = await unpauseLinks(tx, { subtreeOf: f.folder.id }, "moderation");
+      expect(back.map((c) => c.linkId).sort()).toEqual(
+        [f.links.folder, f.links.sibling, f.links.sub, f.links.deep].map((l) => l.id).sort(),
+      );
+    });
+    expect(await reasonsOf(f.links.file.id)).toEqual(["moderation"]);
+    expect(await state(f.links.sibling.id)).toEqual({ reasons: [], pausedAt: null });
+    expect(await state(f.links.folder.id)).toEqual({ reasons: [], pausedAt: null });
+
+    // Restoring the file itself, by its own node: now its link is live.
+    await restoreTakedown(db, f.file.id);
+    const last = await unpauseLinks(db, { nodeId: f.file.id }, "moderation");
+    expect(last).toEqual([{ linkId: f.links.file.id, nodeId: f.file.id, ownerId: f.owner, nowLive: true }]);
+  });
+
+  it("restoring a folder's takedown: a link under ANOTHER taken-down folder, and one on a locked file, keep their pause", async () => {
+    const f = await subtreeFixture();
+    await takedownNode(db, f.folder.id, { reason: "abuse", by: null });
+    await takedownNode(db, f.sub.id, { reason: "abuse", by: null });
+    await pauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    // `sibling` is locked as suspected CSAM: the lock paused its link with the same reason.
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, f.sibling.id));
+
+    await restoreTakedown(db, f.folder.id);
+    const back = await unpauseLinks(db, { subtreeOf: f.folder.id }, "moderation");
+    expect(back.map((c) => c.linkId).sort()).toEqual([f.links.folder.id, f.links.file.id].sort());
+    // `sub` is still down: its own link and the one on the file under it stay paused.
+    expect(await reasonsOf(f.links.sub.id)).toEqual(["moderation"]);
+    expect(await reasonsOf(f.links.deep.id)).toEqual(["moderation"]);
+    expect(await reasonsOf(f.links.sibling.id)).toEqual(["moderation"]);
+
+    // Another reason is not the restore's question: `{ subtreeOf }` removes it from all it matches.
+    await pauseLinks(db, { subtreeOf: f.folder.id }, "report");
+    const reports = await unpauseLinks(db, { subtreeOf: f.folder.id }, "report");
+    expect(reports).toHaveLength(5);
+    expect(await reasonsOf(f.links.deep.id)).toEqual(["moderation"]);
   });
 
   it("unpauseLinks({ all: true }, 'ceiling') removes ceiling only and leaves lockedByAdmin rows alone", async () => {

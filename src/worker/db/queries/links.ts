@@ -19,6 +19,7 @@ import {
   type ShareLink,
   shareLinks,
 } from "../schema";
+import { notEffectivelyHidden } from "./tree";
 
 /** Failures that carry no delay. Must equal the shared constant of the same name. */
 export const PASSWORD_FREE_ATTEMPTS = 3;
@@ -109,7 +110,12 @@ export async function consumeDownload(db: Executor, linkId: string): Promise<boo
 
 // ── the pause set ───────────────────────────────────────────────────────────────────────────
 
-export type LinkSelector = { linkId: string } | { nodeId: string } | { ownerId: string };
+/**
+ * `{ nodeId }` — links ON that node only. `{ subtreeOf }` — links on that node or on anything
+ * under it, at any depth (trashed rows included): what the takedown of a folder pauses.
+ */
+export type LinkSelector =
+  { linkId: string } | { nodeId: string } | { subtreeOf: string } | { ownerId: string };
 
 export type PauseChange = {
   linkId: string;
@@ -126,13 +132,24 @@ function selector(where: LinkSelector | { all: true }, t: SQL): SQL | null {
   if ("all" in where) return sql`NOT ${t}.locked_by_admin`;
   if ("linkId" in where) return isUuid(where.linkId) ? sql`${t}.id = ${where.linkId}` : null;
   if ("nodeId" in where) return isUuid(where.nodeId) ? sql`${t}.node_id = ${where.nodeId}` : null;
+  if ("subtreeOf" in where) {
+    if (!isUuid(where.subtreeOf)) return null;
+    return sql`${t}.node_id IN (
+      WITH RECURSIVE down(id) AS (
+        SELECT d.id FROM nodes d WHERE d.id = ${where.subtreeOf}
+        UNION ALL
+        SELECT ch.id FROM nodes ch JOIN down ON ch.parent_id = down.id
+      ) CYCLE id SET is_cycle USING path
+      SELECT id FROM down)`;
+  }
   return sql`${t}.created_by = ${where.ownerId}`;
 }
 
 /**
  * Adds `reason` to every matching link that does not carry it yet, and sets `pausedAt` if the
  * link was not paused. A second call with the same reason changes nothing.
- * `{ nodeId }` matches links ON that node only, not links on its ancestors or descendants.
+ * `{ nodeId }` matches links ON that node only, not links on its ancestors or descendants;
+ * `{ subtreeOf }` matches links on the node and on every descendant (a folder's takedown).
  * Returns the links that changed; `newlyPaused` marks those whose set was empty before — the
  * transition a "your link was paused" email hangs on.
  */
@@ -174,6 +191,14 @@ export async function pauseLinks(
  * Removes `reason` — and only that reason — from every matching link that carries it; `pausedAt`
  * is cleared only where the set became empty. A link without the reason is untouched.
  * `{ all: true }` matches every link carrying the reason, except rows with `lockedByAdmin`.
+ *
+ * `{ subtreeOf }` with reason `moderation` is the restore of a folder's takedown, and it is the
+ * ONE form that looks at the nodes: the reason is removed only from links whose node is NO LONGER
+ * HIDDEN at that moment — not taken down itself or by another ancestor, and not locked as
+ * `suspected_csam`. Call it AFTER `restoreTakedown`, in the same transaction: a file inside the
+ * folder that is taken down separately (or lies under another taken-down folder, or is locked)
+ * keeps its pause, a sibling's link resumes, and the caller re-applies nothing. Every other
+ * selector and reason removes the reason from all it matches, as before.
  * Returns the links that changed; `nowLive` marks those with no reason left.
  */
 export async function unpauseLinks(
@@ -184,11 +209,19 @@ export async function unpauseLinks(
   assertReason(reason);
   const match = selector(where, sql`l`);
   if (!match) return [];
+  // The same test as the tree's `effectiveHidden`: the inherited takedown, or the file's own lock.
+  const stillHidden =
+    "subtreeOf" in where && reason === "moderation"
+      ? sql`AND NOT EXISTS (
+          SELECT 1 FROM nodes x
+          WHERE x.id = l.node_id
+            AND (x.scan_status = 'suspected_csam' OR NOT ${notEffectivelyHidden("x")}))`
+      : sql``;
   const result = await db.execute<{ id: string; node_id: string; created_by: string; now_live: boolean }>(sql`
     UPDATE share_links l
     SET pause_reasons = array_remove(l.pause_reasons, ${reason}::text),
         paused_at = CASE WHEN cardinality(array_remove(l.pause_reasons, ${reason}::text)) = 0 THEN NULL ELSE l.paused_at END
-    WHERE ${match} AND ${reason}::text = ANY(l.pause_reasons)
+    WHERE ${match} AND ${reason}::text = ANY(l.pause_reasons) ${stillHidden}
     RETURNING l.id, l.node_id, l.created_by, cardinality(l.pause_reasons) = 0 AS now_live`);
   return result.rows.map((r) => ({
     linkId: r.id,
