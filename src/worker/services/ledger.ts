@@ -128,7 +128,10 @@ async function pauseForCeiling(source: ServiceDeps, linkId: string): Promise<voi
  * grows by what was sent. A refund that fails is logged and dropped: the requester stays charged.
  */
 export async function settleServe(source: ServiceDeps, charge: ServeCharge, sent: number): Promise<void> {
-  const unsent = Math.max(0, charge.bytes - Math.max(0, sent));
+  // A count that is not one (never seen; a bug if it is) refunds nothing: the charge stands.
+  const counted = Number.isSafeInteger(sent) && sent >= 0;
+  const delivered = counted ? Math.min(sent, charge.bytes) : charge.bytes;
+  const unsent = charge.bytes - delivered;
   if (unsent > 0) {
     for (const { kind, subjectId, receipt } of charge.charges) {
       try {
@@ -139,9 +142,9 @@ export async function settleServe(source: ServiceDeps, charge: ServeCharge, sent
       }
     }
   }
-  if (charge.linkId !== null && sent > 0) {
+  if (charge.linkId !== null && counted && delivered > 0) {
     try {
-      await addBytesServed(source.db, charge.linkId, Math.min(sent, charge.bytes));
+      await addBytesServed(source.db, charge.linkId, delivered);
     } catch {
       metric("link", { outcome: "error", reason: "bytes_served" });
       console.warn("files host: a link's served bytes were not recorded");

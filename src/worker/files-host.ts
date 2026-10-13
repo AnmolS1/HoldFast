@@ -337,10 +337,9 @@ function evaluate(meta: { etag: string; uploaded: Date }, conditions: Conditions
 function storeCondition(conditions: Conditions): R2Conditional | undefined {
   const out: R2Conditional = {};
   const { match, noneMatch, unmodifiedSince, modifiedSince } = conditions;
-  // A list is passed as a list: the storage service takes one, the binding's type names one tag.
-  const list = (tags: string[]) => (tags.length === 1 ? tags[0]! : tags) as string;
-  if (match && !match.any && match.tags.length > 0) out.etagMatches = list(match.tags);
-  if (noneMatch && !noneMatch.any && noneMatch.tags.length > 0) out.etagDoesNotMatch = list(noneMatch.tags);
+  // One tag per condition: a list is settled from the object's metadata, before this is built.
+  if (match && !match.any && match.tags.length === 1) out.etagMatches = match.tags[0];
+  if (noneMatch && !noneMatch.any && noneMatch.tags.length === 1) out.etagDoesNotMatch = noneMatch.tags[0];
   if (unmodifiedSince) out.uploadedBefore = unmodifiedSince;
   if (modifiedSince) out.uploadedAfter = modifiedSince;
   if (unmodifiedSince || modifiedSince) out.secondsGranularity = true;
@@ -568,14 +567,16 @@ async function serveObject(
   shown: Shown,
 ): Promise<Response | null> {
   const store = storage(c.env);
-  const conditions = conditionsOf(c);
+  let conditions = conditionsOf(c);
   const head = isHeadRequest(c);
   const rangeHeader = c.req.header("range");
   const ifRange = c.req.header("if-range");
 
-  // A HEAD, and `If-None-Match: *` (which the store is never asked about): the object's metadata
-  // only — no body is opened and nothing is charged.
-  if (head || conditions.noneMatch?.any) {
+  // Settled from the object's metadata alone, without opening a body: a HEAD; `If-None-Match: *`
+  // (which the store is never asked about); and a LIST of entity tags — the store takes one tag
+  // per condition, and a key's object never changes, so its tag read now is its tag.
+  const listed = (tags: Tags | null) => (tags?.tags.length ?? 0) > 1;
+  if (head || conditions.noneMatch?.any || listed(conditions.match) || listed(conditions.noneMatch)) {
     const meta = await store.head(key);
     if (!meta) return null;
     const range = parseRange(rangeHeader, size ?? meta.size);
@@ -583,13 +584,18 @@ async function serveObject(
     const verdict = evaluate(meta, conditions);
     if (verdict === 304) return notModified(meta);
     if (verdict === 412) return preconditionFailed();
-    const headers = objectHeaders(meta, shown);
-    const partial = range !== null && (ifRange === undefined || ifRangeHolds(ifRange, meta));
-    if (partial && range) {
-      headers.set("Content-Range", `bytes ${range.offset}-${range.offset + range.length - 1}/${meta.size}`);
+    if (head) {
+      // Nothing is charged for a HEAD: it sends no body.
+      const headers = objectHeaders(meta, shown);
+      const partial = range !== null && (ifRange === undefined || ifRangeHolds(ifRange, meta));
+      if (partial && range) {
+        headers.set("Content-Range", `bytes ${range.offset}-${range.offset + range.length - 1}/${meta.size}`);
+      }
+      headers.set("Content-Length", String(partial && range ? range.length : meta.size));
+      return new Response(null, { status: partial ? 206 : 200, headers });
     }
-    headers.set("Content-Length", String(partial && range ? range.length : meta.size));
-    return new Response(null, { status: partial ? 206 : 200, headers });
+    // A GET whose conditions hold: the store is asked for the body alone.
+    conditions = { match: null, noneMatch: null, unmodifiedSince: null, modifiedSince: null };
   }
 
   // 1 — the range, from the size in hand, before the store is asked.
