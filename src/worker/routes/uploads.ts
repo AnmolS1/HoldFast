@@ -69,7 +69,7 @@ import type { Db } from "../db/client";
 import { LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
-import { getNode, replaceVersion } from "../db/queries/nodes";
+import { findByR2Key, getNode, replaceVersion } from "../db/queries/nodes";
 import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/queries/trash";
 import * as uploadIps from "../db/queries/upload-ips";
 import * as sessions from "../db/queries/upload-sessions";
@@ -720,6 +720,7 @@ async function finish(
   uploader: SessionUser,
   becomes: Becomes,
   sealed: Awaited<ReturnType<typeof sealIp>>,
+  declaredSha256: string,
 ): Promise<Finished> {
   return retryOnDeadlock(db(c), async (tx) => {
     let node: Node;
@@ -761,6 +762,7 @@ async function finish(
       node = await insertNamed(tx, becomes.values);
     }
     if (session.purpose === "file") await quota.commit(tx, session.ownerId, session.size);
+    await sessions.setDeclaredHash(tx, session.id, declaredSha256);
     // Not `completing` any more: the stale-upload job gave this session up. Nothing is kept.
     if (!(await markDone(tx, session.id))) throw new AppError("conflict", "This upload is no longer open.");
     // A charge, not an enforcement: these bytes were counted as open work until this commit.
@@ -874,10 +876,58 @@ async function discardRemoved(store: Storage, removed: DeletedRows[]): Promise<v
   }
 }
 
+const stillCompleting = () =>
+  new AppError("conflict", "This upload is being completed.", { state: "completing" });
+
+/**
+ * A complete of a session that is already `done`: the answer the first one gave, and NOTHING
+ * done a second time — no node, no audit row, no usage, no scan message, no strike, no lock,
+ * and the blocklist is not asked again. `409` when the body is not what completed; and for a
+ * node the caller can no longer see, what a read of it by id answers (`404`) — except a hidden
+ * one, which answers as a session that was given up does, like every other blocked upload.
+ */
+async function completedAgain(c: Ctx, user: SessionUser, session: Upload, body: CompleteUploadBody) {
+  const gone = () => new AppError("conflict", "This upload is no longer open.");
+  const parts = isSingle(session) ? [] : await sessions.listParts(db(c), session.id);
+  const claimed = new Map(body.parts.map((part) => [part.n, part.etag]));
+  const same =
+    session.expectedSha256 === body.sha256 &&
+    body.parts.length === parts.length &&
+    claimed.size === parts.length &&
+    parts.every((part) => claimed.get(part.n) === part.etag);
+  if (!same) throw new AppError("conflict");
+  // The node this session wrote: the one whose current version is the session's object.
+  const node = await findByR2Key(db(c), session.r2Key);
+  if (!node) throw new AppError("not_found");
+  if (node.system === "avatar") {
+    if (node.ownerId !== user.id || node.takedownAt !== null || node.scanStatus === "suspected_csam")
+      throw gone();
+    return c.json(await toOwnAvatarDto(db(c), node, { viewerId: user.id }), 200);
+  }
+  let access;
+  try {
+    access = await requireRole(c, node.id, "viewer");
+  } catch (error) {
+    // Hidden (or out of reach): not told apart from an upload that was refused and given up.
+    if (error instanceof AppError && error.code === "not_found") throw gone();
+    throw error;
+  }
+  await assertNotTrashed(c, node.id);
+  const dto = await toNodeDto(db(c), node, {
+    viewerId: user.id,
+    role: access.role,
+    shareRootId: access.shareRootId,
+  });
+  return c.json(dto, 200);
+}
+
 router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   const user = requireVerified(c);
   const open = await loadSession(c);
   const body = CompleteUploadBody.parse(await jsonBody(c));
+  // A complete that is sent again — a lost answer, a retry — must be safe.
+  if (open.status === "done") return completedAgain(c, user, open, body);
+  if (open.status === "completing") throw stillCompleting();
   assertOpen(c, open);
 
   // The body by mode — before the claim, so that a refused body leaves the session open.
@@ -903,7 +953,13 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
   }
 
   const session = await claimCompleting(db(c), open.id, user.id);
-  if (!session) throw new AppError("conflict", "This upload is already being completed.");
+  if (!session) {
+    // Another complete of this session got there first: it is running, or it has finished.
+    const current = await sessions.get(db(c), open.id);
+    if (current?.status === "done") return completedAgain(c, user, current, body);
+    if (current?.status === "completing") throw stillCompleting();
+    throw new AppError("conflict", "This upload is no longer open.");
+  }
   const avatar = session.purpose === "avatar";
   const replacing = session.replaceNodeId !== null;
   // What the store holds for this session, read again now that nothing can add to it: a part or
@@ -974,8 +1030,11 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     const actual = await storedSha256(store, session.r2Key);
     if (actual !== body.sha256) {
       // The declaration was false; what the bytes really are decides. With no real hit this
-      // upload goes on exactly like any other whose declared hash is not its bytes' — the
-      // answer must not say that the declared value was on a list. Recorded here only.
+      // upload goes on like any other — the answer must not say that the declared value was on
+      // a list — but a hash the server has PROVED false is never written to the node: the row
+      // carries the hash of its bytes, and the declared value stays on the session and in the
+      // audit row. (A listed hash on an innocent file's row would frame it to every later
+      // lookup by hash.)
       hit = actual === null ? null : await blocklist.lookup(db(c), actual);
       audit(
         c,
@@ -984,7 +1043,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
         { nodeId: session.nodeId, declaredListedAs: declared.reason, actualListedAs: hit?.reason ?? null },
       );
       metric("upload", { outcome: "hash_mismatch", kind: modeOf(session) });
-      if (hit && actual !== null) sha256 = actual;
+      if (actual !== null) sha256 = actual;
     }
   }
 
@@ -998,7 +1057,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
     // database handle, after this route's transaction: it retries its own deadlocks, and its
     // record and alert run through the request's `defer`.
     const values = nodeValues(session, user, sha256, replacing ? uuidv7() : session.nodeId);
-    const { node } = await finish(c, session, user, { as: "new", values }, sealed);
+    const { node } = await finish(c, session, user, { as: "new", values }, sealed, body.sha256);
     audit(c, "node.upload", { type: "node", id: node.id }, { uploadId: session.id, size: session.size });
     await lockSuspectedCsam(deps(c), node.id, { source: "system" });
     throw blocked();
@@ -1036,7 +1095,7 @@ router.post(`/uploads/${ID}/complete`, verified, async (c) => {
 
   let finished: Finished;
   try {
-    finished = await finish(c, session, user, becomes, sealed);
+    finished = await finish(c, session, user, becomes, sealed, body.sha256);
   } catch (error) {
     if (!(error instanceof ReplaceRefused)) throw error;
     // The target changed under the upload (a scan, a hold, a takedown): the same answer for all.

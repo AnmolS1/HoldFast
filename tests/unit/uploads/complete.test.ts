@@ -129,10 +129,65 @@ describe("a finished upload", () => {
     expect(ips[0]!.iv.byteLength).toBe(12);
     expect(ips[0]!.ipEncrypted.byteLength).toBeGreaterThan(0);
     expect(new TextDecoder().decode(ips[0]!.ipEncrypted)).not.toContain("203.0.113");
-    // A second complete has nothing to claim.
-    const again = await complete(user, session.uploadId, { sha256 });
-    expect(again.status).toBe(409);
     expect(await nodesIn(folder.id)).toHaveLength(1);
+  });
+
+  it("complete is safe to repeat: the same answer again, and nothing done twice", async () => {
+    const user = await uploader();
+    const folder = await makeFolder(user.id);
+    const session = await uploaded(user, { parentId: folder.id });
+    const sha256 = sha();
+    const sent: unknown[] = [];
+    const first = await complete(user, session.uploadId, { sha256 }, { sent });
+    expect(first.status).toBe(201);
+    const nodeId = String(first.body.id);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done", expectedSha256: sha256 });
+
+    const watched = watchedBucket();
+    for (let repeat = 0; repeat < 3; repeat++) {
+      const again = await complete(
+        user,
+        session.uploadId,
+        { sha256 },
+        { sent, env: { FILES: watched.bucket } },
+      );
+      expect(again.status).toBe(200);
+      expect({ ...again.body, requestId: "" }).toEqual({ ...first.body, requestId: "" });
+    }
+    // One node, one audit row, one usage record, one scan message, one address — and the store
+    // was not touched again.
+    expect(await nodesIn(folder.id)).toHaveLength(1);
+    expect(await auditFor("node.upload", nodeId)).toHaveLength(1);
+    expect(await ledgerOf("upload_user", user.id)).toMatchObject([{ bytes: 1000, count: 1 }]);
+    expect(sent).toHaveLength(1);
+    expect(await testDb().select().from(uploadIps).where(eq(uploadIps.nodeId, nodeId))).toHaveLength(1);
+    expect(watched.calls).toEqual({});
+    expect(await usedBytes(user.id)).toBe(1000);
+
+    // A body that is not what completed is not "the same request again".
+    expect((await complete(user, session.uploadId, { sha256: sha() })).status).toBe(409);
+    expect((await complete(user, session.uploadId, { sha256, parts: [{ n: 1, etag: "x" }] })).status).toBe(
+      409,
+    );
+    // Someone else's repeat is nobody's session.
+    expect((await complete(await uploader(), session.uploadId, { sha256 })).status).toBe(404);
+    // The node in the trash: what a read of it would answer — and never a second node.
+    await testDb()
+      .update(nodes)
+      .set({ deletedAt: new Date(), trashedRoot: true })
+      .where(eq(nodes.id, nodeId));
+    expect((await complete(user, session.uploadId, { sha256 })).status).toBe(404);
+    expect(await nodesIn(folder.id)).toHaveLength(1);
+  });
+
+  it("a complete that meets one still running is told so: 409 with details.state", async () => {
+    const user = await uploader();
+    const session = await uploaded(user);
+    await claimCompleting(testDb(), session.uploadId, user.id);
+    const answer = await complete(user, session.uploadId);
+    expect(answer.status).toBe(409);
+    expect(answer.body).toMatchObject({ error: "conflict", details: { state: "completing" } });
+    expect((await sessionRow(session.uploadId))?.status).toBe("completing");
   });
 
   it("an editor's upload: the owner's node, created by the editor; both ledgers charged; answered as an editor sees it", async () => {
@@ -155,14 +210,23 @@ describe("a finished upload", () => {
     expect(await ledgerOf("upload_user", editor.id)).toHaveLength(0);
   });
 
-  it("completes at once: exactly one node, the others 409", async () => {
+  it("completes at once: exactly one node, whatever the others are answered", async () => {
     for (let round = 0; round < 4; round++) {
       const user = await uploader();
       const folder = await makeFolder(user.id);
       const session = await uploaded(user, { parentId: folder.id });
       const answers = await Promise.all(Array.from({ length: 4 }, () => complete(user, session.uploadId)));
-      expect(answers.map((answer) => answer.status).sort()).toEqual([201, 409, 409, 409]);
+      // One of them makes the node; the others find it being made (409, "completing") or made (200).
+      const statuses = answers.map((answer) => answer.status);
+      expect(statuses.filter((status) => status === 201)).toHaveLength(1);
+      const made = answers.find((answer) => answer.status === 201)!;
+      for (const answer of answers) {
+        if (answer.status === 409) expect(answer.body.details).toEqual({ state: "completing" });
+        else expect(answer.body.id).toBe(made.body.id);
+        expect([200, 201, 409]).toContain(answer.status);
+      }
       expect(await nodesIn(folder.id)).toHaveLength(1);
+      expect(await auditFor("node.upload", String(made.body.id))).toHaveLength(1);
       expect(await usedBytes(user.id)).toBe(1000);
       expect(await ledgerOf("upload_user", user.id)).toMatchObject([{ bytes: 1000, count: 1 }]);
     }

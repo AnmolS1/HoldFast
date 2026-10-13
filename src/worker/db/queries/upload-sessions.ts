@@ -58,6 +58,15 @@ export async function create(
   return row!;
 }
 
+/**
+ * Keeps the SHA-256 the client DECLARED at complete on the session (`expected_sha256`) — the
+ * one place it is kept whatever the server later learns about the bytes: what a repeated
+ * complete is compared with, and what a scanner can compare its own hash with.
+ */
+export async function setDeclaredHash(tx: Executor, uploadId: string, sha256: string): Promise<void> {
+  await tx.update(uploads).set({ expectedSha256: sha256 }).where(eq(uploads.id, uploadId));
+}
+
 /** Records the multipart upload's id on a session that is still `open`. False when it is not. */
 export async function setR2UploadId(db: Executor, uploadId: string, r2UploadId: string): Promise<boolean> {
   const rows = await db

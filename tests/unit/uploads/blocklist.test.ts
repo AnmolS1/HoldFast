@@ -44,6 +44,7 @@ import {
   uploader,
   usedBytes,
   userRow,
+  watchedBucket,
   type UserRow,
 } from "./helpers";
 
@@ -234,14 +235,27 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
     expect(comparable(answer)).toBe(comparable(unlisted));
     expect(JSON.stringify(answer.body)).not.toMatch(/block|listed|csam/i);
 
-    // The same rows as any upload: a pending node with the DECLARED hash, a scan message.
-    expect(await nodeById(nodeId)).toMatchObject({
+    // The same rows as any upload — a pending node, a scan message — with ONE difference no
+    // client can cause harm with: the row carries the hash of its BYTES, never the listed hash
+    // the server proved false. No lookup by hash will ever take this file for the listed content.
+    const node = (await nodeById(nodeId))!;
+    expect(node).toMatchObject({
       scanStatus: "pending",
       legalHold: false,
-      sha256: known.sha256,
       ownerId: owner.id,
       createdBy: editor.id,
     });
+    expect(node.sha256).toBe(await storedSha256(storage(env), key));
+    expect(node.sha256).not.toBe(known.sha256);
+    expect(await blocklist.lookup(testDb(), node.sha256!)).toBeNull();
+    // The declared value is kept where the scanner can compare with it — and only there.
+    expect(await sessionRow(session.uploadId)).toMatchObject({ expectedSha256: known.sha256 });
+    expect(await sessionRow(control.uploadId)).toMatchObject({
+      expectedSha256: unlisted.body.sha256 ?? expect.any(String),
+    });
+    expect(
+      await testDb().select({ id: nodes.id }).from(nodes).where(eq(nodes.sha256, known.sha256)),
+    ).toHaveLength(0);
     expect(sent).toEqual([{ v: 1, nodeId, key, force: false }]);
     expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done" });
     expect(await userRow(owner.id)).toMatchObject({ legalHold: false });
@@ -255,6 +269,18 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
       { actorUserId: editor.id, meta: { declaredListedAs: "csam", actualListedAs: null } },
     ]);
     expect(await auditFor("upload.hash_mismatch", control.uploadId)).toHaveLength(0);
+    // A repeat of the same complete answers again and verifies nothing again.
+    const watched = watchedBucket();
+    const again = await complete(
+      editor,
+      session.uploadId,
+      { sha256: known.sha256 },
+      { env: { FILES: watched.bucket } },
+    );
+    expect(again.status).toBe(200);
+    expect(again.body.id).toBe(nodeId);
+    expect(watched.calls).toEqual({});
+    expect(await auditFor("upload.hash_mismatch", session.uploadId)).toHaveLength(1);
     // The entry on the list is what it was.
     expect(await blocklist.lookup(testDb(), known.sha256)).toMatchObject({
       reason: "csam",
@@ -358,6 +384,15 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(await auditRows({ action: "scan.csam_alert_sent", targetId: row.nodeId })).toHaveLength(1);
     expect(operatorMails()).toBe(mailsBefore + 1);
     expect(await auditFor("upload.blocked", row.id)).toHaveLength(0);
+    // Sent again, both blocked uploads answer alike — the lock is not told apart by a repeat —
+    // and nothing is done a second time.
+    const repeatCsam = await complete(owner, row.id, { sha256: known.sha256 });
+    const repeatMalware = await complete(someone, other.uploadId, { sha256: malware.sha256 });
+    expect(repeatCsam.status).toBe(409);
+    expect(repeatCsam.bytes).toBe(repeatMalware.bytes);
+    expect(await reportsOn(owner.id)).toHaveLength(1);
+    expect(operatorMails()).toBe(mailsBefore + 1);
+    expect(await strikesOf(someone.id)).toHaveLength(1);
   });
 
   it("an editor's upload into another user's folder: the editor's account is held too", async () => {
