@@ -19,6 +19,8 @@ const PAUSE_SENTENCE: Record<Exclude<PauseReason, "user">, Parameters<typeof t>[
   auth: "ribbon.auth",
   ceiling: "ribbon.ceiling",
   disabled: "ribbon.disabled",
+  limited: "ribbon.limited",
+  open: "ribbon.open",
 };
 
 const isBlocked = (item: UploadItem) => item.state === "done" && item.scanStatus === "infected";
@@ -103,7 +105,9 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  const failed = items.filter((item) => item.state === "error").length;
+  const unconfirmed = items.filter((item) => item.state === "error" && item.unconfirmed).length;
+  const failed = items.filter((item) => item.state === "error" && !item.unconfirmed).length;
+  const stillChecking = items.filter((item) => item.state === "done" && item.scanStatus === "pending").length;
   const refused = items.filter((item) => item.state === "refused").length;
   const blocked = items.filter(isBlocked).length;
   const unscanned = items.filter(isUnscanned).length;
@@ -128,6 +132,20 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
       status: "error",
     };
   }
+  if (unconfirmed > 0) {
+    return {
+      progress: 1,
+      sentence: counted("ribbon.unconfirmed.one", "ribbon.unconfirmed.other", unconfirmed),
+      status: "paused",
+    };
+  }
+  if (stillChecking > 0) {
+    return {
+      progress: 1,
+      sentence: counted("ribbon.stillChecking.one", "ribbon.stillChecking.other", stillChecking),
+      status: "paused",
+    };
+  }
   if (unscanned > 0) {
     return {
       progress: 1,
@@ -144,6 +162,8 @@ const PAUSED: Record<PauseReason, Parameters<typeof t>[0]> = {
   auth: "row.auth",
   ceiling: "row.ceiling",
   disabled: "row.disabled",
+  limited: "row.limited",
+  open: "row.open",
 };
 
 /** The row's state in words. Null when the scan status says it instead. */
@@ -166,6 +186,7 @@ export function describeItem(item: UploadItem): string | null {
     case "scanning":
       return t("row.scanning");
     case "done":
+      if (item.scanStatus === "pending") return t("row.stillChecking");
       return item.scanStatus === null || item.scanStatus === "clean" ? t("row.done") : null;
     case "cancelled":
       return t("row.cancelled");

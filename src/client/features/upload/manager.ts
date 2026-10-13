@@ -1,24 +1,38 @@
 // The upload manager: the queue's scheduler and the one writer of `store.ts`.
 //
-//   queued → uploading → (hashing, when the digest lags) → completing → scanning → done
+//   queued → (its folder) → uploading → (hashing, when the digest lags) → completing → scanning → done
 //
 // Three files at a time, three parts per file. A request that fails on the network or with a 5xx
 // is tried again on the schedule in `plan.ts`; every other answer has one meaning (see `fail`).
 // Pausing aborts what is in flight and keeps what the server already has: resuming sends only the
 // missing parts, with no new init.
 //
+// `complete` is the one step that cannot be taken back: once it has been SENT the file may have
+// landed whatever comes back, so from then on the item is neither paused nor cancelled, the same
+// `complete` is asked again until the server says what happened, and nothing is uploaded a
+// second time unless the server says the session is gone.
+//
 // The queue belongs to the signed-in account. `purgeUploads` — registered with the shell — aborts
-// everything, empties the queue and the resume list, and moves the epoch on, so a request that
-// was in flight for the previous account changes nothing when it comes back.
+// everything, empties the queue and the resume list, and moves the epoch on. Every step that
+// outlives a request takes a `Mark` when it starts and does nothing once the mark is stale: no
+// write, no announcement, no request.
 import type { NodeDto } from "../../../shared/schemas/node";
-import type { InitUploadBody, InitUploadResponse, UploadedPart } from "../../../shared/schemas/upload";
+import type {
+  CompleteUploadBody,
+  InitUploadBody,
+  InitUploadResponse,
+  UploadedPart,
+} from "../../../shared/schemas/upload";
 import { toast } from "../../components/Toaster";
 import { ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { formatBytes } from "../../lib/format";
-import { getCachedSession, publicConfigQuery, queryClient } from "../../lib/query";
+import { accountEpoch, getCachedSession, publicConfigQuery, queryClient, sameAccount } from "../../lib/query";
 import { startHashInWorker, type HashJob, type StartHash } from "./hashing";
+import { resetPicker } from "./picker";
 import {
+  COMPLETE_WAIT_LIMIT_MS,
+  COMPLETE_WAIT_MS,
   FILE_CONCURRENCY,
   foldersToCreate,
   lastModifiedIso,
@@ -30,7 +44,13 @@ import {
   partRange,
   partSize,
   preflight,
+  RATE_PAUSE_DEFAULT_MS,
+  RATE_PAUSE_MAX_MS,
+  RETRY_AFTER_CAP_MS,
   RETRY_DELAYS_MS,
+  SCAN_BACKOFF_MAX_MS,
+  SCAN_FOLLOW_LIMIT_MS,
+  SCAN_INTERVAL_MS,
   sortedParts,
 } from "./plan";
 import {
@@ -46,7 +66,7 @@ import {
   putSingle,
   type PutBody,
 } from "./protocol";
-import { clearResumeRows, dropResumeRow, readResumeRows, saveResumeRow } from "./resume-list";
+import { clearResumeRows, dropResumeRow, isExpired, readResumeRows, saveResumeRow } from "./resume-list";
 import {
   addItems,
   announce,
@@ -78,13 +98,28 @@ export function setUploadRuntimeForTests(patch: Partial<UploadRuntime> | null): 
 }
 
 // ---------------------------------------------------------------------------------------------
-// Per-item working state that no component reads.
+// Whose work is this? The feature's own epoch and the shell's account epoch, read together when
+// a piece of work starts.
 
+interface Mark {
+  epoch: number;
+  account: number;
+}
+
+let epoch = 0;
+const mark = (): Mark => ({ epoch, account: accountEpoch() });
+const live = (then: Mark): boolean => then.epoch === epoch && sameAccount(then.account);
+
+// ---------------------------------------------------------------------------------------------
+// Module state. Every one of these is emptied by `dropQueue` (the purger).
+
+/** Per-item working state that no component reads. */
 interface Work {
   /** Aborts the run in flight; null when none is. */
   controller: AbortController | null;
   running: boolean;
   phase: "init" | "send" | "complete";
+  /** The hash worker while it runs; null before it starts and once it is done or stopped. */
   hash: HashJob | null;
   sha256: string | null;
   hashFailed: boolean;
@@ -92,16 +127,40 @@ interface Work {
   inFlight: Map<number, number>;
   sample: { at: number; bytes: number } | null;
   started: boolean;
-  poll: AbortController | null;
+  /** An init that is still on its way, with the body it was sent with: never asked twice at once. */
+  init: { body: string; asked: Promise<InitUploadResponse> } | null;
+}
+
+/** One `addFiles` call: the folders it creates and its "do the same for every other". */
+interface Batch {
+  id: string;
+  rootId: string | null;
+  policy: ConflictChoice | null;
+  /** Folder path → the folder's id. */
+  made: Map<string, string>;
+  flying: Map<string, Promise<string | null>>;
+  /** Folder path → why it could not be made. Forgotten when a file of it is tried again. */
+  failed: Map<string, FolderProblem>;
+  controller: AbortController;
+  /** Every file of it was cancelled or removed. */
+  abandoned: boolean;
+  mark: Mark;
 }
 
 const works = new Map<string, Work>();
+const batches = new Map<string, Batch>();
 /** Reasons the whole queue is paused for. */
 const queuePauses = new Set<PauseReason>();
-const folderRuns = new Set<AbortController>();
-let epoch = 0;
-let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
-let conflictPolicy: ConflictChoice | null = null;
+/** Timers that end a queue pause by themselves (a rate limit, the daily ceiling). */
+const pauseTimers = new Map<PauseReason, ReturnType<typeof setTimeout>>();
+/** Resolved when the queue is open again. */
+let openWaiters: Array<() => void> = [];
+/** Landed files whose scan is being followed, in the order they are asked about. */
+let scanQueue: string[] = [];
+const scanSince = new Map<string, number>();
+let scanTimer: ReturnType<typeof setTimeout> | undefined;
+let scanBusy = false;
+let scanBackoff = 0;
 let localRestore: Promise<void> | null = null;
 let serverRestore: Promise<void> | null = null;
 let authProbe: Promise<void> | null = null;
@@ -121,7 +180,7 @@ function workOf(id: string): Work {
       inFlight: new Map(),
       sample: null,
       started: false,
-      poll: null,
+      init: null,
     };
     works.set(id, work);
   }
@@ -133,6 +192,22 @@ function newId(): string {
   return `u${Date.now().toString(36)}-${nextId}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function newBatch(rootId: string | null): Batch {
+  const batch: Batch = {
+    id: newId(),
+    rootId,
+    policy: null,
+    made: new Map(),
+    flying: new Map(),
+    failed: new Map(),
+    controller: new AbortController(),
+    abandoned: false,
+    mark: mark(),
+  };
+  batches.set(batch.id, batch);
+  return batch;
+}
+
 const LIVE: ReadonlySet<UploadState> = new Set([
   "queued",
   "hashing",
@@ -141,7 +216,8 @@ const LIVE: ReadonlySet<UploadState> = new Set([
   "scanning",
   "conflict",
 ]);
-const SENDING: ReadonlySet<UploadState> = new Set(["queued", "hashing", "uploading", "completing"]);
+/** What a pause may stop. `completing` is not among them: `complete` is never taken back. */
+const PAUSABLE: ReadonlySet<UploadState> = new Set(["queued", "hashing", "uploading"]);
 
 /** Still on its way: not finished, not failed, and not a restored row waiting for its file. */
 function isLive(item: UploadItem): boolean {
@@ -158,6 +234,13 @@ function abortError(): DOMException {
   return new DOMException("The upload was stopped.", "AbortError");
 }
 
+/** The file cannot be read (moved, changed, or the hasher failed). */
+class UnreadableFile extends Error {}
+/** Nobody could say whether `complete` took effect. */
+class Unconfirmed extends Error {}
+/** A folder of a folder upload could not be made; `message` is the sentence to show. */
+class FolderProblem extends Error {}
+
 // ---------------------------------------------------------------------------------------------
 // Retry: network failures and 5xx only.
 
@@ -167,6 +250,11 @@ function isRetryable(cause: unknown): boolean {
   if (cause.status < 500) return false;
   // A kill switch is an answer, not a blip.
   return cause.code !== "feature_disabled" && cause.code !== "read_only";
+}
+
+function retryAfterMs(cause: unknown, cap: number): number {
+  if (!(cause instanceof ApiError) || cause.retryAfter === undefined) return 0;
+  return Math.min(cap, cause.retryAfter * 1000);
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -195,8 +283,7 @@ async function retrying<T>(request: () => Promise<T>, signal: AbortSignal): Prom
     } catch (cause) {
       const delay = RETRY_DELAYS_MS[attempt];
       if (delay === undefined || !isRetryable(cause)) throw cause;
-      const asked = cause instanceof ApiError && cause.retryAfter ? cause.retryAfter * 1000 : 0;
-      await sleep(Math.max(delay, asked), signal);
+      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal);
     }
   }
 }
@@ -217,7 +304,8 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> 
       },
       (cause: unknown) => {
         signal.removeEventListener("abort", stop);
-        reject(cause instanceof Error ? cause : new Error(String(cause)));
+        // Rejections here are always Errors of ours (ApiError, FolderProblem, a DOMException).
+        reject(cause as Error);
       },
     );
   });
@@ -260,15 +348,57 @@ function measure(id: string): void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Hashing. A worker runs only for a file that is being sent: never for one that waits in a
+// question, is paused, has failed or was cancelled — so there are never more workers than files
+// in flight.
+
+function startHash(work: Work, file: File): void {
+  if (work.hash || work.sha256) return;
+  work.hashFailed = false;
+  try {
+    const job = runtime.startHash(file);
+    work.hash = job;
+    job.promise.then(
+      (sha256) => {
+        if (work.hash !== job) return;
+        work.sha256 = sha256;
+        work.hash = null;
+      },
+      () => {
+        if (work.hash !== job) return;
+        work.hashFailed = true;
+        work.hash = null;
+      },
+    );
+  } catch {
+    work.hashFailed = true;
+  }
+}
+
+/** Stop the worker if it is still running. A digest that is already in is kept. */
+function stopHash(work: Work): void {
+  work.hash?.cancel();
+  work.hash = null;
+}
+
+/** Hash workers running right now (tests assert the bound). */
+export function liveHashJobs(): number {
+  let count = 0;
+  for (const work of works.values()) if (work.hash) count += 1;
+  return count;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The scheduler.
 
 function pump(): void {
   if (queuePauses.size > 0) return;
   let running = 0;
   for (const work of works.values()) if (work.running) running += 1;
+  if (running >= FILE_CONCURRENCY) return;
   for (const item of currentItems()) {
     if (running >= FILE_CONCURRENCY) return;
-    if (item.state !== "queued" || item.waitingFolder || item.file === null) continue;
+    if (item.state !== "queued" || item.file === null) continue;
     const work = workOf(item.id);
     if (work.running) continue;
     running += 1;
@@ -279,15 +409,15 @@ function pump(): void {
 function start(id: string): void {
   const work = workOf(id);
   const controller = new AbortController();
-  const runEpoch = epoch;
+  const then = mark();
   work.controller = controller;
   work.running = true;
-  void run(id, controller.signal, runEpoch)
+  void run(id, controller.signal, then)
     .catch((cause: unknown) => {
-      if (runEpoch === epoch) fail(id, cause);
+      if (live(then)) fail(id, cause);
     })
     .finally(() => {
-      if (runEpoch !== epoch) return;
+      if (!live(then)) return;
       if (work.controller === controller) work.controller = null;
       work.running = false;
       sweep();
@@ -321,14 +451,15 @@ function keepForResume(item: UploadItem, body: InitUploadBody, init: InitUploadR
     body,
     path: item.path,
     finalName: init.finalName,
+    expiresAt: init.expiresAt,
   });
 }
 
-async function run(id: string, signal: AbortSignal, runEpoch: number): Promise<void> {
+async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
   const work = workOf(id);
   /** The item, or null when this run is no longer the one that counts. */
   const current = (): UploadItem | null => {
-    if (runEpoch !== epoch || signal.aborted) return null;
+    if (!live(then) || signal.aborted) return null;
     return findItem(id) ?? null;
   };
   let item = current();
@@ -339,79 +470,108 @@ async function run(id: string, signal: AbortSignal, runEpoch: number): Promise<v
     work.started = true;
     announce(t("live.start", { name: item.name }));
   }
-  if (!work.hash && !work.sha256) {
-    work.hashFailed = false;
-    try {
-      const job = runtime.startHash(file);
-      work.hash = job;
-      job.promise.then(
-        (sha256) => {
-          if (work.hash === job) work.sha256 = sha256;
-        },
-        () => {
-          if (work.hash === job) work.hashFailed = true;
-        },
-      );
-    } catch {
-      work.hashFailed = true;
-    }
-  }
+  patchItem(id, {
+    state: item.completeSent ? "completing" : "uploading",
+    pauseReason: null,
+    message: null,
+    requestId: null,
+    unconfirmed: false,
+  });
 
-  if (!item.uploadId) {
-    work.phase = "init";
-    patchItem(id, { state: "uploading", pauseReason: null, message: null, requestId: null });
-    const body = initBodyOf(item, file);
-    const init = await retrying(() => initUpload(body, signal), signal);
+  if (!item.completeSent) {
+    // Its folder first (a folder upload): made once per folder, shared by the files of it.
+    if (item.waitingFolder) {
+      work.phase = "init";
+      const batch = batches.get(item.batchId);
+      const parentId = batch ? await unlessAborted(ensureFolder(batch, item.path), signal) : item.parentId;
+      if (!current()) return;
+      patchItem(id, { parentId, waitingFolder: false });
+    }
+
     item = current();
     if (!item) return;
-    patchItem(id, {
-      uploadId: init.uploadId,
-      mode: init.mode,
-      partBytes: init.partBytes,
-      partCount: init.partCount,
-      parts: init.mode === "multipart" ? sortedParts(init.resumedParts) : [],
-      finalName: init.finalName,
-      resumeBody: null,
-    });
-    keepForResume(item, body, init);
-  } else {
-    patchItem(id, { state: "uploading", pauseReason: null, message: null, requestId: null });
-  }
-  measure(id);
-
-  work.phase = "send";
-  item = current();
-  if (!item?.uploadId) return;
-  const uploadId = item.uploadId;
-  if (item.mode === "single") {
-    if (item.parts.length === 0) {
-      const { etag } = await retrying(
-        () =>
-          putSingle(runtime.put, uploadId, file, {
-            signal,
-            onProgress: (loaded) => {
-              if (!current()) return;
-              work.inFlight.set(0, loaded);
-              measure(id);
-            },
-          }),
+    if (!item.uploadId) {
+      work.phase = "init";
+      const body = initBodyOf(item, file);
+      // Not tied to the run's signal: an init that is cancelled half-way may already have opened
+      // a session, and then its id is needed to close it again.
+      const sent = JSON.stringify(body);
+      let flying = work.init?.body === sent ? work.init : null;
+      if (!flying) {
+        const asked = initUpload(body);
+        flying = { body: sent, asked };
+        work.init = flying;
+        const settled = () => {
+          if (work.init?.asked === asked) work.init = null;
+        };
+        asked.then((init) => {
+          settled();
+          if (!live(then)) return;
+          const now = findItem(id);
+          if (!now || now.state === "cancelled") abortUpload(init.uploadId).catch(() => {});
+        }, settled);
+      }
+      const first = flying.asked;
+      // The first try is the one in flight; later tries (a 5xx, the network) are the run's own.
+      let tries = 0;
+      const init = await unlessAborted(
+        retrying(() => (tries++ === 0 ? first : initUpload(body, signal)), signal),
         signal,
       );
-      if (!current()) return;
-      // The mark that the body is with the server; `complete` sends no parts for a single PUT.
-      work.inFlight.delete(0);
-      patchItem(id, { parts: [{ n: 1, etag }] });
-      measure(id);
+      item = current();
+      if (!item) return;
+      patchItem(id, {
+        uploadId: init.uploadId,
+        expiresAt: init.expiresAt,
+        mode: init.mode,
+        partBytes: init.partBytes,
+        partCount: init.partCount,
+        parts: init.mode === "multipart" ? sortedParts(init.resumedParts) : [],
+        finalName: init.finalName,
+        resumeBody: null,
+      });
+      keepForResume(item, body, init);
+      absorbRestored(id, init.uploadId);
     }
-  } else {
-    await sendParts(id, uploadId, file, signal, current);
+    measure(id);
+    // Only now: a file that met a conflict, a refusal or a full quota at init is never read.
+    startHash(work, file);
+
+    work.phase = "send";
+    item = current();
+    if (!item?.uploadId) return;
+    const sending = item.uploadId;
+    if (item.mode === "single") {
+      if (item.parts.length === 0) {
+        const { etag } = await retrying(
+          () =>
+            putSingle(runtime.put, sending, file, {
+              signal,
+              onProgress: (loaded) => {
+                if (!current()) return;
+                work.inFlight.set(0, loaded);
+                measure(id);
+              },
+            }),
+          signal,
+        );
+        if (!current()) return;
+        // The mark that the body is with the server; `complete` sends no parts for a single PUT.
+        work.inFlight.delete(0);
+        patchItem(id, { parts: [{ n: 1, etag }] });
+        measure(id);
+      }
+    } else {
+      await sendParts(id, sending, file, signal, current);
+    }
   }
 
   item = current();
-  if (!item) return;
+  if (!item?.uploadId) return;
   if (!work.sha256) {
+    startHash(work, file);
     if (!work.hash || work.hashFailed) throw new UnreadableFile();
-    patchItem(id, { state: "hashing" });
+    if (!item.completeSent) patchItem(id, { state: "hashing" });
     try {
       work.sha256 = await unlessAborted(work.hash.promise, signal);
     } catch (cause) {
@@ -420,18 +580,61 @@ async function run(id: string, signal: AbortSignal, runEpoch: number): Promise<v
     }
   }
   item = current();
-  if (!item) return;
+  if (!item?.uploadId) return;
 
+  // From here the file may land whatever comes back: no pause, no cancel, and the same body is
+  // asked again until the server says what happened.
   work.phase = "complete";
-  patchItem(id, { state: "completing", progress: 1, sentBytes: item.size, eta: null });
-  const sha256 = work.sha256;
-  const parts = item.mode === "single" ? [] : sortedParts(item.parts);
-  const node = await retrying(() => completeUpload(uploadId, { sha256, parts }, signal), signal);
+  patchItem(id, {
+    state: "completing",
+    completeSent: true,
+    progress: 1,
+    sentBytes: item.size,
+    speed: 0,
+    eta: null,
+  });
+  const body: CompleteUploadBody = {
+    sha256: work.sha256,
+    parts: item.mode === "single" ? [] : sortedParts(item.parts),
+  };
+  const node = await confirmComplete(item.uploadId, body, signal);
   if (!current()) return;
-  landed(id, node, runEpoch);
+  landed(id, node);
 }
 
-class UnreadableFile extends Error {}
+/**
+ * Send `complete` until the server says what happened. `200` is "landed" — whichever attempt did
+ * it. `409` with `state: "completing"` is "another attempt is at it": wait and ask again, for a
+ * bounded time. A lost answer (network, 5xx) is asked again on the retry schedule. When neither
+ * ends in an answer the upload is unconfirmed — not failed, and never sent again by itself.
+ */
+async function confirmComplete(
+  uploadId: string,
+  body: CompleteUploadBody,
+  signal: AbortSignal,
+): Promise<NodeDto> {
+  const began = Date.now();
+  let lost = 0;
+  let waits = 0;
+  for (;;) {
+    try {
+      return await completeUpload(uploadId, body, signal);
+    } catch (cause) {
+      if (isAbort(cause)) throw cause;
+      if (cause instanceof ApiError && cause.status === 409 && cause.details?.state === "completing") {
+        if (Date.now() - began >= COMPLETE_WAIT_LIMIT_MS) throw new Unconfirmed();
+        await sleep(COMPLETE_WAIT_MS[Math.min(waits, COMPLETE_WAIT_MS.length - 1)]!, signal);
+        waits += 1;
+        continue;
+      }
+      if (!isRetryable(cause)) throw cause;
+      const delay = RETRY_DELAYS_MS[lost];
+      if (delay === undefined) throw new Unconfirmed();
+      lost += 1;
+      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal);
+    }
+  }
+}
 
 async function sendParts(
   id: string,
@@ -496,18 +699,117 @@ async function sendParts(
 }
 
 // ---------------------------------------------------------------------------------------------
-// After the file landed: tell the other features, then follow the scan.
+// Folders of a folder upload. A folder is made when the first file of it is about to start — so
+// it waits, stops and is tried again with the files: paused or offline nothing is asked, a
+// cancelled upload makes no more folders, and a failure is the file's to try again.
 
-/** Waits between two reads of the scan state; the last one repeats. */
-export const SCAN_POLL_MS = [1_000, 1_000, 2_000, 2_000, 3_000, 5_000] as const;
-/** After this long a file still `pending` is left to the listing to show. */
-export const SCAN_POLL_LIMIT_MS = 5 * 60_000;
+/** These answers are about the whole queue (the session, a limit, a switch): `fail` reads them. */
+function isQueueAnswer(cause: unknown): boolean {
+  return (
+    cause instanceof ApiError &&
+    (cause.status === 401 ||
+      cause.status === 429 ||
+      cause.code === "feature_disabled" ||
+      cause.code === "read_only")
+  );
+}
 
-function landed(id: string, node: NodeDto, runEpoch: number): void {
+/**
+ * The id of the folder at `path` inside the batch, making it (and its parents, first) if it is
+ * not there yet. A name a folder already holds is that folder (the server says which); a name
+ * something else holds is a problem of that subtree. The folder's children are never listed.
+ */
+function ensureFolder(batch: Batch, path: string): Promise<string | null> {
+  if (path === "") return Promise.resolve(batch.rootId);
+  const made = batch.made.get(path);
+  if (made !== undefined) return Promise.resolve(made);
+  const failed = batch.failed.get(path);
+  if (failed) return Promise.reject(failed);
+  let flying = batch.flying.get(path);
+  if (flying) return flying;
+  flying = (async () => {
+    const parentId = await ensureFolder(batch, parentPath(path));
+    const name = lastSegment(path);
+    // The signal of now: a pause or a cancel since the parent was asked for stops this one too.
+    const { signal } = batch.controller;
+    try {
+      if (batch.abandoned) throw abortError();
+      const node = await retrying(() => createFolder({ parentId, name }, signal), signal);
+      if (live(batch.mark)) emitNodesChanged([parentId]);
+      batch.made.set(path, node.id);
+      return node.id;
+    } catch (cause) {
+      if (isAbort(cause) || isQueueAnswer(cause)) throw cause;
+      const taken = cause instanceof ApiError && cause.status === 409;
+      const existingId = taken ? cause.details?.existingId : undefined;
+      if (typeof existingId === "string") {
+        batch.made.set(path, existingId);
+        return existingId;
+      }
+      // Remembered, so the other files of the folder do not each ask again; a new try forgets it.
+      const problem = new FolderProblem(t(taken ? "folder.taken" : "folder.failed", { name }));
+      batch.failed.set(path, problem);
+      throw problem;
+    }
+  })();
+  batch.flying.set(path, flying);
+  const done = () => {
+    if (batch.flying.get(path) === flying) batch.flying.delete(path);
+  };
+  flying.then(done, done);
+  return flying;
+}
+
+/**
+ * No file of the upload is wanted any more (all cancelled or removed): its folder requests stop,
+ * the one in flight included.
+ */
+function stopFoldersIfUnwanted(batchId: string): void {
+  const batch = batches.get(batchId);
+  if (!batch) return;
+  const wanted = currentItems().some((item) => item.batchId === batchId && item.state !== "cancelled");
+  if (wanted) return;
+  batch.abandoned = true;
+  batch.controller.abort();
+}
+
+function forgetFolderProblems(item: UploadItem): void {
+  const batch = batches.get(item.batchId);
+  if (!batch) return;
+  for (let path = item.path; path !== ""; path = parentPath(path)) batch.failed.delete(path);
+}
+
+/** Resolves when no reason holds the queue. */
+function queueOpen(): Promise<void> {
+  if (queuePauses.size === 0) return Promise.resolve();
+  return new Promise((resolve) => openWaiters.push(resolve));
+}
+
+/** Folders with no file in them: made one at a time, while the queue is open and the upload is wanted. */
+async function makeEmptyFolders(batch: Batch, folders: string[]): Promise<void> {
+  for (const path of folders) {
+    await queueOpen();
+    // The account changed, or every file of the upload was cancelled: it is no longer wanted.
+    if (!live(batch.mark) || batch.abandoned) return;
+    try {
+      await ensureFolder(batch, path);
+    } catch (cause) {
+      // Stopped by a queue pause: asked again once the queue is open. Any other failure of an
+      // empty folder holds nothing back.
+      if (isAbort(cause) && live(batch.mark) && !batch.abandoned) await makeEmptyFolders(batch, [path]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// After the file landed: tell the other features, then follow the scan — with ONE loop for the
+// whole queue. It asks about one file per interval however many wait, backs off when the server
+// says to, does not ask while the tab is hidden, and stops asking about a file after a bound.
+
+function landed(id: string, node: NodeDto): void {
   const item = findItem(id);
   if (!item) return;
   void dropResumeRow(id);
-  workOf(id).hash = null;
   patchItem(id, {
     state: "scanning",
     nodeId: node.id,
@@ -519,13 +821,19 @@ function landed(id: string, node: NodeDto, runEpoch: number): void {
   });
   emitNodesChanged([item.parentId]);
   announce(t("live.done", { name: node.name }));
-  if (node.scanStatus !== "pending") settleScan(id, node);
-  else void pollScan(id, node.id, runEpoch);
+  if (node.scanStatus !== "pending") {
+    settleScan(id, node);
+    return;
+  }
+  scanSince.set(id, Date.now());
+  scanQueue.push(id);
+  scheduleScan(SCAN_INTERVAL_MS);
 }
 
 function settleScan(id: string, node: Pick<NodeDto, "scanStatus" | "scanReason" | "name">): void {
   const item = findItem(id);
   if (!item) return;
+  scanSince.delete(id);
   patchItem(id, { state: "done", scanStatus: node.scanStatus, scanReason: node.scanReason });
   if (node.scanStatus === "infected") announce(t("live.blocked", { name: node.name }));
   else if (node.scanStatus === "error" || node.scanStatus === "skipped")
@@ -535,37 +843,67 @@ function settleScan(id: string, node: Pick<NodeDto, "scanStatus" | "scanReason" 
   sweep();
 }
 
-async function pollScan(id: string, nodeId: string, runEpoch: number): Promise<void> {
-  const work = workOf(id);
-  const controller = new AbortController();
-  work.poll = controller;
-  const { signal } = controller;
-  const began = Date.now();
-  try {
-    for (let round = 0; Date.now() - began < SCAN_POLL_LIMIT_MS; round += 1) {
-      await sleep(SCAN_POLL_MS[Math.min(round, SCAN_POLL_MS.length - 1)]!, signal);
-      let detail;
-      try {
-        detail = await getNode(nodeId, signal);
-      } catch (cause) {
-        if (isAbort(cause)) return;
-        // The file is gone, or no longer ours to see: there is nothing left to follow.
-        if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500) break;
-        continue;
-      }
-      if (runEpoch !== epoch || signal.aborted) return;
-      if (detail.node.scanStatus !== "pending") {
-        settleScan(id, detail.node);
-        return;
-      }
+const tabHidden = (): boolean => typeof document !== "undefined" && document.visibilityState === "hidden";
+
+function scheduleScan(wait: number): void {
+  if (scanTimer !== undefined || scanBusy || scanQueue.length === 0 || tabHidden()) return;
+  scanTimer = setTimeout(() => void scanTick(), wait);
+}
+
+/** The next file to ask about; files that are gone or past their bound are dealt with on the way. */
+function nextScan(): UploadItem | null {
+  for (;;) {
+    const id = scanQueue.shift();
+    if (id === undefined) return null;
+    const item = findItem(id);
+    if (!item || item.state !== "scanning" || !item.nodeId) {
+      scanSince.delete(id);
+      continue;
     }
-  } catch (cause) {
-    if (isAbort(cause)) return;
+    if (Date.now() - (scanSince.get(id) ?? 0) >= SCAN_FOLLOW_LIMIT_MS) {
+      // Still running after the bound: the row says so and nothing more is asked.
+      scanSince.delete(id);
+      patchItem(id, { state: "done", scanStatus: "pending" });
+      continue;
+    }
+    return item;
   }
-  if (runEpoch !== epoch || signal.aborted) return;
-  // Not known: the row just completes, and the listing shows the status when there is one.
-  patchItem(id, { state: "done", scanStatus: null });
+}
+
+async function scanTick(): Promise<void> {
+  scanTimer = undefined;
+  const then = mark();
+  const item = nextScan();
+  if (!item?.nodeId) {
+    sweep();
+    return;
+  }
+  scanBusy = true;
+  let wait: number = SCAN_INTERVAL_MS;
+  try {
+    const detail = await getNode(item.nodeId);
+    if (!live(then)) return;
+    scanBackoff = 0;
+    if (detail.node.scanStatus === "pending") scanQueue.push(item.id);
+    else settleScan(item.id, detail.node);
+  } catch (cause) {
+    if (!live(then)) return;
+    const status = cause instanceof ApiError ? cause.status : 0;
+    if (status >= 400 && status < 500 && status !== 429) {
+      // The file is gone, or no longer ours to see: there is nothing left to follow.
+      scanSince.delete(item.id);
+      patchItem(item.id, { state: "done", scanStatus: null });
+    } else {
+      // Told to slow down, or no answer: the whole loop waits longer — it does not ask the next file instead.
+      scanQueue.push(item.id);
+      scanBackoff = Math.min(SCAN_BACKOFF_MAX_MS, Math.max(2 * SCAN_INTERVAL_MS, scanBackoff * 2));
+      wait = Math.max(scanBackoff, retryAfterMs(cause, RATE_PAUSE_MAX_MS));
+    }
+  }
+  if (!live(then)) return;
+  scanBusy = false;
   sweep();
+  scheduleScan(wait);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -576,7 +914,17 @@ function forgetSession(id: string): void {
   const work = workOf(id);
   work.inFlight.clear();
   work.sample = null;
-  patchItem(id, { uploadId: null, mode: null, parts: [], sentBytes: 0, progress: 0, speed: 0, eta: null });
+  patchItem(id, {
+    uploadId: null,
+    expiresAt: null,
+    mode: null,
+    parts: [],
+    sentBytes: 0,
+    progress: 0,
+    speed: 0,
+    eta: null,
+    completeSent: false,
+  });
 }
 
 function fail(id: string, cause: unknown): void {
@@ -585,16 +933,36 @@ function fail(id: string, cause: unknown): void {
   const work = workOf(id);
   work.inFlight.clear();
   const name = shownName(item);
+  const stopped = (patch: Partial<UploadItem>) => {
+    // Nothing is sent for it now, so nothing is read for it either.
+    stopHash(work);
+    patchItem(id, { speed: 0, eta: null, ...patch });
+  };
 
+  if (cause instanceof Unconfirmed) {
+    stopped({
+      state: "error",
+      unconfirmed: true,
+      message: t("row.unconfirmed"),
+      requestId: null,
+      canRetry: true,
+    });
+    announce(t("live.unconfirmed", { name }));
+    return;
+  }
+  if (cause instanceof FolderProblem) {
+    stopped({ state: "error", message: cause.message, requestId: null, canRetry: true });
+    announce(t("live.failed", { name }));
+    return;
+  }
   if (cause instanceof UnreadableFile) {
-    work.hash = null;
     work.sha256 = null;
-    patchItem(id, { state: "error", message: t("row.unreadable"), requestId: null, canRetry: true });
+    stopped({ state: "error", message: t("row.unreadable"), requestId: null, canRetry: true });
     announce(t("live.failed", { name }));
     return;
   }
   if (!(cause instanceof ApiError)) {
-    patchItem(id, { state: "error", message: t("row.failed"), requestId: null, canRetry: true });
+    stopped({ state: "error", message: t("row.failed"), requestId: null, canRetry: true });
     announce(t("live.failed", { name }));
     return;
   }
@@ -602,26 +970,45 @@ function fail(id: string, cause: unknown): void {
 
   // No session: the queue waits for the sign-in and then goes on where it was.
   if (cause.status === 401) {
-    patchItem(id, { state: "paused", pauseReason: "auth" });
+    stopped({ state: "paused", pauseReason: "auth" });
     // A JSON call that ends in 401 has been through the sign-in already (and was given up).
     if (work.phase === "send") probeSession();
     return;
   }
   // Blocked content is final for this file: no retry, no resume, nothing to try again.
   if (cause.status === 403 && reason === "blocked_content") {
-    work.hash?.cancel();
-    work.hash = null;
     void dropResumeRow(id);
-    patchItem(id, {
+    stopped({
       state: "refused",
       message: t("row.refused"),
       requestId: cause.requestId ?? null,
       canRetry: false,
       uploadId: null,
-      speed: 0,
-      eta: null,
+      completeSent: false,
     });
     announce(t("live.refused", { name }));
+    return;
+  }
+  // A limit: the whole queue waits. The file has not failed.
+  if (cause.status === 429) {
+    const kind = typeof cause.details?.kind === "string" ? cause.details.kind : undefined;
+    const pause: PauseReason =
+      cause.code !== "ceiling_exceeded" ? "limited" : kind === "open_uploads" ? "open" : "ceiling";
+    stopped({ state: "paused", pauseReason: pause });
+    pauseQueue(pause);
+    if (pause === "limited") {
+      // Always ends by itself: after what the server asked for, bounded both ways.
+      const asked = cause.retryAfter === undefined ? RATE_PAUSE_DEFAULT_MS : cause.retryAfter * 1000;
+      resumeQueueIn(pause, Math.min(RATE_PAUSE_MAX_MS, Math.max(SCAN_INTERVAL_MS, asked)));
+    } else if (pause === "ceiling" && cause.retryAfter !== undefined) {
+      resumeQueueIn(pause, cause.retryAfter * 1000);
+    }
+    return;
+  }
+  // The upload switch, and the maintenance switch that stops every write: the queue waits.
+  if (cause.code === "feature_disabled" || cause.code === "read_only") {
+    stopped({ state: "paused", pauseReason: "disabled" });
+    pauseQueue("disabled");
     return;
   }
   // The name is taken (409) — or the replace that was asked for is not allowed: a 409 in the
@@ -629,8 +1016,23 @@ function fail(id: string, cause: unknown): void {
   const replacing = work.phase === "init" && item.onConflict === "replace";
   const notReplaceable = replacing && (cause.status === 403 || cause.status === 404);
   if ((cause.status === 409 && work.phase === "init") || notReplaceable) {
+    void dropResumeRow(id);
+    if (item.onConflict === "rename") {
+      // The server was asked to pick a free name and still says taken: that is not a question
+      // any more, and asking again would get the same answer. One try, then the file stops.
+      stopped({
+        state: "error",
+        message: t("row.noFreeName"),
+        requestId: cause.requestId ?? null,
+        canRetry: true,
+        resumeBody: null,
+        uploadId: null,
+      });
+      announce(t("live.failed", { name }));
+      return;
+    }
     const existingId = typeof cause.details?.existingId === "string" ? cause.details.existingId : null;
-    patchItem(id, {
+    stopped({
       state: "conflict",
       conflict: {
         existingId: replacing ? (item.conflict?.existingId ?? null) : existingId,
@@ -642,35 +1044,27 @@ function fail(id: string, cause: unknown): void {
       resumeBody: null,
       uploadId: null,
     });
-    void dropResumeRow(id);
-    if (!applyPolicy(id)) announce(t("live.conflict", { name }));
-    return;
-  }
-  if (cause.code === "ceiling_exceeded") {
-    patchItem(id, { state: "paused", pauseReason: "ceiling" });
-    pauseQueue("ceiling");
-    clearTimeout(ceilingTimer);
-    if (cause.retryAfter !== undefined) {
-      ceilingTimer = setTimeout(() => resumeQueue("ceiling"), cause.retryAfter * 1000);
-    }
-    return;
-  }
-  // The upload switch, and the maintenance switch that stops every write: the queue waits.
-  if (cause.code === "feature_disabled" || cause.code === "read_only") {
-    patchItem(id, { state: "paused", pauseReason: "disabled" });
-    pauseQueue("disabled");
+    // The run that met the conflict is still unwinding; it pumps the queue when it has.
+    const policy = batches.get(item.batchId)?.policy ?? null;
+    if (!(policy !== null && choose(id, policy))) announce(t("live.conflict", { name }));
     return;
   }
   // The session is gone (expired, aborted, or its folder is): a new try starts from the top.
-  if (work.phase !== "init" && (cause.status === 404 || cause.status === 409)) forgetSession(id);
+  const gone = work.phase !== "init" && (cause.status === 404 || cause.status === 409);
+  if (gone) forgetSession(id);
+  // Lost on the way, at `complete`: nobody knows. (Reached only through an answer that is not a
+  // lost one — `confirmComplete` turns those into Unconfirmed itself.)
   const ours = cause.code === "network" || cause.code === "invalid_response" || cause.status >= 500;
-  patchItem(id, {
+  // An answer that will be the same next time offers no new try.
+  const settled =
+    cause.code === "file_too_large" ||
+    cause.code === "validation" ||
+    (!gone && (cause.status === 403 || cause.status === 404));
+  stopped({
     state: "error",
     message: ours || cause.code === "http_error" ? t("row.failed") : cause.message,
     requestId: cause.requestId ?? null,
-    canRetry: cause.code !== "file_too_large",
-    speed: 0,
-    eta: null,
+    canRetry: !settled,
   });
   announce(t("live.failed", { name }));
 }
@@ -682,7 +1076,7 @@ function fail(id: string, cause: unknown): void {
  */
 function probeSession(): void {
   if (authProbe) return;
-  const probeEpoch = epoch;
+  const then = mark();
   authGateSeen = false;
   authProbe = openUploads()
     .then(
@@ -690,8 +1084,9 @@ function probeSession(): void {
       (cause: unknown) => !(cause instanceof ApiError && cause.status === 401),
     )
     .then((answered) => {
+      if (!live(then)) return;
       authProbe = null;
-      if (probeEpoch !== epoch || authGateSeen || !answered) return;
+      if (authGateSeen || !answered) return;
       // The session is fine after all, so that 401 was not about it: an ordinary failure.
       for (const item of currentItems()) {
         if (item.state === "paused" && item.pauseReason === "auth") {
@@ -716,11 +1111,12 @@ function halt(id: string): void {
   work.controller = null;
   work.inFlight.clear();
   work.sample = null;
+  stopHash(work);
 }
 
 function pauseOne(id: string, reason: PauseReason): void {
   const item = findItem(id);
-  if (!item || !SENDING.has(item.state)) return;
+  if (!item || !PAUSABLE.has(item.state) || item.completeSent) return;
   halt(id);
   patchItem(id, { state: "paused", pauseReason: reason, speed: 0, eta: null });
   measure(id);
@@ -730,11 +1126,15 @@ export function pauseItem(id: string): void {
   pauseOne(id, "user");
 }
 
+/** Reasons a person may end by hand; `auth` ends with the sign-in. */
+const BY_HAND: ReadonlySet<PauseReason> = new Set(["ceiling", "disabled", "limited", "open", "offline"]);
+
 export function resumeItem(id: string): void {
   const item = findItem(id);
-  if (!item || item.state !== "paused" || item.file === null) return;
-  // Trying again by hand is how a ceiling or switch pause is ended before its time.
-  if (item.pauseReason === "ceiling" || item.pauseReason === "disabled") {
+  if (!item || item.state !== "paused" || item.file === null || item.pauseReason === null) return;
+  // Trying again by hand is how a queue pause is ended before its time (or when the browser is
+  // wrong about being offline).
+  if (BY_HAND.has(item.pauseReason)) {
     resumeQueue(item.pauseReason);
     return;
   }
@@ -748,18 +1148,40 @@ export function resumeItem(id: string): void {
 function pauseQueue(reason: PauseReason): void {
   queuePauses.add(reason);
   for (const item of currentItems()) pauseOne(item.id, reason);
+  // A folder request in flight is stopped with the files that wait for it.
+  for (const batch of batches.values()) {
+    batch.controller.abort();
+    batch.controller = new AbortController();
+  }
 }
 
 function resumeQueue(reason: PauseReason): void {
   queuePauses.delete(reason);
-  if (reason === "ceiling") clearTimeout(ceilingTimer);
+  clearTimeout(pauseTimers.get(reason));
+  pauseTimers.delete(reason);
   const blocked = Array.from(queuePauses)[0];
   for (const item of currentItems()) {
     if (item.state !== "paused" || item.pauseReason !== reason || item.file === null) continue;
     if (blocked) patchItem(item.id, { pauseReason: blocked });
     else patchItem(item.id, { state: "queued", pauseReason: null });
   }
+  if (!blocked) {
+    const waiting = openWaiters;
+    openWaiters = [];
+    for (const open of waiting) open();
+  }
   pump();
+}
+
+function resumeQueueIn(reason: PauseReason, ms: number): void {
+  const then = mark();
+  clearTimeout(pauseTimers.get(reason));
+  pauseTimers.set(
+    reason,
+    setTimeout(() => {
+      if (live(then)) resumeQueue(reason);
+    }, ms),
+  );
 }
 
 export function pauseAll(): void {
@@ -773,11 +1195,8 @@ export function resumeAll(): void {
 }
 
 function release(item: UploadItem): void {
-  const work = workOf(item.id);
   halt(item.id);
-  work.hash?.cancel();
-  work.hash = null;
-  work.poll?.abort();
+  scanSince.delete(item.id);
   void dropResumeRow(item.id);
   // The server releases what the session reserved. Best effort: an expired session is gone anyway.
   if (item.uploadId && item.state !== "scanning" && item.state !== "done") {
@@ -785,9 +1204,15 @@ function release(item: UploadItem): void {
   }
 }
 
+/** May this item still be taken back? Not once `complete` has been sent. */
+export function canCancel(item: UploadItem): boolean {
+  if (item.completeSent || item.state === "scanning") return false;
+  return isLive(item) || item.state === "error";
+}
+
 export function cancelItem(id: string): void {
   const item = findItem(id);
-  if (!item || !(isLive(item) || item.state === "error") || item.state === "scanning") return;
+  if (!item || !canCancel(item)) return;
   release(item);
   patchItem(id, {
     state: "cancelled",
@@ -798,6 +1223,7 @@ export function cancelItem(id: string): void {
     eta: null,
   });
   announce(t("live.cancelled", { name: shownName(item) }));
+  stopFoldersIfUnwanted(item.batchId);
   sweep();
   pump();
 }
@@ -805,6 +1231,7 @@ export function cancelItem(id: string): void {
 export function retryItem(id: string): void {
   const item = findItem(id);
   if (!item || item.state !== "error" || !item.canRetry || item.file === null) return;
+  forgetFolderProblems(item);
   const blocked = Array.from(queuePauses)[0];
   patchItem(id, {
     state: blocked ? "paused" : "queued",
@@ -818,10 +1245,14 @@ export function retryItem(id: string): void {
 /** Take a row off the list: a finished one, a failed one, or a restored one nobody wants back. */
 export function removeItem(id: string): void {
   const item = findItem(id);
-  if (!item) return;
-  release(item);
+  // A file whose `complete` is on its way stays until the answer is in.
+  if (!item || item.state === "completing") return;
+  // An unconfirmed upload may have landed: its session is left alone.
+  if (item.completeSent) halt(id);
+  else release(item);
   works.delete(id);
   removeItems(new Set([id]));
+  stopFoldersIfUnwanted(item.batchId);
   sweep();
   pump();
 }
@@ -830,7 +1261,6 @@ export function removeItem(id: string): void {
 function sweep(): void {
   const items = currentItems();
   if (items.length === 0 || items.some(isLive)) return;
-  conflictPolicy = null;
   const gone = new Set<string>();
   let finished = 0;
   for (const item of items) {
@@ -841,10 +1271,14 @@ function sweep(): void {
   if (gone.size === 0) return;
   for (const id of gone) works.delete(id);
   removeItems(gone, gone.size === items.length ? finished : 0);
+  // Batches nothing refers to any more.
+  const used = new Set(currentItems().map((item) => item.batchId));
+  for (const batchId of batches.keys()) if (!used.has(batchId)) batches.delete(batchId);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Conflicts.
+// Conflicts. "Do the same for every other file" belongs to the upload it was ticked for (one
+// `addFiles` call) and answers each file's question once.
 
 export type ConflictChoice = "replace" | "rename" | "skip";
 
@@ -865,16 +1299,15 @@ function choose(id: string, choice: ConflictChoice): boolean {
   return true;
 }
 
-function applyPolicy(id: string): boolean {
-  // The run that met the conflict is still unwinding; it pumps the queue when it has.
-  return conflictPolicy !== null && choose(id, conflictPolicy);
-}
-
 export function resolveConflict(id: string, choice: ConflictChoice, applyToAll: boolean): void {
+  const batchId = findItem(id)?.batchId;
   if (!choose(id, choice)) return;
-  if (applyToAll) {
-    conflictPolicy = choice;
-    for (const item of currentItems()) if (item.state === "conflict") choose(item.id, choice);
+  if (applyToAll && batchId !== undefined) {
+    const batch = batches.get(batchId);
+    if (batch) batch.policy = choice;
+    for (const item of currentItems()) {
+      if (item.state === "conflict" && item.batchId === batchId) choose(item.id, choice);
+    }
   }
   pump();
 }
@@ -888,14 +1321,22 @@ export interface IncomingFile {
   path?: string;
 }
 
+/** What could not be taken from a drop. */
+export interface IntakeProblems {
+  unreadable?: readonly string[];
+  tooMany?: boolean;
+}
+
 function blankItem(
   file: File | null,
   meta: { name: string; size: number; lastModified: number },
+  batchId: string,
   parentId: string | null,
   path: string,
 ): UploadItem {
   return {
     id: newId(),
+    batchId,
     file,
     name: meta.name,
     size: meta.size,
@@ -909,6 +1350,7 @@ function blankItem(
     speed: 0,
     eta: null,
     uploadId: null,
+    expiresAt: null,
     mode: null,
     partBytes: 0,
     partCount: 0,
@@ -924,8 +1366,28 @@ function blankItem(
     onConflict: "fail",
     replaceNodeId: null,
     resumeBody: null,
-    waitingFolder: false,
+    waitingFolder: path !== "",
+    completeSent: false,
+    unconfirmed: false,
   };
+}
+
+const sameFile = (
+  a: { name: string; size: number; lastModified: number },
+  b: { name: string; size: number; lastModified: number },
+): boolean => a.name === b.name && a.size === b.size && a.lastModified === b.lastModified;
+
+/** A restored row whose session has run out is dropped where it is met. */
+function dropExpired(): void {
+  const gone = new Set<string>();
+  for (const item of currentItems()) {
+    if (item.file === null && isExpired(item.expiresAt)) gone.add(item.id);
+  }
+  for (const id of gone) {
+    void dropResumeRow(id);
+    works.delete(id);
+  }
+  removeItems(gone);
 }
 
 /** Give a restored row its file back. Returns whether `file` was one that a row waited for. */
@@ -952,17 +1414,28 @@ function rejoin(file: File): boolean {
 }
 
 /**
+ * The session a fresh init was answered with is one a restored row was waiting on (the row came
+ * from the server's list under the session's final name, which is not the file's): that row is
+ * this upload, so it goes.
+ */
+function absorbRestored(id: string, uploadId: string): void {
+  const twins = new Set<string>();
+  for (const item of currentItems()) {
+    if (item.id !== id && item.file === null && item.uploadId === uploadId) twins.add(item.id);
+  }
+  for (const twin of twins) {
+    void dropResumeRow(twin);
+    works.delete(twin);
+  }
+  removeItems(twins);
+}
+
+/**
  * A file that was refused and is still on the list is not sent a second time by dropping it
  * again: the answer would be the same refusal.
  */
 function refusedBefore(file: File): boolean {
-  const again = currentItems().some(
-    (item) =>
-      item.state === "refused" &&
-      item.name === file.name &&
-      item.size === file.size &&
-      item.lastModified === file.lastModified,
-  );
+  const again = currentItems().some((item) => item.state === "refused" && sameFile(item, file));
   if (again) announce(t("live.refused", { name: file.name }));
   return again;
 }
@@ -990,19 +1463,64 @@ async function freeBytes(parentId: string | null): Promise<number | null> {
   }
 }
 
+/** "a.jpg, b.jpg, c.jpg and 4 more". */
+function listed(names: readonly string[]): string {
+  const shown = names.slice(0, 3).join(", ");
+  return names.length > 3 ? t("intake.listMore", { names: shown, more: names.length - 3 }) : shown;
+}
+
 /**
  * Queue files for `parentId` (null = the top level). `folders` are the folder paths of a folder
- * upload, including empty ones; they are created first.
+ * upload, including empty ones. `problems` is what a drop could not hand over.
  */
 export async function addFiles(
   incoming: readonly IncomingFile[],
   parentId: string | null,
   folders: readonly string[] = [],
+  problems: IntakeProblems = {},
 ): Promise<void> {
-  const addEpoch = epoch;
+  const then = mark();
+  if (problems.tooMany) {
+    const sentence = t("intake.tooMany");
+    toast({ message: sentence, key: "upload-too-many" });
+    announce(sentence);
+    return;
+  }
+  const unreadable = problems.unreadable ?? [];
+  if (unreadable.length > 0) {
+    // Said at once and by name: a folder upload that quietly leaves files out is no success.
+    const sentence =
+      unreadable.length === 1
+        ? t("intake.unreadable.one", { names: listed(unreadable) })
+        : t("intake.unreadable.other", { count: unreadable.length, names: listed(unreadable) });
+    toast({ message: sentence, key: "upload-unreadable", duration: 12_000 });
+    announce(sentence);
+  }
   // A page that was opened offline never saw the event.
   if (typeof navigator !== "undefined" && navigator.onLine === false) queuePauses.add("offline");
-  const fresh = incoming.filter((entry) => !rejoin(entry.file) && !refusedBefore(entry.file));
+  dropExpired();
+  // The same file for the same place twice is one upload (the server would answer the second
+  // init with the first one's session, and the two would then fight over it).
+  const underway = new Set<string>();
+  const keyOf = (
+    target: string | null,
+    path: string,
+    file: { name: string; size: number; lastModified: number },
+  ) => `${target ?? ""}\n${path}\n${file.name}\n${file.size}\n${file.lastModified}`;
+  for (const item of currentItems()) {
+    if (item.file === null || item.state === "cancelled" || item.state === "done" || item.state === "refused")
+      continue;
+    // Where it was added for: the upload's root (a file of a folder upload moves on to its folder).
+    const batch = batches.get(item.batchId);
+    underway.add(keyOf(batch ? batch.rootId : item.parentId, item.path, item));
+  }
+  const fresh = incoming.filter((entry) => {
+    if (rejoin(entry.file) || refusedBefore(entry.file)) return false;
+    const key = keyOf(parentId, entry.path ?? "", entry.file);
+    if (underway.has(key)) return false;
+    underway.add(key);
+    return true;
+  });
   pump();
   if (fresh.length === 0 && folders.length === 0) return;
 
@@ -1014,7 +1532,8 @@ export async function addFiles(
   const sized = fresh.map((entry) => ({ entry, name: entry.file.name, size: entry.file.size }));
   const first = preflight(sized, config?.maxFileBytes ?? null, null);
   const free = first.accepted.length > 0 ? await freeBytes(parentId) : null;
-  if (addEpoch !== epoch) return;
+  // The account changed while the free space was being read: these files are nobody's now.
+  if (!live(then)) return;
   const checked = preflight(sized, config?.maxFileBytes ?? null, free);
   if (checked.quota) {
     const sentence = t("preflight.quota", {
@@ -1026,16 +1545,16 @@ export async function addFiles(
     return;
   }
 
+  const batch = newBatch(parentId);
   const blocked = Array.from(queuePauses)[0];
   const items: UploadItem[] = [];
   for (const { entry } of checked.accepted) {
-    const item = blankItem(entry.file, entry.file, parentId, entry.path ?? "");
-    if (item.path !== "") item.waitingFolder = true;
+    const item = blankItem(entry.file, entry.file, batch.id, parentId, entry.path ?? "");
     if (blocked) Object.assign(item, { state: "paused", pauseReason: blocked });
     items.push(item);
   }
   for (const { file, reason } of checked.rejected) {
-    const item = blankItem(file.entry.file, file.entry.file, parentId, file.entry.path ?? "");
+    const item = blankItem(file.entry.file, file.entry.file, batch.id, parentId, file.entry.path ?? "");
     const max = formatBytes(config?.maxFileBytes ?? 0);
     Object.assign(item, {
       state: "error",
@@ -1047,74 +1566,11 @@ export async function addFiles(
   addItems(items);
   for (const item of items) if (item.state === "error") announce(t("live.failed", { name: item.name }));
 
-  const paths = [...folders, ...items.map((item) => item.path)].filter((path) => path !== "");
-  if (paths.length > 0) {
-    void makeFolders(foldersToCreate(paths), parentId, new Set(items.map((item) => item.id)), addEpoch);
-  }
+  // Folders that hold a file are made when that file starts; the others — empty ones — here.
+  const withFiles = new Set(foldersToCreate(items.map((item) => item.path)));
+  const empty = foldersToCreate(folders).filter((path) => !withFiles.has(path));
+  if (empty.length > 0) void makeEmptyFolders(batch, empty);
   pump();
-}
-
-/**
- * Create the folders of a folder upload, parents first, each once. A name that a folder already
- * holds is that folder (the server says which); a name something else holds fails that subtree
- * and nothing else. The folder's children are never listed to find out.
- */
-async function makeFolders(
-  folders: string[],
-  rootId: string | null,
-  batch: ReadonlySet<string>,
-  runEpoch: number,
-): Promise<void> {
-  const controller = new AbortController();
-  folderRuns.add(controller);
-  const { signal } = controller;
-  type Outcome = { id: string | null } | { error: string };
-  const made = new Map<string, Outcome>([["", { id: rootId }]]);
-  try {
-    for (const folder of folders) {
-      const parent = made.get(parentPath(folder)) ?? { error: t("row.failed") };
-      const name = lastSegment(folder);
-      let outcome: Outcome;
-      if ("error" in parent) outcome = parent;
-      else {
-        try {
-          const node = await retrying(() => createFolder({ parentId: parent.id, name }, signal), signal);
-          if (runEpoch !== epoch) return;
-          emitNodesChanged([parent.id]);
-          outcome = { id: node.id };
-        } catch (cause) {
-          if (isAbort(cause) || runEpoch !== epoch) return;
-          const existingId = cause instanceof ApiError ? cause.details?.existingId : undefined;
-          if (cause instanceof ApiError && cause.status === 409 && typeof existingId === "string") {
-            outcome = { id: existingId };
-          } else if (cause instanceof ApiError && cause.status === 409) {
-            outcome = { error: t("folder.taken", { name }) };
-          } else {
-            outcome = { error: t("folder.failed", { name }) };
-          }
-        }
-      }
-      made.set(folder, outcome);
-      for (const item of currentItems()) {
-        if (!batch.has(item.id) || item.path !== folder || !item.waitingFolder) continue;
-        if ("error" in outcome) {
-          patchItem(item.id, {
-            state: "error",
-            waitingFolder: false,
-            message: outcome.error,
-            canRetry: false,
-          });
-          announce(t("live.failed", { name: item.name }));
-        } else {
-          patchItem(item.id, { parentId: outcome.id, waitingFolder: false });
-        }
-      }
-      pump();
-    }
-  } finally {
-    folderRuns.delete(controller);
-    if (runEpoch === epoch) sweep();
-  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1126,11 +1582,14 @@ function restoredItem(row: {
   body: InitUploadBody;
   path: string;
   finalName: string;
+  expiresAt: string;
 }): UploadItem {
   return {
     ...blankItem(
       null,
       { name: row.body.name, size: row.body.size, lastModified: Date.parse(row.body.fileLastModified) },
+      // A batch of its own: nothing of another upload's choices applies to it.
+      newBatch(row.body.parentId).id,
       row.body.parentId,
       row.path,
     ),
@@ -1138,36 +1597,39 @@ function restoredItem(row: {
     state: "paused",
     pauseReason: "user",
     uploadId: row.uploadId,
+    expiresAt: row.expiresAt,
     finalName: row.finalName,
     onConflict: row.body.onConflict,
     replaceNodeId: row.body.replaceNodeId ?? null,
     resumeBody: row.body,
+    // The body names the folder it was going to; there is nothing left to make.
+    waitingFolder: false,
   };
 }
 
 /**
  * Put the resume list back into the queue as rows that wait for their file ("Select <name> again
- * to resume"). Rows of another account are deleted, never shown. With `server`, the list is
- * checked against the caller's open sessions: a row whose session is gone goes, and an open
- * session this browser has no row for is added.
+ * to resume"). Rows of another account are deleted, never shown; so are rows whose session has
+ * expired. With `server`, the list is checked against the caller's open sessions: a row whose
+ * session is gone goes, and an open session this browser has no row for is added.
  */
 export async function restoreUploads(options: { server?: boolean } = {}): Promise<void> {
-  const runEpoch = epoch;
+  const then = mark();
   const userId = getCachedSession()?.user.id;
   if (!userId) return;
   // Each half runs once however many callers ask at the same moment (the frame and the page both
   // do): a second run beside the first would show every row twice.
-  await (localRestore ??= restoreFromDevice(userId, runEpoch));
-  if (!options.server || runEpoch !== epoch) return;
-  await (serverRestore ??= restoreFromServer(userId, runEpoch).then((done) => {
+  await (localRestore ??= restoreFromDevice(userId, then));
+  if (!options.server || !live(then)) return;
+  await (serverRestore ??= restoreFromServer(userId, then).then((done) => {
     // Not answered: the next caller asks again.
-    if (!done && runEpoch === epoch) serverRestore = null;
+    if (!done && live(then)) serverRestore = null;
   }));
 }
 
-async function restoreFromDevice(userId: string, runEpoch: number): Promise<void> {
+async function restoreFromDevice(userId: string, then: Mark): Promise<void> {
   const rows = await readResumeRows();
-  if (runEpoch !== epoch) return;
+  if (!live(then)) return;
   const known = new Set(currentItems().map((item) => item.id));
   const mine = [];
   for (const row of rows) {
@@ -1177,14 +1639,14 @@ async function restoreFromDevice(userId: string, runEpoch: number): Promise<void
   addItems(mine);
 }
 
-async function restoreFromServer(userId: string, runEpoch: number): Promise<boolean> {
+async function restoreFromServer(userId: string, then: Mark): Promise<boolean> {
   let sessions;
   try {
     sessions = await openUploads();
   } catch {
     return false;
   }
-  if (runEpoch !== epoch) return false;
+  if (!live(then)) return false;
   const open = new Set(sessions.map((session) => session.uploadId));
   const gone = new Set<string>();
   const held = new Set<string>();
@@ -1201,6 +1663,7 @@ async function restoreFromServer(userId: string, runEpoch: number): Promise<bool
   for (const session of sessions) {
     // A session without the file's date can never be matched to a file again.
     if (held.has(session.uploadId) || session.fileLastModified === null) continue;
+    if (isExpired(session.expiresAt)) continue;
     const body: InitUploadBody = {
       parentId: session.parentId,
       name: session.name,
@@ -1210,22 +1673,17 @@ async function restoreFromServer(userId: string, runEpoch: number): Promise<bool
       onConflict: "fail",
       purpose: "file",
     };
-    const item = restoredItem({
+    const row = {
       id: newId(),
-      uploadId: session.uploadId,
-      body,
-      path: "",
-      finalName: session.name,
-    });
-    added.push(item);
-    void saveResumeRow({
-      id: item.id,
       userId,
       uploadId: session.uploadId,
       body,
       path: "",
       finalName: session.name,
-    });
+      expiresAt: session.expiresAt,
+    };
+    added.push(restoredItem(row));
+    void saveResumeRow(row);
   }
   addItems(added);
   return true;
@@ -1240,17 +1698,25 @@ function dropQueue(): void {
   for (const work of works.values()) {
     work.controller?.abort();
     work.hash?.cancel();
-    work.poll?.abort();
   }
   works.clear();
-  for (const controller of folderRuns) controller.abort();
-  folderRuns.clear();
+  for (const batch of batches.values()) batch.controller.abort();
+  batches.clear();
   queuePauses.clear();
-  clearTimeout(ceilingTimer);
-  conflictPolicy = null;
+  for (const timer of pauseTimers.values()) clearTimeout(timer);
+  pauseTimers.clear();
+  openWaiters = [];
+  scanQueue = [];
+  scanSince.clear();
+  clearTimeout(scanTimer);
+  scanTimer = undefined;
+  scanBusy = false;
+  scanBackoff = 0;
   localRestore = null;
   serverRestore = null;
   authProbe = null;
+  authGateSeen = false;
+  resetPicker();
   resetStore();
 }
 
@@ -1270,7 +1736,7 @@ export function forgetUploadsForTests(): void {
 
 registerUserStatePurger(purgeUploads);
 
-// The connection and the session, for the whole queue.
+// The connection, the session and the tab, for the whole queue.
 if (typeof window !== "undefined") {
   window.addEventListener("offline", () => pauseQueue("offline"));
   window.addEventListener("online", () => resumeQueue("offline"));
@@ -1279,4 +1745,12 @@ if (typeof window !== "undefined") {
     pauseQueue("auth");
   });
   window.addEventListener(AUTH_RESTORED_EVENT, () => resumeQueue("auth"));
+  document.addEventListener("visibilitychange", () => {
+    if (tabHidden()) {
+      clearTimeout(scanTimer);
+      scanTimer = undefined;
+    } else {
+      scheduleScan(SCAN_INTERVAL_MS);
+    }
+  });
 }

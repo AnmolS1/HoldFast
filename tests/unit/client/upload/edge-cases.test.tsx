@@ -106,7 +106,7 @@ describe("blocked content is final", () => {
     expect(items().map((item) => [item.name, item.state])).toEqual([["bad.bin", "refused"]]);
   });
 
-  it("control: a 500 at complete on the same item IS retried, and ends as an error that offers a new try", async () => {
+  it("control: a 500 at complete on the same item IS asked again, and ends as an upload nobody could confirm — with a new try", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.onComplete = () => envelope("internal", 500);
     renderUploader();
@@ -115,11 +115,9 @@ describe("blocked content is final", () => {
     expect(server.completes.length).toBe(2);
     await settled(60_000);
     expect(server.completes.length).toBe(6);
-    expect(items()[0]).toMatchObject({ state: "error", canRetry: true });
+    expect(items()[0]).toMatchObject({ state: "error", canRetry: true, unconfirmed: true });
     expect(screen.getByRole("button", { name: "Try bad.bin again" })).toBeTruthy();
-    expect(live()).toContain("bad.bin didn't finish");
-    // Still resumable: its row stays on the resume list.
-    expect((await readResumeRows()).length).toBe(1);
+    expect(live()).toContain("Couldn't confirm bad.bin — check the folder");
   });
 });
 
@@ -446,16 +444,6 @@ describe("limits and switches", () => {
     await settle();
     expect(items()[0]).toMatchObject({ state: "paused", pauseReason: "disabled" });
     expect(server.inits.length).toBe(1);
-  });
-
-  it("429 rate_limited is an answer, not a blip: no retry on the schedule, an error that can be tried again", async () => {
-    vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
-    server.onPut = () => apiError(429, "rate_limited");
-    await addFiles([{ file: smallFile("a.txt") }], null);
-    await settle(0);
-    await settle(120_000);
-    expect(server.puts.length).toBe(1);
-    expect(items()[0]).toMatchObject({ state: "error", canRetry: true, message: "rate_limited message" });
   });
 
   it("a session that is gone (404 at a part) is forgotten: the new try starts from init", async () => {

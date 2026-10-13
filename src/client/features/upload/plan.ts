@@ -11,6 +11,33 @@ export const PART_CONCURRENCY = 3;
  */
 export const RETRY_DELAYS_MS = [0, 2_000, 5_000, 15_000, 30_000] as const;
 
+/** A `Retry-After` on a retried request is honoured up to this. */
+export const RETRY_AFTER_CAP_MS = 60_000;
+
+/**
+ * `complete` answered "still completing": ask again after these waits (the last repeats), for at
+ * most `COMPLETE_WAIT_LIMIT_MS` in all. Then the row says it could not be confirmed.
+ */
+export const COMPLETE_WAIT_MS = [1_000, 2_000, 3_000, 5_000] as const;
+export const COMPLETE_WAIT_LIMIT_MS = 120_000;
+
+/**
+ * The scan is followed by ONE loop for the whole queue: at most one request per interval however
+ * many files wait, each file for at most `SCAN_FOLLOW_LIMIT_MS`.
+ */
+export const SCAN_INTERVAL_MS = 1_000;
+export const SCAN_FOLLOW_LIMIT_MS = 5 * 60_000;
+export const SCAN_BACKOFF_MAX_MS = 60_000;
+
+/** A rate limit pauses the queue for its `Retry-After`: this when none is given, and never longer than the cap. */
+export const RATE_PAUSE_DEFAULT_MS = 30_000;
+export const RATE_PAUSE_MAX_MS = 10 * 60_000;
+
+/** A drop of more files than this is refused whole. */
+export const MAX_DROP_FILES = 10_000;
+/** Rows the panel draws; the rest are counted in one line. */
+export const PANEL_ROWS = 200;
+
 /**
  * The byte range of part `n` (1-based). `partBytes` is the server's — the client never computes
  * a part size.

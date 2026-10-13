@@ -1,13 +1,8 @@
 // The upload manager against a stand-in API: limits, slicing, retry, pause and resume, what is
 // sent at complete, and what happens after a file has landed.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  addFiles,
-  pauseItem,
-  resumeItem,
-  retryItem,
-  SCAN_POLL_MS,
-} from "../../../../src/client/features/upload/manager";
+import { addFiles, pauseItem, resumeItem, retryItem } from "../../../../src/client/features/upload/manager";
+import { SCAN_INTERVAL_MS } from "../../../../src/client/features/upload/plan";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { setupShell } from "../shell/helpers";
@@ -284,12 +279,12 @@ describe("after the file has landed", () => {
     const nodeId = items()[0]!.nodeId!;
     const polls = () => server.count("GET", new RegExp(`^/api/nodes/${nodeId}$`));
     expect(polls()).toBe(0);
-    await settle(SCAN_POLL_MS[0]);
+    await settle(SCAN_INTERVAL_MS);
     expect(polls()).toBe(1);
     expect(items()[0]!.state).toBe("scanning");
 
     server.scanStatus = "infected";
-    await settle(SCAN_POLL_MS[1]);
+    await settle(SCAN_INTERVAL_MS);
     expect(polls()).toBe(2);
     expect(items()[0]).toMatchObject({ state: "done", scanStatus: "infected" });
     // And then it stops asking.
@@ -311,8 +306,8 @@ describe("after the file has landed", () => {
       call.path === `/api/nodes/${nodeId}`
         ? json(nodeDto({ id: nodeId, scanStatus: "infected" }))
         : undefined;
-    await settle(SCAN_POLL_MS[0]);
-    await settle(SCAN_POLL_MS[1]);
+    await settle(SCAN_INTERVAL_MS);
+    await settle(SCAN_INTERVAL_MS);
     expect(items()[0]!.state).toBe("scanning");
   });
 
@@ -333,7 +328,7 @@ describe("after the file has landed", () => {
     server.scanStatus = "error";
     await addFiles([{ file: smallFile("a.txt") }], null);
     await settle(0);
-    await settle(SCAN_POLL_MS[0]);
+    await settle(SCAN_INTERVAL_MS);
     expect(items()[0]).toMatchObject({ state: "done", scanStatus: "error" });
     expect(getUploads().announcements.at(-1)!.text).toBe("Couldn't scan a.txt");
   });

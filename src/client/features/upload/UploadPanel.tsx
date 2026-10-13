@@ -3,15 +3,26 @@
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
+import Typography from "@mui/material/Typography";
 import { Pause, Play, RotateCw, X } from "lucide-react";
-import { useLayoutEffect, useRef, type ReactNode } from "react";
+import { memo, useCallback, useLayoutEffect, useRef, type ReactNode } from "react";
 import { ProgressUnderline } from "../../components/ProgressUnderline";
 import { StatusDot } from "../../components/StatusDot";
 import { t as shellT } from "../../lib/i18n";
 import { TOUCH_QUERY } from "../../theme";
 import { hf, layout } from "../../theme/tokens";
-import { cancelItem, pauseAll, pauseItem, removeItem, resumeAll, resumeItem, retryItem } from "./manager";
+import {
+  canCancel,
+  cancelItem,
+  pauseAll,
+  pauseItem,
+  removeItem,
+  resumeAll,
+  resumeItem,
+  retryItem,
+} from "./manager";
 import { openPicker } from "./picker";
+import { PANEL_ROWS } from "./plan";
 import { useUploads, type UploadItem } from "./store";
 import { t } from "./strings";
 import { describeItem } from "./summary";
@@ -31,21 +42,25 @@ function RowButton({ label, onClick, children }: { label: string; onClick(): voi
   );
 }
 
-function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
+// Memoised: a progress sample of one file re-renders that file's row, not the whole list.
+const Row = memo(function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
   const name = item.finalName ?? item.name;
   const status = describeItem(item);
-  const flagged = item.state === "done" && item.scanStatus !== null && item.scanStatus !== "clean";
+  const flagged =
+    item.state === "done" &&
+    item.scanStatus !== null &&
+    item.scanStatus !== "clean" &&
+    item.scanStatus !== "pending";
   const moving = item.state === "uploading" || item.state === "hashing" || item.state === "completing";
-  const pausable = moving || item.state === "queued";
+  // Once `complete` is on its way nothing is offered: the row says why.
+  const pausable =
+    !item.completeSent && (item.state === "uploading" || item.state === "hashing" || item.state === "queued");
   const resumable =
-    item.state === "paused" &&
-    item.file !== null &&
-    (item.pauseReason === "user" || item.pauseReason === "ceiling" || item.pauseReason === "disabled");
+    item.state === "paused" && item.file !== null && item.pauseReason !== null && item.pauseReason !== "auth";
   const waitsForFile = item.state === "paused" && item.file === null;
   const removable =
-    item.state === "error" || item.state === "refused" || flagged || waitsForFile || item.state === "done";
-  const cancellable =
-    pausable || item.state === "conflict" || (item.state === "paused" && item.file !== null);
+    item.state === "error" || item.state === "refused" || waitsForFile || item.state === "done";
+  const cancellable = canCancel(item) && item.state !== "error";
   // Red means blocked, and nothing else (a refusal is one); an upload that did not finish is
   // said in the ordinary text colour.
   const tone = item.state === "refused" ? hf.danger : item.state === "error" ? hf.text : hf.textSecondary;
@@ -61,23 +76,29 @@ function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
         alignItems: "center",
         gap: 2,
         minHeight: layout.rowHeight,
-        padding: "4px 12px 4px 20px",
+        py: 1,
+        pr: 3,
+        pl: 5,
         borderBottom: `1px solid ${hf.hairline}`,
         [touch]: { minHeight: layout.touchRowHeight },
       }}
     >
       <Box sx={{ flex: "1 1 auto", minWidth: 0 }}>
-        <Box sx={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <Typography
+          variant="subtitle1"
+          component="div"
+          sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+        >
           {name}
           {item.path ? (
-            <Box component="span" sx={{ color: hf.textSecondary, fontWeight: 400 }}>
+            <Typography variant="body1" component="span" sx={{ color: hf.textSecondary }}>
               {" "}
               {t("panel.in", { folder: item.path })}
-            </Box>
+            </Typography>
           ) : null}
-        </Box>
+        </Typography>
         {status !== null ? (
-          <Box data-upload-status sx={{ color: tone, fontSize: 12, lineHeight: "16px" }}>
+          <Typography variant="body2" component="div" data-upload-status sx={{ color: tone }}>
             {status}
             {item.state === "error" && item.requestId ? (
               <Box component="span" className="mono" sx={{ color: hf.textSecondary }}>
@@ -85,7 +106,7 @@ function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
                 {shellT("app.requestId", { id: item.requestId })}
               </Box>
             ) : null}
-          </Box>
+          </Typography>
         ) : null}
         {flagged && item.scanStatus ? (
           <StatusDot status={item.scanStatus} reason={item.scanReason} variant="sentence" />
@@ -146,23 +167,21 @@ function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
       ) : null}
     </Box>
   );
-}
+});
 
 export function UploadPanel() {
   const { items } = useUploads();
   const title = useRef<HTMLHeadingElement>(null);
   const anySending = items.some(
     (item) =>
-      item.state === "queued" ||
-      item.state === "uploading" ||
-      item.state === "hashing" ||
-      item.state === "completing",
+      !item.completeSent &&
+      (item.state === "queued" || item.state === "uploading" || item.state === "hashing"),
   );
   const anyPausedByHand = items.some(
     (item) => item.state === "paused" && item.pauseReason === "user" && item.file !== null,
   );
   // A row that goes takes the focus with it: put it on the panel's heading, never on <body>.
-  const focusTitle = () => title.current?.focus();
+  const focusTitle = useCallback(() => title.current?.focus(), []);
   const root = useRef<HTMLDivElement>(null);
   // And when the panel itself goes (its last row was removed, or the queue finished) while the
   // focus is inside it, the focus moves to the page — a layout effect, so it runs while the
@@ -175,6 +194,9 @@ export function UploadPanel() {
       }
     };
   }, []);
+  // A drop of thousands of files is counted, not drawn: the first rows, then one line.
+  const shown = items.length > PANEL_ROWS ? items.slice(0, PANEL_ROWS) : items;
+  const more = items.length - shown.length;
 
   return (
     <Box data-upload-panel ref={root}>
@@ -183,18 +205,21 @@ export function UploadPanel() {
           display: "flex",
           alignItems: "center",
           gap: 2,
-          padding: "4px 12px 4px 20px",
+          py: 1,
+          pr: 3,
+          pl: 5,
           borderBottom: `1px solid ${hf.hairline}`,
         }}
       >
-        <Box
+        <Typography
+          variant="h3"
           component="h2"
           ref={title}
           tabIndex={-1}
-          sx={{ flex: "1 1 auto", margin: 0, fontSize: 13, lineHeight: "20px", fontWeight: 600 }}
+          sx={{ flex: "1 1 auto", margin: 0 }}
         >
           {t("panel.title")}
-        </Box>
+        </Typography>
         {anySending || anyPausedByHand ? (
           <Button size="small" onClick={() => (anySending ? pauseAll() : resumeAll())}>
             {anySending ? t("panel.pauseAll") : t("panel.resumeAll")}
@@ -202,10 +227,15 @@ export function UploadPanel() {
         ) : null}
       </Box>
       <Box component="ul" sx={{ listStyle: "none", margin: 0, padding: 0 }}>
-        {items.map((item) => (
+        {shown.map((item) => (
           <Row key={item.id} item={item} onGone={focusTitle} />
         ))}
       </Box>
+      {more > 0 ? (
+        <Typography variant="body2" data-upload-more sx={{ color: hf.textSecondary, py: 2, pr: 3, pl: 5 }}>
+          {more === 1 ? t("panel.more.one") : t("panel.more.other", { count: more })}
+        </Typography>
+      ) : null}
     </Box>
   );
 }

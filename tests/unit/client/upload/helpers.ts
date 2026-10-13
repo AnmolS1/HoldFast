@@ -67,6 +67,10 @@ export interface Server {
   onComplete?: (body: CompleteUploadBody, nth: number) => JsonAnswer;
   onPut?: (call: PutCall, nth: number) => ApiError | undefined;
   onJson?: (call: MockCall) => JsonAnswer | Promise<Response>;
+  /** Hash workers: started, stopped before they finished, running now, and the most at once. */
+  hashes: { started: number; cancelled: number; running: number; peak: number };
+  /** When true a hash never finishes by itself (a slow disk). */
+  holdHash: boolean;
   /** In-flight body requests right now, and the most there ever were. */
   inFlight: number;
   peak: number;
@@ -95,6 +99,8 @@ export function installServer(): Server {
     hold: false,
     partBytes: 67_108_864,
     scanStatus: "clean",
+    hashes: { started: 0, cancelled: 0, running: 0, peak: 0 },
+    holdHash: false,
     inFlight: 0,
     peak: 0,
     count: (method, path) => server.calls.filter((c) => c.method === method && path.test(c.path)).length,
@@ -206,7 +212,31 @@ export function installServer(): Server {
           call.resolve();
         }
       }),
-    startHash: () => ({ promise: Promise.resolve(DIGEST), cancel: () => {} }),
+    startHash: () => {
+      const { hashes } = server;
+      hashes.started += 1;
+      hashes.running += 1;
+      hashes.peak = Math.max(hashes.peak, hashes.running);
+      let over = false;
+      const end = () => {
+        if (over) return false;
+        over = true;
+        hashes.running -= 1;
+        return true;
+      };
+      const promise = server.holdHash
+        ? new Promise<string>(() => {})
+        : Promise.resolve(DIGEST).then((digest) => {
+            end();
+            return digest;
+          });
+      return {
+        promise,
+        cancel: () => {
+          if (end()) hashes.cancelled += 1;
+        },
+      };
+    },
   });
   return server;
 }

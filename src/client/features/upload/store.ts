@@ -7,7 +7,7 @@ import type { InitUploadBody, UploadedPart } from "../../../shared/schemas/uploa
 /**
  * `refused` is final (blocked content): never retried, never resumable. `conflict` waits for the
  * user's choice. A file that landed is `scanning` and then `done`; what the scan said is in
- * `scanStatus`.
+ * `scanStatus` (`pending` on a `done` row: the scan was still running when this stopped asking).
  */
 export type UploadState =
   | "queued"
@@ -22,18 +22,24 @@ export type UploadState =
   | "refused"
   | "conflict";
 
-/** Why an item is paused. Every reason but `user` belongs to the whole queue. */
-export type PauseReason = "user" | "offline" | "auth" | "ceiling" | "disabled";
+/**
+ * Why an item is paused. Every reason but `user` belongs to the whole queue: no connection, no
+ * session, the daily ceiling, the upload switch, a rate limit (`limited`), too many open sessions
+ * (`open`).
+ */
+export type PauseReason = "user" | "offline" | "auth" | "ceiling" | "disabled" | "limited" | "open";
 
 export interface UploadConflict {
   /** The file that holds the name, when the server says which. Replace needs it. */
   existingId: string | null;
-  /** Set once a replace was refused: the server's sentence, shown as it is. */
+  /** Set once a replace was refused: the sentence to show. */
   replaceRefused: string | null;
 }
 
 export interface UploadItem {
   id: string;
+  /** The `addFiles` call it came in with: its folders and its "do the same for every other". */
+  batchId: string;
   /** Null for a row restored after a reload, until the file is selected again. */
   file: File | null;
   name: string;
@@ -53,6 +59,8 @@ export interface UploadItem {
   /** Seconds left; null = not known. */
   eta: number | null;
   uploadId: string | null;
+  /** When the server's session ends; a restored row past it is dropped. */
+  expiresAt: string | null;
   mode: "single" | "multipart" | null;
   partBytes: number;
   partCount: number;
@@ -72,8 +80,15 @@ export interface UploadItem {
   replaceNodeId: string | null;
   /** The init body of a restored row, sent again as it was once the file is back. */
   resumeBody: InitUploadBody | null;
-  /** Its folder (of a folder upload) is not created yet. */
+  /** Its folder (of a folder upload) is not created yet; `parentId` is the upload's root until then. */
   waitingFolder: boolean;
+  /**
+   * `complete` has been sent: the file may have landed whatever came back. From here the item is
+   * never paused or cancelled, and a new try asks `complete` again before anything else.
+   */
+  completeSent: boolean;
+  /** An `error` that is not a failure: nobody could say whether the file landed. */
+  unconfirmed: boolean;
 }
 
 export interface Announcement {
@@ -95,7 +110,13 @@ export const PROGRESS_FLUSH_MS = 200;
 
 const EMPTY: UploadSnapshot = { items: [], announcements: [], finished: 0 };
 
-let working: UploadSnapshot = EMPTY;
+// Kept by id, in the order added: a change to one item of ten thousand costs one map write, and
+// the array the components read is built once per publish.
+let items = new Map<string, UploadItem>();
+let list: UploadItem[] | null = [];
+let announcements: readonly Announcement[] = [];
+let finished = 0;
+let dirty = false;
 let published: UploadSnapshot = EMPTY;
 let announcementId = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -104,56 +125,64 @@ const listeners = new Set<() => void>();
 function flush(): void {
   clearTimeout(timer);
   timer = undefined;
-  if (published === working) return;
-  published = working;
+  if (!dirty) return;
+  dirty = false;
+  published = { items: currentItems(), announcements, finished };
   for (const listener of Array.from(listeners)) listener();
 }
 
 /** `quiet` changes (progress samples) are coalesced; everything else is published at once. */
 function touch(quiet: boolean): void {
+  dirty = true;
   if (!quiet) flush();
   else timer ??= setTimeout(flush, PROGRESS_FLUSH_MS);
 }
 
 /** The queue as the manager sees it — ahead of `getUploads()` by at most one progress flush. */
 export function currentItems(): readonly UploadItem[] {
-  return working.items;
+  return (list ??= Array.from(items.values()));
 }
 
 export function findItem(id: string): UploadItem | undefined {
-  return working.items.find((item) => item.id === id);
+  return items.get(id);
 }
 
-export function addItems(items: UploadItem[]): void {
-  if (items.length === 0) return;
-  working = { ...working, items: [...working.items, ...items], finished: 0 };
+export function addItems(added: UploadItem[]): void {
+  if (added.length === 0) return;
+  for (const item of added) items.set(item.id, item);
+  list = null;
+  finished = 0;
   touch(false);
 }
 
 export function patchItem(id: string, patch: Partial<UploadItem>, quiet = false): void {
-  if (!findItem(id)) return;
-  working = {
-    ...working,
-    items: working.items.map((item) => (item.id === id ? { ...item, ...patch } : item)),
-  };
+  const item = items.get(id);
+  if (!item) return;
+  items.set(id, { ...item, ...patch });
+  list = null;
   touch(quiet);
 }
 
-export function removeItems(ids: ReadonlySet<string>, finished?: number): void {
-  const items = working.items.filter((item) => !ids.has(item.id));
-  if (items.length === working.items.length && finished === undefined) return;
-  working = { ...working, items, finished: finished ?? working.finished };
+export function removeItems(ids: ReadonlySet<string>, landed?: number): void {
+  let removed = false;
+  for (const id of ids) removed = items.delete(id) || removed;
+  if (!removed && landed === undefined) return;
+  list = null;
+  if (landed !== undefined) finished = landed;
   touch(false);
 }
 
 export function announce(text: string): void {
-  const announcements = [...working.announcements, { id: ++announcementId, text }];
-  working = { ...working, announcements: announcements.slice(-ANNOUNCEMENTS_KEPT) };
+  announcements = [...announcements, { id: ++announcementId, text }].slice(-ANNOUNCEMENTS_KEPT);
   touch(false);
 }
 
 export function resetStore(): void {
-  working = EMPTY;
+  items = new Map();
+  list = [];
+  announcements = [];
+  finished = 0;
+  dirty = true;
   flush();
 }
 
