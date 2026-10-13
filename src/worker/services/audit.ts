@@ -7,6 +7,9 @@
 // The row is written AFTER the response, through `defer`, so it is never part of the caller's
 // transaction and never slows a request. A failed insert is reported and swallowed.
 //
+//   await auditInTx(tx, c, "node.purge", { type: "node", id }, { bytes });   a PURGE only: the
+//                                          row is awaited on `tx`, and a failed insert throws
+//
 // From a request the row carries `ipHashDaily`, `ua`, `country` and `requestId`, and the actor
 // defaults to the session (an impersonated session is recorded as the admin behind it). From a
 // `ServiceDeps` those four are null and the actor defaults to `system` — pass `options` to name
@@ -16,12 +19,22 @@
 
 import { userAgentFamily } from "../../shared/sentry-redact";
 import type { Context } from "hono";
+import type { Tx } from "../db/client";
 import type { AuditRow } from "../db/queries/audit";
 import { captureError } from "../sentry";
 import { now } from "./clock";
 import { dayUTC, ipHashDaily } from "./ip-hash";
 import { writeMetric } from "./metrics";
-import { coreFor, coreOf, db, defer, keys, type AppEnv, type ServiceDeps } from "./request-context";
+import {
+  coreFor,
+  coreOf,
+  db,
+  defer,
+  keys,
+  type AppEnv,
+  type CoreDeps,
+  type ServiceDeps,
+} from "./request-context";
 
 export type { AuditRow };
 export type AuditTarget = { type: string; id?: string | null } | null;
@@ -50,13 +63,22 @@ async function write(env: Env, insert: () => Promise<void>): Promise<void> {
   }
 }
 
-export function audit(
+/** The row but for the daily IP hash, which only a request has and which takes an await. */
+type Prepared = {
+  core: CoreDeps;
+  env: Env;
+  row: Omit<AuditRow, "ipHashDaily">;
+  ipHash: (() => Promise<string>) | null;
+};
+
+/** The one place a row is built: `audit` and `auditInTx` differ only in where they insert it. */
+function prepare(
   source: Context<AppEnv> | ServiceDeps,
   action: string,
   target: AuditTarget,
-  meta: Record<string, unknown> | null = null,
-  options: AuditOptions = {},
-): void {
+  meta: Record<string, unknown> | null,
+  options: AuditOptions,
+): Prepared {
   const base = {
     action,
     targetType: target?.type ?? null,
@@ -76,22 +98,59 @@ export function audit(
     const cf = c.req.raw.cf as { country?: unknown } | undefined;
     const country = typeof cf?.country === "string" ? cf.country : null;
     const day = dayUTC(now(c));
-    const insert = coreOf(c).insertAudit;
+    return {
+      core: coreOf(c),
+      env: c.env,
+      row: { ...base, ...actor, ua, country, requestId },
+      ipHash: () => ipHashDaily(keys(c), ip, day),
+    };
+  }
+
+  const actor: Required<AuditOptions> = { actorUserId: null, actorType: "system", ...options };
+  return {
+    core: coreFor(source),
+    env: source.env,
+    row: { ...base, ...actor, ua: null, country: null, requestId: null },
+    ipHash: null,
+  };
+}
+
+export function audit(
+  source: Context<AppEnv> | ServiceDeps,
+  action: string,
+  target: AuditTarget,
+  meta: Record<string, unknown> | null = null,
+  options: AuditOptions = {},
+): void {
+  const { core, env, row, ipHash } = prepare(source, action, target, meta, options);
+  const insert = core.insertAudit;
+  if (isContext(source)) {
+    const c = source;
     defer(
       c,
-      write(c.env, async () => {
-        const hash = await ipHashDaily(keys(c), ip, day);
-        await insert(db(c), { ...base, ...actor, ipHashDaily: hash, ua, country, requestId });
+      write(env, async () => {
+        const hash = ipHash ? await ipHash() : null;
+        await insert(db(c), { ...row, ipHashDaily: hash });
       }),
     );
     return;
   }
+  source.defer(write(env, () => insert(source.db, { ...row, ipHashDaily: null })));
+}
 
-  const actor: Required<AuditOptions> = { actorUserId: null, actorType: "system", ...options };
-  const insert = coreFor(source).insertAudit;
-  source.defer(
-    write(source.env, () =>
-      insert(source.db, { ...base, ...actor, ipHashDaily: null, ua: null, country: null, requestId: null }),
-    ),
-  );
+/**
+ * The same row as `audit` would write, inserted NOW on the caller's transaction — for a purge,
+ * whose record must commit or roll back with its deletes. Nothing is deferred and nothing is
+ * swallowed: a failed insert throws, and the caller's transaction ends with it.
+ */
+export async function auditInTx(
+  tx: Tx,
+  source: Context<AppEnv> | ServiceDeps,
+  action: string,
+  target: AuditTarget,
+  meta: Record<string, unknown> | null = null,
+  options: AuditOptions = {},
+): Promise<void> {
+  const { core, row, ipHash } = prepare(source, action, target, meta, options);
+  await core.insertAudit(tx, { ...row, ipHashDaily: ipHash ? await ipHash() : null });
 }
