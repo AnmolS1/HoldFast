@@ -116,10 +116,15 @@ describe("the scan loop", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     await settle(60_000);
     expect(polls().length).toBe(0);
+    // A file that lands while the tab is hidden does not start the asking either.
+    await addFiles([{ file: smallFile("late.txt") }], null);
+    await settle(0);
+    await settle(60_000);
+    expect(polls().length).toBe(0);
     visibility.mockReturnValue("visible");
     document.dispatchEvent(new Event("visibilitychange"));
-    await settle(2_000);
-    expect(polls().length).toBe(2);
+    await settle(3_000);
+    expect(polls().length).toBe(3);
   });
 
   it("after the bound a file still pending says 'still being checked' and is asked about no more", async () => {
