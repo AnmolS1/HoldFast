@@ -15,6 +15,7 @@ import {
 import * as sessions from "../../../src/worker/db/queries/upload-sessions";
 import { claimCompleting } from "../../../src/worker/db/queries/uploads";
 import { uploadParts } from "../../../src/worker/db/schema";
+import { storedSha256 } from "../../../src/worker/routes/uploads";
 import { keyFor, storage } from "../../../src/worker/services/storage";
 import { SPARSE_FILE_BYTES } from "../../setup/fixture-bytes";
 import { deliver, gate, nodeById, testDb } from "../services-core/helpers";
@@ -364,6 +365,11 @@ describe("PUT /uploads/:id/parts/:n", () => {
     // The tail of the object is the part that was sent last.
     const tail = await env.FILES.get(row.r2Key, { range: { suffix: 4 } });
     expect(new Uint8Array(await tail!.arrayBuffer())).toEqual(filled(4, 1));
+    // What a blocklist hit costs at this size: the server's own hash of the stored object.
+    const hashStarted = Date.now();
+    const hashed = await storedSha256(storage(env), row.r2Key);
+    console.log(`T12 TIMING sha256 of ${size} stored bytes: ${Date.now() - hashStarted} ms wall`);
+    expect(hashed).toMatch(/^[0-9a-f]{64}$/);
     // Nothing more is taken for it.
     const late = await call(user, "PUT", `/uploads/${session.uploadId}/parts/3`, {
       body: zeros(last),
