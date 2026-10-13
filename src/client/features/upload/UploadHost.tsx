@@ -10,7 +10,7 @@ import { hf, layout } from "../../theme/tokens";
 import { ConflictDialog } from "./ConflictDialog";
 import { carriesFiles, fromDrop, fromFileList } from "./intake";
 import { addFiles, restoreUploads } from "./manager";
-import { pickerTarget, registerPicker, targetFromLocation } from "./picker";
+import { registerPicker, takePickerTarget, targetFromLocation } from "./picker";
 import { getNode } from "./protocol";
 import { useUploads } from "./store";
 import { t } from "./strings";
@@ -109,7 +109,7 @@ export function UploadHost() {
     const intake = fromFileList(Array.from(input.files ?? []));
     // Emptied, so choosing the same file again is a change again.
     input.value = "";
-    void addFiles(intake.files, pickerTarget(), intake.folders);
+    void addFiles(intake.files, takePickerTarget(), intake.folders);
   };
 
   return (

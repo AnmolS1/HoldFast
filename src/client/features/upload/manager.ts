@@ -102,8 +102,8 @@ const folderRuns = new Set<AbortController>();
 let epoch = 0;
 let ceilingTimer: ReturnType<typeof setTimeout> | undefined;
 let conflictPolicy: ConflictChoice | null = null;
-let restored = false;
-let reconciled = false;
+let localRestore: Promise<void> | null = null;
+let serverRestore: Promise<void> | null = null;
 let authProbe: Promise<void> | null = null;
 let authGateSeen = false;
 let nextId = 0;
@@ -1153,27 +1153,36 @@ export async function restoreUploads(options: { server?: boolean } = {}): Promis
   const runEpoch = epoch;
   const userId = getCachedSession()?.user.id;
   if (!userId) return;
-  if (!restored) {
-    restored = true;
-    const rows = await readResumeRows();
-    if (runEpoch !== epoch) return;
-    const known = new Set(currentItems().map((item) => item.id));
-    const mine = [];
-    for (const row of rows) {
-      if (row.userId !== userId) void dropResumeRow(row.id);
-      else if (!known.has(row.id)) mine.push(restoredItem(row));
-    }
-    addItems(mine);
+  // Each half runs once however many callers ask at the same moment (the frame and the page both
+  // do): a second run beside the first would show every row twice.
+  await (localRestore ??= restoreFromDevice(userId, runEpoch));
+  if (!options.server || runEpoch !== epoch) return;
+  await (serverRestore ??= restoreFromServer(userId, runEpoch).then((done) => {
+    // Not answered: the next caller asks again.
+    if (!done && runEpoch === epoch) serverRestore = null;
+  }));
+}
+
+async function restoreFromDevice(userId: string, runEpoch: number): Promise<void> {
+  const rows = await readResumeRows();
+  if (runEpoch !== epoch) return;
+  const known = new Set(currentItems().map((item) => item.id));
+  const mine = [];
+  for (const row of rows) {
+    if (row.userId !== userId) void dropResumeRow(row.id);
+    else if (!known.has(row.id)) mine.push(restoredItem(row));
   }
-  if (!options.server || reconciled) return;
+  addItems(mine);
+}
+
+async function restoreFromServer(userId: string, runEpoch: number): Promise<boolean> {
   let sessions;
   try {
     sessions = await openUploads();
   } catch {
-    return;
+    return false;
   }
-  if (runEpoch !== epoch) return;
-  reconciled = true;
+  if (runEpoch !== epoch) return false;
   const open = new Set(sessions.map((session) => session.uploadId));
   const gone = new Set<string>();
   const held = new Set<string>();
@@ -1217,6 +1226,7 @@ export async function restoreUploads(options: { server?: boolean } = {}): Promis
     });
   }
   addItems(added);
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1236,8 +1246,8 @@ function dropQueue(): void {
   queuePauses.clear();
   clearTimeout(ceilingTimer);
   conflictPolicy = null;
-  restored = false;
-  reconciled = false;
+  localRestore = null;
+  serverRestore = null;
   authProbe = null;
   resetStore();
 }

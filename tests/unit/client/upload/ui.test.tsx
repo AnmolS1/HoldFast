@@ -189,6 +189,21 @@ describe("requestUpload", () => {
     expect(server.inits.map((body) => [body.name, body.parentId])).toEqual([["a.txt", FOLDER_ID]]);
   });
 
+  it("files that reach the input without the picker being asked for go to the folder in the address", async () => {
+    renderShell(<UploadDropOverlay />);
+    window.history.replaceState({}, "", `/uploads?parent=${FOLDER_ID}`);
+    await act(async () => choose(filesInput(), [smallFile("a.txt")]));
+    await settled();
+    // And a target that was asked for is used once, not kept for the next selection.
+    window.history.replaceState({}, "", "/");
+    await act(async () => choose(filesInput(), [smallFile("b.txt")]));
+    await settled();
+    expect(server.inits.map((body) => [body.name, body.parentId])).toEqual([
+      ["a.txt", FOLDER_ID],
+      ["b.txt", null],
+    ]);
+  });
+
   it("the folder picker asks for a directory", () => {
     renderShell(<UploadDropOverlay />);
     expect(folderInput().hasAttribute("webkitdirectory")).toBe(true);

@@ -218,6 +218,30 @@ describe("after a reload", () => {
     });
   });
 
+  it("the frame and the page asking at the same moment show the row once", async () => {
+    const row = await reloadMidUpload();
+    const still = uploadSession({
+      uploadId: row.uploadId,
+      name: row.body.name,
+      size: row.body.size,
+      parentId: row.body.parentId,
+      fileLastModified: row.body.fileLastModified,
+    });
+    server.onJson = (call) =>
+      call.path === "/api/uploads/open" ? json(openUploadsResponse([still])) : undefined;
+    // As on /uploads after a reload: the host restores from the device, the page also asks the
+    // server — and in development every effect runs twice.
+    await Promise.all([
+      restoreUploads(),
+      restoreUploads({ server: true }),
+      restoreUploads(),
+      restoreUploads({ server: true }),
+    ]);
+    expect(items().map((item) => item.uploadId)).toEqual([row.uploadId]);
+    expect((await readResumeRows()).length).toBe(1);
+    expect(server.count("GET", /^\/api\/uploads\/open$/)).toBe(1);
+  });
+
   it("a row of another account is never shown, and is deleted", async () => {
     const mine = await reloadMidUpload();
     await saveResumeRow({ ...mine, id: "theirs", userId: OTHER_USER_ID, uploadId: rowId(0xd1) });

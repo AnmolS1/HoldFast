@@ -4,15 +4,21 @@
 export type PickerKind = "files" | "folder";
 
 const inputs: Record<PickerKind, HTMLInputElement | null> = { files: null, folder: null };
-let pickerParent: string | null = null;
+/** `undefined`: no picker was opened by `openPicker` (the input was reached some other way). */
+let pickerParent: string | null | undefined;
 
 export function registerPicker(kind: PickerKind, input: HTMLInputElement | null): void {
   inputs[kind] = input;
 }
 
-/** Where the files of the picker that is open go. */
-export function pickerTarget(): string | null {
-  return pickerParent;
+/**
+ * Where the files a picker just handed over go: the folder it was opened for — and for an input
+ * that was not opened through `openPicker`, the folder in the address. Asked once per selection.
+ */
+export function takePickerTarget(): string | null {
+  const target = pickerParent === undefined ? targetFromLocation() : pickerParent;
+  pickerParent = undefined;
+  return target;
 }
 
 /**
