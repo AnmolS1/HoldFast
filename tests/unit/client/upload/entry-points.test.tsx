@@ -3,7 +3,7 @@ import "fake-indexeddb/auto";
 // the paste, requestUpload — before anything asynchronous. Whatever arrives later under another
 // account is discarded whole: nothing queued, shown, announced or sent.
 import { act } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { requestUpload, UploadDropOverlay } from "../../../../src/client/features/upload";
 import { fromDrop } from "../../../../src/client/features/upload/intake";
@@ -16,7 +16,7 @@ import {
 import { readResumeRows } from "../../../../src/client/features/upload/resume-list";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
-import { adoptIdentity, purgeUserState } from "../../../../src/client/lib/query";
+import { adoptIdentity, purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import { OTHER_USER_ID, usageDto } from "./fixtures";
 import { freshUploader, installServer, json, settle, smallFile, type Server } from "./helpers";
@@ -203,12 +203,21 @@ describe("the mark of the user's action", () => {
       call.path === "/api/account/usage" ? new Promise<Response>((resolve) => (answer = resolve)) : undefined;
     const adding = addFiles([{ file: smallFile("a.txt") }], null);
     await settle();
-    // Not awaited: the shell has moved its epoch on and is still cancelling its queries.
+    // The shell has moved its epoch on and is still cancelling its queries: this feature's own
+    // purger has not run yet. Held open here for as long as the test needs.
+    let finish!: () => void;
+    const cancelling = vi
+      .spyOn(queryClient, "cancelQueries")
+      .mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
     const purging = purgeUserState();
     answer(json(usageDto()));
     await adding;
+    await settle();
     expect(server.inits).toEqual([]);
+    expect(items()).toEqual([]);
     expect(said()).toEqual([]);
+    cancelling.mockRestore();
+    finish();
     await purging;
     await settle();
     expect(server.inits).toEqual([]);

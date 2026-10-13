@@ -25,7 +25,7 @@ import { UploadsPage } from "../../../../src/client/features/upload/UploadsPage"
 import { ApiError } from "../../../../src/client/lib/api";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { renderRoutes, renderShell, setupShell } from "../shell/helpers";
-import { EXISTING_ID, FOLDER_ID, folderDto, rowId } from "./fixtures";
+import { EXISTING_ID, FOLDER_ID, folderDto, nodeDto, rowId } from "./fixtures";
 import {
   bigFile,
   envelope,
@@ -482,17 +482,31 @@ describe("the scan loop's bound and the queue's length", () => {
     );
   });
 
-  it("when the frame goes, the scan is not asked about either; it goes on when the frame is back", async () => {
+  it("when the frame goes, the scan is not asked about either — also for a file that lands meanwhile; it goes on when the frame is back", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
+    let land!: () => void;
     const view = renderShell(<UploadDropOverlay />);
     await act(() => addFiles([{ file: smallFile("a.txt") }], null));
     await act(() => settle(0));
+    // A second file whose complete is on its way when the frame goes: it still lands.
+    const landing = server.completes.length;
+    server.onComplete = (_body, nth) =>
+      nth === landing + 1
+        ? new Promise<Response>((resolve) => {
+            land = () => resolve(json(nodeDto({ id: rowId(0x9100), name: "b.txt", scanStatus: "pending" })));
+          })
+        : undefined;
+    await act(() => addFiles([{ file: smallFile("b.txt") }], null));
+    await act(() => settle(0));
     view.unmount();
+    land();
+    await settle(0);
+    expect(items().map((item) => item.state)).toEqual(["scanning", "scanning"]);
     await settle(60_000);
     expect(polls().length).toBe(0);
     renderShell(<UploadDropOverlay />);
-    await act(() => settle(2_000));
+    await act(() => settle(3_000));
     expect(polls().length).toBeGreaterThan(0);
   });
 });
