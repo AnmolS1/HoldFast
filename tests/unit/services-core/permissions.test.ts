@@ -1,0 +1,341 @@
+// The permission matrix: owner, editor, viewer, nobody and a public link — against each question
+// a route asks. Run inside real requests.
+import { eq } from "drizzle-orm";
+import { describe, expect, it } from "vitest";
+import { statementsSent } from "../../../src/worker/db/client";
+import { nodes, shares, user as userTable } from "../../../src/worker/db/schema";
+import {
+  assertContentAccess,
+  assertNotTrashed,
+  getAccess,
+  requireRole,
+  requireUpload,
+  withLinkScope,
+  type Role,
+} from "../../../src/worker/services/permissions";
+import { db } from "../../../src/worker/services/request-context";
+import { makeFile, makeFolder, makeShare, makeUser, testDb } from "./helpers";
+import { invoke, value, type Caller } from "./request";
+
+/**
+ * owner's tree:   shared/            ← shared with the editors and the viewer
+ *                   inner/
+ *                     file.txt
+ *                 private/           ← shared with nobody
+ *                   secret.txt
+ */
+async function tree() {
+  const owner = await makeUser();
+  const editor = await makeUser();
+  const editorNoUpload = await makeUser();
+  const viewer = await makeUser();
+  const stranger = await makeUser();
+  const shared = await makeFolder(owner.id);
+  const inner = await makeFolder(owner.id, shared.id);
+  const file = await makeFile(owner.id, inner.id, { scanStatus: "clean" });
+  const privateFolder = await makeFolder(owner.id);
+  const secret = await makeFile(owner.id, privateFolder.id, { scanStatus: "clean" });
+  await makeShare(shared.id, owner.id, editor.id, { role: "editor", canUpload: true });
+  await makeShare(shared.id, owner.id, editorNoUpload.id, { role: "editor", canUpload: false });
+  await makeShare(shared.id, owner.id, viewer.id, { role: "viewer" });
+  const as = (row: typeof owner): Caller => ({ user: row });
+  return {
+    owner: as(owner),
+    editor: as(editor),
+    editorNoUpload: as(editorNoUpload),
+    viewer: as(viewer),
+    stranger: as(stranger),
+    ids: { owner: owner.id, viewer: viewer.id },
+    shared,
+    inner,
+    file,
+    privateFolder,
+    secret,
+  };
+}
+
+const outcome = async (caller: Caller, work: Parameters<typeof invoke>[1]) => {
+  const invoked = await invoke(caller, work);
+  return invoked.ok ? "ok" : `${invoked.status} ${invoked.error}`;
+};
+
+describe("getAccess", () => {
+  it("answers the role, where it comes from and whether uploads are allowed", async () => {
+    const t = await tree();
+    for (const node of [t.shared, t.inner, t.file]) {
+      expect(await value(t.owner, (c) => getAccess(c, node.id))).toEqual({
+        role: "owner",
+        shareRootId: null,
+        canUpload: true,
+        via: "owner",
+      });
+      // A share on a folder reaches everything under it.
+      expect(await value(t.editor, (c) => getAccess(c, node.id))).toEqual({
+        role: "editor",
+        shareRootId: t.shared.id,
+        canUpload: true,
+        via: "share",
+      });
+      expect(await value(t.editorNoUpload, (c) => getAccess(c, node.id))).toEqual({
+        role: "editor",
+        shareRootId: t.shared.id,
+        canUpload: false,
+        via: "share",
+      });
+      expect(await value(t.viewer, (c) => getAccess(c, node.id))).toEqual({
+        role: "viewer",
+        shareRootId: t.shared.id,
+        canUpload: false,
+        via: "share",
+      });
+      expect(await value(t.stranger, (c) => getAccess(c, node.id))).toBeNull();
+      expect(await value(null, (c) => getAccess(c, node.id))).toBeNull();
+    }
+    // Nothing leaks sideways: the share is on `shared`, not on the owner's other folders.
+    for (const caller of [t.editor, t.viewer, t.stranger]) {
+      expect(await value(caller, (c) => getAccess(c, t.privateFolder.id))).toBeNull();
+      expect(await value(caller, (c) => getAccess(c, t.secret.id))).toBeNull();
+    }
+    for (const id of [crypto.randomUUID(), "not-an-id", ""]) {
+      expect(await value(t.owner, (c) => getAccess(c, id))).toBeNull();
+    }
+  });
+
+  it("a share that is not activated grants nothing; an inactive owner's shares grant nothing", async () => {
+    const t = await tree();
+    await testDb()
+      .update(shares)
+      .set({ activatedAt: null, granteeUserId: null })
+      .where(eq(shares.granteeUserId, t.ids.viewer));
+    expect(await value(t.viewer, (c) => getAccess(c, t.file.id))).toBeNull();
+
+    // The control: the editor's share still works — until the owner is suspended.
+    expect((await value(t.editor, (c) => getAccess(c, t.file.id)))?.role).toBe("editor");
+    await testDb().update(userTable).set({ suspendedAt: new Date() }).where(eq(userTable.id, t.ids.owner));
+    expect(await value(t.editor, (c) => getAccess(c, t.file.id))).toBeNull();
+  });
+
+  it("is cached for the request: the second answer for a node costs no statement", async () => {
+    const t = await tree();
+    const counts = await value(t.viewer, async (c) => {
+      const sent = () => statementsSent(db(c));
+      const start = sent();
+      const first = await getAccess(c, t.file.id);
+      const afterFirst = sent();
+      const second = await getAccess(c, t.file.id);
+      const afterSecond = sent();
+      const missing = await getAccess(c, t.secret.id);
+      const afterMiss = sent();
+      const missingAgain = await getAccess(c, t.secret.id);
+      return {
+        same: first === second,
+        firstCost: afterFirst - start,
+        secondCost: afterSecond - afterFirst,
+        missCost: afterMiss - afterSecond,
+        secondMissCost: sent() - afterMiss,
+        missing,
+        missingAgain,
+      };
+    });
+    expect(counts.same).toBe(true);
+    // The control: the first answer for each node does cost statements.
+    expect(counts.firstCost).toBeGreaterThan(0);
+    expect(counts.missCost).toBeGreaterThan(0);
+    expect(counts.secondCost).toBe(0);
+    expect(counts.secondMissCost, "a cached 'no access' is not asked again either").toBe(0);
+    expect(counts.missing).toBeNull();
+    expect(counts.missingAgain).toBeNull();
+  });
+});
+
+describe("requireRole", () => {
+  it("the matrix: nobody → 404, too low → 403, enough → the access", async () => {
+    const t = await tree();
+    const expected: Record<string, Record<Role, string>> = {
+      owner: { viewer: "ok", editor: "ok", owner: "ok" },
+      editor: { viewer: "ok", editor: "ok", owner: "403 forbidden" },
+      editorNoUpload: { viewer: "ok", editor: "ok", owner: "403 forbidden" },
+      viewer: { viewer: "ok", editor: "403 forbidden", owner: "403 forbidden" },
+      stranger: { viewer: "404 not_found", editor: "404 not_found", owner: "404 not_found" },
+      signedOut: { viewer: "404 not_found", editor: "404 not_found", owner: "404 not_found" },
+    };
+    const callers: Record<string, Caller> = {
+      owner: t.owner,
+      editor: t.editor,
+      editorNoUpload: t.editorNoUpload,
+      viewer: t.viewer,
+      stranger: t.stranger,
+      signedOut: null,
+    };
+    for (const [name, caller] of Object.entries(callers)) {
+      for (const min of ["viewer", "editor", "owner"] as const) {
+        expect(await outcome(caller, (c) => requireRole(c, t.file.id, min)), `${name} needs ${min}`).toBe(
+          expected[name]![min],
+        );
+      }
+    }
+    expect(await value(t.editor, (c) => requireRole(c, t.file.id, "editor"))).toMatchObject({
+      role: "editor",
+      via: "share",
+    });
+  });
+
+  it("no existence oracle: an unknown id and a node of someone else's answer identically", async () => {
+    const t = await tree();
+    const unknown = await invoke(t.stranger, (c) => requireRole(c, crypto.randomUUID(), "viewer"));
+    const foreign = await invoke(t.stranger, (c) => requireRole(c, t.secret.id, "viewer"));
+    const malformed = await invoke(t.stranger, (c) => requireRole(c, "not-an-id", "owner"));
+    for (const answer of [unknown, foreign, malformed]) {
+      expect(answer).toMatchObject({ ok: false, status: 404, error: "not_found", message: "Not found." });
+      expect("details" in answer ? answer.details : undefined).toBeUndefined();
+    }
+    // 403 only to someone who can already see the node.
+    expect(await invoke(t.viewer, (c) => requireRole(c, t.file.id, "owner"))).toMatchObject({
+      status: 403,
+      error: "forbidden",
+      details: { reason: "role" },
+    });
+  });
+});
+
+describe("requireUpload", () => {
+  it("the owner and an editor with the toggle may; an editor without it and a viewer may not; nobody else sees it", async () => {
+    const t = await tree();
+    for (const parent of [t.shared, t.inner]) {
+      expect(await outcome(t.owner, (c) => requireUpload(c, parent.id))).toBe("ok");
+      expect(await outcome(t.editor, (c) => requireUpload(c, parent.id))).toBe("ok");
+      expect(await invoke(t.editorNoUpload, (c) => requireUpload(c, parent.id))).toMatchObject({
+        status: 403,
+        error: "forbidden",
+        details: { reason: "upload_not_allowed" },
+      });
+      // A viewer is refused for the ROLE, before the upload toggle is even looked at.
+      expect(await invoke(t.viewer, (c) => requireUpload(c, parent.id))).toMatchObject({
+        status: 403,
+        error: "forbidden",
+        details: { reason: "role" },
+      });
+      expect(await outcome(t.stranger, (c) => requireUpload(c, parent.id))).toBe("404 not_found");
+      expect(await outcome(null, (c) => requireUpload(c, parent.id))).toBe("404 not_found");
+    }
+    expect(await outcome(t.editor, (c) => requireUpload(c, t.privateFolder.id))).toBe("404 not_found");
+    expect(await value(t.editor, (c) => requireUpload(c, t.inner.id))).toMatchObject({
+      role: "editor",
+      canUpload: true,
+      via: "share",
+    });
+  });
+
+  it("the caller's own root (no parent) is theirs; not a signed-out caller's", async () => {
+    const t = await tree();
+    expect(await value(t.viewer, (c) => requireUpload(c, null))).toEqual({
+      role: "owner",
+      shareRootId: null,
+      canUpload: true,
+      via: "owner",
+    });
+    expect(await outcome(null, (c) => requireUpload(c, null))).toBe("404 not_found");
+  });
+});
+
+describe("link scope", () => {
+  it("is viewer for the link's root and its descendants, and nothing for any other node", async () => {
+    const t = await tree();
+    const scope = { linkId: crypto.randomUUID(), rootNodeId: t.shared.id };
+    const linkAccess = { role: "viewer", shareRootId: t.shared.id, canUpload: false, via: "link" };
+    // A stranger, a signed-out visitor — and the OWNER — all get exactly the link's access.
+    for (const caller of [null, t.stranger, t.owner, t.editor]) {
+      const seen = await value(caller, async (c) => {
+        withLinkScope(c, scope);
+        return {
+          root: await getAccess(c, t.shared.id),
+          inner: await getAccess(c, t.inner.id),
+          file: await getAccess(c, t.file.id),
+          outside: await getAccess(c, t.secret.id),
+          outsideFolder: await getAccess(c, t.privateFolder.id),
+          unknown: await getAccess(c, crypto.randomUUID()),
+        };
+      });
+      expect(seen).toEqual({
+        root: linkAccess,
+        inner: linkAccess,
+        file: linkAccess,
+        outside: null,
+        outsideFolder: null,
+        unknown: null,
+      });
+    }
+  });
+
+  it("a link on a file reaches that file only, not its folder or its siblings", async () => {
+    const t = await tree();
+    const sibling = await makeFile(t.ids.owner, t.inner.id, { scanStatus: "clean" });
+    const seen = await value(null, async (c) => {
+      withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t.file.id });
+      return [await getAccess(c, t.file.id), await getAccess(c, t.inner.id), await getAccess(c, sibling.id)];
+    });
+    expect(seen.map((access) => access?.via ?? null)).toEqual(["link", null, null]);
+  });
+
+  it("requireRole and requireUpload under a link: viewer passes, more is 403, outside is 404", async () => {
+    const t = await tree();
+    const scoped = (work: Parameters<typeof invoke>[1]) =>
+      outcome(t.owner, async (c) => {
+        withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t.shared.id });
+        return work(c);
+      });
+    expect(await scoped((c) => requireRole(c, t.file.id, "viewer"))).toBe("ok");
+    expect(await scoped((c) => requireRole(c, t.file.id, "editor"))).toBe("403 forbidden");
+    expect(await scoped((c) => requireRole(c, t.file.id, "owner"))).toBe("403 forbidden");
+    expect(await scoped((c) => requireUpload(c, t.inner.id))).toBe("403 forbidden");
+    expect(await scoped((c) => requireUpload(c, null))).toBe("404 not_found");
+    expect(await scoped((c) => requireRole(c, t.secret.id, "viewer"))).toBe("404 not_found");
+  });
+
+  it("setting the scope drops answers that were given for the session", async () => {
+    const t = await tree();
+    const seen = await value(t.owner, async (c) => {
+      const before = await getAccess(c, t.secret.id);
+      withLinkScope(c, { linkId: crypto.randomUUID(), rootNodeId: t.shared.id });
+      return { before: before?.via, after: await getAccess(c, t.secret.id) };
+    });
+    expect(seen).toEqual({ before: "owner", after: null });
+  });
+});
+
+describe("assertNotTrashed", () => {
+  it("is a 404 for a trashed node, for anything under a trashed folder and for an unknown id", async () => {
+    const t = await tree();
+    expect(await outcome(t.owner, (c) => assertNotTrashed(c, t.file.id))).toBe("ok");
+    await testDb()
+      .update(nodes)
+      .set({ deletedAt: new Date(), trashedRoot: true })
+      .where(eq(nodes.id, t.shared.id));
+    for (const node of [t.shared, t.inner, t.file]) {
+      expect(await outcome(t.owner, (c) => assertNotTrashed(c, node.id))).toBe("404 not_found");
+    }
+    expect(await outcome(t.owner, (c) => assertNotTrashed(c, t.secret.id))).toBe("ok");
+    expect(await outcome(t.owner, (c) => assertNotTrashed(c, crypto.randomUUID()))).toBe("404 not_found");
+  });
+});
+
+describe("assertContentAccess", () => {
+  it("throws 403 for an impersonated session and passes for the user's own", async () => {
+    const t = await tree();
+    const work = async (c: Parameters<typeof assertContentAccess>[0]) => {
+      assertContentAccess(c);
+      return "minted";
+    };
+    expect(await value(t.owner, work)).toBe("minted");
+    expect(await value(null, work)).toBe("minted");
+    const impersonated: Caller = { user: t.owner!.user, impersonatedBy: "a".repeat(32) };
+    expect(await invoke(impersonated, work)).toMatchObject({
+      ok: false,
+      status: 403,
+      error: "forbidden",
+      details: { reason: "impersonation_read_only" },
+    });
+    // The role itself is untouched: an impersonating admin sees what the user sees, and mints nothing.
+    expect((await value(impersonated, (c) => getAccess(c, t.file.id)))?.role).toBe("owner");
+  });
+});
