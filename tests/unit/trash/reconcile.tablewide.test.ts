@@ -9,7 +9,7 @@
 // tested by telling the sweep what time it is (`now`, the one comparison it reaches): 47 hours
 // from now everything planted is still young, 49 hours from now it is old.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
@@ -137,7 +137,13 @@ describe("reconcile: the quota half", () => {
     expect(await usedBytes(owner.id)).toBe(1200);
     const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
     // Either it reached the last account (and starts over), or it stopped at one past this one.
-    expect(cursor.user === null || cursor.user >= owner.id).toBe(true);
+    // "Past" as the DATABASE orders ids (its collation, which the walk follows) — not as JS does.
+    if (cursor.user !== null) {
+      const order = await testDb().execute<{ past: boolean }>(
+        sql`SELECT (${cursor.user}::text >= ${owner.id}::text) AS past`,
+      );
+      expect(order.rows[0]!.past).toBe(true);
+    }
     expect(cursor.area).toBeLessThan(ORPHAN_AREAS.length);
   });
 
