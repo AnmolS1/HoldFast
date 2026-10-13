@@ -46,7 +46,9 @@ function Row({ item, onGone }: { item: UploadItem; onGone(): void }) {
     item.state === "error" || item.state === "refused" || flagged || waitsForFile || item.state === "done";
   const cancellable =
     pausable || item.state === "conflict" || (item.state === "paused" && item.file !== null);
-  const tone = item.state === "error" || item.state === "refused" ? hf.danger : hf.textSecondary;
+  // Red means blocked, and nothing else (a refusal is one); an upload that did not finish is
+  // said in the ordinary text colour.
+  const tone = item.state === "refused" ? hf.danger : item.state === "error" ? hf.text : hf.textSecondary;
 
   return (
     <Box
