@@ -160,6 +160,7 @@ function draftsWith(value: string): Record<TemplateName, ReturnType<(typeof temp
     quarantineNotice: templates.quarantineNotice({ name: value, fileName: value }),
     uploadNotIntact: templates.uploadNotIntact({ name: value, fileName: value }),
     linkPaused: templates.linkPaused({ name: value, itemName: value }),
+    linkCapReached: templates.linkCapReached({ name: value }),
     linkAvailableAgain: templates.linkAvailableAgain({ name: value, itemName: value }),
     adminDigest: templates.adminDigest({ lines: [{ label: value, value }], adminUrl: `${APP}/admin` }),
     reportReviewed: templates.reportReviewed(),

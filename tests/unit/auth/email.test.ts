@@ -132,6 +132,7 @@ function draftsWith(value: string) {
     quarantineNotice: templates.quarantineNotice({ name: value, fileName: value }),
     uploadNotIntact: templates.uploadNotIntact({ name: value, fileName: value }),
     linkPaused: templates.linkPaused({ name: value, itemName: value }),
+    linkCapReached: templates.linkCapReached({ name: value }),
     linkAvailableAgain: templates.linkAvailableAgain({ name: value, itemName: value }),
     adminDigest: templates.adminDigest({ lines: [{ label: value, value }], adminUrl: `${APP}/admin` }),
     adminAlert: templates.adminAlert({
@@ -198,6 +199,7 @@ describe("templates", () => {
         "quarantineNotice",
         "uploadNotIntact",
         "linkPaused",
+        "linkCapReached",
         "linkAvailableAgain",
         "adminDigest",
         "adminAlert",
@@ -213,6 +215,12 @@ describe("templates", () => {
       Object.keys(draftsWith("x")).map((key) => key.replace(/(Resend|NoAccount|Csam)$/, "")),
     );
     expect([...covered].sort()).toEqual(names);
+  });
+
+  it("the owner-cap mail never says a link was paused — nothing is, and nothing has to be resumed", () => {
+    const message = render(renderEnv, templates.linkCapReached({ name: "Ada" }));
+    expect(`${message.subject}\n${message.text}\n${message.html}`).not.toMatch(/paus|resum/i);
+    expect(message.text).toContain("midnight UTC");
   });
 
   it.each(HOSTILE.map((value, index) => [index, value] as const))(

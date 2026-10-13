@@ -636,6 +636,19 @@ export const templates = {
       },
     ],
   }),
+  // Not a pause: the owner's daily transfer cap over all their links. Nothing is paused and nothing
+  // has to be resumed — the day rolling over ends it — so this must never say "paused".
+  linkCapReached: (d: { name?: unknown }): Draft => ({
+    subject: "Your public links reached today's transfer limit",
+    heading: "Your public links reached today's transfer limit",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: "Downloads through your public links reached today's transfer limit, so the links are unavailable until midnight UTC. They come back on their own; there is nothing you need to do.",
+      },
+      { text: "Your own downloads are not affected." },
+    ],
+  }),
   linkAvailableAgain: (d: { name?: unknown; itemName: unknown }): Draft => ({
     subject: "A public link is available again",
     heading: "A public link is available again",
@@ -795,6 +808,7 @@ export const KINDS = {
   quarantineNotice: { class: "transactional_user", severity: "routine", bucket: "product" },
   uploadNotIntact: { class: "transactional_user", severity: "routine", bucket: "product" },
   linkPaused: { class: "transactional_user", severity: "routine", bucket: "product" },
+  linkCapReached: { class: "transactional_user", severity: "routine", bucket: "product" },
   linkAvailableAgain: { class: "transactional_user", severity: "routine", bucket: "product" },
   adminDigest: { class: "transactional_user", severity: "routine", bucket: "product" },
   reportReviewed: { class: "transactional_user", severity: "routine", bucket: "product" },
@@ -1436,6 +1450,8 @@ export const sendUploadNotIntact = (deps: ServiceDeps, d: To & { fileName: strin
   deliver(deps, "uploadNotIntact", d.to, () => templates.uploadNotIntact(d), SYSTEM);
 export const sendLinkPaused = (deps: ServiceDeps, d: To & { itemName: string }) =>
   deliver(deps, "linkPaused", d.to, () => templates.linkPaused(d), SYSTEM);
+export const sendLinkCapReached = (deps: ServiceDeps, d: To) =>
+  deliver(deps, "linkCapReached", d.to, () => templates.linkCapReached(d), SYSTEM);
 export const sendLinkAvailableAgain = (deps: ServiceDeps, d: To & { itemName: string }) =>
   deliver(deps, "linkAvailableAgain", d.to, () => templates.linkAvailableAgain(d), SYSTEM);
 export const sendAdminDigest = (
