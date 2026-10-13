@@ -23,7 +23,7 @@
 // Exclusions are the listings' own: system nodes, and anything in the trash or taken down —
 // directly or by ancestry (a file inside a taken-down folder is not found) — for the owner as well.
 
-import { inArray, sql, type SQL } from "drizzle-orm";
+import { and, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { MIME_CATEGORIES } from "../../../shared/constants";
 import type { Executor } from "../client";
 import { decodeCursor, encodeCursor } from "../cursor";
@@ -120,6 +120,10 @@ const statusList = (statuses: readonly ScanStatus[]): SQL =>
     statuses.map((s) => sql`${s}::scan_status`),
     sql`, `,
   );
+
+/** `column IN (statuses)` — false for an empty list, which is not valid SQL as a list. */
+const stillVisible = (column: SQL, statuses: readonly ScanStatus[]): SQL =>
+  statuses.length === 0 ? sql`false` : sql`${column} IN (${statusList(statuses)})`;
 
 /** The filters and ranking both sides share, over a `nodes` row aliased `n`. */
 function matchAndRank(
@@ -298,13 +302,26 @@ export async function searchNames(
 
   const window = ranked.slice(offset, offset + limit);
   if (window.length === 0) return { items: [], nextCursor: null };
+  // The rows of the window, in a statement of its own — so WITH THE SAME EXCLUSIONS as the
+  // ranked reads: between the two a row can be taken down, locked, trashed, or change its scan
+  // status, and what is read here is what leaves. A row that no longer passes is dropped from
+  // the page (a short page, not an error and not a row its reader may not see): each side by
+  // its own status list, like the ranked reads. (Whether a shared row is STILL shared is not
+  // asked again: a share withdrawn between the two statements is a search that came first.)
   const rows = await db
     .select()
     .from(nodes)
     .where(
-      inArray(
-        nodes.id,
-        window.map((r) => r.id),
+      and(
+        inArray(
+          nodes.id,
+          window.map((r) => r.id),
+        ),
+        isNull(nodes.system),
+        notEffectivelyTrashedOrHidden(),
+        sql`CASE WHEN ${nodes.ownerId} = ${userId}
+              THEN ${stillVisible(sql`${nodes.scanStatus}`, mineStatuses)}
+              ELSE ${stillVisible(sql`${nodes.scanStatus}`, sharedStatuses)} END`,
       ),
     );
   const byId = new Map(rows.map((row) => [row.id, row]));
