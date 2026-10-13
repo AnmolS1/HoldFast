@@ -317,9 +317,9 @@ describe("enqueueScan", () => {
 });
 
 describe("enqueueRescan", () => {
-  it("resets an unlocked file to pending and sends a forced message", async () => {
+  it("any other status: back to pending, a forced message, { queued: true }", async () => {
     const owner = await makeUser();
-    for (const status of ["clean", "infected", "skipped", "error"] as const) {
+    for (const status of ["clean", "infected", "skipped", "error", "pending"] as const) {
       const file = await makeFile(owner.id, null, {
         scanStatus: status,
         scannedAt: new Date(),
@@ -327,7 +327,7 @@ describe("enqueueRescan", () => {
         mimeSniffed: "image/png",
       });
       const { deps, sent, settle } = recordingDeps();
-      await enqueueRescan(deps, file.id, { by: "owner" });
+      expect(await enqueueRescan(deps, file.id, { by: "owner" }), status).toEqual({ queued: true });
       await settle();
       const after = await nodeById(file.id);
       expect(after, status).toMatchObject({ scanStatus: "pending", scannedAt: null, scanDetail: null });
@@ -342,39 +342,55 @@ describe("enqueueRescan", () => {
     expect(sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: false }]);
   });
 
-  it("leaves under_review, suspected_csam and a taken-down file exactly as they are, and sends nothing", async () => {
+  it("taken down, whatever the status: nothing changes, nothing is sent, { queued: false, reason: 'taken_down' }", async () => {
     const owner = await makeUser();
-    const locked = [
-      await makeFile(owner.id, null, {
-        scanStatus: "under_review",
-        scanStatusPrev: "clean",
-        scannedAt: new Date(),
-      }),
-      await makeFile(owner.id, null, {
-        scanStatus: "suspected_csam",
-        legalHold: true,
-        scannedAt: new Date(),
-      }),
-      await makeFile(owner.id, null, {
-        scanStatus: "clean",
-        scannedAt: new Date(),
-        takedownAt: new Date(),
-        takedownReason: "dmca",
-      }),
-      await makeFile(owner.id, null, {
-        scanStatus: "infected",
-        takedownAt: new Date(),
-        takedownReason: "abuse",
-      }),
-    ];
-    for (const before of locked) {
+    const down = { takedownAt: new Date(), takedownReason: "dmca" as const, scannedAt: new Date() };
+    for (const status of ["clean", "infected", "pending", "under_review", "suspected_csam"] as const) {
+      const before = await makeFile(owner.id, null, { scanStatus: status, ...down });
       const { deps, sent, settle } = recordingDeps();
-      await enqueueRescan(deps, before.id, { by: "admin", force: true });
+      expect(await enqueueRescan(deps, before.id, { by: "admin", force: true }), status).toEqual({
+        queued: false,
+        reason: "taken_down",
+      });
       await settle();
-      expect(await nodeById(before.id), before.scanStatus).toEqual(before);
-      expect(sent, before.scanStatus).toEqual([]);
+      expect(await nodeById(before.id), status).toEqual(before);
+      expect(sent, status).toEqual([]);
       expect(await auditRows({ action: "scan.rescan_requested", targetId: before.id })).toEqual([]);
     }
+  });
+
+  it("suspected_csam: nothing changes, nothing is sent, { queued: false, reason: 'locked' }", async () => {
+    const owner = await makeUser();
+    const before = await makeFile(owner.id, null, {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+      scannedAt: new Date(),
+    });
+    const { deps, sent, settle } = recordingDeps();
+    expect(await enqueueRescan(deps, before.id, { by: "admin", force: true })).toEqual({
+      queued: false,
+      reason: "locked",
+    });
+    await settle();
+    expect(await nodeById(before.id)).toEqual(before);
+    expect(sent).toEqual([]);
+    expect(await auditRows({ action: "scan.rescan_requested", targetId: before.id })).toEqual([]);
+  });
+
+  it("under_review: every column kept, and a message IS sent, { queued: true }", async () => {
+    const owner = await makeUser();
+    const before = await makeFile(owner.id, null, {
+      scanStatus: "under_review",
+      scanStatusPrev: "clean",
+      scannedAt: new Date(),
+      scanDetail: { engine: "stub" },
+    });
+    const { deps, sent, settle } = recordingDeps();
+    expect(await enqueueRescan(deps, before.id, { by: "admin" })).toEqual({ queued: true });
+    await settle();
+    expect(await nodeById(before.id)).toEqual(before);
+    expect(sent).toEqual([{ v: 1, nodeId: before.id, key: before.r2Key, force: true }]);
+    expect(await auditRows({ action: "scan.rescan_requested", targetId: before.id })).toHaveLength(1);
   });
 
   it("a takedown that lands while the rescan runs is seen: verdict kept, not pending, nothing sent", async () => {
@@ -402,8 +418,9 @@ describe("enqueueRescan", () => {
     });
     await lockHeld.opened;
     const rescan = enqueueRescan(deps, file.id, { by: "owner" });
-    await Promise.all([takedown, rescan]);
+    const [, result] = await Promise.all([takedown, rescan]);
     await settle();
+    expect(result).toEqual({ queued: false, reason: "taken_down" });
 
     const after = await nodeById(file.id);
     expect(after!.takedownAt).toBeInstanceOf(Date);

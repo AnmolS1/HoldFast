@@ -201,17 +201,25 @@ export async function enqueueScan(
   await deps.env.SCAN_QUEUE.send(message);
 }
 
+export type RescanResult = { queued: boolean; reason?: "taken_down" | "locked" };
+
 /**
- * Rescan: the node goes back to `pending` and a message is sent — with `force` unless the caller
- * says otherwise, because the finished job of the earlier scan is only taken over by a forced
- * claim.
+ * Rescan. What happens depends on the node's state — read from its LOCKED row, in the
+ * transaction that resets it, so a takedown that lands while this runs is either seen (nothing
+ * happens) or comes after the reset has committed:
  *
- * A node that is `under_review`, `suspected_csam` or taken down KEEPS ITS STATUS — and its
- * verdict — and nothing is sent: a rescan must never be a way to launder a locked file back to
- * `pending` and then `clean`. That is decided on the node's LOCKED row, in the transaction that
- * resets it: a takedown that lands while this runs is either seen (nothing happens) or comes
- * after the reset has committed. The message and the audit row follow the commit, and only when
- * the reset happened.
+ *   taken down, whatever its status   nothing: status and verdict kept      { queued: false, reason: "taken_down" }
+ *   `suspected_csam`                  nothing: status and verdict kept      { queued: false, reason: "locked" }
+ *   `under_review`                    status KEPT, a message is sent        { queued: true }
+ *   any other status                  back to `pending`, a message is sent  { queued: true }
+ *
+ * A rescan must never be a way to launder a locked file back to `pending` and then `clean`. For
+ * an `under_review` file the scan still runs — the real pipeline records its outcome as the status
+ * a dismissed review restores; the stub consumer writes nothing for it.
+ *
+ * The message carries `force` unless the caller says otherwise, because the finished job of the
+ * earlier scan is only taken over by a forced claim. The message and the audit row follow the
+ * commit, and only when something was queued.
  *
  * `404 not_found` for an id that is not a file. The one-per-hour owner throttle is the route's.
  */
@@ -219,30 +227,37 @@ export async function enqueueRescan(
   deps: ServiceDeps,
   nodeId: string,
   opts: { force?: boolean; by: "owner" | "admin" },
-): Promise<void> {
+): Promise<RescanResult> {
   const seen = await getNode(deps.db, nodeId);
   if (!seen || seen.kind !== "file" || !seen.r2Key) throw new AppError("not_found");
 
-  const key = await deps.db.transaction(async (tx) => {
+  type Decision = { key: string } | { reason: "taken_down" | "locked" } | null;
+  const decision = await deps.db.transaction(async (tx): Promise<Decision> => {
     // The row is locked through its object key. A replace that landed since the read above gave
     // the node a new key: then the node is read again and locked through that one.
     let r2Key: string | null = seen.r2Key;
     for (let attempt = 0; attempt < 3 && r2Key; attempt++) {
       const locked = await findByR2Key(tx, r2Key, { forUpdate: true });
       if (locked?.id === nodeId) {
-        if (locked.kind !== "file" || locked.takedownAt !== null) return null;
-        // False for `under_review` and `suspected_csam` (the guard is in the statement itself).
-        return (await resetToPending(tx, nodeId)) ? r2Key : null;
+        if (locked.kind !== "file") return null;
+        if (locked.takedownAt !== null) return { reason: "taken_down" };
+        if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
+        if (locked.scanStatus === "under_review") return { key: r2Key };
+        // The statement has the same guard: it changes nothing for the two locked statuses.
+        return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
       }
       r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
     }
     return null;
   });
-  if (key === null) return;
+  // Gone, or replaced faster than it could be locked: there is no such file to rescan.
+  if (decision === null) throw new AppError("not_found");
+  if ("reason" in decision) return { queued: false, reason: decision.reason };
 
   const force = opts.force ?? true;
-  await enqueueScan(deps, { nodeId, key, force });
+  await enqueueScan(deps, { nodeId, key: decision.key, force });
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by, force });
+  return { queued: true };
 }
 
 // ── suspected CSAM ──────────────────────────────────────────────────────────────────────────
