@@ -14,6 +14,7 @@ import { notEffectivelyHidden } from "./tree";
 type ReportCategory = (typeof reports.category.enumValues)[number];
 type ReportSource = (typeof reports.source.enumValues)[number];
 type TakedownReason = NonNullable<typeof nodes.$inferSelect.takedownReason>;
+type BlocklistReason = (typeof hashBlocklist.reason.enumValues)[number];
 
 /** A notice in one of these states still protects its nodes from purge. */
 export const OPEN_NOTICE_STATUSES = ["received", "incomplete", "actioned", "counter_received"] as const;
@@ -298,16 +299,20 @@ async function lockRows(
   await pauseLinks(sp, { nodeId }, "moderation");
   await sp.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
   if (node.sha256 !== null) {
-    // NOT `blocklist.upsert`, which rewrites the whole entry: a hash that was already listed —
-    // by an admin, by an earlier verdict — keeps its source, its author and its note, and only
-    // its reason is raised to `csam` (a `csam` entry is left as it is). `sourceNodeId` is this
-    // node ONLY on an entry this lock created; that is what `clearSuspectedCsam` may remove.
+    // NOT `blocklist.upsert`, which rewrites the whole entry. One atomic statement:
+    //   - no entry: one is created, `sourceNodeId` this node — the only entry this lock OWNS;
+    //   - an entry with another reason (an admin's, an earlier verdict's): it keeps its source,
+    //     its author and its note; its reason is RAISED to `csam`, and what it was and whose
+    //     lock raised it are recorded (`raisedFrom`, `raisedByNodeId`) so that a false positive
+    //     can be undone. Only an entry that is not `csam` is ever raised, so a raise that is in
+    //     force is never recorded over;
+    //   - a `csam` entry: untouched.
     await sp
       .insert(hashBlocklist)
       .values({ sha256: node.sha256, reason: "csam", sourceNodeId: nodeId })
       .onConflictDoUpdate({
         target: hashBlocklist.sha256,
-        set: { reason: "csam" },
+        set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: nodeId },
         setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
       });
   }
@@ -336,13 +341,17 @@ export type CsamClearResult = {
    * not exist), or a `csam` report on it was FILED (`actioned`) — that is never undone here.
    */
   refused: "not_locked" | "reported" | null;
+  /** The entry a lock CREATED was deleted: the hash is no longer blocklisted. */
   blocklistRemoved: boolean;
+  /** The entry a lock RAISED to `csam` was put back to this reason: still blocklisted, as before. */
+  blocklistRestoredTo: BlocklistReason | null;
   /**
-   * Why the hash is still blocklisted after a clear: the entry is not the one this node's lock
-   * created; another node with the same hash is still locked; or a `csam` report on another node
-   * with that hash was filed. Null when the entry was removed or there is none.
+   * Why the entry was left exactly as it is: it is no lock's (an admin's, an unknown source's);
+   * another node with the same hash is still locked; a `csam` report on a node with that hash
+   * was filed; or it was this lock's and someone has changed its reason since (`edited`).
+   * Null when it was removed or restored, or there is none.
    */
-  blocklistKept: "not_this_locks" | "other_node_locked" | "reported" | null;
+  blocklistKept: "not_this_locks" | "other_node_locked" | "reported" | "edited" | null;
   /** The `csam` reports dismissed, ascending. */
   reportIds: string[];
 };
@@ -368,11 +377,14 @@ export type CsamClearResult = {
  *   - `moderation` — that reason only — is removed from the links ON the node, unless the node
  *     or an ancestor is taken down: that takedown put, or would have put, the same reason
  *     there, and its restore removes it;
- *   - the hash leaves the blocklist only when ALL of this holds: the entry is the one this
- *     node's lock CREATED (`sourceNodeId` is this node, the reason is `csam` — a row the lock
- *     found, it left as it was or only raised to `csam`); no OTHER node with the same hash is
- *     `suspected_csam`; and no `csam` report on any node with that hash was filed. Otherwise the
- *     entry stays and `blocklistKept` says why;
+ *   - the blocklist entry of the hash goes back to what it was before any lock touched it —
+ *     DELETED when a lock created it, its reason put back (`raisedFrom`) when a lock only raised
+ *     it — but only when ALL of this holds: it is a lock's doing, this node's or that of a twin
+ *     (another node with the content) that was itself cleared as a false positive; no OTHER
+ *     node with the same hash is `suspected_csam`; and no `csam` report on any node with that
+ *     hash was filed. So of two locked twins the FIRST clear leaves the entry and the SECOND
+ *     undoes it, whichever of the two created or raised it. Otherwise the entry stays exactly
+ *     as it is and `blocklistKept` says why — also when someone changed its reason in between;
  *   - every `csam` report on the node that is `open` or `reviewing` becomes `dismissed`
  *     (`resolvedAt` now, `resolution` `false_positive`; `assignedTo` as it was). Their ids are
  *     returned.
@@ -384,6 +396,7 @@ export async function clearSuspectedCsam(tx: Executor, nodeId: string): Promise<
     cleared: false,
     refused: why,
     blocklistRemoved: false,
+    blocklistRestoredTo: null,
     blocklistKept: null,
     reportIds: [],
   });
@@ -421,7 +434,7 @@ export async function clearSuspectedCsam(tx: Executor, nodeId: string): Promise<
       .where(and(eq(nodes.id, nodeId), notEffectivelyHidden()));
     if (visible) await unpauseLinks(sp, { nodeId }, "moderation");
 
-    const blocklistKept = node.sha256 === null ? null : await releaseBlocklistEntry(sp, nodeId, node.sha256);
+    const entry = node.sha256 === null ? null : await releaseBlocklistEntry(sp, nodeId, node.sha256);
 
     const dismissed = await sp
       .update(reports)
@@ -438,31 +451,50 @@ export async function clearSuspectedCsam(tx: Executor, nodeId: string): Promise<
     return {
       cleared: true,
       refused: null,
-      blocklistRemoved: node.sha256 !== null && blocklistKept === "removed",
-      blocklistKept: blocklistKept === "removed" ? null : blocklistKept,
+      blocklistRemoved: entry === "removed",
+      blocklistRestoredTo: entry !== null && typeof entry === "object" ? entry.restoredTo : null,
+      blocklistKept: typeof entry === "string" && entry !== "removed" ? entry : null,
       reportIds: dismissed.map((r) => r.id).sort(),
     };
   });
 }
 
 /**
- * Removes the hash's blocklist entry if the cleared node's lock is all that stands behind it.
- * The entry is locked first: a lock of another node with the same hash, running now, either
- * finished before (its node is seen below) or waits and then inserts its own entry.
- * `removed`, why it was kept, or null when there is no entry.
+ * Undoes what a lock did to the hash's blocklist entry, if the cleared node was the last thing
+ * standing behind it. The entry is locked first: a lock of another node with the same hash,
+ * running now, either finished before (its node is seen below) or waits and then writes its own.
+ * `removed`, `{ restoredTo }`, why it was left alone, or null when there is no entry.
  */
 async function releaseBlocklistEntry(
   sp: Executor,
   nodeId: string,
   sha256: string,
-): Promise<"removed" | "not_this_locks" | "other_node_locked" | "reported" | null> {
+): Promise<
+  | "removed"
+  | { restoredTo: BlocklistReason }
+  | "not_this_locks"
+  | "other_node_locked"
+  | "reported"
+  | "edited"
+  | null
+> {
   const [entry] = await sp
-    .select({ reason: hashBlocklist.reason, sourceNodeId: hashBlocklist.sourceNodeId })
+    .select({
+      reason: hashBlocklist.reason,
+      sourceNodeId: hashBlocklist.sourceNodeId,
+      raisedFrom: hashBlocklist.raisedFrom,
+      raisedByNodeId: hashBlocklist.raisedByNodeId,
+    })
     .from(hashBlocklist)
     .where(eq(hashBlocklist.sha256, sha256))
     .for("update");
   if (!entry) return null;
-  if (entry.reason !== "csam" || entry.sourceNodeId !== nodeId) return "not_this_locks";
+  // Whose lock made the entry `csam`: the one that raised it, or else the one that created it.
+  const lockedBy = entry.raisedFrom !== null ? entry.raisedByNodeId : entry.sourceNodeId;
+  // Not `csam` any more: no lock's entry now. If it was this lock's, somebody edited it.
+  if (entry.reason !== "csam") return lockedBy === nodeId ? "edited" : "not_this_locks";
+  if (lockedBy === null) return "not_this_locks";
+
   const [alsoLocked] = await sp
     .select({ id: nodes.id })
     .from(nodes)
@@ -478,6 +510,34 @@ async function releaseBlocklistEntry(
     .where(and(eq(nodes.sha256, sha256), eq(reports.category, "csam"), eq(reports.status, "actioned")))
     .limit(1);
   if (filed) return "reported";
+
+  // A lock's doing — this node's, or a twin's whose own clear had to leave the entry because
+  // this node was still locked then. A twin counts only on the record of its clear: a `csam`
+  // report on it dismissed as a false positive. Any other source (an admin's entry, a node that
+  // is gone, an id nobody knows) is not ours to undo.
+  if (lockedBy !== nodeId) {
+    const [clearedTwin] = await sp
+      .select({ id: reports.id })
+      .from(reports)
+      .where(
+        and(
+          eq(reports.nodeId, lockedBy),
+          eq(reports.category, "csam"),
+          eq(reports.status, "dismissed"),
+          eq(reports.resolution, CSAM_CLEARED_RESOLUTION),
+        ),
+      )
+      .limit(1);
+    if (!clearedTwin) return "not_this_locks";
+  }
+
+  if (entry.raisedFrom !== null) {
+    await sp
+      .update(hashBlocklist)
+      .set({ reason: entry.raisedFrom, raisedFrom: null, raisedByNodeId: null })
+      .where(eq(hashBlocklist.sha256, sha256));
+    return { restoredTo: entry.raisedFrom };
+  }
   await sp.delete(hashBlocklist).where(eq(hashBlocklist.sha256, sha256));
   return "removed";
 }

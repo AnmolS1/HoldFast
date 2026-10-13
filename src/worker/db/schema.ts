@@ -526,6 +526,13 @@ export const hashBlocklist = pgTable("hash_blocklist", {
   reason: blocklistReason().notNull(),
   /** The node whose verdict added the entry. No FK. */
   sourceNodeId: uuid(),
+  /**
+   * Set when a suspected-CSAM lock RAISED an entry that was already there to `csam`: the reason
+   * it had, and the node whose lock raised it (no FK) — so that clearing a false positive can
+   * put the entry back. Both null on an entry nothing raised.
+   */
+  raisedFrom: blocklistReason(),
+  raisedByNodeId: uuid(),
   addedBy: text().references(() => user.id, { onDelete: "set null" }),
   addedAt: ts().notNull().defaultNow(),
   note: text(),

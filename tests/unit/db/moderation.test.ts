@@ -409,6 +409,7 @@ describe("clearSuspectedCsam", () => {
       cleared: true,
       refused: null,
       blocklistRemoved: true,
+      blocklistRestoredTo: null,
       blocklistKept: null,
       reportIds: [reportId],
     });
@@ -441,7 +442,10 @@ describe("clearSuspectedCsam", () => {
     }
     // The control: a refused clear leaves the verdict where it is.
     const { file } = await reported("clean");
-    await db.update(nodes).set({ scanReason: "hash_mismatch", scannedAt: new Date() }).where(eq(nodes.id, file.id));
+    await db
+      .update(nodes)
+      .set({ scanReason: "hash_mismatch", scannedAt: new Date() })
+      .where(eq(nodes.id, file.id));
     await clearSuspectedCsam(db, file.id);
     expect((await getNode(db, file.id))!.scanReason).toBe("hash_mismatch");
   });
@@ -502,6 +506,7 @@ describe("clearSuspectedCsam", () => {
       cleared: false,
       refused: "reported",
       blocklistRemoved: false,
+      blocklistRestoredTo: null,
       blocklistKept: null,
       reportIds: [],
     });
@@ -521,6 +526,7 @@ describe("clearSuspectedCsam", () => {
       cleared: false,
       refused: "not_locked",
       blocklistRemoved: false,
+      blocklistRestoredTo: null,
       blocklistKept: null,
       reportIds: [],
     };
@@ -593,117 +599,217 @@ describe("clearSuspectedCsam", () => {
     expect((await getById(db, links.underFolder!))!.pauseReasons).toEqual([]);
   });
 
-  it("the lock keeps an existing blocklist entry's provenance: only the reason is raised to csam, and a clear does not remove it", async () => {
+  const entryOf = async (sha256: string) =>
+    (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha256)))[0] ?? null;
+
+  it("the lock RAISES an entry that was already there — provenance kept, what it was recorded — and the clear puts it back", async () => {
     const admin = await makeUser(db);
     for (const reason of ["malware", "dmca", "admin"] as const) {
       const { file } = await reported("clean");
       const earlierSource = uuidv7();
-      await upsert(db, {
-        sha256: file.sha256!,
-        reason,
-        sourceNodeId: earlierSource,
-        addedBy: admin,
-        note: "listed before",
-      });
-      const entry = async () =>
-        (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, file.sha256!)))[0];
+      const before = { reason, sourceNodeId: earlierSource, addedBy: admin, note: "listed before" };
+      await upsert(db, { sha256: file.sha256!, ...before });
+      const addedAt = (await entryOf(file.sha256!))!.addedAt;
 
       await lockSuspectedCsam(db, file.id, { source: "photodna" });
-      expect(await entry(), reason).toMatchObject({
+      expect(await entryOf(file.sha256!), reason).toMatchObject({
+        ...before,
         reason: "csam",
-        sourceNodeId: earlierSource,
-        addedBy: admin,
-        note: "listed before",
+        raisedFrom: reason,
+        raisedByNodeId: file.id,
       });
-      // Not this lock's row: the clear leaves the hash blocklisted, and says why.
+      // A second lock call (a redelivery) records nothing over the raise that is in force.
+      await lockSuspectedCsam(db, file.id, { source: "admin" });
+      expect(await entryOf(file.sha256!), reason).toMatchObject({
+        raisedFrom: reason,
+        raisedByNodeId: file.id,
+      });
+
       expect(await clearSuspectedCsam(db, file.id), reason).toMatchObject({
         cleared: true,
         blocklistRemoved: false,
-        blocklistKept: "not_this_locks",
+        blocklistRestoredTo: reason,
+        blocklistKept: null,
       });
-      expect(await entry(), reason).toMatchObject({ sourceNodeId: earlierSource, addedBy: admin });
+      // Exactly the entry there was: still blocklisted, for its own reason, by its own author.
+      expect(await entryOf(file.sha256!), reason).toMatchObject({
+        ...before,
+        addedAt,
+        raisedFrom: null,
+        raisedByNodeId: null,
+      });
     }
   });
 
-  it("removes the blocklist entry only when this lock created it", async () => {
+  it("removes the blocklist entry only when a lock created it; an entry that is nobody's lock's is left", async () => {
     // This lock created it.
     const mine = await locked();
-    expect(await lookup(db, mine.file.sha256!)).toEqual({ reason: "csam", sourceNodeId: mine.file.id });
+    expect(await entryOf(mine.file.sha256!)).toMatchObject({
+      reason: "csam",
+      sourceNodeId: mine.file.id,
+      raisedFrom: null,
+      raisedByNodeId: null,
+    });
     expect(await clearSuspectedCsam(db, mine.file.id)).toMatchObject({
       blocklistRemoved: true,
+      blocklistRestoredTo: null,
       blocklistKept: null,
     });
     expect(await lookup(db, mine.file.sha256!)).toBeNull();
 
-    // The lock found a `csam` row from another node, or one added by hand (no source): it wrote
-    // nothing, so the clear removes nothing.
+    // The lock found a `csam` entry with a source nobody knows, or one added by hand (no
+    // source): it wrote nothing, and the clear leaves it.
     for (const sourceNodeId of [uuidv7(), null]) {
       const { file } = await reported("clean");
       await upsert(db, { sha256: file.sha256!, reason: "csam", sourceNodeId });
       await lockSuspectedCsam(db, file.id, { source: "system" });
-      expect(await lookup(db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId });
+      expect(await entryOf(file.sha256!)).toMatchObject({ reason: "csam", sourceNodeId, raisedFrom: null });
       expect(await clearSuspectedCsam(db, file.id)).toMatchObject({
         cleared: true,
         blocklistRemoved: false,
+        blocklistRestoredTo: null,
         blocklistKept: "not_this_locks",
       });
       expect(await lookup(db, file.sha256!)).toEqual({ reason: "csam", sourceNodeId });
     }
+    // The same for a `csam` entry whose source is a real node that was never locked and cleared
+    // (an admin listed it from that node).
+    const owner = await makeUser(db);
+    const listedFrom = await makeFile(db, owner, null, `listed-${rand()}.bin`);
+    const twin = await makeFile(db, owner, null, `twin-${rand()}.bin`, { sha256: listedFrom.sha256 });
+    await upsert(db, { sha256: twin.sha256!, reason: "csam", sourceNodeId: listedFrom.id });
+    await lockSuspectedCsam(db, twin.id, { source: "system" });
+    expect(await clearSuspectedCsam(db, twin.id)).toMatchObject({ blocklistKept: "not_this_locks" });
+    expect(await lookup(db, twin.sha256!)).toEqual({ reason: "csam", sourceNodeId: listedFrom.id });
 
-    // This node's source but not the lock's reason (rewritten since): not the lock's row.
-    const rewritten = await locked();
+    // A file with no hash, and one whose entry is gone: nothing to undo, nothing kept.
+    const hashless = await makeFile(db, owner, null, `nohash-${rand()}.bin`, { sha256: null });
+    await lockSuspectedCsam(db, hashless.id, { source: "system" });
+    const nothing = {
+      cleared: true,
+      blocklistRemoved: false,
+      blocklistRestoredTo: null,
+      blocklistKept: null,
+    };
+    expect(await clearSuspectedCsam(db, hashless.id)).toMatchObject(nothing);
+    const unlisted = await locked();
+    await db.delete(hashBlocklist).where(eq(hashBlocklist.sha256, unlisted.file.sha256!));
+    expect(await clearSuspectedCsam(db, unlisted.file.id)).toMatchObject(nothing);
+  });
+
+  it("an entry somebody edited between the lock and the clear is left as they made it, and the result says so", async () => {
+    // Created by this lock, its reason changed since.
+    const created = await locked();
     await db
       .update(hashBlocklist)
       .set({ reason: "malware" })
-      .where(eq(hashBlocklist.sha256, rewritten.file.sha256!));
-    expect(await clearSuspectedCsam(db, rewritten.file.id)).toMatchObject({
+      .where(eq(hashBlocklist.sha256, created.file.sha256!));
+    expect(await clearSuspectedCsam(db, created.file.id)).toMatchObject({
       blocklistRemoved: false,
-      blocklistKept: "not_this_locks",
+      blocklistRestoredTo: null,
+      blocklistKept: "edited",
     });
-    expect(await lookup(db, rewritten.file.sha256!)).toEqual({
+    expect(await lookup(db, created.file.sha256!)).toEqual({
       reason: "malware",
-      sourceNodeId: rewritten.file.id,
+      sourceNodeId: created.file.id,
     });
 
-    // A file with no hash, and one whose entry is gone: nothing to remove, nothing kept.
-    const owner = await makeUser(db);
-    const hashless = await makeFile(db, owner, null, `nohash-${rand()}.bin`, { sha256: null });
-    await lockSuspectedCsam(db, hashless.id, { source: "system" });
-    expect(await clearSuspectedCsam(db, hashless.id)).toMatchObject({
-      cleared: true,
-      blocklistRemoved: false,
-      blocklistKept: null,
+    // Raised by this lock, then set to another reason by an admin: not put back to the old one.
+    const { file } = await reported("clean");
+    await upsert(db, { sha256: file.sha256!, reason: "malware", note: "first" });
+    await lockSuspectedCsam(db, file.id, { source: "system" });
+    await db
+      .update(hashBlocklist)
+      .set({ reason: "dmca", note: "second" })
+      .where(eq(hashBlocklist.sha256, file.sha256!));
+    expect(await clearSuspectedCsam(db, file.id)).toMatchObject({
+      blocklistRestoredTo: null,
+      blocklistKept: "edited",
     });
-    const unlisted = await locked();
-    await db.delete(hashBlocklist).where(eq(hashBlocklist.sha256, unlisted.file.sha256!));
-    expect(await clearSuspectedCsam(db, unlisted.file.id)).toMatchObject({
-      cleared: true,
-      blocklistRemoved: false,
-      blocklistKept: null,
-    });
+    expect(await entryOf(file.sha256!)).toMatchObject({ reason: "dmca", note: "second" });
+
+    // Removed and listed again by hand as `csam`: a new entry, no lock's.
+    const relisted = await locked();
+    await db.delete(hashBlocklist).where(eq(hashBlocklist.sha256, relisted.file.sha256!));
+    await upsert(db, { sha256: relisted.file.sha256!, reason: "csam", note: "by hand" });
+    expect(await clearSuspectedCsam(db, relisted.file.id)).toMatchObject({ blocklistKept: "not_this_locks" });
+    expect(await entryOf(relisted.file.sha256!)).toMatchObject({ reason: "csam", note: "by hand" });
   });
 
-  it("keeps the hash blocklisted while another node with the same content is still locked, or a csam report on one was filed", async () => {
-    const sha256 = rand(32);
+  it("two locked twins: the first clear leaves the entry, the SECOND puts it back to what it was — whichever of the two created or raised it", async () => {
     const owner = await makeUser(db);
+    const twins = async (before: "nothing" | "malware") => {
+      const sha256 = rand(32);
+      if (before === "malware") await upsert(db, { sha256, reason: "malware", note: "admin's" });
+      const first = await makeFile(db, owner, null, `first-${rand()}.bin`, { sha256 });
+      const second = await makeFile(db, owner, null, `second-${rand()}.bin`, { sha256 });
+      // `first`'s lock creates or raises the entry; `second`'s finds it `csam` and writes nothing.
+      await lockSuspectedCsam(db, first.id, { source: "photodna" });
+      const afterFirst = await entryOf(sha256);
+      await lockSuspectedCsam(db, second.id, { source: "photodna" });
+      expect(await entryOf(sha256)).toEqual(afterFirst);
+      return { sha256, first, second };
+    };
+    const kept = { blocklistRemoved: false, blocklistRestoredTo: null, blocklistKept: "other_node_locked" };
+
+    for (const order of ["maker first", "maker last"] as const) {
+      // A lock CREATED the entry: after both clears there is none.
+      const created = await twins("nothing");
+      const [one, two] =
+        order === "maker first" ? [created.first, created.second] : [created.second, created.first];
+      expect(await clearSuspectedCsam(db, one.id), order).toMatchObject(kept);
+      expect(await lookup(db, created.sha256), order).toEqual({
+        reason: "csam",
+        sourceNodeId: created.first.id,
+      });
+      expect(await clearSuspectedCsam(db, two.id), order).toMatchObject({
+        blocklistRemoved: true,
+        blocklistRestoredTo: null,
+        blocklistKept: null,
+      });
+      expect(await entryOf(created.sha256), order).toBeNull();
+
+      // A lock RAISED the entry: after both clears it is the admin's `malware` entry again.
+      const raised = await twins("malware");
+      const [three, four] =
+        order === "maker first" ? [raised.first, raised.second] : [raised.second, raised.first];
+      expect(await clearSuspectedCsam(db, three.id), order).toMatchObject(kept);
+      expect(await entryOf(raised.sha256), order).toMatchObject({
+        reason: "csam",
+        raisedFrom: "malware",
+        raisedByNodeId: raised.first.id,
+      });
+      expect(await clearSuspectedCsam(db, four.id), order).toMatchObject({
+        blocklistRemoved: false,
+        blocklistRestoredTo: "malware",
+        blocklistKept: null,
+      });
+      expect(await entryOf(raised.sha256), order).toMatchObject({
+        reason: "malware",
+        note: "admin's",
+        sourceNodeId: null,
+        raisedFrom: null,
+        raisedByNodeId: null,
+      });
+    }
+  });
+
+  it("keeps the hash blocklisted while a csam report on a node with that content was filed", async () => {
+    const owner = await makeUser(db);
+    // Three twins; the third was reported and filed: it cannot be cleared, and stays locked.
+    const sha256 = rand(32);
     const twin = async () => {
       const file = await makeFile(db, owner, null, `twin-${rand()}.bin`, { sha256 });
       const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "photodna" }))!;
       return { file, reportId };
     };
-    // `first`'s lock created the entry; `second` and `third` found it.
     const first = await twin();
     const second = await twin();
     const third = await twin();
-    expect(await lookup(db, sha256)).toEqual({ reason: "csam", sourceNodeId: first.file.id });
-
-    // The others cleared or refused: `second` is not the entry's lock; `third` was reported and
-    // filed, so it stays locked — and keeps the hash listed when `first` is cleared.
-    expect(await clearSuspectedCsam(db, second.file.id)).toMatchObject({
-      cleared: true,
-      blocklistKept: "not_this_locks",
-    });
     await db.update(reports).set({ status: "actioned" }).where(eq(reports.id, third.reportId));
+    expect(await clearSuspectedCsam(db, second.file.id)).toMatchObject({
+      blocklistKept: "other_node_locked",
+    });
     expect(await clearSuspectedCsam(db, third.file.id)).toMatchObject({
       cleared: false,
       refused: "reported",
@@ -730,6 +836,7 @@ describe("clearSuspectedCsam", () => {
     expect(await clearSuspectedCsam(db, mine.id)).toMatchObject({
       cleared: true,
       blocklistRemoved: false,
+      blocklistRestoredTo: null,
       blocklistKept: "reported",
     });
     expect(await lookup(db, sha2)).toEqual({ reason: "csam", sourceNodeId: mine.id });

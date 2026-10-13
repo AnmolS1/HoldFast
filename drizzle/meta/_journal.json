@@ -43,6 +43,13 @@
       "when": 1791854088093,
       "tag": "0005_strikes_dedupe_ledger_subjects",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1791866343195,
+      "tag": "0006_blocklist_raised_from",
+      "breakpoints": true
     }
   ]
 }
