@@ -20,6 +20,7 @@ import { makeLink } from "../auth/helpers";
 import {
   ADMIN_EMAIL,
   auditRows,
+  gate,
   mailTo,
   makeFile,
   makeFolder,
@@ -29,6 +30,7 @@ import {
   rand,
   serviceDeps,
   testDb,
+  untilBlockedBy,
 } from "./helpers";
 
 const OWNER = "o".repeat(32);
@@ -49,27 +51,6 @@ function streamOf(bytes: Uint8Array, chunk = 65_536): ReadableStream<Uint8Array>
       at += chunk;
     },
   });
-}
-
-/** A promise with its resolver, so one side of a race can be held until the other is in place. */
-function gate<T = void>() {
-  let open!: (value: T) => void;
-  const opened = new Promise<T>((resolve) => (open = resolve));
-  return { opened, open };
-}
-
-/** Resolves once some backend of this database is blocked on a lock that `pid` holds. */
-async function untilBlockedBy(pid: number): Promise<void> {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    const result = await testDb().execute<{ n: number }>(
-      sql`SELECT count(*)::int AS n FROM pg_stat_activity
-          WHERE datname = current_database() AND ${pid} = ANY(pg_blocking_pids(pid))`,
-    );
-    if (Number(result.rows[0]?.n) > 0) return;
-    if (Date.now() > deadline) throw new Error("nothing ever waited for the lock: the rescan did not block");
-    await new Promise((resolve) => setTimeout(resolve, 15));
-  }
 }
 
 /** A database handle that runs `after` once, right after the first plain read made through it. */

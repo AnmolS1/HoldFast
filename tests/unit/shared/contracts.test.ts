@@ -664,7 +664,7 @@ describe("every schema", () => {
       ).toBe(false);
     }
     expect(Object.keys(admin.CeilingOverrides.shape).sort()).toEqual([...constants.CEILING_KEYS].sort());
-    expect(constants.CEILING_KEYS).toHaveLength(17);
+    expect(constants.CEILING_KEYS).toHaveLength(18);
   });
 
   it("an unknown field in an answer is dropped, not refused", () => {
@@ -996,10 +996,24 @@ describe("a link's pause reasons, as its owner is told", () => {
 
   it("canUnpause: paused, only reasons the owner can clear, and not locked", () => {
     expect(link.ownerCanUnpause(["owner"], false)).toBe(true);
-    expect(link.ownerCanUnpause(["ceiling", "anomaly", "owner"], false)).toBe(true);
+    expect(link.ownerCanUnpause(["ceiling", "owner"], false)).toBe(true);
+    expect(link.ownerCanUnpause(["ceiling"], false)).toBe(true);
+    // An abuse pause is not the owner's to clear — alone or beside their own.
+    expect(link.ownerCanUnpause(["anomaly"], false)).toBe(false);
+    expect(link.ownerCanUnpause(["owner", "anomaly"], false)).toBe(false);
+    expect(link.ownerCanUnpause(["ceiling", "anomaly", "owner"], false)).toBe(false);
+    // …though it is still SHOWN to the owner as traffic.
+    expect(link.publicPauseReasons(["anomaly"])).toEqual(["traffic"]);
     expect(link.ownerCanUnpause([], false)).toBe(false);
     expect(link.ownerCanUnpause(["owner"], true)).toBe(false);
-    for (const blocking of ["report", "moderation", "owner_deletion", "owner_suspended", "something_new"]) {
+    for (const blocking of [
+      "anomaly",
+      "report",
+      "moderation",
+      "owner_deletion",
+      "owner_suspended",
+      "something_new",
+    ]) {
       expect(link.ownerCanUnpause(["owner", blocking], false), blocking).toBe(false);
       expect(link.ownerCanUnpause([blocking], false), blocking).toBe(false);
     }

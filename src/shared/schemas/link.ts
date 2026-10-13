@@ -22,8 +22,13 @@ const SHOWN_AS: Record<string, LinkPauseReason> = {
   owner_suspended: "account",
   owner: "owner",
 };
-/** The stored reasons the owner's own "resume" can clear. */
-const OWNER_CLEARABLE = ["owner", "ceiling", "anomaly"];
+/**
+ * The stored reasons the owner's own "resume" can clear: their own pause, and a daily-ceiling
+ * pause (resuming bypasses nothing — the next request still meets the ceiling). NOT `anomaly`:
+ * that is an abuse pause, lifted by an admin or by the midnight job; if the owner could resume
+ * it, the control would last one click.
+ */
+const OWNER_CLEARABLE = ["owner", "ceiling"];
 
 /**
  * The stored pause-reason set of a link as `LinkDto.pausedReasons`: mapped, de-duplicated, in the

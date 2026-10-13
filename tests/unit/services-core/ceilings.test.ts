@@ -1,16 +1,17 @@
 // Daily ceilings: the limit arithmetic as a table, then each kind at its boundary inside real
 // requests against the real ledger.
 import { env } from "cloudflare:workers";
+import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { CEILING_KEYS } from "../../../src/shared/constants";
 import { todayTotals } from "../../../src/worker/db/queries/ledger";
 import type { Settings } from "../../../src/worker/db/queries/settings";
+import { shareLinks } from "../../../src/worker/db/schema";
 import {
   CEILING_KINDS,
   checkCeiling,
   consumeCeiling,
   effectiveLimits,
-  enforceCeiling,
   recordUsage,
   type CeilingKind,
   type CeilingSubject,
@@ -32,12 +33,14 @@ describe("effectiveLimits", () => {
     expect(limits("download_user")).toEqual({ bytes: 20_000_000_000 });
     expect(limits("download_link")).toEqual({ bytes: 20_000_000_000, count: 1000 });
     expect(effectiveLimits(env, none, "download_ip", undefined, NOW)).toEqual({ bytes: 50_000_000_000 });
+    expect(limits("download_owner")).toEqual({ bytes: 100_000_000_000 });
+    expect(env.CEIL_OWNER_LINK_BYTES_DAY).toBe("100000000000");
     expect(limits("upload_user")).toEqual({ bytes: 10_000_000_000, count: 2000 });
     expect(limits("upload_editor")).toEqual({ bytes: 2_000_000_000 });
     expect(limits("transform_user")).toEqual({ count: 2000 });
     expect(limits("share_user")).toEqual({ count: 200 });
     expect(limits("link_user")).toEqual({ count: 100 });
-    expect(CEILING_KINDS).toHaveLength(8);
+    expect(CEILING_KINDS).toHaveLength(9);
     // Another environment's values are what it answers with.
     const other = { ...env, CEIL_SHARES_DAY: "7", CEIL_USER_BYTES_DAY: "123" };
     expect(effectiveLimits(other, none, "share_user", OLD, NOW)).toEqual({ count: 7 });
@@ -51,8 +54,18 @@ describe("effectiveLimits", () => {
     expect(effectiveLimits(env, none, "download_user", big, NOW)).toEqual({ bytes: 3_000_000_000_000 });
     expect(effectiveLimits(env, none, "upload_user", big, NOW)).toEqual({
       bytes: 3_000_000_000_000,
-      count: Math.floor(3_000_000_000_000 / 10_485_760),
+      count: 300_000,
     });
+    // One file a day per 10,000,000 bytes of quota (decimal): 5,000,000,000 bytes give 500 —
+    // which the base of 2,000 exceeds, so it shows only once the base is lower.
+    const lowBase = { ceilings: { CEIL_UPLOAD_COUNT_DAY: 100 } };
+    expect(effectiveLimits(env, lowBase, "upload_user", OLD, NOW).count).toBe(500);
+    expect(effectiveLimits(env, lowBase, "upload_user", { ...OLD, quotaBytes: 9_999_999 }, NOW).count).toBe(
+      100,
+    );
+    expect(
+      effectiveLimits(env, lowBase, "upload_user", { ...OLD, quotaBytes: 1_010_000_000 }, NOW).count,
+    ).toBe(101);
     // A quota below the base leaves the base.
     expect(effectiveLimits(env, none, "download_user", OLD, NOW)).toEqual({ bytes: 20_000_000_000 });
     expect(effectiveLimits(env, none, "upload_user", OLD, NOW)).toEqual({
@@ -65,6 +78,8 @@ describe("effectiveLimits", () => {
       count: 1000,
     });
     expect(effectiveLimits(env, none, "upload_editor", big, NOW)).toEqual({ bytes: 2_000_000_000 });
+    // The owner-wide link limit protects against strangers too: it does not grow with the quota.
+    expect(effectiveLimits(env, none, "download_owner", big, NOW)).toEqual({ bytes: 100_000_000_000 });
     expect(effectiveLimits(env, none, "transform_user", big, NOW)).toEqual({ count: 2000 });
     expect(effectiveLimits(env, none, "share_user", big, NOW)).toEqual({ count: 200 });
     expect(effectiveLimits(env, none, "link_user", big, NOW)).toEqual({ count: 100 });
@@ -79,6 +94,17 @@ describe("effectiveLimits", () => {
       count: 250,
     });
     expect(effectiveLimits(env, none, "upload_user", NEW, NOW)).toEqual({ bytes: 2_500_000_000, count: 500 });
+    expect(effectiveLimits(env, none, "download_owner", NEW, NOW)).toEqual({ bytes: 25_000_000_000 });
+    expect(
+      effectiveLimits(env, { ceilings: { CEIL_OWNER_LINK_BYTES_DAY: 4000 } }, "download_owner", OLD, NOW),
+    ).toEqual({
+      bytes: 4000,
+    });
+    expect(
+      effectiveLimits(env, { ceilings: { CEIL_OWNER_LINK_BYTES_DAY: 4000 } }, "download_owner", NEW, NOW),
+    ).toEqual({
+      bytes: 1000,
+    });
     expect(effectiveLimits(env, none, "upload_editor", NEW, NOW)).toEqual({ bytes: 500_000_000 });
     expect(effectiveLimits(env, none, "transform_user", NEW, NOW)).toEqual({ count: 500 });
     expect(effectiveLimits(env, none, "share_user", NEW, NOW)).toEqual({ count: 50 });
@@ -159,6 +185,7 @@ const SMALL: Settings = {
     CEIL_LINK_BYTES_DAY: 1000,
     CEIL_LINK_DOWNLOADS_DAY: 3,
     CEIL_IP_BYTES_DAY: 1000,
+    CEIL_OWNER_LINK_BYTES_DAY: 1000,
     CEIL_UPLOAD_BYTES_DAY: 1000,
     CEIL_UPLOAD_COUNT_DAY: 3,
     CEIL_EDITOR_UPLOAD_BYTES_DAY: 1000,
@@ -176,6 +203,7 @@ describe("checkCeiling at the boundary", () => {
     { kind: "download_link", dimension: "bytes", limit: 1000 },
     { kind: "download_link", dimension: "count", limit: 3 },
     { kind: "download_ip", dimension: "bytes", limit: 1000 },
+    { kind: "download_owner", dimension: "bytes", limit: 1000 },
     { kind: "upload_user", dimension: "bytes", limit: 1000, needsUser: true },
     { kind: "upload_user", dimension: "count", limit: 3, needsUser: true },
     { kind: "upload_editor", dimension: "bytes", limit: 1000, needsUser: true },
@@ -369,8 +397,6 @@ describe("link_user: the new-account cap on live links", () => {
     expect(await check({ id: young.id, account: oldAccount })).toEqual({ ok: true });
 
     // A revoked link is not live: there is room again.
-    const { shareLinks } = await import("../../../src/worker/db/schema");
-    const { eq } = await import("drizzle-orm");
     const [one] = await testDb().select().from(shareLinks).where(eq(shareLinks.createdBy, young.id)).limit(1);
     await testDb().update(shareLinks).set({ revokedAt: new Date() }).where(eq(shareLinks.id, one!.id));
     expect(await check({ id: young.id, account })).toEqual({ ok: true });
@@ -419,9 +445,9 @@ describe("refusals", () => {
     // blobs: [name, outcome, kind, reason, route, environment]
     expect(points[0]!.blobs.slice(0, 4)).toEqual(["ceiling", "refused", "share_user", "count"]);
 
-    // enforceCeiling adds none of its own.
+    // A refused consume adds none of its own.
     const enforced = metrics();
-    await invoke(null, (c) => enforceCeiling(c, "download_link", subject, { bytes: 5000 }), {
+    await invoke(null, (c) => consumeCeiling(c, "download_link", subject, { bytes: 5000 }), {
       ...small,
       env: enforced.env,
     });
@@ -430,12 +456,12 @@ describe("refusals", () => {
     ]);
   });
 
-  it("enforceCeiling answers 429 ceiling_exceeded with details and Retry-After to 00:00 UTC", async () => {
+  it("a refusal is 429 ceiling_exceeded with details and Retry-After to 00:00 UTC", async () => {
     const subject = { id: subjectId(), account: oldAccount };
     const at = (iso: string): InvokeOptions => ({ ...small, headers: { "x-holdfast-test-now": iso } });
     const refused = await invoke(
       null,
-      (c) => enforceCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T23:59:30.000Z"),
     );
     expect(refused).toMatchObject({
@@ -447,19 +473,19 @@ describe("refusals", () => {
     expect(refused.headers.get("retry-after")).toBe("30");
     const midday = await invoke(
       null,
-      (c) => enforceCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T12:00:00.000Z"),
     );
     expect(midday.headers.get("retry-after")).toBe("43200");
     const midnight = await invoke(
       null,
-      (c) => enforceCeiling(c, "transform_user", subject, { count: 4 }),
+      (c) => consumeCeiling(c, "transform_user", subject, { count: 4 }),
       at("2026-10-12T00:00:00.000Z"),
     );
     expect(midnight.headers.get("retry-after")).toBe("86400");
     // The control: within the limit nothing is thrown.
     expect(
-      await invoke(null, (c) => enforceCeiling(c, "transform_user", subject, { count: 3 }), small),
+      await invoke(null, (c) => consumeCeiling(c, "transform_user", subject, { count: 3 }), small),
     ).toMatchObject({
       ok: true,
     });
@@ -502,11 +528,11 @@ describe("recordUsage and consumeCeiling", () => {
     const subject = { id: subjectId(), account: oldAccount };
     const results = await Promise.all(
       Array.from({ length: 8 }, () =>
-        invoke(null, (c) => consumeCeiling(c, "link_user", subject, { count: 1 }), small),
+        invoke(null, (c) => consumeCeiling(c, "share_user", subject, { count: 1 }), small),
       ),
     );
     expect(results.filter((result) => result.ok)).toHaveLength(3);
     expect(results.filter((result) => !result.ok).every((result) => result.status === 429)).toBe(true);
-    expect(await todayTotals(testDb(), "link_user", subject.id)).toEqual({ bytes: 0, count: 3 });
+    expect(await todayTotals(testDb(), "share_user", subject.id)).toEqual({ bytes: 0, count: 3 });
   });
 });

@@ -5,7 +5,7 @@
 // counts a whole table. R2 and the queue are isolated per test FILE.
 import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { nodes, scanJobs, type ScanStatus, shares, uploads, user } from "../../../src/worker/db/schema";
 import { queue } from "../../../src/worker/scan/consumer";
@@ -216,4 +216,44 @@ export function r2Event(key: string, action = "CompleteMultipartUpload", size = 
     action,
     object: { key, size, eTag: "dce1c18393acbef2580b54a3b321765d-3" },
   };
+}
+
+// ── races, without sleeping ─────────────────────────────────────────────────────────────────
+
+/** A promise with its resolver, so one side of a race can be held until the other is in place. */
+export function gate<T = void>() {
+  let open!: (value: T) => void;
+  const opened = new Promise<T>((resolve) => (open = resolve));
+  return { opened, open };
+}
+
+/** The backend process id of the connection a transaction runs on. */
+export async function backendPid(tx: {
+  execute: (query: ReturnType<typeof sql>) => Promise<{ rows: unknown[] }>;
+}) {
+  const result = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
+  return Number((result.rows[0] as { pid: number }).pid);
+}
+
+/**
+ * Resolves once some backend of this database is blocked on a lock that `pid` holds — or, when
+ * `orElse` is given, once that returns true (the other side got past the point where it would
+ * have blocked). Polls the server's own view of who waits for whom; throws after ten seconds.
+ */
+export async function untilBlockedBy(
+  pid: number,
+  orElse: () => boolean = () => false,
+): Promise<"blocked" | "passed"> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    if (orElse()) return "passed";
+    const result = await testDb().execute<{ n: number }>(
+      sql`SELECT count(*)::int AS n FROM pg_stat_activity
+          WHERE datname = current_database() AND ${pid} = ANY(pg_blocking_pids(pid))`,
+    );
+    if (Number(result.rows[0]?.n) > 0) return "blocked";
+    if (Date.now() > deadline)
+      throw new Error("nothing ever waited for the lock, and the other side never passed");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
 }
