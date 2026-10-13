@@ -381,6 +381,36 @@ describe("the account purge", () => {
     expect(await pendingPurge(a.id)).toEqual(before);
   });
 
+  it("a hold placed while the purge is running stops the account row: it is re-read under the row's lock", async () => {
+    const a = await account();
+    // The hold lands in the middle of the run — the moment the first root's objects are removed.
+    let placed = false;
+    const bucket = new Proxy(env.FILES, {
+      get(target, property) {
+        const value = Reflect.get(target, property) as unknown;
+        if (typeof value !== "function") return value;
+        return async (...args: unknown[]) => {
+          if (property === "delete" && !placed) {
+            placed = true;
+            await setUserLegalHold(testDb(), a.id, true);
+          }
+          return (value as (...inner: unknown[]) => unknown).apply(target, args);
+        };
+      },
+    });
+    const outcome = await purgeAccount(jobContext({ env: { FILES: bucket } }).bg, a.id);
+    expect(placed).toBe(true);
+    expect(outcome).toBe("held");
+    // What was purged before the hold stays purged; the account and its sign-in rows are kept.
+    expect(await userRow(a.id)).not.toBeNull();
+    expect(await sessionsLeft(a.sessionId)).toBe(1);
+    expect(await audits("system.user_purge", a.id)).toEqual([]);
+    const pending = (await pendingPurge(a.id))!;
+    expect([pending.finishedAt, pending.error]).toEqual([null, null]);
+    // Held, not deferred: its date is not moved.
+    expect(pending.scheduledFor.getTime()).toBeLessThan(Date.now());
+  });
+
   it("two runs for the same account at once: one deletion, one record, no error", async () => {
     const a = await account();
     const outcomes = await Promise.all([

@@ -197,17 +197,22 @@ export function deadlock(): Error {
 }
 
 /**
- * A database handle whose first `failures` transactions end as deadlock victims before running
- * anything — what Postgres does to the loser, seen from the caller. `attempts` counts them all.
+ * A database handle whose first `failures` transactions end as deadlock victims: each runs its
+ * work and is then rolled back with 40P01 — what Postgres does to the loser, whose statements up
+ * to that point are thrown away. `attempts` counts every transaction started on the handle.
  */
 export function deadlockingDb(failures = 1) {
   const made = createDb(env);
   const counter = { attempts: 0 };
   const real = made.db.transaction.bind(made.db);
-  (made.db as { transaction: unknown }).transaction = (...args: Parameters<typeof real>) => {
+  type Run = Parameters<typeof real>[0];
+  (made.db as { transaction: unknown }).transaction = (run: Run, ...rest: unknown[]) => {
     counter.attempts += 1;
-    if (counter.attempts <= failures) return Promise.reject(deadlock());
-    return real(...args);
+    if (counter.attempts > failures) return (real as (...args: unknown[]) => unknown)(run, ...rest);
+    return real(async (tx) => {
+      await run(tx);
+      throw deadlock();
+    });
   };
   return { ...made, counter };
 }
