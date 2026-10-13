@@ -5,7 +5,12 @@ import { and, eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { addUsage, utcDay } from "../../../src/worker/db/queries/ledger";
 import { auditLog, downloadLedger } from "../../../src/worker/db/schema";
-import { notifyLinkPausedOnce, notifyOwnerLinkCapOnce } from "../../../src/worker/services/ledger";
+import {
+  notifyLinkPausedOnce,
+  notifyOwnerLinkCapOnce,
+  settleServe,
+  type ServeCharge,
+} from "../../../src/worker/services/ledger";
 import { serviceDeps } from "../auth/helpers";
 import {
   accessLog,
@@ -565,5 +570,93 @@ describe("the settle runs once, on the request's client or — for a long stream
     expect(await ledgerBytes("link", link.id)).toBe(SIZE * 2);
     expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 2);
     expect((await linkById(link.id)).bytesServed).toBe(SIZE * 2);
+  });
+});
+
+describe("what a reservation can and cannot do", () => {
+  it("one byte of a large object reserves one byte: `bytes=0-0` charges 1 on every ledger", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    expect(
+      (await ask(await urlFor("download", node, { link }), { ip, headers: { range: "bytes=0-0" } })).status,
+    ).toBe(206);
+    expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(1);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(1);
+    expect(await ledgerBytes("link", link.id)).toBe(1);
+    expect((await linkById(link.id)).bytesServed).toBe(1);
+  });
+
+  it("downloads held open by ONE address reserve at most that address's own ceiling on the owner's cap and on the link — and all of it comes back when they end", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    const url = await urlFor("download", node, { link });
+    // The address may take two and a half files a day; the link and the owner far more.
+    const limits = { ...ceilings({ CEIL_IP_BYTES_DAY: SIZE * 2 + 500 }), ip };
+    const held = [];
+    for (let i = 0; i < 6; i++) held.push(await open(url, limits));
+    expect(held.map((one) => one.response.status)).toEqual([200, 200, 429, 429, 429, 429]);
+    // Nothing was read: two responses' bytes are reserved, on the address FIRST — the four
+    // refused requests reached neither the owner's nor the link's ledger.
+    expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(SIZE * 2);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 2);
+    expect(await ledgerBytes("link", link.id)).toBe(SIZE * 2);
+    expect((await linkById(link.id)).pauseReasons).toEqual([]);
+
+    for (const one of held) {
+      await one.response.body?.cancel();
+      await one.ctx.settle();
+    }
+    expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(0);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(0);
+    expect(await ledgerBytes("link", link.id)).toBe(0);
+    expect((await linkById(link.id)).bytesServed).toBe(0);
+    // Another address is not affected by the first one's refusals.
+    expect((await ask(url, ceilings({ CEIL_IP_BYTES_DAY: SIZE * 2 + 500 }))).status).toBe(200);
+  });
+
+  it("two downloads at once through two links of one owner, fitting under the owner's cap alone but not together → one 200, one 429", async () => {
+    const owner = await makeAccount();
+    const urls: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const file = await storedFile(owner.id, { content: pattern(SIZE, i) });
+      urls.push(await urlFor("download", file.node, { link: await linkOn(file.node.id, owner.id) }));
+    }
+    const limits = ceilings({ CEIL_OWNER_LINK_BYTES_DAY: SIZE + 500 });
+    const answers = await Promise.all(urls.map((url) => ask(url, limits)));
+    expect(answers.map((answer) => answer.status).sort()).toEqual([200, 429]);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE);
+  });
+
+  it("the settle never gives back more than was charged: a count above the charge, below zero or not a number refunds nothing", async () => {
+    const { owner, link } = await world();
+    const { deps } = serviceDeps();
+    const day = utcDay();
+    const charged = async (): Promise<ServeCharge> => {
+      await testDb().delete(downloadLedger).where(eq(downloadLedger.subjectId, owner.id));
+      await addUsage(testDb(), day, "user", owner.id, SIZE, 0);
+      await addUsage(testDb(), day, "link_owner", owner.id, SIZE, 0);
+      return {
+        bytes: SIZE,
+        linkId: link.id,
+        charges: [
+          { kind: "download_user", subjectId: owner.id, receipt: { day } },
+          { kind: "download_owner", subjectId: owner.id, receipt: { day } },
+        ],
+      };
+    };
+    for (const sent of [SIZE, SIZE + 1, SIZE * 10, -1, Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+      await settleServe(deps, await charged(), sent);
+      expect(await ledgerBytes("user", owner.id), String(sent)).toBe(SIZE);
+      expect(await ledgerBytes("link_owner", owner.id), String(sent)).toBe(SIZE);
+    }
+    // Only real counts were added to the link: SIZE, then SIZE capped twice.
+    expect((await linkById(link.id)).bytesServed).toBe(SIZE * 3);
+    // The control: an honest count gives the rest back, on every ledger.
+    await settleServe(deps, await charged(), 250);
+    expect(await ledgerBytes("user", owner.id)).toBe(250);
+    expect(await ledgerBytes("link_owner", owner.id)).toBe(250);
+    // A charge of nothing (a response without a body) settles to nothing.
+    await settleServe(deps, { bytes: 0, charges: [], linkId: link.id }, 0);
+    expect((await linkById(link.id)).bytesServed).toBe(SIZE * 3 + 250);
   });
 });
