@@ -187,6 +187,71 @@ describe("scopes", () => {
     expect(own).toContain(w.sharedInfected.id);
   });
 
+  it("a grantee is shown no file that is not clean, whatever else its state is called", async () => {
+    const w = await world();
+    const notClean = ["pending", "infected", "under_review", "skipped", "error", "suspected_csam"] as const;
+    const made = new Map<string, string>();
+    for (const scanStatus of notClean) {
+      const file = await makeFile(w.owner.id, w.inner.id, {
+        name: `${w.t} state ${scanStatus}.txt`,
+        scanStatus,
+      });
+      made.set(scanStatus, file.id);
+    }
+    for (const scope of ["shared", "all"] as const) {
+      const found = page(await get(as(w.me), searchPath({ q: w.t, scope, limit: 50 })));
+      for (const id of made.values()) expect(found.items.map((item) => item.id)).not.toContain(id);
+      // No answer names a state a grantee may not know of (a file under review was reported).
+      expect(found.items.filter((item) => item.role !== "owner").map((item) => item.scanStatus)).toEqual(
+        found.items.filter((item) => item.role !== "owner").map(() => "clean"),
+      );
+    }
+    // The owner sees every one of them but the locked file.
+    const own = idsOf(await get(as(w.owner), searchPath({ q: w.t, scope: "mine", limit: 50 })));
+    for (const [status, id] of made) {
+      if (status === "suspected_csam") expect(own).not.toContain(id);
+      else expect(own, status).toContain(id);
+    }
+  });
+
+  it("what a suspended, banned or leaving owner shared is found by no grantee, and is no folder to search in", async () => {
+    const t = token();
+    const me = await makeUser();
+    const active = await makeUser();
+    const owners = [
+      await makeUser({ suspendedAt: new Date() }),
+      await makeUser({ banned: true }),
+      await makeUser({ deleteScheduledAt: new Date(Date.now() + 86_400_000) }),
+    ];
+    const gone: string[] = [];
+    const folders: string[] = [];
+    for (const owner of [active, ...owners]) {
+      const folder = await makeFolder(owner.id);
+      const file = await makeFile(owner.id, folder.id, {
+        name: `${t} of ${owner.id.slice(0, 6)}.txt`,
+        ...clean,
+      });
+      await makeShare(folder.id, owner.id, me.id);
+      if (owner !== active) {
+        gone.push(file.id);
+        folders.push(folder.id);
+      }
+    }
+    for (const scope of ["shared", "all"] as const) {
+      const ids = idsOf(await get(as(me), searchPath({ q: t, scope })));
+      // Only the active owner's file: the fixture is live, the other three are absent.
+      expect(ids).toHaveLength(1);
+      for (const id of gone) expect(ids).not.toContain(id);
+    }
+    const unknown = await get(as(me), searchPath({ q: t, inFolder: uuidv7() }));
+    const withoutId = (answer: Answer) => ({ ...(answer.body as object), requestId: "" });
+    for (const folder of folders) {
+      const answer = await get(as(me), searchPath({ q: t, inFolder: folder }));
+      expect(answer.status).toBe(404);
+      expect(withoutId(answer)).toEqual(withoutId(unknown));
+    }
+  });
+
   it("a file locked as suspected CSAM is found by nobody, its owner included", async () => {
     const w = await world();
     const locked = await makeFile(w.owner.id, w.shared.id, {
@@ -272,13 +337,20 @@ describe("inFolder", () => {
     await makeFile(owner.id, theirs.id, { name: `${t} theirs.txt`, ...clean });
     const invited = await makeFolder(owner.id);
     await makePendingShare(invited.id, owner.id, me.email);
-    const takenDown = await makeFolder(me.id, null, { takedownAt: new Date(), takedownReason: "abuse" });
+    const down = { takedownAt: new Date(), takedownReason: "abuse" } as const;
+    const takenDown = await makeFolder(me.id, null, down);
+    const underTakenDown = await makeFolder(me.id, takenDown.id);
+    const locked = await makeFile(me.id, null, { scanStatus: "suspected_csam" });
+    // Shared with the caller, then taken down: the share is no way in.
+    const sharedDown = await makeFolder(owner.id, null, down);
+    const underSharedDown = await makeFolder(owner.id, sharedDown.id);
+    await makeShare(sharedDown.id, owner.id, me.id, { role: "editor" });
 
     const unknown = await get(as(me), searchPath({ q: t, inFolder: uuidv7() }));
     expect(unknown.status).toBe(404);
     expect(errorOf(unknown)).toBe("not_found");
     const withoutId = (answer: Answer) => ({ ...(answer.body as object), requestId: "" });
-    for (const folder of [theirs, invited, takenDown]) {
+    for (const folder of [theirs, invited, takenDown, underTakenDown, locked, sharedDown, underSharedDown]) {
       const answer = await get(as(me), searchPath({ q: t, inFolder: folder.id }));
       expect(answer.status).toBe(404);
       expect(withoutId(answer)).toEqual(withoutId(unknown));
@@ -472,7 +544,11 @@ describe("the answer", () => {
     expect(hint(sharedRoot.id, theirs.items)).toBe("");
     expect(hint(sharedFile.id, theirs.items)).toBe(sharedRoot.name);
     expect(theirs.items.every((item) => item.role === "editor")).toBe(true);
+    // Nothing of the owner's own folder above the share: not its name, not its id.
     expect(JSON.stringify(theirs)).not.toContain(folder.name);
+    expect(JSON.stringify(theirs)).not.toContain(folder.id);
+    expect(theirs.items.find((item) => item.id === sharedRoot.id)?.parentId).toBeNull();
+    expect(own.items.find((item) => item.id === sharedRoot.id)?.parentId).toBe(folder.id);
   });
 
   it("tells a grantee nothing about how the owner shares the node", async () => {
