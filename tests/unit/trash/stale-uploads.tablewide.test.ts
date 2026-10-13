@@ -142,6 +142,45 @@ describe("the stale-upload job", () => {
     expect(ctx.outcomes("stale-uploads")).not.toContain("error");
   });
 
+  it("the object a finished multipart upload left is deleted even when the abort fails", async () => {
+    const owner = await member();
+    const lost = await multipart(owner.id, { status: "completing", completingAt: ago(2 * HOUR), size: 700 });
+    await putObject(lost.r2Key, "completed in the store, referenced by nothing");
+    await setUsedBytes(owner.id, 700);
+    // The store refuses the abort with something other than "no such upload".
+    const bucket = new Proxy(env.FILES, {
+      get(target, property) {
+        const value = Reflect.get(target, property) as unknown;
+        if (typeof value !== "function") return value;
+        if (property !== "resumeMultipartUpload") return value.bind(target);
+        return () => ({
+          abort: async () => {
+            throw new Error("abortMultipartUpload: internal error (10001)");
+          },
+        });
+      },
+    });
+    const { ctx } = await run(jobContext({ env: { FILES: bucket } }));
+    expect(await uploadRow(lost.id)).toMatchObject({ status: "aborted" });
+    expect(await usedBytes(owner.id)).toBe(0);
+    expect(await objectExists(lost.r2Key)).toBe(false);
+    // The failed abort is still reported: the session counts as an error, not as settled.
+    expect(ctx.outcomes("stale-uploads")).toContain("error");
+  });
+
+  it("a held uploader's stale session is ended like any other: the row stays as a record, its parts go", async () => {
+    const owner = await member();
+    const held = await member({ legalHold: true });
+    const session = await makeUpload(owner.id, held.id, { size: 400, expiresAt: ago(HOUR) });
+    const uploadId = await startMultipart(session.r2Key);
+    await testDb().update(uploads).set({ r2UploadId: uploadId }).where(eq(uploads.id, session.id));
+    await setUsedBytes(owner.id, 400);
+    await run();
+    expect(await uploadRow(session.id)).toMatchObject({ status: "aborted", uploaderId: held.id });
+    expect(await multipartIsOpen(session.r2Key, uploadId)).toBe(false);
+    expect(await usedBytes(owner.id)).toBe(0);
+  });
+
   it("a session its client claimed after the job listed it is left alone, reservation and all", async () => {
     const owner = await member();
     // Two stale sessions; the job lists both, oldest first.

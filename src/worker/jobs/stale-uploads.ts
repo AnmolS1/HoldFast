@@ -11,6 +11,10 @@
 // Rows first, the store second: once the row says `aborted` nobody completes the session, so
 // what is then removed from the store is referenced by nothing.
 //
+// A HOLD CHANGES NOTHING HERE: a stale session of a held uploader, or into a held folder, is
+// ended like any other — its unfinished parts leave the store, as they do when a purge ends a
+// kept session (queries/trash.ts). The ROW is what a hold keeps (`uploads.trimFinished`).
+//
 // A SINGLE-PUT session (`r2UploadId` null) has no multipart upload, and this job deletes no
 // object for it: one its PUT left at the key is an orphan like any other, and the reconcile
 // job's orphan sweep removes it under its own guards.
@@ -56,9 +60,23 @@ async function settle(bg: BackgroundContext, listed: Upload): Promise<Settled> {
   const uploadId = session.r2UploadId;
   if (uploadId === null) return "aborted";
   const store = storage(bg.env);
-  await store.abort(store.resumeMultipart(session.r2Key, uploadId));
+  // Two clean-ups, each attempted whatever became of the other: the row is `aborted` already, so
+  // this job never comes back to the session — an object skipped here would wait for the sweep.
+  let failure: unknown = null;
+  try {
+    await store.abort(store.resumeMultipart(session.r2Key, uploadId));
+  } catch (error) {
+    failure = error;
+  }
   // A multipart upload that was being completed may have become an object before its request died.
-  if (session.status === "completing") await store.delete([session.r2Key]);
+  if (session.status === "completing") {
+    try {
+      await store.delete([session.r2Key]);
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (failure) throw failure;
   return "aborted";
 }
 
