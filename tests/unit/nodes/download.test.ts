@@ -20,6 +20,7 @@ import {
   impersonated,
   makeFile,
   makeFolder,
+  manyFiles,
   nodeById,
   person,
   setStatus,
@@ -404,6 +405,24 @@ describe("download-urls (the zip batch)", () => {
       expect(new URL(item.url).pathname.startsWith(`/d/${item.nodeId}/`)).toBe(true);
       expect(await claimsOf(item.url)).toMatchObject({ k: "download", st: "u" });
     }
+  });
+
+  it("a full window of 50 files: 50 URLs and 50 audit rows (none is dropped by the request's own bounds)", async () => {
+    const owner = await person();
+    const folder = await makeFolder(owner.id);
+    await manyFiles(owner.id, folder.id, 50);
+    const listed = await api(owner.as, "GET", `/nodes/${folder.id}/children?limit=50`);
+    const ids: string[] = listed.body.items.map((item: { id: string }) => item.id);
+    expect(ids).toHaveLength(50);
+    const answer = await api(owner.as, "POST", "/nodes/download-urls", { body: { nodeIds: ids } });
+    expect(
+      answer.body.items.map((item: { nodeId: string; url?: string }) => [item.nodeId, typeof item.url]),
+    ).toEqual(ids.map((id) => [id, "string"]));
+    const rows = (await auditRows({ action: "file.download", actorUserId: owner.id })).filter((row) =>
+      ids.includes(row.targetId!),
+    );
+    expect(rows).toHaveLength(50);
+    expect(new Set(rows.map((row) => row.targetId)).size).toBe(50);
   });
 
   it("takes 1 to 50 ids", async () => {
