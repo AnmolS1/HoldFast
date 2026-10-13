@@ -118,8 +118,15 @@ export type ZipLimits = {
 };
 
 /**
- * The files under `roots` (a root that is a file is itself one), by path, the roots in the order
- * given. `clean` files are `entries`; the others are `skipped` with the reason their download
+ * The files under `roots` (a root that is a file is itself one).
+ *
+ * THE ORDER, of `entries` and of `skipped` alike: the roots in the order given; under one root
+ * by the whole path compared BYTE BY BYTE (`COLLATE "C"`, whatever the database's own collation
+ * is). So everything under one folder is together — a folder's files are never interleaved with
+ * a sibling folder's — and the order is the same on every database; upper case sorts before
+ * lower case, and a folder's own files stand among its subfolders by name. This is also the
+ * order in which the entry cap is filled: the first `maxFiles` clean files in it are the entries.
+ * `clean` files are `entries`; the others are `skipped` with the reason their download
  * would be refused for.
  *
  * LEFT OUT ENTIRELY — from `entries` and from `skipped`, because naming them would disclose
@@ -229,7 +236,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
     SELECT t.walked, l.id, l.path, l.owner, l.size, l.version_id, l.scan_status, l.modified_at
     FROM (SELECT count(*)::int AS walked FROM walked) t
     LEFT JOIN listed l ON true
-    ORDER BY l.ord, l.path, l.id`);
+    ORDER BY l.ord, l.path COLLATE "C", l.id`);
 
   const manifest: ZipManifest = {
     entries: [],

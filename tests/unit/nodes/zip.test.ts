@@ -311,6 +311,50 @@ describe("POST /nodes/zip-manifest", () => {
     expect(body.totalBytes).toBe(body.entries.reduce((sum, entry) => sum + entry.size, 0));
   });
 
+  it("the order: roots as given, then byte by byte along the path — a folder's files stay together, and the cap keeps the first of them", async () => {
+    const owner = await person();
+    const second = await makeFolder(owner.id, null, { name: "second root" });
+    const first = await makeFolder(owner.id, null, { name: "zz first root" });
+    const file = (parentId: string, name: string) =>
+      makeFile(owner.id, parentId, { name, scanStatus: "clean" });
+    // Two sibling folders whose names differ by punctuation, a capitalised one, a deeper one.
+    const dashed = await makeFolder(owner.id, first.id, { name: "a-b" });
+    const plain = await makeFolder(owner.id, first.id, { name: "ab" });
+    const upper = await makeFolder(owner.id, first.id, { name: "B" });
+    const deep = await makeFolder(owner.id, dashed.id, { name: "deep" });
+    await file(dashed.id, "1.txt");
+    await file(plain.id, "2.txt");
+    await file(dashed.id, "3.txt");
+    await file(upper.id, "x.txt");
+    await file(deep.id, "0.txt");
+    await file(first.id, "aa.txt");
+    await file(first.id, "Zebra.txt");
+    await file(second.id, "only.txt");
+
+    const roots = [
+      { id: first.id, label: "zz first root", owner: true },
+      { id: second.id, label: "second root", owner: true },
+    ];
+    const expected = [
+      "zz first root/B/x.txt",
+      "zz first root/Zebra.txt",
+      "zz first root/a-b/1.txt",
+      "zz first root/a-b/3.txt",
+      "zz first root/a-b/deep/0.txt",
+      "zz first root/aa.txt",
+      "zz first root/ab/2.txt",
+      "second root/only.txt",
+    ];
+    const all = await zipManifest(testDb(), roots, { maxFiles: 100 });
+    expect(all.entries.map((entry) => entry.path)).toEqual(expected);
+    // Through the route the same, and the cap takes the first of that order.
+    const answer = await manifest(owner.as, { nodeIds: [first.id, second.id] });
+    expect(answer.body.entries.map((entry: { path: string }) => entry.path)).toEqual(expected);
+    const capped = await zipManifest(testDb(), roots, { maxFiles: 3, maxWalked: 100 });
+    expect(capped.entries.map((entry) => entry.path)).toEqual(expected.slice(0, 3));
+    expect(capped.truncated).toBe(true);
+  });
+
   it("the cap counts entries only: skipped files neither use it up nor set truncated", async () => {
     const owner = await person();
     const folder = await makeFolder(owner.id, null, { name: "mixed" });
