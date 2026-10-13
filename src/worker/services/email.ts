@@ -360,6 +360,7 @@ const OPERATOR_CRITICAL = {
   admin_lockout: "An administrator account is locked out",
   storage_budget: "The storage budget switch was triggered",
   scanner_down: "The virus scanner is not answering",
+  database_rollback: "The database is older than the object store: orphan deletion is stopped",
   unknown: "A critical event needs attention",
 } as const;
 export type OperatorCriticalEvent = Exclude<keyof typeof OPERATOR_CRITICAL, "unknown">;
