@@ -128,6 +128,8 @@ describe("ledger", () => {
       "user",
       "link",
       "ip",
+      "link_owner",
+      "notice",
       "upload_user",
       "upload_editor",
       "transform_user",
