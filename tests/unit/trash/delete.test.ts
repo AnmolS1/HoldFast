@@ -1,13 +1,12 @@
 // DELETE /nodes/:id and DELETE /trash: permanent deletion as its owner sees it — what goes, what
 // is recorded with it, and that a hold changes nothing the owner can observe. Rows this file made.
 import { eq } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { EmptyTrashResponse, TrashResponse } from "../../../src/shared/schemas/node";
 import { setNodeLegalHold } from "../../../src/worker/db/queries/moderation";
 import { usageBreakdown } from "../../../src/worker/db/queries/quota";
 import { restore as restoreQuery } from "../../../src/worker/db/queries/trash";
 import { uploadParts, uploads } from "../../../src/worker/db/schema";
-import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
   audits,
@@ -387,10 +386,10 @@ describe("DELETE /nodes/:id", () => {
 });
 
 describe("DELETE /trash", () => {
-  let restoreDeadline: (() => void) | null = null;
-  afterEach(() => {
-    restoreDeadline?.();
-    restoreDeadline = null;
+  /** A request that began a minute ago by the server's clock: its 20 seconds are long over. */
+  const late = () => ({
+    ...DELETE,
+    headers: { "x-holdfast-test-now": new Date(Date.now() - 60_000).toISOString() },
   });
 
   it("deletes every trashed root of the caller — held ones included, as far as the caller can tell", async () => {
@@ -426,22 +425,18 @@ describe("DELETE /trash", () => {
     for (let i = 0; i < 3; i++) files.push(await makeFile(t.id, null, { scanStatus: "clean" }));
     for (const file of files) await trash(t.owner, file.id);
     // The deadline has passed before the first purge returns: one root a request.
-    restoreDeadline = setEmptyTrashDeadlineForTests(0);
-
-    const first = await api(t.owner, "/trash", DELETE);
+    const first = await api(t.owner, "/trash", late());
     expect(first.status).toBe(202);
     expect(EmptyTrashResponse.parse(first.body)).toEqual({ remaining: 2 });
     expect(await nodesLeft(files.map((file) => file.id))).toHaveLength(2);
-    const second = await api(t.owner, "/trash", DELETE);
+    const second = await api(t.owner, "/trash", late());
     expect([second.status, second.body]).toEqual([202, { remaining: 1 }]);
     // The last root: nothing is left, so it is done whatever the clock says.
-    const third = await api(t.owner, "/trash", DELETE);
+    const third = await api(t.owner, "/trash", late());
     expect([third.status, third.body]).toEqual([204, null]);
     expect(await nodesLeft(files.map((file) => file.id))).toEqual([]);
 
-    // Control: with the real deadline one request does it all.
-    restoreDeadline();
-    restoreDeadline = null;
+    // Control: a request that began now has its 20 seconds, and does it all.
     for (let i = 0; i < 3; i++)
       await trash(t.owner, (await makeFile(t.id, null, { scanStatus: "clean" })).id);
     expect((await api(t.owner, "/trash", DELETE)).status).toBe(204);

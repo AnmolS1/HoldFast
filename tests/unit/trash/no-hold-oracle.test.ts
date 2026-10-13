@@ -4,10 +4,9 @@
 // Every comparison is between the answer for something held and the answer for its un-held
 // twin, made the same way by an owner with the same tree: status, body, EVERY response header,
 // and the number of SQL statements sent before the answer existed.
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { countTrash } from "../../../src/worker/db/queries/trash-jobs";
-import { setEmptyTrashDeadlineForTests } from "../../../src/worker/routes/trash";
 import {
   api,
   auditRows,
@@ -26,6 +25,11 @@ import {
 
 const POST = { method: "POST" } as const;
 const DELETE = { method: "DELETE" } as const;
+/** A `DELETE` that began a minute ago by the server's clock: past its deadline, one root a request. */
+const LATE = () => ({
+  ...DELETE,
+  headers: { "x-holdfast-test-now": new Date(Date.now() - 60_000).toISOString() },
+});
 
 /** An answer with what differs per request by design taken out: ids, and timestamps of the node. */
 function shape(answer: Answer) {
@@ -128,11 +132,6 @@ describe.each(CAUSES)("%s", (_name, hold) => {
 });
 
 describe("a file trashed on its own inside a folder that is then deleted for good", () => {
-  let restoreClock: Record<string, string> | undefined;
-  afterEach(() => {
-    restoreClock = undefined;
-  });
-
   // The everyday sequence: trash a file, then the folder it was in, then "delete forever" the
   // folder. Un-held, the folder's whole subtree goes — the file with it. Held, nothing goes; the
   // file must then be as gone to its owner as the folder is: in the listing and in the count,
@@ -201,9 +200,8 @@ describe("a file trashed on its own inside a folder that is then deleted for goo
       expect(await nodeById(free.t.file.id)).toBeNull();
 
       // Emptying the trash afterwards, one root a request: the same countdown for both.
-      restoreClock = { "x-holdfast-test-now": new Date(Date.now() - 60_000).toISOString() };
       const empty = async (t: Tree) => {
-        const answer = await api(t.caller, "/trash", { ...DELETE, headers: restoreClock });
+        const answer = await api(t.caller, "/trash", LATE());
         return [answer.status, answer.body];
       };
       expect(await empty(held.t)).toEqual(await empty(free.t));
@@ -243,12 +241,6 @@ describe("a restore out of a trashed folder that protects the file", () => {
 });
 
 describe("DELETE /trash with a held root in it", () => {
-  let restoreDeadline: (() => void) | null = null;
-  afterEach(() => {
-    restoreDeadline?.();
-    restoreDeadline = null;
-  });
-
   it("counts down exactly as an un-held trash does: the same `remaining`, the same number of requests", async () => {
     const trashOf = async (heldIndex: number | null) => {
       const owner = await member();
@@ -262,11 +254,10 @@ describe("DELETE /trash with a held root in it", () => {
     const free = await trashOf(null);
     // Each position in turn: the newest root (purged first), the middle one, the oldest.
     const withHeld = [await trashOf(2), await trashOf(1), await trashOf(0)];
-    restoreDeadline = setEmptyTrashDeadlineForTests(0);
     const countdown = async (caller: Caller) => {
       const seen: unknown[] = [];
       for (let request = 0; request < 6; request++) {
-        const answer = await api(caller, "/trash", DELETE);
+        const answer = await api(caller, "/trash", LATE());
         seen.push([answer.status, answer.body]);
         if (answer.status === 204) break;
       }

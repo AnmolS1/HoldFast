@@ -38,6 +38,7 @@ import type { Node } from "../db/schema";
 import { purgeRoot, recordPurgeRequest } from "../jobs/purge";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
+import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { toNodeDto, toTrashItemDto, toTrashItemDtos } from "../services/node-dto";
 import { assertNotTrashed, getAccess, requireRole, type Access, type Role } from "../services/permissions";
@@ -51,15 +52,6 @@ const ID = `:id{${UUID_PARAM}}`;
 export const EMPTY_TRASH_BATCH = 100;
 /** `DELETE /trash` stops starting purges after this long and answers `202` with what is left. */
 export const EMPTY_TRASH_DEADLINE_MS = 20_000;
-
-let emptyTrashDeadlineMs = EMPTY_TRASH_DEADLINE_MS;
-/** Tests only: a unit test cannot sit out the real bound. Returns the function that restores it. */
-export function setEmptyTrashDeadlineForTests(ms: number): () => void {
-  emptyTrashDeadlineMs = ms;
-  return () => {
-    emptyTrashDeadlineMs = EMPTY_TRASH_DEADLINE_MS;
-  };
-}
 
 /** The one "cannot do that now" of this file: no message of its own, no detail, no cause. */
 const refused = () => new AppError("conflict");
@@ -122,7 +114,9 @@ router.get("/trash", async (c) => {
 
 router.delete("/trash", async (c) => {
   const user = requireVerified(c);
-  const stopAt = Date.now() + emptyTrashDeadlineMs;
+  // When the request began, by the one server clock (services/clock.ts) — which a test may set
+  // for its own request, and nothing else can: there is no other way to move this deadline.
+  const stopAt = now(c).getTime() + EMPTY_TRASH_DEADLINE_MS;
   for (;;) {
     // Always the first page: a root that was purged, or marked as requested, has left the listing.
     const page = await listTrash(db(c), user.id, { limit: EMPTY_TRASH_BATCH });
