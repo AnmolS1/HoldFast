@@ -784,6 +784,13 @@ export async function setUserLegalHold(db: Executor, userId: string, held: boole
  *     claimed on or after the day the report was created (one day of slack).
  * Each row carries the report's own `source`. Oldest first, at most `limit`. Read-only.
  * (A report someone is handling — `reviewing` — or has closed is not listed.)
+ *
+ * ONLY A REPORT WHOSE NODE IS LOCKED (`suspected_csam`). A user's report in the `csam` category
+ * is also an open `csam` report, but its file is merely `under_review` until an operator
+ * escalates it: nothing is locked, so there is no lock to record and no "a file was locked"
+ * mail to send — listing it would write a `scan.suspected_csam` audit row for a file that is not
+ * locked and send that critical mail every day. Once it is escalated the node is locked and the
+ * same report is listed here.
  */
 export async function csamReportsToAnnounce(
   db: Executor,
@@ -811,6 +818,7 @@ export async function csamReportsToAnnounce(
             AND k.subject_id = 'csam_locked:' || r.id::text
             AND k.count > 0) AS lock_recorded
       FROM reports r
+      JOIN nodes locked ON locked.id = r.node_id AND locked.scan_status = 'suspected_csam'
       WHERE r.category = 'csam' AND r.status = 'open'
     ) o
     WHERE NOT o.told_today OR NOT o.lock_recorded

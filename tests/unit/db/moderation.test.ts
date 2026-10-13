@@ -1327,6 +1327,26 @@ describe("csamReportsToAnnounce", () => {
     expect(await dueAmong([open, ...others])).toEqual([open]);
   });
 
+  it("only a LOCKED file: a user's open csam report on a file that is merely under review is not listed — until it is escalated", async () => {
+    const locked = await lockedReport(5);
+    // What a user's report in the csam category leaves: an open csam report, the file `under_review`.
+    const { file, owner } = await reported("pending");
+    const userReport = await insertReport(db, {
+      nodeId: file.id,
+      ownerId: owner,
+      source: "user",
+      category: "csam",
+    });
+    await db.update(nodes).set({ scanStatus: "under_review" }).where(eq(nodes.id, file.id));
+    expect(await dueAmong([locked, { reportId: userReport! }])).toEqual([locked]);
+
+    // Escalated: the lock returns that same report, and now it is listed.
+    const escalated = (await lockSuspectedCsam(db, file.id, { source: "admin" }))!;
+    expect(escalated.reportId).toBe(userReport);
+    const due = await dueAmong([locked, { reportId: userReport! }]);
+    expect(due.map((row) => row.reportId).sort()).toEqual([locked.reportId, userReport!].sort());
+  });
+
   it("only category `csam`: an open report of another category is not listed", async () => {
     const csam = await lockedReport(5);
     const { file, owner } = await reported();
