@@ -10,6 +10,7 @@ import { filesUrl, ID, NODES, nodeOf } from "./fixtures";
 import {
   advance,
   dialog,
+  envelope,
   installFetch,
   loadedOf,
   ownerApi,
@@ -150,14 +151,7 @@ describe("MediaPreview — reactive refresh", () => {
         return probe();
       },
     });
-    const view = renderPreview(
-      <MediaPreview
-        source="owner"
-        item={loadedOf(NODES.mp4)}
-        kind="video"
-        download={<button>Download</button>}
-      />,
-    );
+    const view = renderPreview(<MediaPreview source="owner" item={loadedOf(NODES.mp4)} kind="video" />);
     await settle();
     const video = view.container.querySelector("video")!;
     loadMetadata(video);
@@ -198,7 +192,6 @@ describe("MediaPreview — reactive refresh", () => {
     // One question to the files host about the fresh URL, by status alone.
     expect(probes).toEqual([`HEAD /i/${ID.mp4}/tok-2`]);
     expect(within(view.container).queryByText(/^req /)).toBeNull();
-    expect(within(view.container).getByRole("button", { name: "Download" })).toBeTruthy();
   });
 
   it("a second error on a URL the files host serves → the browser cannot play it: say so, offer Download", async () => {
@@ -214,14 +207,82 @@ describe("MediaPreview — reactive refresh", () => {
     expect(api.minted.length).toBe(2);
   });
 
-  it("after a recovery the next failure gets its own retry", async () => {
-    const { api, video } = await playing();
+  it("a file that fails at the same place every time: 25 errors after metadata → exactly 2 mints, then it ends", async () => {
+    const { api, video, view, probes } = await playing();
+    // Each fresh URL loads its metadata, is sent back to where playback was, and fails there again.
+    for (let round = 0; round < 25; round += 1) {
+      if (!video.isConnected) break;
+      setPlayback(video, { error: { code: 3 } });
+      fireEvent.error(video);
+      await settle();
+      if (video.isConnected) loadMetadata(video);
+    }
+    await settle(20);
+    expect(api.minted.length).toBe(2);
+    expect(view.container.querySelector("video")).toBeNull();
+    expect(view.container.querySelector('[data-preview-state="error"]')).not.toBeNull();
+    // One question to the files host, not one per error.
+    expect(probes.length).toBe(1);
+  });
+
+  it('the same with a host that serves the bytes: 2 mints, then "can\'t play" — never a third', async () => {
+    const { api, video, view, setProbe } = await playing();
+    setProbe(() => new Response(null, { status: 200 }));
+    for (let round = 0; round < 25; round += 1) {
+      if (!video.isConnected) break;
+      setPlayback(video, { error: { code: 3 } });
+      fireEvent.error(video);
+      await settle();
+      if (video.isConnected) loadMetadata(video);
+    }
+    expect(api.minted.length).toBe(2);
+    expect(within(view.container).getByText("Your browser can't play this — download")).toBeTruthy();
+  });
+
+  it("errors arriving while the files host is being asked do not ask it again", async () => {
+    const { api, video, probes, setProbe } = await playing();
+    setProbe(() => new Promise<Response>(() => {}) as unknown as Response);
     fail(video);
     await settle();
+    fail(video);
+    fail(video);
+    fail(video);
+    await settle();
+    expect(probes.length).toBe(1);
+    expect(api.minted.length).toBe(2);
+  });
+});
+
+describe("MediaPreview — a proactive refresh that fails mid-play", () => {
+  it("the film keeps playing on the URL it has; the refresh is tried again and then swapped in", async () => {
+    vi.useFakeTimers();
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints === 2 ? envelope("internal", 503) : undefined;
+    });
+    installFetch({ api: api.handler });
+    const view = renderPreview(<MediaPreview source="owner" item={loadedOf(NODES.mp4)} kind="video" />);
+    await advance(0);
+    const video = view.container.querySelector("video")!;
     loadMetadata(video);
-    fail(video);
-    await settle();
-    expect(api.minted.length).toBe(3);
+    setPlayback(video, { currentTime: 700, paused: false });
+    await advance(REFRESH_MS);
+    expect(mints).toBe(2);
+    // Nothing on screen changed: the same element, the same URL, no error state.
+    expect(view.container.querySelector("video")).toBe(video);
+    expect(video.getAttribute("src")).toBe(filesUrl("inline", ID.mp4, "tok-1"));
+    expect(view.container.querySelector('[data-preview-state="error"]')).toBeNull();
+    expect(HTMLMediaElement.prototype.pause).not.toHaveBeenCalled();
+
+    setPlayback(video, { currentTime: 715 });
+    await advance(15_000);
+    expect(mints).toBe(3);
+    expect(video.getAttribute("src")).toBe(filesUrl("inline", ID.mp4, "tok-2"));
+    setPlayback(video, { currentTime: 0, paused: true });
+    loadMetadata(video);
+    expect(video.currentTime).toBe(715);
   });
 });
 

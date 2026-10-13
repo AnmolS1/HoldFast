@@ -1,10 +1,15 @@
 // Short-lived files-host URLs for the renderers, kept fresh.
 //
-//   proactive  a new URL is minted at 80 % of the lifetime for as long as the consumer has not
-//              said it holds everything it needs (`settle`);
-//   reactive   when the URL fails (`reportFailure`: a media or image `error` event, a 403 from a
-//              fetch) ONE more is minted; a second failure is final;
-//   final      a mint that is refused is final at once — no further mint, no timer left running.
+//   proactive  a new URL is minted at 80 % of the lifetime (never sooner than 30 s after the
+//              last) for as long as the consumer has not said it holds everything it needs
+//              (`settle`). A refresh that FAILS changes nothing on screen — the URL in use is
+//              still good — and is tried again 15 s, 30 s and 60 s later, then given up;
+//   reactive   when the URL in use fails (`reportFailure`: a media or image `error` event, a 403
+//              from a fetch) ONE more is minted — once per view of the file, whatever happened
+//              in between. A second failure is final, and so is a "fresh" URL that is the very
+//              one that failed (thumbnail URLs are identical for minutes);
+//   final      the first mint, or the one after a failure, being refused is final at once — no
+//              further mint, no timer left running.
 //
 // A URL is a bearer token: it lives in this hook's state and in the element that shows it, and
 // is never logged or stored.
@@ -33,12 +38,11 @@ export interface PreviewUrl {
   url: string | null;
   failure: PreviewFailure | null;
   /**
-   * The current URL did not work. Mints once more and resolves with the new URL, or with null
-   * when this was already the second failure (or the mint was refused) — then `failure` is set.
+   * The URL in use did not work. Mints once more — once per view of the file — and resolves with
+   * the new URL; resolves with null when this was already the second failure, when the mint was
+   * refused, or when the "new" URL is the one that failed. Then `failure` is set.
    */
   reportFailure(): Promise<string | null>;
-  /** The URL worked: a later failure gets its own single retry. */
-  loaded(): void;
   /** Everything needed is in hand (decoded image, fetched bytes): stop refreshing. */
   settle(): void;
   /** Give up without another mint (a files-host answer no fresh URL would change). */
@@ -53,20 +57,27 @@ interface State {
 
 interface Controller {
   reportFailure(): Promise<string | null>;
-  loaded(): void;
   settle(): void;
   fail(): void;
 }
 
 const REFRESH_AT = 0.8;
+/** A refresh is never scheduled sooner than this, whatever `expiresAt` and this device's clock say. */
+export const REFRESH_MIN_MS = 30_000;
+/** A failed proactive refresh is tried again after these waits, then given up. */
+export const REFRESH_RETRY_MS: readonly number[] = [15_000, 30_000, 60_000];
 
-/** When to mint again: 80 % of the lifetime, never later than 80 % of the kind's own lifetime. */
+/**
+ * When to mint again: 80 % of the lifetime — never later than 80 % of the kind's own lifetime,
+ * and never sooner than `REFRESH_MIN_MS`.
+ */
 export function refreshDelayMs(minted: MintedUrl, kind: "inline" | "thumb", now: number): number {
   const ttl = TOKEN_TTL[kind] * 1000;
   const remaining = Date.parse(minted.expiresAt) - now;
-  // A clock that disagrees with the server's must not push the refresh past the real expiry.
+  // A clock that disagrees with the server's must not push the refresh past the real expiry —
+  // nor make every URL look seconds from it (a mint and a reload every few seconds).
   const lifetime = Number.isFinite(remaining) && remaining > 0 ? Math.min(remaining, ttl) : ttl;
-  return lifetime * REFRESH_AT;
+  return Math.max(REFRESH_MIN_MS, lifetime * REFRESH_AT);
 }
 
 export function usePreviewUrl(
@@ -89,12 +100,17 @@ export function usePreviewUrl(
   useEffect(() => {
     let cancelled = false;
     let dead = false;
+    // The one re-mint after a failure. Spent once per view of this file and never given back:
+    // a file that fails at the same place every time must not mint for ever.
     let retried = false;
     let settled = false;
+    let inUse: string | null = null;
+    // Only the latest mint may publish: an older one answering late is dropped.
+    let latest = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let inFlight: Promise<string | null> | null = null;
 
     const publish = (url: string | null, failure: PreviewFailure | null) => {
+      inUse = url;
       if (!cancelled) setState({ key, url, failure });
     };
     const stop = (failure: PreviewFailure) => {
@@ -102,25 +118,44 @@ export function usePreviewUrl(
       clearTimeout(timer);
       publish(null, failure);
     };
-    const mint = (): Promise<string | null> => {
+    const adopt = (minted: MintedUrl): string => {
+      publish(minted.url, null);
+      if (!settled) timer = setTimeout(() => refresh(0), refreshDelayMs(minted, kind, Date.now()));
+      return minted.url;
+    };
+    /** The first URL, and the one after a failure: a refusal is final. */
+    const mint = (failed: string | null): Promise<string | null> => {
       clearTimeout(timer);
-      const request = mintUrl(latestSource.current, nodeId, kind, size).then(
+      const mine = (latest += 1);
+      return mintUrl(latestSource.current, nodeId, kind, size).then(
         (minted) => {
-          if (cancelled || dead) return null;
-          publish(minted.url, null);
-          if (!settled) timer = setTimeout(() => void mint(), refreshDelayMs(minted, kind, Date.now()));
-          return minted.url;
+          if (cancelled || dead || mine !== latest) return null;
+          // The same URL again would load nothing new and report nothing: it IS the second failure.
+          if (failed !== null && minted.url === failed) {
+            stop(HOST_FAILURE);
+            return null;
+          }
+          return adopt(minted);
         },
         (error: unknown) => {
-          if (!cancelled && !dead) stop(failureOf(error));
+          if (!cancelled && !dead && mine === latest) stop(failureOf(error));
           return null;
         },
       );
-      inFlight = request;
-      void request.finally(() => {
-        if (inFlight === request) inFlight = null;
-      });
-      return request;
+    };
+    /** The proactive refresh: a failure leaves what is on screen alone and is tried again. */
+    const refresh = (attempt: number): void => {
+      const mine = (latest += 1);
+      mintUrl(latestSource.current, nodeId, kind, size).then(
+        (minted) => {
+          if (!cancelled && !dead && !settled && mine === latest) adopt(minted);
+        },
+        () => {
+          if (cancelled || dead || settled || mine !== latest) return;
+          const wait = REFRESH_RETRY_MS[attempt];
+          if (wait !== undefined) timer = setTimeout(() => refresh(attempt + 1), wait);
+        },
+      );
     };
 
     const own: Controller = {
@@ -131,11 +166,7 @@ export function usePreviewUrl(
           return Promise.resolve(null);
         }
         retried = true;
-        // A refresh already under way is the one retry.
-        return inFlight ?? mint();
-      },
-      loaded() {
-        retried = false;
+        return mint(inUse);
       },
       settle() {
         settled = true;
@@ -149,7 +180,7 @@ export function usePreviewUrl(
     // Asked a moment later: a mount that is undone at once (development's double mount) mints
     // nothing, so one view of a file is one URL.
     queueMicrotask(() => {
-      if (!cancelled) void mint();
+      if (!cancelled) void mint(null);
     });
     return () => {
       cancelled = true;
@@ -159,7 +190,6 @@ export function usePreviewUrl(
   }, [nodeId, kind, size, key]);
 
   const reportFailure = useCallback(() => controller.current?.reportFailure() ?? Promise.resolve(null), []);
-  const loaded = useCallback(() => controller.current?.loaded(), []);
   const settle = useCallback(() => controller.current?.settle(), []);
   const fail = useCallback(() => controller.current?.fail(), []);
 
@@ -169,7 +199,6 @@ export function usePreviewUrl(
     url: current?.url ?? null,
     failure: current?.failure ?? null,
     reportFailure,
-    loaded,
     settle,
     fail,
   };

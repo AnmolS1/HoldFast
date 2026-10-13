@@ -73,10 +73,16 @@ export interface OwnerApi {
 }
 
 /**
- * The signed-in API for a set of nodes: `GET /api/nodes/:id`, `download-url`, `thumb-url`. Each
- * mint answers a NEW URL (`tok-1`, `tok-2`, …), so a test can tell them apart.
+ * The signed-in API for a set of nodes: `GET /api/nodes/:id`, `download-url`, `thumb-url`.
+ * An inline or download mint answers a NEW URL each time (`tok-1`, `tok-2`, …). A THUMBNAIL mint
+ * answers the SAME URL every time, as the real API does within a 600 s bucket — a test that
+ * wants distinct thumbnail URLs (a mint that straddles a bucket) says `distinctThumbs`.
  */
-export function ownerApi(nodes: NodeDto[], extra?: Handler): OwnerApi {
+export function ownerApi(
+  nodes: NodeDto[],
+  extra?: Handler,
+  options: { distinctThumbs?: boolean } = {},
+): OwnerApi {
   const minted: OwnerApi["minted"] = [];
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const handler: Handler = (call) => {
@@ -95,7 +101,8 @@ export function ownerApi(nodes: NodeDto[], extra?: Handler): OwnerApi {
     }
     if (match[2] === "/thumb-url" && call.method === "GET") {
       const size = Number(call.url.searchParams.get("size"));
-      const url = filesUrl("thumb", node.id, `tok-${minted.length + 1}`, size);
+      const token = options.distinctThumbs ? `tok-${minted.length + 1}` : "thumb-bucket";
+      const url = filesUrl("thumb", node.id, token, size);
       minted.push({ kind: "thumb", nodeId: node.id, url, size });
       return json(thumbUrlOf(url, Date.now()));
     }

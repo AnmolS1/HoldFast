@@ -18,14 +18,17 @@ interface Position {
 }
 
 export default function MediaPreview(props: RendererProps & { kind: "video" | "audio" }) {
-  const { source, item, download, kind } = props;
+  const { source, item, kind } = props;
   const preview = usePreviewUrl(source, item.id, "inline");
   const element = useRef<HTMLVideoElement | HTMLAudioElement | null>(null);
   // Where playback was when the URL was swapped; applied once the new one has its metadata.
   const resume = useRef<Position | null>(null);
   // The last position the element reported (an element in its error state may report none).
   const last = useRef<Position>({ time: 0, playing: false, rate: 1 });
+  // Errors seen in this view of the file. Never reset: metadata loading again on a fresh URL is
+  // not progress — a file that fails at the same second every time would otherwise mint for ever.
   const failures = useRef(0);
+  const probing = useRef(false);
   const [unsupported, setUnsupported] = useState(false);
 
   const track = () => {
@@ -38,7 +41,7 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
     };
   };
 
-  const { url, reportFailure, loaded } = preview;
+  const { url, reportFailure } = preview;
   useEffect(() => {
     const media = element.current;
     if (!media || !url) return;
@@ -73,8 +76,6 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
   const onLoadedMetadata = () => {
     const media = element.current;
     if (!media) return;
-    failures.current = 0;
-    loaded();
     const position = resume.current;
     resume.current = null;
     if (!position) return;
@@ -92,8 +93,11 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
       void reportFailure();
       return;
     }
-    // The fresh URL failed too. If the files host does serve it, the bytes are fine and it is the
+    // Failed again. If the files host does serve the URL, the bytes are fine and it is the
     // browser that cannot play them; otherwise this is the second failure and it is final.
+    // Either way this view of the file ends here: nothing more is minted.
+    if (probing.current) return;
+    probing.current = true;
     const current = media.currentSrc || media.src;
     fetch(current, { method: "HEAD", mode: "cors", credentials: "omit" }).then(
       (response) => {
@@ -104,8 +108,8 @@ export default function MediaPreview(props: RendererProps & { kind: "video" | "a
     );
   };
 
-  if (unsupported) return <NoPreview item={item} message={t("media.unsupported")} download={download} />;
-  if (preview.failure) return <ErrorState failure={preview.failure} actions={download} />;
+  if (unsupported) return <NoPreview item={item} message={t("media.unsupported")} />;
+  if (preview.failure) return <ErrorState failure={preview.failure} />;
 
   const shared = {
     controls: true,

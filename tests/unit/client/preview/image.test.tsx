@@ -103,7 +103,7 @@ describe("ImagePreview", () => {
     },
   );
 
-  it("an image that fails to load is re-minted once; a second failure is the error state, with no request id", async () => {
+  it("an image that fails to load is re-minted once; a second failure — the host refusing it, or the browser unable to draw it — is NoPreview", async () => {
     const { api } = await openOwner(nodeOf({ thumb: false }));
     fireEvent.error(main()!);
     await settle();
@@ -111,11 +111,16 @@ describe("ImagePreview", () => {
     expect(main()!.getAttribute("src")).toBe(api.minted[1]!.url);
     fireEvent.error(main()!);
     await settle();
-    expect(state()).toBe("error");
+    // Not a broken image and not an endless skeleton: the card, and the one Download button.
+    expect(renderer()).toBe("none");
+    expect(state()).toBeNull();
     expect(api.minted.length).toBe(2);
-    expect(within(dialog()!).queryByText(/^req /)).toBeNull();
-    // The file itself can still be had.
-    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBeGreaterThan(0);
+    expect(screen.getByText("No preview for this image — download to see it")).toBeTruthy();
+    expect(dialog()!.querySelector("[data-preview-blurup]")).toBeNull();
+    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBe(1);
+    // Nothing more is minted, however many errors a stray element might still report.
+    await settle(20);
+    expect(api.minted.length).toBe(2);
   });
 
   it("a refused mint is the error state with the API's request id", async () => {
@@ -153,7 +158,7 @@ describe("ImagePreview for HEIC / HEIF", () => {
       expect(renderer()).toBe("heic");
       expect(api.minted.filter((mint) => mint.kind !== "thumb")).toEqual([]);
       expect(api.minted.map((mint) => mint.size).sort()).toEqual([1280, 320]);
-      expect(main()!.getAttribute("src")).toBe(filesUrl("thumb", ID.heic, "tok-1", 1280));
+      expect(main()!.getAttribute("src")).toBe(filesUrl("thumb", ID.heic, "thumb-bucket", 1280));
       expect(screen.getByText("Original is HEIC — download for full quality")).toBeTruthy();
       expect(network.api().some((call) => call.url.pathname.endsWith("/download-url"))).toBe(false);
     },
@@ -180,22 +185,54 @@ describe("ImagePreview for HEIC / HEIF", () => {
     expect(renderer()).toBe("none");
     expect(api.minted).toEqual([]);
     expect(network.api().some((call) => /thumb-url|download-url/.test(call.url.pathname))).toBe(false);
-    expect(screen.getByText("No preview for this photo — download to see it")).toBeTruthy();
-    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBeGreaterThan(0);
+    expect(screen.getByText("No preview for this image — download to see it")).toBeTruthy();
+    expect(within(dialog()!).getAllByRole("button", { name: "Download" }).length).toBe(1);
   });
 
-  it("a 404 for the thumbnail → NoPreview (not an error), with Download", async () => {
+  it("a 404 for the thumbnail → NoPreview, although the re-mint answers the SAME URL (as the real API does)", async () => {
     const { api } = await openOwner(NODES.heic);
-    // The files host answers 404: the <img> reports an error, twice (one fresh URL in between).
-    fireEvent.error(main()!);
-    await settle();
+    // The files host answers 404: the <img> reports ONE error. The re-mint is the identical URL,
+    // so no second load and no second error will ever come — the preview must not wait for one.
     fireEvent.error(main()!);
     await settle();
     expect(renderer()).toBe("none");
     expect(state()).toBeNull();
-    expect(api.minted.filter((mint) => mint.size === 1280).length).toBe(2);
+    expect(dialog()!.querySelector("[data-preview-blurup]")).toBeNull();
+    const big = api.minted.filter((mint) => mint.size === 1280);
+    expect(big.length).toBe(2);
+    expect(big[0]!.url).toBe(big[1]!.url);
     expect(api.minted.some((mint) => mint.kind === "inline")).toBe(false);
-    expect(screen.getByText("No preview for this photo — download to see it")).toBeTruthy();
+    expect(screen.getByText("No preview for this image — download to see it")).toBeTruthy();
+    await settle(20);
+    expect(api.minted.filter((mint) => mint.size === 1280).length).toBe(2);
+  });
+
+  it("the special case — a re-mint that straddles a bucket and IS a new URL: the second load failing is NoPreview too", async () => {
+    await preloadRenderers();
+    const api = ownerApi([NODES.heic], undefined, { distinctThumbs: true });
+    installFetch({ api: api.handler });
+    renderPreview(<PreviewDialog open nodeId={ID.heic} onClose={noop} source="owner" />);
+    await screen.findByText(NODES.heic.name);
+    await waitFor(() => expect(renderer()).toBe("heic"));
+    await settle();
+    const first = main()!.getAttribute("src");
+    fireEvent.error(main()!);
+    await settle();
+    expect(renderer()).toBe("heic");
+    expect(main()!.getAttribute("src")).not.toBe(first);
+    fireEvent.error(main()!);
+    await settle();
+    expect(renderer()).toBe("none");
+    expect(api.minted.filter((mint) => mint.size === 1280).length).toBe(2);
+  });
+
+  it('the thumbnail mint itself answered 404 by the API → NoPreview, not "this file isn\'t here"', async () => {
+    await openOwner(NODES.heic, (call) =>
+      call.url.pathname.endsWith("/thumb-url") ? envelope("not_found", 404) : undefined,
+    );
+    await waitFor(() => expect(renderer()).toBe("none"));
+    expect(state()).toBeNull();
+    expect(screen.getByText("No preview for this image — download to see it")).toBeTruthy();
   });
 });
 

@@ -70,7 +70,7 @@ function BlurUp({ source, item }: Pick<RendererProps, "source" | "item">) {
 }
 
 export default function ImagePreview(props: RendererProps & { variant: "inline" | "thumb" }) {
-  const { source, item, download, variant } = props;
+  const { source, item, variant } = props;
   const preview = usePreviewUrl(
     source,
     item.id,
@@ -129,12 +129,13 @@ export default function ImagePreview(props: RendererProps & { variant: "inline" 
   }, [zoom, zoomBy]);
 
   if (preview.failure) {
-    // HEIC has nothing but its thumbnail: when the files host has none (a 404 is normal — the
-    // image service refused, or its quota is spent) there is no preview, only Download.
-    if (variant === "thumb" && preview.failure.host) {
-      return <NoPreview item={item} message={t("none.heicUnavailable")} download={download} />;
+    // The files host would not serve it, or the browser would not draw what it served (a file
+    // that is not the image it claims, one too large to decode): no preview, only Download. For
+    // HEIC that is normal — it has nothing but its thumbnail, and the image service may have none.
+    if (preview.failure.host || (variant === "thumb" && preview.failure.notFound)) {
+      return <NoPreview item={item} message={t("none.imageUnavailable")} />;
     }
-    return <ErrorState failure={preview.failure} actions={download} />;
+    return <ErrorState failure={preview.failure} />;
   }
 
   const width = zoom !== null && naturalWidth > 0 ? naturalWidth * zoom : undefined;
@@ -170,7 +171,6 @@ export default function ImagePreview(props: RendererProps & { variant: "inline" 
               setNaturalWidth(event.currentTarget.naturalWidth);
               setShown(true);
               // Decoded: nothing needs swapping any more.
-              preview.loaded();
               preview.settle();
             }}
             onError={() => {

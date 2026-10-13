@@ -5,6 +5,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { PublicPreviewSource } from "../../../../src/client/components/slots";
 import {
   fetchPreview,
+  REFRESH_MIN_MS,
+  REFRESH_RETRY_MS,
   refreshDelayMs,
   usePreviewUrl,
 } from "../../../../src/client/features/preview/usePreviewUrl";
@@ -103,10 +105,112 @@ describe("usePreviewUrl — proactive refresh", () => {
     expect(refreshDelayMs(at(INLINE_MS + 600_000), "inline", now)).toBe(REFRESH_MS);
     // A shorter-lived URL is refreshed at 80 % of what it has.
     expect(refreshDelayMs(at(100_000), "inline", now)).toBe(80_000);
+    // Never sooner than half a minute: a clock almost one lifetime ahead of the server's makes
+    // every URL look seconds from its end, and a film must not reload every few seconds.
+    expect(REFRESH_MIN_MS).toBe(30_000);
+    expect(refreshDelayMs(at(10_000), "inline", now)).toBe(30_000);
+    expect(refreshDelayMs(at(1_000), "inline", now)).toBe(30_000);
+    expect(refreshDelayMs(at(1), "thumb", now)).toBe(30_000);
+    expect(refreshDelayMs(at(37_500), "inline", now)).toBe(30_000);
+    expect(refreshDelayMs(at(37_501), "inline", now)).toBeGreaterThan(30_000);
     // Already past, or unreadable: the kind's lifetime is assumed.
     expect(refreshDelayMs(at(-5_000), "inline", now)).toBe(REFRESH_MS);
     expect(refreshDelayMs({ url: "u", expiresAt: "soon" }, "inline", now)).toBe(REFRESH_MS);
     expect(refreshDelayMs(at(INLINE_MS), "thumb", now)).toBe(600_000 * 0.8);
+  });
+});
+
+describe("usePreviewUrl — a proactive refresh that fails", () => {
+  /** Mints succeed except the calls whose number (1-based) is in `failing`. */
+  function flaky(failing: Set<number>) {
+    let count = 0;
+    return publicSource(async (nodeId) => {
+      count += 1;
+      if (failing.has(count)) throw new Error("503");
+      return {
+        url: filesUrl("inline", nodeId, `pub-${count}`),
+        expiresAt: new Date(Date.now() + INLINE_MS).toISOString(),
+      };
+    });
+  }
+
+  it("changes nothing on screen, and is tried again after 15 s", async () => {
+    vi.useFakeTimers();
+    const { source, mint } = flaky(new Set([2]));
+    const { result } = renderHook(() => usePreviewUrl(source, ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    expect(mint).toHaveBeenCalledTimes(2);
+    // The URL in use is still the first one, and nothing has failed.
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "pub-1"));
+    expect(result.current.failure).toBeNull();
+    await advance(REFRESH_RETRY_MS[0]! - 1);
+    expect(mint).toHaveBeenCalledTimes(2);
+    await advance(1);
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "pub-3"));
+    // Back to the ordinary rhythm: the next refresh is a period after the one that worked.
+    await advance(REFRESH_MS - 1);
+    expect(mint).toHaveBeenCalledTimes(3);
+    await advance(1);
+    expect(mint).toHaveBeenCalledTimes(4);
+  });
+
+  it("is bounded: 15 s, 30 s and 60 s later, then no more — and still nothing on screen has changed", async () => {
+    vi.useFakeTimers();
+    expect(REFRESH_RETRY_MS).toEqual([15_000, 30_000, 60_000]);
+    const { source, mint } = flaky(new Set([2, 3, 4, 5, 6, 7, 8]));
+    const { result } = renderHook(() => usePreviewUrl(source, ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    expect(mint).toHaveBeenCalledTimes(2);
+    await advance(15_000);
+    expect(mint).toHaveBeenCalledTimes(3);
+    await advance(30_000);
+    expect(mint).toHaveBeenCalledTimes(4);
+    await advance(60_000);
+    expect(mint).toHaveBeenCalledTimes(5);
+    await advance(10 * INLINE_MS);
+    expect(mint).toHaveBeenCalledTimes(5);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "pub-1"));
+    expect(result.current.failure).toBeNull();
+  });
+
+  it("only a failure of the URL in use leads to the one re-mint — and that one being refused is final", async () => {
+    vi.useFakeTimers();
+    const { source, mint } = flaky(new Set([2, 3]));
+    const { result } = renderHook(() => usePreviewUrl(source, ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    expect(result.current.failure).toBeNull();
+    // Now the URL in use fails (it has expired): the re-mint is call 3, which is refused.
+    await act(async () => void (await result.current.reportFailure()));
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(result.current.failure).toEqual({});
+    await advance(10 * INLINE_MS);
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("the signed-in source behaves the same: a 503 at the refresh leaves the URL, the request id is not shown", async () => {
+    vi.useFakeTimers();
+    let mints = 0;
+    const api = ownerApi([NODES.mp4], (call) => {
+      if (!call.url.pathname.endsWith("/download-url")) return undefined;
+      mints += 1;
+      return mints === 2 ? envelope("internal", 503) : undefined;
+    });
+    installFetch({ api: api.handler });
+    const { result } = renderHook(() => usePreviewUrl("owner", ID.mp4, "inline"));
+    await advance(0);
+    await advance(REFRESH_MS);
+    expect(mints).toBe(2);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "tok-1"));
+    expect(result.current.failure).toBeNull();
+    await advance(15_000);
+    expect(mints).toBe(3);
+    expect(result.current.url).toBe(filesUrl("inline", ID.mp4, "tok-2"));
   });
 });
 
@@ -137,19 +241,61 @@ describe("usePreviewUrl — reactive refresh", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("a URL that worked again earns the next failure its own single retry", async () => {
+  it("the one retry is per view of the file: nothing that happens in between gives it back", async () => {
     vi.useFakeTimers();
     const { source, mint } = publicSource();
     const { result } = renderHook(() => usePreviewUrl(source, ID.mp4, "inline"));
     await advance(0);
     await act(async () => void (await result.current.reportFailure()));
-    act(() => result.current.loaded());
-    await act(async () => void (await result.current.reportFailure()));
+    expect(mint).toHaveBeenCalledTimes(2);
+    // The fresh URL works for a while (a proactive refresh even replaces it) — and then fails.
+    await advance(REFRESH_MS);
     expect(mint).toHaveBeenCalledTimes(3);
     expect(result.current.failure).toBeNull();
     await act(async () => void (await result.current.reportFailure()));
     expect(mint).toHaveBeenCalledTimes(3);
     expect(result.current.failure).toEqual({ host: true });
+    await advance(10 * INLINE_MS);
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a re-mint that answers the very URL that failed is the second failure — nothing waits for a reload", async () => {
+    vi.useFakeTimers();
+    const same = filesUrl("thumb", ID.heic, "thumb-bucket", 1280);
+    const { source, mint } = publicSource(async () => ({
+      url: same,
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    }));
+    const { result } = renderHook(() => usePreviewUrl(source, ID.heic, "thumb", 1280));
+    await advance(0);
+    expect(result.current.url).toBe(same);
+    let next: string | null = "";
+    await act(async () => {
+      next = await result.current.reportFailure();
+    });
+    expect(next).toBeNull();
+    expect(mint).toHaveBeenCalledTimes(2);
+    expect(result.current.failure).toEqual({ host: true });
+    expect(result.current.url).toBeNull();
+    await advance(10 * INLINE_MS);
+    expect(mint).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("control: a proactive refresh that answers the same URL is fine (nothing failed)", async () => {
+    vi.useFakeTimers();
+    const same = filesUrl("thumb", ID.heic, "thumb-bucket", 1280);
+    const { source, mint } = publicSource(async () => ({
+      url: same,
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    }));
+    const { result } = renderHook(() => usePreviewUrl(source, ID.heic, "thumb", 1280));
+    await advance(0);
+    await advance(480_000);
+    expect(mint).toHaveBeenCalledTimes(2);
+    expect(result.current.url).toBe(same);
+    expect(result.current.failure).toBeNull();
   });
 
   it("a refused mint is final at once: no second mint, no retry, no timer", async () => {
@@ -215,7 +361,7 @@ describe("usePreviewUrl — reactive refresh", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(result.current.url).toBe(filesUrl("thumb", ID.heic, "tok-1", 1280));
+    expect(result.current.url).toBe(filesUrl("thumb", ID.heic, "thumb-bucket", 1280));
     expect(network.api("/api/nodes/").map((call) => call.url.pathname + call.url.search)).toEqual([
       `/api/nodes/${ID.heic}/thumb-url?size=1280`,
     ]);
