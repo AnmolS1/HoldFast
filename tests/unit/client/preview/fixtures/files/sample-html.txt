@@ -1,0 +1,2 @@
+<!doctype html>
+<html><body><script>window.__htmlRan = true</script><h1 id="fixture-html-heading">fixture html</h1></body></html>

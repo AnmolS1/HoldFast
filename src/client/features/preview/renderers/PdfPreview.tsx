@@ -14,6 +14,7 @@ import { ErrorState, PreviewSkeleton } from "../parts";
 import { t } from "../strings";
 import { fetchPreview, usePreviewUrl } from "../usePreviewUrl";
 import { NoPreview } from "./NoPreview";
+import { safeExternalUrl } from "./pdf-links";
 import { openPdf, PdfLockedError, type PdfDocument, type PdfLink, type PdfPage } from "./pdf-engine";
 import type { RendererProps } from "./types";
 
@@ -437,7 +438,9 @@ function Pages({ opened, name }: { opened: Opened; name: string }) {
         confirmLabel={t("pdf.leave.confirm")}
         onCancel={() => setLeaving(null)}
         onConfirm={() => {
-          if (leaving) window.open(leaving, "_blank", "noopener,noreferrer");
+          // Checked again where it is used: only http(s) and mailto ever leave the app.
+          const url = safeExternalUrl(leaving);
+          if (url) window.open(url, "_blank", "noopener,noreferrer");
           setLeaving(null);
         }}
       />

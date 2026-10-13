@@ -40,7 +40,8 @@ export default function TextPreview({ source, item, download }: RendererProps) {
       const response = await fetchPreview(firstUrl, { reportFailure, fail }, abort.signal);
       if (!response) return;
       try {
-        const decoded = decodeText(await response.arrayBuffer());
+        // A file's final line break ends its last line; it is not one more (empty) line.
+        const decoded = decodeText(await response.arrayBuffer()).replace(/(\r\n|\r|\n)$/, "");
         if (abort.signal.aborted) return;
         // The text is in hand: no URL is needed any more.
         settle();

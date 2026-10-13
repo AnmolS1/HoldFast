@@ -15,6 +15,7 @@ import {
   type PDFPageProxy,
 } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { safeExternalUrl } from "./pdf-links";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -53,19 +54,6 @@ export interface PdfDocument {
   /** The 1-based page a link's destination is on, or null. */
   pageOfDest(dest: unknown): Promise<number | null>;
   destroy(): void;
-}
-
-/** Only these leave the app from a document; everything else (`javascript:`, `file:`, …) is dropped. */
-export function safeExternalUrl(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" || url.protocol === "mailto:"
-      ? url.href
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 interface RawAnnotation {
