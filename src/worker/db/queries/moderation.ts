@@ -1,6 +1,32 @@
 // Moderation: the database side effects only. Callers send email, write audit rows and emit
 // metrics. Every function that composes others runs them on the executor it was given, in one
 // transaction (a savepoint when the caller already has one).
+//
+// LOCK ORDER FOR ANYTHING THAT TOUCHES A CSAM CASE — the lock, the clear, and every writer the
+// admin console adds (a filing, a release of holds). Taken out of this order two of them end in
+// a deadlock (40P01: nothing wrong is written, but one of them fails):
+//   1. the owner's TREE LOCK (queries/tree.ts) — only when an inheritable cause is written (a
+//      takedown, a node's legal hold, a DMCA notice on a node); FIRST in the transaction;
+//   2. `user` rows, lowest id first (`lockSuspectedCsam` takes them FOR NO KEY UPDATE);
+//   3. the `nodes` row;
+//   4. the hash's blocklist entry (`lockSuspectedCsam` writes it, `clearSuspectedCsam` locks it,
+//      `blocklist.confirmCsam` writes it);
+//   5. the node's `reports` rows, lowest id first.
+// So A FILING — the report becomes `actioned` — runs in ONE transaction: the node row first,
+// then `confirmCsam` (4), and only then the UPDATE of the report (5). Updating the report
+// first and confirming the hash afterwards is the opposite order to the clear's.
+// `clearSuspectedCsam` locks EVERY report on the node, not only the `csam` ones (and the `csam`
+// reports of the node's twins): a writer that holds any report of that node and then asks for
+// the node row deadlocks with it — every change of a report's status takes the NODE row first.
+//
+// Helpers that take the tree lock (`takedownNode`, `restoreTakedown`, `setNodeLegalHold`) take it
+// first in THEIR transaction; in a caller's transaction that is only "first" if the caller took
+// no row lock before. In one transaction they therefore come BEFORE: `lockSuspectedCsam` and
+// `clearSuspectedCsam` (user rows, the node), `setUnderReview` / `dismissReview` (the node),
+// `pauseLinks` / `unpauseLinks` (link rows). The natural orders are the right ones — take down,
+// then pause the subtree's links; restore, then unpause — and the two to watch are "confirm as
+// CSAM and take the folder down" and "clear the lock and restore the takedown": the takedown or
+// the restore goes first, or into a transaction of its own.
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { PgTransaction } from "drizzle-orm/pg-core";
@@ -168,6 +194,17 @@ export const CSAM_LOCK_ATTEMPTS = 4;
 const CSAM_LOCK_BACKOFF_MS = 15;
 const RETRYABLE = new Set(["40P01", "40001"]);
 
+export type CsamLockResult = {
+  reportId: string;
+  ownerId: string;
+  /**
+   * The status of the report returned, as the lock saw it under its locks: `open` for a new
+   * report and for one nobody has picked up; `reviewing` when someone is on it; `actioned` when
+   * it was FILED. The caller announces and records only an `open` one.
+   */
+  reportStatus: "open" | "reviewing" | "actioned";
+};
+
 /** The uploader set grew between the unlocked read and the locked one. */
 class SubjectsGrew extends Error {
   constructor(readonly userIds: string[]) {
@@ -189,7 +226,8 @@ class SubjectsGrew extends Error {
  * returns the node's `csam` report that is `open` or `reviewing`, or else the one that was FILED
  * (`actioned`: a redelivered verdict on a reported node opens no new case). Only after a
  * `dismissed` one is a lock a new case with a new report.
- * Null when there is no such node (also when a purge that started first deleted it meanwhile).
+ * Null when there is no such node (also when a purge that started first deleted it meanwhile)
+ * and for a node that is not a FILE: nothing is written.
  *
  * LOSING A DEADLOCK DOES NOT LOSE THE LOCK. Called with the database handle itself (not inside a
  * caller's transaction — every caller in the product), a transaction that Postgres ended as a
@@ -203,7 +241,7 @@ export async function lockSuspectedCsam(
   db: Executor,
   nodeId: string,
   opts: { source: "photodna" | "system" | "admin" },
-): Promise<{ reportId: string; ownerId: string } | null> {
+): Promise<CsamLockResult | null> {
   if (!isUuid(nodeId)) return null;
   if (isTransaction(db)) return lockInOneTransaction(db, nodeId, opts.source);
   for (let attempt = 1; ; attempt++) {
@@ -226,7 +264,7 @@ function lockInOneTransaction(
   db: Executor,
   nodeId: string,
   source: "photodna" | "system" | "admin",
-): Promise<{ reportId: string; ownerId: string } | null> {
+): Promise<CsamLockResult | null> {
   return db.transaction(async (tx) => {
     // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
     // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
@@ -275,18 +313,21 @@ async function lockRows(
   nodeId: string,
   userIds: string[],
   source: "photodna" | "system" | "admin",
-): Promise<{ reportId: string; ownerId: string } | null> {
+): Promise<CsamLockResult | null> {
   // One at a time, in order. An account deleted since the read locks nothing and is skipped.
   for (const userId of userIds) {
     await sp.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("no key update");
   }
   const [node] = await sp
-    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256 })
+    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256, kind: nodes.kind })
     .from(nodes)
     .where(eq(nodes.id, nodeId))
     .for("update");
   // Gone while this waited for a user row: a purge that began first has deleted it.
   if (!node) return null;
+  // A FILE only. A folder is dealt with by a takedown: this lock sets a hold that nothing may
+  // inherit, and takes no tree lock (queries/tree.ts).
+  if (node.kind !== "file") return null;
   const now = await csamSubjects(sp, nodeId);
   if (!now) return null;
   const all = subjectUserIds(now);
@@ -321,7 +362,7 @@ async function lockRows(
   }
 
   const [existing] = await sp
-    .select({ id: reports.id })
+    .select({ id: reports.id, status: reports.status })
     .from(reports)
     .where(
       and(
@@ -333,9 +374,15 @@ async function lockRows(
     // The case that is still being worked on first; else the one that was filed.
     .orderBy(sql`(${reports.status} = 'actioned')`, reports.createdAt)
     .limit(1);
-  const reportId =
-    existing?.id ?? (await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" }));
-  return { reportId: reportId!, ownerId: node.ownerId };
+  if (existing) {
+    return {
+      reportId: existing.id,
+      ownerId: node.ownerId,
+      reportStatus: existing.status as CsamLockResult["reportStatus"],
+    };
+  }
+  const reportId = await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" });
+  return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open" };
 }
 
 export type CsamClearResult = {

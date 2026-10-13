@@ -290,6 +290,37 @@ describe("blocklist", () => {
     expect(source).not.toBeNull();
   });
 
+  it("remove with onlyIfSourceNodeId refuses an entry a lock raised and a confirmed listing; a verdict's own entry goes", async () => {
+    const node = uuidv7();
+    const entry = async (sha: string) =>
+      (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha)))[0] ?? null;
+    // Raised by a lock on the very node that listed it: { csam, source X, raisedFrom malware }.
+    const raised = rand(32);
+    await db
+      .insert(hashBlocklist)
+      .values({
+        sha256: raised,
+        reason: "csam",
+        sourceNodeId: node,
+        raisedFrom: "malware",
+        raisedByNodeId: node,
+      });
+    expect(await blocklist.remove(db, raised, { onlyIfSourceNodeId: node })).toBe(false);
+    expect(await entry(raised)).toMatchObject({ reason: "csam", raisedFrom: "malware" });
+    // A confirmed listing has no source: no node's verdict can claim it.
+    const confirmed = rand(32);
+    await blocklist.confirmCsam(db, confirmed);
+    expect(await blocklist.remove(db, confirmed, { onlyIfSourceNodeId: node })).toBe(false);
+    expect(await entry(confirmed)).not.toBeNull();
+    // The control: the same node's plain verdict entry is removed.
+    const plain = rand(32);
+    await blocklist.upsert(db, { sha256: plain, reason: "malware", sourceNodeId: node });
+    expect(await blocklist.remove(db, plain, { onlyIfSourceNodeId: node })).toBe(true);
+    expect(await entry(plain)).toBeNull();
+    // Without the option (an admin deleting an entry outright) nothing is refused.
+    expect(await blocklist.remove(db, raised)).toBe(true);
+  });
+
   it("an explicit csam upsert and confirmCsam leave a detached entry: no source, nothing raised, author and note of a csam entry kept", async () => {
     const admin = await makeUser(db);
     const entry = async (sha: string) =>

@@ -1,7 +1,7 @@
 // The scanning interface: message shapes, the stub scanner, sending, rescans and the
 // suspected-CSAM handler. The consumer has its own file.
 import { env } from "cloudflare:workers";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
@@ -774,6 +774,57 @@ describe("lockSuspectedCsam", () => {
       ]);
       expect(await viaIn(db, file.id)).toEqual(["lock", "sweep"]);
     });
+  });
+
+  it("a lock repeated on a node whose report is FILED or being reviewed mails nobody and writes no second lock row", async () => {
+    /** Yesterday's markers: a repeat today WOULD record the lock and tell the operators again. */
+    const ageMarkers = (reportId: string) =>
+      testDb()
+        .update(downloadLedger)
+        .set({ day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10) })
+        .where(
+          and(
+            eq(downloadLedger.subjectType, "notice"),
+            inArray(downloadLedger.subjectId, [csamAlertMarker(reportId), csamLockMarker(reportId)]),
+          ),
+        );
+    const lockedYesterday = async () => {
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256: rand(32) });
+      const first = serviceDeps();
+      const { reportId } = await lockSuspectedCsam(first.deps, file.id, { source: "photodna" });
+      await first.settle();
+      expect(alertsFor(reportId)).toHaveLength(1);
+      expect(await lockRowsOf(file.id)).toHaveLength(1);
+      await ageMarkers(reportId);
+      return { file, reportId };
+    };
+    const repeat = async (fileId: string) => {
+      const again = serviceDeps();
+      const result = await lockSuspectedCsam(again.deps, fileId, { source: "photodna" });
+      await again.settle();
+      expect(again.deferred).toHaveLength(0);
+      return result;
+    };
+
+    for (const status of ["actioned", "reviewing"] as const) {
+      const { file, reportId } = await lockedYesterday();
+      await testDb().update(reports).set({ status }).where(eq(reports.id, reportId));
+      // The same report comes back; nobody is mailed, nothing is recorded, no new report.
+      expect(await repeat(file.id), status).toEqual({ reportId });
+      expect(alertsFor(reportId), status).toHaveLength(1);
+      expect(await lockRowsOf(file.id), status).toHaveLength(1);
+      expect(await sentRowsOf(file.id), status).toHaveLength(1);
+      expect(await testDb().select().from(reports).where(eq(reports.nodeId, file.id)), status).toHaveLength(
+        1,
+      );
+    }
+
+    // The control: the same repeat while the report is still OPEN records and announces again.
+    const open = await lockedYesterday();
+    expect(await repeat(open.file.id)).toEqual({ reportId: open.reportId });
+    expect(alertsFor(open.reportId)).toHaveLength(2);
+    expect(await lockRowsOf(open.file.id)).toHaveLength(2);
   });
 
   it("a mail that is only being retried reached nobody: unclaimed, false — and the lock is on record all the same", async () => {

@@ -454,6 +454,10 @@ export async function lockSuspectedCsam(
   const locked = await lockRows(deps.db, nodeId, opts);
   if (!locked) throw new AppError("not_found");
   const { reportId } = locked;
+  // Only a report nobody has picked up is recorded and announced: a repeat on a node whose
+  // report is being reviewed (someone is on it) or was FILED mails nobody and writes no second
+  // lock row. Decided on the status the lock saw under its locks, not on a second read.
+  if (locked.reportStatus !== "open") return { reportId };
   deps.defer(
     (async () => {
       await attempt(deps, "lock_record", () =>

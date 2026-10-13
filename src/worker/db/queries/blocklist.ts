@@ -1,4 +1,20 @@
 // The SHA-256 blocklist. A `csam` entry is never downgraded or removed by a weaker write.
+//
+// AN ENTRY'S STATES, and who moves it between them:
+//   - listed for a reason other than `csam` (`upsert`): `sourceNodeId` is the node whose verdict
+//     or takedown listed it, or null;
+//   - CREATED by a suspected-CSAM lock (`moderation.lockSuspectedCsam`): `csam`, `sourceNodeId`
+//     the locked node — a clear of the last locked node with that content deletes it;
+//   - RAISED by a lock: it was listed for another reason and is `csam` while the lock stands —
+//     `raisedFrom` is what it was, `raisedByNodeId` whose lock raised it; a clear puts it back;
+//   - CONFIRMED (`confirmCsam`, or an explicit `csam` `upsert`): `csam` with no source and
+//     nothing raised. Permanent to every clear of a lock.
+// `moderation.clearSuspectedCsam` is the only way a lock's entry is undone; `remove` here is an
+// admin's delete, and its `onlyIfSourceNodeId` form refuses the raised and the confirmed states.
+//
+// LOCK ORDER: the entry's row comes AFTER the `nodes` row and BEFORE the node's `reports` rows
+// (queries/moderation.ts). `confirmCsam` and `upsert` take the entry's row lock: a filing calls
+// `confirmCsam` after it has the node row and before it updates the report.
 
 import { and, eq, sql } from "drizzle-orm";
 import type { Executor } from "../client";
@@ -87,8 +103,11 @@ export async function confirmCsam(tx: Executor, sha256: string): Promise<boolean
 }
 
 /**
- * Removes an entry. With `onlyIfSourceNodeId`, only when that node's verdict added it (the
- * false-positive path must not remove an entry someone else added). True when a row went.
+ * Removes an entry. With `onlyIfSourceNodeId`, only when that node's verdict added it AND the
+ * entry is still what that verdict made it: an entry a suspected-CSAM lock RAISED (it has its
+ * own way back, `raisedFrom`) and a confirmed `csam` listing (no source at all) are refused.
+ * This is not how a cleared CSAM lock undoes its entry — that is `moderation.clearSuspectedCsam`,
+ * which knows the entry's whole state. True when a row went.
  */
 export async function remove(
   db: Executor,
@@ -101,7 +120,10 @@ export async function remove(
       and(
         eq(hashBlocklist.sha256, sha256),
         opts.onlyIfSourceNodeId !== undefined
-          ? eq(hashBlocklist.sourceNodeId, opts.onlyIfSourceNodeId)
+          ? and(
+              eq(hashBlocklist.sourceNodeId, opts.onlyIfSourceNodeId),
+              sql`${hashBlocklist.raisedFrom} IS NULL`,
+            )
           : undefined,
       ),
     )

@@ -230,6 +230,20 @@ export function notEffectivelyTrashedOrHidden(alias: string = "nodes"): SQL {
  * LOCK ORDER: the tree lock FIRST — before any row lock of the transaction — then `user` rows
  * (lowest id first), then `nodes`, then the rest. It ends with the (outermost) transaction.
  * Call it inside a transaction; outside one it would be released at once.
+ *
+ * "FIRST" IS ABOUT THE CALLER'S TRANSACTION, not about the helper that takes it: a helper that
+ * takes row locks may not run before a helper that takes the tree lock, in one transaction.
+ * The pairs to keep in this order (tree-lock helper first):
+ *   - `trash.deleteSubtreeRows` / `deleteVersionRows` BEFORE `uploads.deleteForUser` (upload
+ *     rows, other owners' `user` rows) — the account purge walks its roots first;
+ *   - `nodes.move`, `trash.restore`, the purge paths BEFORE `quota.reserve` / `release` /
+ *     `reconcileUsedBytes` and `ceilings.enforceUploadCeilings` (`user` rows) and
+ *     `nodes.replaceVersion` (the owner's `user` row, the node);
+ *   - `moderation.takedownNode` / `restoreTakedown` / `setNodeLegalHold` BEFORE
+ *     `lockSuspectedCsam`, `clearSuspectedCsam`, `setUnderReview`, `dismissReview` (user rows,
+ *     the node) and `links.pauseLinks` / `unpauseLinks` (link rows) — see queries/moderation.ts.
+ * Two transactions that each take the tree lock of TWO owners take them lowest owner id first
+ * (nothing built does).
  */
 export async function lockOwnerTree(tx: Executor, ownerId: string): Promise<void> {
   await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"tree:" + ownerId}, 0))`);

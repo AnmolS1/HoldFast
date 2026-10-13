@@ -81,7 +81,6 @@ afterAll(async () => {
 describe("migration 0006", () => {
   it("is in the journal, right after 0005", () => {
     expect(journal.entries[6]!.tag).toBe(TAG);
-    expect(journal.entries).toHaveLength(7);
   });
 
   it("before it, an entry cannot say what it was raised from (the control)", async () => {

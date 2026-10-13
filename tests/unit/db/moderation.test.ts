@@ -207,7 +207,7 @@ describe("lockSuspectedCsam", () => {
       keyVersion: 1,
     });
     const result = await lockSuspectedCsam(db, file.id, { source: "photodna" });
-    expect(result).toEqual({ reportId: expect.any(String), ownerId: owner });
+    expect(result).toEqual({ reportId: expect.any(String), ownerId: owner, reportStatus: "open" });
 
     expect(await getNode(db, file.id)).toMatchObject({
       scanStatus: "suspected_csam",
@@ -255,10 +255,15 @@ describe("lockSuspectedCsam", () => {
         .map((r) => r.id)
         .sort();
 
-    // A redelivered verdict on the reported node.
+    // A redelivered verdict on the reported node — and the caller is told the report was filed.
+    expect(first.reportStatus).toBe("open");
     expect(await lockSuspectedCsam(db, file.id, { source: "photodna" })).toMatchObject({
       reportId: first.reportId,
+      reportStatus: "actioned",
     });
+    await db.update(reports).set({ status: "reviewing" }).where(eq(reports.id, first.reportId));
+    expect((await lockSuspectedCsam(db, file.id, { source: "photodna" }))!.reportStatus).toBe("reviewing");
+    await db.update(reports).set({ status: "actioned" }).where(eq(reports.id, first.reportId));
     expect(await csamReports()).toEqual([first.reportId]);
 
     // A report that is still being worked on comes before the filed one.
@@ -275,6 +280,21 @@ describe("lockSuspectedCsam", () => {
     const fresh = (await lockSuspectedCsam(db, file.id, { source: "system" }))!;
     expect([first.reportId, open]).not.toContain(fresh.reportId);
     expect(await csamReports()).toHaveLength(3);
+  });
+
+  it("locks a FILE only: a folder is refused like an unknown id, and nothing is written", async () => {
+    const owner = await makeUser(db);
+    const folder = await makeFolder(db, owner, null, `folder-${rand()}`);
+    const inside = await makeFile(db, owner, folder.id, "inside.bin");
+    const link = await makeLink(db, folder.id, owner);
+    expect(await lockSuspectedCsam(db, folder.id, { source: "admin" })).toBeNull();
+    expect(await getNode(db, folder.id)).toMatchObject({ scanStatus: "clean", legalHold: false });
+    expect((await getById(db, link.id))!.pauseReasons).toEqual([]);
+    expect(await heldUsers([owner])).toEqual([]);
+    expect(await db.select().from(reports).where(eq(reports.nodeId, folder.id))).toEqual([]);
+    // The control: the file inside it is locked by the same call.
+    expect(await lockSuspectedCsam(db, inside.id, { source: "admin" })).toMatchObject({ ownerId: owner });
+    expect(await heldUsers([owner])).toEqual([owner]);
   });
 
   it("is all or nothing", async () => {
@@ -357,7 +377,7 @@ describe("lockSuspectedCsam", () => {
     });
 
     const result = await lockSuspectedCsam(db, f.file.id, { source: "photodna" });
-    expect(result).toEqual({ reportId: expect.any(String), ownerId: f.owner });
+    expect(result).toEqual({ reportId: expect.any(String), ownerId: f.owner, reportStatus: "open" });
     expect(await getNode(db, f.file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
     expect(await heldUsers(everyone)).toEqual([f.owner, f.e1, f.e2, f.e3].sort());
     // `csamSubjects` IS the set the lock held — what "Release holds" will release.
