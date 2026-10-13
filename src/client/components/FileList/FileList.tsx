@@ -825,7 +825,7 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
       )}
       {skeletons}
       {hasMore ? (
-        <Box ref={sentinelRef} data-load-more-sentinel aria-hidden="true" sx={{ height: 1 }} />
+        <Box ref={sentinelRef} data-load-more-sentinel aria-hidden="true" sx={{ height: "1px" }} />
       ) : null}
     </Box>
   );

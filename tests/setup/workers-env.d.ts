@@ -7,5 +7,7 @@ declare module "vitest" {
   interface ProvidedContext {
     /** This checkout's local database name (HOLDFAST_DB). */
     holdfastDb: string;
+    /** True when the run was started with HOLDFAST_CAP_TESTS=1 (the 2 GB tests). */
+    capTests: boolean;
   }
 }
