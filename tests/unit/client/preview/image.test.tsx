@@ -35,7 +35,8 @@ async function openOwner(node: NodeDto, extra?: Parameters<typeof ownerApi>[1]) 
   const network = installFetch({ api: api.handler });
   renderPreview(<PreviewDialog open nodeId={node.id} onClose={noop} source="owner" />);
   await screen.findByText(node.name);
-  await waitFor(() => expect(renderer()).not.toBeNull());
+  // The renderer, or — when the very first mint is refused — the error state in its place.
+  await waitFor(() => expect(renderer() ?? state()).not.toBeNull());
   await settle();
   return { api, network };
 }
