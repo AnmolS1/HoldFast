@@ -26,8 +26,13 @@ export type SearchOptions = {
    */
   visibleStatuses: readonly ScanStatus[] | { mine: readonly ScanStatus[]; shared: readonly ScanStatus[] };
   kind?: "file" | "folder";
-  /** The sniffed types and the extension fallback of one category, already resolved. */
-  category?: { mimes: readonly string[]; exts: readonly string[] };
+  /**
+   * The sniffed types and the extension fallback of one category, already resolved.
+   * `not: true` asks for the complement — the files in NONE of these types and extensions, as
+   * `categoryOf` (services/mime.ts) decides it: pass every category's types and extensions and
+   * the result is exactly the files it calls `other`.
+   */
+  category?: { mimes: readonly string[]; exts: readonly string[]; not?: true };
   /** Restrict to the content of this folder (any depth). */
   inFolder?: string;
   cursor?: string | null;
@@ -94,7 +99,16 @@ function matchAndRank(
     sql`n.scan_status IN (${statusList(statuses)})`,
   ];
   if (opts.kind) conditions.push(sql`n.kind = ${opts.kind}::node_kind`);
-  if (opts.category) {
+  if (opts.category?.not) {
+    // `categoryOf`'s own rule, negated: a file not yet sniffed, or sniffed as nothing in
+    // particular, is labelled by its extension first — so it is "in none" only when neither its
+    // extension nor its type is listed. IS NOT TRUE, not NOT: an unsniffed file compares as NULL.
+    conditions.push(
+      sql`n.kind = 'file' AND (lower(n.mime_sniffed) = ANY(${textArray(opts.category.mimes)})
+        OR (coalesce(lower(n.mime_sniffed), '') IN ('', 'text/plain', 'application/octet-stream')
+          AND n.ext = ANY(${textArray(opts.category.exts)}))) IS NOT TRUE`,
+    );
+  } else if (opts.category) {
     conditions.push(
       sql`n.kind = 'file' AND (n.mime_sniffed = ANY(${textArray(opts.category.mimes)})
         OR (n.mime_sniffed IS NULL AND n.ext = ANY(${textArray(opts.category.exts)})))`,
