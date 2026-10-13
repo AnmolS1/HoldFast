@@ -590,8 +590,20 @@ export const strikes = pgTable(
     note: text(),
     liftedAt: ts(),
     liftedBy: text().references(() => user.id, { onDelete: "set null" }),
+    /** SHA-256 of the content the strike is for, as `nodes.sha256` holds it. Null when unknown. */
+    contentSha256: text(),
   },
-  (t) => [index("strikes_user_at_idx").on(t.userId, t.at)],
+  (t) => [
+    index("strikes_user_at_idx").on(t.userId, t.at),
+    // One unlifted strike per violation: the same file (a redelivered verdict) and the same
+    // content (the same bytes uploaded again) never strike twice.
+    uniqueIndex("strikes_user_kind_node_uq")
+      .on(t.userId, t.kind, t.nodeId)
+      .where(sql`node_id IS NOT NULL AND lifted_at IS NULL`),
+    uniqueIndex("strikes_user_kind_content_uq")
+      .on(t.userId, t.kind, t.contentSha256)
+      .where(sql`content_sha256 IS NOT NULL AND lifted_at IS NULL`),
+  ],
 );
 
 /** One row per notice per alleged infringer. */
