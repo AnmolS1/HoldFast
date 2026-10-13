@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { SearchSuggestions } from "../../../../src/client/features/search";
 import { DEBOUNCE_MS } from "../../../../src/client/features/search/queries";
+import { redactCrumbOrDrop, redactOrDrop } from "../../../../src/client/lib/sentry";
 import { MIME_CATEGORIES } from "../../../../src/shared/constants";
 import { SearchResponse } from "../../../../src/shared/schemas/search";
 import { renderShell, setupShell, shellFetch } from "../shell/helpers";
@@ -160,6 +161,29 @@ describe("/search", () => {
     await openView("/search?q=secretword", { "GET /api/search": () => new Response("{", { status: 500 }) });
     for (const spy of spies)
       for (const call of spy.mock.calls) expect(JSON.stringify(call)).not.toContain("secretword");
+  });
+
+  it("q never reaches an error report: the address and the request lose their query in a breadcrumb or an event", () => {
+    // What the SDK records for the page's own navigation and for its request, passed through the
+    // same function `beforeBreadcrumb` / `beforeSend` use.
+    const crumbs = [
+      { category: "navigation", data: { from: "/search?q=se", to: "/search?q=secretword&category=pdf" } },
+      {
+        category: "fetch",
+        data: { method: "GET", url: "/api/search?q=secretword&scope=all", status_code: 200 },
+      },
+      { category: "xhr", data: { url: "http://localhost:5173/api/search?q=secretword" } },
+    ];
+    for (const crumb of crumbs) {
+      const sent = JSON.stringify(redactCrumbOrDrop(crumb));
+      expect(sent, crumb.category).not.toContain("secretword");
+      expect(sent, crumb.category).toContain("search");
+    }
+    const event = redactOrDrop({
+      message: "Failed to fetch /api/search?q=secretword",
+      request: { url: "http://localhost:5173/search?q=secretword", query_string: "q=secretword" },
+    });
+    expect(JSON.stringify(event)).not.toContain("secretword");
   });
 
   it("mobile: the filters are in a sheet", async () => {

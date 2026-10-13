@@ -88,7 +88,9 @@ function viewsApi(
         return answer(emptied ? USAGE_AFTER_EMPTY : USAGE);
       if (method === "GET" && path === "/api/search") {
         if (!(query.get("q") ?? "").startsWith("rep")) return answer(SEARCH_NONE);
-        return answer(query.get("category") === "pdf" ? SEARCH_PDF : SEARCH);
+        const found = query.get("category") === "pdf" ? SEARCH_PDF : SEARCH;
+        const kind = query.get("kind");
+        return answer(kind ? { ...found, items: found.items.filter((item) => item.kind === kind) } : found);
       }
       if (method === "DELETE" && path === "/api/trash") {
         deletes += 1;
@@ -361,11 +363,8 @@ test.describe("recent, starred, search, storage", () => {
     await open(page, origins.port, "/starred");
     await page.getByRole("searchbox", { name: "Search files" }).fill("rep");
     const suggestions = page.getByRole("list", { name: "Suggestions" });
-    await expect(suggestions.getByRole("button")).toHaveText([
-      "report.pdfWork",
-      "reported-bugs.txt",
-      "ReportsWork",
-    ]);
+    // Files only: a suggestion opens a preview, which a folder has not.
+    await expect(suggestions.getByRole("button")).toHaveText(["report.pdfWork", "reported-bugs.txt"]);
     await suggestions.getByRole("button").first().click();
     await expect(page).toHaveURL(new RegExp(`/preview/${nodeId(31)}$`));
   });
