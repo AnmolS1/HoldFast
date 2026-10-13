@@ -1,20 +1,25 @@
 // Name search over what a user may see: their own tree (`mine`), what is shared with them
 // through activated shares (`shared`), or both (`all`).
 //
-// Matching: `name ILIKE '%q%'`, or fuzzily — trigram similarity of the whole name (`name % q`,
-// pg_trgm's default threshold 0.3), or, for a query of `WORD_MATCH_MIN_CHARS` or more, WORD
+// Matching: `name ILIKE '%q%'`, or trigram similarity of the whole name (`name % q`, pg_trgm's
+// default threshold 0.3) — the STRICT matches, one statement per side, served by the GIN trigram
+// index on `nodes.name`. Ranking: a name that starts with the query, then a word that starts
+// with it, then a name that contains it, then the similar names; within each by similarity.
+//
+// THE WORD MATCH IS A FALLBACK. Only when the strict matches do not fill the window that was
+// asked for, and the query has `WORD_MATCH_MIN_CHARS` or more, the names that match by WORD
 // similarity (`q <% name`: the query against the best-matching stretch of the name, so a typo in
 // one word of a long name, or a name with an extension, is still found — "reprot" finds
-// report.pdf). All three are served by the GIN trigram index on `nodes.name`. Ranking: a name
-// that starts with the query, then a word that starts with it, then a name that contains it,
-// then the fuzzy matches; within each by similarity.
+// report.pdf) are read as well, strict matches excluded, and placed AFTER every strict match.
+// A query the strict matches answer costs and returns what it did without the fallback; the
+// order "strict, then by word" is the same on every page, so paging neither repeats nor skips.
 //
 // THE WORD THRESHOLD IS A SETTING, NOT AN ARGUMENT. `<%` compares with the server setting
 // `pg_trgm.word_similarity_threshold` (default 0.6), and the index is asked with that same
-// setting, so the search sets it — `set_config(…, is_local => true)`, i.e. SET LOCAL — in a
-// transaction of its own around the ranked reads. It ends with that transaction: the connection
-// goes back to the pool with the server's default. (Called inside a caller's transaction, it
-// lasts until THAT transaction ends; nothing else in this code base uses `<%`.)
+// setting, so the fallback sets it — `set_config(…, is_local => true)`, i.e. SET LOCAL — in a
+// transaction of its own around its reads. It ends with that transaction: the connection goes
+// back to the pool with the server's default. (Called inside a caller's transaction, it lasts
+// until THAT transaction ends; nothing else in this code base uses `<%`.)
 // Exclusions are the listings' own: system nodes, and anything in the trash or taken down —
 // directly or by ancestry (a file inside a taken-down folder is not found) — for the owner as well.
 
@@ -52,8 +57,8 @@ export type SearchOptions = {
   limit: number;
   /**
    * Raises the WHOLE-NAME similarity a fuzzy (non-substring) match needs. Default 0.3, the
-   * index's own. Given, every fuzzy match must reach it and there is no word matching; leave it
-   * unset for the default search.
+   * index's own. Given, every fuzzy match must reach it and there is no fallback to word
+   * matching; leave it unset for the default search.
    */
   threshold?: number;
 };
@@ -83,8 +88,8 @@ type Ranked = {
  */
 export const WORD_SIMILARITY_THRESHOLD = 0.4;
 /**
- * Queries shorter than this are not matched by word: at four letters and fewer the threshold is
- * reached by any word that merely begins with the same two letters.
+ * Queries shorter than this never fall back to the word match: at four letters and fewer the
+ * threshold is reached by any word that merely begins with the same two letters.
  */
 export const WORD_MATCH_MIN_CHARS = 5;
 
@@ -125,9 +130,10 @@ function matchAndRank(
 ): { where: SQL; rank: SQL; sim: SQL } {
   const escaped = escapeLike(q);
   const threshold = opts.threshold ?? 0.3;
-  const wholeName = sql`(n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real)`;
+  const strict = sql`(n.name ILIKE ${"%" + escaped + "%"} OR (n.name % ${q} AND similarity(n.name, ${q}) >= ${threshold}::real))`;
   const conditions: SQL[] = [
-    sql`(n.name ILIKE ${"%" + escaped + "%"} OR ${wholeName}${byWord ? sql` OR ${q} <% n.name` : sql``})`,
+    // By word: what the strict read did not already find.
+    byWord ? sql`${q} <% n.name AND NOT ${strict}` : strict,
     sql`n.system IS NULL`,
     notEffectivelyTrashedOrHidden("n"),
     sql`n.scan_status IN (${statusList(statuses)})`,
@@ -160,13 +166,16 @@ function matchAndRank(
       ) CYCLE id SET is_cycle USING path
       SELECT id FROM inside)`);
   }
+  const where = sql.join(conditions, sql` AND `);
+  // Below every strict match, the closest stretch first.
+  if (byWord) return { where, rank: sql`-1`, sim: sql`word_similarity(${q}, n.name)` };
   const rank = sql`CASE
     WHEN n.name ILIKE ${escaped + "%"} THEN 3
     WHEN n.name ILIKE ${"% " + escaped + "%"} OR n.name ILIKE ${"%\\_" + escaped + "%"}
       OR n.name ILIKE ${"%-" + escaped + "%"} OR n.name ILIKE ${"%." + escaped + "%"} THEN 2
     WHEN n.name ILIKE ${"%" + escaped + "%"} THEN 1
     ELSE 0 END`;
-  return { where: sql.join(conditions, sql` AND `), rank, sim: sql`similarity(n.name, ${q})` };
+  return { where, rank, sim: sql`similarity(n.name, ${q})` };
 }
 
 const ORDER = sql`rank DESC, sim DESC, name_key ASC, id ASC`;
@@ -266,23 +275,24 @@ export async function searchNames(
   if (offset > MAX_OFFSET) return { items: [], nextCursor: null };
   const take = offset + limit + 1;
 
-  const byWord = opts.threshold === undefined && [...query].length >= WORD_MATCH_MIN_CHARS;
   const ranked: Ranked[] = [];
-  const rankedReads = async (ex: Executor) => {
+  const rankedReads = async (ex: Executor, byWord: boolean, rows: number) => {
     if (opts.scope !== "shared")
-      ranked.push(...(await searchMine(ex, userId, query, opts, mineStatuses, take, byWord)));
+      ranked.push(...(await searchMine(ex, userId, query, opts, mineStatuses, rows, byWord)));
     if (opts.scope !== "mine")
-      ranked.push(...(await searchShared(ex, userId, query, opts, sharedStatuses, take, byWord)));
+      ranked.push(...(await searchShared(ex, userId, query, opts, sharedStatuses, rows, byWord)));
   };
-  if (byWord) {
+  await rankedReads(db, false, take);
+  // Fewer strict matches than the window needs: every one of them is in hand (each side was
+  // asked for the whole window), and the rest of the window is filled by word.
+  const missing = take - ranked.length;
+  if (missing > 0 && opts.threshold === undefined && [...query].length >= WORD_MATCH_MIN_CHARS) {
     await db.transaction(async (tx) => {
       await tx.execute(
         sql`SELECT set_config('pg_trgm.word_similarity_threshold', ${String(WORD_SIMILARITY_THRESHOLD)}, true)`,
       );
-      await rankedReads(tx);
+      await rankedReads(tx, true, missing);
     });
-  } else {
-    await rankedReads(db);
   }
   ranked.sort(compareRanked);
 
