@@ -328,6 +328,32 @@ describe("category and kind", () => {
     }
   });
 
+  it("a file is found under the category its answer shows, and under no other", async () => {
+    const me = await makeUser();
+    const t = token();
+    // Sniffed as nothing in particular: the extension is the label. A specific type is never
+    // overruled by the name.
+    await makeFile(me.id, null, { name: `${t} script.py`, mimeSniffed: "text/plain", ...clean });
+    await makeFile(me.id, null, {
+      name: `${t} blob.jpg`,
+      mimeSniffed: "application/octet-stream",
+      ...clean,
+    });
+    await makeFile(me.id, null, { name: `${t} program.jpg`, mimeSniffed: "application/zip", ...clean });
+    await makeFile(me.id, null, { name: `${t} readme`, mimeSniffed: "text/plain", ...clean });
+
+    const everything = page(await get(as(me), searchPath({ q: t, scope: "mine" })));
+    const shown = new Map(everything.items.map((item) => [item.name, item.mimeCategory]));
+    expect(shown.get(`${t} script.py`)).toBe("code");
+    expect(shown.get(`${t} blob.jpg`)).toBe("image");
+    expect(shown.get(`${t} program.jpg`)).toBe("archive");
+    for (const name of MIME_CATEGORY_NAMES) {
+      const found = namesOf(await get(as(me), searchPath({ q: t, scope: "mine", category: name })));
+      const expected = [...shown].filter(([, category]) => category === name).map(([file]) => file);
+      expect(found.sort(), name).toEqual(expected.sort());
+    }
+  });
+
   it("refuses a category that is not one of the eight, and any other name for the filter", async () => {
     const me = await makeUser();
     const refused: Record<string, string>[] = [
