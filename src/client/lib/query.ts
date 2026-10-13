@@ -54,7 +54,27 @@ const CONFIG_KEY = "public-config";
  * sign-out and on any identity change; `keepSession` is for the guard below, which runs while the
  * new session is being adopted.
  */
+let epoch = 0;
+
+/**
+ * A number that changes every time the account's state is purged (sign-out, a different
+ * identity). Work that outlives its request — a rollback after a failed save, an Undo, a toast, a
+ * poll — reads it when it STARTS and checks `sameAccount(then)` before it writes to the query
+ * cache or shows anything: a request that fails after the purge must not put the previous
+ * account's rows back into a cache the next account reads.
+ */
+export function accountEpoch(): number {
+  return epoch;
+}
+
+/** Whether no purge has happened since `then` (a value of `accountEpoch()`). */
+export function sameAccount(then: number): boolean {
+  return then === epoch;
+}
+
 export async function purgeUserState(options: { keepSession?: boolean } = {}): Promise<void> {
+  // First: from here on nothing started earlier may write.
+  epoch += 1;
   cancelReauth();
   cancelTermsGate();
   const userScoped = (key: readonly unknown[]) => key[0] !== CONFIG_KEY && key[0] !== SESSION_KEY;
