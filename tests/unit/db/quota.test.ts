@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { QueryError } from "../../../src/worker/db/errors";
+import { takedownNode } from "../../../src/worker/db/queries/moderation";
 import {
   commit,
   computeUsedBytes,
@@ -10,7 +11,8 @@ import {
   reserve,
   usageBreakdown,
 } from "../../../src/worker/db/queries/quota";
-import { nodeVersions, user } from "../../../src/worker/db/schema";
+import { effectiveHidden } from "../../../src/worker/db/queries/tree";
+import { nodes, nodeVersions, user } from "../../../src/worker/db/schema";
 import { baId, makeFile, makeFolder, makeUpload, makeUser, openDb, rand, rejection } from "./_helpers";
 
 let db: Db;
@@ -186,5 +188,38 @@ describe("usageBreakdown", () => {
     expect(u.filesBytes + u.trashBytes + u.versionsBytes + u.reservedBytes).toBe(u.usedBytes);
     for (const value of Object.values(u)) expect(typeof value).toBe("number");
     expect(await usageBreakdown(db, baId())).toBeNull();
+  });
+
+  // Hidden bytes COUNT (ruling D-8): the listings' inherited "hidden" predicate is never applied
+  // to a sum, so the meter does not move when something is taken down and reveals nothing.
+  it("a file inside a taken-down folder counts exactly as before the takedown — computeUsedBytes, reconcile and usageBreakdown", async () => {
+    const owner = await makeUser(db, { quotaBytes: 10_000 });
+    const folder = await makeFolder(db, owner, null, `f-${rand()}`);
+    const sub = await makeFolder(db, owner, folder.id, "sub");
+    const file = await makeFile(db, owner, sub.id, "inside.bin", { size: 1000 });
+    await db.insert(nodeVersions).values({
+      nodeId: file.id,
+      versionId: "old",
+      r2Key: `k/${rand()}`,
+      size: 300,
+      purgeAfter: new Date(Date.now() + 86_400_000),
+    });
+    await makeFile(db, owner, null, "outside.bin", { size: 50 });
+    await reconcileUsedBytes(db, owner);
+    const before = { used: await computeUsedBytes(db, owner), usage: await usageBreakdown(db, owner) };
+    expect(before.used).toBe(1350);
+    expect(before.usage).toMatchObject({ usedBytes: 1350, filesBytes: 1050, versionsBytes: 300 });
+
+    expect(await takedownNode(db, folder.id, { reason: "dmca", by: null })).toBe(true);
+    // The control that the takedown is real: the file is hidden by ancestry.
+    expect(await effectiveHidden(db, file.id)).toBe(true);
+    expect(await computeUsedBytes(db, owner)).toBe(before.used);
+    expect(await reconcileUsedBytes(db, owner)).toEqual({ before: 1350, after: 1350, delta: 0 });
+    expect(await usageBreakdown(db, owner)).toEqual(before.usage);
+
+    // Locked as suspected CSAM on top: still counted.
+    await db.update(nodes).set({ scanStatus: "suspected_csam" }).where(eq(nodes.id, file.id));
+    expect(await computeUsedBytes(db, owner)).toBe(before.used);
+    expect(await usageBreakdown(db, owner)).toEqual(before.usage);
   });
 });
