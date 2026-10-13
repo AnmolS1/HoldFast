@@ -181,6 +181,64 @@ describe("a finished upload", () => {
   });
 });
 
+describe("what a client cannot do with a finished or a second session", () => {
+  it("a failure AFTER the commit (the scan message cannot be sent) keeps the node and its bytes counted — nothing is released", async () => {
+    const user = await uploader();
+    const session = await uploaded(user, { size: 1000 });
+    const answer = await complete(
+      user,
+      session.uploadId,
+      {},
+      {
+        env: {
+          SCAN_QUEUE: {
+            send: async () => {
+              throw new Error("test: the queue is down");
+            },
+          },
+        },
+      },
+    );
+    expect(answer.status).toBe(201);
+    expect(await nodeById(String(answer.body.id))).toMatchObject({ scanStatus: "pending" });
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done" });
+    expect(await usedBytes(user.id)).toBe(1000);
+    // And the session cannot be aborted for a refund afterwards.
+    expect((await call(user, "DELETE", `/uploads/${session.uploadId}`)).status).toBe(409);
+    expect(await usedBytes(user.id)).toBe(1000);
+  });
+
+  it("two sessions never resolve to one key — not even two replaces of one file; the second to complete is refused", async () => {
+    const owner = await uploader({ usedBytes: 100 });
+    const folder = await makeFolder(owner.id);
+    const file = await makeFile(owner.id, folder.id, { name: "plan.txt", scanStatus: "clean" });
+    await putObject(file.r2Key!, "the old version");
+    const replace = {
+      parentId: folder.id,
+      name: "plan.txt",
+      onConflict: "replace" as const,
+      replaceNodeId: file.id,
+    };
+    const a = await uploaded(owner, replace, new Uint8Array(1000).fill(1));
+    const b = await uploaded(owner, replace, new Uint8Array(2000).fill(2));
+    const [rowA, rowB] = [(await sessionRow(a.uploadId))!, (await sessionRow(b.uploadId))!];
+    expect(rowA.nodeId).toBe(rowB.nodeId);
+    expect(new Set([rowA.r2Key, rowB.r2Key, file.r2Key]).size).toBe(3);
+    expect(await usedBytes(owner.id)).toBe(3100);
+
+    expect((await complete(owner, a.uploadId)).status).toBe(200);
+    // The file is `pending` again: it cannot be replaced before it has a verdict.
+    const second = await complete(owner, b.uploadId);
+    expect(second.status).toBe(409);
+    expect(second.body.message).toBe(REPLACE_REFUSED_MESSAGE);
+    expect(await nodeById(file.id)).toMatchObject({ r2Key: rowA.r2Key, size: 1000 });
+    expect(await env.FILES.head(rowB.r2Key)).toBeNull();
+    // The old version (100) and the new one (1000) count; the refused upload's 2000 came back.
+    expect(await usedBytes(owner.id)).toBe(1100);
+    expect(await versionsOf(file.id)).toHaveLength(1);
+  });
+});
+
 describe("the stub scan pipeline (how files become downloadable in this wave)", () => {
   it("the message complete sent, handed to the consumer, turns the node clean — and the EICAR file infected", async () => {
     const user = await uploader();
