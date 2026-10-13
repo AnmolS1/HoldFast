@@ -150,10 +150,13 @@ describe("registry: controls (each rule is seen to fail)", () => {
     expect(withExtra({ file: "search", method: "GET", path: "/nodes" })).toEqual([
       "search: GET /nodes — outside its row (may declare: /search)",
     ]);
-    expect(withExtra({ file: "nodes", method: "DELETE", path: `/nodes/${id}` })).toEqual([
+    // Once the real trash router declares these two, declaring them in `nodes` is also a
+    // duplicate; "outside its row" is what this case is about (as for accept-terms below).
+    const outside = (problems: string[]) => problems.filter((problem) => problem.includes("outside its row"));
+    expect(outside(withExtra({ file: "nodes", method: "DELETE", path: `/nodes/${id}` }))).toEqual([
       `nodes: DELETE /nodes/${id} — outside its row: claimed by trash`,
     ]);
-    expect(withExtra({ file: "nodes", method: "POST", path: `/nodes/${id}/trash` })).toHaveLength(1);
+    expect(outside(withExtra({ file: "nodes", method: "POST", path: `/nodes/${id}/trash` }))).toHaveLength(1);
     // accept-terms is a real route of account-lifecycle now: declaring it in `account` is outside
     // that file's row (and, separately, a duplicate).
     expect(
@@ -161,7 +164,7 @@ describe("registry: controls (each rule is seen to fail)", () => {
         problem.includes("outside its row"),
       ),
     ).toHaveLength(1);
-    expect(withExtra({ file: "account", method: "GET", path: "/account/usage" })).toHaveLength(1);
+    expect(outside(withExtra({ file: "account", method: "GET", path: "/account/usage" }))).toHaveLength(1);
     expect(withExtra({ file: "uploads", method: "GET", path: "/made-up" })).toHaveLength(1);
     // A router-wide middleware would also run for every router mounted after it.
     expect(withExtra({ file: "nodes", method: "ALL", path: "/*" })).toHaveLength(1);
