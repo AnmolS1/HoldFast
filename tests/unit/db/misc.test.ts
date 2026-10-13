@@ -296,15 +296,13 @@ describe("blocklist", () => {
       (await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha)))[0] ?? null;
     // Raised by a lock on the very node that listed it: { csam, source X, raisedFrom malware }.
     const raised = rand(32);
-    await db
-      .insert(hashBlocklist)
-      .values({
-        sha256: raised,
-        reason: "csam",
-        sourceNodeId: node,
-        raisedFrom: "malware",
-        raisedByNodeId: node,
-      });
+    await db.insert(hashBlocklist).values({
+      sha256: raised,
+      reason: "csam",
+      sourceNodeId: node,
+      raisedFrom: "malware",
+      raisedByNodeId: node,
+    });
     expect(await blocklist.remove(db, raised, { onlyIfSourceNodeId: node })).toBe(false);
     expect(await entry(raised)).toMatchObject({ reason: "csam", raisedFrom: "malware" });
     // A confirmed listing has no source: no node's verdict can claim it.
