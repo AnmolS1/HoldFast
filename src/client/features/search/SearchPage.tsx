@@ -5,7 +5,7 @@ import Button from "@mui/material/Button";
 import TextField from "@mui/material/TextField";
 import { SlidersHorizontal } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { useSearchParams } from "react-router";
+import { useLocation, useNavigationType, useSearchParams } from "react-router";
 import { BottomSheet } from "../../components/BottomSheet";
 import { EmptyState } from "../../components/EmptyState";
 import { useIsDesktop } from "../../theme/breakpoints";
@@ -43,6 +43,11 @@ const SCOPE_LABEL = {
 } as const satisfies Record<SearchScope, string>;
 
 const ANY = "";
+
+/** Marks an address this page wrote from its own box (see the note on `typed` below). */
+const OWN_WRITE = { searchBox: true } as const;
+const isOwnWrite = (state: unknown): boolean =>
+  typeof state === "object" && state !== null && (state as { searchBox?: unknown }).searchBox === true;
 
 interface FiltersProps {
   state: SearchState;
@@ -102,24 +107,30 @@ export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const state = useMemo(() => parseSearch(params), [params]);
   const search = useSearch(state);
+  const location = useLocation();
+  const navigationType = useNavigationType();
   const loadMore = useLoadMore(search.fetchNextPage);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [sheet, setSheet] = useState(false);
 
-  // What the user has typed and the address does not say yet; `null` = the box shows the address.
+  // The box is the source of truth while the user types: `typed` is what it holds, the address
+  // follows after a pause, and an address that changed BECAUSE of that write never overrules the
+  // box — the write can take a while to land (the frame re-checks the session on every address
+  // change) and more keys arrive meanwhile. The address wins only when somebody else changed it:
+  // the header's search, a link, back / forward. `null` = the box shows the address.
   const [typed, setTyped] = useState<string | null>(null);
   const [seenQ, setSeenQ] = useState(state.q);
+  const ownWrite = navigationType !== "POP" && isOwnWrite(location.state);
   if (state.q !== seenQ) {
     setSeenQ(state.q);
-    // The address changed under the box (the header's search, back/forward): it wins.
-    if (typed !== null && typed.trim() !== state.q) setTyped(null);
+    if (!ownWrite && typed !== null && typed.trim() !== state.q) setTyped(null);
   }
   useEffect(() => {
     if (typed === null) return;
     const q = typed.trim().slice(0, Q_MAX);
     if (q === state.q) return;
     const timer = setTimeout(
-      () => setParams(searchParamsOf({ ...state, q }), { replace: true }),
+      () => setParams(searchParamsOf({ ...state, q }), { replace: true, state: OWN_WRITE }),
       DEBOUNCE_MS,
     );
     return () => clearTimeout(timer);
