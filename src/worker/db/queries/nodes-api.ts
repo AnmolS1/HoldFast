@@ -56,7 +56,7 @@ function skipReason(status: ScanStatus, owner: boolean): ZipSkipReason {
 const WALK_FACTOR = 3;
 
 export type ZipLimits = {
-  /** At most this many files are answered. */
+  /** At most this many entries are answered. */
   maxFiles: number;
   /** At most this many rows of the tree (folders and files) are read. Default: 3 × `maxFiles`. */
   maxWalked?: number;
@@ -81,8 +81,9 @@ export type ZipLimits = {
  * costs. Everything that does need a whole set — one row per file, the order — works on those
  * rows only. A tree that is larger is answered from its upper levels, with `truncated`.
  *
- * At most `maxFiles` files are answered (entries and skipped together); `truncated` says there
- * were more, or that the walk was cut. A file reached through two roots (a folder and something
+ * At most `maxFiles` ENTRIES are answered; `truncated` says there were more clean files, or that
+ * the walk was cut. Skipped files do not count against the cap (their number is bounded by the
+ * walk). A file reached through two roots (a folder and something
  * inside it) is listed once, under the outer one.
  */
 export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLimits): Promise<ZipManifest> {
@@ -138,26 +139,30 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
     LEFT JOIN listed l ON true
     ORDER BY l.ord, l.path, l.id`);
 
-  const found = result.rows.filter((row) => row.id !== null);
-  const rows = found.slice(0, maxFiles);
   const manifest: ZipManifest = {
     entries: [],
     totalBytes: 0,
     skipped: [],
-    truncated: found.length > maxFiles || Number(result.rows[0]?.walked ?? 0) > maxWalked,
+    truncated: Number(result.rows[0]?.walked ?? 0) > maxWalked,
   };
-  for (const row of rows) {
+  for (const row of result.rows) {
+    if (row.id === null) continue;
     if (row.scan_status !== "clean") {
       manifest.skipped.push({
-        nodeId: row.id!,
+        nodeId: row.id,
         path: row.path,
         reason: skipReason(row.scan_status, row.owner),
       });
       continue;
     }
+    // The cap is on ENTRIES: a file that is skipped anyway does not take a clean file's place.
+    if (manifest.entries.length >= maxFiles) {
+      manifest.truncated = true;
+      continue;
+    }
     const size = Number(row.size);
     manifest.entries.push({
-      nodeId: row.id!,
+      nodeId: row.id,
       path: row.path,
       size,
       etag: row.version_id,

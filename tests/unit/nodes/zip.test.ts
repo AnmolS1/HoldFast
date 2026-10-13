@@ -246,6 +246,23 @@ describe("POST /nodes/zip-manifest", () => {
     expect(body.totalBytes).toBe(body.entries.reduce((sum, entry) => sum + entry.size, 0));
   });
 
+  it("the cap counts entries only: skipped files neither use it up nor set truncated", async () => {
+    const owner = await person();
+    const folder = await makeFolder(owner.id, null, { name: "mixed" });
+    // Six files that are skipped sort BEFORE the eight clean ones.
+    for (let i = 0; i < 6; i++)
+      await makeFile(owner.id, folder.id, { name: `a-pending-${i}.bin`, scanStatus: "pending" });
+    for (let i = 0; i < 8; i++)
+      await makeFile(owner.id, folder.id, { name: `b-clean-${i}.bin`, scanStatus: "clean" });
+    const roots = [{ id: folder.id, label: "mixed", owner: true }];
+
+    const exact = await zipManifest(testDb(), roots, { maxFiles: 8 });
+    expect([exact.entries.length, exact.skipped.length, exact.truncated]).toEqual([8, 6, false]);
+    const over = await zipManifest(testDb(), roots, { maxFiles: 7 });
+    expect([over.entries.length, over.skipped.length, over.truncated]).toEqual([7, 6, true]);
+    expect(over.totalBytes).toBe(over.entries.reduce((sum, entry) => sum + entry.size, 0));
+  });
+
   describe("bounded before it walks", () => {
     // A second handle on the same database that records what it sends, so the plan that is
     // checked is the plan of the statement the manifest really sent.
