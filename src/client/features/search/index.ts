@@ -1,10 +1,3 @@
-// PLACEHOLDER — taken over by the views task (T19), which keeps `SearchSuggestions` and its props.
-import type { SearchSuggestionsProps } from "../../components/slots";
-
+// The search slot of the shell: the header renders `SearchSuggestions` under its box.
 export { routes } from "./routes";
-
-/** Stub: renders nothing. The real component lists the top matches under the header search box. */
-export function SearchSuggestions(props: SearchSuggestionsProps): null {
-  void props;
-  return null;
-}
+export { SearchSuggestions } from "./SearchSuggestions";
