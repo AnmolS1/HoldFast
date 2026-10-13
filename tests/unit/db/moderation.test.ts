@@ -315,10 +315,12 @@ describe("csamReportsToAnnounce", () => {
   });
 
   it("today's claimed marker takes a report off the list; yesterday's, another report's, or an unclaimed one does not", async () => {
-    const toldToday = await lockedReport(5);
-    const toldYesterday = { ...(await lockedReport(4)), lockRecorded: true };
-    const unclaimed = { ...(await lockedReport(3)), lockRecorded: true };
-    const untold = { ...(await lockedReport(2)), lockRecorded: true };
+    // Four days old, like their lock markers below: a marker is claimed during its report's life.
+    const old = 4 * 1440;
+    const toldToday = await lockedReport(old + 5);
+    const toldYesterday = { ...(await lockedReport(old + 4)), lockRecorded: true };
+    const unclaimed = { ...(await lockedReport(old + 3)), lockRecorded: true };
+    const untold = { ...(await lockedReport(old + 2)), lockRecorded: true };
     // Every lock here was recorded (on some earlier day), so only the alert decides.
     for (const report of [toldToday, toldYesterday, unclaimed, untold]) {
       await mark(report.reportId, 3, 1, "csam_locked");
@@ -335,7 +337,8 @@ describe("csamReportsToAnnounce", () => {
 
   it("a lock that was NEVER recorded keeps a report listed even when the operators were told today; a lock recorded on any day does not", async () => {
     const neverRecorded = await lockedReport(4);
-    const recordedDaysAgo = await lockedReport(3);
+    // Nine days old, recorded the day it was filed.
+    const recordedDaysAgo = await lockedReport(9 * 1440 + 3);
     const zeroCountRow = await lockedReport(2);
     for (const report of [neverRecorded, recordedDaysAgo, zeroCountRow]) await mark(report.reportId, 0);
     await mark(recordedDaysAgo.reportId, 9, 1, "csam_locked");
@@ -350,6 +353,41 @@ describe("csamReportsToAnnounce", () => {
     const { reportId } = (await lockSuspectedCsam(db, file.id, { source: "photodna" }))!;
     expect(await dueAmong([{ reportId }])).toEqual([
       { reportId, nodeId: file.id, source: "photodna", lockRecorded: false },
+    ]);
+  });
+
+  it("the lock's record is looked for from the report's own day on: old rows of other subjects do not count, and nothing is read from before the report existed", async () => {
+    const day = 1440;
+    const told = async (ageMinutes: number) => {
+      const report = await lockedReport(ageMinutes);
+      await mark(report.reportId, 0);
+      return report;
+    };
+    // An old, unrelated ledger row — another report's lock marker, a year back — says nothing
+    // about this report.
+    const besideOldRow = await told(5);
+    await mark(uuidv7(), 400, 1, "csam_locked");
+    await db.insert(downloadLedger).values({
+      day: sql`((now() AT TIME ZONE 'UTC')::date - 400)`,
+      subjectType: "notice",
+      subjectId: `unrelated:${besideOldRow.reportId}`,
+      bytes: 0,
+      count: 1,
+    });
+    // Recorded on the day the report was filed, thirty days ago: found.
+    const recordedAtFiling = await told(30 * day + 4);
+    await mark(recordedAtFiling.reportId, 30, 1, "csam_locked");
+    // Recorded yesterday, for a report filed thirty days ago (the sweep caught up): found.
+    const recordedLater = await told(30 * day + 3);
+    await mark(recordedLater.reportId, 1, 1, "csam_locked");
+    // THE BOUND: a row dated long before the report existed is outside what is read. (No such
+    // row can be written — the marker's id is the report's — which is why the scan may skip it.)
+    const before = await told(2);
+    await mark(before.reportId, 60, 1, "csam_locked");
+
+    expect(await dueAmong([besideOldRow, recordedAtFiling, recordedLater, before])).toEqual([
+      besideOldRow,
+      before,
     ]);
   });
 

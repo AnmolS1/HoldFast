@@ -259,7 +259,9 @@ export async function setUserLegalHold(db: Executor, userId: string, held: boole
  *   - nobody has been told TODAY — today's alert marker (ledger subject `notice`, id
  *     `csam_alert:<report id>`) has not been claimed; or
  *   - the lock was NEVER recorded — no `csam_locked:<report id>` marker has been claimed on any
- *     day (`lockRecorded: false`).
+ *     day of the report's life (`lockRecorded: false`). The ledger's key starts with the day, so
+ *     that lookup is bounded below by the report's own age: a marker names its report, so it is
+ *     claimed on or after the day the report was created (one day of slack).
  * Each row carries the report's own `source`. Oldest first, at most `limit`. Read-only.
  * (A report someone is handling — `reviewing` — or has closed is not listed.)
  */
@@ -284,7 +286,8 @@ export async function csamReportsToAnnounce(
             AND l.count > 0) AS told_today,
         EXISTS (
           SELECT 1 FROM download_ledger k
-          WHERE k.subject_type = 'notice'
+          WHERE k.day >= (r.created_at AT TIME ZONE 'UTC')::date - 1
+            AND k.subject_type = 'notice'
             AND k.subject_id = 'csam_locked:' || r.id::text
             AND k.count > 0) AS lock_recorded
       FROM reports r
