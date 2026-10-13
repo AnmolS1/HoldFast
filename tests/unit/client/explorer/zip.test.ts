@@ -7,9 +7,18 @@ import {
   cancelZip,
   getZipJobs,
   leftOutSentence,
+  safeZipPath,
+  setZipSleepForTests,
   startZip,
+  uniqueZipPath,
   ZIP_BLOB_MAX_BYTES,
+  ZIP_FETCH_ATTEMPTS,
+  ZIP_LIMITS,
+  ZIP_MANIFEST_ROOTS,
+  ZIP_RATE_WAIT_MAX_MS,
+  ZIP_RATE_WAITS,
 } from "../../../../src/client/features/explorer/zip";
+import { purgeUserState } from "../../../../src/client/lib/query";
 import { TOKEN_TTL, ZIP_URL_BATCH } from "../../../../src/shared/constants";
 import type { NodeDto, ZipManifest } from "../../../../src/shared/schemas/node";
 import { json, type MockCall } from "../shell/helpers";
@@ -125,11 +134,11 @@ describe("URLs are minted lazily, one window ahead of the stream", () => {
     const tokens = calls
       .filter((call) => isFile(call) && idOfFile(call) === files[0]!.id)
       .map((call) => call.path);
-    expect(tokens).toHaveLength(2);
-    expect(tokens[0]).not.toBe(tokens[1]);
+    // (The fake numbers its tokens: the window minted 1 and 2, the re-mint 3.)
+    expect(tokens).toEqual([`/d/${files[0]!.id}/token-1`, `/d/${files[0]!.id}/token-3`]);
   });
 
-  it("once means once: a node that keeps failing is left out and named, the rest is zipped", async () => {
+  it("once means once: a node that keeps failing is MISSING — the archive is not called saved, and says which files", async () => {
     const files = filesIn(3);
     const drive = new FakeDrive([FOLDER, ...files]);
     drive.urlErrors.set(files[0]!.id, ["scan_pending", "scan_pending", "scan_pending"]);
@@ -137,19 +146,19 @@ describe("URLs are minted lazily, one window ahead of the stream", () => {
       if (!isFile(call)) return undefined;
       return idOfFile(call) === files[2]!.id ? new Response("no", { status: 403 }) : bytes("ok");
     });
-    captureBlob();
+    const { saved } = captureBlob();
     const result = await startZip([FOLDER.id], "Trip");
-    expect(result.outcome).toBe("saved");
-    expect(result.leftOut).toEqual([
-      { path: "Trip/photo-001.jpg", reason: "unavailable" },
-      { path: "Trip/photo-003.jpg", reason: "unavailable" },
-    ]);
+    expect(result.outcome).toBe("partial");
+    expect(result.missing).toEqual(["Trip/photo-001.jpg", "Trip/photo-003.jpg"]);
+    expect(result.leftOut).toEqual([]);
     // First window, then exactly one more mint for each of the two.
     expect(mints(calls)).toEqual([files.map((file) => file.id), [files[0]!.id], [files[2]!.id]]);
     expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[2]!.id)).toHaveLength(2);
+    expect(saved).toHaveLength(1);
     expect(toastMessages()).toEqual([
-      "Zip saved. 2 items were left out: Trip/photo-001.jpg (couldn't be fetched), Trip/photo-003.jpg (couldn't be fetched).",
+      "The zip is saved, but 2 files are missing from it: Trip/photo-001.jpg, Trip/photo-003.jpg. Download them one by one.",
     ]);
+    expect(toastMessages()[0]).not.toMatch(/^Zip saved/);
   });
 });
 
@@ -164,7 +173,7 @@ describe("one re-mint per node, whatever the reason", () => {
     });
     captureBlob();
     const result = await startZip([FOLDER.id], "Trip");
-    expect(result.leftOut).toEqual([{ path: "Trip/photo-001.jpg", reason: "unavailable" }]);
+    expect(result.missing).toEqual(["Trip/photo-001.jpg"]);
     expect(mints(calls)).toEqual([files.map((file) => file.id), [files[0]!.id]]);
     expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[0]!.id)).toHaveLength(1);
   });
@@ -398,5 +407,348 @@ describe("progress and failure", () => {
     expect(saved).toHaveLength(0);
     expect(getToasts()).toHaveLength(0);
     expect(getZipJobs()).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review, fix pass 1.
+
+/** Record every wait the zip asks for, and do not wait. */
+function noWaiting(): number[] {
+  const waits: number[] = [];
+  setZipSleepForTests(async (ms) => {
+    waits.push(ms);
+  });
+  return waits;
+}
+const text = async (blob: Blob) => new TextDecoder("latin1").decode(new Uint8Array(await blob.arrayBuffer()));
+
+describe("M1 — a file the files host does not give is never dropped in silence", () => {
+  it("429: waits as long as Retry-After says and fetches again — the file is in the archive", async () => {
+    const waits = noWaiting();
+    const files = filesIn(3);
+    const refusals = new Map([[files[1]!.id, 2]]);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      const left = refusals.get(idOfFile(call)) ?? 0;
+      if (left > 0) {
+        refusals.set(idOfFile(call), left - 1);
+        return new Response("Too many requests.", { status: 429, headers: { "retry-after": "7" } });
+      }
+      return bytes(`bytes-of-${idOfFile(call)}`);
+    });
+    const { saved } = captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(result).toMatchObject({ outcome: "saved", missing: [] });
+    expect(waits).toEqual([7_000, 7_000]);
+    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[1]!.id)).toHaveLength(3);
+    expect(await text(saved[0]!.blob)).toContain(`bytes-of-${files[1]!.id}`);
+    // Waiting is not a reason to mint again.
+    expect(mints(calls)).toHaveLength(1);
+    expect(toastMessages()).toEqual(["Zip saved."]);
+  });
+
+  it(`5xx and a dropped connection: ${ZIP_FETCH_ATTEMPTS} tries with a growing wait, then the file counts as missing`, async () => {
+    const waits = noWaiting();
+    const files = filesIn(3);
+    let flaky = 1;
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      if (idOfFile(call) === files[0]!.id) return new Response("Bad gateway.", { status: 502 });
+      if (idOfFile(call) === files[1]!.id && flaky-- > 0) throw new TypeError("Failed to fetch");
+      return bytes("ok");
+    });
+    const { saved } = captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[0]!.id)).toHaveLength(
+      ZIP_FETCH_ATTEMPTS,
+    );
+    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[1]!.id)).toHaveLength(2);
+    expect(waits).toEqual([1_000, 3_000, 1_000]);
+    expect(result.outcome).toBe("partial");
+    expect(result.missing).toEqual(["Trip/photo-001.jpg"]);
+    expect(saved).toHaveLength(1);
+    expect(toastMessages()).toEqual([
+      "The zip is saved, but 1 file is missing from it: Trip/photo-001.jpg. Download it on its own.",
+    ]);
+  });
+
+  it("a 429 that never lifts is bounded: a few waits for that file, then it is missing — never an endless loop", async () => {
+    const waits = noWaiting();
+    const files = filesIn(2);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      return idOfFile(call) === files[0]!.id
+        ? new Response("Too many requests.", { status: 429, headers: { "retry-after": "2" } })
+        : bytes("ok");
+    });
+    captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(waits).toHaveLength(ZIP_RATE_WAITS);
+    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[0]!.id)).toHaveLength(
+      ZIP_RATE_WAITS + 1,
+    );
+    expect(result).toMatchObject({ outcome: "partial", missing: ["Trip/photo-001.jpg"] });
+  });
+
+  it("a daily ceiling (Retry-After beyond a minute) stops the zip at once: no archive, and not one request per remaining file", async () => {
+    const waits = noWaiting();
+    const files = filesIn(40);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      return idOfFile(call) === files[2]!.id
+        ? new Response("Daily download limit reached.", { status: 429, headers: { "retry-after": "3600" } })
+        : bytes("ok");
+    });
+    const { saved } = captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(3600 * 1000).toBeGreaterThan(ZIP_RATE_WAIT_MAX_MS);
+    expect(result.outcome).toBe("limited");
+    expect(waits).toEqual([]);
+    expect(calls.filter(isFile)).toHaveLength(3);
+    expect(saved).toHaveLength(0);
+    expect(toastMessages()).toEqual([
+      "The download limit was reached, so the zip was stopped. Try again later.",
+    ]);
+  });
+
+  it("the API's own limiter on a window of URLs is waited out too", async () => {
+    const waits = noWaiting();
+    const files = filesIn(2);
+    let refused = false;
+    serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (isFile(call)) return bytes("ok");
+      if (call.path === "/api/nodes/download-urls" && !refused) {
+        refused = true;
+        return new Response(JSON.stringify({ error: "rate_limited", message: "x", requestId: "r" }), {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "3" },
+        });
+      }
+      return undefined;
+    });
+    captureBlob();
+    expect((await startZip([FOLDER.id], "Trip")).outcome).toBe("saved");
+    expect(waits).toEqual([3_000]);
+  });
+});
+
+describe("M2 — more roots than one manifest may name", () => {
+  it(`250 selected items: three manifest requests of at most ${ZIP_MANIFEST_ROOTS}, merged into one archive`, async () => {
+    const files = Array.from({ length: 250 }, (_, index) =>
+      fileNode(index + 100, { name: `f-${String(index).padStart(3, "0")}.txt`, size: 2 }),
+    );
+    const calls = serveDrive(new FakeDrive(files), (call) => (isFile(call) ? bytes("ok") : undefined));
+    const { saved } = captureBlob();
+    const result = await startZip(
+      files.map((file) => file.id),
+      "Holdfast 2026-10-13",
+    );
+    const manifests = calls.filter((call) => call.path === "/api/nodes/zip-manifest");
+    expect(manifests.map((call) => (call.body as { nodeIds: string[] }).nodeIds.length)).toEqual([
+      100, 100, 50,
+    ]);
+    expect(manifests.flatMap((call) => (call.body as { nodeIds: string[] }).nodeIds)).toEqual(
+      files.map((f) => f.id),
+    );
+    expect(result).toMatchObject({ outcome: "saved", missing: [], truncated: false });
+    expect(calls.filter(isFile)).toHaveLength(250);
+    const archive = await text(saved[0]!.blob);
+    expect(archive).toContain("f-000.txt");
+    expect(archive).toContain("f-249.txt");
+    // URL windows are still 50 at a time.
+    expect(mints(calls).map((ids) => ids.length)).toEqual([50, 50, 50, 50, 50]);
+  });
+
+  it("a part that says truncated makes the whole truncated; the in-memory ceiling is held against the parts' sum", async () => {
+    const files = Array.from({ length: 150 }, (_, index) =>
+      fileNode(index + 100, { name: `f-${index}.txt`, size: 1 }),
+    );
+    let part = 0;
+    const calls = serveDrive(new FakeDrive(files), (call) => {
+      if (call.path !== "/api/nodes/zip-manifest") return undefined;
+      part += 1;
+      const mine = files.filter((file) => (call.body as { nodeIds: string[] }).nodeIds.includes(file.id));
+      return json({
+        ...manifestOf(
+          mine.map((node) => ({ node })),
+          [],
+          part === 2,
+        ),
+        totalBytes: ZIP_BLOB_MAX_BYTES / 2 + 1,
+      });
+    });
+    captureBlob();
+    const result = await startZip(
+      files.map((file) => file.id),
+      "Big",
+    );
+    expect(part).toBe(2);
+    expect(result.outcome).toBe("too_large");
+    expect(calls.filter(isFile)).toHaveLength(0);
+  });
+});
+
+describe("m1 — names in the archive are checked here, whatever the manifest says", () => {
+  it.each([
+    ["../../etc/passwd", "etc/passwd"],
+    ["/etc/passwd", "etc/passwd"],
+    ["C:\\Windows\\system.ini", "Windows/system.ini"],
+    ["a/./b/../c.txt", "a/b/c.txt"],
+    ["Trip/\u0000evil\u001f.txt", "Trip/evil.txt"],
+    ["..", "file"],
+    ["", "file"],
+    ["ok/name.txt", "ok/name.txt"],
+  ])("%j → %j", (hostile, safe) => {
+    expect(safeZipPath(hostile)).toBe(safe);
+  });
+
+  it("two entries never share a name, compared without case", () => {
+    const taken = new Set<string>();
+    expect(["a.txt", "A.TXT", "a.txt", "dir/b", "dir/B"].map((path) => uniqueZipPath(path, taken))).toEqual([
+      "a.txt",
+      "A (2).TXT",
+      "a (3).txt",
+      "dir/b",
+      "dir/B (2)",
+    ]);
+  });
+
+  it("a hostile manifest: nothing in the archive escapes its folder or overwrites a neighbour", async () => {
+    const files = filesIn(4);
+    const paths = ["../../outside.txt", "/abs/secret.txt", "same.txt", "SAME.txt"];
+    serveDrive(new FakeDrive(files), (call) =>
+      call.path === "/api/nodes/zip-manifest"
+        ? json(manifestOf(files.map((node, index) => ({ node, path: paths[index]! }))))
+        : isFile(call)
+          ? bytes("ok")
+          : undefined,
+    );
+    const { saved } = captureBlob();
+    await startZip(
+      files.map((file) => file.id),
+      "Hostile",
+    );
+    const archive = await text(saved[0]!.blob);
+    expect(archive).not.toContain("../");
+    expect(archive).not.toContain("/abs/");
+    for (const name of ["outside.txt", "abs/secret.txt", "same.txt", "SAME (2).txt"])
+      expect(archive).toContain(name);
+  });
+});
+
+describe("m2, m3, m4, m6 — the sinks and the URLs", () => {
+  it("the 1 GB ceiling is held against the bytes that arrive, not only the manifest's promise", async () => {
+    const files = filesIn(1, () => ({ size: 5 }));
+    serveDrive(new FakeDrive(files), (call) => (isFile(call) ? bytes("x".repeat(64)) : undefined));
+    const { saved } = captureBlob();
+    // The ceiling lowered to 10 bytes for this test: the manifest promises 5, the file that arrives is 64.
+    ZIP_LIMITS.blobMax = 10;
+    try {
+      const result = await startZip([files[0]!.id], "Grown");
+      expect(result.outcome).toBe("too_large");
+    } finally {
+      ZIP_LIMITS.blobMax = ZIP_BLOB_MAX_BYTES;
+    }
+    expect(saved).toHaveLength(0);
+    expect(toastMessages()).toEqual(["Too large to zip in this browser — download the items individually."]);
+  });
+
+  it("one in-memory zip at a time: a second is refused while the first runs", async () => {
+    const files = filesIn(1);
+    const held = deferred<Response>();
+    serveDrive(new FakeDrive([FOLDER, ...files]), (call) => (isFile(call) ? held.promise : undefined));
+    captureBlob();
+    const first = startZip([FOLDER.id], "One");
+    await vi.waitFor(() => expect(getZipJobs()).toHaveLength(1));
+    const second = await startZip([FOLDER.id], "Two");
+    expect(second.outcome).toBe("busy");
+    expect(toastMessages()).toEqual(["Another zip is still being made. Wait for it to finish."]);
+    held.resolve(bytes("ok"));
+    expect((await first).outcome).toBe("saved");
+  });
+
+  it("a zip that fails after the picker created its file takes the empty file away again", async () => {
+    const remove = vi.fn(async () => {});
+    vi.stubGlobal("showSaveFilePicker", async () => ({
+      createWritable: async () => new WritableStream<Uint8Array>(),
+      remove,
+    }));
+    serveDrive(new FakeDrive([FOLDER]).fail("POST", /\/zip-manifest$/, 500));
+    expect((await startZip([FOLDER.id], "Trip")).outcome).toBe("failed");
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(toastMessages()).toEqual(["The zip didn't finish. Try again."]);
+  });
+
+  it("where the browser cannot remove it, the toast says an empty file may be left", async () => {
+    vi.stubGlobal("showSaveFilePicker", async () => ({
+      createWritable: async () => new WritableStream<Uint8Array>(),
+    }));
+    serveDrive(new FakeDrive([FOLDER]).fail("POST", /\/zip-manifest$/, 500));
+    await startZip([FOLDER.id], "Trip");
+    expect(toastMessages()).toEqual([
+      "The zip didn't finish. Try again. An empty file may be left where you chose to save it.",
+    ]);
+  });
+
+  it("a URL that is not on the files origin is never fetched: the file is missing, and said so", async () => {
+    const files = filesIn(2);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (call.path === "/api/nodes/download-urls") {
+        const ids = (call.body as { nodeIds: string[] }).nodeIds;
+        return json({
+          items: ids.map((nodeId) => ({
+            nodeId,
+            url:
+              nodeId === files[0]!.id
+                ? "https://evil.example/d/x/y"
+                : `http://files.localhost:3000/d/${nodeId}/t`,
+            expiresAt: "2026-10-02T12:00:00.000Z",
+          })),
+        });
+      }
+      return isFile(call) ? bytes("ok") : undefined;
+    });
+    captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(calls.filter(isFile).map(idOfFile)).toEqual([files[1]!.id]);
+    expect(result).toMatchObject({ outcome: "partial", missing: ["Trip/photo-001.jpg"] });
+  });
+});
+
+describe("B2 — a zip belongs to the account that started it", () => {
+  it("the account changes while the save picker is open: nothing is requested afterwards", async () => {
+    let choose: (handle: unknown) => void = () => {};
+    const remove = vi.fn(async () => {});
+    vi.stubGlobal(
+      "showSaveFilePicker",
+      () =>
+        new Promise((resolve) => {
+          choose = resolve;
+        }),
+    );
+    const calls = serveDrive(new FakeDrive([FOLDER, ...filesIn(1)]));
+    const running = startZip([FOLDER.id], "Trip");
+    await purgeUserState();
+    choose({ createWritable: async () => new WritableStream<Uint8Array>(), remove });
+    expect((await running).outcome).toBe("cancelled");
+    expect(calls).toHaveLength(0);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(getToasts()).toHaveLength(0);
+  });
+
+  it("a zip that fails after the account changed says nothing", async () => {
+    const held = deferred<Response>();
+    serveDrive(new FakeDrive([FOLDER]), (call) =>
+      call.path === "/api/nodes/zip-manifest" ? held.promise : undefined,
+    );
+    vi.stubGlobal("showSaveFilePicker", undefined);
+    const running = startZip([FOLDER.id], "Trip");
+    await vi.waitFor(() => expect(getZipJobs()).toHaveLength(1));
+    await purgeUserState();
+    held.resolve(json({ error: "internal", message: "x", requestId: "req-old" }, 500));
+    await running;
+    expect(getToasts()).toHaveLength(0);
+    expect(getRibbonSnapshot().current).toBeNull();
   });
 });

@@ -10,24 +10,45 @@ import { publish } from "../../components/TransferRibbon";
 import { ApiError } from "../../lib/api";
 import { registerUserStatePurger } from "../../lib/contracts";
 import { formatBytes } from "../../lib/format";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { batchDownloadUrls, zipManifest } from "./api";
-import { saveBlob } from "./download";
+import { isFilesUrl, saveBlob } from "./download";
 import { t } from "./strings";
 
 /** The in-memory sink's ceiling: 1 GB, decimal, like every size the UI shows. */
 export const ZIP_BLOB_MAX_BYTES = 1_000_000_000;
+/** The ceiling as the engine reads it — an object so that a test can lower it and send real bytes past it. */
+export const ZIP_LIMITS = { blobMax: ZIP_BLOB_MAX_BYTES };
 /** How many left-out items one toast names before "and N more". */
 const NAMED_IN_TOAST = 3;
 const PUBLISH_EVERY_MS = 200;
 
-export type ZipOutcome = "saved" | "cancelled" | "empty" | "too_large" | "failed";
+/** Roots one manifest request may name (`ZipManifestBody`); a larger selection is asked for in parts. */
+export const ZIP_MANIFEST_ROOTS = 100;
+/** Tries for one file when the files host fails (`5xx`) or the network drops: the first and two more. */
+export const ZIP_FETCH_ATTEMPTS = 3;
+/** Waits for one file on `429`, each as long as `Retry-After` says — up to ZIP_RATE_WAIT_MAX_MS. */
+export const ZIP_RATE_WAITS = 5;
+/** A `Retry-After` longer than this is a daily ceiling, not a busy minute: the zip stops. */
+export const ZIP_RATE_WAIT_MAX_MS = 60_000;
+/** How long a finished zip stays on the ribbon. */
+const DONE_LINGER_MS = 4_000;
 
-export type LeftOutReason = "scan_pending" | "scan_blocked" | "unscanned" | "unavailable";
+/**
+ * "saved" is said only of an archive that holds every file the manifest listed. One that lacks a
+ * file the files host would not give is "partial" — and says which.
+ */
+export type ZipOutcome =
+  "saved" | "partial" | "cancelled" | "empty" | "too_large" | "busy" | "limited" | "failed";
+
+export type LeftOutReason = "scan_pending" | "scan_blocked" | "unscanned";
 
 export interface ZipResult {
   outcome: ZipOutcome;
-  /** What the archive does not hold, and why. */
+  /** What the manifest itself left out, and why. */
   leftOut: Array<{ path: string; reason: LeftOutReason }>;
+  /** Files the manifest listed that could not be fetched: the archive is incomplete without them. */
+  missing: string[];
   truncated: boolean;
 }
 
@@ -36,6 +57,29 @@ interface Job {
   controller: AbortController;
   /** "Zipping 3 of 12" — the plain count the selection bar shows. */
   label: string;
+  /** Built in memory (no save picker): only one of these at a time. */
+  inMemory: boolean;
+}
+
+// Waiting, replaceable by tests (a retry waits seconds).
+const realSleep = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+let sleep: (ms: number, signal: AbortSignal) => Promise<void> = realSleep;
+
+/** Tests only: replace the wait between retries (`null` = the real one). */
+export function setZipSleepForTests(replacement: typeof realSleep | null): void {
+  sleep = replacement ?? realSleep;
 }
 
 // Running transfers belong to the account that started them.
@@ -81,6 +125,8 @@ registerUserStatePurger(resetZipForTests);
 
 interface SaveFileHandle {
   createWritable(): Promise<WritableStream<Uint8Array>>;
+  /** Chromium: delete the file again. */
+  remove?(): Promise<void>;
 }
 type SaveFilePicker = (options: {
   suggestedName: string;
@@ -95,44 +141,127 @@ function saveFilePicker(): SaveFilePicker | null {
 // By name: an abort raised by a stream or by `fetch` is not always the page's own DOMException class.
 const isAbort = (cause: unknown) => (cause as { name?: unknown } | null)?.name === "AbortError";
 
+/** Why a zip stopped short of an archive, when it is not a plain failure. */
+class ZipStop extends Error {
+  constructor(readonly outcome: "too_large" | "limited") {
+    super(outcome);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry names. The manifest's paths are said to be relative and sanitised; an archive is written
+// to the user's disk, so they are checked here as well.
+
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is removed
+const CONTROL = /[\u0000-\u001f\u007f]/g;
+
+/** A relative path with no `..`, no absolute or drive prefix, no control character, no empty part. */
+export function safeZipPath(path: string): string {
+  const parts = path
+    .split(/[\\/]+/)
+    .map((part) => part.replace(CONTROL, "").trim())
+    .filter(
+      (part, index) =>
+        part !== "" && part !== "." && part !== ".." && !(index === 0 && /^[A-Za-z]:$/.test(part)),
+    );
+  return parts.length > 0 ? parts.join("/") : "file";
+}
+
+/** Give each entry a name no other has, comparing without case: "a.txt", "a (2).txt", … */
+export function uniqueZipPath(path: string, taken: Set<string>): string {
+  let candidate = path;
+  const slash = path.lastIndexOf("/");
+  const dot = path.lastIndexOf(".");
+  const stem = dot > slash + 1 ? path.slice(0, dot) : path;
+  const ext = dot > slash + 1 ? path.slice(dot) : "";
+  for (let n = 2; taken.has(candidate.toLowerCase()); n += 1) candidate = `${stem} (${n})${ext}`;
+  taken.add(candidate.toLowerCase());
+  return candidate;
+}
+
+// ---------------------------------------------------------------------------------------------
+
 const REASON_TEXT = {
   scan_pending: "explorer.zip.reason.pending",
   scan_blocked: "explorer.zip.reason.blocked",
   unscanned: "explorer.zip.reason.unscanned",
-  unavailable: "explorer.zip.reason.unavailable",
 } as const;
+
+const named = (items: string[]) => {
+  const list = items.slice(0, NAMED_IN_TOAST).join(", ");
+  const more = items.length - NAMED_IN_TOAST;
+  return more > 0 ? t("explorer.zip.leftOut.more", { list, count: more }) : list;
+};
 
 /** "2 items were left out: a.txt (still scanning), b.exe (blocked)". */
 export function leftOutSentence(leftOut: ZipResult["leftOut"]): string | null {
   if (leftOut.length === 0) return null;
-  const named = leftOut
-    .slice(0, NAMED_IN_TOAST)
-    .map((item) => t("explorer.zip.leftOut.item", { path: item.path, reason: t(REASON_TEXT[item.reason]) }))
-    .join(", ");
-  const more = leftOut.length - NAMED_IN_TOAST;
-  const list = more > 0 ? t("explorer.zip.leftOut.more", { list: named, count: more }) : named;
+  const list = named(
+    leftOut.map((item) =>
+      t("explorer.zip.leftOut.item", { path: item.path, reason: t(REASON_TEXT[item.reason]) }),
+    ),
+  );
   return leftOut.length === 1
     ? t("explorer.zip.leftOut.one", { list })
     : t("explorer.zip.leftOut.many", { count: leftOut.length, list });
 }
 
-function finish(result: ZipResult, message: string, requestId?: string): ZipResult {
-  const parts = [
-    message,
-    leftOutSentence(result.leftOut),
-    result.truncated ? t("explorer.zip.truncated", { count: ZIP_MAX_ENTRIES.toLocaleString("en") }) : null,
-  ];
-  toast({ message: parts.filter(Boolean).join(" "), requestId, key: "zip", duration: 8000 });
-  return result;
+/** "The zip is saved, but 2 files are missing from it: a.jpg, b.jpg. Download them one by one." */
+export function missingSentence(missing: string[]): string {
+  return missing.length === 1
+    ? t("explorer.zip.missing.one", { list: named(missing) })
+    : t("explorer.zip.missing.many", { count: missing.length, list: named(missing) });
+}
+
+/** Every manifest of a selection, asked for ZIP_MANIFEST_ROOTS roots at a time and merged. */
+async function readManifest(nodeIds: readonly string[], signal: AbortSignal): Promise<ZipManifest> {
+  const merged: ZipManifest = { entries: [], totalBytes: 0, skipped: [], truncated: false };
+  const seen = new Set<string>();
+  for (let start = 0; start < nodeIds.length; start += ZIP_MANIFEST_ROOTS) {
+    const part = await zipManifest({ nodeIds: nodeIds.slice(start, start + ZIP_MANIFEST_ROOTS) }, signal);
+    merged.truncated ||= part.truncated;
+    merged.skipped.push(...part.skipped);
+    // The server's own total for this part (it is what the in-memory ceiling is first held against).
+    merged.totalBytes += part.totalBytes;
+    for (const entry of part.entries) {
+      if (seen.has(entry.nodeId)) continue;
+      // The archive holds at most what one manifest may: the rest is said, not silently cut.
+      if (merged.entries.length >= ZIP_MAX_ENTRIES) {
+        merged.truncated = true;
+        return merged;
+      }
+      seen.add(entry.nodeId);
+      merged.entries.push(entry);
+    }
+  }
+  return merged;
 }
 
 /**
  * Zip the given files and folders into one download. `suggestedName` is the archive's name
- * without the extension. Never throws: every way it can end is a `ZipOutcome` and one toast.
+ * without the extension. Never throws: every way it can end is a `ZipOutcome` and at most one
+ * toast — none at all once the account that started it is no longer the one signed in.
  */
 export async function startZip(nodeIds: readonly string[], suggestedName: string): Promise<ZipResult> {
-  const result: ZipResult = { outcome: "failed", leftOut: [], truncated: false };
+  const then = accountEpoch();
+  const mine = () => sameAccount(then);
+  const result: ZipResult = { outcome: "failed", leftOut: [], missing: [], truncated: false };
   const fileName = `${suggestedName}.zip`;
+  const finish = (outcome: ZipOutcome, message: string | null, requestId?: string): ZipResult => {
+    result.outcome = outcome;
+    if (message !== null && mine()) {
+      const complete = outcome === "saved" || outcome === "partial" || outcome === "empty";
+      const parts = [
+        message,
+        complete ? leftOutSentence(result.leftOut) : null,
+        complete && result.truncated
+          ? t("explorer.zip.truncated", { count: ZIP_MAX_ENTRIES.toLocaleString("en") })
+          : null,
+      ];
+      toast({ message: parts.filter(Boolean).join(" "), requestId, key: "zip", duration: 8000 });
+    }
+    return result;
+  };
 
   // The picker needs the click that started this, so it is asked before anything is fetched.
   let handle: SaveFileHandle | null = null;
@@ -144,44 +273,59 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
         types: [{ description: t("explorer.zip.fileType"), accept: { "application/zip": [".zip"] } }],
       });
     } catch (cause) {
-      if (isAbort(cause)) return { ...result, outcome: "cancelled" };
-      // Refused for another reason (no user activation, a blocked folder): the in-memory sink.
+      if (isAbort(cause)) return finish("cancelled", null);
+      // Refused for another reason (no user activation, a blocked folder): the in-memory sink,
+      // with its ceiling.
       handle = null;
     }
   }
+  /** A file the picker created and nothing was written to: take it away again where the browser can. */
+  const discard = async () => {
+    try {
+      await handle?.remove?.();
+    } catch {
+      // It stays, empty; the toast of a failure says so.
+    }
+  };
+  // The account may have changed while the picker was open.
+  if (!mine()) {
+    await discard();
+    return finish("cancelled", null);
+  }
+  // One archive in memory at a time: each may hold up to the ceiling.
+  if (!handle && snapshot.some((other) => other.inMemory)) return finish("busy", t("explorer.zip.busy"));
 
-  const job: Job = { id: nextId++, controller: new AbortController(), label: t("explorer.zip.preparing") };
+  const job: Job = {
+    id: nextId++,
+    controller: new AbortController(),
+    label: t("explorer.zip.preparing"),
+    inMemory: handle === null,
+  };
   const sourceId = `zip:${job.id}`;
   const { signal } = job.controller;
   jobs.set(job.id, job);
   emit();
   publish(sourceId, { progress: 0, sentence: job.label, status: "active" });
-  const close = () => {
-    jobs.delete(job.id);
-    emit();
-  };
+  const leftover = handle && typeof handle.remove !== "function" ? ` ${t("explorer.zip.emptyFile")}` : "";
 
   try {
-    const manifest: ZipManifest = await zipManifest({ nodeIds: [...nodeIds] }, signal);
-    result.leftOut = manifest.skipped.map((item) => ({ path: item.path, reason: item.reason }));
+    const manifest = await readManifest(nodeIds, signal);
+    result.leftOut = manifest.skipped.map((item) => ({ path: safeZipPath(item.path), reason: item.reason }));
     result.truncated = manifest.truncated;
     if (manifest.entries.length === 0) {
       publish(sourceId, null);
-      return finish({ ...result, outcome: "empty" }, t("explorer.zip.empty"));
+      await discard();
+      return finish("empty", t("explorer.zip.empty"));
     }
-    if (!handle && manifest.totalBytes > ZIP_BLOB_MAX_BYTES) {
-      publish(sourceId, null);
-      return finish(
-        { ...result, outcome: "too_large", leftOut: [], truncated: false },
-        t("explorer.zip.tooLarge"),
-      );
-    }
+    if (!handle && manifest.totalBytes > ZIP_LIMITS.blobMax) throw new ZipStop("too_large");
 
     const total = manifest.entries.length;
     let doneBytes = 0;
     let fileIndex = 0;
     let published = 0;
     const report = (force = false) => {
+      // Nothing is shown for a zip that was stopped, or whose account has gone.
+      if (signal.aborted || !mine()) return;
       const now = Date.now();
       if (!force && now - published < PUBLISH_EVERY_MS) return;
       published = now;
@@ -204,10 +348,21 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
     const urls = new Map<string, string>();
     const reminted = new Set<string>();
     const mint = async (ids: string[]) => {
-      const answer = await batchDownloadUrls({ nodeIds: ids }, signal);
-      for (const item of answer.items) {
-        if ("url" in item) urls.set(item.nodeId, item.url);
-        else urls.delete(item.nodeId);
+      for (let waits = 0; ; waits += 1) {
+        try {
+          const answer = await batchDownloadUrls({ nodeIds: ids }, signal);
+          for (const item of answer.items) {
+            if ("url" in item && isFilesUrl(item.url)) urls.set(item.nodeId, item.url);
+            else urls.delete(item.nodeId);
+          }
+          return;
+        } catch (cause) {
+          // The API's own limiter: wait as long as it says, a few times; a ceiling stops the zip.
+          if (!(cause instanceof ApiError) || cause.status !== 429) throw cause;
+          const wait = (cause.retryAfter ?? 5) * 1000;
+          if (wait > ZIP_RATE_WAIT_MAX_MS || waits >= ZIP_RATE_WAITS) throw new ZipStop("limited");
+          await sleep(wait, signal);
+        }
       }
     };
     /** One more URL for one node — once per node, whatever the reason. */
@@ -217,19 +372,54 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
       await mint([id]);
       return urls.get(id);
     };
+    const refuse = async (response: Response) => {
+      // Not read: let the connection go.
+      await response.body?.cancel().catch(() => {});
+    };
+    /**
+     * The file's bytes, or null when the files host will not give them. Never a silent miss for
+     * a reason that waiting cures: `429` waits `Retry-After`, `5xx` and a dropped connection are
+     * tried again.
+     */
     const open = async (entry: ZipEntry): Promise<Response | null> => {
       let url = urls.get(entry.nodeId) ?? (await remint(entry.nodeId));
-      if (!url) return null;
-      let response = await fetch(url, { signal });
-      // The files host answers a token that no longer verifies with 403: mint once more.
-      if (response.status === 403) {
-        url = await remint(entry.nodeId);
-        if (!url) return null;
-        response = await fetch(url, { signal });
+      let failures = 0;
+      let waits = 0;
+      while (url) {
+        let response: Response;
+        try {
+          response = await fetch(url, { signal });
+        } catch (cause) {
+          if (signal.aborted || isAbort(cause)) throw cause;
+          failures += 1;
+          if (failures >= ZIP_FETCH_ATTEMPTS) return null;
+          await sleep(1000 * 3 ** (failures - 1), signal);
+          continue;
+        }
+        if (response.ok && response.body) return response;
+        await refuse(response);
+        if (response.status === 403) {
+          // The files host answers a token that no longer verifies with 403 and plain text —
+          // the status is all there is to go by (PLAN §10): mint once more, fetch once more.
+          url = await remint(entry.nodeId);
+        } else if (response.status === 429) {
+          const header = Number(response.headers.get("retry-after"));
+          const wait = Number.isFinite(header) && header > 0 ? header * 1000 : 5000;
+          // A wait of more than a minute is a daily ceiling: every later file would be refused too.
+          if (wait > ZIP_RATE_WAIT_MAX_MS) throw new ZipStop("limited");
+          waits += 1;
+          if (waits > ZIP_RATE_WAITS) return null;
+          await sleep(wait, signal);
+        } else if (response.status >= 500) {
+          failures += 1;
+          if (failures >= ZIP_FETCH_ATTEMPTS) return null;
+          await sleep(1000 * 3 ** (failures - 1), signal);
+        } else return null;
       }
-      return response.ok && response.body ? response : null;
+      return null;
     };
 
+    const names = new Set<string>();
     async function* files() {
       for (let index = 0; index < manifest.entries.length; index += 1) {
         signal.throwIfAborted();
@@ -238,10 +428,11 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
         if (index % ZIP_URL_BATCH === 0) {
           await mint(manifest.entries.slice(index, index + ZIP_URL_BATCH).map((item) => item.nodeId));
         }
+        const name = uniqueZipPath(safeZipPath(entry.path), names);
         const response = await open(entry);
         fileIndex = index + 1;
         if (!response?.body) {
-          result.leftOut.push({ path: entry.path, reason: "unavailable" });
+          result.missing.push(name);
           report(true);
           continue;
         }
@@ -250,12 +441,17 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
           new TransformStream<Uint8Array, Uint8Array>({
             transform(chunk, controller) {
               doneBytes += chunk.byteLength;
+              // The ceiling is on what is really held, not on what the manifest promised.
+              if (!handle && doneBytes > ZIP_LIMITS.blobMax) {
+                controller.error(new ZipStop("too_large"));
+                return;
+              }
               report();
               controller.enqueue(chunk);
             },
           }),
         );
-        yield { name: entry.path, lastModified: new Date(entry.modifiedAt), input: counted };
+        yield { name, lastModified: new Date(entry.modifiedAt), input: counted };
       }
     }
 
@@ -264,19 +460,34 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
       const writable = await handle.createWritable();
       await archive.body!.pipeTo(writable, { signal });
     } else {
-      saveBlob(await archive.blob(), fileName);
+      const blob = await archive.blob();
+      // Bytes of the account that asked for them: not handed over once it is gone.
+      if (!mine()) return finish("cancelled", null);
+      saveBlob(blob, fileName);
     }
-    publish(sourceId, { progress: 1, sentence: t("explorer.zip.saved"), status: "done" });
-    return finish({ ...result, outcome: "saved" }, t("explorer.zip.saved"));
+    if (mine()) {
+      publish(sourceId, { progress: 1, sentence: t("explorer.zip.saved"), status: "done" });
+      setTimeout(() => publish(sourceId, null), DONE_LINGER_MS);
+    }
+    return result.missing.length > 0
+      ? finish("partial", missingSentence(result.missing))
+      : finish("saved", t("explorer.zip.saved"));
   } catch (cause) {
-    publish(sourceId, null);
-    if (signal.aborted || isAbort(cause)) return { ...result, outcome: "cancelled" };
+    if (mine()) publish(sourceId, null);
+    await discard();
+    if (signal.aborted || isAbort(cause)) return finish("cancelled", null);
+    if (cause instanceof ZipStop) {
+      return cause.outcome === "too_large"
+        ? finish("too_large", t("explorer.zip.tooLarge"))
+        : finish("limited", t("explorer.zip.limited") + leftover);
+    }
     return finish(
-      { ...result, outcome: "failed", leftOut: [], truncated: false },
-      t("explorer.zip.failed"),
+      "failed",
+      t("explorer.zip.failed") + leftover,
       cause instanceof ApiError ? cause.requestId : undefined,
     );
   } finally {
-    close();
+    jobs.delete(job.id);
+    emit();
   }
 }
