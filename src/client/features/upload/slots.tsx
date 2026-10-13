@@ -1,7 +1,7 @@
 // The two slots the shell pre-wired: the frame renders `UploadDropOverlay` once at its root; the
 // FAB, the header's "New" menu, the palette and the explorer call `requestUpload`.
 import type { RequestUpload } from "../../components/slots";
-import { addFiles } from "./manager";
+import { actionMark, addFiles } from "./manager";
 import { openPicker, targetFromLocation } from "./picker";
 import "./ribbon";
 import { UploadHost } from "./UploadHost";
@@ -22,6 +22,9 @@ export const requestUpload: RequestUpload = (opts) => {
     void addFiles(
       opts.files.map((file) => ({ file })),
       parentId,
+      [],
+      {},
+      actionMark(),
     );
     return;
   }

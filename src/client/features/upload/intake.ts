@@ -42,8 +42,9 @@ function fileOf(entry: FileSystemFileEntry): Promise<File> {
  * Walk one entry. Each entry fails on its own: an unreadable file or folder is written down and
  * its siblings are still taken. The walk ends once the drop is larger than one upload takes.
  */
-async function walk(entry: FileSystemEntry, into: Intake): Promise<void> {
-  if (into.tooMany) return;
+async function walk(entry: FileSystemEntry, into: Intake, wanted: () => boolean): Promise<void> {
+  // Not wanted any more (the account that dropped it is gone): nothing further is read.
+  if (into.tooMany || !wanted()) return;
   const path = entry.fullPath.replace(/^\/+/, "");
   if (entry.isFile) {
     try {
@@ -68,15 +69,16 @@ async function walk(entry: FileSystemEntry, into: Intake): Promise<void> {
       return;
     }
     if (batch.length === 0) return;
-    for (const child of batch) await walk(child, into);
+    for (const child of batch) await walk(child, into, wanted);
   }
 }
 
 /**
  * The files and folders of a drop. The entries must be taken while the drop event is still being
  * handled — the transfer is emptied after — so that part is synchronous and only the walk waits.
+ * The walk can take seconds; `wanted` is asked before every entry and ends it.
  */
-export function fromDrop(transfer: DataTransfer): Promise<Intake> {
+export function fromDrop(transfer: DataTransfer, wanted: () => boolean = () => true): Promise<Intake> {
   const entries: FileSystemEntry[] = [];
   const loose: File[] = [];
   for (const item of Array.from(transfer.items ?? [])) {
@@ -96,7 +98,7 @@ export function fromDrop(transfer: DataTransfer): Promise<Intake> {
       unreadable: [],
       tooMany: false,
     };
-    for (const entry of entries) await walk(entry, intake);
+    for (const entry of entries) await walk(entry, intake, wanted);
     return intake;
   })();
 }

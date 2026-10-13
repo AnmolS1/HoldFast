@@ -10,7 +10,7 @@ import { isEditableTarget } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { ConflictDialog } from "./ConflictDialog";
 import { carriesFiles, fromDrop, fromFileList } from "./intake";
-import { addFiles, pauseAll, restoreUploads } from "./manager";
+import { actionMark, addFiles, frameMounted, restoreUploads, sameActor } from "./manager";
 import { registerPicker, takePickerTarget, targetFromLocation } from "./picker";
 import { getNode } from "./protocol";
 import { useUploads } from "./store";
@@ -44,7 +44,10 @@ export function UploadHost() {
 
   // Leaving the frame (a public page, the sign-in screen) stops what is running: nothing reads a
   // file or sends a body for a page that shows no progress. The rows wait, paused.
-  useEffect(() => () => pauseAll(), []);
+  useEffect(() => {
+    frameMounted(true);
+    return () => frameMounted(false);
+  }, []);
 
   useEffect(() => {
     const enter = (event: DragEvent) => {
@@ -83,15 +86,18 @@ export function UploadHost() {
       depth.current = 0;
       setTarget(null);
       const parentId = targetFromLocation();
-      void fromDrop(event.dataTransfer).then((intake) =>
-        addFiles(intake.files, parentId, intake.folders, intake),
+      // Whose drop this is, taken now: the walk below can outlive the account that dropped.
+      const then = actionMark();
+      // `wanted` ends the walk early; `addFiles` itself refuses a stale mark.
+      void fromDrop(event.dataTransfer, () => sameActor(then)).then((intake) =>
+        addFiles(intake.files, parentId, intake.folders, intake, then),
       );
     };
     const paste = (event: ClipboardEvent) => {
       const files = Array.from(event.clipboardData?.files ?? []);
       if (files.length === 0 || isEditableTarget(event.target)) return;
       event.preventDefault();
-      void addFiles(fromFileList(files).files, targetFromLocation());
+      void addFiles(fromFileList(files).files, targetFromLocation(), [], {}, actionMark());
     };
     window.addEventListener("dragenter", enter);
     window.addEventListener("dragover", over);
@@ -111,7 +117,7 @@ export function UploadHost() {
     const intake = fromFileList(Array.from(input.files ?? []));
     // Emptied, so choosing the same file again is a change again.
     input.value = "";
-    void addFiles(intake.files, takePickerTarget(), intake.folders, intake);
+    void addFiles(intake.files, takePickerTarget(), intake.folders, intake, actionMark());
   };
 
   return (
