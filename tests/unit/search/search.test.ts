@@ -445,8 +445,9 @@ describe("the query text stays out of everything but the database", () => {
     const me = await makeUser();
     const q = `zebra${token()}crossing`;
     await makeFile(me.id, null, { name: `${q}.txt`, ...clean });
+    // Spied on, not silenced: what is logged still reaches the run's output, where it can be searched.
     const spies = (["log", "info", "warn", "error", "debug"] as const).map((level) =>
-      vi.spyOn(console, level).mockImplementation(() => {}),
+      vi.spyOn(console, level),
     );
 
     const found = await get(as(me), searchPath({ q, scope: "mine" }));
