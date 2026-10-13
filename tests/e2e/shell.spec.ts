@@ -5,111 +5,25 @@
 //
 //   npm run e2e -- tests/e2e/shell.spec.ts
 //
-// OFFLINE MODE. With HOLDFAST_E2E_DIST=<path to dist/client> (and a Playwright config that starts
-// no server) every request to the app origin is answered from the production build on disk, by
-// request interception — no listening socket at all. It exists for machines where a dev server
-// cannot start; the two tests that need Vite's module graph are skipped there and say so.
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { extname, join } from "node:path";
+// OFFLINE MODE (HOLDFAST_E2E_DIST, see fixtures/mock-shell.ts): the two tests that need Vite's
+// module graph are skipped there and say so.
 import type { Locator, Page, Route } from "@playwright/test";
-import { expect, expectNoA11yViolations, stubTurnstile, test } from "./fixtures";
+import {
+  E2E_DIST,
+  expect,
+  expectNoA11yViolations,
+  mockEnvelope as envelope,
+  mockShell,
+  serveBuild,
+  stubTurnstile,
+  test,
+} from "./fixtures";
 
 const DESKTOP_MIN = 1024;
 
-interface User {
-  id: string;
-  name: string;
-  email: string;
-  emailVerified: boolean;
-  role: string;
-  timezone: string;
-  termsVersion: string;
-  deleteScheduledAt: string | null;
-}
-
-const USER: User = {
-  id: "a".repeat(32),
-  name: "Ada Lovelace",
-  email: "ada@example.com",
-  emailVerified: true,
-  role: "user",
-  timezone: "UTC",
-  termsVersion: "2026-10",
-  deleteScheduledAt: null,
-};
-
-interface MockOptions {
-  /** `null` = signed out. */
-  user?: Partial<User> | null;
-  config?: Record<string, unknown>;
-  /** Extra API answers, checked before the defaults. Return true when the route was fulfilled. */
-  api?: (route: Route, path: string) => Promise<boolean> | boolean;
-}
-
-const DIST = process.env.HOLDFAST_E2E_DIST;
-const CONTENT_TYPES: Record<string, string> = {
-  ".html": "text/html",
-  ".js": "text/javascript",
-  ".css": "text/css",
-  ".woff2": "font/woff2",
-  ".woff": "font/woff",
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".webmanifest": "application/manifest+json",
-};
+const DIST = E2E_DIST;
 /** The application's entry script: Vite's module in dev, the hashed bundle in a build. */
 const APP_ENTRY = DIST ? "**/assets/index-*.js" : "**/src/client/main.tsx";
-
-/** Offline mode only: answer the app origin from the build, with the SPA fallback. */
-async function serveBuild(page: Page, port: number): Promise<void> {
-  if (!DIST) return;
-  await page.route(`http://localhost:${port}/**`, (route) => {
-    const path = decodeURIComponent(new URL(route.request().url()).pathname);
-    let file = join(DIST, path);
-    if (!existsSync(file) || statSync(file).isDirectory()) file = join(DIST, "index.html");
-    return route.fulfill({
-      body: readFileSync(file),
-      contentType: CONTENT_TYPES[extname(file)] ?? "application/octet-stream",
-    });
-  });
-}
-
-function envelope(error: string, message: string) {
-  return { error, message, requestId: "req-e2e" };
-}
-
-/** Mock every `/api/*` request: config, session, and a JSON 404 for anything a test did not name. */
-async function mockShell(page: Page, port: number, options: MockOptions = {}): Promise<void> {
-  const config = {
-    signupMode: "invite",
-    quotaBytes: 5_000_000_000,
-    maxFileBytes: 2_000_000_000,
-    partBytes: 67_108_864,
-    turnstileSiteKey: "1x00000000000000000000AA",
-    appOrigin: `http://localhost:${port}`,
-    filesOrigin: `http://files.localhost:${port}`,
-    termsVersion: "2026-10",
-    uploadsEnabled: true,
-    linksEnabled: true,
-    readOnly: false,
-    sentryDsnWeb: null,
-    sentryEnvironment: "test",
-    release: "e2e",
-    ...options.config,
-  };
-  const session = options.user === null ? null : { user: { ...USER, ...options.user }, session: {} };
-  await serveBuild(page, port);
-  await page.route("**/api/**", async (route) => {
-    const path = new URL(route.request().url()).pathname;
-    if (path === "/api/health") return route.fallback();
-    if (options.api && (await options.api(route, path))) return;
-    if (path === "/api/public/config") return route.fulfill({ json: config });
-    if (path === "/api/auth/get-session") return route.fulfill({ json: session });
-    if (path === "/api/account/deletion-status") return route.fulfill({ json: { scheduledFor: null } });
-    return route.fulfill({ status: 404, json: envelope("not_found", "Not found.") });
-  });
-  await stubTurnstile(page);
-}
 
 const isMobile = (page: Page) => (page.viewportSize()?.width ?? 0) < DESKTOP_MIN;
 const placeholder = (scope: Page | Locator, name: string) =>

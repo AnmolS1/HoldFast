@@ -3,7 +3,8 @@
 //   import { expect, test } from "./fixtures";
 //
 // Signed-in fixtures (signedInUser, signedInAdmin2fa) are not here: they live in
-// tests/setup/auth-fixtures.ts and build on these.
+// tests/setup/auth-fixtures.ts and build on these. A MOCKED signed-in session for specs of the
+// SPA is `mockShell` (./mock-shell.ts); which of the two a spec uses is `REAL` (./mode.ts).
 import { test as base } from "@playwright/test";
 import { appOrigin, e2ePort, filesOrigin } from "../../setup/local-env";
 import { addVirtualAuthenticator, type VirtualAuthenticator } from "./webauthn";
@@ -67,6 +68,16 @@ export const test = base.extend<HarnessFixtures>({
 
 export { expect } from "@playwright/test";
 export { expectNoA11yViolations } from "./axe";
+export {
+  E2E_DIST,
+  MOCK_USER,
+  mockEnvelope,
+  mockShell,
+  serveBuild,
+  type MockShellOptions,
+  type MockUser,
+} from "./mock-shell";
+export { mockedOnly, REAL, realOnly } from "./mode";
 export { clearOutbox, latestMailTo, linksIn } from "./outbox";
 export { stubTurnstile } from "./turnstile";
 export { addVirtualAuthenticator } from "./webauthn";
