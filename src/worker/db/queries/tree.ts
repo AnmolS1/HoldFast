@@ -251,6 +251,19 @@ export function notEffectivelyHidden(alias: string = "nodes"): SQL {
 }
 
 /**
+ * For the `WHERE` of a write to ONE `nodes` row: the row is not hidden — not taken down, itself
+ * or by a folder above it, and not locked as suspected CSAM (`tree.effectiveHidden`, as a
+ * predicate). A write that carries it never lands on a hidden node, whatever its caller read
+ * before: the row's own state is re-tested by Postgres on the row version it actually updates
+ * (a CSAM lock or a takedown of the node that committed while the write waited for the row is
+ * seen), and a takedown of a folder ABOVE is seen when it committed before the statement began —
+ * one that commits during the statement is the same as the write having come first.
+ */
+export function notHiddenRow(alias: string = "nodes"): SQL {
+  return sql`(${sql.identifier(alias)}.scan_status <> 'suspected_csam' AND ${notEffectivelyHidden(alias)})`;
+}
+
+/**
  * `notEffectivelyTrashed(alias) AND notEffectivelyHidden(alias)` with ONE ancestor walk instead
  * of two — what a listing that needs both uses. (Measured on 5,000 files six folders deep: the
  * two predicates side by side cost about six times one walk; this costs one.)

@@ -21,8 +21,16 @@ import {
   setUserLegalHold,
   takedownNode,
 } from "../../../src/worker/db/queries/moderation";
-import { getNode, move, moveNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
-import { deleteSubtreeRows, deleteVersionRows } from "../../../src/worker/db/queries/trash";
+import {
+  getNode,
+  move,
+  moveNode,
+  rename,
+  replaceVersion,
+  setStar,
+  touchAccessed,
+} from "../../../src/worker/db/queries/nodes";
+import { deleteSubtreeRows, deleteVersionRows, restore, trash } from "../../../src/worker/db/queries/trash";
 import { lockOwnerTree } from "../../../src/worker/db/queries/tree";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
@@ -985,6 +993,95 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
         scanStatus: "suspected_csam",
         legalHold: true,
       });
+  });
+});
+
+// The writers that take no tree lock decide "hidden" in their own statement. Against a change of
+// the node's OWN row (the CSAM lock, a takedown of the node) that is exact: the write waits for
+// the row and Postgres re-tests the predicate on the row as committed.
+describe("a write beside a node being hidden: it waits for the row, then writes nothing", () => {
+  const cases: Record<string, (tx: Tx, id: string, owner: string) => Promise<unknown>> = {
+    rename: (tx, id) => rename(tx, id, `renamed-${rand()}.jpg`).catch((error: unknown) => error),
+    setStar: (tx, id) => setStar(tx, id, true),
+    touchAccessed: (tx, id) => touchAccessed(tx, id),
+    trash: (tx, id, owner) => trash(tx, id, owner),
+  };
+  const hides: Record<string, (tx: Tx, id: string) => Promise<unknown>> = {
+    "the CSAM lock": (tx, id) => lockSuspectedCsam(tx, id, { source: "photodna" }),
+    "a takedown of the node": (tx, id) => takedownNode(tx, id, { reason: "abuse", by: null }),
+  };
+  const pairs = Object.keys(hides).flatMap((hide) =>
+    Object.keys(cases).map((write) => [write, hide] as const),
+  );
+
+  it.each(pairs)("%s beside %s", async (write, hide) => {
+    const owner = await makeUser(a.db);
+    const folder = await makeFolder(a.db, owner, null, `folder-${rand()}`);
+    const file = await makeFile(a.db, owner, folder.id, "evidence.jpg");
+    const writerPid = gate<number>();
+    const hidden = gate();
+
+    const hiding = settle(
+      a.db.transaction(async (tx) => {
+        await hides[hide]!(tx, file.id);
+        hidden.open();
+        await untilWaitingForLock(await writerPid.opened, write);
+      }),
+    );
+    const writing = settle(
+      b.db.transaction(async (tx) => {
+        await hidden.opened;
+        writerPid.open(await pidOf(tx));
+        return cases[write]!(tx, file.id, owner);
+      }),
+    );
+    const [hid, wrote] = await Promise.all([hiding, writing]);
+    expect(hid.ok, `${write} waited for the row`).toBe(true);
+    expect(wrote.ok).toBe(true);
+    const answer = (wrote as { value: unknown }).value;
+    if (write === "rename") {
+      expect(answer).toBeInstanceOf(QueryError);
+      expect((answer as QueryError).code).toBe("not_found");
+    } else if (write === "trash") expect(answer).toBeNull();
+    else expect(answer).toBe(false);
+    expect(await getNode(a.db, file.id)).toMatchObject({
+      name: "evidence.jpg",
+      starred: false,
+      lastAccessedAt: null,
+      deletedAt: null,
+      trashedRoot: false,
+    });
+  });
+
+  // A restore re-parents: it is under the tree lock, like a move. The takedown of the folder
+  // above is written and not committed; the restore to the top level waits, then is not_found.
+  it("a restore to the top level beside a takedown of the folder above: it waits, then is not_found", async () => {
+    const owner = await makeUser(a.db);
+    const folder = await makeFolder(a.db, owner, null, `folder-${rand()}`);
+    const file = await makeFile(a.db, owner, folder.id, "binned.txt", {
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    const restorePid = gate<number>();
+    const down = gate();
+    const takedown = settle(
+      a.db.transaction(async (tx) => {
+        await takedownNode(tx, folder.id, { reason: "abuse", by: null });
+        down.open();
+        await untilWaitingForLock(await restorePid.opened, "the restore");
+      }),
+    );
+    const restoring = settle(
+      b.db.transaction(async (tx) => {
+        await down.opened;
+        restorePid.open(await pidOf(tx));
+        return restore(tx, file.id, { toRoot: true });
+      }),
+    );
+    const [took, restored] = await Promise.all([takedown, restoring]);
+    expect(took.ok).toBe(true);
+    expect(!restored.ok && restored.error instanceof QueryError && restored.error.code).toBe("not_found");
+    expect(await getNode(a.db, file.id)).toMatchObject({ parentId: folder.id, trashedRoot: true });
   });
 });
 

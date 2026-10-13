@@ -27,7 +27,7 @@ import {
   ownCauses,
   userHeld,
 } from "./holds";
-import { effectiveTrashed, lockOwnerTree, notEffectivelyHidden } from "./tree";
+import { effectiveHidden, effectiveTrashed, lockOwnerTree, notEffectivelyHidden, notHiddenRow } from "./tree";
 
 export { LegalHoldError };
 
@@ -46,8 +46,10 @@ const uuidArray = (ids: readonly string[]): SQL =>
 
 /**
  * Moves a node to the trash: `deletedAt`, `trashedRoot`, `trashedBy` and `purgeAfter` on that
- * row only. Null when there is no such node, it is a system node, or it is already a trashed
- * root. Never consults holds: trashing destroys nothing.
+ * row only. Null when there is no such node, it is a system node, it is already a trashed
+ * root, or it is HIDDEN (taken down itself or by a folder above it, or locked as suspected CSAM
+ * — `tree.notHiddenRow`, in the statement itself): a hidden node is not there to be trashed,
+ * and its row is not altered. Never consults holds: trashing destroys nothing.
  */
 export async function trash(
   db: Executor,
@@ -65,7 +67,7 @@ export async function trash(
       trashedBy: actorId,
       purgeAfter: sql`now() + make_interval(days => ${days})`,
     })
-    .where(and(eq(nodes.id, nodeId), isNull(nodes.deletedAt), isNull(nodes.system)))
+    .where(and(eq(nodes.id, nodeId), isNull(nodes.deletedAt), isNull(nodes.system), notHiddenRow()))
     .returning();
   return row ?? null;
 }
@@ -84,6 +86,9 @@ function restoredName(name: string, attempt: number): string {
  * (the caller passes it when the parent is itself trashed). When the name is taken there, the
  * node comes back as "<name> (restored)".
  * Null when the node is not a restorable trashed root (not trashed, purge already requested);
+ * `not_found` when it is HIDDEN — taken down itself or by a folder above it, or locked: decided
+ * under the tree lock and the row's lock, like `nodes.move` (restored to the top level it would
+ * otherwise come out from under the folder that hides it);
  * `conflict` when the parent is in the trash and `toRoot` was not passed; `LegalHoldError`
  * (internal, as from the purge gate) when `toRoot` would take it out from under a folder that
  * is on legal hold or named by an open notice — restored in place it stays protected.
@@ -100,7 +105,9 @@ export async function restore(
     if (!peek) return null;
     await lockOwnerTree(tx, peek.ownerId);
     const [node] = await tx.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
-    if (!node || node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
+    if (!node) return null;
+    if (await effectiveHidden(tx, nodeId)) throw new QueryError("not_found");
+    if (node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
     const parentId = opts.toRoot ? null : node.parentId;
     // Like `move`: not out from under a folder that is on legal hold or under an open notice.
     if (parentId !== node.parentId) {

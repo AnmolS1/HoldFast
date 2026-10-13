@@ -25,11 +25,12 @@ import {
 } from "../schema";
 import { lostByLeaving } from "./holds";
 import {
+  effectiveHidden,
   isDescendantOrSelf,
-  effectiveTrashed,
   lockOwnerTree,
   nodeVisibility,
   notEffectivelyTrashedOrHidden,
+  notHiddenRow,
 } from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
@@ -371,7 +372,11 @@ async function withNameConflict<T>(db: Executor, write: (tx: Executor) => Promis
 /**
  * Creates a folder. `ownerId` is the owner of the tree, `createdBy` the caller (an editor inside
  * a shared folder is not the owner). `not_found` when the parent is not a live folder of that
- * owner; `conflict` when the name is taken; `validation` for an unusable name.
+ * owner — in the trash or hidden, itself or by a folder above it, included; `conflict` when the
+ * name is taken; `validation` for an unusable name.
+ *
+ * The parent's state is read before the insert, not under a lock: a folder created in the
+ * instant its parent is trashed or taken down is inside it, and is trashed or hidden with it.
  */
 export async function createFolder(
   db: Executor,
@@ -383,7 +388,8 @@ export async function createFolder(
     if (!parent || parent.kind !== "folder" || parent.ownerId !== args.ownerId || parent.system !== null) {
       throw new QueryError("not_found");
     }
-    if (await effectiveTrashed(db, parent.id)) throw new QueryError("not_found");
+    const place = await nodeVisibility(db, parent.id);
+    if (place.trashed || place.hidden) throw new QueryError("not_found");
   }
   return withNameConflict(db, async (tx) => {
     const [row] = await tx
@@ -403,7 +409,11 @@ export async function createFolder(
   });
 }
 
-/** Rewrites `name`, `nameKey` and `ext` together. The object key and version do not change. */
+/**
+ * Rewrites `name`, `nameKey` and `ext` together. The object key and version do not change.
+ * `not_found` for an id that does not exist, a system node, and a HIDDEN node (`notHiddenRow`,
+ * in the statement itself): the name of a file that is locked or taken down is not altered.
+ */
 export async function rename(db: Executor, nodeId: string, rawName: string): Promise<Node> {
   const name = sanitizeName(rawName);
   if (!isUuid(nodeId)) throw new QueryError("not_found");
@@ -416,7 +426,7 @@ export async function rename(db: Executor, nodeId: string, rawName: string): Pro
         ext: sql`CASE WHEN ${nodes.kind} = 'file' THEN ${extOf(name)} ELSE '' END`,
         updatedAt: sql`now()`,
       })
-      .where(and(eq(nodes.id, nodeId), isNull(nodes.system)))
+      .where(and(eq(nodes.id, nodeId), isNull(nodes.system), notHiddenRow()))
       .returning();
     if (!row) throw new QueryError("not_found");
     return row;
@@ -509,18 +519,21 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
   return (await moveNode(db, nodeId, newParentId)).node;
 }
 
-/** False when no such node exists. */
+/** False when no such node exists — a hidden node (`notHiddenRow`) included: nothing is written. */
 export async function setStar(db: Executor, nodeId: string, starred: boolean): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
   const rows = await db
     .update(nodes)
     .set({ starred })
-    .where(and(eq(nodes.id, nodeId), isNull(nodes.system)))
+    .where(and(eq(nodes.id, nodeId), isNull(nodes.system), notHiddenRow()))
     .returning({ id: nodes.id });
   return rows.length > 0;
 }
 
-/** Sets `lastAccessedAt`, at most once per 10 minutes per node. True when it wrote. */
+/**
+ * Sets `lastAccessedAt`, at most once per 10 minutes per node. True when it wrote. Never on a
+ * hidden node (`notHiddenRow`): nobody opened it.
+ */
 export async function touchAccessed(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
   const rows = await db
@@ -530,6 +543,7 @@ export async function touchAccessed(db: Executor, nodeId: string): Promise<boole
       and(
         eq(nodes.id, nodeId),
         sql`(${nodes.lastAccessedAt} IS NULL OR ${nodes.lastAccessedAt} < now() - interval '10 minutes')`,
+        notHiddenRow(),
       ),
     )
     .returning({ id: nodes.id });
@@ -538,7 +552,10 @@ export async function touchAccessed(db: Executor, nodeId: string): Promise<boole
 
 /**
  * The owner-rescan throttle: one request per node per hour, taken atomically. False = throttled
- * (or no such node). Whether the node's status allows a rescan is the caller's check.
+ * (or no such node). Whether the node's status allows a rescan is the caller's check — and
+ * whether it is hidden: this stamps the throttle only, and `scanning.enqueueRescan` decides on
+ * the locked row and refuses a hidden node there. (No hidden test here on purpose: false means
+ * "throttled" to the caller, which a node hidden in this instant must not be answered with.)
  */
 export async function requestRescan(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
@@ -675,9 +692,11 @@ export async function resetToPending(db: Executor, nodeId: string): Promise<bool
 /**
  * Replace: the node keeps its id, name, shares and links and gets a new current version; the
  * previous one moves to `node_versions` for 30 days. Guarded — allowed only while the node is
- * `clean`, `skipped` or `error`, not taken down, and neither it nor its owner is on legal hold:
+ * `clean`, `skipped` or `error`, not taken down — itself or by a folder above it — and neither
+ * it nor its owner is on legal hold:
  *   `scan_pending` for `pending`; `scan_blocked` for `infected` / `under_review`;
- *   `not_found` for `suspected_csam`, a held or taken-down node, a folder, or no node at all.
+ *   `not_found` for `suspected_csam`, a held or taken-down node (also one inside a taken-down
+ *   folder), a folder, or no node at all.
  * The new version starts `pending`. `createdBy` becomes the node's uploader.
  * Returns the previous `versionId`, so the caller can delete that version's thumbnails.
  * No quota arithmetic: the upload's reservation becomes the new version, and the old version
@@ -713,6 +732,11 @@ export async function replaceVersion(
     ) {
       throw new QueryError("not_found");
     }
+    // By ancestry too, read with the row held: a file inside a taken-down folder is as hidden as
+    // one taken down itself. (No tree lock here — the owner's row is already held, and the tree
+    // lock comes before every row lock: a takedown of a folder above that commits after this
+    // read is the same as the Replace having come first.)
+    if (await effectiveHidden(sp, nodeId)) throw new QueryError("not_found");
     if (node.scanStatus === "pending") throw new QueryError("scan_pending");
     if (node.scanStatus === "infected" || node.scanStatus === "under_review")
       throw new QueryError("scan_blocked");

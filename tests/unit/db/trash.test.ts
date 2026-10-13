@@ -115,6 +115,64 @@ describe("trash and restore", () => {
     expect(await restore(db, uuidv7())).toBeNull();
   });
 
+  // Hidden — taken down itself or by a folder above it, or locked — is not there to be trashed
+  // or restored: neither writes, and a restore to the top level cannot take a file out from
+  // under the folder that hides it.
+  it("trash and restore refuse a hidden node and write nothing", async () => {
+    const t = await tree();
+    const rowOf = async (id: string) => (await db.select().from(nodes).where(eq(nodes.id, id)))[0]!;
+    const locked = await makeFile(db, t.owner, t.root.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const own = await makeFile(db, t.owner, t.root.id, "own.txt", {
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    // Trashed before the folder above was taken down — and one whose own row was hidden in the trash.
+    await trash(db, t.deep.id, t.owner);
+    const binnedLocked = await makeFile(db, t.owner, t.root.id, "binned.jpg", {
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    await db
+      .update(nodes)
+      .set({ scanStatus: "suspected_csam", legalHold: true })
+      .where(eq(nodes.id, binnedLocked.id));
+    expect(await takedownNode(db, t.sub.id, { reason: "abuse", by: null })).toBe(true);
+
+    // trash: the node itself hidden, a folder taken down, a file… (`deep` is trashed already).
+    for (const id of [locked.id, own.id, t.sub.id]) {
+      const before = await rowOf(id);
+      expect(await trash(db, id, t.owner)).toBeNull();
+      expect(await rowOf(id)).toEqual(before);
+    }
+    const under = await makeFile(db, t.owner, t.sub.id, "under.txt");
+    expect(await trash(db, under.id, t.owner)).toBeNull();
+    expect(await rowOf(under.id)).toMatchObject({ deletedAt: null, trashedRoot: false });
+
+    // restore: in place and to the top level alike — and for a hidden node that is not even in
+    // the trash the answer is the same not_found, not the "not restorable" null.
+    const notFound = async (promise: Promise<unknown>) => {
+      const error = await rejection(promise);
+      expect(error).toBeInstanceOf(QueryError);
+      expect((error as QueryError).code).toBe("not_found");
+    };
+    for (const id of [t.deep.id, binnedLocked.id, own.id, locked.id, t.sub.id]) {
+      const before = await rowOf(id);
+      await notFound(restore(db, id));
+      await notFound(restore(db, id, { toRoot: true }));
+      expect(await rowOf(id)).toEqual(before);
+    }
+    // The control: visible again, the same calls do what they did.
+    expect(await restoreTakedown(db, t.sub.id)).toBe(true);
+    expect(await trash(db, under.id, t.owner)).toMatchObject({ id: under.id, trashedRoot: true });
+    expect(await restore(db, t.deep.id, { toRoot: true })).toMatchObject({ id: t.deep.id, parentId: null });
+    // An unknown id and a visible node that is not in the trash are still the null they were.
+    expect(await restore(db, uuidv7())).toBeNull();
+    expect(await restore(db, t.keep.id)).toBeNull();
+  });
+
   it("a name collision on restore gets the suffix ' (restored)', before the extension", async () => {
     const t = await tree();
     await trash(db, t.keep.id, t.owner);

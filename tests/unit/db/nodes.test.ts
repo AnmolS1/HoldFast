@@ -804,6 +804,111 @@ describe("small writes", () => {
   });
 });
 
+// A hidden node — taken down itself or by a folder above it, or locked as suspected CSAM — is not
+// written to by the small writers either, whatever their caller read a moment before.
+describe("a hidden node is not written to", () => {
+  /** live/ { plain.txt, own.txt (taken down), locked.jpg (csam) }   down/ (taken down) { sub/ { deep.txt }, inside.txt } */
+  async function hiddenFamily() {
+    const owner = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const plain = await makeFile(db, owner, live.id, "plain.txt", { scanStatus: "clean" });
+    const own = await makeFile(db, owner, live.id, "own.txt", {
+      scanStatus: "clean",
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(db, owner, live.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const down = await makeFolder(db, owner, null, `down-${rand()}`, {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const sub = await makeFolder(db, owner, down.id, "sub");
+    const inside = await makeFile(db, owner, down.id, "inside.txt", { scanStatus: "clean" });
+    const deep = await makeFile(db, owner, sub.id, "deep.txt", { scanStatus: "clean" });
+    return { owner, live, plain, down, sub, hidden: [own, locked, down, sub, inside, deep] };
+  }
+  const rowOf = async (id: string) => (await db.select().from(nodes).where(eq(nodes.id, id)))[0]!;
+
+  it("rename, setStar and touchAccessed: not_found / false, and the row is as it was", async () => {
+    const f = await hiddenFamily();
+    for (const node of f.hidden) {
+      const before = await rowOf(node.id);
+      await expectCode(rename(db, node.id, `renamed-${rand()}.txt`), "not_found");
+      expect(await setStar(db, node.id, true), node.name).toBe(false);
+      expect(await touchAccessed(db, node.id), node.name).toBe(false);
+      expect(await rowOf(node.id), node.name).toEqual(before);
+    }
+    // The control, in the same run: a visible node beside them, and the same nodes once visible.
+    expect((await rename(db, f.plain.id, "plain-2.txt")).name).toBe("plain-2.txt");
+    expect(await setStar(db, f.plain.id, true)).toBe(true);
+    expect(await touchAccessed(db, f.plain.id)).toBe(true);
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    const deep = f.hidden[5]!;
+    expect((await rename(db, deep.id, "deep-2.txt")).name).toBe("deep-2.txt");
+    expect(await setStar(db, deep.id, true)).toBe(true);
+    expect(await touchAccessed(db, deep.id)).toBe(true);
+  });
+
+  it("createFolder: a hidden parent is not_found — also when the name is taken there", async () => {
+    const f = await hiddenFamily();
+    for (const parent of [f.down, f.sub]) {
+      const args = { ownerId: f.owner, createdBy: f.owner, parentId: parent.id };
+      await expectCode(createFolder(db, { ...args, name: `new-${rand()}` }), "not_found");
+      // `sub` and `deep.txt` hold these names: the answer must not say so.
+      await expectCode(
+        createFolder(db, { ...args, name: parent.id === f.down.id ? "sub" : "deep.txt" }),
+        "not_found",
+      );
+    }
+    const children = await db.select({ id: nodes.id }).from(nodes).where(eq(nodes.parentId, f.sub.id));
+    expect(children).toHaveLength(1);
+    // The control: beside them, and inside once the takedown is lifted.
+    expect(
+      (await createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId: f.live.id, name: "ok" }))
+        .parentId,
+    ).toBe(f.live.id);
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    expect(
+      (await createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId: f.sub.id, name: "ok" }))
+        .parentId,
+    ).toBe(f.sub.id);
+  });
+
+  it("replaceVersion: a file inside a taken-down folder is not_found, like one taken down itself", async () => {
+    const f = await hiddenFamily();
+    const next = () => ({
+      r2Key: `u/${f.owner}/x/${rand(8)}`,
+      versionId: rand(8),
+      size: 9,
+      sha256: "new-hash",
+      createdBy: f.owner,
+    });
+    for (const node of f.hidden.filter((n) => n.kind === "file")) {
+      const before = await rowOf(node.id);
+      await expectCode(
+        db.transaction((tx) => replaceVersion(tx, node.id, next())),
+        "not_found",
+      );
+      expect(await rowOf(node.id), node.name).toEqual(before);
+      expect(await db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, node.id))).toHaveLength(0);
+    }
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    const deep = f.hidden[5]!;
+    expect(await db.transaction((tx) => replaceVersion(tx, deep.id, next()))).toEqual({
+      previousVersionId: deep.versionId,
+    });
+  });
+
+  it("requestRescan is the throttle only: it does not decide on hidden (enqueueRescan does, on the locked row)", async () => {
+    const f = await hiddenFamily();
+    // Stated, so that a change of this is a decision: false would read as "throttled" to the route.
+    expect(await requestRescan(db, f.hidden[0]!.id)).toBe(true);
+  });
+});
+
 describe("by-key helpers", () => {
   it("findByR2Key finds the current version only", async () => {
     const owner = await makeUser(db);
