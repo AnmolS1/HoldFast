@@ -21,7 +21,7 @@ import {
   setUserLegalHold,
   takedownNode,
 } from "../../../src/worker/db/queries/moderation";
-import { getNode, move, replaceVersion } from "../../../src/worker/db/queries/nodes";
+import { getNode, move, moveNode, replaceVersion } from "../../../src/worker/db/queries/nodes";
 import { deleteSubtreeRows, deleteVersionRows } from "../../../src/worker/db/queries/trash";
 import { lockOwnerTree } from "../../../src/worker/db/queries/tree";
 import { cancel, schedule } from "../../../src/worker/db/queries/user-purge";
@@ -684,6 +684,9 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
     return { owner, folder, trashed, movable, flagged, elsewhere, noticeId: notice!.id };
   }
   const isHeldError = (outcome: Outcome<unknown>) => !outcome.ok && outcome.error instanceof LegalHoldError;
+  const isNotFound = (outcome: Outcome<unknown>) =>
+    !outcome.ok && outcome.error instanceof QueryError && outcome.error.code === "not_found";
+  type Family = Awaited<ReturnType<typeof family>>;
 
   // A purge that got the tree lock first has finished deciding AND deleting before a hold can be
   // placed on the folder above: the hold-setter waits for it. (The other order — the hold first,
@@ -727,7 +730,7 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
 
     const hold = settle(
       a.db.transaction(async (tx) => {
-        await takedownNode(tx, f.folder.id, { reason: "csam", by: null });
+        await setNodeLegalHold(tx, f.folder.id, true);
         holdWritten.open();
         await untilWaitingForLock(await movePid.opened, "the move");
       }),
@@ -743,6 +746,106 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
     expect(heldNow.ok, "the move waited for the hold").toBe(true);
     expect(isHeldError(moved)).toBe(true);
     expect(await getNode(a.db, f.movable.id)).toMatchObject({ parentId: f.folder.id });
+  });
+
+  // A takedown of the folder is written and not committed; a move of a file out of it — or of
+  // the folder itself, or of something INTO it — starts. It waits for the tree lock, then finds
+  // the folder taken down and answers as for an id that does not exist: nothing is moved, and no
+  // file comes out from under the folder that hides it. (`abuse` sets no hold: only the hidden
+  // check stands between the file and the top level. `csam` sets one too: hidden answers first.)
+  it.each([
+    ["a file inside it, to another folder", "abuse", (f: Family) => [f.movable.id, f.elsewhere.id] as const],
+    ["a file inside it, to the top level", "abuse", (f: Family) => [f.movable.id, null] as const],
+    ["a file inside it, to the top level", "csam", (f: Family) => [f.movable.id, null] as const],
+    ["the folder itself", "dmca", (f: Family) => [f.folder.id, f.elsewhere.id] as const],
+    ["a folder from outside INTO it", "abuse", (f: Family) => [f.elsewhere.id, f.folder.id] as const],
+  ] as const)(
+    "a move beside a takedown being placed — %s (%s): the move waits, then is not_found",
+    async (_what, reason, pick) => {
+      const f = await family();
+      const [nodeId, targetId] = pick(f);
+      const before = (await getNode(a.db, nodeId))!;
+      const movePid = gate<number>();
+      const takedownWritten = gate();
+
+      const takedown = settle(
+        a.db.transaction(async (tx) => {
+          await takedownNode(tx, f.folder.id, { reason, by: null });
+          takedownWritten.open();
+          await untilWaitingForLock(await movePid.opened, "the move");
+        }),
+      );
+      const moving = settle(
+        b.db.transaction(async (tx) => {
+          await takedownWritten.opened;
+          movePid.open(await pidOf(tx));
+          return moveNode(tx, nodeId, targetId);
+        }),
+      );
+      const [down, moved] = await Promise.all([takedown, moving]);
+      expect(down.ok, "the move waited for the takedown").toBe(true);
+      expect(isNotFound(moved), "refused as an id that does not exist").toBe(true);
+      const after = (await getNode(a.db, nodeId))!;
+      expect(after.parentId).toBe(before.parentId);
+      expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+    },
+  );
+
+  // The other order: the move got the tree lock first and is done before the takedown lands.
+  it("a takedown beside a move that got there first: the takedown waits, the move is whole", async () => {
+    const f = await family();
+    const takedownPid = gate<number>();
+    const moved = gate();
+    const moving = settle(
+      a.db.transaction(async (tx) => {
+        const result = await moveNode(tx, f.movable.id, null);
+        moved.open();
+        await untilWaitingForLock(await takedownPid.opened, "the takedown");
+        return result;
+      }),
+    );
+    const takedown = settle(
+      b.db.transaction(async (tx) => {
+        await moved.opened;
+        takedownPid.open(await pidOf(tx));
+        return takedownNode(tx, f.folder.id, { reason: "abuse", by: null });
+      }),
+    );
+    const [did, down] = await Promise.all([moving, takedown]);
+    expect(did).toMatchObject({ ok: true, value: { previousParentId: f.folder.id, changed: true } });
+    expect(down).toEqual({ ok: true, value: true });
+    // It left before the folder was taken down: a move the owner was free to make.
+    expect(await getNode(a.db, f.movable.id)).toMatchObject({ parentId: null });
+  });
+
+  // The CSAM lock takes no tree lock: it and the move meet on the node's ROW. The lock is
+  // written and not committed; the move waits for the row, then reads the file as locked.
+  it("a move beside the CSAM lock of the file being moved: the move waits for the row, then is not_found", async () => {
+    const f = await family();
+    const movePid = gate<number>();
+    const lockWritten = gate();
+    const locking = settle(
+      a.db.transaction(async (tx) => {
+        const locked = await lockSuspectedCsam(tx, f.flagged.id, { source: "photodna" });
+        lockWritten.open();
+        await untilWaitingForLock(await movePid.opened, "the move");
+        return locked;
+      }),
+    );
+    const moving = settle(
+      b.db.transaction(async (tx) => {
+        await lockWritten.opened;
+        movePid.open(await pidOf(tx));
+        return moveNode(tx, f.flagged.id, f.elsewhere.id);
+      }),
+    );
+    const [locked, moved] = await Promise.all([locking, moving]);
+    expect(locked.ok).toBe(true);
+    expect(isNotFound(moved)).toBe(true);
+    expect(await getNode(a.db, f.flagged.id)).toMatchObject({
+      parentId: f.folder.id,
+      scanStatus: "suspected_csam",
+    });
   });
 
   // Closing a notice ends a cause that reaches down. The close is written and not committed; a
@@ -793,8 +896,8 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
 
   // Pairwise, in both orders: the first has taken ITS first lock and stops; the second runs until
   // it waits or is done; then the first goes on. Nobody is ended as a deadlock victim, and the
-  // only refusal there can be is the hold's own (a purge or a move after the takedown).
-  type Family = Awaited<ReturnType<typeof family>>;
+  // only refusals there can be are the hold's own (a purge after the takedown) and, for a move
+  // after the takedown, that of a node under a folder that is hidden now: `not_found`.
   const ops: Record<
     string,
     { first: (tx: Tx, f: Family) => Promise<unknown>; run: (tx: Tx, f: Family) => Promise<unknown> }
@@ -862,15 +965,19 @@ describe("the owner's tree lock: move, purge, takedown and the CSAM lock", () =>
       }),
     );
     const [did, also] = await Promise.all([first, second]);
+    const involved = [one, two];
     for (const [name, outcome] of [
       [one, did],
       [two, also],
     ] as const) {
       expect(sqlState(outcome), `${name} was not a deadlock victim`).not.toBe("40P01");
-      expect(outcome.ok || isHeldError(outcome), `${name} finished, or was refused by the hold`).toBe(true);
+      const hiddenNow = name === "move" && involved.includes("takedown") && isNotFound(outcome);
+      expect(
+        outcome.ok || isHeldError(outcome) || hiddenNow,
+        `${name} finished, or was refused by the hold or the takedown`,
+      ).toBe(true);
     }
     // Whatever the order, the folder is held in the end and the flagged file locked.
-    const involved = [one, two];
     if (involved.includes("takedown"))
       expect(await getNode(a.db, f.folder.id)).toMatchObject({ legalHold: true });
     if (involved.includes("csamLock"))

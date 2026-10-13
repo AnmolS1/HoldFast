@@ -13,6 +13,7 @@ import {
   listRecent,
   listStarred,
   move,
+  moveNode,
   type NodeSort,
   OWNER_VISIBLE_STATUSES,
   rename,
@@ -658,6 +659,83 @@ describe("createFolder, rename, move", () => {
     // Into the trash is not a move.
     const bin = await makeFolder(db, owner, null, "bin", { deletedAt: new Date(), trashedRoot: true });
     await expectCode(move(db, file.id, bin.id), "not_found");
+  });
+
+  // A node that is hidden — taken down itself or by a folder above it, or locked — does not
+  // exist for a move, as a node or as a target: moved out, it would no longer be under what hides it.
+  it("move refuses a hidden node and a hidden target, and writes nothing", async () => {
+    const owner = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const down = await makeFolder(db, owner, null, `down-${rand()}`, {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const sub = await makeFolder(db, owner, down.id, "sub");
+    const inside = await makeFile(db, owner, down.id, "inside.txt");
+    const deep = await makeFile(db, owner, sub.id, "deep.txt");
+    const own = await makeFile(db, owner, live.id, "own.txt", {
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(db, owner, live.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const free = await makeFile(db, owner, live.id, "free.txt");
+    const before = async (ids: string[]) =>
+      Promise.all(
+        ids.map(async (id) => [(await getNode(db, id))!.parentId, (await getNode(db, id))!.updatedAt]),
+      );
+    const all = [down.id, sub.id, inside.id, deep.id, own.id, locked.id, free.id];
+    const was = await before(all);
+
+    for (const node of [inside, deep, sub, down, own, locked]) {
+      await expectCode(moveNode(db, node.id, null), "not_found");
+      await expectCode(moveNode(db, node.id, live.id), "not_found");
+    }
+    // Within the hidden folder, and to where it already is: the same answer, not a quiet no-op.
+    await expectCode(moveNode(db, deep.id, down.id), "not_found");
+    await expectCode(moveNode(db, inside.id, down.id), "not_found");
+    await expectCode(moveNode(db, own.id, live.id), "not_found");
+    // Into a hidden folder, or into a folder under one.
+    await expectCode(moveNode(db, free.id, down.id), "not_found");
+    await expectCode(moveNode(db, free.id, sub.id), "not_found");
+    await expectCode(move(db, free.id, sub.id), "not_found");
+    expect(await before(all)).toEqual(was);
+
+    // The control: the same moves once the takedown is lifted.
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, down.id));
+    expect(await moveNode(db, free.id, sub.id)).toMatchObject({
+      node: { id: free.id, parentId: sub.id },
+      previousParentId: live.id,
+      changed: true,
+    });
+    expect((await move(db, inside.id, null)).parentId).toBeNull();
+  });
+
+  it("moveNode says where the node was, and whether anything changed", async () => {
+    const owner = await makeUser(db);
+    const from = await makeFolder(db, owner, null, `from-${rand()}`);
+    const to = await makeFolder(db, owner, null, `to-${rand()}`);
+    const file = await makeFile(db, owner, from.id, "note.txt");
+
+    const moved = await moveNode(db, file.id, to.id);
+    expect(moved).toMatchObject({ previousParentId: from.id, changed: true, node: { parentId: to.id } });
+    // The same request again: nothing is written, and the caller is told so.
+    const again = await moveNode(db, file.id, to.id);
+    expect(again).toMatchObject({ previousParentId: to.id, changed: false, node: { parentId: to.id } });
+    expect(again.node.updatedAt.getTime()).toBe(moved.node.updatedAt.getTime());
+    // To the top level and back to it.
+    expect(await moveNode(db, file.id, null)).toMatchObject({ previousParentId: to.id, changed: true });
+    expect(await moveNode(db, file.id, null)).toMatchObject({ previousParentId: null, changed: false });
+    // `move` is the same move, the row only.
+    expect(await move(db, file.id, from.id)).toMatchObject({ id: file.id, parentId: from.id });
+    // Two moves of one node at once: each reports the parent IT found, so the two rows chain.
+    const [one, two] = await Promise.all([moveNode(db, file.id, to.id), moveNode(db, file.id, null)]);
+    const first = one.previousParentId === from.id ? one : two;
+    const second = first === one ? two : one;
+    expect(first).toMatchObject({ previousParentId: from.id, changed: true });
+    expect(second).toMatchObject({ previousParentId: first.node.parentId, changed: true });
   });
 
   it("concurrent moves cannot build a cycle", async () => {

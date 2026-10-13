@@ -24,7 +24,13 @@ import {
   user,
 } from "../schema";
 import { lostByLeaving } from "./holds";
-import { isDescendantOrSelf, effectiveTrashed, lockOwnerTree, notEffectivelyTrashedOrHidden } from "./tree";
+import {
+  isDescendantOrSelf,
+  effectiveTrashed,
+  lockOwnerTree,
+  nodeVisibility,
+  notEffectivelyTrashedOrHidden,
+} from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
 export type SortDir = "asc" | "desc";
@@ -417,20 +423,39 @@ export async function rename(db: Executor, nodeId: string, rawName: string): Pro
   });
 }
 
+export type Moved = {
+  /** The row as it is now. */
+  node: Node;
+  /** Where it was, read under the tree lock: what an audit row's `from` is. */
+  previousParentId: string | null;
+  /** False when it already was there: nothing was written, and there is nothing to record. */
+  changed: boolean;
+};
+
 /**
  * Moves a node under another folder of the same owner (null = the top level). One transaction:
  * it takes the owner's TREE LOCK first (queries/tree.ts — two concurrent moves could otherwise
- * each pass the cycle check and together build a cycle, and a purge or a hold being placed
- * could otherwise decide on a tree that is changing), then the node and the target are locked
- * `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found` for a missing, trashed
- * (itself or under a trashed folder), system or foreign node or target.
+ * each pass the cycle check and together build a cycle, and a purge, a hold or a takedown being
+ * placed could otherwise decide on a tree that is changing), then the node and the target are
+ * locked `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found` for a missing,
+ * trashed (itself or under a trashed folder), system or foreign node or target.
+ *
+ * `not_found` as well — nothing written — for a node or a target that is HIDDEN: taken down
+ * itself or by a folder above it, or locked as suspected CSAM. Decided here, under the locks,
+ * not on what the caller read before: a takedown takes this tree lock (`moderation.takedownNode`
+ * — the admin's and a notice's alike) and the CSAM lock and the verdict writer take the node's
+ * row, so each has either committed and is seen, or waits until the move is done. Without it a
+ * file moved out of a folder as that folder is taken down would come out visible.
  *
  * `LegalHoldError` — the purge gate's own error, the cause in it, and like there NEVER to be
  * shown to the caller — when the move would take the node out from under a folder that is on
  * legal hold or named by an open notice: outside it nothing would protect the node, and it
  * could be trashed and purged. Nothing is moved.
+ *
+ * Returns where the node was as well: the caller's own earlier read of the parent is not the
+ * move's (two moves racing), and `changed: false` is a move that did nothing.
  */
-export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
+export async function moveNode(db: Executor, nodeId: string, newParentId: string | null): Promise<Moved> {
   if (!isUuid(nodeId) || (newParentId !== null && !isUuid(newParentId))) throw new QueryError("not_found");
   const peek = await getNode(db, nodeId);
   if (!peek) throw new QueryError("not_found");
@@ -449,7 +474,10 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
     }
     // Trashed by ancestry too: moving a node out of a trashed folder would be a restore that
     // skips `restore` (and takes content out of a folder whose purge may already be requested).
-    if (await effectiveTrashed(tx, nodeId)) throw new QueryError("not_found");
+    // Hidden, itself or by ancestry: at its new place it would no longer be under the folder
+    // that hides it. Both read now, under the locks.
+    const here = await nodeVisibility(tx, nodeId);
+    if (here.trashed || here.hidden) throw new QueryError("not_found");
     if (newParentId !== null) {
       const target = locked.find((row) => row.id === newParentId);
       if (!target || target.kind !== "folder" || target.system !== null || target.ownerId !== node.ownerId) {
@@ -458,9 +486,10 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
       if (await isDescendantOrSelf(tx, newParentId, nodeId)) {
         throw new QueryError("conflict", "a folder cannot be moved into itself");
       }
-      if (await effectiveTrashed(tx, newParentId)) throw new QueryError("not_found");
+      const there = await nodeVisibility(tx, newParentId);
+      if (there.trashed || there.hidden) throw new QueryError("not_found");
     }
-    if (node.parentId === newParentId) return node;
+    if (node.parentId === newParentId) return { node, previousParentId: node.parentId, changed: false };
     // A hold or an open notice on a folder above protects this node only while it stays under
     // it: a move that would take it OUT from under one is refused. Moving within that folder, or
     // into a protected one, is fine; a hold of the node's own travels with it.
@@ -471,8 +500,13 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
       .set({ parentId: newParentId, updatedAt: sql`now()` })
       .where(eq(nodes.id, nodeId))
       .returning();
-    return row!;
+    return { node: row!, previousParentId: node.parentId, changed: true };
   });
+}
+
+/** `moveNode`, for a caller that only wants the row. */
+export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
+  return (await moveNode(db, nodeId, newParentId)).node;
 }
 
 /** False when no such node exists. */
