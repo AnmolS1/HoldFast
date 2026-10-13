@@ -415,6 +415,37 @@ describe("clearSuspectedCsam", () => {
     expect(await getNode(db, file.id)).toMatchObject({ scanStatus: "pending", scanStatusPrev: null });
   });
 
+  it("clears the verdict that came with the lock — what a rescan clears — whichever status the node goes back to", async () => {
+    for (const otherCase of [false, true]) {
+      const { file, owner } = await locked();
+      await db
+        .update(nodes)
+        .set({
+          scanReason: "engine",
+          scanDetail: { engine: "photodna", signatures: ["x"] },
+          scannedAt: new Date(),
+          mimeSniffed: "image/jpeg",
+        })
+        .where(eq(nodes.id, file.id));
+      if (otherCase)
+        await insertReport(db, { nodeId: file.id, ownerId: owner, source: "user", category: "spam" });
+      await clearSuspectedCsam(db, file.id);
+      expect(await getNode(db, file.id), String(otherCase)).toMatchObject({
+        scanStatus: otherCase ? "under_review" : "pending",
+        scanReason: null,
+        scanDetail: null,
+        scannedAt: null,
+        // Not a verdict: the sniffed type stays, as it does on a rescan.
+        mimeSniffed: "image/jpeg",
+      });
+    }
+    // The control: a refused clear leaves the verdict where it is.
+    const { file } = await reported("clean");
+    await db.update(nodes).set({ scanReason: "hash_mismatch", scannedAt: new Date() }).where(eq(nodes.id, file.id));
+    await clearSuspectedCsam(db, file.id);
+    expect((await getNode(db, file.id))!.scanReason).toBe("hash_mismatch");
+  });
+
   it("does not downgrade another open case: with an open or reviewing report of another category the node is under_review again, with pending saved under it", async () => {
     for (const status of ["open", "reviewing"] as const) {
       const { file, link, owner } = await locked();

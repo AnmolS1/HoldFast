@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { LegalHoldError } from "../../../src/worker/db/errors";
@@ -6,7 +6,7 @@ import { getById, pauseLinks } from "../../../src/worker/db/queries/links";
 import { release } from "../../../src/worker/db/queries/quota";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { ownedRoots } from "../../../src/worker/db/queries/tree";
-import { deleteForUser } from "../../../src/worker/db/queries/uploads";
+import { deleteForUser, remainingForUser } from "../../../src/worker/db/queries/uploads";
 import {
   cancel,
   defer,
@@ -27,6 +27,7 @@ import {
   makeUpload,
   makeUser,
   openDb,
+  protectedFiles,
   rand,
 } from "./_helpers";
 
@@ -273,5 +274,65 @@ describe("hard delete of a user", () => {
     // The owner's tree is intact; authorship is anonymised.
     const [file] = await db.select().from(nodes).where(eq(nodes.id, uploaded.id));
     expect(file).toMatchObject({ ownerId: owner, createdBy: null });
+  });
+
+  it("uploads.deleteForUser leaves what a hold protects: the other party's hold and a protected node keep their sessions, and the user row waits", async () => {
+    const leaving = await makeUser(db);
+    const heldOwner = await makeUser(db, { legalHold: true, quotaBytes: 100_000, usedBytes: 900 });
+    const heldEditor = await makeUser(db, { legalHold: true });
+    const freeOwner = await makeUser(db, { quotaBytes: 100_000, usedBytes: 40 });
+    const { files } = await protectedFiles(db);
+    const session = async (
+      ownerId: string,
+      uploaderId: string,
+      extra: Partial<typeof uploads.$inferInsert> = {},
+    ) => (await makeUpload(db, ownerId, uploaderId, { status: "done", ...extra })).id;
+
+    const kept: Record<string, string> = {
+      // The leaving user uploaded into a held owner's folder (an open session: its reservation stays).
+      into_held_owner: await session(heldOwner, leaving, { status: "open", size: 900 }),
+      // A held editor uploaded into the leaving user's folder.
+      by_held_editor: await session(leaving, heldEditor),
+    };
+    // The leaving user's session wrote a node the purge gate protects, for each cause.
+    for (const [cause, { node }] of Object.entries(files)) {
+      kept[cause] = await session(freeOwner, leaving, { nodeId: node.id });
+    }
+    // The controls, in the same call: nobody and nothing is held.
+    const gone = [
+      await session(leaving, leaving),
+      await session(freeOwner, leaving, { status: "open", size: 40, r2UploadId: "mpu-1" }),
+    ];
+    const present = async (id: string) =>
+      (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+
+    const toAbort = await deleteForUser(db, leaving);
+    // Only the deleted unfinished session is to abort — never the kept one.
+    expect(toAbort).toHaveLength(1);
+    expect(toAbort[0]!.r2UploadId).toBe("mpu-1");
+    for (const id of gone) expect(await present(id)).toBe(false);
+    for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
+    // The deleted reservation is released; the kept one is not.
+    const used = async (id: string) =>
+      (await db.select({ usedBytes: user.usedBytes }).from(user).where(eq(user.id, id)))[0]!.usedBytes;
+    expect(await used(freeOwner)).toBe(0);
+    expect(await used(heldOwner)).toBe(900);
+
+    // The user row cannot go yet, and the job can tell: it waits.
+    expect(await remainingForUser(db, leaving)).toBe(Object.keys(kept).length);
+    await expect(db.delete(user).where(eq(user.id, leaving))).rejects.toThrow();
+
+    // Each hold lifted, its session goes on the next run; then the user can be deleted.
+    for (const { release: lift } of Object.values(files)) await lift();
+    await db
+      .update(user)
+      .set({ legalHold: false })
+      .where(inArray(user.id, [heldOwner, heldEditor]));
+    const aborted = await deleteForUser(db, leaving);
+    expect(aborted).toHaveLength(1);
+    expect(await remainingForUser(db, leaving)).toBe(0);
+    expect(await used(heldOwner)).toBe(0);
+    await db.delete(user).where(eq(user.id, leaving));
+    expect(await userState(db, leaving)).toBeNull();
   });
 });

@@ -20,6 +20,9 @@ export const OPEN_NOTICE_STATUSES = ["received", "incomplete", "actioned", "coun
 export const TERMINAL_NOTICE_STATUSES = ["rejected", "restored", "upheld", "withdrawn", "closed"] as const;
 export type TerminalNoticeStatus = (typeof TERMINAL_NOTICE_STATUSES)[number];
 
+/** The verdict columns a rescan starts from (what `nodes.resetToPending` clears). */
+const NO_VERDICT = { scanReason: null, scanDetail: null, scannedAt: null } as const;
+
 /** `reports.resolution` of a `csam` report dismissed by `clearSuspectedCsam`. */
 export const CSAM_CLEARED_RESOLUTION = "false_positive";
 
@@ -360,6 +363,8 @@ export type CsamClearResult = {
  *     still `open` or `reviewing`, to `under_review` with `scanStatusPrev = 'pending'`: that
  *     review is still open, and a clean scan must not make the file servable under it (its
  *     `report` pause on the links is not touched either way);
+ *     either way the verdict that came with the lock is cleared (`scanReason`, `scanDetail`,
+ *     `scannedAt` — what a rescan clears), so the node does not carry it while it waits;
  *   - `moderation` — that reason only — is removed from the links ON the node, unless the node
  *     or an ancestor is taken down: that takedown put, or would have put, the same reason
  *     there, and its restore removes it;
@@ -403,9 +408,10 @@ export async function clearSuspectedCsam(tx: Executor, nodeId: string): Promise<
     await sp
       .update(nodes)
       .set(
+        // The lock's verdict goes with it — the columns `resetToPending` clears.
         otherCaseOpen
-          ? { scanStatus: "under_review", scanStatusPrev: "pending" }
-          : { scanStatus: "pending", scanStatusPrev: null },
+          ? { scanStatus: "under_review", scanStatusPrev: "pending", ...NO_VERDICT }
+          : { scanStatus: "pending", scanStatusPrev: null, ...NO_VERDICT },
       )
       .where(eq(nodes.id, nodeId));
 

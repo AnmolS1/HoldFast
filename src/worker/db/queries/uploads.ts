@@ -198,6 +198,13 @@ export async function trimFinished(
  *
  * This one helper does touch `used_bytes`: an unfinished session the user ran in ANOTHER
  * owner's folder holds a reservation on that owner, who stays; it is released here.
+ *
+ * WHAT A HOLD PROTECTS STAYS: a session whose owner or uploader is on legal hold, or whose node
+ * is one the purge gate protects (queries/holds.ts), is not deleted — a held account is not
+ * purged at all, so in practice this is the OTHER party's hold (the user uploaded into a held
+ * owner's folder, or a held editor uploaded into the user's) or a node under review, locked or
+ * under an open notice. Such a row still references the user, so the `user` row cannot be
+ * deleted yet: `remainingForUser` says how many are left, and the purge job waits (`defer`).
  */
 export async function deleteForUser(
   db: Executor,
@@ -206,7 +213,14 @@ export async function deleteForUser(
   return db.transaction(async (tx) => {
     const rows = await tx
       .delete(uploads)
-      .where(or(eq(uploads.ownerId, userId), eq(uploads.uploaderId, userId)))
+      .where(
+        and(
+          or(eq(uploads.ownerId, userId), eq(uploads.uploaderId, userId)),
+          not(userHeld(sql`${uploads.ownerId}`)),
+          not(userHeld(sql`${uploads.uploaderId}`)),
+          not(nodeProtected(sql`${uploads.nodeId}`)),
+        ),
+      )
       .returning({
         ownerId: uploads.ownerId,
         status: uploads.status,
@@ -229,4 +243,17 @@ export async function deleteForUser(
     }
     return unfinished.map((r) => ({ r2Key: r.r2Key, r2UploadId: r.r2UploadId }));
   });
+}
+
+/**
+ * Sessions that still name the user as owner or uploader — after `deleteForUser`, the ones a
+ * hold protects. While this is not zero the `user` row cannot be deleted (both references are
+ * RESTRICT) and the purge must wait.
+ */
+export async function remainingForUser(db: Executor, userId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)`.mapWith(Number) })
+    .from(uploads)
+    .where(or(eq(uploads.ownerId, userId), eq(uploads.uploaderId, userId)));
+  return row?.n ?? 0;
 }
