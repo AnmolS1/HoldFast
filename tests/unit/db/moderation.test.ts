@@ -962,10 +962,8 @@ describe("clearSuspectedCsam", () => {
       const [one, two] =
         order === "maker first" ? [created.first, created.second] : [created.second, created.first];
       expect(await clearSuspectedCsam(db, one.id), order).toMatchObject(kept);
-      expect(await lookup(db, created.sha256), order).toEqual({
-        reason: "csam",
-        sourceNodeId: created.first.id,
-      });
+      // Still listed, and it names the twin that is still locked (handed over, or its own).
+      expect(await lookup(db, created.sha256), order).toEqual({ reason: "csam", sourceNodeId: two.id });
       expect(await clearSuspectedCsam(db, two.id), order).toMatchObject({
         blocklistRemoved: true,
         blocklistRestoredTo: null,
@@ -981,7 +979,7 @@ describe("clearSuspectedCsam", () => {
       expect(await entryOf(raised.sha256), order).toMatchObject({
         reason: "csam",
         raisedFrom: "malware",
-        raisedByNodeId: raised.first.id,
+        raisedByNodeId: four.id,
       });
       expect(await clearSuspectedCsam(db, four.id), order).toMatchObject({
         blocklistRemoved: false,
@@ -995,6 +993,53 @@ describe("clearSuspectedCsam", () => {
         raisedFrom: null,
         raisedByNodeId: null,
       });
+    }
+  });
+
+  it("the twin that made the entry is cleared and then GONE: the last clear still undoes the entry, because the first handed it over", async () => {
+    const owner = await makeUser(db);
+    for (const before of ["nothing", "malware"] as const) {
+      const sha256 = rand(32);
+      if (before === "malware") await upsert(db, { sha256, reason: "malware", note: "admin's" });
+      const maker = await makeFile(db, owner, null, `maker-${rand()}.bin`, { sha256 });
+      const twins = [
+        await makeFile(db, owner, null, `twin-a-${rand()}.bin`, { sha256 }),
+        await makeFile(db, owner, null, `twin-b-${rand()}.bin`, { sha256 }),
+      ];
+      await lockSuspectedCsam(db, maker.id, { source: "photodna" });
+      for (const twin of twins) await lockSuspectedCsam(db, twin.id, { source: "photodna" });
+      const lowest = twins.map((t) => t.id).sort()[0]!;
+
+      // The maker is cleared first: the entry stays, and now names the lowest twin still locked.
+      expect(await clearSuspectedCsam(db, maker.id), before).toMatchObject({
+        blocklistKept: "other_node_locked",
+      });
+      const handed = (await entryOf(sha256))!;
+      expect(before === "malware" ? handed.raisedByNodeId : handed.sourceNodeId, before).toBe(lowest);
+      // …and then its row disappears altogether (trashed and purged): nothing names it any more.
+      await db.delete(nodes).where(eq(nodes.id, maker.id));
+
+      // The twin that holds the entry is cleared next: it hands it on to the last one.
+      expect(await clearSuspectedCsam(db, lowest), before).toMatchObject({
+        blocklistKept: "other_node_locked",
+      });
+      const last = twins.find((t) => t.id !== lowest)!;
+      expect(await clearSuspectedCsam(db, last.id), before).toMatchObject(
+        before === "malware"
+          ? { blocklistRemoved: false, blocklistRestoredTo: "malware", blocklistKept: null }
+          : { blocklistRemoved: true, blocklistRestoredTo: null, blocklistKept: null },
+      );
+      const end = await entryOf(sha256);
+      if (before === "malware") {
+        expect(end).toMatchObject({
+          reason: "malware",
+          note: "admin's",
+          raisedFrom: null,
+          raisedByNodeId: null,
+        });
+      } else {
+        expect(end).toBeNull();
+      }
     }
   });
 
@@ -1023,7 +1068,8 @@ describe("clearSuspectedCsam", () => {
       blocklistRemoved: false,
       blocklistKept: "other_node_locked",
     });
-    expect(await lookup(db, sha256)).toEqual({ reason: "csam", sourceNodeId: first.file.id });
+    // Kept — and handed to the twin that is still locked.
+    expect(await lookup(db, sha256)).toEqual({ reason: "csam", sourceNodeId: third.file.id });
 
     // A filed report on a node with this hash that is NOT locked (it was dealt with another way).
     const sha2 = rand(32);

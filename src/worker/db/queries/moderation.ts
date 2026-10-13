@@ -387,11 +387,12 @@ export type CsamClearResult = {
  *     there, and its restore removes it;
  *   - the blocklist entry of the hash goes back to what it was before any lock touched it —
  *     DELETED when a lock created it, its reason put back (`raisedFrom`) when a lock only raised
- *     it — but only when ALL of this holds: it is a lock's doing, this node's or that of a twin
- *     (another node with the content) that was itself cleared as a false positive; no OTHER
+ *     it — but only when ALL of this holds: the entry names THIS node as the lock behind it
+ *     (the lock that made it, or a twin's clear that handed it over); no OTHER
  *     node with the same hash is `suspected_csam`; and no `csam` report on any node with that
- *     hash was filed. So of two locked twins the FIRST clear leaves the entry and the SECOND
- *     undoes it, whichever of the two created or raised it. Otherwise the entry stays exactly
+ *     hash was filed. Of two locked twins the FIRST clear leaves the entry — handing it to the
+ *     twin that is still locked, if it was its own — and the SECOND undoes it, whichever of the
+ *     two created or raised it. Otherwise the entry stays exactly
  *     as it is and `blocklistKept` says why — also when someone changed its reason in between,
  *     and ALWAYS when it is a confirmed listing (`blocklist.confirmCsam`, or an explicit `csam`
  *     `upsert`: no source, nothing raised it). That a hash was reported lives on the entry —
@@ -550,35 +551,30 @@ async function releaseBlocklistEntry(
   }
   if (lockedBy === null) return "not_this_locks";
 
-  const [alsoLocked] = await sp
+  // Another node with this content is still locked: the entry stays. If it is THIS node's lock
+  // that made it `csam`, it is handed to that twin (the lowest id) — the entry then always
+  // names a node that is still locked, so the LAST clear finds an entry that is its own and
+  // undoes it, whatever has happened to the nodes cleared before it (their rows may be gone).
+  const [twin] = await sp
     .select({ id: nodes.id })
     .from(nodes)
     .where(
       and(eq(nodes.sha256, sha256), eq(nodes.scanStatus, "suspected_csam"), sql`${nodes.id} <> ${nodeId}`),
     )
+    .orderBy(nodes.id)
     .limit(1);
-  if (alsoLocked) return "other_node_locked";
-  if (filed) return "reported";
-
-  // A lock's doing — this node's, or a twin's whose own clear had to leave the entry because
-  // this node was still locked then. A twin counts only on the record of its clear: a `csam`
-  // report on it dismissed as a false positive. Any other source (an admin's entry, a node that
-  // is gone, an id nobody knows) is not ours to undo.
-  if (lockedBy !== nodeId) {
-    const [clearedTwin] = await sp
-      .select({ id: reports.id })
-      .from(reports)
-      .where(
-        and(
-          eq(reports.nodeId, lockedBy),
-          eq(reports.category, "csam"),
-          eq(reports.status, "dismissed"),
-          eq(reports.resolution, CSAM_CLEARED_RESOLUTION),
-        ),
-      )
-      .limit(1);
-    if (!clearedTwin) return "not_this_locks";
+  if (twin) {
+    if (lockedBy === nodeId) {
+      await sp
+        .update(hashBlocklist)
+        .set(entry.raisedFrom !== null ? { raisedByNodeId: twin.id } : { sourceNodeId: twin.id })
+        .where(eq(hashBlocklist.sha256, sha256));
+    }
+    return "other_node_locked";
   }
+  if (filed) return "reported";
+  // Some other source — an unknown id, a node never locked: not a lock's entry to undo.
+  if (lockedBy !== nodeId) return "not_this_locks";
 
   if (entry.raisedFrom !== null) {
     await sp
