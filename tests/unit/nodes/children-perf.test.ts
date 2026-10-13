@@ -1,13 +1,13 @@
-// A folder with 5,000 children: each of the four sorts finds its page through an index — the plan
-// of the very statement the listing sends is checked — and the route's p95 stays under 150 ms.
+// A folder with 5,000 children: each of the four sorts finds its page through an index, and has
+// an index of its own that serves the page in order — the plans of the very statements the
+// listing sends are checked — and the route's p95 stays under 150 ms.
 import { env } from "cloudflare:workers";
-import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { listChildren, OWNER_VISIBLE_STATUSES } from "../../../src/worker/db/queries/nodes";
 import * as schema from "../../../src/worker/db/schema";
-import { api, makeFolder, manyFiles, person, testDb } from "./helpers";
+import { api, makeFolder, manyFiles, person } from "./helpers";
 
 const CHILDREN = 5_000;
 const SORTS = ["name", "size", "updated", "kind"] as const;
@@ -21,7 +21,13 @@ const INDEX = {
 const BY_FOLDER: string[] = [...Object.values(INDEX), "nodes_live_name_child_uq", "nodes_owner_parent_idx"];
 const P95_LIMIT_MS = 150;
 
-type Plan = { "Node Type": string; "Index Name"?: string; "Relation Name"?: string; Plans?: Plan[] };
+type Plan = {
+  "Node Type": string;
+  "Index Name"?: string;
+  "Relation Name"?: string;
+  "Actual Rows"?: number;
+  Plans?: Plan[];
+};
 const flatten = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(flatten)];
 
 let owner: Awaited<ReturnType<typeof person>>;
@@ -41,15 +47,37 @@ beforeAll(async () => {
   folderId = folder.id;
   await manyFiles(owner.id, folder.id, CHILDREN);
   for (let i = 0; i < 20; i++) await makeFolder(owner.id, folder.id);
-  // Fresh statistics for the rows just written; changes no data.
-  await testDb().execute(sql`ANALYZE nodes`);
+  // No ANALYZE: the table is shared with every test file of the run, and nothing below depends
+  // on what the planner happens to know about it.
 }, 60_000);
+
+/**
+ * The plan of a statement when the planner is NOT ALLOWED to sort (this transaction only — the
+ * two settings end with it): the answer to "can an index hand these rows over already in order",
+ * whatever the table's statistics would make the planner prefer today.
+ */
+async function planWithoutSorting(statement: { text: string; params: unknown[] }): Promise<Plan[]> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL enable_sort = off");
+    await client.query("SET LOCAL enable_incremental_sort = off");
+    const explained = await client.query(
+      `EXPLAIN (ANALYZE, FORMAT JSON) ${statement.text}`,
+      statement.params,
+    );
+    return flatten((explained.rows[0] as { "QUERY PLAN": { Plan: Plan }[] })["QUERY PLAN"][0]!.Plan);
+  } finally {
+    await client.query("ROLLBACK");
+    client.release();
+  }
+}
 
 afterAll(() => pool.end());
 
 describe(`children of a folder with ${CHILDREN} files`, () => {
   it.each(SORTS.flatMap((sort) => (["asc", "desc"] as const).map((dir) => ({ sort, dir }))))(
-    "sort=$sort dir=$dir: the page is read through an index on the folder — never a table scan",
+    "sort=$sort dir=$dir: never a table scan — and the sort's own index serves the page in order, reading one page of rows",
     async ({ sort, dir }) => {
       const list = (cursor?: string | null) =>
         listChildren(recording, {
@@ -82,19 +110,23 @@ describe(`children of a folder with ${CHILDREN} files`, () => {
         const label = `${sort} ${dir} ${statement.params.includes("file") ? "files" : "folders"}`;
         expect(types, label).not.toContain("Seq Scan");
         if (!ofFiles.includes(statement)) continue;
-        // The folder's rows are found through an index that leads with the folder — never by
-        // reading the table. WHICH index is the planner's choice and moves with the table's
-        // statistics (one row estimate per parent for the whole table): the sort's own index read
-        // in order and cut by the LIMIT, the unique live-name index with an incremental sort, or
-        // the folder's rows through another of its indexes and a top-N sort of those rows alone.
-        // All three are seen on this database; what must not appear is anything else.
+        // As the planner runs it today: through an index that leads with the folder. (Which one
+        // moves with the table's statistics — it may even read the folder's rows through another
+        // index and sort them — so only "an index on the folder" is asked of this plan.)
         expect(types[0], label).toBe("Limit");
         expect(types[types.length - 1], label).toBe("Index Scan");
-        expect(
-          types.filter((type) => !["Limit", "Sort", "Incremental Sort", "Index Scan"].includes(type)),
-          label,
-        ).toEqual([]);
         expect(BY_FOLDER, label).toContain(nodes[nodes.length - 1]!["Index Name"]);
+
+        // And what keyset paging rests on, whatever the statistics: the sort HAS an index that
+        // serves the page in order. Forbidden to sort, the plan is that index and a LIMIT —
+        // nothing else — and it read a page's worth of rows, not the folder.
+        const ordered = await planWithoutSorting(statement);
+        expect(
+          ordered.map((node) => node["Node Type"]),
+          label,
+        ).toEqual(["Limit", "Index Scan"]);
+        expect(ordered[1]!["Index Name"], label).toBe(INDEX[sort]);
+        expect(ordered[1]!["Actual Rows"], label).toBeLessThanOrEqual(101);
       }
     },
   );
