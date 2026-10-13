@@ -1,7 +1,14 @@
 // Which renderer a file gets. Decided from the DETECTED type (`mimeSniffed`) and the product's
 // allow-lists — never from the name, and never because a type "is only XML". Whatever is not
 // listed gets no preview: the files host would refuse an inline URL for it anyway.
-import { INLINE_TYPES, PREVIEW_TEXT_MAX_BYTES, PREVIEW_TEXT_TYPES } from "../../../shared/constants";
+import {
+  IMAGE_PREVIEW_MAX_BYTES,
+  INLINE_TYPES,
+  PDF_PREVIEW_MAX_BYTES,
+  PREVIEW_TEXT_MAX_BYTES,
+  PREVIEW_TEXT_TYPES,
+} from "../../../shared/constants";
+import { isActiveType, OCTET_STREAM } from "../../../shared/mime";
 import type { PreviewItem } from "../../components/slots";
 
 export type RendererKind = "image" | "heic" | "pdf" | "text" | "video" | "audio" | "none";
@@ -14,22 +21,8 @@ export interface RendererChoice {
   reason?: NoPreviewReason;
 }
 
-/**
- * The largest PDF the viewer opens. pdf.js is handed the whole file, so its size is memory in
- * the tab: above this there is Download. The fetch itself stops at the same number.
- */
-export const PDF_PREVIEW_MAX_BYTES = 50_000_000;
-/** The largest image put in an <img>: decoding a larger one can exhaust a phone. */
-export const IMAGE_PREVIEW_MAX_BYTES = 50_000_000;
-
 /** Inline images no browser decodes: shown through their thumbnail, which has its own limit. */
 const THUMB_ONLY_IMAGE_TYPES: readonly string[] = ["image/heic", "image/heif"];
-const OCTET_STREAM = "application/octet-stream";
-
-/** HTML, SVG and every XML type: they can run script when a browser opens them. */
-function isActiveType(type: string): boolean {
-  return type === "text/html" || type.endsWith("+xml") || type.endsWith("/xml");
-}
 
 const within = (size: number, limit: number) => Number.isFinite(size) && size <= limit;
 const TOO_LARGE: RendererChoice = { kind: "none", reason: "tooLarge" };

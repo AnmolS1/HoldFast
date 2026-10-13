@@ -1,18 +1,16 @@
 // Which renderer a file gets — decided from the detected type and the allow-lists, never from
 // the name or from "it is only XML".
 import { describe, expect, it } from "vitest";
+import { rendererFor, type RendererKind } from "../../../../src/client/features/preview/renderer-map";
 import {
   IMAGE_PREVIEW_MAX_BYTES,
-  PDF_PREVIEW_MAX_BYTES,
-  rendererFor,
-  type RendererKind,
-} from "../../../../src/client/features/preview/renderer-map";
-import {
   INLINE_TYPES,
+  PDF_PREVIEW_MAX_BYTES,
   MIME_CATEGORIES,
   PREVIEW_TEXT_MAX_BYTES,
   PREVIEW_TEXT_TYPES,
 } from "../../../../src/shared/constants";
+import { categoryOf, inlineKindAllowed } from "../../../../src/shared/mime";
 import type { MimeCategory } from "../../../../src/shared/schemas/common";
 
 const kind = (mimeCategory: MimeCategory, mimeSniffed: string | null | undefined, size = 1000) =>
@@ -147,5 +145,31 @@ describe("renderer map", () => {
         }
       }
     }
+  });
+});
+
+describe("the renderer map and the product's MIME policy", () => {
+  it("a file has a renderer exactly when the files host would serve it inline (HEIC aside: its thumbnail)", () => {
+    const types = new Set<string>(["", "application/octet-stream", "text/plain"]);
+    const exts = new Set<string>([""]);
+    for (const { types: listed, exts: extensions } of Object.values(MIME_CATEGORIES)) {
+      listed.forEach((type) => types.add(type));
+      extensions.forEach((ext) => exts.add(ext));
+    }
+    let checked = 0;
+    for (const type of types) {
+      for (const ext of exts) {
+        for (const size of [10, PREVIEW_TEXT_MAX_BYTES, PREVIEW_TEXT_MAX_BYTES + 1]) {
+          const name = ext ? `file.${ext}` : "file";
+          const served = inlineKindAllowed({ mimeSniffed: type || null, name, ext, size });
+          const shown =
+            rendererFor({ mimeCategory: categoryOf(type, ext), mimeSniffed: type || null, size }).kind !==
+            "none";
+          expect(shown, `${type} .${ext} ${size}`).toBe(served);
+          checked += 1;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(20_000);
   });
 });

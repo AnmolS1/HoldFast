@@ -4,14 +4,14 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { PreviewDialog } from "../../../../src/client/features/preview";
-import { fetchLimitFor, PDF_PREVIEW_MAX_BYTES } from "../../../../src/client/features/preview/renderer-map";
+import { fetchLimitFor } from "../../../../src/client/features/preview/renderer-map";
 import {
   MAX_CANVAS_PIXELS,
   PDF_MAX_PAGES,
   pixelRatioFor,
 } from "../../../../src/client/features/preview/renderers/pdf-limits";
 import { readLimited, TOO_LARGE } from "../../../../src/client/features/preview/usePreviewUrl";
-import { PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
+import { PDF_PREVIEW_MAX_BYTES, PREVIEW_TEXT_MAX_BYTES } from "../../../../src/shared/constants";
 import { ID, NODES, nodeOf, pageOf } from "./fixtures";
 import {
   dialog,
