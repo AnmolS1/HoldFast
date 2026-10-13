@@ -207,14 +207,16 @@ export type JobContext = {
 };
 
 /** What a job gets from `runBackground`, over the test database, with settings of the test's own. */
-export function jobContext(options: { settings?: Settings; db?: Db } = {}): JobContext {
+export function jobContext(
+  options: { settings?: Settings; db?: Db; env?: Record<string, unknown> } = {},
+): JobContext {
   registerCoreDeps(realCore);
   const deferred: Promise<unknown>[] = [];
   const metric = vi.fn();
   const resolved = resolveSettings(env, { ...BASE_SETTINGS, ...options.settings });
   const bg: BackgroundContext = {
     db: options.db ?? testDb(),
-    env,
+    env: { ...env, ...options.env } as unknown as Env,
     defer: (promise) => void deferred.push(promise),
     keys: createKeys(env.FILES_TOKEN_SECRET),
     settings: async () => resolved,
