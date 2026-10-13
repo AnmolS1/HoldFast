@@ -674,8 +674,8 @@ test.describe("uploads (mocked API)", () => {
     await expect(rows(page)).toHaveCount(1);
     await expect(panel.getByRole("heading", { name: "Uploads" })).toBeFocused();
     // The last row takes the panel with it: the focus goes to the page, not to nowhere.
-    await page.keyboard.press("Tab");
-    await expect(page.getByRole("button", { name: "Try page.html again" })).toBeFocused();
+    // (A name the server refuses will be refused again: no new try is offered for it.)
+    await expect(page.getByRole("button", { name: "Try page.html again" })).toHaveCount(0);
     await page.keyboard.press("Tab");
     await expect(page.getByRole("button", { name: "Remove page.html from the list" })).toBeFocused();
     await page.keyboard.press("Enter");
