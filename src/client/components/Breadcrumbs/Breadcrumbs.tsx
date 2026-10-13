@@ -68,6 +68,7 @@ export function Breadcrumbs({ fallbackTitle, compact = false }: BreadcrumbsProps
               >
                 {crumb.to ? (
                   <Box
+                    {...crumb.dropProps}
                     component={RouterLink}
                     to={crumb.to}
                     sx={{
