@@ -211,8 +211,9 @@ export const job: Job = {
     const stopAt = Date.now() + (opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS);
     const over = () => Date.now() >= stopAt;
     const count = (outcome: string) => bg.metric("job", { kind: "purge", outcome });
-    // What this run has already tried. A root the gate refused is stamped and goes to the back
-    // of the queue; one that failed otherwise comes back first — it is not tried twice in a run.
+    // What this run has already tried. EVERY root it could not purge — refused by the gate,
+    // ended by Postgres, failed — is stamped and so goes to the back of the queue: the next
+    // batch is then other roots, never the same two hundred again with the rest starved behind.
     const seen = new Set<string>();
 
     for (;;) {
@@ -223,7 +224,7 @@ export const job: Job = {
         seen.add(root.id);
         try {
           const result = await purgeRoot(bg, root.id, "cron");
-          if (result.outcome === "held") refused.push(root.id);
+          if (result.outcome === "held" || result.outcome === "retry") refused.push(root.id);
           if (result.outcome !== "missing") count(result.outcome);
         } catch (error) {
           // One root that cannot be purged must not stop the roots behind it.

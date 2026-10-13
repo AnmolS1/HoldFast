@@ -213,8 +213,8 @@ describe("the purge job", () => {
     expect(outcomes).toContain("retry");
     expect(outcomes).not.toContain("purged");
     expect(outcomes).not.toContain("error");
-    // Not stamped as refused: it is first in line again.
-    expect((await nodeById(s.root.id))!.purgeAttemptedAt).toBeNull();
+    // Stamped, like every root a tick could not purge: it goes behind the roots not tried since.
+    expect((await nodeById(s.root.id))!.purgeAttemptedAt).toBeInstanceOf(Date);
     // One attempt per root — a job does not retry in place.
     const single = deadlockingDb(Number.POSITIVE_INFINITY);
     expect(await purgeRoot(jobContext({ db: single.db }).bg, s.root.id, "cron")).toEqual({
