@@ -720,6 +720,43 @@ export async function resetToPending(db: Executor, nodeId: string): Promise<bool
   return rows.length > 0;
 }
 
+/** What `resetToPending` clears — the verdict a node carried before a rescan was asked for. */
+export type ScanState = {
+  scanStatus: ScanStatus;
+  scanReason: ScanReason | null;
+  scanDetail: ScanDetail | null;
+  scannedAt: Date | null;
+};
+
+/**
+ * Undoes a `resetToPending` whose scan message could not be sent: puts back the status and the
+ * verdict the node had — ONLY while nothing else has happened to it since: it is still `pending`
+ * and `r2Key` is still its current version. A node that was replaced, locked, put under review
+ * or given a verdict in between is left as it is (false). `under_review` and `suspected_csam`
+ * are never written from a caller's memory (a reset leaves those alone, so there is nothing of
+ * theirs to put back).
+ */
+export async function restoreScanState(
+  db: Executor,
+  nodeId: string,
+  r2Key: string,
+  before: ScanState,
+): Promise<boolean> {
+  if (!isUuid(nodeId)) return false;
+  if (before.scanStatus === "under_review" || before.scanStatus === "suspected_csam") return false;
+  const rows = await db
+    .update(nodes)
+    .set({
+      scanStatus: before.scanStatus,
+      scanReason: before.scanReason,
+      scanDetail: before.scanDetail,
+      scannedAt: before.scannedAt,
+    })
+    .where(and(eq(nodes.id, nodeId), eq(nodes.r2Key, r2Key), eq(nodes.scanStatus, "pending")))
+    .returning({ id: nodes.id });
+  return rows.length > 0;
+}
+
 /**
  * Replace: the node keeps its id, name, shares and links and gets a new current version; the
  * previous one moves to `node_versions` for 30 days. Guarded — allowed only while the node is

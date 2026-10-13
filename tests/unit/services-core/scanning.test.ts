@@ -5,6 +5,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
+import { restoreScanState } from "../../../src/worker/db/queries/nodes";
 import {
   csamReportsToAnnounce,
   lockSuspectedCsam as lockRows,
@@ -499,6 +500,154 @@ describe("enqueueRescan", () => {
     await enqueueRescan(stale, file.id, { by: "admin" });
     expect(sent).toEqual([{ v: 1, nodeId: file.id, key: newKey, force: true }]);
     expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+  });
+
+  // The reset commits before the queue is asked. A queue that refuses must not leave the node
+  // `pending` with nothing to scan it — the owner's retry would be refused for a pending file.
+  describe("a send that fails after the reset", () => {
+    const VERDICT = {
+      scanReason: "engine" as const,
+      scanDetail: { engine: "clamav", error: "made up" },
+      scannedAt: new Date("2026-10-01T00:00:00.000Z"),
+    };
+    /** Deps whose queue refuses; `beforeFailing` runs after the reset committed, before the send fails. */
+    function failingDeps(beforeFailing: () => Promise<unknown> = async () => {}) {
+      const made = serviceDeps({
+        SCAN_QUEUE: {
+          send: async () => {
+            await beforeFailing();
+            throw new Error("the queue is not taking messages");
+          },
+        },
+      });
+      return made;
+    }
+
+    it("puts back what the locked row had and rethrows; the retry then goes through", async () => {
+      const owner = await makeUser();
+      for (const status of ["error", "skipped", "clean", "infected"] as const) {
+        const file = await makeFile(owner.id, null, { scanStatus: status, ...VERDICT });
+        const { deps, settle } = failingDeps();
+        await expect(enqueueRescan(deps, file.id, { by: "owner" })).rejects.toThrow(
+          "the queue is not taking",
+        );
+        await settle();
+        // As it was — not `pending` with nobody to scan it.
+        expect(await nodeById(file.id), status).toMatchObject({ scanStatus: status, ...VERDICT });
+        expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toEqual([]);
+
+        // The owner asks again, the queue is back: reset, sent, recorded once.
+        const again = recordingDeps();
+        expect(await enqueueRescan(again.deps, file.id, { by: "owner" })).toEqual({ queued: true });
+        await again.settle();
+        expect(again.sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
+        expect(await nodeById(file.id), status).toMatchObject({
+          scanStatus: "pending",
+          scanReason: null,
+          scanDetail: null,
+          scannedAt: null,
+        });
+        expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toHaveLength(1);
+      }
+    });
+
+    it("the reset happened at all: the status seen by the failing send is pending", async () => {
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { scanStatus: "error", ...VERDICT });
+      let duringSend: string | undefined;
+      const { deps } = failingDeps(async () => {
+        duringSend = (await nodeById(file.id))!.scanStatus;
+      });
+      await expect(enqueueRescan(deps, file.id, { by: "owner" })).rejects.toThrow();
+      expect(duringSend).toBe("pending");
+      expect((await nodeById(file.id))!.scanStatus).toBe("error");
+    });
+
+    it("only while the node is still pending on the same key: what happened in between wins", async () => {
+      const owner = await makeUser();
+      const set = (id: string, values: Partial<typeof nodes.$inferInsert>) =>
+        testDb().update(nodes).set(values).where(eq(nodes.id, id));
+      const newKey = (id: string) => `u/${owner.id}/${id}/${crypto.randomUUID()}`;
+      const between: Record<
+        string,
+        { change: (id: string) => Promise<unknown>; expected: (id: string) => Record<string, unknown> }
+      > = {
+        "replaced (a new key, pending)": {
+          change: async (id) => set(id, { r2Key: (keys[id] = newKey(id)), versionId: crypto.randomUUID() }),
+          expected: (id) => ({ scanStatus: "pending", r2Key: keys[id], scannedAt: null }),
+        },
+        "locked as suspected CSAM": {
+          change: (id) => set(id, { scanStatus: "suspected_csam", legalHold: true }),
+          expected: () => ({ scanStatus: "suspected_csam", scanDetail: null }),
+        },
+        "put under review": {
+          change: (id) => set(id, { scanStatus: "under_review", scanStatusPrev: "pending" }),
+          expected: () => ({ scanStatus: "under_review", scanStatusPrev: "pending" }),
+        },
+        "given a verdict by a scan that was already running": {
+          change: (id) =>
+            set(id, { scanStatus: "infected", scannedAt: new Date("2026-10-13T00:00:00.000Z") }),
+          expected: () => ({ scanStatus: "infected", scannedAt: new Date("2026-10-13T00:00:00.000Z") }),
+        },
+      };
+      const keys: Record<string, string> = {};
+      for (const [name, spec] of Object.entries(between)) {
+        const file = await makeFile(owner.id, null, { scanStatus: "error", ...VERDICT });
+        const { deps } = failingDeps(() => spec.change(file.id));
+        await expect(enqueueRescan(deps, file.id, { by: "admin" })).rejects.toThrow(
+          "the queue is not taking",
+        );
+        expect(await nodeById(file.id), name).toMatchObject(spec.expected(file.id));
+      }
+    });
+
+    it("an under_review file was not reset, so nothing is put back; a pending one stays pending", async () => {
+      const owner = await makeUser();
+      const reviewed = await makeFile(owner.id, null, {
+        scanStatus: "under_review",
+        scanStatusPrev: "clean",
+        ...VERDICT,
+      });
+      const pending = await makeFile(owner.id, null, { scanStatus: "pending" });
+      for (const file of [reviewed, pending]) {
+        const { deps } = failingDeps();
+        await expect(enqueueRescan(deps, file.id, { by: "admin" })).rejects.toThrow(
+          "the queue is not taking",
+        );
+      }
+      expect(await nodeById(reviewed.id)).toMatchObject({
+        scanStatus: "under_review",
+        scanStatusPrev: "clean",
+        ...VERDICT,
+      });
+      expect(await nodeById(pending.id)).toMatchObject({ scanStatus: "pending", scannedAt: null });
+    });
+
+    it("restoreScanState never writes a blocking state and never touches another version", async () => {
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { scanStatus: "pending" });
+      const state = { scanReason: null, scanDetail: null, scannedAt: null };
+      for (const blocking of ["under_review", "suspected_csam"] as const) {
+        expect(
+          await restoreScanState(testDb(), file.id, file.r2Key!, { scanStatus: blocking, ...state }),
+        ).toBe(false);
+      }
+      expect(
+        await restoreScanState(testDb(), file.id, "u/another/key", { scanStatus: "clean", ...state }),
+      ).toBe(false);
+      expect(
+        await restoreScanState(testDb(), crypto.randomUUID(), file.r2Key!, { scanStatus: "clean", ...state }),
+      ).toBe(false);
+      expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+      expect(
+        await restoreScanState(testDb(), file.id, file.r2Key!, { scanStatus: "error", ...VERDICT }),
+      ).toBe(true);
+      expect(await nodeById(file.id)).toMatchObject({ scanStatus: "error", ...VERDICT });
+      // Not pending any more: a second put-back changes nothing.
+      expect(await restoreScanState(testDb(), file.id, file.r2Key!, { scanStatus: "clean", ...state })).toBe(
+        false,
+      );
+    });
   });
 
   it("is a 404 for a folder and for an id that does not exist", async () => {

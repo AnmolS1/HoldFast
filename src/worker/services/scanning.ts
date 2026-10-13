@@ -25,7 +25,7 @@
 import { UUID } from "../../shared/ids";
 import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import { csamReportsToAnnounce, lockSuspectedCsam as lockRows } from "../db/queries/moderation";
-import { findByR2Key, getNode, resetToPending } from "../db/queries/nodes";
+import { findByR2Key, getNode, resetToPending, restoreScanState, type ScanState } from "../db/queries/nodes";
 import type { ScanReason } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit } from "./audit";
@@ -225,6 +225,16 @@ export type RescanResult = { queued: true } | { queued: false; reason: "taken_do
  * so there is no option for it. The message and the audit row follow the
  * commit, and only when something was queued.
  *
+ * A SEND THAT FAILS DOES NOT STRAND THE NODE. The reset has committed when the queue is asked;
+ * if the send throws, the node would be `pending` with no message — and an owner's retry would
+ * be refused (a `pending` file is not one they may rescan). So what the locked row had — status,
+ * reason, detail, scan time — is put back, only while the node is still `pending` on the same
+ * object key (a replace, a lock, a report or a verdict in between wins), and the send's error
+ * is rethrown: nothing was queued, no audit row. If putting it back fails too (or the process
+ * dies between the commit and the send), the node stays `pending`: served to nobody, and found
+ * by the pending-scan sweep (T21's `sweepPendingScans`), which re-sends for a node that is
+ * `pending` with no live job. The two do not overlap: a node put back is not `pending`.
+ *
  * AN OWNER NEVER LEARNS WHY. "Taken down" and "locked" are states an account holder must not be
  * able to observe, so for `by: "owner"` both are the same `404 not_found` — the very error an id
  * that is not a file gets — and no reason is produced at all. Only `by: "admin"` is told.
@@ -249,7 +259,8 @@ export async function enqueueRescan(
   const seen = await getNode(deps.db, nodeId);
   if (!seen || seen.kind !== "file" || !seen.r2Key) throw new AppError("not_found");
 
-  type Decision = { key: string } | { reason: "taken_down" | "locked" } | null;
+  // `before`: what the reset cleared — present only when it reset something.
+  type Decision = { key: string; before?: ScanState } | { reason: "taken_down" | "locked" } | null;
   const decision = await deps.db.transaction(async (tx): Promise<Decision> => {
     // The row is locked through its object key. A replace that landed since the read above gave
     // the node a new key: then the node is read again and locked through that one.
@@ -261,8 +272,14 @@ export async function enqueueRescan(
         if (locked.takedownAt !== null) return { reason: "taken_down" };
         if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
         if (locked.scanStatus === "under_review") return { key: r2Key };
+        const before: ScanState = {
+          scanStatus: locked.scanStatus,
+          scanReason: locked.scanReason,
+          scanDetail: locked.scanDetail,
+          scannedAt: locked.scannedAt,
+        };
         // The statement has the same guard: it changes nothing for the two locked statuses.
-        return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
+        return (await resetToPending(tx, nodeId)) ? { key: r2Key, before } : { reason: "locked" };
       }
       r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
     }
@@ -276,7 +293,19 @@ export async function enqueueRescan(
     return { queued: false, reason: decision.reason };
   }
 
-  await enqueueScan(deps, { nodeId, key: decision.key, force: true });
+  try {
+    await enqueueScan(deps, { nodeId, key: decision.key, force: true });
+  } catch (error) {
+    if (decision.before) {
+      try {
+        await restoreScanState(deps.db, nodeId, decision.key, decision.before);
+      } catch (restoreError) {
+        // The node stays `pending` (fail closed); the send's error is the one the caller gets.
+        captureError(restoreError, { kind: "rescan_restore" });
+      }
+    }
+    throw error;
+  }
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by });
   return { queued: true };
 }
