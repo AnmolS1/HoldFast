@@ -6,11 +6,13 @@ import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
+import { dayUTC } from "../../../src/worker/services/ip-hash";
 import { keyFor, thumbKey } from "../../../src/worker/services/storage";
 import {
   failureMarker,
   makeThumbnail,
-  THUMB_ATTEMPTS_PER_DAY,
+  THUMB_CALLS_PER_DAY,
+  unitMarker,
 } from "../../../src/worker/services/thumbnails";
 import {
   ask,
@@ -378,7 +380,33 @@ describe("the daily transform ceiling", () => {
   });
 });
 
-describe("a thumbnail is attempted at most three times a day, and not again once it is known to fail", () => {
+describe("one thumbnail per day: at most three calls of the image service and one unit of its owner's", () => {
+  /** Opens once every one of `total` requests is inside the image service or has answered a 404. */
+  const tally = (total: number) => {
+    const all = gate();
+    let inside = 0;
+    let out = 0;
+    const check = () => {
+      if (inside + out === total) all.open();
+    };
+    return {
+      all: all.opened,
+      enter: () => {
+        inside++;
+        check();
+      },
+      answered: <T extends { status: number }>(answer: T) => {
+        if (answer.status === 404) {
+          out++;
+          check();
+        }
+        return answer;
+      },
+    };
+  };
+  const unitRow = (node: { id: string; versionId: string }) => ledgerRow("notice", unitMarker(node, 320));
+  const callRow = (node: { id: string; versionId: string }) => ledgerRow("notice", failureMarker(node, 320));
+
   it("thirteen requests for one failing thumbnail — a link, a share partner, an address already over its own ceiling — cost the owner ONE unit and the account ONE call; nobody is charged a byte", async () => {
     const owner = await makeAccount();
     const partner = await makeAccount();
@@ -410,10 +438,11 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(statuses).toEqual(Array.from({ length: 13 }, () => 404));
     expect(images.calls).toHaveLength(1);
     expect(await ledgerRow("transform_user", owner.id)).toEqual({ bytes: 0, count: 1 });
-    // One attempt made, and given up on for the day.
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 1, count: 1 });
+    // One call made, then given up on for the day: the count is past the cap.
+    expect(await callRow(node)).toEqual({ bytes: 0, count: 1 + THUMB_CALLS_PER_DAY });
+    expect(await unitRow(node)).toEqual({ bytes: 1, count: 1 });
     expect(spy.puts).toEqual([]);
-    // The file itself was read once: for the one attempt.
+    // The file itself was read once: for the one call.
     expect(spy.gets.filter((call) => call.key === node.r2Key)).toHaveLength(1);
     for (const row of [
       await ledgerRow("ip", await ipSubject(ip)),
@@ -426,7 +455,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     }
   });
 
-  it("the marker is for one size of one version on one day: another size, a replaced file and the next UTC day each get a fresh attempt", async () => {
+  it("the markers are for one size of one version on one day: another size, a replaced file and the next UTC day each get a fresh day", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
     const failing = imagesMock(() => {
@@ -448,7 +477,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(small.status).toBe(200);
     expect(working.calls).toHaveLength(1);
 
-    // The next UTC day: the marker was yesterday's.
+    // The next UTC day: the markers were yesterday's.
     const tomorrow = new Date(Date.now() + 86_400_000);
     const later = await ask(await urlFor("thumb", node, subject), {
       now: tomorrow,
@@ -457,7 +486,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(later.status).toBe(200);
     expect(working.calls).toHaveLength(2);
 
-    // A replaced file: a new version, a new key, no marker.
+    // A replaced file: a new version, new keys, no marker.
     const replaced = await picture(owner.id);
     const before = await ask(await urlFor("thumb", replaced, subject), { env: { IMAGES: failing.binding } });
     expect(before.status).toBe(404);
@@ -472,7 +501,7 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     expect(working.calls).toHaveLength(3);
   });
 
-  it("a transform that succeeds is one attempt and is never given up on; a missing source object and an empty output are", async () => {
+  it("a transform that succeeds is one call and one unit and is never given up on; a missing source object and an empty output are", async () => {
     const owner = await makeAccount();
     const good = await picture(owner.id);
     const fine = imagesMock();
@@ -482,9 +511,10 @@ describe("a thumbnail is attempted at most three times a day, and not again once
       });
       expect(answer.status).toBe(200);
     }
-    // Five of the six were cache hits: they claimed nothing. The one attempt was given back.
+    // Five of the six were cache hits: they claimed nothing.
     expect(fine.calls).toHaveLength(1);
-    expect(await ledgerRow("notice", failureMarker(good, 320))).toEqual({ bytes: 0, count: 0 });
+    expect(await callRow(good)).toEqual({ bytes: 0, count: 1 });
+    expect(await unitRow(good)).toEqual({ bytes: 1, count: 1 });
 
     const gone = await picture(owner.id, { content: null, node: { size: 2000 } });
     const empty = await picture(owner.id);
@@ -496,14 +526,14 @@ describe("a thumbnail is attempted at most three times a day, and not again once
         });
         expect(answer.status).toBe(404);
       }
-      expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 1, count: 1 });
+      expect(await callRow(node)).toEqual({ bytes: 0, count: 1 + THUMB_CALLS_PER_DAY });
     }
     // One call for the empty output; none at all for the missing object. Three units in all.
     expect(nothing.calls).toHaveLength(1);
     expect(await units(owner.id)).toBe(3);
   });
 
-  it("a failure without a code uses up an attempt and no more: six requests → three calls, three units", async () => {
+  it("a failure without a code is a call that stays counted, and the owner pays once: six requests → three calls, ONE unit", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
     const images = imagesMock(() => {
@@ -512,11 +542,11 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     const url = await urlFor("thumb", node, { user: owner.id });
     for (let i = 0; i < 6; i++)
       expect((await ask(url, { env: { IMAGES: images.binding } })).status).toBe(404);
-    expect(THUMB_ATTEMPTS_PER_DAY).toBe(3);
+    expect(THUMB_CALLS_PER_DAY).toBe(3);
     expect(images.calls).toHaveLength(3);
-    expect(await units(owner.id)).toBe(3);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 3, count: 0 });
-    // A connection that comes back within the three attempts is not held against the thumbnail.
+    expect(await units(owner.id)).toBe(1);
+    expect(await callRow(node)).toEqual({ bytes: 0, count: 3 });
+    // A connection that comes back within the three calls is not held against the thumbnail.
     const flaky = await picture(owner.id);
     let failures = 2;
     const recovering = imagesMock(() => {
@@ -532,126 +562,47 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     }
     expect(statuses).toEqual([404, 404, 200, 200]);
     expect(recovering.calls).toHaveLength(3);
-  });
-
-  it("two misses at once that both fail → two calls, one marker row; after them, none", async () => {
-    const owner = await makeAccount();
-    const node = await picture(owner.id);
-    const hold = gate();
-    const bothIn = gate();
-    let inside = 0;
-    const images = imagesMock(async () => {
-      if (++inside === 2) bothIn.open();
-      await hold.opened;
-      throw imagesError(9523, "heif: Decoder plugin generated an error");
-    });
-    const env = { IMAGES: images.binding };
-    const url = await urlFor("thumb", node, { user: owner.id });
-    const both = [ask(url, { env }), ask(url, { env })];
-    // Both are inside the image service before either has failed.
-    await bothIn.opened;
-    hold.open();
-    expect((await Promise.all(both)).map((answer) => answer.status)).toEqual([404, 404]);
-    expect(images.calls).toHaveLength(2);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 2, count: 1 });
-    for (let i = 0; i < 5; i++) expect((await ask(url, { env })).status).toBe(404);
-    expect(images.calls).toHaveLength(2);
     expect(await units(owner.id)).toBe(2);
   });
 
-  it("twenty misses at once for ONE failing thumbnail → three attempts between them, whatever the twenty: three calls, three units, twenty 404s", async () => {
+  it("fifty requests that are cut before the image service answers, on one thumbnail that can be made → three calls and one unit; then the icon until 00:00 UTC, and the next day an honest request renders", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
+    // Locally an aborted request runs to its end, so "the call was cut" is the service never
+    // answering with a result: an untyped error, as a lost connection or a killed invocation is.
+    const cut = imagesMock(() => {
+      throw new Error("Network connection lost.");
+    });
     const link = await linkOn(node.id, owner.id);
-    const hold = gate();
-    const allIn = gate();
-    let inside = 0;
-    const images = imagesMock(async () => {
-      if (++inside === THUMB_ATTEMPTS_PER_DAY) allIn.open();
-      await hold.opened;
-      throw imagesError(9523, "heif: Decoder plugin generated an error");
-    });
-    const env = { IMAGES: images.binding };
-    const answers = [];
-    for (let i = 0; i < 20; i++) {
-      answers.push(ask(await urlFor("thumb", node, i % 2 ? { link } : { user: owner.id }), { env }));
+    const ip = freshIp();
+    const statuses: number[] = [];
+    for (let i = 0; i < 50; i++) {
+      statuses.push(
+        (await ask(await urlFor("thumb", node, { link }), { ip, env: { IMAGES: cut.binding } })).status,
+      );
     }
-    // The admitted attempts are all inside the image service, held there; the other seventeen
-    // have nothing to wait for and answer on their own.
-    await allIn.opened;
-    hold.open();
-    const statuses = (await Promise.all(answers)).map((answer) => answer.status);
-    expect(statuses).toEqual(Array.from({ length: 20 }, () => 404));
-    expect(images.calls).toHaveLength(THUMB_ATTEMPTS_PER_DAY);
-    expect(await units(owner.id)).toBe(THUMB_ATTEMPTS_PER_DAY);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 3, count: 1 });
-    for (let i = 0; i < 5; i++) {
-      expect((await ask(await urlFor("thumb", node, { link }), { env })).status).toBe(404);
-    }
-    expect(images.calls).toHaveLength(THUMB_ATTEMPTS_PER_DAY);
-  });
+    expect(statuses).toEqual(Array.from({ length: 50 }, () => 404));
+    expect(cut.calls).toHaveLength(THUMB_CALLS_PER_DAY);
+    expect(await units(owner.id)).toBe(1);
+    // The asking address paid nothing in bytes: no response carried any.
+    expect(await ledgerRow("ip", await ipSubject(ip))).toBeNull();
 
-  it("twenty misses at once for ONE thumbnail that can be made → three transforms, three served, seventeen icons; the next request is a cache hit", async () => {
-    const owner = await makeAccount();
-    const node = await picture(owner.id);
-    const hold = gate();
-    const allIn = gate();
-    let inside = 0;
-    const images = imagesMock(async () => {
-      if (++inside === THUMB_ATTEMPTS_PER_DAY) allIn.open();
-      await hold.opened;
-      return FAKE_WEBP;
-    });
-    const spy = spyBucket();
-    const env = { IMAGES: images.binding, FILES: spy.bucket };
+    // Today the thumbnail is the icon, even for its owner and with a service that now works.
+    const working = imagesMock();
     const url = await urlFor("thumb", node, { user: owner.id });
-    // The three admitted transforms are held open until the seventeen that got no attempt have
-    // answered — otherwise a late one of them finds the finished thumbnail in the cache (a 200
-    // it is welcome to, but then the count of icons is not a fixed number).
-    const iconsOut = gate();
-    let icons = 0;
-    const answers = Array.from({ length: 20 }, () =>
-      ask(url, { env }).then((answer) => {
-        if (answer.status === 404 && ++icons === 17) iconsOut.open();
-        return answer;
-      }),
-    );
-    await allIn.opened;
-    await iconsOut.opened;
-    hold.open();
-    const statuses = (await Promise.all(answers)).map((answer) => answer.status).sort();
-    expect(statuses).toEqual([
-      ...Array.from({ length: 3 }, () => 200),
-      ...Array.from({ length: 17 }, () => 404),
-    ]);
-    expect(images.calls).toHaveLength(3);
-    expect(await units(owner.id)).toBe(3);
-    // Three writers of one key, the same bytes: one object.
-    expect(spy.puts).toEqual(Array.from({ length: 3 }, () => thumbKey(node.id, node.versionId, 320)));
-    // All three were made: all three attempts were given back.
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
-    const after = await ask(url, { env });
-    expect(after.status).toBe(200);
-    expect(after.bytes).toEqual(FAKE_WEBP);
-    expect(images.calls).toHaveLength(3);
-    expect(await units(owner.id)).toBe(3);
+    expect((await ask(url, { env: { IMAGES: working.binding } })).status).toBe(404);
+    expect(working.calls).toHaveLength(0);
+
+    // The next UTC day: one call, one unit of that day, served and cached.
+    const tomorrow = new Date(Date.now() + 86_400_000);
+    const next = await ask(url, { now: tomorrow, env: { IMAGES: working.binding } });
+    expect(next.status).toBe(200);
+    expect(next.bytes).toEqual(FAKE_WEBP);
+    expect(working.calls).toHaveLength(1);
+    expect(await ledgerRow("transform_user", owner.id, dayUTC(tomorrow))).toEqual({ bytes: 0, count: 1 });
   });
 
-  it("an attempt that ends for a reason that is not the image's is given back: the owner's unit refused five times does not cost the thumbnail its day", async () => {
-    const owner = await makeAccount();
-    const node = await picture(owner.id);
-    const images = imagesMock();
-    const url = await urlFor("thumb", node, { user: owner.id });
-    const none = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: 0 } } };
-    for (let i = 0; i < 5; i++) expect((await ask(url, none)).status).toBe(404);
-    expect(images.calls).toHaveLength(0);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
-    // With a unit to spend, it is made.
-    expect((await ask(url, { env: { IMAGES: images.binding } })).status).toBe(200);
-    expect(images.calls).toHaveLength(1);
-  });
-
-  it("a thumbnail that is made is never held back by its marker, even when the cache write fails every time: five requests, five thumbnails", async () => {
+  it("a thumbnail whose cache write fails every time is served three times and then is the icon: nothing gives a call back", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
     const images = imagesMock();
@@ -662,14 +613,124 @@ describe("a thumbnail is attempted at most three times a day, and not again once
     });
     const env = { IMAGES: images.binding, FILES: broken.bucket };
     const url = await urlFor("thumb", node, { user: owner.id });
-    for (let i = 0; i < 5; i++) {
-      const answer = await ask(url, { env });
-      expect(answer.status).toBe(200);
-      expect(answer.bytes).toEqual(FAKE_WEBP);
+    const statuses: number[] = [];
+    for (let i = 0; i < 8; i++) statuses.push((await ask(url, { env })).status);
+    expect(statuses).toEqual([200, 200, 200, 404, 404, 404, 404, 404]);
+    expect(images.calls).toHaveLength(THUMB_CALLS_PER_DAY);
+    expect(await units(owner.id)).toBe(1);
+    // Never given up on — the image was fine — but no call is left today.
+    expect(await callRow(node)).toEqual({ bytes: 0, count: THUMB_CALLS_PER_DAY });
+  });
+
+  it("twenty misses at once for ONE failing thumbnail → at most three calls and ONE unit between them, twenty 404s; after them, none", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const link = await linkOn(node.id, owner.id);
+    const hold = gate();
+    const count = tally(20);
+    const images = imagesMock(async () => {
+      count.enter();
+      await hold.opened;
+      throw imagesError(9523, "heif: Decoder plugin generated an error");
+    });
+    const env = { IMAGES: images.binding };
+    const answers = [];
+    for (let i = 0; i < 20; i++) {
+      const url = await urlFor("thumb", node, i % 2 ? { link } : { user: owner.id });
+      answers.push(ask(url, { env }).then(count.answered));
     }
-    expect(images.calls).toHaveLength(5);
-    expect(await units(owner.id)).toBe(5);
-    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: 0 });
+    // Every request is either inside the image service, held there, or has answered.
+    await count.all;
+    hold.open();
+    const statuses = (await Promise.all(answers)).map((answer) => answer.status);
+    expect(statuses).toEqual(Array.from({ length: 20 }, () => 404));
+    expect(images.calls.length).toBeGreaterThanOrEqual(1);
+    expect(images.calls.length).toBeLessThanOrEqual(THUMB_CALLS_PER_DAY);
+    expect(await units(owner.id)).toBe(1);
+    for (let i = 0; i < 5; i++) {
+      expect((await ask(await urlFor("thumb", node, { link }), { env })).status).toBe(404);
+    }
+    expect(images.calls.length).toBeLessThanOrEqual(THUMB_CALLS_PER_DAY);
+  });
+
+  it("twenty misses at once for ONE thumbnail that can be made → at most three transforms and ONE unit; the next request is a cache hit", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const hold = gate();
+    const count = tally(20);
+    const images = imagesMock(async () => {
+      count.enter();
+      await hold.opened;
+      return FAKE_WEBP;
+    });
+    const spy = spyBucket();
+    const env = { IMAGES: images.binding, FILES: spy.bucket };
+    const url = await urlFor("thumb", node, { user: owner.id });
+    // The admitted transforms are held open until every other request has answered — otherwise a
+    // late one finds the finished thumbnail in the cache (a 200 it is welcome to, but then the
+    // counts are not fixed).
+    const answers = Array.from({ length: 20 }, () => ask(url, { env }).then(count.answered));
+    await count.all;
+    const made = images.calls.length;
+    expect(made).toBeGreaterThanOrEqual(1);
+    expect(made).toBeLessThanOrEqual(THUMB_CALLS_PER_DAY);
+    hold.open();
+    const statuses = (await Promise.all(answers)).map((answer) => answer.status).sort();
+    expect(statuses).toEqual([
+      ...Array.from({ length: made }, () => 200),
+      ...Array.from({ length: 20 - made }, () => 404),
+    ]);
+    expect(await units(owner.id)).toBe(1);
+    // Writers of one key, the same bytes: one object.
+    expect(spy.puts).toEqual(Array.from({ length: made }, () => thumbKey(node.id, node.versionId, 320)));
+    const after = await ask(url, { env });
+    expect(after.status).toBe(200);
+    expect(after.bytes).toEqual(FAKE_WEBP);
+    expect(images.calls).toHaveLength(made);
+    expect(await units(owner.id)).toBe(1);
+  });
+
+  it("an owner at their transform ceiling: ten misses at once for one thumbnail → no call; and the unit already paid for one thumbnail does not pay for another", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const atCeiling = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: 0 } } };
+    const url = await urlFor("thumb", node, { user: owner.id });
+    const statuses = (await Promise.all(Array.from({ length: 10 }, () => ask(url, atCeiling)))).map(
+      (answer) => answer.status,
+    );
+    expect(statuses).toEqual(Array.from({ length: 10 }, () => 404));
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(0);
+
+    // A ceiling of one: thumbnail A takes it; ten misses at once each for A' and B are refused.
+    const one = await makeAccount();
+    const a = await picture(one.id);
+    const b = await picture(one.id);
+    const c = await picture(one.id);
+    const single = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: 1 } } };
+    expect((await ask(await urlFor("thumb", a, { user: one.id }), single)).status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    const urls = [await urlFor("thumb", b, { user: one.id }), await urlFor("thumb", c, { user: one.id })];
+    const refused = await Promise.all(Array.from({ length: 20 }, (_, i) => ask(urls[i % 2]!, single)));
+    expect(refused.map((answer) => answer.status)).toEqual(Array.from({ length: 20 }, () => 404));
+    expect(images.calls).toHaveLength(1);
+    expect(await units(one.id)).toBe(1);
+  });
+
+  it("an attempt that ends for a reason that is not the image's is given back: the owner's unit refused five times does not cost the thumbnail its day", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const url = await urlFor("thumb", node, { user: owner.id });
+    const none = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: 0 } } };
+    for (let i = 0; i < 5; i++) expect((await ask(url, none)).status).toBe(404);
+    expect(images.calls).toHaveLength(0);
+    expect(await callRow(node)).toBeNull();
+    expect(await unitRow(node)).toEqual({ bytes: 0, count: 0 });
+    // With a unit to spend, it is made.
+    expect((await ask(url, { env: { IMAGES: images.binding } })).status).toBe(200);
+    expect(images.calls).toHaveLength(1);
   });
 
   it("the attempt is handed to the request's deferred work before the image service is asked: it does not depend on the asker staying", async () => {
