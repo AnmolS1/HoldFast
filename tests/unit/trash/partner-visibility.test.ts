@@ -4,7 +4,7 @@
 // id that was never issued: status, body, every header and the number of statements. So does a
 // node that is already in the trash, on the trash route.
 import { describe, expect, it } from "vitest";
-import type { ScanStatus } from "../../../src/shared/schemas/node";
+import type { ScanStatus } from "../../../src/shared/schemas/common";
 import {
   api,
   envelope,
