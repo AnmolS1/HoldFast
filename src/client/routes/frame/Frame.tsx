@@ -11,7 +11,7 @@ import type { RouteHandle } from "../../components/slots";
 import { TransferRibbon } from "../../components/TransferRibbon";
 import { UploadDropOverlay } from "../../features/upload";
 import { t } from "../../lib/i18n";
-import { useSession } from "../../lib/query";
+import { getKnownUserId, useSession } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ShortcutsDialog } from "../help";
@@ -51,7 +51,10 @@ function ColdBackground({ routes, from }: { routes: RouteObject[]; from: string 
  * that state away with the component.
  */
 export function AccountKeyed({ children }: { children: ReactNode }) {
-  const userId = useSession().data?.user.id ?? "signed-out";
+  // An expired session read as null is NOT another account: the remembered id holds until a real
+  // sign-out purges it (or a different account is adopted) — so a re-auth as the same account
+  // keeps every page, upload and dialog as it was.
+  const userId = useSession().data?.user.id ?? getKnownUserId() ?? "signed-out";
   return <Fragment key={userId}>{children}</Fragment>;
 }
 
