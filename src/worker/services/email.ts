@@ -361,6 +361,8 @@ const OPERATOR_CRITICAL = {
   storage_budget: "The storage budget switch was triggered",
   scanner_down: "The virus scanner is not answering",
   database_rollback: "The database is older than the object store: orphan deletion is stopped",
+  detector_unreadable:
+    "The rollback detector cannot read the object store or the database: every destructive job is stopped",
   unknown: "A critical event needs attention",
 } as const;
 export type OperatorCriticalEvent = Exclude<keyof typeof OPERATOR_CRITICAL, "unknown">;
