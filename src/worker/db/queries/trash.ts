@@ -27,7 +27,7 @@ import {
   ownCauses,
   userHeld,
 } from "./holds";
-import { effectiveTrashed, lockOwnerTree, notEffectivelyHidden } from "./tree";
+import { effectiveHidden, effectiveTrashed, lockOwnerTree, notEffectivelyHidden, notHiddenRow } from "./tree";
 
 export { LegalHoldError };
 
@@ -46,8 +46,10 @@ const uuidArray = (ids: readonly string[]): SQL =>
 
 /**
  * Moves a node to the trash: `deletedAt`, `trashedRoot`, `trashedBy` and `purgeAfter` on that
- * row only. Null when there is no such node, it is a system node, or it is already a trashed
- * root. Never consults holds: trashing destroys nothing.
+ * row only. Null when there is no such node, it is a system node, it is already a trashed
+ * root, or it is HIDDEN (taken down itself or by a folder above it, or locked as suspected CSAM
+ * — `tree.notHiddenRow`, in the statement itself): a hidden node is not there to be trashed,
+ * and its row is not altered. Never consults holds: trashing destroys nothing.
  */
 export async function trash(
   db: Executor,
@@ -65,7 +67,7 @@ export async function trash(
       trashedBy: actorId,
       purgeAfter: sql`now() + make_interval(days => ${days})`,
     })
-    .where(and(eq(nodes.id, nodeId), isNull(nodes.deletedAt), isNull(nodes.system)))
+    .where(and(eq(nodes.id, nodeId), isNull(nodes.deletedAt), isNull(nodes.system), notHiddenRow()))
     .returning();
   return row ?? null;
 }
@@ -84,6 +86,9 @@ function restoredName(name: string, attempt: number): string {
  * (the caller passes it when the parent is itself trashed). When the name is taken there, the
  * node comes back as "<name> (restored)".
  * Null when the node is not a restorable trashed root (not trashed, purge already requested);
+ * `not_found` when it is HIDDEN — taken down itself or by a folder above it, or locked: decided
+ * under the tree lock and the row's lock, like `nodes.move` (restored to the top level it would
+ * otherwise come out from under the folder that hides it);
  * `conflict` when the parent is in the trash and `toRoot` was not passed; `LegalHoldError`
  * (internal, as from the purge gate) when `toRoot` would take it out from under a folder that
  * is on legal hold or named by an open notice — restored in place it stays protected.
@@ -100,7 +105,9 @@ export async function restore(
     if (!peek) return null;
     await lockOwnerTree(tx, peek.ownerId);
     const [node] = await tx.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
-    if (!node || node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
+    if (!node) return null;
+    if (await effectiveHidden(tx, nodeId)) throw new QueryError("not_found");
+    if (node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
     const parentId = opts.toRoot ? null : node.parentId;
     // Like `move`: not out from under a folder that is on legal hold or under an open notice.
     if (parentId !== node.parentId) {
@@ -349,8 +356,9 @@ const emptyDeleted = (ownerId: string | null): DeletedRows => ({
  * Before both it takes the owner's tree lock, so the folders above the root — whose holds reach
  * down — cannot change meanwhile and the root cannot be moved. Upload sessions
  * that point into the subtree are deleted too, finished ones included (their `parent_id`
- * reference would block the delete) — except one a hold protects (a held uploader's), which is
- * kept, detached from the folder; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
+ * reference would block the delete) — except one a hold protects (a held uploader's) and any
+ * `completing` one (a request is working on its object), which are kept, detached from the
+ * folder — a `completing` one's object is never in `uploadsToAbort`; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
  */
 export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<DeletedRows> {
   if (!isUuid(rootId)) return emptyDeleted(null);
@@ -412,9 +420,15 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
     // UPLOADER's (the gate has already refused a held owner or a protected node of the subtree)
     // — is a record that must outlive the folder: it is KEPT, detached from the folder that is
     // going (`parent_id` null; `replace_node_id` is nulled by its foreign key), and if it was
-    // unfinished it is ended as `aborted`. Every other one is deleted, as before. An unfinished
-    // session is aborted in storage and its reservation given back either way: there is nowhere
-    // left for it to complete into.
+    // `open` it is ended as `aborted`. Every other one is deleted, as before. An `open` session
+    // is aborted in storage and its reservation given back either way: there is nowhere left
+    // for it to complete into.
+    // A `completing` session — ANY, held or not — is a request working on its object right now
+    // (hashing it; for a declared blocklist hit it will PRESERVE that object as a locked node):
+    // it is KEPT and detached like a held one, left `completing`, its object NOT aborted and its
+    // reservation NOT given back here. The request that holds it ends it (its give-up path
+    // aborts the object and releases the reservation when there is nowhere to complete into),
+    // or, if that request died, the stale-upload job does (`uploads.expired`).
     const sessions = await sp
       .select({
         id: uploads.id,
@@ -430,16 +444,17 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
       .where(or(inArray(uploads.parentId, ids), inArray(uploads.replaceNodeId, ids)))
       .orderBy(uploads.id)
       .for("update");
-    const unfinished = (s: { status: string }) => s.status === "open" || s.status === "completing";
+    const isOpen = (s: { status: string }) => s.status === "open";
+    const completing = (s: { status: string }) => s.status === "completing";
     for (const session of sessions) {
-      if (!unfinished(session)) continue;
+      if (!isOpen(session)) continue;
       out.uploadsToAbort.push({ r2Key: session.r2Key, r2UploadId: session.r2UploadId });
       if (session.purpose === "file") out.freedBytes += session.size;
     }
-    const kept = sessions.filter((s) => s.kept === true);
-    const gone = sessions.filter((s) => s.kept !== true).map((s) => s.id);
+    const kept = sessions.filter((s) => s.kept === true || completing(s));
+    const gone = sessions.filter((s) => s.kept !== true && !completing(s)).map((s) => s.id);
     if (kept.length > 0) {
-      const ended = kept.filter(unfinished).map((s) => s.id);
+      const ended = kept.filter(isOpen).map((s) => s.id);
       if (ended.length > 0) {
         await sp
           .update(uploads)

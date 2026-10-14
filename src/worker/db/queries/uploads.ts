@@ -140,7 +140,8 @@ export async function markAborted(tx: Executor, uploadId: string): Promise<boole
 
 /**
  * Sessions the stale-upload job should look at: `open` past `expiresAt`, and `completing` for
- * more than an hour (its request died between the claim and the commit).
+ * more than an hour (its request died between the claim and the commit) — except one that owes
+ * a locked node (`owesLockedNode`), which the repair sweep owns.
  */
 export async function expired(db: Executor, limit: number): Promise<Upload[]> {
   return db
@@ -152,12 +153,18 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
         and(
           eq(uploads.status, "completing"),
           sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) < now() - make_interval(mins => ${COMPLETING_STALE_MINUTES})`,
+          // A session that owes a locked node is never the stale job's to abort: the repair
+          // sweep (T22) owns it — its object is verified bytes that must be preserved.
+          not(owesLockedNode()),
         ),
       ),
     )
     .orderBy(uploads.expiresAt, uploads.id)
     .limit(limit);
 }
+
+/** How long a finished (`done` / `aborted`) session is kept before `trimFinished` deletes it. */
+export const FINISHED_TRIM_DAYS = 7;
 
 /**
  * Deletes finished (`done` / `aborted`) sessions that ended more than `olderThanDays` ago, at
@@ -168,7 +175,7 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
  */
 export async function trimFinished(
   db: Executor,
-  olderThanDays: number = 7,
+  olderThanDays: number = FINISHED_TRIM_DAYS,
   limit: number = 5000,
 ): Promise<number> {
   const doomed = db
@@ -192,6 +199,18 @@ export async function trimFinished(
 }
 
 /**
+ * A `completing` session whose declared hash is listed as CSAM: a LOCKED node is owed for its
+ * verified object (the uploads route preserves only a csam hit; another reason is refused and the
+ * object deleted, so nothing is owed and the stale job ends such a session as any other). Decided
+ * when the statement runs, so an entry RAISED to `csam` meanwhile counts.
+ */
+export function owesLockedNode(): SQL {
+  return sql`(${uploads.status} = 'completing' AND ${uploads.expectedSha256} IS NOT NULL
+    AND EXISTS (SELECT 1 FROM hash_blocklist b
+                WHERE b.sha256 = ${uploads.expectedSha256} AND b.reason = 'csam'))`;
+}
+
+/**
  * Removes every session in which the user is owner OR uploader — the step the user-purge job
  * runs before the hard delete, because both references are RESTRICT. Returns the unfinished
  * sessions' objects, still to abort in storage.
@@ -205,6 +224,15 @@ export async function trimFinished(
  * owner's folder, or a held editor uploaded into the user's) or a node under review, locked or
  * under an open notice. Such a row still references the user, so the `user` row cannot be
  * deleted yet: `remainingForUser` says how many are left, and the purge job waits (`defer`).
+ *
+ * SO DOES EVERY `completing` SESSION: a request is working on its object right now (hashing it;
+ * one whose declared hash is listed as csam owes a LOCKED node for verified bytes — the uploads
+ * route, or the repair sweep, writes it). Its row is kept (it cannot be detached: `owner_id` and
+ * `uploader_id` are NOT NULL, RESTRICT — so the user row waits, as for a hold), its object is
+ * NOT returned to abort and its reservation is not released here. When the request ends it
+ * (done or aborted) the next run deletes it; a request that died leaves it to the stale-upload
+ * job (`expired`) — except an owed one, which the repair sweep owns. Once an owed node is
+ * written the csam lock holds the owner and the uploader, and the account is not purged at all.
  */
 export async function deleteForUser(
   db: Executor,
@@ -219,6 +247,7 @@ export async function deleteForUser(
           not(userHeld(sql`${uploads.ownerId}`)),
           not(userHeld(sql`${uploads.uploaderId}`)),
           not(nodeProtected(sql`${uploads.nodeId}`)),
+          ne(uploads.status, "completing"),
         ),
       )
       .returning({
@@ -229,7 +258,7 @@ export async function deleteForUser(
         r2Key: uploads.r2Key,
         r2UploadId: uploads.r2UploadId,
       });
-    const unfinished = rows.filter((r) => r.status === "open" || r.status === "completing");
+    const unfinished = rows.filter((r) => r.status === "open");
     const owed = new Map<string, number>();
     for (const row of unfinished) {
       if (row.ownerId !== userId && row.purpose === "file")

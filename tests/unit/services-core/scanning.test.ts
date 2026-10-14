@@ -5,9 +5,13 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
+import { hasLiveScanJob } from "../../../src/worker/db/queries/nodes";
+import { SCAN_CLAIM_STALE_MINUTES } from "../../../src/worker/db/queries/scan-jobs";
 import {
+  csamLocksWithoutReport,
   csamReportsToAnnounce,
   lockSuspectedCsam as lockRows,
+  takedownNode,
 } from "../../../src/worker/db/queries/moderation";
 import {
   auditLog,
@@ -15,6 +19,7 @@ import {
   hashBlocklist,
   nodes,
   reports,
+  scanJobs,
   shareLinks,
   uploadIps,
   user,
@@ -36,13 +41,17 @@ import {
   STUB_SCAN_MAX_BYTES,
   stubEnabled,
   sweepCsamAlerts,
+  sweepUnrecordedCsamLocks,
 } from "../../../src/worker/services/scanning";
 import { eicarBytes, nestedEicarZipBytes } from "../../setup/fixture-bytes";
 import { makeLink } from "../auth/helpers";
 import {
   ADMIN_EMAIL,
   auditRows,
+  backendPid,
+  deliver,
   gate,
+  jobsFor,
   mailTo,
   makeFile,
   makeFolder,
@@ -501,6 +510,260 @@ describe("enqueueRescan", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("pending");
   });
 
+  // The reset commits before the queue is asked. A queue that refuses leaves the node `pending`
+  // — fail closed, no earlier verdict is ever written back — and what makes that recoverable is
+  // that a `pending` node with no scan under way may simply be asked for again.
+  describe("a send that fails after the reset", () => {
+    const VERDICT = {
+      scanReason: "engine" as const,
+      scanDetail: { engine: "clamav", error: "made up" },
+      scannedAt: new Date("2026-10-01T00:00:00.000Z"),
+    };
+    /** Deps whose queue refuses; `beforeFailing` runs after the reset committed, before the send fails. */
+    function failingDeps(beforeFailing: () => Promise<unknown> = async () => {}) {
+      return serviceDeps({
+        SCAN_QUEUE: {
+          send: async () => {
+            await beforeFailing();
+            throw new Error("the queue is not taking messages");
+          },
+        },
+      });
+    }
+    const job = (
+      file: { id: string; r2Key: string | null },
+      values: Partial<typeof scanJobs.$inferInsert> = {},
+    ) =>
+      testDb()
+        .insert(scanJobs)
+        .values({ nodeId: file.id, r2Key: file.r2Key!, status: "running", startedAt: new Date(), ...values });
+
+    it("the node stays pending, nothing is recorded, and the owner's retry sends the message", async () => {
+      const owner = await makeUser();
+      for (const status of ["error", "skipped", "clean", "infected"] as const) {
+        const file = await makeFile(owner.id, null, { scanStatus: status, ...VERDICT });
+        const { deps, settle } = failingDeps();
+        await expect(enqueueRescan(deps, file.id, { by: "owner" })).rejects.toThrow(
+          "the queue is not taking",
+        );
+        await settle();
+        // Fail closed: pending, the earlier verdict gone and NOT put back; no job, no audit row.
+        expect(await nodeById(file.id), status).toMatchObject({
+          scanStatus: "pending",
+          scanReason: null,
+          scanDetail: null,
+          scannedAt: null,
+        });
+        expect(await jobsFor(file.r2Key!)).toEqual([]);
+        expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toEqual([]);
+
+        // The owner asks again — a `pending` file now, with no scan of it under way: sent, once.
+        const again = recordingDeps();
+        expect(await enqueueRescan(again.deps, file.id, { by: "owner" })).toEqual({ queued: true });
+        await again.settle();
+        expect(again.sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
+        expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+        expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toHaveLength(1);
+      }
+    });
+
+    it("a pending file WITH a scan under way: 409 for its owner, nothing sent; an admin's is sent as before", async () => {
+      const owner = await makeUser();
+      const busy = await makeFile(owner.id, null, { scanStatus: "pending" });
+      await job(busy);
+      const first = recordingDeps();
+      const error = await enqueueRescan(first.deps, busy.id, { by: "owner" }).catch(
+        (thrown: unknown) => thrown,
+      );
+      expect(error).toBeInstanceOf(AppError);
+      expect((error as AppError).code).toBe("conflict");
+      await first.settle();
+      expect(first.sent).toEqual([]);
+      expect(await auditRows({ action: "scan.rescan_requested", targetId: busy.id })).toEqual([]);
+      const admin = recordingDeps();
+      expect(await enqueueRescan(admin.deps, busy.id, { by: "admin" })).toEqual({ queued: true });
+      expect(admin.sent).toEqual([{ v: 1, nodeId: busy.id, key: busy.r2Key, force: true }]);
+
+      // Not "under way": a claim past the stale time (it will be taken over), a failed job, a
+      // finished one, and a live job of ANOTHER key (the version before a replace).
+      const notLive: Partial<typeof scanJobs.$inferInsert>[] = [
+        { startedAt: new Date(Date.now() - 21 * 60_000) },
+        { status: "failed", finishedAt: new Date() },
+        { status: "done", finishedAt: new Date() },
+        { r2Key: `u/${owner.id}/${crypto.randomUUID()}/${crypto.randomUUID()}` },
+      ];
+      for (const values of notLive) {
+        const file = await makeFile(owner.id, null, { scanStatus: "pending" });
+        await job(file, values);
+        const { deps, sent } = recordingDeps();
+        expect(await enqueueRescan(deps, file.id, { by: "owner" }), JSON.stringify(values)).toEqual({
+          queued: true,
+        });
+        expect(sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
+      }
+      // 19 minutes old is still a live claim.
+      const young = await makeFile(owner.id, null, { scanStatus: "pending" });
+      await job(young, { startedAt: new Date(Date.now() - 19 * 60_000) });
+      await expect(enqueueRescan(recordingDeps().deps, young.id, { by: "owner" })).rejects.toMatchObject({
+        code: "conflict",
+      });
+    });
+
+    // The sequence a put-back would get wrong: rescan A resets and its send fails; before A does
+    // anything else, rescan B succeeds — the node is `pending` on the same key, for B's reason.
+    // B's scan then finds the file infected. Had A written the old `clean` back, B's verdict
+    // would have been dropped (the consumer writes only to a `pending` node) and the file served.
+    it("a second rescan that got through while the first one's send failed: its verdict IS written", async () => {
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { name: "eicar.com.txt", scanStatus: "clean", ...VERDICT });
+      await putObject(file.r2Key!, eicarBytes());
+      const second = recordingDeps();
+      const first = failingDeps(async () => {
+        expect(await enqueueRescan(second.deps, file.id, { by: "admin" })).toEqual({ queued: true });
+      });
+      await expect(enqueueRescan(first.deps, file.id, { by: "admin" })).rejects.toThrow(
+        "the queue is not taking",
+      );
+      expect(second.sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
+      // Still pending when the first call has returned — nothing wrote `clean` back.
+      expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+
+      expect(await deliver([{ body: second.sent[0] }])).toEqual([{ outcome: "ack" }]);
+      expect(await nodeById(file.id)).toMatchObject({
+        scanStatus: "infected",
+        scanDetail: { engine: "stub", signatures: ["Stub.EICAR"] },
+      });
+    });
+
+    it("two re-sends are one job and one verdict: the second delivery writes nothing to the node", async () => {
+      const owner = await makeUser();
+      const file = await makeFile(owner.id, null, { name: "notes.txt", scanStatus: "error", ...VERDICT });
+      await putObject(file.r2Key!, "hello");
+      const failed = failingDeps();
+      await expect(enqueueRescan(failed.deps, file.id, { by: "owner" })).rejects.toThrow();
+      const one = recordingDeps();
+      const two = recordingDeps();
+      await Promise.all([
+        enqueueRescan(one.deps, file.id, { by: "owner" }),
+        enqueueRescan(two.deps, file.id, { by: "admin" }),
+      ]);
+      expect([...one.sent, ...two.sent]).toHaveLength(2);
+
+      expect(await deliver([{ body: one.sent[0] }])).toEqual([{ outcome: "ack" }]);
+      const scanned = (await nodeById(file.id))!;
+      expect(scanned).toMatchObject({ scanStatus: "clean", scanDetail: { engine: "stub" } });
+      // The second message: the same job row is claimed again (forced), the bytes are read again,
+      // and the node — no longer pending — is left exactly as the first verdict made it.
+      await testDb()
+        .update(nodes)
+        .set({ scanDetail: { engine: "marker" } })
+        .where(eq(nodes.id, file.id));
+      expect(await deliver([{ body: two.sent[0] }])).toEqual([{ outcome: "ack" }]);
+      expect(await nodeById(file.id)).toMatchObject({
+        scanStatus: "clean",
+        scanDetail: { engine: "marker" },
+        scannedAt: scanned.scannedAt,
+      });
+      expect(await jobsFor(file.r2Key!)).toMatchObject([{ status: "done", attempt: 2 }]);
+    });
+  });
+
+  // Hidden is inherited: a file inside a taken-down folder is as taken down as one taken down itself.
+  describe("a file inside a taken-down folder", () => {
+    const DOWN = { takedownAt: new Date(), takedownReason: "abuse" as const };
+    const VERDICT = {
+      scanDetail: { engine: "clamav", signatures: ["Made.Up.Signature"] },
+      scannedAt: new Date("2026-10-01T00:00:00.000Z"),
+    };
+
+    it("admin: { queued: false, reason: 'taken_down' }; owner: the unknown id's 404 — nothing reset, nothing sent, at any depth and status", async () => {
+      const owner = await makeUser();
+      const down = await makeFolder(owner.id, null, DOWN);
+      const sub = await makeFolder(owner.id, down.id);
+      for (const status of ["clean", "infected", "skipped", "error", "pending", "under_review"] as const) {
+        for (const parent of [down, sub]) {
+          const file = await makeFile(owner.id, parent.id, { scanStatus: status, ...VERDICT });
+          const admin = recordingDeps();
+          expect(await enqueueRescan(admin.deps, file.id, { by: "admin" }), status).toEqual({
+            queued: false,
+            reason: "taken_down",
+          });
+          const mine = recordingDeps();
+          const error = await enqueueRescan(mine.deps, file.id, { by: "owner" }).catch(
+            (thrown: unknown) => thrown,
+          );
+          const unknown = await enqueueRescan(mine.deps, crypto.randomUUID(), { by: "owner" }).catch(
+            (thrown: unknown) => thrown,
+          );
+          expect(error).toBeInstanceOf(AppError);
+          expect({ code: (error as AppError).code, message: (error as AppError).message }).toEqual({
+            code: (unknown as AppError).code,
+            message: (unknown as AppError).message,
+          });
+          await admin.settle();
+          await mine.settle();
+          expect([...admin.sent, ...mine.sent], status).toEqual([]);
+          expect(await nodeById(file.id), status).toMatchObject({ scanStatus: status, ...VERDICT });
+          expect(await auditRows({ action: "scan.rescan_requested", targetId: file.id })).toEqual([]);
+        }
+      }
+    });
+
+    it("the table's precedence is kept: taken down itself, then locked, then the folder above", async () => {
+      const owner = await makeUser();
+      const down = await makeFolder(owner.id, null, DOWN);
+      const lockedInside = await makeFile(owner.id, down.id, {
+        scanStatus: "suspected_csam",
+        legalHold: true,
+      });
+      const bothInside = await makeFile(owner.id, down.id, {
+        scanStatus: "suspected_csam",
+        legalHold: true,
+        ...DOWN,
+      });
+      const ownInside = await makeFile(owner.id, down.id, { scanStatus: "clean", ...DOWN });
+      const by = { by: "admin" } as const;
+      const answer = (id: string) => enqueueRescan(recordingDeps().deps, id, by);
+      // A locked file answers "locked" wherever it lies — as it did before this rule.
+      expect(await answer(lockedInside.id)).toEqual({ queued: false, reason: "locked" });
+      expect(await answer(bothInside.id)).toEqual({ queued: false, reason: "taken_down" });
+      expect(await answer(ownInside.id)).toEqual({ queued: false, reason: "taken_down" });
+      // The control: once the folder is restored a file inside it is rescanned as any other.
+      const plain = await makeFile(owner.id, down.id, { scanStatus: "clean" });
+      expect(await answer(plain.id)).toEqual({ queued: false, reason: "taken_down" });
+      await testDb()
+        .update(nodes)
+        .set({ takedownAt: null, takedownReason: null })
+        .where(eq(nodes.id, down.id));
+      const { deps, sent } = recordingDeps();
+      expect(await enqueueRescan(deps, plain.id, by)).toEqual({ queued: true });
+      expect(sent).toHaveLength(1);
+    });
+
+    it("a takedown of the folder above that lands while the rescan runs is seen: the rescan waits for the tree lock", async () => {
+      const owner = await makeUser();
+      const folder = await makeFolder(owner.id);
+      const file = await makeFile(owner.id, folder.id, { scanStatus: "infected", ...VERDICT });
+      const { deps, sent, settle } = recordingDeps();
+      const lockHeld = gate<number>();
+      // The takedown is written and holds the owner's tree lock until the rescan waits for it.
+      const takedown = testDb().transaction(async (tx) => {
+        expect(await takedownNode(tx, folder.id, { reason: "abuse", by: null })).toBe(true);
+        const pid = await backendPid(tx);
+        lockHeld.open(pid);
+        await untilBlockedBy(pid);
+      });
+      await lockHeld.opened;
+      const outcome = enqueueRescan(deps, file.id, { by: "owner" }).catch((thrown: unknown) => thrown);
+      const [, error] = await Promise.all([takedown, outcome]);
+      await settle();
+      expect(error).toBeInstanceOf(AppError);
+      expect((error as AppError).code).toBe("not_found");
+      expect(await nodeById(file.id)).toMatchObject({ scanStatus: "infected", ...VERDICT });
+      expect(sent).toEqual([]);
+    });
+  });
+
   it("is a 404 for a folder and for an id that does not exist", async () => {
     const owner = await makeUser();
     const folder = await makeFolder(owner.id);
@@ -632,6 +895,19 @@ describe("lockSuspectedCsam", () => {
       .catch((error: unknown) => {
         if (error !== ROLLBACK) throw error;
       });
+  }
+  /**
+   * Is this report in `csamReportsToAnnounce`? Asked in a transaction that is rolled back, with
+   * the report dated before every other and a limit of one — so the answer does not depend on how
+   * many unannounced reports other tests and runs left in the shared database.
+   */
+  async function dueToAnnounce(reportId: string): Promise<boolean> {
+    let due = false;
+    await alone(async ({ db }) => {
+      await oldestFirst(db, [reportId]);
+      due = (await csamReportsToAnnounce(db, 1)).some((row) => row.reportId === reportId);
+    });
+    return due;
   }
   /** Dates these reports before every other in the database, in the order given. */
   async function oldestFirst(db: Db, reportIds: string[]): Promise<void> {
@@ -896,7 +1172,7 @@ describe("lockSuspectedCsam", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
     expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "photodna", reportId } }]);
     expect(await sentRowsOf(file.id)).toEqual([]);
-    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+    expect(await dueToAnnounce(reportId)).toBe(true);
   });
 
   it("the marker is read and claimed on ONE day — the day this call computed, not the database's", async () => {
@@ -1111,7 +1387,7 @@ describe("lockSuspectedCsam", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
     expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
     expect(await sentRowsOf(file.id)).toEqual([]);
-    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+    expect(await dueToAnnounce(reportId)).toBe(true);
 
     // Once there is someone to tell, the very next call tells them.
     const fixed = serviceDeps();
@@ -1120,6 +1396,237 @@ describe("lockSuspectedCsam", () => {
     expect(alertsFor(reportId)).toHaveLength(1);
     expect(await viaOf(file.id), "via defaults to the sweep").toEqual(["sweep"]);
     expect(await lockRowsOf(file.id)).toHaveLength(1);
+  });
+
+  // The upload route inserts a server-verified CSAM object's node ALREADY locked and calls the
+  // lock right after. Until that call has run the node is hidden and held — and nothing else.
+  describe("a node written locked, with no report", () => {
+    /** A file as the upload route writes it: locked and held, nothing else done. */
+    async function writtenLocked(db: Db = testDb()) {
+      const owner = await makeUser();
+      const sha256 = rand(32);
+      // Inserted plain (committed), made locked through `db` — inside `alone` nobody else sees it.
+      const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256 });
+      const link = await makeLink(file.id, owner.id);
+      await db.insert(uploadIps).values({
+        nodeId: file.id,
+        versionId: file.versionId!,
+        uploaderId: owner.id,
+        ipEncrypted: new Uint8Array(20),
+        iv: new Uint8Array(12),
+        keyVersion: 1,
+      });
+      await db
+        .update(nodes)
+        .set({ scanStatus: "suspected_csam", legalHold: true })
+        .where(eq(nodes.id, file.id));
+      return { owner, file, link, sha256 };
+    }
+    async function expectCompleted(
+      db: Db,
+      made: Awaited<ReturnType<typeof writtenLocked>>,
+      reportId: string,
+    ) {
+      const [ownerRow] = await db.select().from(user).where(eq(user.id, made.owner.id));
+      expect(ownerRow).toMatchObject({ legalHold: true, suspendedAt: null });
+      const [linkRow] = await db.select().from(shareLinks).where(eq(shareLinks.id, made.link.id));
+      expect(linkRow!.pauseReasons).toEqual(["moderation"]);
+      const ips = await db.select().from(uploadIps).where(eq(uploadIps.nodeId, made.file.id));
+      expect(ips.map((row) => row.legalHold)).toEqual([true]);
+      const [blocked] = await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, made.sha256));
+      expect(blocked).toMatchObject({ reason: "csam", sourceNodeId: made.file.id });
+      expect(await db.select().from(reports).where(eq(reports.nodeId, made.file.id))).toMatchObject([
+        { id: reportId, category: "csam", status: "open", ownerId: made.owner.id },
+      ]);
+    }
+
+    it("one call does the whole job and is a FIRST lock: report, holds, pauses, one record, one alert; a repeat changes nothing", async () => {
+      const made = await writtenLocked();
+      expect(await csamLocksWithoutReport(testDb(), 1_000_000)).toContainEqual({ nodeId: made.file.id });
+      const first = serviceDeps();
+      const { reportId } = await lockSuspectedCsam(first.deps, made.file.id, { source: "system" });
+      await first.settle();
+      await expectCompleted(testDb(), made, reportId);
+      expect(await lockRowsOf(made.file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
+      expect((await lockRowsOf(made.file.id))[0]!.meta).not.toHaveProperty("recoveredBy");
+      expect(await viaOf(made.file.id)).toEqual(["lock"]);
+      expect(alertsFor(reportId)).toHaveLength(1);
+      expect(await csamLocksWithoutReport(testDb(), 1_000_000)).not.toContainEqual({ nodeId: made.file.id });
+
+      // The repeat: the same case, nothing new written, nobody told twice.
+      const again = serviceDeps();
+      expect(await lockSuspectedCsam(again.deps, made.file.id, { source: "system" })).toEqual({ reportId });
+      await again.settle();
+      expect(await lockRowsOf(made.file.id)).toHaveLength(1);
+      expect(alertsFor(reportId)).toHaveLength(1);
+      expect(await testDb().select().from(reports).where(eq(reports.nodeId, made.file.id))).toHaveLength(1);
+    });
+
+    it("the database half says so: alreadyLocked is false for the call that filed its report, true for the repeat", async () => {
+      const made = await writtenLocked();
+      expect(await lockRows(testDb(), made.file.id, { source: "system" })).toMatchObject({
+        reportStatus: "open",
+        alreadyLocked: false,
+      });
+      expect(await lockRows(testDb(), made.file.id, { source: "system" })).toMatchObject({
+        reportStatus: "open",
+        alreadyLocked: true,
+      });
+    });
+
+    it("the call made to fail: the sweep completes it later — the whole job, one record marked recovered, exactly one alert", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const made = await writtenLocked(db);
+        // Older than every other node: the sweep's head is this one.
+        await db
+          .update(nodes)
+          .set({ createdAt: new Date(Date.UTC(1990, 0, 1)) })
+          .where(eq(nodes.id, made.file.id));
+        const failing = depsOn();
+        failing.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "transaction") {
+              return () => Promise.reject(new Error("the database went away"));
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        await expect(lockSuspectedCsam(failing.deps, made.file.id, { source: "system" })).rejects.toThrow(
+          "the database went away",
+        );
+        expect(await db.select().from(reports).where(eq(reports.nodeId, made.file.id))).toEqual([]);
+        expect(await csamLocksWithoutReport(db, 1)).toEqual([{ nodeId: made.file.id }]);
+
+        const sweep = depsOn();
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 1 })).toEqual({
+          checked: 1,
+          completed: 1,
+          repeated: 0,
+          skipped: 0,
+          failed: 0,
+        });
+        await sweep.settle();
+        const [report] = await db.select().from(reports).where(eq(reports.nodeId, made.file.id));
+        await expectCompleted(db, made, report!.id);
+        expect(await auditIn(db, "scan.suspected_csam", made.file.id)).toMatchObject([
+          { meta: { source: "system", reportId: report!.id, recoveredBy: "sweep" } },
+        ]);
+        expect(await viaIn(db, made.file.id)).toEqual(["sweep"]);
+        expect(alertsFor(report!.id)).toHaveLength(1);
+
+        // Completed: no longer due for this sweep, nor owed anything by the alert sweep.
+        expect(await csamLocksWithoutReport(db, 1_000_000)).not.toContainEqual({ nodeId: made.file.id });
+        await oldestFirst(db, [report!.id]);
+        expect((await csamReportsToAnnounce(db, 1_000)).map((row) => row.reportId)).not.toContain(report!.id);
+        const later = depsOn();
+        await sweepUnrecordedCsamLocks(later.deps, { limit: 1 });
+        await later.settle();
+        expect(alertsFor(report!.id)).toHaveLength(1);
+        expect(await auditIn(db, "scan.suspected_csam", made.file.id)).toHaveLength(1);
+      });
+    });
+
+    it("one node that fails does not stop the rest: it is counted, captured, and found again next time", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const broken = await writtenLocked(db);
+        const fine = await writtenLocked(db);
+        for (const [index, id] of [broken.file.id, fine.file.id].entries()) {
+          await db
+            .update(nodes)
+            .set({ createdAt: new Date(Date.UTC(1990, 0, 1, 0, 0, index)) })
+            .where(eq(nodes.id, id));
+        }
+        const sweep = depsOn();
+        // The first lock's transaction fails; every later one goes through.
+        let calls = 0;
+        sweep.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "transaction" && calls++ === 0) {
+              return () => Promise.reject(new Error("the database went away"));
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 2 })).toEqual({
+          checked: 2,
+          completed: 1,
+          repeated: 0,
+          skipped: 0,
+          failed: 1,
+        });
+        await sweep.settle();
+        expect(await db.select().from(reports).where(eq(reports.nodeId, broken.file.id))).toEqual([]);
+        expect(await db.select().from(reports).where(eq(reports.nodeId, fine.file.id))).toHaveLength(1);
+        expect(await csamLocksWithoutReport(db, 1)).toEqual([{ nodeId: broken.file.id }]);
+      });
+    });
+    // Review m1 / m5: what made a node due is re-decided under its lock. Between the sweep's
+    // listing and its lock one node is CLEARED (a false positive — never locked again) and the
+    // other is COMPLETED by someone else (a repeat — counted as one, nothing written twice).
+    it("a node cleared, or completed elsewhere, after the listing: skipped / repeated, nothing written", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const cleared = await writtenLocked(db);
+        const elsewhere = await writtenLocked(db);
+        for (const [index, id] of [cleared.file.id, elsewhere.file.id].entries()) {
+          await db
+            .update(nodes)
+            .set({ createdAt: new Date(Date.UTC(1990, 0, 1, 0, 0, index)) })
+            .where(eq(nodes.id, id));
+        }
+        expect(await csamLocksWithoutReport(db, 2)).toEqual([
+          { nodeId: cleared.file.id },
+          { nodeId: elsewhere.file.id },
+        ]);
+        const sweep = depsOn();
+        // Right after the listing (the sweep's one `execute`): the clear, and the other lock.
+        let fired = false;
+        let elsewhereReport = "";
+        sweep.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "execute" && !fired) {
+              return async (...args: unknown[]) => {
+                const result: unknown = await (target.execute as (...a: unknown[]) => Promise<unknown>)(
+                  ...args,
+                );
+                fired = true;
+                await db
+                  .update(nodes)
+                  .set({ scanStatus: "pending", legalHold: false })
+                  .where(eq(nodes.id, cleared.file.id));
+                elsewhereReport = (await lockRows(db, elsewhere.file.id, { source: "system" }))!.reportId;
+                return result;
+              };
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 2 })).toEqual({
+          checked: 2,
+          completed: 0,
+          repeated: 1,
+          skipped: 1,
+          failed: 0,
+        });
+        await sweep.settle();
+        // The cleared node stays cleared: no lock, no case, its link not paused, nobody told.
+        expect(await db.select().from(nodes).where(eq(nodes.id, cleared.file.id))).toMatchObject([
+          { scanStatus: "pending", legalHold: false },
+        ]);
+        expect(await db.select().from(reports).where(eq(reports.nodeId, cleared.file.id))).toEqual([]);
+        const [link] = await db.select().from(shareLinks).where(eq(shareLinks.id, cleared.link.id));
+        expect(link!.pauseReasons).toEqual([]);
+        expect(await auditIn(db, "scan.suspected_csam", cleared.file.id)).toEqual([]);
+        // The other: its one case, and the sweep neither recorded nor announced it.
+        expect(await db.select().from(reports).where(eq(reports.nodeId, elsewhere.file.id))).toMatchObject([
+          { id: elsewhereReport },
+        ]);
+        expect(await auditIn(db, "scan.suspected_csam", elsewhere.file.id)).toEqual([]);
+        expect(alertsFor(elsewhereReport)).toHaveLength(0);
+      });
+    });
   });
 
   it("ensureCsamAlerted for something that is not a report id does nothing", async () => {
@@ -1136,5 +1643,30 @@ describe("lockSuspectedCsam", () => {
       expect(error).toBeInstanceOf(AppError);
       expect((error as AppError).code).toBe("not_found");
     }
+  });
+});
+
+// Review m6: "a scan under way" is exactly the claim scan-jobs.claim will not take over — a
+// `running` row younger than SCAN_CLAIM_STALE_MINUTES. Pinned on both sides of the boundary.
+describe("hasLiveScanJob", () => {
+  it("a running claim just inside the stale time is live; just outside, or finished, it is not", async () => {
+    const owner = await makeUser();
+    const at = (seconds: number) => new Date(Date.now() - SCAN_CLAIM_STALE_MINUTES * 60_000 + seconds * 1000);
+    const cases: [string, Partial<typeof scanJobs.$inferInsert>, boolean][] = [
+      ["30 s inside", { status: "running", startedAt: at(30) }, true],
+      ["30 s outside", { status: "running", startedAt: at(-30) }, false],
+      ["done", { status: "done", startedAt: at(30), finishedAt: new Date() }, false],
+      ["failed", { status: "failed", startedAt: at(30), finishedAt: new Date() }, false],
+    ];
+    for (const [name, values, live] of cases) {
+      const file = await makeFile(owner.id, null, { scanStatus: "pending" });
+      await testDb()
+        .insert(scanJobs)
+        .values({ nodeId: file.id, r2Key: file.r2Key!, ...values });
+      expect(await hasLiveScanJob(testDb(), file.r2Key!), name).toBe(live);
+    }
+    // No row at all for the key.
+    const none = await makeFile(owner.id, null, { scanStatus: "pending" });
+    expect(await hasLiveScanJob(testDb(), none.r2Key!)).toBe(false);
   });
 });
