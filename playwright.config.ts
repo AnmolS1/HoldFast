@@ -81,6 +81,9 @@ export default defineConfig({
     // does not depend on the database, which /api/health does (503 when the database is down).
     url: `${baseURL}/__meta`,
     reuseExistingServer: false,
+    // Vite's own lines (dependency optimisation, reloads) go to stdout, which Playwright drops by
+    // default: a CI log without them cannot say whether the dev server re-optimised mid-run.
+    stdout: "pipe",
     timeout: 60_000,
     gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },
     env: {
