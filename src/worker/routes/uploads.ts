@@ -194,11 +194,17 @@ async function freeName(
 
 // ── the session of an `:id` route ───────────────────────────────────────────────────────────
 
-/** The caller's own session, or `404 not_found` — the same for a missing row and another user's. */
+/**
+ * The caller's own session, or `404 not_found` — the same for a missing row, another user's,
+ * and a finished one past the trim age: such a row is deleted by the trim UNLESS a hold keeps
+ * it, so answering it would tell a held file from one that is gone. One statement in every case.
+ */
 async function loadSession(c: Ctx): Promise<Upload> {
   const user = requireVerified(c);
   const session = await sessions.get(db(c), c.req.param("id") ?? "");
-  if (!session || session.uploaderId !== user.id) throw new AppError("not_found");
+  if (!session || session.uploaderId !== user.id || sessions.pastTrim(session, now(c))) {
+    throw new AppError("not_found");
+  }
   return session;
 }
 
@@ -374,13 +380,19 @@ async function lockOrRecord(c: Ctx, nodeId: string, session: Upload): Promise<vo
   }
 }
 
-/** The critical operator alert, by the session's id. Its own failure is logged, never thrown. */
+/** How the critical operator alert is sent. Exported for the tests that make it fail. */
+export const operatorAlert = { send: sendOperatorCritical };
+
+/**
+ * The critical operator alert, by the session's id, to every operator. Its own failure is logged,
+ * never thrown: one address failing does not stop the next, and nothing fails the request.
+ */
 async function tellOperators(c: Ctx, session: Upload): Promise<void> {
   try {
     for (const to of adminListOf(c.env).addresses) {
-      await sendOperatorCritical(deps(c), { to, event: "csam_lock", id: session.id }).catch(
-        (error: unknown) => captureError(error, { kind: "upload_csam_alert" }),
-      );
+      await operatorAlert
+        .send(deps(c), { to, event: "csam_lock", id: session.id })
+        .catch((error: unknown) => captureError(error, { kind: "upload_csam_alert" }));
     }
   } catch (error) {
     captureError(error, { kind: "upload_csam_alert" });
@@ -1045,9 +1057,10 @@ async function completedAgain(c: Ctx, user: SessionUser, session: Upload, body: 
     (body.parts.length === parts.length &&
       claimed.size === parts.length &&
       parts.every((part) => claimed.get(part.n) === part.etag));
-  if (session.expectedSha256 !== body.sha256 || !sameParts) throw noLongerOpen();
+  // The reads come before every decision: a body that does not match, a refused upload and a
+  // node that is not there all cost what a locked upload's repeat costs.
   const found = await sessionNode(c, user, session);
-  // A refused upload is answered after the same reads as a locked one (its node is never there).
+  if (session.expectedSha256 !== body.sha256 || !sameParts) throw noLongerOpen();
   if (!found || session.status === "aborted") throw noLongerOpen();
   if (!found.access) return c.json(await toOwnAvatarDto(db(c), found.node, { viewerId: user.id }), 200);
   const dto = await toNodeDto(db(c), found.node, {

@@ -9,11 +9,14 @@ import { eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { SessionUser } from "../../../src/worker/auth/types";
+import { uuidv7 } from "../../../src/worker/db/ids";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import * as quotaRows from "../../../src/worker/db/queries/quota";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { nodes, reports, shares, uploads, user as userTable } from "../../../src/worker/db/schema";
-import { RaisedToCsam, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
+import { FINISHED_TRIM_DAYS } from "../../../src/worker/db/queries/upload-sessions";
+import { operatorAlert, RaisedToCsam, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
+import trimSource from "../../../src/worker/db/queries/uploads.ts?raw";
 import { requireRole } from "../../../src/worker/services/permissions";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
@@ -433,6 +436,11 @@ describe("M1 — after the blocked 403, a locked upload is not told from a refus
     return [
       await observed(user, "POST", `${path}/complete`, body(known.sha256)),
       await observed(user, "POST", `${path}/complete`, body(sha())),
+      // The same hash with parts that are not what completed (r3-m1).
+      await observed(user, "POST", `${path}/complete`, {
+        sha256: known.sha256,
+        parts: [{ n: 1, etag: "x" }],
+      }),
       await observed(user, "DELETE", path),
       await observed(user, "DELETE", path),
       await observed(user, "POST", `${path}/complete`, body(known.sha256)),
@@ -761,5 +769,114 @@ describe("the minors", () => {
     const answer = await complete(user, session.uploadId);
     expect(answer.status).toBe(201);
     expect(answer.body.name).toBe("notes (2).txt");
+  });
+});
+
+describe("r3-m2 — the operator alert failing changes nothing but the alert", () => {
+  // Two operators (made-up addresses), so that one failing can be seen not to stop the other.
+  const OPERATORS = { ADMIN_EMAILS: "admin@example.test,second-operator@example.test", E2E_ADMIN_EMAILS: "" };
+
+  /** `send` is handed the real sender, to pass the mails it does not fail on. */
+  async function owedWith(send: (real: typeof operatorAlert.send) => typeof operatorAlert.send) {
+    const owner = await uploader();
+    const known = await listed("csam");
+    const session = await uploaded(owner, {}, known.bytes);
+    const original = operatorAlert.send;
+    operatorAlert.send = send(original);
+    try {
+      // Both transactions fail: the node is owed, and the operators are to be told.
+      const answer = await complete(
+        owner,
+        session.uploadId,
+        { sha256: known.sha256 },
+        {
+          env: OPERATORS,
+          beforeCommit: (n) => {
+            if (n <= 2) throw new Error(`test: transaction ${n} fails`);
+          },
+        },
+      );
+      return { answer, session, known };
+    } finally {
+      operatorAlert.send = original;
+    }
+  }
+
+  async function expectOwed({ answer, session, known }: Awaited<ReturnType<typeof owedWith>>) {
+    expect(answer.status).toBe(403);
+    expect(await auditRows({ action: "upload.csam_node_owed", targetId: session.uploadId })).toHaveLength(1);
+    expect(await sessionRow(session.uploadId)).toMatchObject({
+      status: "completing",
+      expectedSha256: known.sha256,
+    });
+  }
+
+  it("the first operator's mail fails (a rejected send): the audit row, the session, the answer as always — and the second operator is still told", async () => {
+    const secondBefore = mailTo("second-operator@example.test").length;
+    const run = await owedWith(
+      (real) => (deps, d) =>
+        d.to === "admin@example.test"
+          ? Promise.reject(new Error("test: the mail transport is down"))
+          : real(deps, d),
+    );
+    await expectOwed(run);
+    expect(mailTo("second-operator@example.test").length).toBe(secondBefore + 1);
+  });
+
+  it("the alert cannot even start (a send that throws at once): still the answer, the audit row, the session completing", async () => {
+    const run = await owedWith(() => () => {
+      throw new Error("test: the mailer cannot be built");
+    });
+    await expectOwed(run);
+  });
+});
+
+describe("r3-m3 — a finished session past the trim age answers as an unknown upload id, kept by a hold or not", () => {
+  it("FINISHED_TRIM_DAYS is the trim's own default (T05 uploads.trimFinished)", () => {
+    expect(trimSource).toMatch(new RegExp(`olderThanDays: number = ${FINISHED_TRIM_DAYS},`));
+  });
+
+  it("held-and-kept, trimmed, never existed: one answer — status, body, headers, statements — for a repeat and a DELETE", async () => {
+    const user = await uploader();
+    const old = new Date(Date.now() - (FINISHED_TRIM_DAYS + 1) * 86_400_000);
+    async function finishedLongAgo() {
+      const session = await uploaded(user, {});
+      const sha256 = sha();
+      expect((await complete(user, session.uploadId, { sha256 })).status).toBe(201);
+      await testDb().update(uploads).set({ completedAt: old }).where(eq(uploads.id, session.uploadId));
+      return { id: session.uploadId, sha256, nodeId: (await sessionRow(session.uploadId))!.nodeId };
+    }
+    // Kept by the trim: its node is taken down AND on legal hold.
+    const kept = await finishedLongAgo();
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "admin", legalHold: true })
+      .where(eq(nodes.id, kept.nodeId));
+    // Trimmed: the row is gone (what the trim does to it).
+    const trimmed = await finishedLongAgo();
+    await testDb().delete(uploads).where(eq(uploads.id, trimmed.id));
+    const never = { id: uuidv7(), sha256: sha() };
+
+    const answers = async (target: { id: string; sha256: string }) => [
+      await observed(user, "POST", `/uploads/${target.id}/complete`, { sha256: target.sha256, parts: [] }),
+      await observed(user, "DELETE", `/uploads/${target.id}`),
+    ];
+    const reference = await answers(never);
+    expect(reference[0]!.seen.startsWith("404 ")).toBe(true);
+    expect(await answers(kept)).toEqual(reference);
+    expect(await answers(trimmed)).toEqual(reference);
+    expect(await sessionRow(kept.id)).toMatchObject({ status: "done" });
+  });
+
+  it("control: the same held session a day before the trim age still answers as a finished upload does (409)", async () => {
+    const user = await uploader();
+    const session = await uploaded(user, {});
+    const sha256 = sha();
+    await complete(user, session.uploadId, { sha256 });
+    const recent = new Date(Date.now() - (FINISHED_TRIM_DAYS - 1) * 86_400_000);
+    await testDb().update(uploads).set({ completedAt: recent }).where(eq(uploads.id, session.uploadId));
+    const nodeId = (await sessionRow(session.uploadId))!.nodeId;
+    await testDb().update(nodes).set({ takedownAt: new Date(), legalHold: true }).where(eq(nodes.id, nodeId));
+    expect((await complete(user, session.uploadId, { sha256 })).status).toBe(409);
   });
 });

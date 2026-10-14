@@ -18,6 +18,22 @@ export type NewNode = typeof nodes.$inferInsert;
 
 export type SessionPart = { n: number; etag: string; size: number };
 
+/**
+ * The age after which T05's `uploads.trimFinished` deletes a finished session (its default
+ * `olderThanDays`; SEAM: T05 to export it as a constant — until then a test pins the two equal).
+ */
+export const FINISHED_TRIM_DAYS = 7;
+
+/**
+ * A `done` / `aborted` session older than the trim age — measured as the trim measures it,
+ * from `completedAt` (else `createdAt`). The trim deletes such a row unless a hold keeps it.
+ */
+export function pastTrim(session: Upload, at: Date): boolean {
+  if (session.status !== "done" && session.status !== "aborted") return false;
+  const ended = (session.completedAt ?? session.createdAt).getTime();
+  return ended < at.getTime() - FINISHED_TRIM_DAYS * 86_400_000;
+}
+
 /** The row, whatever its state and whoever runs it. Whose it is, is the caller's check. */
 export async function get(db: Executor, uploadId: string): Promise<Upload | null> {
   if (!isUuid(uploadId)) return null;
