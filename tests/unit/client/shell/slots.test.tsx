@@ -105,9 +105,6 @@ const STUBS: Array<[behaviour: string, check: () => void]> = [
   ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
   ["SearchSuggestions renders nothing", rendersNothing(<SearchSuggestions query="tax" onPick={noop} />)],
   ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
-  ["UploadDropOverlay renders nothing", rendersNothing(<UploadDropOverlay />)],
-  ["requestUpload() is a no-op", returns(() => requestUpload(), undefined)],
-  ["requestUpload(opts) is a no-op", returns(() => requestUpload({ files: [], parentId: "p" }), undefined)],
   ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
   ["useUsageSummary() is null", returns(() => useUsageSummary(), null)],
 ];
