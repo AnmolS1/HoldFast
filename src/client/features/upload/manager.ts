@@ -121,6 +121,8 @@ interface Mark {
 let epoch = 0;
 const mark = (): Mark => ({ epoch, account: accountEpoch() });
 const live = (then: Mark): boolean => then.epoch === epoch && sameAccount(then.account);
+/** The account the queue's contents belong to: taken again each time the purger empties it. */
+let queueOwner: Mark = mark();
 
 /**
  * Whose action this is. Taken in the handler of the user's action — the drop, the picker's
@@ -207,6 +209,8 @@ let frameUp = true;
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let scanBusy = false;
 let scanBackoff = 0;
+/** The scan loop does not ask before this (its backoff, a `Retry-After`) — also after a remount or a tab switch. */
+let scanNotBefore = 0;
 let localRestore: Promise<void> | null = null;
 let serverRestore: Promise<void> | null = null;
 let authProbe: Promise<void> | null = null;
@@ -470,9 +474,13 @@ function pump(): void {
 }
 
 function start(id: string): void {
+  // The queue belongs to the account it was filled under (the purger empties it on every change).
+  // Started by an event (online, Retry, Resume) after the shell's epoch moved and before the
+  // purger ran: the account is no longer the queue's, and nothing starts.
+  const then = queueOwner;
+  if (!live(then)) return;
   const work = workOf(id);
   const controller = new AbortController();
-  const then = mark();
   work.controller = controller;
   work.running = true;
   void run(id, controller.signal, then)
@@ -1005,7 +1013,7 @@ function scheduleScan(wait: number): void {
   // The account whose files these are is the one that schedules the ask: a tick that fires after
   // the shell's epoch moved (before the purger stops it) sends nothing.
   const then = mark();
-  scanTimer = setTimeout(() => void scanTick(then), wait);
+  scanTimer = setTimeout(() => void scanTick(then), Math.max(wait, scanNotBefore - Date.now()));
 }
 
 /**
@@ -1081,6 +1089,7 @@ async function scanTick(then: Mark): Promise<void> {
   if (!live(then)) return;
   scanBusy = false;
   sweep();
+  scanNotBefore = Date.now() + wait;
   scheduleScan(wait);
 }
 
@@ -1924,6 +1933,7 @@ async function restoreFromServer(userId: string, then: Mark): Promise<boolean> {
 /** Everything in memory: abort what is in flight and empty the queue. */
 function dropQueue(): void {
   epoch += 1;
+  queueOwner = mark();
   for (const work of works.values()) {
     work.controller?.abort();
     work.hash?.cancel();
@@ -1941,6 +1951,7 @@ function dropQueue(): void {
   scanTimer = undefined;
   scanBusy = false;
   scanBackoff = 0;
+  scanNotBefore = 0;
   localRestore = null;
   serverRestore = null;
   authProbe = null;

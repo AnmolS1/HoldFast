@@ -98,6 +98,16 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
       reason && reason !== "user" ? t(PAUSE_SENTENCE[reason]) : t("ribbon.paused", { n, total, left });
     return { progress, sentence, status: "paused" };
   }
+  // A drop of empty folders only, paused: still the ribbon's (and with it the panel's Resume all).
+  const pausedFolders = items.filter((item) => item.kind === "folder" && item.state === "paused");
+  if (pausedFolders.length > 0) {
+    const reason = pausedFolders.find((item) => item.pauseReason !== "user")?.pauseReason;
+    const sentence =
+      reason && reason !== "user"
+        ? t(PAUSE_SENTENCE[reason])
+        : counted("ribbon.folders.paused.one", "ribbon.folders.paused.other", pausedFolders.length);
+    return { progress, sentence, status: "paused" };
+  }
 
   const scanning = items.filter((item) => item.state === "scanning").length;
   if (scanning > 0) {
@@ -225,6 +235,10 @@ export function describeItem(item: UploadItem): string | null {
  * cap: paused rows, rows waiting on the scanner (no action, so a thousand of them are counted, not
  * drawn), waiting rows and finished rows, in that order of claim. The queue's own order is kept.
  */
+/** Rows that wait on the scanner and have nothing to act on: counted in their own line when not drawn. */
+export const isStillChecking = (item: UploadItem): boolean =>
+  item.state === "scanning" || (item.state === "done" && item.scanStatus === "pending");
+
 export function rowsToDraw(items: readonly UploadItem[], cap: number): UploadItem[] {
   if (items.length <= cap) return [...items];
   const rank = (item: UploadItem): number => {
@@ -243,7 +257,9 @@ export function rowsToDraw(items: readonly UploadItem[], cap: number): UploadIte
       case "queued":
         return 3;
       case "done":
-        return item.scanStatus === null || item.scanStatus === "clean" ? 4 : 0;
+        if (item.scanStatus === null || item.scanStatus === "clean") return 4;
+        // Given up on by the scan's bound: still being checked, nothing to do — counted, not drawn.
+        return item.scanStatus === "pending" ? 2 : 0;
       case "cancelled":
         return 4;
     }

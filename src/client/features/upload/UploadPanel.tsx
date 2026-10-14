@@ -25,7 +25,7 @@ import { openPicker } from "./picker";
 import { PANEL_ROWS } from "./plan";
 import { isRestored, useUploads, type UploadItem } from "./store";
 import { t } from "./strings";
-import { describeItem, rowsToDraw } from "./summary";
+import { describeItem, isStillChecking, rowsToDraw } from "./summary";
 
 const touch = `@media ${TOUCH_QUERY}`;
 
@@ -197,7 +197,9 @@ export function UploadPanel() {
   // A drop of thousands of files is counted, not drawn — but every row that is moving or has
   // failed is drawn, wherever it stands in the queue: those are the ones to act on.
   const shown = rowsToDraw(items, PANEL_ROWS);
-  const more = items.length - shown.length;
+  const drawn = new Set(shown.map((item) => item.id));
+  const checking = items.filter((item) => !drawn.has(item.id) && isStillChecking(item)).length;
+  const more = items.length - shown.length - checking;
 
   return (
     <Box data-upload-panel ref={root}>
@@ -235,6 +237,15 @@ export function UploadPanel() {
       {more > 0 ? (
         <Typography variant="body2" data-upload-more sx={{ color: hf.textSecondary, py: 2, pr: 3, pl: 5 }}>
           {more === 1 ? t("panel.more.one") : t("panel.more.other", { count: more })}
+        </Typography>
+      ) : null}
+      {checking > 0 ? (
+        <Typography
+          variant="body2"
+          data-upload-checking
+          sx={{ color: hf.textSecondary, py: 2, pr: 3, pl: 5 }}
+        >
+          {checking === 1 ? t("panel.checking.one") : t("panel.checking.other", { count: checking })}
         </Typography>
       ) : null}
     </Box>
