@@ -140,7 +140,8 @@ export async function markAborted(tx: Executor, uploadId: string): Promise<boole
 
 /**
  * Sessions the stale-upload job should look at: `open` past `expiresAt`, and `completing` for
- * more than an hour (its request died between the claim and the commit).
+ * more than an hour (its request died between the claim and the commit) — except one that owes
+ * a locked node (`owesLockedNode`), which the repair sweep owns.
  */
 export async function expired(db: Executor, limit: number): Promise<Upload[]> {
   return db
@@ -152,6 +153,9 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
         and(
           eq(uploads.status, "completing"),
           sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) < now() - make_interval(mins => ${COMPLETING_STALE_MINUTES})`,
+          // A session that owes a locked node is never the stale job's to abort: the repair
+          // sweep (T22) owns it — its object is verified bytes that must be preserved.
+          not(owesLockedNode()),
         ),
       ),
     )

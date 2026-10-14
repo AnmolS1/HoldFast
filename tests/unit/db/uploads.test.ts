@@ -14,7 +14,7 @@ import {
   trimFinished,
 } from "../../../src/worker/db/queries/uploads";
 import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
-import { uploadParts, uploads } from "../../../src/worker/db/schema";
+import { hashBlocklist, uploadParts, uploads } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeUpload, makeUser, openDb, protectedFiles, rand } from "./_helpers";
 
 let db: Db;
@@ -215,6 +215,30 @@ describe("expired and trimFinished", () => {
     const one = await expired(db, 1);
     expect(one).toHaveLength(1);
     expect(one[0]).toHaveProperty("r2Key");
+  });
+
+  // H2 K (the lead's ruling): a completing session whose declared hash is blocklisted owes a
+  // LOCKED node for verified bytes; the stale job would abort its object. The repair sweep owns it.
+  it("expired never hands the stale job a completing session that owes a locked node", async () => {
+    const owner = await makeUser(db);
+    const stale = new Date(Date.now() - (COMPLETING_STALE_MINUTES + 5) * 60_000);
+    const listed = rand(32);
+    await db.insert(hashBlocklist).values({ sha256: listed, reason: "csam" });
+    const owed = await makeUpload(db, owner, owner, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: listed,
+    });
+    // The controls: an unlisted hash, and no declared hash at all — still the stale job's.
+    const unlisted = await makeUpload(db, owner, owner, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: rand(32),
+    });
+    const undeclared = await makeUpload(db, owner, owner, { status: "completing", completingAt: stale });
+    const ids = (await expired(db, 100_000)).filter((u) => u.ownerId === owner).map((u) => u.id);
+    expect(ids.sort()).toEqual([unlisted.id, undeclared.id].sort());
+    expect(ids).not.toContain(owed.id);
   });
 
   it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", async () => {
