@@ -62,6 +62,7 @@ import {
 } from "../db/queries/nodes";
 import {
   liveNameHolder,
+  lockForEdit,
   ownEditorShares,
   releaseRescan,
   zipManifest,
@@ -199,7 +200,7 @@ router.post("/nodes/folder", async (c) => {
     const details = await existingFolder(c, { ownerId, parentId: body.parentId, name: body.name });
     throw new AppError("conflict", error.message, details);
   }
-  audit(c, "node.create_folder", target(created.id), { parentId: body.parentId });
+  audit(c, "node.create_folder", target(created.id), { parentId: created.parentId });
   return c.json(await toNodeDto(db(c), created, view));
 });
 
@@ -404,14 +405,27 @@ router.patch(`/nodes/${ID}`, async (c) => {
     if (access.shareRootId === id) throw new AppError("forbidden");
   }
 
-  if (body.name !== undefined) {
-    node = await rename(db(c), id, body.name);
+  // Both writes in one transaction, the row locked first: what each CHANGED is decided against
+  // the row as it was under the lock — not as this request read it — so a rename to the name the
+  // node already has, or a star it already has, writes no audit row, and a real one always does.
+  // DATABASE STATEMENTS ONLY inside the callback (it may run again); the rows are written after.
+  const edit = await retryOnDeadlock(deps(c).db, async (tx) => {
+    const before = await lockForEdit(tx, id);
+    if (!before) throw new AppError("not_found");
+    let after = node;
+    if (body.name !== undefined) after = await rename(tx, id, body.name);
+    if (body.starred !== undefined) {
+      if (!(await setStar(tx, id, body.starred))) throw new AppError("not_found");
+      after = { ...after, starred: body.starred };
+    }
+    return { before, after };
+  });
+  node = edit.after;
+  if (body.name !== undefined && edit.after.name !== edit.before.name) {
     audit(c, "node.rename", target(id), null);
   }
-  if (body.starred !== undefined) {
-    if (!(await setStar(db(c), id, body.starred))) throw new AppError("not_found");
-    node = { ...node, starred: body.starred };
-    audit(c, "node.star", target(id), { starred: body.starred });
+  if (body.starred !== undefined && edit.after.starred !== edit.before.starred) {
+    audit(c, "node.star", target(id), { starred: edit.after.starred });
   }
   return c.json(await toNodeDto(db(c), node, viewOf(user, access)));
 });

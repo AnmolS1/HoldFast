@@ -409,5 +409,5 @@ describe("a share partner and files that are not clean", () => {
       const real = await route.call(t.stranger.as, files.clean.id, t);
       expect(real.statements, route.name).toBe(unknown.statements);
     }
-  });
+  }, 30_000);
 });

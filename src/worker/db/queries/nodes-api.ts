@@ -69,6 +69,24 @@ export async function releaseRescan(db: Executor, nodeId: string, previous: Date
   await db.update(nodes).set({ rescanRequestedAt: previous }).where(eq(nodes.id, nodeId));
 }
 
+/**
+ * The node's name and star as they are NOW, its row locked (`FOR UPDATE`) until the caller's
+ * transaction ends: a rename or star made after this in the same transaction is compared with
+ * what it changed, and no other writer of the row can come between. Null: no such row.
+ */
+export async function lockForEdit(
+  tx: Executor,
+  nodeId: string,
+): Promise<{ name: string; starred: boolean } | null> {
+  if (!isUuid(nodeId)) return null;
+  const [row] = await tx
+    .select({ name: nodes.name, starred: nodes.starred })
+    .from(nodes)
+    .where(eq(nodes.id, nodeId))
+    .for("update");
+  return row ?? null;
+}
+
 export type ZipRoot = {
   id: string;
   /** The first path segment of everything under this root: its name, made unique by the caller. */
