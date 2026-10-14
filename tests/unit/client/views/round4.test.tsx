@@ -2,12 +2,16 @@
 // the cache can lift; an expired session before a run's first batch goes through re-auth; the
 // "cancelled" note goes with the next act.
 import { focusManager, onlineManager } from "@tanstack/react-query";
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { INVALIDATE_WAIT_MS, viewKeys } from "../../../../src/client/features/starred/view-queries";
-import { clearPageFailures } from "../../../../src/client/features/starred/view-state";
-import { clearWaits, waitKey, waitUntil } from "../../../../src/client/features/starred/waits";
+import {
+  clearPageFailures,
+  usePagedView,
+  type PagedQueryLike,
+} from "../../../../src/client/features/starred/view-state";
+import { clearWaits, holdUntil, waitKey, waitUntil } from "../../../../src/client/features/starred/waits";
 import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
 import { cancelReauth, completeReauth, isReauthPending } from "../../../../src/client/lib/api";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
@@ -192,6 +196,28 @@ describe("r4-2: a failed page's wait outlives its query", () => {
     await settle();
     expect(pageTwo()).toHaveLength(1);
     expect(document.querySelector("[data-load-more-sentinel]")).toBeNull();
+  });
+});
+
+describe("r4-2: loadMore on its own", () => {
+  it("a list inside a wait asks for no page, even when loadMore is called (not only when the trigger is off)", async () => {
+    const KEY = ["views", "probe-wait"] as const;
+    const fetchNextPage = vi.fn(async () => ({ isError: false, isFetchNextPageError: false, error: null }));
+    const fake: PagedQueryLike = {
+      data: { pages: [] },
+      error: null,
+      isError: false,
+      errorUpdatedAt: 0,
+      fetchStatus: "idle",
+      refetch: async () => ({ isSuccess: true }),
+      hasNextPage: true,
+      fetchNextPage,
+    };
+    holdUntil(waitKey(KEY), Date.now() + 30_000);
+    const { result } = renderHook(() => usePagedView(fake, KEY, 0));
+    expect(result.current.hasMore).toBe(false);
+    await act(async () => result.current.loadMore());
+    expect(fetchNextPage).not.toHaveBeenCalled();
   });
 });
 
