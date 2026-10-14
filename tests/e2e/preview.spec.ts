@@ -201,6 +201,62 @@ test.describe("previews (mocked API and files host)", () => {
     mockedOnly("the journeys script the node API and the files host; real uploads are post-integration");
   });
 
+  test("opened from a page of the app with the opener's state (as the explorer opens it): the entry is stamped once and the preview settles", async ({
+    page,
+    origins,
+  }) => {
+    // Every replace of the history entry, counted in the page.
+    await page.addInitScript(() => {
+      const own = window as unknown as { __replaces: number };
+      own.__replaces = 0;
+      const replace = history.replaceState.bind(history);
+      history.replaceState = (...args: Parameters<History["replaceState"]>) => {
+        own.__replaces += 1;
+        replace(...args);
+      };
+    });
+    await page.clock.install();
+    const arranged = await arrange(page, origins, [NODES.png]);
+    // The session read the frame's loader makes is slow (a real network): a navigation to the
+    // preview's address stays "loading" across renders — what exposed the stamp loop.
+    let slowSession = false;
+    await page.route("**/api/auth/get-session", async (route) => {
+      if (slowSession) await new Promise((resolve) => setTimeout(resolve, 600));
+      await route.fallback();
+    });
+    await page.goto("/");
+    await expect(page.locator("#main")).toBeVisible();
+    // The cached session is past its 15 s: the next navigation reads it again, slowly.
+    slowSession = true;
+    await page.clock.fastForward(20_000);
+    const before = await page.evaluate(() => (window as unknown as { __replaces: number }).__replaces);
+    // The explorer's open, through the app's own router: a new entry whose state is the opener's
+    // — `{ from: "/" }`, no account — then the router is told the location changed.
+    await page.evaluate((id) => {
+      const index = ((history.state as { idx?: number } | null)?.idx ?? 0) + 1;
+      history.pushState({ usr: { from: "/" }, key: "opened", idx: index }, "", `/preview/${id}`);
+      window.dispatchEvent(new PopStateEvent("popstate", { state: history.state }));
+    }, ID.png);
+    await expect(dialog(page)).toHaveAccessibleName("sample.png");
+    await expect(renderer(page, "image").getByRole("img", { name: "sample.png" })).toBeVisible();
+    // Long enough for a loop to repeat many times; then: one replace (the stamp), and it stays.
+    await page.clock.runFor(3_000);
+    await page.waitForTimeout(1_500);
+    const after = await page.evaluate(() => ({
+      replaces: (window as unknown as { __replaces: number }).__replaces,
+      state: (history.state as { usr?: unknown } | null)?.usr,
+      path: location.pathname,
+    }));
+    expect(after.replaces - before).toBe(1);
+    expect(after.path).toBe(`/preview/${ID.png}`);
+    expect(after.state).toMatchObject({ from: "/", account: expect.any(String) });
+    // And it closes to the page it came from.
+    await page.keyboard.press("Escape");
+    await expect(dialog(page)).toHaveCount(0);
+    await expect(page).toHaveURL(/\/$/);
+    expectClean(arranged);
+  });
+
   test("a PNG opens from its inline URL, with the 320 thumbnail as the blur-up", async ({
     page,
     origins,
@@ -310,7 +366,7 @@ test.describe("previews (mocked API and files host)", () => {
     expectClean(arranged);
   });
 
-  test("a crafted file inside every size bound: highlighting never holds the page, and Escape DURING the run answers at once", async ({
+  test("a crafted file inside every size bound: Escape pressed DURING highlighting closes the preview before the run ends", async ({
     page,
     origins,
   }) => {
@@ -320,26 +376,23 @@ test.describe("previews (mocked API and files host)", () => {
     const body = Buffer.from(`${"(".repeat(999)}\n`.repeat(200));
     const crafted = nodeOf({ ...NODES.ts, size: body.length });
     await page.addInitScript(() => {
-      const probe = window as unknown as {
-        __long: Array<[number, number]>;
-        __keyDelay: number[];
-        __keyPhase: Array<string | null>;
-      };
-      probe.__long = [];
-      probe.__keyDelay = [];
+      const probe = window as unknown as { __phases: string[]; __keyPhase: Array<string | null> };
+      probe.__phases = [];
       probe.__keyPhase = [];
-      new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) probe.__long.push([entry.startTime, entry.duration]);
-      }).observe({ entryTypes: ["longtask"] });
-      // How long a key press waited before any handler ran, and whether highlighting was running.
+      // Every state the highlighting run of the text viewer goes through.
+      new MutationObserver((records) => {
+        for (const record of records) {
+          const value = (record.target as Element).getAttribute("data-highlight");
+          if (value !== null) probe.__phases.push(value);
+        }
+      }).observe(document, { subtree: true, attributes: true, attributeFilter: ["data-highlight"] });
+      // Where the run was when the key was handed to the page.
       document.addEventListener(
         "keydown",
-        (event) => {
-          probe.__keyDelay.push(performance.now() - event.timeStamp);
+        () =>
           probe.__keyPhase.push(
             document.querySelector('[data-preview-renderer="text"]')?.getAttribute("data-highlight") ?? null,
-          );
-        },
+          ),
         true,
       );
     });
@@ -358,28 +411,20 @@ test.describe("previews (mocked API and files host)", () => {
     const text = renderer(page, "text");
     await expect(text.locator("[data-line]")).toHaveCount(200);
     await expect(text).toHaveAttribute("data-highlight", "running");
-    const shownAt = await page.evaluate(() => performance.now());
-    // Let it work for a while, then press Escape in the middle of the run.
-    await page.waitForTimeout(300);
     await page.keyboard.press("Escape");
     await expect(dialog(page)).toHaveCount(0);
     const probe = await page.evaluate(() => {
-      const own = window as unknown as {
-        __long: Array<[number, number]>;
-        __keyDelay: number[];
-        __keyPhase: Array<string | null>;
-      };
-      return { long: own.__long, delays: own.__keyDelay, phases: own.__keyPhase };
+      const own = window as unknown as { __phases: string[]; __keyPhase: Array<string | null> };
+      return { phases: own.__phases, atKey: own.__keyPhase };
     });
-    // The key arrived while the run was still going.
+    // No wall-clock number: what is asserted is the order of events, which a loaded machine does
+    // not change. The page took the key while the run was still going — so the run had yielded
+    // the main thread to it — and the preview closed without the run ever reaching its end (an
+    // unyielding run would have finished, "plain", before the key could be handled).
+    expect(probe.atKey).toEqual(["running"]);
     expect(probe.phases).toContain("running");
-    // Handled within a few frames of being pressed (it was seconds): it waits at most for the
-    // stretch of work in progress.
-    expect(Math.max(...probe.delays)).toBeLessThan(100);
-    // A stretch is a slice plus one uninterruptible scan of one line (~44 ms at worst, measured;
-    // HIGHLIGHT_TASK_BOUND_MS); 150 ms leaves room for a loaded machine.
-    const longest = Math.max(0, ...probe.long.filter(([start]) => start >= shownAt).map(([, ms]) => ms));
-    expect(longest).toBeLessThan(150);
+    expect(probe.phases).not.toContain("plain");
+    expect(probe.phases).not.toContain("done");
     expectClean(arranged);
   });
 

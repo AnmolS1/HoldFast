@@ -5,6 +5,7 @@ import { useState } from "react";
 import { useLocation, useNavigate, useParams, type RouteObject } from "react-router";
 import { describe, expect, it } from "vitest";
 import { routes as previewRoutes } from "../../../../src/client/features/preview";
+import { adoptIdentity } from "../../../../src/client/lib/query";
 import { Frame } from "../../../../src/client/routes/frame/Frame";
 import { renderRoutes, seedConfig, seedSession, sessionOf } from "../shell/helpers";
 import { ID, NODES, nodeOf } from "./fixtures";
@@ -185,5 +186,45 @@ describe("the preview route", () => {
     await settle(10);
     fireEvent.keyDown(dialog()!, { key: "Escape" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/folder/${ID.folder}`));
+  });
+});
+
+describe("the account stamp on the route's history state", () => {
+  // As the app's frame route: a loader that takes a moment (the session read), so a navigation
+  // to the preview's own address is "loading" for a while before it lands.
+  const slow: RouteObject[] = [
+    {
+      path: "/",
+      loader: () => new Promise<null>((resolve) => setTimeout(() => resolve(null), 20)),
+      element: <Frame backgroundRoutes={background} />,
+      children,
+    },
+  ];
+
+  it("opened with an opener's unstamped state: stamped once, and the navigation settles", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slow, [`/folder/${ID.folder}`]);
+    await screen.findByTestId("list");
+    const navigations: string[] = [];
+    const stop = router.subscribe((next) => {
+      if (next.navigation.state === "loading") navigations.push(next.navigation.location?.pathname ?? "");
+    });
+    act(() => screen.getByText("open sample.svg").click());
+    await screen.findByText("sample.svg");
+    // Long enough for a loop to show itself many times over (each turn is one 20 ms loader).
+    await settle(400);
+    stop();
+    // The opener's push, and the one replace that stamps it — not one after another for ever.
+    expect(navigations.length).toBeLessThanOrEqual(2);
+    expect(router.state.navigation.state).toBe("idle");
+    expect(router.state.location.state).toEqual({
+      siblingIds: SIBLINGS,
+      from: `/folder/${ID.folder}`,
+      account: sessionOf().user.id,
+    });
+    // Still usable: Next moves on.
+    fireEvent.click(screen.getByRole("button", { name: "Next file" }));
+    await screen.findByText("sample.html");
   });
 });
