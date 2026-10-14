@@ -8,6 +8,13 @@ import { setupShell } from "../shell/helpers";
 import { node, nodeId, RECENT, RECENT_NOW, SEARCH, STARRED, TRASH } from "./fixtures";
 import { json, openView, queryOf, requests, rowNames } from "./helpers";
 
+// The preview is T18's feature: these tests check what a view WRITES when it opens a file (the
+// address and its state), so the route answers with a stand-in. The real one stamps the state
+// with the account and loads its renderers, which is T18's to test.
+vi.mock("../../../../src/client/features/preview/PreviewRoute", () => ({
+  PreviewRoute: () => <div data-preview-stand-in />,
+}));
+
 setupShell();
 afterEach(() => vi.useRealTimers());
 

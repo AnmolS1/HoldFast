@@ -2,6 +2,7 @@
 // route tree (frame, sidebar, page) over a fetch router answering what the test names.
 import { waitFor } from "@testing-library/react";
 import { afterEach, beforeEach } from "vitest";
+import { clearWaits } from "../../../../src/client/features/starred/waits";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { buildRoutes } from "../../../../src/client/router";
 import { DESKTOP_MIN } from "../../../../src/client/theme/breakpoints";
@@ -43,6 +44,9 @@ export interface OpenOptions {
 
 /** Open a path of the app, signed in. Unnamed `/api/*` requests get the 404 envelope. */
 export async function openView(path: string, answers: Answers = {}, options: OpenOptions = {}) {
+  // A wait the API named during the previous test (a page still mounted at its purge may have
+  // read once more) is not this test's.
+  clearWaits();
   const width = options.width ?? 1280;
   setViewport(width, { coarse: width < DESKTOP_MIN });
   const calls = shellFetch({
