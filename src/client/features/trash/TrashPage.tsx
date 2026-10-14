@@ -35,7 +35,8 @@ import {
   usePagedView,
 } from "../starred/view-state";
 import { EmptyTrashAction } from "./EmptyTrashAction";
-import { setBatchStop, useBatchStop, type BatchStop } from "./batch-stop";
+import { holdUntil, useWaitUntil } from "../starred/waits";
+import { BATCH_WAIT, setBatchStop, useBatchStop, type BatchStop } from "./batch-stop";
 import { usePreConfirmRead } from "./empty-run";
 import { announcedByClient, deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
 import { t } from "./strings";
@@ -81,7 +82,7 @@ export function TrashPage() {
   const stopped = useBatchStop();
   // After a `429` the two actions are not offered again before the time the API named — on this
   // visit or a later one (the stop is the account's, batch-stop.ts).
-  const batchWait = useBlockedUntil(stopped?.retryAt ?? 0);
+  const batchWait = useBlockedUntil(useWaitUntil(BATCH_WAIT));
   // The read before "Empty the trash?" is out: nothing else destructive starts meanwhile.
   const preConfirm = usePreConfirmRead();
   const blocked = busy || batchWait || preConfirm;
@@ -103,15 +104,16 @@ export function TrashPage() {
     setSelection((current) => new Set(Array.from(current).filter((id) => !ids.has(id))));
   };
 
-  const stop = (action: BatchStop["action"], done: number, left: number, error: unknown) =>
+  const stop = (action: BatchStop["action"], done: number, left: number, error: unknown) => {
+    holdUntil(BATCH_WAIT, retryNotBefore(error, Date.now()));
     setBatchStop({
       action,
       done,
       left,
-      retryAt: retryNotBefore(error, Date.now()),
       requestId: error instanceof ApiError ? error.requestId : undefined,
       announced: announcedByClient(error),
     });
+  };
 
   // Both batches send ONE request at a time, and stop at the first answer that is about the API
   // (see `stopsBatch`): what is left stays selected, one notice says how far it got, and after

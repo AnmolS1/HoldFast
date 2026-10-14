@@ -24,6 +24,9 @@ import { t } from "./strings";
 
 const UNKNOWN: TrashSize = { count: null, more: false };
 
+/** What ends the moment "Empty trash cancelled." describes. */
+const NEXT_ACTS = ["pointerdown", "keydown"] as const;
+
 /** What a user does that is not "waiting for the dialog I asked for". */
 const OTHER_ACTS = ["pointerdown", "keydown", "click"] as const;
 
@@ -70,6 +73,16 @@ export function EmptyTrashAction() {
   const [asked, setAsked] = useState<TrashSize | null>(null);
   // The question was withdrawn by something else the user did: said in the status line.
   const [withdrawnNote, setWithdrawnNote] = useState(false);
+  // It describes a moment: the user's next act (a key, a press) clears it. The polite region has
+  // announced it already. (Not on a timer: the shell exports no status-line timeout — SEAM.)
+  useEffect(() => {
+    if (!withdrawnNote) return;
+    const clear = () => setWithdrawnNote(false);
+    for (const type of NEXT_ACTS) document.addEventListener(type, clear, true);
+    return () => {
+      for (const type of NEXT_ACTS) document.removeEventListener(type, clear, true);
+    };
+  }, [withdrawnNote]);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;

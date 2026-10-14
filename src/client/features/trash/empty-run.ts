@@ -4,8 +4,9 @@
 // is stopped and forgotten on sign-out or an account switch.
 import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
-import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
-import { accountEpoch, getKnownUserId, queryClient, refreshSession, sameAccount } from "../../lib/query";
+import { api } from "../../lib/api";
+import { emitNodesChanged, registerUserStatePurger, SessionShape } from "../../lib/contracts";
+import { accountEpoch, getKnownUserId, queryClient, sameAccount } from "../../lib/query";
 import { refreshQueries, viewKeys } from "../starred/view-queries";
 import { retryNotBefore } from "../starred/view-state";
 import { announcedByClient, emptyTrash, EMPTY_TRASH, isAbort } from "./queries";
@@ -84,14 +85,20 @@ export function startEmptyTrash(): void {
   // Whose trash this is. `DELETE /api/trash` means "the caller's", and the caller is whoever the
   // cookie names when the request LEAVES — so the account is checked before every request, the
   // first included, not only when an answer arrives: against what this tab knows, and against
-  // the session read again, because another tab may have signed somebody else in meanwhile (the
-  // click may come long after the page loaded; each later batch follows up to twenty seconds of
-  // server work).
+  // the session as the server has it now, because another tab may have signed somebody else in
+  // meanwhile (the click may come long after the page loaded; each later batch follows up to
+  // twenty seconds of server work). ANOTHER account ends the run without a word. NO session
+  // (it expired) is not another account: the batch goes, draws its `401`, and the API client
+  // opens re-auth — signed in again as the same account, the request is replayed and the run
+  // goes on; cancelled, the run stops and says so; another account, the shell starts afresh.
+  // (The session is read without writing it to the cache: a `null` there would tell the API
+  // client there never was a session, and the `401` would open nothing.)
   const owner = getKnownUserId();
   const account = accountEpoch();
   const beforeBatch = async () => {
-    const session = await refreshSession();
-    if ((session?.user.id ?? null) !== owner) throw new NotThisAccount();
+    const session = await api("/api/auth/get-session", { schema: SessionShape });
+    const now = session?.user.id ?? null;
+    if (now !== null && now !== owner) throw new NotThisAccount();
     if (!sameAccount(account) || getKnownUserId() !== owner) throw new NotThisAccount();
   };
   emptyTrash(
