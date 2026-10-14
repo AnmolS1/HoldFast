@@ -242,6 +242,8 @@ describe("A2: a failed next page is not asked for again by a refresh of the list
     await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
     await waitFor(() => expect(rowNames()).toEqual([]));
     late.resolve(json(TRASH));
+    // The late answer has been handled — taken or dropped — once nothing of the trash is in flight.
+    await waitFor(() => expect(queryClient.isFetching({ queryKey: viewKeys.trash })).toBe(0));
     await settle();
     expect(rowNames()).toEqual([]);
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(2);
