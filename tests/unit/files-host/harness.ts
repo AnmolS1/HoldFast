@@ -20,6 +20,7 @@ import {
   type Node,
   type ScanStatus,
 } from "../../../src/worker/db/schema";
+import { statementsSent, type Db } from "../../../src/worker/db/client";
 import { createFilesHost } from "../../../src/worker/files-host";
 import { dayUTC, ipHashDaily } from "../../../src/worker/services/ip-hash";
 import { createKeys } from "../../../src/worker/services/keys";
@@ -97,13 +98,15 @@ const allow = { limit: async () => ({ success: true }) };
 /** How many database clients the requests of this file opened (a refused token must open none). */
 export const opened = { clients: 0 };
 
-function coreFor(options: AskOptions): CoreDeps {
+function coreFor(options: AskOptions, handles: Db[] = []): CoreDeps {
   return {
     ...realCore,
     limits: options.limits,
     createDb: (...args) => {
       opened.clients += 1;
-      return realCore.createDb(...args);
+      const made = realCore.createDb(...args);
+      handles.push(made.db);
+      return made;
     },
     getSettings: async () => ({ ...BASE_SETTINGS, ...options.settings }),
   };
@@ -120,15 +123,27 @@ export async function open(path: string, options: AskOptions = {}) {
   if (options.now) headers.set("x-holdfast-test-now", options.now.toISOString());
   const request = new Request(`${TEST_FILES_ORIGIN}${path}`, { method: options.method ?? "GET", headers });
   const requestEnv = { ...env, RL_FILES: allow, ...options.env } as unknown as Env;
-  const response = await createFilesHost(coreFor(options)).fetch(request, requestEnv, ctx);
-  return { response, ctx };
+  const handles: Db[] = [];
+  const response = await createFilesHost(coreFor(options, handles)).fetch(request, requestEnv, ctx);
+  /** The statements this request has sent so far (its deferred work's too, once settled). */
+  const statements = () => handles.reduce((sum, handle) => sum + statementsSent(handle), 0);
+  return { response, ctx, answered: statements(), statements };
 }
 
-export type Answer = { status: number; headers: Headers; bytes: Uint8Array; text: string };
+export type Answer = {
+  status: number;
+  headers: Headers;
+  bytes: Uint8Array;
+  text: string;
+  /** Statements sent before the response was handed back — what its timing can show. */
+  answered: number;
+  /** Statements sent in all, deferred work included. */
+  statements: number;
+};
 
 /** One request, its body read to the end, and everything it deferred done. */
 export async function ask(path: string, options: AskOptions = {}): Promise<Answer> {
-  const { response, ctx } = await open(path, options);
+  const { response, ctx, answered, statements } = await open(path, options);
   const bytes = new Uint8Array(await response.arrayBuffer());
   await ctx.settle();
   return {
@@ -136,6 +151,8 @@ export async function ask(path: string, options: AskOptions = {}): Promise<Answe
     headers: response.headers,
     bytes,
     text: new TextDecoder().decode(bytes.subarray(0, 512)),
+    answered,
+    statements: statements(),
   };
 }
 

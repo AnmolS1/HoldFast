@@ -33,7 +33,7 @@ import { Hono, type Context } from "hono";
 import { getById as linkById, logAccess } from "./db/queries/links";
 import { accountOf, type ServeAccount } from "./db/queries/files-host";
 import { getNode, partnerSees, touchAccessed } from "./db/queries/nodes";
-import { effectiveHidden, effectiveRole, effectiveTrashed, isDescendantOrSelf } from "./db/queries/tree";
+import { effectiveRole, isDescendantOrSelf, NO_SUCH_OWNER_ID, nodeVisibility } from "./db/queries/tree";
 import { userState, type UserState } from "./db/queries/users";
 import type { Node, ShareLink } from "./db/schema";
 import { rateLimitByIp } from "./middleware/rate-limit";
@@ -118,28 +118,29 @@ const refuse = (gate: string, code: ErrorCode, log?: Refusal["log"]): Refusal =>
 
 const blocked = (state: UserState | null) => state === null || state.banned || state.suspendedAt !== null;
 
-/** Gates 3b–3e: the scan state. A link subject learns nothing but "still being scanned". */
+/**
+ * Gates 3b–3e: the scan state, for a signed-in subject the shared rule (3f) has already let see
+ * the file — its owner, or the partner who uploaded this version. (A link's visitor never gets
+ * here with a file that is not clean: 3f answered first.)
+ */
 function scanGate(node: Node, claims: DownloadClaims, kind: TokenKind): Refusal | "unscanned" | null {
-  const linkLog = claims.st === "l" ? { linkId: claims.sub, outcome: "denied_scan" as const } : undefined;
-  const hidden = (gate: string) =>
-    claims.st === "l" ? refuse(gate, "not_found", linkLog) : refuse(gate, "scan_blocked");
   switch (node.scanStatus) {
     case "clean":
       return null;
     case "suspected_csam":
-      return refuse("3b", "not_found", linkLog);
+      return refuse("3b", "not_found");
     case "pending":
-      return refuse("3c", "scan_pending", linkLog);
+      return refuse("3c", "scan_pending");
     case "infected":
     case "under_review":
-      return hidden("3d");
+      return refuse("3d", "scan_blocked");
     case "skipped":
     case "error":
       // Never scanned: only its owner may take it, and only as a download.
-      if (claims.st === "u" && claims.sub === node.ownerId && kind === "download") return "unscanned";
-      return hidden("3e");
+      if (claims.sub === node.ownerId && kind === "download") return "unscanned";
+      return refuse("3e", "scan_blocked");
     default:
-      return hidden("3d");
+      return refuse("3d", "scan_blocked");
   }
 }
 
@@ -164,41 +165,56 @@ function kindGate(node: Node, kind: TokenKind): Refusal | null {
  * For a link, LINK STATE COMES BEFORE NODE STATE — a paused link to a reported or trashed file
  * answers "paused", as the public API does — so "not in the trash" (part of gate 2 for a user)
  * is answered with the node state, after the link's rows.
+ *
+ * THE SAME WORK FOR EVERY ANSWER. Everything the rows read is read before the first row is
+ * decided, whatever the node turns out to be — and the node's state (trashed, hidden, what the
+ * partner rule needs) comes from the ONE statement `permissions.getAccess` uses for it,
+ * `tree.nodeVisibility`. So a missing file, a replaced version, a trashed one, a taken-down
+ * one, a `suspected_csam` one, one a partner may not see, a removed share and an id that was
+ * never issued cost one number of statements per kind of token: they cannot be told apart by
+ * the time the answer takes. (This host has no session, so it asks the tree queries
+ * `getAccess` is built on with the token's subject instead of calling it.)
  */
 async function gates(c: Ctx, claims: DownloadClaims, kind: TokenKind): Promise<Passed | Refusal> {
   const handle = db(c);
   const found = await getNode(handle, claims.n);
+  const ownerId = found?.ownerId ?? NO_SUCH_OWNER_ID;
 
   // 2 — the node exists, is a file, and is still the version the token was minted for.
-  if (!found || found.kind !== "file" || !found.r2Key || !found.versionId || found.versionId !== claims.ver) {
-    return refuse("2", "not_found");
-  }
-  const node = found as Passed["node"];
-  const ownedBySubject = claims.st === "u" && claims.sub === node.ownerId;
+  const exists = Boolean(
+    found && found.kind === "file" && found.r2Key && found.versionId && found.versionId === claims.ver,
+  );
 
   if (claims.st === "u") {
-    if (await effectiveTrashed(handle, node.id)) return refuse("2", "not_found");
+    const [seen, ownerState, subjectState, role] = await Promise.all([
+      nodeVisibility(handle, claims.n),
+      userState(handle, ownerId),
+      userState(handle, claims.sub),
+      effectiveRole(handle, claims.sub, claims.n),
+    ]);
+    if (!exists) return refuse("2", "not_found");
+    const node = found as Passed["node"];
+    const ownedBySubject = claims.sub === node.ownerId;
+    if (seen.trashed) return refuse("2", "not_found");
     // 3a — taken down, itself or by ANY ancestor (and the lock of 3b): as if it did not exist.
-    if (await effectiveHidden(handle, node.id)) return refuse("3a", "not_found");
+    if (seen.hidden || seen.kind === null || seen.scanStatus === null) return refuse("3a", "not_found");
     // 3f — someone who is not the owner sees a file by id only when it is clean, or when they
     // uploaded this version of it (never one under review): otherwise it is a missing file.
-    if (!ownedBySubject && !partnerSees(node, claims.sub)) return refuse("3f", "not_found");
+    const state = { kind: seen.kind, scanStatus: seen.scanStatus, createdBy: seen.createdBy };
+    if (!ownedBySubject && !partnerSees(state, claims.sub)) return refuse("3f", "not_found");
     const scan = scanGate(node, claims, kind);
     if (scan && scan !== "unscanned") return scan;
 
     // 4a — the owner: suspension and a ban block everyone, the owner included.
-    const ownerState = await userState(handle, node.ownerId);
     if (blocked(ownerState)) return refuse("4a", "forbidden");
     // 4b — inside the deletion window nothing is served to OTHERS; the owner keeps access.
     if (ownerState?.deleteScheduledAt && !ownedBySubject) return refuse("4b", "forbidden");
     // 4c — the subject itself (its own scheduled deletion is no reason to refuse).
-    if (!ownedBySubject && blocked(await userState(handle, claims.sub))) return refuse("4c", "forbidden");
+    if (!ownedBySubject && blocked(subjectState)) return refuse("4c", "forbidden");
     // 4d — still at least a viewer. An avatar's thumbnail is the exception: who may see an
     // avatar is decided where its URL is minted.
     const avatarThumb = node.system === "avatar" && kind === "thumb";
-    if (!avatarThumb && (await effectiveRole(handle, claims.sub, node.id)) === null) {
-      return refuse("4d", "not_found");
-    }
+    if (!avatarThumb && role === null) return refuse("4d", "not_found");
     const policy = kindGate(node, kind);
     if (policy) return policy;
 
@@ -209,16 +225,24 @@ async function gates(c: Ctx, claims: DownloadClaims, kind: TokenKind): Promise<P
   }
 
   // ── a link ──
+  const [ownerState, link] = await Promise.all([userState(handle, ownerId), linkById(handle, claims.sub)]);
+  const enabled = (await settings(c)).linksEnabled;
+  // The link's own root when there is a link; the node itself otherwise — the same statement.
+  const [covered, seen] = await Promise.all([
+    isDescendantOrSelf(handle, claims.n, link?.nodeId ?? claims.n),
+    nodeVisibility(handle, claims.n),
+  ]);
+  if (!exists) return refuse("2", "not_found");
+  const node = found as Passed["node"];
+
   const paused = (gate: string, outcome: LinkOutcome = "denied_paused") =>
     refuse(gate, "link_paused", { linkId: claims.sub, outcome });
   // 4a, 4b — the owner's state. A link is "other people": the deletion window blocks it too.
-  const ownerState = await userState(handle, node.ownerId);
   if (blocked(ownerState)) return paused("4a", "denied_owner");
   if (ownerState?.deleteScheduledAt) return paused("4b", "denied_owner");
   // 4e — the kill switch.
-  if (!(await settings(c)).linksEnabled) return paused("4e");
-  // 4f — the link row, read now.
-  const link = await linkById(handle, claims.sub);
+  if (!enabled) return paused("4e");
+  // 4f — the link row, read in this request.
   if (!link) return refuse("4f", "not_found");
   if (link.revokedAt !== null)
     return refuse("4f", "link_expired", { linkId: link.id, outcome: "denied_expired" });
@@ -233,17 +257,18 @@ async function gates(c: Ctx, claims: DownloadClaims, kind: TokenKind): Promise<P
   // 4i — the link covers the node: it is the link's node or lies under it, and nothing on the
   // way up — the link's own root and what is above it included — is in the trash or taken down.
   // (This is also gate 2's "not in the trash" and gate 3a for a link: the same 404.)
-  if (!(await isDescendantOrSelf(handle, node.id, link.nodeId))) return refuse("4i", "not_found");
-  if (await effectiveTrashed(handle, node.id)) return refuse("2", "not_found");
-  if (await effectiveHidden(handle, node.id)) {
+  if (!covered) return refuse("4i", "not_found");
+  if (seen.trashed) return refuse("2", "not_found");
+  if (seen.hidden || seen.kind === null || seen.scanStatus === null) {
     return refuse("3a", "not_found", { linkId: link.id, outcome: "denied_scan" });
   }
-  // 3f — a link's visitor uploaded nothing: only a clean file exists for them.
-  if (!partnerSees(node, null)) return refuse("3f", "not_found", { linkId: link.id, outcome: "denied_scan" });
+  // 3f — a link's visitor uploaded nothing: only a clean file exists for them. (3b–3e therefore
+  // have nothing left to answer for a link.)
+  const state = { kind: seen.kind, scanStatus: seen.scanStatus, createdBy: seen.createdBy };
+  if (!partnerSees(state, null))
+    return refuse("3f", "not_found", { linkId: link.id, outcome: "denied_scan" });
   // 4j
   if (kind !== "download" && !link.allowPreview) return refuse("4j", "forbidden");
-  const scan = scanGate(node, claims, kind);
-  if (scan && scan !== "unscanned") return scan;
   const policy = kindGate(node, kind);
   if (policy) return policy;
 
@@ -513,7 +538,34 @@ async function ipSubject(c: Ctx): Promise<string> {
   return ipHashDaily(keys(c), c.get("ip"), dayUTC(now(c)));
 }
 
-/** A refusal's row in `link_access_log`, after the response. The response never says why. */
+// The moment each request's response is final (set by the middleware `answeredWhenDone`).
+const answers = new WeakMap<object, { done: Promise<void>; open: () => void }>();
+
+function answeredOf(c: Ctx) {
+  let entry = answers.get(c);
+  if (!entry) {
+    let open!: () => void;
+    const done = new Promise<void>((resolve) => (open = resolve));
+    entry = { done, open };
+    answers.set(c, entry);
+  }
+  return entry;
+}
+
+/** Marks the response final, whatever it is; work that waits for it starts only then. */
+const answeredWhenDone = async (c: Ctx, next: () => Promise<void>) => {
+  try {
+    await next();
+  } finally {
+    answeredOf(c).open();
+  }
+};
+
+/**
+ * A refusal's row in `link_access_log`, written AFTER the response is final — so that a refusal
+ * that is logged takes no more statements before its answer than one that is not (every kind of
+ * 404 must cost the same; see `gates`). The response never says why.
+ */
 function logDenied(c: Ctx, nodeId: string | null, log: NonNullable<Refusal["log"]>): void {
   const country = (c.req.raw as { cf?: { country?: unknown } }).cf?.country;
   const write = async () =>
@@ -527,7 +579,9 @@ function logDenied(c: Ctx, nodeId: string | null, log: NonNullable<Refusal["log"
     });
   defer(
     c,
-    write().catch(() => {}),
+    answeredOf(c)
+      .done.then(write)
+      .catch(() => {}),
   );
 }
 
@@ -789,6 +843,7 @@ export function createFilesHost(core: CoreDeps): Hono<AppEnv> {
   // First: one reading of the path and the method (middleware/canonical.ts).
   app.use("*", canonicalRequest("files"));
   app.use("*", requestContext(core));
+  app.use("*", answeredWhenDone);
   app.use("*", filesHostHeaders);
   app.use("*", rateLimitByIp("RL_FILES"));
 

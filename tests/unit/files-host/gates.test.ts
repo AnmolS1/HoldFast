@@ -440,7 +440,7 @@ describe("gates 4a–4d — the accounts behind a user's token", () => {
       await refused(await urlFor(kind, node, { link }), 423, "link_paused", {}, "link");
       await served(await urlFor(kind, node, { user: owner.id }), {}, "owner");
     }
-    expect((await accessLog(link.id)).every((row) => row.outcome === "denied_owner")).toBe(true);
+    expect((await accessLog(link.id)).map((row) => row.outcome)).toEqual(ROUTES.map(() => "denied_owner"));
   });
 
   it("4c: the subject banned, suspended or gone → 403; its own scheduled deletion is no reason to refuse", async () => {
@@ -769,5 +769,149 @@ describe("gate 6 — what a kind of URL may serve, by the DETECTED type alone", 
     const { owner, node } = await types("text/html", "page.html");
     await refused(await urlFor("inline", node, { user: owner.id }), 403, "forbidden");
     expect(await ledgerRow("user", owner.id)).toBeNull();
+  });
+});
+
+describe("every kind of 404 costs one number of statements", () => {
+  /** A token for a node id that was never issued: the answer every other 404 must equal. */
+  const ghostUrl = async (kind: TokenKind, subject: Subject) => {
+    const ghost = crypto.randomUUID();
+    return urlFor(kind, { id: ghost, versionId: crypto.randomUUID() }, subject);
+  };
+
+  it("a signed-in token: missing, replaced, trashed (itself, by a folder), taken down (itself, by a folder), suspected_csam, every state a partner may not see, a removed share and a stranger — the same bytes, headers and statements", async () => {
+    const owner = await makeAccount();
+    const partner = await makeAccount();
+    const stranger = await makeAccount();
+    const folder = await makeFolder(owner.id);
+    const share = await makeShare(folder.id, owner.id, partner.id);
+    const file = async (set: Parameters<typeof storedFile>[1] = {}) =>
+      (
+        await storedFile(owner.id, {
+          parentId: folder.id,
+          mime: "image/png",
+          name: `p-${crypto.randomUUID()}.png`,
+          ...set,
+        })
+      ).node;
+    const trashedFolder = await makeFolder(owner.id, folder.id);
+    const downFolder = await makeFolder(owner.id, folder.id);
+    const inTrash = await file({ parentId: trashedFolder.id });
+    const inDown = await file({ parentId: downFolder.id });
+    await updateNode(trashedFolder.id, { deletedAt: new Date() });
+    await updateNode(downFolder.id, { takedownAt: new Date(), takedownReason: "dmca" });
+    const trashed = await file({ node: { deletedAt: new Date() } });
+    const takenDown = await file({ node: { takedownAt: new Date(), takedownReason: "admin" } });
+    const csam = await file({ scanStatus: "suspected_csam" });
+    const unseen = await Promise.all(
+      (["pending", "infected", "under_review", "skipped", "error"] as const).map((scanStatus) =>
+        file({ scanStatus }),
+      ),
+    );
+    const clean = await file();
+    const unshared = await file();
+
+    for (const kind of ROUTES) {
+      const missing = await ask(await ghostUrl(kind, { user: partner.id }), withImages());
+      expect(missing.status).toBe(404);
+      // Something was counted: the node, its state, two accounts and the role.
+      expect(missing.answered).toBeGreaterThanOrEqual(5);
+      const cases: Array<[string, string]> = [
+        ["a stranger's made-up id", await ghostUrl(kind, { user: stranger.id })],
+        ["the owner's made-up id", await ghostUrl(kind, { user: owner.id })],
+        [
+          "a replaced version",
+          await urlFor(kind, { id: clean.id, versionId: crypto.randomUUID() }, { user: partner.id }),
+        ],
+        ["trashed", await urlFor(kind, trashed, { user: partner.id })],
+        ["trashed (owner)", await urlFor(kind, trashed, { user: owner.id })],
+        ["in a trashed folder", await urlFor(kind, inTrash, { user: partner.id })],
+        ["taken down", await urlFor(kind, takenDown, { user: partner.id })],
+        ["taken down (owner)", await urlFor(kind, takenDown, { user: owner.id })],
+        ["in a taken-down folder", await urlFor(kind, inDown, { user: partner.id })],
+        ["suspected_csam", await urlFor(kind, csam, { user: partner.id })],
+        ...unseen.map((node): [string, string] => [`partner, ${node.scanStatus}`, ""]),
+        ["a stranger's real id", await urlFor(kind, clean, { user: stranger.id })],
+      ];
+      for (const [i, node] of unseen.entries()) {
+        cases[cases.length - 1 - unseen.length + i]![1] = await urlFor(kind, node, { user: partner.id });
+      }
+      for (const [label, url] of cases) {
+        const answer = await ask(url, withImages());
+        expect(answer.status, `${kind} ${label}`).toBe(404);
+        expect(answer.bytes, label).toEqual(missing.bytes);
+        expect([...answer.headers].sort(), label).toEqual([...missing.headers].sort());
+        expect({ label, answered: answer.answered, statements: answer.statements }).toEqual({
+          label,
+          answered: missing.answered,
+          statements: missing.statements,
+        });
+      }
+      // A share removed after the mint: the same.
+      const url = await urlFor(kind, unshared, { user: partner.id });
+      await testDb().delete(shares).where(eq(shares.id, share.id));
+      const removed = await ask(url, withImages());
+      expect(removed.status).toBe(404);
+      expect(removed.bytes).toEqual(missing.bytes);
+      expect({ answered: removed.answered, statements: removed.statements }).toEqual({
+        answered: missing.answered,
+        statements: missing.statements,
+      });
+      await makeShare(folder.id, owner.id, partner.id).then((made) => Object.assign(share, made));
+    }
+  });
+
+  it("a link token: a missing node, a replaced version, outside the subtree, no such link, trashed (itself, by a folder), taken down (itself, by a folder), suspected_csam and every state that is not clean — the same bytes, headers and statements before the answer", async () => {
+    const owner = await makeAccount();
+    const root = await makeFolder(owner.id);
+    const link = await linkOn(root.id, owner.id);
+    const file = async (set: Parameters<typeof storedFile>[1] = {}) =>
+      (
+        await storedFile(owner.id, {
+          parentId: root.id,
+          mime: "image/png",
+          name: `p-${crypto.randomUUID()}.png`,
+          ...set,
+        })
+      ).node;
+    const trashedFolder = await makeFolder(owner.id, root.id);
+    const downFolder = await makeFolder(owner.id, root.id);
+    const inTrash = await file({ parentId: trashedFolder.id });
+    const inDown = await file({ parentId: downFolder.id });
+    await updateNode(trashedFolder.id, { deletedAt: new Date() });
+    await updateNode(downFolder.id, { takedownAt: new Date(), takedownReason: "dmca" });
+    const outside = (await storedFile(owner.id, { mime: "image/png" })).node;
+    const clean = await file();
+    const states = ["pending", "infected", "under_review", "skipped", "error", "suspected_csam"] as const;
+    const unseen = await Promise.all(states.map((scanStatus) => file({ scanStatus })));
+    const trashed = await file({ node: { deletedAt: new Date() } });
+    const takenDown = await file({ node: { takedownAt: new Date(), takedownReason: "admin" } });
+    const noLink = { link: { id: crypto.randomUUID(), passwordHash: null } };
+
+    for (const kind of ROUTES) {
+      const missing = await ask(await ghostUrl(kind, { link }), withImages());
+      expect(missing.status).toBe(404);
+      expect(missing.answered).toBeGreaterThanOrEqual(4);
+      const cases: Array<[string, string]> = [
+        [
+          "a replaced version",
+          await urlFor(kind, { id: clean.id, versionId: crypto.randomUUID() }, { link }),
+        ],
+        ["outside the subtree", await urlFor(kind, outside, { link })],
+        ["no such link", await urlFor(kind, clean, noLink)],
+        ["trashed", await urlFor(kind, trashed, { link })],
+        ["in a trashed folder", await urlFor(kind, inTrash, { link })],
+        ["taken down", await urlFor(kind, takenDown, { link })],
+        ["in a taken-down folder", await urlFor(kind, inDown, { link })],
+      ];
+      for (const node of unseen) cases.push([node.scanStatus, await urlFor(kind, node, { link })]);
+      for (const [label, url] of cases) {
+        const answer = await ask(url, withImages());
+        expect(answer.status, `${kind} ${label}`).toBe(404);
+        expect(answer.bytes, label).toEqual(missing.bytes);
+        expect([...answer.headers].sort(), label).toEqual([...missing.headers].sort());
+        expect({ label, answered: answer.answered }).toEqual({ label, answered: missing.answered });
+      }
+    }
   });
 });
