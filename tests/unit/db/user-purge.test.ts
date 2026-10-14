@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
@@ -17,7 +18,7 @@ import {
   schedule,
 } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
-import { nodes, pendingUserPurges, uploads, user } from "../../../src/worker/db/schema";
+import { hashBlocklist, nodes, pendingUserPurges, uploads, user } from "../../../src/worker/db/schema";
 import {
   baId,
   makeFile,
@@ -334,5 +335,47 @@ describe("hard delete of a user", () => {
     expect(await used(heldOwner)).toBe(0);
     await db.delete(user).where(eq(user.id, leaving));
     expect(await userState(db, leaving)).toBeNull();
+  });
+  // H2 K extension: a `completing` session whose declared hash is on the blocklist owes a locked
+  // node for verified bytes (the uploads route's "csam node owed" state, repaired later by a
+  // sweep). The account purge must not take its row or its object.
+  it("uploads.deleteForUser keeps a completing session whose expected hash is blocklisted: no key to abort, row kept, the user row waits", async () => {
+    const leaving = await makeUser(db, { quotaBytes: 100_000, usedBytes: 300 });
+    const editor = await makeUser(db);
+    const listed = randomBytes(32).toString("hex");
+    await db.insert(hashBlocklist).values({ sha256: listed, reason: "csam" });
+    const owed = [
+      // Into the leaving user's folder, by an editor; and the leaving user's own.
+      await makeUpload(db, leaving, editor, { status: "completing", expectedSha256: listed, size: 200 }),
+      await makeUpload(db, leaving, leaving, { status: "completing", expectedSha256: listed, size: 100 }),
+    ];
+    // The controls, same call: completing with an unlisted hash, and an OPEN session with the listed one.
+    const gone = [
+      await makeUpload(db, leaving, editor, {
+        status: "completing",
+        expectedSha256: randomBytes(32).toString("hex"),
+        r2UploadId: "mpu-unlisted",
+      }),
+      await makeUpload(db, leaving, editor, {
+        status: "open",
+        expectedSha256: listed,
+        r2UploadId: "mpu-open",
+      }),
+    ];
+    const present = async (id: string) =>
+      (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+
+    const toAbort = await deleteForUser(db, leaving);
+    expect(toAbort.map((u) => u.r2UploadId).sort()).toEqual(["mpu-open", "mpu-unlisted"]);
+    for (const session of owed) {
+      expect(toAbort.map((u) => u.r2Key)).not.toContain(session.r2Key);
+      expect(await db.select().from(uploads).where(eq(uploads.id, session.id))).toMatchObject([
+        { status: "completing", expectedSha256: listed },
+      ]);
+    }
+    for (const session of gone) expect(await present(session.id)).toBe(false);
+    // The rows reference the user (NOT NULL, RESTRICT): it cannot be deleted, and the job can tell.
+    expect(await remainingForUser(db, leaving)).toBe(2);
+    await expect(db.delete(user).where(eq(user.id, leaving))).rejects.toThrow();
   });
 });
