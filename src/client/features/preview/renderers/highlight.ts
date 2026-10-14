@@ -6,7 +6,8 @@
 //   - one line at a time, each given at most `HIGHLIGHT_LINE_TIME_MS` by the grammar (what is
 //     left of a line after that stays plain);
 //   - after `HIGHLIGHT_SLICE_MS` of work the run yields to the page — a click on Close is handled
-//     before the next line — and looks at its signal: an aborted run ends there;
+//     before the next line — and looks at its signal: an aborted run ends there. A stretch of
+//     work is that slice plus the line in progress (`HIGHLIGHT_TASK_BOUND_MS`, measured);
 //   - the whole run gets `HIGHLIGHT_TOTAL_MS` of work and `TEXT_MAX_PIECES` pieces; past either
 //     the text simply stays plain.
 // The grammar's state is carried from line to line from the tokens themselves (nothing is
@@ -33,8 +34,17 @@ export const HIGHLIGHT_MAX_LINE_LENGTH = 2_000;
 export const HIGHLIGHT_LINE_TIME_MS = 8;
 /** Goes at one line (each within the limit, a yield in between) before it keeps what it has. */
 export const HIGHLIGHT_LINE_ATTEMPTS = 4;
-/** Work done between two yields to the page: under one frame, with the line limit on top. */
+/** Work done before the run yields to the page (checked between lines). */
 export const HIGHLIGHT_SLICE_MS = 8;
+/**
+ * What one stretch of work between two yields is held to, MEASURED, not derived: a slice plus
+ * the line in progress. The grammar checks `HIGHLIGHT_LINE_TIME_MS` only between its scans, and
+ * one scan of a line cannot be interrupted — 2,000-character Vue lines (`<a :b="{` repeated) take
+ * ~37–44 ms per stretch on every run, other grammars 10–35 ms (jsdom, load average 11–20,
+ * 2026-10-13); a grammar's first use adds its compilation once (~100 ms). Under the 50 ms long-task line in the
+ * worst case measured; a rule that backtracks worse on a crafted line could exceed it.
+ */
+export const HIGHLIGHT_TASK_BOUND_MS = 60;
 /** Work the whole run may take; past it the text stays plain. */
 export const HIGHLIGHT_TOTAL_MS = 2_000;
 

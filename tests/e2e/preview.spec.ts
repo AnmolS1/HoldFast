@@ -310,25 +310,36 @@ test.describe("previews (mocked API and files host)", () => {
     expectClean(arranged);
   });
 
-  test("a crafted file inside every size bound: highlighting never holds the page, and Escape answers at once", async ({
+  test("a crafted file inside every size bound: highlighting never holds the page, and Escape DURING the run answers at once", async ({
     page,
     origins,
   }) => {
-    // 200 lines of 999 characters that a grammar cuts into ~200,000 pieces: this took one
-    // uninterruptible 13 s on the main thread before highlighting was bounded in time.
-    const body = Buffer.from(`${"a<".repeat(499)}\n`.repeat(200));
+    // 200 lines of 999 characters that the TypeScript grammar works on until the run's 2 s budget
+    // is spent: before highlighting was bounded in time, such a file held the main thread for
+    // seconds in one uninterruptible task.
+    const body = Buffer.from(`${"(".repeat(999)}\n`.repeat(200));
     const crafted = nodeOf({ ...NODES.ts, size: body.length });
     await page.addInitScript(() => {
-      const probe = window as unknown as { __long: Array<[number, number]>; __keyDelay: number[] };
+      const probe = window as unknown as {
+        __long: Array<[number, number]>;
+        __keyDelay: number[];
+        __keyPhase: Array<string | null>;
+      };
       probe.__long = [];
       probe.__keyDelay = [];
+      probe.__keyPhase = [];
       new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) probe.__long.push([entry.startTime, entry.duration]);
       }).observe({ entryTypes: ["longtask"] });
-      // How long a key press waited before any handler ran.
+      // How long a key press waited before any handler ran, and whether highlighting was running.
       document.addEventListener(
         "keydown",
-        (event) => probe.__keyDelay.push(performance.now() - event.timeStamp),
+        (event) => {
+          probe.__keyDelay.push(performance.now() - event.timeStamp);
+          probe.__keyPhase.push(
+            document.querySelector('[data-preview-renderer="text"]')?.getAttribute("data-highlight") ?? null,
+          );
+        },
         true,
       );
     });
@@ -346,29 +357,29 @@ test.describe("previews (mocked API and files host)", () => {
     await open(page, ID.ts);
     const text = renderer(page, "text");
     await expect(text.locator("[data-line]")).toHaveCount(200);
+    await expect(text).toHaveAttribute("data-highlight", "running");
     const shownAt = await page.evaluate(() => performance.now());
-    // The run ends by itself — here by passing the piece cap — and the text stays plain.
-    await expect(text).toHaveAttribute("data-highlight", "plain");
-    await expect(text).toHaveAttribute("data-highlighted", "false");
-    const longest = await page.evaluate(
-      (from) =>
-        Math.max(
-          0,
-          ...(window as unknown as { __long: Array<[number, number]> }).__long
-            .filter(([start]) => start >= from)
-            .map(([, duration]) => duration),
-        ),
-      shownAt,
-    );
-    // A slice is 8 ms of work plus at most one line's 8 ms; 200 ms leaves room for a loaded machine.
-    expect(longest).toBeLessThan(200);
-
+    // Let it work for a while, then press Escape in the middle of the run.
+    await page.waitForTimeout(300);
     await page.keyboard.press("Escape");
     await expect(dialog(page)).toHaveCount(0);
-    const delays = await page.evaluate(() => (window as unknown as { __keyDelay: number[] }).__keyDelay);
-    expect(delays.length).toBeGreaterThan(0);
-    // Within a frame or two of being pressed (it was seconds).
-    expect(Math.max(...delays)).toBeLessThan(50);
+    const probe = await page.evaluate(() => {
+      const own = window as unknown as {
+        __long: Array<[number, number]>;
+        __keyDelay: number[];
+        __keyPhase: Array<string | null>;
+      };
+      return { long: own.__long, delays: own.__keyDelay, phases: own.__keyPhase };
+    });
+    // The key arrived while the run was still going.
+    expect(probe.phases).toContain("running");
+    // Handled within a few frames of being pressed (it was seconds): it waits at most for the
+    // stretch of work in progress.
+    expect(Math.max(...probe.delays)).toBeLessThan(100);
+    // A stretch is a slice plus one uninterruptible scan of one line (~44 ms at worst, measured;
+    // HIGHLIGHT_TASK_BOUND_MS); 150 ms leaves room for a loaded machine.
+    const longest = Math.max(0, ...probe.long.filter(([start]) => start >= shownAt).map(([, ms]) => ms));
+    expect(longest).toBeLessThan(150);
     expectClean(arranged);
   });
 
