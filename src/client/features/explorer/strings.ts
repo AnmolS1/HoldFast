@@ -167,6 +167,12 @@ export const messages = {
     "The zip is saved, but {count} files are missing from it: {list}. Download them one by one.",
   "explorer.zip.busy": "Another zip is still being made. Wait for it to finish.",
   "explorer.zip.limited": "The download limit was reached, so the zip was stopped. Try again later.",
+  "explorer.zip.limitedShort.one":
+    "The download limit was reached, so the zip was saved without 1 file: {list}. Download it later.",
+  "explorer.zip.limitedShort.many":
+    "The download limit was reached, so the zip was saved without {count} files: {list}. Download them later.",
+  "explorer.zip.savedShort.one": "Zip saved with 1 file missing.",
+  "explorer.zip.savedShort.many": "Zip saved with {count} files missing.",
   "explorer.zip.emptyFile": "An empty file may be left where you chose to save it.",
 } as const;
 

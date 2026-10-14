@@ -319,6 +319,45 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     expect(archive.toString("latin1")).toContain("holdfast e2e bytes");
   });
 
+  test("M7: a 429 from the files host — another origin — whose Retry-After the page cannot read stops the zip after three tries", async ({
+    page,
+    origins,
+  }) => {
+    mockedOnly();
+    test.skip(isMobile(page), "desktop menus");
+    await page.addInitScript(() => {
+      delete (window as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    });
+    // The zip's waits are stepped over, not waited for.
+    await page.clock.install();
+    const fake = await serve(page, origins.port, drive());
+    // day-2.jpg is refused with a daily ceiling's answer — as the files host sends it today:
+    // `Retry-After` present, but not in `Access-Control-Expose-Headers`, so the page cannot see it.
+    let refused = 0;
+    await page.context().route(`${fake.filesOrigin}/d/${fileNode(5).id}/**`, (route) => {
+      refused += 1;
+      return route.fulfill({
+        status: 429,
+        headers: { "retry-after": "3600", "access-control-allow-origin": "*", "content-type": "text/plain" },
+        body: "Daily download limit reached.",
+      });
+    });
+    await openExplorer(page);
+    const download = page.waitForEvent("download");
+    await menuAction(page, row(page, "Trip"), "Download as zip");
+    await expect.poll(() => refused).toBe(1);
+    await page.clock.runFor(15_000);
+    await expect.poll(() => refused).toBe(2);
+    await page.clock.runFor(45_000);
+    const saved = await download;
+    expect(saved.suggestedFilename()).toBe("Trip.zip");
+    await expect(toastText(page)).toContainText(
+      "The download limit was reached, so the zip was saved without 1 file: Trip/day-2.jpg. Download it later.",
+    );
+    // Three tries, then the stop — had the header been readable it would have been one.
+    expect(refused).toBe(3);
+  });
+
   test("details of a file; Re-check sends it back to scanning; share is a disabled stub", async ({
     page,
     origins,

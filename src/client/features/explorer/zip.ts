@@ -27,10 +27,23 @@ const PUBLISH_EVERY_MS = 200;
 export const ZIP_MANIFEST_ROOTS = 100;
 /** Tries for one file when the files host fails (`5xx`) or the network drops: the first and two more. */
 export const ZIP_FETCH_ATTEMPTS = 3;
-/** Waits for one file on `429`, each as long as `Retry-After` says — up to ZIP_RATE_WAIT_MAX_MS. */
+/** Waits for a window of URLs on the API's own `429` (same origin: its `Retry-After` is readable). */
 export const ZIP_RATE_WAITS = 5;
 /** A `Retry-After` longer than this is a daily ceiling, not a busy minute: the zip stops. */
 export const ZIP_RATE_WAIT_MAX_MS = 60_000;
+/**
+ * The files host's `429`. It is another origin: unless it lists `Retry-After` in
+ * `Access-Control-Expose-Headers` the page cannot read it, and its per-address limiter sends none
+ * at all — so the header is used when it can be read and never relied on. One file is asked for
+ * at most ZIP_RATE_TRIES times; a `429` on the last try stops the WHOLE zip (every later file
+ * would be refused too), and the archive is saved with what it already holds, the rest named.
+ */
+export const ZIP_RATE_TRIES = 3;
+/**
+ * The waits between those tries when no `Retry-After` can be read: together a full minute, the
+ * period of the files host's per-address limiter, so a busy minute has passed before giving up.
+ */
+export const ZIP_RATE_BACKOFF_MS = [15_000, 45_000] as const;
 /** How long a finished zip stays on the ribbon. */
 const DONE_LINGER_MS = 4_000;
 
@@ -141,7 +154,7 @@ function saveFilePicker(): SaveFilePicker | null {
 // By name: an abort raised by a stream or by `fetch` is not always the page's own DOMException class.
 const isAbort = (cause: unknown) => (cause as { name?: unknown } | null)?.name === "AbortError";
 
-/** Why a zip stopped short of an archive, when it is not a plain failure. */
+/** Why a zip stopped short of a complete archive, when it is not a plain failure. */
 class ZipStop extends Error {
   constructor(readonly outcome: "too_large" | "limited") {
     super(outcome);
@@ -213,6 +226,13 @@ export function missingSentence(missing: string[]): string {
     : t("explorer.zip.missing.many", { count: missing.length, list: named(missing) });
 }
 
+/** "The download limit was reached, so the zip was saved without 38 files: …". */
+export function limitedSentence(missing: string[]): string {
+  return missing.length === 1
+    ? t("explorer.zip.limitedShort.one", { list: named(missing) })
+    : t("explorer.zip.limitedShort.many", { count: missing.length, list: named(missing) });
+}
+
 /** Every manifest of a selection, asked for ZIP_MANIFEST_ROOTS roots at a time and merged. */
 async function readManifest(nodeIds: readonly string[], signal: AbortSignal): Promise<ZipManifest> {
   const merged: ZipManifest = { entries: [], totalBytes: 0, skipped: [], truncated: false };
@@ -250,7 +270,12 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
   const finish = (outcome: ZipOutcome, message: string | null, requestId?: string): ZipResult => {
     result.outcome = outcome;
     if (message !== null && mine()) {
-      const complete = outcome === "saved" || outcome === "partial" || outcome === "empty";
+      // An archive was saved (a limited one too, when it holds what came before the limit).
+      const complete =
+        outcome === "saved" ||
+        outcome === "partial" ||
+        outcome === "empty" ||
+        (outcome === "limited" && result.missing.length > 0);
       const parts = [
         message,
         complete ? leftOutSentence(result.leftOut) : null,
@@ -384,7 +409,7 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
     const open = async (entry: ZipEntry): Promise<Response | null> => {
       let url = urls.get(entry.nodeId) ?? (await remint(entry.nodeId));
       let failures = 0;
-      let waits = 0;
+      let refusals = 0;
       while (url) {
         let response: Response;
         try {
@@ -403,12 +428,15 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
           // the status is all there is to go by (PLAN §10): mint once more, fetch once more.
           url = await remint(entry.nodeId);
         } else if (response.status === 429) {
-          const header = Number(response.headers.get("retry-after"));
-          const wait = Number.isFinite(header) && header > 0 ? header * 1000 : 5000;
-          // A wait of more than a minute is a daily ceiling: every later file would be refused too.
-          if (wait > ZIP_RATE_WAIT_MAX_MS) throw new ZipStop("limited");
-          waits += 1;
-          if (waits > ZIP_RATE_WAITS) return null;
+          refusals += 1;
+          const header = response.headers.get("retry-after");
+          const seconds = header === null ? Number.NaN : Number(header);
+          const wait =
+            Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : ZIP_RATE_BACKOFF_MS[refusals - 1];
+          // A wait of more than a minute is a daily ceiling, and a refusal that outlasts every try
+          // is one this zip cannot wait out: every later file would be refused too.
+          if (wait === undefined || wait > ZIP_RATE_WAIT_MAX_MS || refusals >= ZIP_RATE_TRIES)
+            throw new ZipStop("limited");
           await sleep(wait, signal);
         } else if (response.status >= 500) {
           failures += 1;
@@ -420,16 +448,30 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
     };
 
     const names = new Set<string>();
+    let added = 0;
+    let limited = false;
     async function* files() {
       for (let index = 0; index < manifest.entries.length; index += 1) {
         signal.throwIfAborted();
         const entry = manifest.entries[index]!;
-        // Lazily: the next window is asked for only when the stream reaches it.
-        if (index % ZIP_URL_BATCH === 0) {
-          await mint(manifest.entries.slice(index, index + ZIP_URL_BATCH).map((item) => item.nodeId));
-        }
         const name = uniqueZipPath(safeZipPath(entry.path), names);
-        const response = await open(entry);
+        let response: Response | null;
+        try {
+          // Lazily: the next window is asked for only when the stream reaches it.
+          if (index % ZIP_URL_BATCH === 0) {
+            await mint(manifest.entries.slice(index, index + ZIP_URL_BATCH).map((item) => item.nodeId));
+          }
+          response = await open(entry);
+        } catch (cause) {
+          // Stopped by a limit: nothing more is asked for. With nothing in it yet there is no
+          // archive to save; otherwise it ends here, and this file and every later one are named.
+          if (!(cause instanceof ZipStop) || cause.outcome !== "limited" || added === 0) throw cause;
+          limited = true;
+          result.missing.push(name);
+          for (const rest of manifest.entries.slice(index + 1))
+            result.missing.push(uniqueZipPath(safeZipPath(rest.path), names));
+          return;
+        }
         fileIndex = index + 1;
         if (!response?.body) {
           result.missing.push(name);
@@ -437,6 +479,7 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
           continue;
         }
         report(true);
+        added += 1;
         const counted = response.body.pipeThrough(
           new TransformStream<Uint8Array, Uint8Array>({
             transform(chunk, controller) {
@@ -465,11 +508,20 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
       if (!mine()) return finish("cancelled", null);
       saveBlob(blob, fileName);
     }
+    // The ribbon's live region says what the toast says: never "saved" alone for an incomplete archive.
+    const short = result.missing.length;
     if (mine()) {
-      publish(sourceId, { progress: 1, sentence: t("explorer.zip.saved"), status: "done" });
+      const sentence =
+        short === 0
+          ? t("explorer.zip.saved")
+          : short === 1
+            ? t("explorer.zip.savedShort.one")
+            : t("explorer.zip.savedShort.many", { count: short });
+      publish(sourceId, { progress: 1, sentence, status: "done" });
       setTimeout(() => publish(sourceId, null), DONE_LINGER_MS);
     }
-    return result.missing.length > 0
+    if (limited) return finish("limited", limitedSentence(result.missing));
+    return short > 0
       ? finish("partial", missingSentence(result.missing))
       : finish("saved", t("explorer.zip.saved"));
   } catch (cause) {

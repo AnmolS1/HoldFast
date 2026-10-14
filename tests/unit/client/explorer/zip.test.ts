@@ -2,6 +2,7 @@
 // node, the two sinks, what was left out, and progress on the transfer ribbon.
 import { describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
+import { publish } from "../../../../src/client/components/TransferRibbon";
 import { getRibbonSnapshot, subscribeRibbon } from "../../../../src/client/components/TransferRibbon/store";
 import {
   cancelZip,
@@ -15,8 +16,9 @@ import {
   ZIP_FETCH_ATTEMPTS,
   ZIP_LIMITS,
   ZIP_MANIFEST_ROOTS,
+  ZIP_RATE_BACKOFF_MS,
+  ZIP_RATE_TRIES,
   ZIP_RATE_WAIT_MAX_MS,
-  ZIP_RATE_WAITS,
 } from "../../../../src/client/features/explorer/zip";
 import { purgeUserState } from "../../../../src/client/lib/query";
 import { TOKEN_TTL, ZIP_URL_BATCH } from "../../../../src/shared/constants";
@@ -27,6 +29,15 @@ import { fileNode, folderNode, manifestOf } from "./fixtures/nodes";
 import { deferred, serveDrive, setupExplorer, toastMessages } from "./helpers";
 
 setupExplorer();
+
+// The zip's ribbon states as published — a finished source is no longer the ribbon's `current`,
+// so its last sentence is read here.
+vi.mock("../../../../src/client/components/TransferRibbon", async (original) => {
+  const real = await original<typeof import("../../../../src/client/components/TransferRibbon")>();
+  return { ...real, publish: vi.fn(real.publish) };
+});
+const doneSentences = () =>
+  vi.mocked(publish).mock.calls.flatMap(([, state]) => (state?.status === "done" ? [state.sentence] : []));
 
 const FOLDER = folderNode(1, { name: "Trip" });
 const filesIn = (count: number, patch: (n: number) => Partial<NodeDto> = () => ({})) =>
@@ -473,25 +484,33 @@ describe("M1 — a file the files host does not give is never dropped in silence
     ]);
   });
 
-  it("a 429 that never lifts is bounded: a few waits for that file, then it is missing — never an endless loop", async () => {
+  it(`a 429 that never lifts is bounded: ${ZIP_RATE_TRIES} tries of that file, then the WHOLE zip stops — saved with what it holds, the rest named`, async () => {
     const waits = noWaiting();
-    const files = filesIn(2);
+    const files = filesIn(10);
     const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
       if (!isFile(call)) return undefined;
-      return idOfFile(call) === files[0]!.id
+      return idOfFile(call) === files[1]!.id
         ? new Response("Too many requests.", { status: 429, headers: { "retry-after": "2" } })
-        : bytes("ok");
+        : bytes(`bytes-of-${idOfFile(call)}`);
     });
-    captureBlob();
+    const { saved } = captureBlob();
     const result = await startZip([FOLDER.id], "Trip");
-    expect(waits).toHaveLength(ZIP_RATE_WAITS);
-    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[0]!.id)).toHaveLength(
-      ZIP_RATE_WAITS + 1,
+    expect(waits).toEqual([2_000, 2_000]);
+    expect(calls.filter((call) => isFile(call) && idOfFile(call) === files[1]!.id)).toHaveLength(
+      ZIP_RATE_TRIES,
     );
-    expect(result).toMatchObject({ outcome: "partial", missing: ["Trip/photo-001.jpg"] });
+    // Nothing after the stop is asked for.
+    expect(calls.filter(isFile)).toHaveLength(1 + ZIP_RATE_TRIES);
+    expect(result.outcome).toBe("limited");
+    expect(result.missing).toEqual(files.slice(1).map((file) => `Trip/${file.name}`));
+    expect(saved).toHaveLength(1);
+    expect(await text(saved[0]!.blob)).toContain(`bytes-of-${files[0]!.id}`);
+    expect(toastMessages()).toEqual([
+      "The download limit was reached, so the zip was saved without 9 files: Trip/photo-002.jpg, Trip/photo-003.jpg, Trip/photo-004.jpg and 6 more. Download them later.",
+    ]);
   });
 
-  it("a daily ceiling (Retry-After beyond a minute) stops the zip at once: no archive, and not one request per remaining file", async () => {
+  it("a daily ceiling (Retry-After beyond a minute) stops the zip at once: not one more request; the archive holds what came before", async () => {
     const waits = noWaiting();
     const files = filesIn(40);
     const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
@@ -506,12 +525,94 @@ describe("M1 — a file the files host does not give is never dropped in silence
     expect(result.outcome).toBe("limited");
     expect(waits).toEqual([]);
     expect(calls.filter(isFile)).toHaveLength(3);
+    expect(result.missing).toHaveLength(38);
+    expect(saved).toHaveLength(1);
+    expect(toastMessages()[0]).toMatch(
+      /^The download limit was reached, so the zip was saved without 38 files: /,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review, fix pass 2 (M7): the files host is another origin. Its `Retry-After` cannot be read
+// unless it is exposed, and its per-address limiter sends none: a `429` without a readable header
+// is what a browser sees. (A same-realm `Response` exposes every header; these leave it out.)
+
+describe("M7 — a 429 from the files host whose Retry-After cannot be read", () => {
+  const refused = () => new Response("Too many requests.", { status: 429 });
+
+  it(`the zip's own back-off: ${ZIP_RATE_BACKOFF_MS.join(" ms, then ")} ms — a full minute — and the file is in the archive when it lifts`, async () => {
+    const waits = noWaiting();
+    const files = filesIn(3);
+    let left = 2;
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      if (idOfFile(call) === files[1]!.id && left-- > 0) return refused();
+      return bytes(`bytes-of-${idOfFile(call)}`);
+    });
+    const { saved } = captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(ZIP_RATE_BACKOFF_MS.reduce((sum, ms) => sum + ms, 0)).toBeGreaterThanOrEqual(60_000);
+    expect(waits).toEqual([...ZIP_RATE_BACKOFF_MS]);
+    expect(result).toMatchObject({ outcome: "saved", missing: [] });
+    expect(calls.filter(isFile)).toHaveLength(3 + 2);
+    expect(await text(saved[0]!.blob)).toContain(`bytes-of-${files[1]!.id}`);
+  });
+
+  it(`persisting: ${ZIP_RATE_TRIES} requests in all, then the zip stops — not ${ZIP_RATE_TRIES} per remaining file`, async () => {
+    const waits = noWaiting();
+    const files = filesIn(40);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      return idOfFile(call) === files[0]!.id || idOfFile(call) === files[1]!.id ? bytes("ok") : refused();
+    });
+    const { saved } = captureBlob();
+    vi.mocked(publish).mockClear();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(calls.filter(isFile)).toHaveLength(2 + ZIP_RATE_TRIES);
+    expect(waits).toEqual([...ZIP_RATE_BACKOFF_MS]);
+    expect(result.outcome).toBe("limited");
+    expect(result.missing).toEqual(files.slice(2).map((file) => `Trip/${file.name}`));
+    expect(saved).toHaveLength(1);
+    // The ribbon's live region does not call it saved and leave it there (m18).
+    expect(doneSentences()).toEqual(["Zip saved with 38 files missing."]);
+  });
+
+  it("refused from the first file on: no archive, one toast, three requests", async () => {
+    const waits = noWaiting();
+    const files = filesIn(10);
+    const calls = serveDrive(new FakeDrive([FOLDER, ...files]), (call) =>
+      isFile(call) ? refused() : undefined,
+    );
+    const { saved } = captureBlob();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(calls.filter(isFile)).toHaveLength(ZIP_RATE_TRIES);
+    expect(waits).toEqual([...ZIP_RATE_BACKOFF_MS]);
+    expect(result.outcome).toBe("limited");
     expect(saved).toHaveLength(0);
     expect(toastMessages()).toEqual([
       "The download limit was reached, so the zip was stopped. Try again later.",
     ]);
   });
+});
 
+describe('m18 — the ribbon never says only "Zip saved." of an incomplete archive', () => {
+  it("a file the files host would not give: the ribbon's last sentence names the shortfall", async () => {
+    noWaiting();
+    const files = filesIn(3);
+    serveDrive(new FakeDrive([FOLDER, ...files]), (call) => {
+      if (!isFile(call)) return undefined;
+      return idOfFile(call) === files[0]!.id ? new Response("Bad gateway.", { status: 502 }) : bytes("ok");
+    });
+    captureBlob();
+    vi.mocked(publish).mockClear();
+    const result = await startZip([FOLDER.id], "Trip");
+    expect(result.outcome).toBe("partial");
+    expect(doneSentences()).toEqual(["Zip saved with 1 file missing."]);
+  });
+});
+
+describe("M1 (continued)", () => {
   it("the API's own limiter on a window of URLs is waited out too", async () => {
     const waits = noWaiting();
     const files = filesIn(2);
