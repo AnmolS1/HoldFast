@@ -176,9 +176,10 @@ function focusRow(id?: string | null): void {
 }
 
 /**
- * The row above the list has one height, from the layout tokens, whatever is in it. The selection
- * bar is laid OVER that row, not into it — so nothing measured from the shared bar is repeated
- * here, and selecting a row cannot move the row under the pointer.
+ * The row above the list has one height, from the layout tokens, whatever is in it. On the desktop
+ * layout the selection bar is laid OVER that row, not into it — so nothing measured from the
+ * shared bar is repeated here, and selecting a row cannot move the row under the pointer. On the
+ * mobile layout it is in the row's flow (it may be taller: see the slot below).
  */
 const barHeight = (desktop: boolean) => (desktop ? layout.touchTarget : layout.header);
 
@@ -791,7 +792,10 @@ function Explorer({ folderId }: { folderId: string | null }) {
         </FrameBanner>
       )}
       <Box data-explorer-bar sx={{ position: "relative", flex: "none", minHeight: barHeight(desktop) }}>
-        <Box sx={{ position: "absolute", top: 0, left: 0, right: 0, zIndex: 2 }}>
+        {/* Desktop: laid over the slot, so that a click that selects never moves the row under the
+            pointer. Mobile: in the slot's flow — the shared bar is a touch target plus its padding,
+            and wraps at a phone's width when a zip is running; laid over, it would cover rows. */}
+        <Box sx={desktop ? { position: "absolute", top: 0, left: 0, right: 0, zIndex: 2 } : undefined}>
           <SelectionBar
             count={selected.length}
             onClear={() => dispatch({ type: "clear" })}

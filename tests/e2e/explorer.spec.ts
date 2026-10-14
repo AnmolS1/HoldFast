@@ -691,6 +691,38 @@ test.describe("mobile layout", () => {
     expect(size.scroll).toBeLessThanOrEqual(size.client);
   });
 
+  test("360 px with a zip running: the selection bar covers no row (m22)", async ({ page, origins }) => {
+    mockedOnly();
+    test.skip(!isMobile(page), "the mobile project (touch)");
+    await page.setViewportSize({ width: 360, height: 740 });
+    await page.addInitScript(() => {
+      delete (window as { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    });
+    await serve(page, origins.port, new FakeDrive(nodes()));
+    // The zip stays at its manifest: "Preparing zip" and Stop stay in the bar.
+    await page.route("**/api/nodes/zip-manifest", () => new Promise<void>(() => {}));
+    await openExplorer(page);
+    const trip = row(page, "Trip");
+    await trip.dispatchEvent("pointerdown", { pointerType: "touch", bubbles: true });
+    await expect(trip).toHaveAttribute("aria-selected", "true");
+    await trip.dispatchEvent("pointerup", { pointerType: "touch", bubbles: true });
+    const bar = page.locator("[data-selection-bar]");
+    await expect(bar).toContainText("1 selected");
+    const measure = () =>
+      page.evaluate(() => {
+        const barBox = document.querySelector("[data-selection-bar]")!.getBoundingClientRect();
+        const first = document.querySelector("[data-item-id]")!.getBoundingClientRect();
+        return { barBottom: barBox.bottom, firstTop: first.top, barHeight: barBox.height };
+      });
+    const selected = await measure();
+    expect(selected.barBottom, JSON.stringify(selected)).toBeLessThanOrEqual(selected.firstTop + 0.5);
+    await bar.getByRole("button", { name: "More" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Download as zip" }).click();
+    await expect(bar.getByRole("button", { name: "Stop" })).toBeVisible();
+    const zipping = await measure();
+    expect(zipping.barBottom, JSON.stringify(zipping)).toBeLessThanOrEqual(zipping.firstTop + 0.5);
+  });
+
   test("the breakpoint: 1023 px is still the mobile layout, 1024 px the desktop one", async ({
     page,
     origins,
