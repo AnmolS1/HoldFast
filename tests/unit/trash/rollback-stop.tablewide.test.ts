@@ -16,7 +16,7 @@ import { getSettings, setSetting } from "../../../src/worker/db/queries/settings
 import { trash as trashQuery } from "../../../src/worker/db/queries/trash";
 import { auditLog, settings as settingsTable, uploads } from "../../../src/worker/db/schema";
 import { runJob, runScheduled } from "../../../src/worker/jobs/index";
-import { GENERATION_KEY, readCursor, runReconcile } from "../../../src/worker/jobs/reconcile";
+import { GENERATION_KEY, runReconcile } from "../../../src/worker/jobs/reconcile";
 import { keyFor } from "../../../src/worker/services/storage";
 import {
   api,
@@ -39,6 +39,7 @@ import {
   testDb,
   userRow,
   type JobContext,
+  databaseGeneration,
 } from "./helpers";
 
 const HOUR = 3_600_000;
@@ -66,8 +67,6 @@ afterAll(async () => {
   else await testDb().delete(settingsTable).where(eq(settingsTable.key, "reconcileCursor"));
 });
 
-const databaseGeneration = async () =>
-  readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor).generation;
 const objectGeneration = async () => (await (await env.FILES.get(GENERATION_KEY))?.text()) ?? null;
 
 /** Something due for each of the five, and how to tell whether it is still there. */

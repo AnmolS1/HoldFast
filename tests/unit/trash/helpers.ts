@@ -14,8 +14,9 @@ import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo, SessionUser } from "../../../src/worker/auth/types";
 import { createDb, statementsSent, type Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import { getSettings, type Settings } from "../../../src/worker/db/queries/settings";
-import { GENERATION_KEY, readCursor } from "../../../src/worker/jobs/reconcile";
+import type { Settings } from "../../../src/worker/db/queries/settings";
+import { readDetectorFields } from "../../../src/worker/db/queries/trash-jobs";
+import { GENERATION_KEY, parseGeneration } from "../../../src/worker/jobs/reconcile";
 import {
   auditLog,
   dmcaNoticeNodes,
@@ -277,9 +278,15 @@ export function jobContext(
  * the guarded jobs this file runs read "ok". Writes no setting. Returns the number.
  */
 export async function generationInStep(): Promise<number> {
-  const database = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor).generation;
+  const database = (await databaseGeneration()) ?? 0;
   await env.FILES.put(GENERATION_KEY, String(database));
   return database;
+}
+
+/** The database's generation as the detector reads it: none stored is 0; null for an anomaly. */
+export async function databaseGeneration(): Promise<number | null> {
+  const raw = (await readDetectorFields(testDb())).generation;
+  return raw === null ? 0 : parseGeneration(raw);
 }
 
 export const cronEvent = (cron: string): ScheduledController => ({

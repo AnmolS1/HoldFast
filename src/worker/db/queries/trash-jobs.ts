@@ -430,21 +430,36 @@ export async function knownVersions(db: Executor, nodeIds: readonly string[]): P
 // The reconcile job's cursor (`settings.reconcileCursor`, a JSON object) holds its place AND the
 // database's generation. They are written separately, so that neither write can undo the other:
 // the place by a merge that leaves `generation` as it is, the generation only by a
-// compare-and-set — never with a value read earlier and written back.
+// compare-and-set — never with a value read earlier and written back. The generation is never
+// interpreted in SQL: it is read as stored text, compared as stored text, written as digits.
 
 const CURSOR_KEY = "reconcileCursor";
 
 /**
- * The stored generation by the rule `jobs/reconcile.ts#asGeneration` states — a jsonb number,
- * integral, 0 … 2^53 − 1 — as an integer; anything else is 0, as `readCursor` reads it.
+ * What the database holds for the rollback detector, RAW, in one statement: the generation as
+ * its stored jsonb TEXT — never interpreted here (`jobs/reconcile.ts#parseGeneration` is the one
+ * parser) — and the two mail times. All null when there is no cursor object; `generation` null
+ * when it has none.
  */
-const storedGeneration = sql`CASE WHEN jsonb_typeof(settings.value -> 'generation') = 'number'
-  THEN CASE
-    -- Nested: the casts run only on a number (AND does not promise an order).
-    WHEN (settings.value -> 'generation')::numeric BETWEEN 0 AND 9007199254740991
-     AND (settings.value -> 'generation')::numeric = trunc((settings.value -> 'generation')::numeric)
-    THEN (settings.value -> 'generation')::numeric::bigint ELSE 0 END
-  ELSE 0 END`;
+export async function readDetectorFields(
+  db: Executor,
+): Promise<{ generation: string | null; rollbackMailedAt: string | null; unknownMailedAt: string | null }> {
+  const result = await db.execute<{
+    generation: string | null;
+    rollback_mailed_at: string | null;
+    unknown_mailed_at: string | null;
+  }>(sql`
+    SELECT (value -> 'generation')::text AS generation,
+           value ->> 'rollbackMailedAt' AS rollback_mailed_at,
+           value ->> 'unknownMailedAt' AS unknown_mailed_at
+      FROM settings WHERE key = ${CURSOR_KEY} AND jsonb_typeof(value) = 'object'`);
+  const row = result.rows[0];
+  return {
+    generation: row?.generation ?? null,
+    rollbackMailedAt: row?.rollback_mailed_at ?? null,
+    unknownMailedAt: row?.unknown_mailed_at ?? null,
+  };
+}
 
 /** The cursor as an object, whatever is stored (a value of another shape is the start). */
 const storedObject = sql`CASE WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value ELSE '{}'::jsonb END`;
@@ -461,44 +476,54 @@ export async function saveReconcilePlace(
   clearSettingsCache();
 }
 
-/** Notes when the operators were last mailed about the rollback going on (kept by the merges). */
-export async function markRollbackMailed(db: Executor, at: Date): Promise<void> {
-  const fields = sql`jsonb_build_object('rollbackMailedAt', ${at.toISOString()}::text)`;
+/** The two mail times the detector keeps in the cursor (kept by every merge). */
+export type DetectorMailField = "rollbackMailedAt" | "unknownMailedAt";
+
+/** Notes when the operators were last mailed about the state going on. */
+export async function markDetectorMailed(db: Executor, field: DetectorMailField, at: Date): Promise<void> {
+  const fields = sql`jsonb_build_object(${field}::text, ${at.toISOString()}::text)`;
   await db.execute(sql`
     INSERT INTO settings (key, value, updated_by) VALUES (${CURSOR_KEY}, ${fields}, NULL)
     ON CONFLICT (key) DO UPDATE SET value = ${storedObject} || ${fields}, updated_by = NULL, updated_at = now()`);
   clearSettingsCache();
 }
 
-/** The rollback is over: the next one mails at once. */
-export async function clearRollbackMailed(db: Executor): Promise<void> {
+/** That state is over: the next one mails at once. */
+export async function clearDetectorMailed(db: Executor, field: DetectorMailField): Promise<void> {
   await db.execute(sql`
-    UPDATE settings SET value = settings.value - 'rollbackMailedAt', updated_at = now()
-    WHERE key = ${CURSOR_KEY} AND jsonb_typeof(settings.value) = 'object' AND settings.value ? 'rollbackMailedAt'`);
+    UPDATE settings SET value = settings.value - ${field}::text, updated_at = now()
+    WHERE key = ${CURSOR_KEY} AND jsonb_typeof(settings.value) = 'object' AND settings.value ? ${field}::text`);
   clearSettingsCache();
 }
 
 /**
- * Counts the database's generation up from `from` — only if it is still `from` (compare-and-
- * set). True when this call moved it. A run that read its number before someone else moved it —
- * another run, an operator, a restore — moves nothing.
+ * Counts the database's generation up — only if it is still EXACTLY what was read (`from`: the
+ * stored jsonb text as `readDetectorFields` gave it, null for none): a compare of the raw stored
+ * form, no number interpreted in SQL. Writes `next`, canonical digits. True when this call moved
+ * it; a reading made before someone else moved it — a run, an operator, a restore — moves nothing.
  */
-export async function advanceGenerationRow(db: Executor, from: number): Promise<boolean> {
-  const next = sql`to_jsonb(${from + 1}::bigint)`;
+export async function advanceGenerationRow(
+  db: Executor,
+  from: string | null,
+  next: string,
+): Promise<boolean> {
+  if (!/^(0|[1-9][0-9]*)$/.test(next)) throw new Error("generation: not canonical digits");
+  const value = sql`${next}::jsonb`;
   const result =
-    from === 0
-      ? // No row reads as 0, so the very first count may create it.
+    from === null
+      ? // No generation stored (it reads as 0): the count may create the row or the field.
         await db.execute(sql`
           INSERT INTO settings (key, value, updated_by)
-          VALUES (${CURSOR_KEY}, jsonb_build_object('generation', ${next}), NULL)
+          VALUES (${CURSOR_KEY}, jsonb_build_object('generation', ${value}), NULL)
           ON CONFLICT (key) DO UPDATE
-            SET value = jsonb_set(${storedObject}, '{generation}', ${next}), updated_by = NULL, updated_at = now()
-            WHERE ${storedGeneration} = 0
+            SET value = ${storedObject} || jsonb_build_object('generation', ${value}), updated_by = NULL, updated_at = now()
+            WHERE NOT (jsonb_typeof(settings.value) = 'object' AND settings.value ? 'generation')
           RETURNING key`)
       : await db.execute(sql`
           UPDATE settings
-            SET value = jsonb_set(${storedObject}, '{generation}', ${next}), updated_by = NULL, updated_at = now()
-            WHERE key = ${CURSOR_KEY} AND ${storedGeneration} = ${from}
+            SET value = jsonb_set(settings.value, '{generation}', ${value}), updated_by = NULL, updated_at = now()
+            WHERE key = ${CURSOR_KEY} AND jsonb_typeof(settings.value) = 'object'
+              AND (settings.value -> 'generation')::text = ${from}
           RETURNING key`);
   clearSettingsCache();
   return result.rows.length === 1;

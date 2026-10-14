@@ -24,6 +24,7 @@ import {
   GENERATION_KEY,
   ROLLBACK_MAIL_EVERY_MS,
   ORPHAN_AREAS,
+  parseGeneration,
   readCursor,
   readsRolledBack,
   reconcileQuotas,
@@ -58,6 +59,7 @@ import {
   testDb,
   uploadRow,
   usedBytes,
+  databaseGeneration,
 } from "./helpers";
 
 // What the job reports to the operator, counted (the report itself is the real one).
@@ -138,8 +140,6 @@ async function generations(database: number, object: number | string | null, at:
   if (object === null) await env.FILES.delete(GENERATION_KEY);
   else await env.FILES.put(GENERATION_KEY, String(object));
 }
-const databaseGeneration = async () =>
-  readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor).generation;
 const objectGeneration = async () => (await (await env.FILES.get(GENERATION_KEY))?.text()) ?? null;
 
 /** The walk, for exactly one account: the first after `after`, with the deadline already past. */
@@ -223,16 +223,43 @@ describe("reconcile: the quota half", () => {
 
   it("anything that is not a cursor reads as the start", () => {
     for (const stored of [undefined, null, "x", 7, [], { user: 5, area: -1 }, { area: 99, object: "c" }]) {
-      expect(readCursor(stored)).toEqual({ user: null, area: 0, object: null, generation: 0 });
+      expect(readCursor(stored)).toEqual({ user: null, area: 0, object: null });
     }
+    // The place only: the generation in the same value is the detector's, read raw elsewhere.
     expect(readCursor({ user: "u", area: 2, object: "c", generation: 4 })).toEqual({
       user: "u",
       area: 2,
       object: "c",
-      generation: 4,
     });
-    expect(readCursor({ generation: -1 }).generation).toBe(0);
-    expect(readCursor({ generation: "7" }).generation).toBe(0);
+  });
+
+  it("the one parser of a generation: canonical digits that are a safe integer — nothing else", () => {
+    for (const [text, value] of [
+      ["0", 0],
+      ["7", 7],
+      ["1760000000000", 1_760_000_000_000],
+      ["9007199254740991", 9_007_199_254_740_991],
+    ] as const) {
+      expect(parseGeneration(text), text).toBe(value);
+    }
+    for (const text of [
+      "",
+      "07",
+      "7.0",
+      "7.0000000000000001",
+      "8.5",
+      '"7"',
+      " 7",
+      "7 ",
+      "7\n",
+      "-1",
+      "7e0",
+      "null",
+      "9007199254740993",
+      "12345678901234567",
+    ]) {
+      expect(parseGeneration(text), JSON.stringify(text)).toBeNull();
+    }
   });
 });
 
@@ -623,7 +650,7 @@ describe("reconcile: the orphan sweep", () => {
         await generations(5, 5);
         // 02:00 — the slot reads 5/5.
         const slot = await detectRollback(jobContext().bg);
-        expect(slot).toEqual({ state: "ok", database: 5 });
+        expect(slot).toEqual({ state: "ok", database: 5, raw: "5" });
         // 02:03 — a heartbeat counts.
         expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
         expect([await databaseGeneration(), await objectGeneration()]).toEqual([6, "6"]);
@@ -700,7 +727,7 @@ describe("reconcile: the orphan sweep", () => {
               ? async (key: string, options?: R2GetOptions) => {
                   if (key === GENERATION_KEY && !counted) {
                     counted = true;
-                    expect(await advanceGenerationRow(testDb(), from)).toBe(true);
+                    expect(await advanceGenerationRow(testDb(), String(from), String(from + 1))).toBe(true);
                     await target.put(GENERATION_KEY, String(from + 1));
                   }
                   return target.get(key, options);
@@ -715,6 +742,7 @@ describe("reconcile: the orphan sweep", () => {
       expect(await detectRollback(jobContext({ env: { FILES: jobs.bucket } }).bg)).toEqual({
         state: "ok",
         database: 6,
+        raw: "6",
       });
       expect(jobs.counted()).toBe(true);
       await generations(5, 5);
@@ -757,27 +785,114 @@ describe("reconcile: the orphan sweep", () => {
       expect(mails()).toEqual([]);
     });
 
-    it('m4-R3: the generation is an integer read the same way in both places — jsonb 7.0 is 7 for the count too; 7.5 and an object of "7.0" are anomalies: a rollback, alerted', async () => {
+    it("m1-R4: one strict parser, nothing interpreted in SQL — every non-canonical stored form, in the database or the object, is an anomaly: a rollback, alerted, never a silent conflict; canonical values count", async () => {
       const raw = (value: string) =>
         testDb().execute(
           sql`UPDATE settings SET value = jsonb_set(value, '{generation}', ${value}::jsonb) WHERE key = 'reconcileCursor'`,
         );
+      // Canonical: counted as usual.
       await generations(7, 7);
-      await raw("7.0");
-      expect((await detectRollback(jobContext().bg)).state).toBe("ok");
-      const ctx = await beat();
-      expect(ctx.outcomes("restore-heartbeat")).toEqual(["counted"]);
-      expect(ctx.outcomes("reconcile")).not.toContain("generation_conflict");
+      expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([8, "8"]);
-      // Not an integer in the database: it reads as 0, below the object — a rollback.
-      await raw("8.5");
-      expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
-      expect(alerts()).toHaveLength(1);
-      // Not an integer in the object: an anomaly.
-      await generations(8, "8.0");
-      expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
-      expect(alerts()).toHaveLength(2);
+      let alerted = 0;
+      // The database's copy: P4's value and the other forms.
+      for (const form of ["7.0000000000000001", "8.0", "8.5", '"8"', '" 8"', "null", "-8"]) {
+        await generations(8, 8);
+        await raw(form);
+        expect((await detectRollback(jobContext().bg)).state, form).toBe("rollback");
+        const ctx = await beat();
+        expect(ctx.outcomes("restore-heartbeat"), form).toEqual(["not_counted"]);
+        expect(ctx.outcomes("reconcile"), form).not.toContain("generation_conflict");
+        alerted += 2;
+        expect(alerts(), form).toHaveLength(alerted);
+        // Nothing was written over it.
+        const stored = await testDb().execute<{ g: string }>(
+          sql`SELECT (value -> 'generation')::text AS g FROM settings WHERE key = 'reconcileCursor'`,
+        );
+        expect(stored.rows[0]!.g, form).toBe(form);
+      }
+      // The object's copy.
+      for (const form of ["8.0", " 8", "8 ", "08", "8\n"]) {
+        await generations(8, form);
+        expect((await detectRollback(jobContext().bg)).state, JSON.stringify(form)).toBe("rollback");
+        alerted += 1;
+        expect(alerts()).toHaveLength(alerted);
+      }
+      // Mended by the operator (an integer, written as one): counted again.
       await generations(8, 8);
+      expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([9, "9"]);
+    });
+
+    it("S14: a detector that cannot read is not silent — alerted on the transition, then at most every 6 hours, recorded at every reading; read again, the next failure alerts at once; a database that cannot be read leaves the report", async () => {
+      const unreadableAlerts = () =>
+        vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "detector_unreadable")
+          .length;
+      const rows = async () => (await audits("system.detector_unreadable", "reconcile")).length;
+      const lastAlertAt = async (hoursAgo: number) => {
+        const stored = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<
+          string,
+          unknown
+        >;
+        await setSetting(
+          testDb(),
+          "reconcileCursor",
+          { ...stored, unknownMailedAt: new Date(Date.now() - hoursAgo * HOUR).toISOString() },
+          null,
+        );
+      };
+      const unreadable = new Proxy(env.FILES, {
+        get: (target, name) =>
+          name === "get"
+            ? async () => {
+                throw new Error("R2 is unavailable");
+              }
+            : (Reflect.get(target, name, target) as () => unknown).bind(target),
+      });
+      const reading = async () => {
+        const ctx = jobContext({ env: { FILES: unreadable } });
+        const state = (await detectRollback(ctx.bg)).state;
+        expect(ctx.outcomes("reconcile")).toEqual(["detector_error"]);
+        return state;
+      };
+      await generations(4, 4);
+      const before = await rows();
+      expect(await reading()).toBe("unknown");
+      expect(unreadableAlerts()).toBe(1);
+      expect(await reading()).toBe("unknown");
+      expect(unreadableAlerts()).toBe(1);
+      // Five hours after the last alert: none. Seven: the reminder.
+      await lastAlertAt(5);
+      await reading();
+      expect(unreadableAlerts()).toBe(1);
+      await lastAlertAt(7);
+      await reading();
+      expect(unreadableAlerts()).toBe(2);
+      await reading();
+      expect(unreadableAlerts()).toBe(2);
+      expect((await rows()) - before).toBe(5);
+      // Read again: over — the next failure alerts at once.
+      expect((await detectRollback(jobContext().bg)).state).toBe("ok");
+      const after = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<string, unknown>;
+      expect("unknownMailedAt" in after).toBe(false);
+      await reading();
+      expect(unreadableAlerts()).toBe(3);
+      // The DATABASE cannot be read: no row, no mail time — the report at every reading.
+      const brokenDb = new Proxy(testDb(), {
+        get: (target, name) =>
+          name === "execute"
+            ? async () => {
+                throw new Error("connection terminated");
+              }
+            : Reflect.get(target, name, target),
+      });
+      const ctx = jobContext({ db: brokenDb as unknown as ReturnType<typeof testDb> });
+      const rowsBefore = await rows();
+      expect((await detectRollback(ctx.bg)).state).toBe("unknown");
+      expect(ctx.outcomes("reconcile")).toEqual(["detector_error"]);
+      expect(await rows()).toBe(rowsBefore);
+      expect(unreadableAlerts()).toBe(3);
+      await generations(4, 4);
     });
 
     it("the generation object is outside every swept area", () => {

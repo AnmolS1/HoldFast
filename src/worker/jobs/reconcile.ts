@@ -54,9 +54,10 @@ import { getSettings } from "../db/queries/settings";
 import { reconcileUsedBytes } from "../db/queries/quota";
 import {
   advanceGenerationRow,
-  clearRollbackMailed,
+  clearDetectorMailed,
   knownVersions,
-  markRollbackMailed,
+  markDetectorMailed,
+  readDetectorFields,
   referencedKeys,
   saveReconcilePlace,
   userIdsAfter,
@@ -87,11 +88,11 @@ export type ReconcileCursor = {
   /** Index into `ORPHAN_AREAS`, and the store's list cursor inside that area (null = its start). */
   area: number;
   object: string | null;
-  /** How many times the generation was counted up. Its twin is the object `GENERATION_KEY`. */
-  generation: number;
 };
+// (The same stored value also holds the detector's `generation` and its mail times. They are
+// read raw by `readDetectorFields` and parsed by `parseGeneration` only — never here.)
 
-const START: ReconcileCursor = { user: null, area: 0, object: null, generation: 0 };
+const START: ReconcileCursor = { user: null, area: 0, object: null };
 
 /** Where the generation is kept outside the database: no swept area, and no upload prefix. */
 export const GENERATION_KEY = "sys/reconcile-generation";
@@ -107,18 +108,24 @@ export function readCursor(stored: unknown): ReconcileCursor {
     user: typeof value.user === "string" && value.user !== "" ? value.user : null,
     area: inRange ? area : 0,
     object: inRange && typeof value.object === "string" && value.object !== "" ? value.object : null,
-    generation: asGeneration(value.generation) ?? 0,
   };
 }
 
 /**
- * THE rule for a generation number, wherever it is read: a non-negative safe integer, else
- * null. The database's copy is read by this (above) and by its SQL twin
- * (trash-jobs.ts#storedGeneration: a jsonb number, integral, 0 … 2^53 − 1) — `7.0` is 7 in both,
- * `7.5` nothing in both. The object's text must be digits that pass it.
+ * THE ONE PARSER of a generation number, for both copies — the object's body and the database's
+ * stored jsonb text: exactly canonical digits (`0`, or no leading zero, at most 16 digits) and a
+ * safe integer; anything else — `7.0`, `7.0000000000000001`, `8.5`, `"7"`, ` 7`, `null` — is null:
+ * an ANOMALY, which reads as a rollback (alerted), never as a number. SQL never interprets it.
  */
-export function asGeneration(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+export function parseGeneration(text: string): number | null {
+  if (!/^(0|[1-9][0-9]{0,15})$/.test(text)) return null;
+  const value = Number(text);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/** The database's number from its raw stored text: none stored is 0; an anomaly is NaN. */
+function databaseNumber(raw: string | null): number {
+  return raw === null ? 0 : (parseGeneration(raw) ?? Number.NaN);
 }
 
 // ── the rollback detector ───────────────────────────────────────────────────────────────────
@@ -130,19 +137,20 @@ export const GENERATION_LOCK_HOLD_MS = 15 * 60_000;
 
 /**
  * What one reading found. `ok` / `first`: jobs may destroy (`first`: but this sweep deletes
- * nothing); `database` is the number read, the one a count starts from. `rollback`, `unknown`:
+ * nothing); `database` is the number read, `raw` its stored text — what a count compares and
+ * starts from. `rollback`, `unknown`:
  * nothing is destroyed.
  */
-export type Detection = { state: "ok" | "first"; database: number } | { state: "rollback" | "unknown" };
+export type Detection =
+  { state: "ok" | "first"; database: number; raw: string | null } | { state: "rollback" | "unknown" };
 export type GenerationState = Detection["state"];
 
 /** The object's number; null when there is no object; NaN when it holds anything but a number. */
 async function storedGeneration(env: Env): Promise<number | null> {
   const found = await storage(env).get(GENERATION_KEY);
   if (found === null || found.kind !== "body") return null;
-  const text = (await found.object.text()).trim();
-  // Anything else proves nothing either way: an anomaly, read as a rollback.
-  return (/^[0-9]+$/.test(text) ? asGeneration(Number(text)) : null) ?? Number.NaN;
+  // Anything but canonical digits proves nothing either way: an anomaly, read as a rollback.
+  return parseGeneration(await found.object.text()) ?? Number.NaN;
 }
 
 async function writeGeneration(env: Env, generation: number): Promise<void> {
@@ -159,53 +167,62 @@ async function writeGeneration(env: Env, generation: number): Promise<void> {
  */
 function classify(object: number | null, database: number): "ok" | "first" | "rollback" {
   if (database === 0 && (object === null || object === 1)) return "first";
-  // A missing object while the database has counted, an unreadable one, or one ahead.
+  // A missing object while the database has counted, an anomaly on either side (NaN compares
+  // false), or an object ahead.
   return object !== null && object <= database ? "ok" : "rollback";
 }
 
-/** A rollback mails the operators at once, then at most this often while it lasts. */
+/** A rollback — or a detector that cannot read — mails at once, then at most this often. */
 export const ROLLBACK_MAIL_EVERY_MS = 6 * 3_600_000;
 
-/** When the operators were last mailed about the rollback that is going on (cursor field). */
-function lastMailed(stored: unknown): number | null {
-  const at =
-    stored && typeof stored === "object" ? (stored as { rollbackMailedAt?: unknown }).rollbackMailedAt : null;
-  const time = typeof at === "string" ? Date.parse(at) : Number.NaN;
-  return Number.isFinite(time) ? time : null;
+/** Is a mail due, from the stored time of the last one (null: none yet — a transition)? */
+function mailDue(last: string | null): boolean {
+  const time = last === null ? Number.NaN : Date.parse(last);
+  return !Number.isFinite(time) || Date.now() - time >= ROLLBACK_MAIL_EVERY_MS;
 }
 
 /**
  * Compares the object's generation with the database's — the object FIRST: a writer counts the
  * database up first and the object after, so a count in flight reads "database ahead" (normal),
- * never "object ahead". Never throws: what cannot be read is `unknown` (reported and counted).
- * A rollback is recorded at every reading (the metric, the report, a `system.database_rollback`
- * audit row) and MAILED on the transition into it, then at most every 6 hours while it lasts.
+ * never "object ahead". Never throws.
+ *   A rollback is recorded at every reading (the metric, the report, a `system.database_rollback`
+ *   audit row) and MAILED on the transition into it, then at most every 6 hours while it lasts.
+ *   What cannot be read is `unknown` — every destroyer stops — and is NOT silent either: recorded
+ *   at every reading (`detector_error`, the report, a `system.detector_unreadable` row) and
+ *   alerted on the transition, then at most every 6 hours (`alertUnreadable`). Its mail time is
+ *   kept in the database: when the DATABASE is what cannot be read, only the report is left.
  */
 export async function detectRollback(bg: BackgroundContext): Promise<Detection> {
-  let object: number | null;
-  let stored: unknown;
+  let object: number | null = null;
+  let fields: Awaited<ReturnType<typeof readDetectorFields>> | null = null;
+  let failure: unknown = null;
   try {
     object = await storedGeneration(bg.env);
-    stored = (await getSettings(bg.db, { fresh: true })).reconcileCursor;
   } catch (error) {
-    captureError(error, { kind: "job", job: "reconcile", reason: "detector" });
-    bg.metric("job", { kind: "reconcile", outcome: "detector_error" });
+    failure = error;
+  }
+  try {
+    fields = await readDetectorFields(bg.db);
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== null || fields === null) {
+    await recordUnreadable(bg, failure, fields);
     return { state: "unknown" };
   }
-  const database = readCursor(stored).generation;
-  const mailed = lastMailed(stored);
+  // Read again: that state is over, and the next time is a transition.
+  if (fields.unknownMailedAt !== null) await clearDetectorMailed(bg.db, "unknownMailedAt");
+  const raw = fields.generation;
+  const database = databaseNumber(raw);
   const state = classify(object, database);
-  // A reading writes no number: only a count, under the lock, does.
-  if (state === "first") return { state, database };
-  if (state === "ok") {
-    // Over: the next rollback is a transition again, and mails at once.
-    if (mailed !== null) await clearRollbackMailed(bg.db);
-    return { state, database };
+  if (state !== "rollback") {
+    if (fields.rollbackMailedAt !== null) await clearDetectorMailed(bg.db, "rollbackMailedAt");
+    return { state, database, raw };
   }
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
-  await recordRollback(bg, object, database);
-  if (mailed === null || Date.now() - mailed >= ROLLBACK_MAIL_EVERY_MS) {
-    if (await mailRollback(bg)) await markRollbackMailed(bg.db, new Date());
+  await recordRollback(bg, object, raw);
+  if (mailDue(fields.rollbackMailedAt) && (await mailRollback(bg))) {
+    await markDetectorMailed(bg.db, "rollbackMailedAt", new Date());
   }
   return { state: "rollback" };
 }
@@ -218,7 +235,7 @@ export async function detectRollback(bg: BackgroundContext): Promise<Detection> 
 export async function readsRolledBack(env: Env, db: Executor): Promise<boolean> {
   try {
     const object = await storedGeneration(env);
-    const database = readCursor((await getSettings(db, { fresh: true })).reconcileCursor).generation;
+    const database = databaseNumber((await readDetectorFields(db)).generation);
     return classify(object, database) === "rollback";
   } catch (error) {
     captureError(error, { kind: "purge_rollback_check" });
@@ -256,16 +273,17 @@ export async function advanceGeneration(bg: BackgroundContext): Promise<boolean>
   const reading = await detectRollback(bg);
   if (reading.state === "first") {
     await writeGeneration(bg.env, 1);
-    return countRow(bg, 0);
+    return countRow(bg, reading.raw, 1);
   }
   if (reading.state !== "ok") return false;
-  if (!(await countRow(bg, reading.database))) return false;
+  if (!(await countRow(bg, reading.raw, reading.database + 1))) return false;
   await writeGeneration(bg.env, reading.database + 1);
   return true;
 }
 
-async function countRow(bg: BackgroundContext, from: number): Promise<boolean> {
-  if (await advanceGenerationRow(bg.db, from)) return true;
+/** The compare-and-set from the exact stored text that was read, to the next number's digits. */
+async function countRow(bg: BackgroundContext, from: string | null, next: number): Promise<boolean> {
+  if (await advanceGenerationRow(bg.db, from, String(next))) return true;
   bg.metric("job", { kind: "reconcile", outcome: "generation_conflict" });
   return false;
 }
@@ -274,7 +292,11 @@ async function countRow(bg: BackgroundContext, from: number): Promise<boolean> {
  * The record of one rollback reading — every reading: the report and an audit row (in a
  * transaction of its own; a failure is reported, never thrown: the jobs stay stopped anyway).
  */
-async function recordRollback(bg: BackgroundContext, object: number | null, database: number): Promise<void> {
+async function recordRollback(
+  bg: BackgroundContext,
+  object: number | null,
+  raw: string | null,
+): Promise<void> {
   captureError(
     new Error("reconcile: the database is older than the object store; every destructive job is stopped"),
     { kind: "job", job: "reconcile", reason: "rollback_detected" },
@@ -286,7 +308,8 @@ async function recordRollback(bg: BackgroundContext, object: number | null, data
         bg,
         "system.database_rollback",
         { type: "job", id: "reconcile" },
-        { database, object: object === null || Number.isNaN(object) ? null : object },
+        // As stored (an anomaly is shown as it is), the object's as read (null: none or an anomaly).
+        { database: raw, object: object === null || Number.isNaN(object) ? null : object },
       ),
     );
   } catch (error) {
@@ -313,6 +336,51 @@ async function mailRollback(bg: BackgroundContext): Promise<boolean> {
     ),
   );
   return sent.includes(true);
+}
+
+/**
+ * The record of one reading that could not be made — every such reading: the report, the metric
+ * and (when the database answers) a `system.detector_unreadable` audit row; and the alert on the
+ * transition into this state, then at most every 6 hours while it lasts (its time kept in the
+ * database — so not when the database is what failed: then the report is all there is).
+ */
+async function recordUnreadable(
+  bg: BackgroundContext,
+  error: unknown,
+  fields: Awaited<ReturnType<typeof readDetectorFields>> | null,
+): Promise<void> {
+  captureError(error, { kind: "job", job: "reconcile", reason: "detector" });
+  bg.metric("job", { kind: "reconcile", outcome: "detector_error" });
+  if (fields === null) return;
+  try {
+    await bg.db.transaction((tx) =>
+      auditInTx(tx, bg, "system.detector_unreadable", { type: "job", id: "reconcile" }),
+    );
+  } catch (failure) {
+    captureError(failure, { kind: "job", job: "reconcile" });
+  }
+  if (mailDue(fields.unknownMailedAt) && alertUnreadable()) {
+    try {
+      await markDetectorMailed(bg.db, "unknownMailedAt", new Date());
+    } catch (failure) {
+      captureError(failure, { kind: "job", job: "reconcile" });
+    }
+  }
+}
+
+/**
+ * The operators' alert for a detector that cannot read. ONE call site. INTERIM until the
+ * operator event kind exists in services/email.ts (QUESTION, fix pass 4): a report of its own,
+ * at the mail's cadence; it becomes `sendOperatorCritical` to every operator, as `mailRollback`.
+ * True when it was handed over.
+ */
+function alertUnreadable(): boolean {
+  captureError(new Error("reconcile: the rollback detector cannot read; every destructive job is stopped"), {
+    kind: "job",
+    job: "reconcile",
+    reason: "detector_unreadable",
+  });
+  return true;
 }
 
 // ── quota ───────────────────────────────────────────────────────────────────────────────────

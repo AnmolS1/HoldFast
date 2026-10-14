@@ -1,7 +1,7 @@
 // The stale-upload job. TABLE-WIDE: it settles every stale session in the database, so this file
 // runs alone; a session is made stale by backdating its own `expiresAt` / `completingAt`.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { lockStaleUpload } from "../../../src/worker/db/queries/trash-jobs";
 import { hashBlocklist, uploadParts, uploads } from "../../../src/worker/db/schema";
@@ -212,25 +212,36 @@ describe("the stale-upload job", () => {
     expect(await usedBytes(owner.id)).toBe(900);
   });
 
-  it("a session whose hash is put on the csam list after the job listed it is not aborted: still completing, its object kept (the repair sweep's)", async () => {
+  it('a session whose hash is put on the csam list after the job listed it is not aborted: still completing, its object kept (the repair sweep\'s) — and one malware-listed by the same hook IS ended (the shared predicate, not "any listing")', async () => {
     const owner = await member();
-    const sha256 = [...crypto.getRandomValues(new Uint8Array(32))]
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    // Stale in completing: its request died after the store completed the multipart upload.
-    const session = await makeUpload(owner.id, owner.id, {
-      status: "completing",
-      completingAt: ago(2 * HOUR),
-      size: 300,
-      expectedSha256: sha256,
-    });
-    await putObject(session.r2Key, "verified bytes that must become a locked node");
-    // After the job's list, before its first transaction: a verdict elsewhere lists the hash.
+    const hex = () =>
+      [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const stale = async (sha256: string) => {
+      // Stale in completing: its request died after the store completed the multipart upload.
+      const session = await makeUpload(owner.id, owner.id, {
+        status: "completing",
+        completingAt: ago(2 * HOUR),
+        size: 300,
+        expectedSha256: sha256,
+      });
+      await putObject(session.r2Key, "completed in the store");
+      return session;
+    };
+    const csam = hex();
+    const malware = hex();
+    const owed = await stale(csam);
+    const ended = await stale(malware);
+    // After the job's list, before its first transaction: verdicts elsewhere list both hashes.
     let listed = false;
     const handle = hookedDb(async () => {
       if (listed) return;
       listed = true;
-      await testDb().insert(hashBlocklist).values({ sha256, reason: "csam", note: "made-up test entry" });
+      await testDb()
+        .insert(hashBlocklist)
+        .values([
+          { sha256: csam, reason: "csam", note: "made-up test entry" },
+          { sha256: malware, reason: "malware", note: "made-up test entry" },
+        ]);
     });
     try {
       await run(jobContext({ db: handle.db }));
@@ -238,9 +249,13 @@ describe("the stale-upload job", () => {
       await handle.close();
     }
     expect(listed).toBe(true);
-    expect(await uploadRow(session.id)).toMatchObject({ status: "completing" });
-    expect(await objectExists(session.r2Key)).toBe(true);
-    await testDb().delete(hashBlocklist).where(eq(hashBlocklist.sha256, sha256));
+    expect(await uploadRow(owed.id)).toMatchObject({ status: "completing" });
+    expect(await objectExists(owed.r2Key)).toBe(true);
+    // Ended like any stale session (a single-PUT one: its object is the orphan sweep's).
+    expect(await uploadRow(ended.id)).toMatchObject({ status: "aborted" });
+    await testDb()
+      .delete(hashBlocklist)
+      .where(inArray(hashBlocklist.sha256, [csam, malware]));
   });
 
   it("the row decides, not the list: a session a client claimed meanwhile is left alone", async () => {
