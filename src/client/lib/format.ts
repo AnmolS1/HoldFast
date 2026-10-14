@@ -25,15 +25,47 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${text} ${UNITS[unit]}`;
 }
 
+// Building an Intl formatter costs far more than using one, and a list draws a date per row: each
+// formatter is built once per locale, zone and options and kept. The key holds all three, so a
+// change of locale or of the account's zone never reuses a formatter made for another.
+const dateFormats = new Map<string, Intl.DateTimeFormat>();
+const relativeFormats = new Map<string, Intl.RelativeTimeFormat>();
+const zones = new Map<string, boolean>();
+
+/** The one `Intl.DateTimeFormat` for these locale and options (the zone is one of the options). */
+export function dateTimeFormat(locale: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const key = JSON.stringify([locale, options]);
+  let format = dateFormats.get(key);
+  if (!format) {
+    format = new Intl.DateTimeFormat(locale, options);
+    dateFormats.set(key, format);
+  }
+  return format;
+}
+
+function relativeTimeFormat(locale: string): Intl.RelativeTimeFormat {
+  let format = relativeFormats.get(locale);
+  if (!format) {
+    format = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+    relativeFormats.set(locale, format);
+  }
+  return format;
+}
+
 /** A time zone Intl accepts, or `undefined` (the browser's zone). */
 export function resolveTimeZone(zone: string | null | undefined): string | undefined {
   if (!zone) return undefined;
-  try {
-    new Intl.DateTimeFormat("en", { timeZone: zone });
-    return zone;
-  } catch {
-    return undefined;
+  let valid = zones.get(zone);
+  if (valid === undefined) {
+    try {
+      new Intl.DateTimeFormat("en", { timeZone: zone });
+      valid = true;
+    } catch {
+      valid = false;
+    }
+    zones.set(zone, valid);
   }
+  return valid ? zone : undefined;
 }
 
 function toDate(value: string | number | Date): Date | null {
@@ -54,15 +86,10 @@ export function formatDate(
   const style = options.style ?? "short";
   const locale = getLocale();
   if (style === "long") {
-    return new Intl.DateTimeFormat(locale, {
-      timeZone,
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-    }).format(date);
+    return dateTimeFormat(locale, { timeZone, year: "numeric", month: "long", day: "numeric" }).format(date);
   }
   if (style === "dateTime") {
-    return new Intl.DateTimeFormat(locale, {
+    return dateTimeFormat(locale, {
       timeZone,
       year: "numeric",
       month: "short",
@@ -73,9 +100,10 @@ export function formatDate(
     }).format(date);
   }
   const now = options.now ?? new Date();
-  const year = (d: Date) => new Intl.DateTimeFormat(locale, { timeZone, year: "numeric" }).format(d);
+  const years = dateTimeFormat(locale, { timeZone, year: "numeric" });
+  const year = (d: Date) => years.format(d);
   const sameYear = year(date) === year(now);
-  return new Intl.DateTimeFormat(locale, {
+  return dateTimeFormat(locale, {
     timeZone,
     month: "short",
     day: "2-digit",
@@ -100,7 +128,7 @@ export function formatRelative(
   const seconds = Math.round((date.getTime() - now.getTime()) / 1000);
   const abs = Math.abs(seconds);
   if (abs >= 7 * 86400) return formatDate(date, { timeZone: options.timeZone, now });
-  const rtf = new Intl.RelativeTimeFormat(getLocale(), { numeric: "auto" });
+  const rtf = relativeTimeFormat(getLocale());
   if (abs < 45) return rtf.format(0, "second");
   let unit: Intl.RelativeTimeFormatUnit = "minute";
   let size = 60;

@@ -1,9 +1,11 @@
-// PLACEHOLDER — taken over by the views task (T19), which keeps `useUsageSummary`.
+// The storage slot of the shell: the sidebar's bar reads `useUsageSummary()`.
 import type { UsageSummary } from "../../components/slots";
+import { useUsage } from "./queries";
 
 export { routes } from "./routes";
 
-/** Stub: `null`, so the storage bar shows its skeleton. */
+/** Used and quota bytes, or `null` while they are not known — loading, or the request failed. */
 export function useUsageSummary(): UsageSummary | null {
-  return null;
+  const { data } = useUsage();
+  return data ? { usedBytes: data.usedBytes, quotaBytes: data.quotaBytes } : null;
 }

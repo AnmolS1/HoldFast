@@ -1,13 +1,32 @@
-// PLACEHOLDER — taken over by the uploader task (T17), which fills both bodies and keeps the
-// names and types. The frame renders `UploadDropOverlay` once at its root; the FAB, the header
-// "New" menu and the palette call `requestUpload`.
+// The two slots the shell pre-wired: the frame renders `UploadDropOverlay` once at its root; the
+// FAB, the header's "New" menu, the palette and the explorer call `requestUpload`.
 import type { RequestUpload } from "../../components/slots";
+import { actionMark, addFiles } from "./manager";
+import { openPicker, targetFromLocation } from "./picker";
+import "./ribbon";
+import { UploadHost } from "./UploadHost";
 
-/** Stub: renders nothing. The real overlay shows "Drop to upload to <folder>". */
-export function UploadDropOverlay(): null {
-  return null;
+/** Dragging files over the app shows "Drop to upload to <folder>"; the folder is the one in the address. */
+export function UploadDropOverlay() {
+  return <UploadHost />;
 }
 
-/** Stub: no-op. The real function opens the file picker or enqueues the given files. */
+/**
+ * Upload `files` into `parentId`; without files, open the file picker. Without a folder the one
+ * in the address is used, else the top level.
+ */
 // eslint-disable-next-line react-refresh/only-export-components -- the slot file exports both by contract
-export const requestUpload: RequestUpload = () => {};
+export const requestUpload: RequestUpload = (opts) => {
+  const parentId = opts?.parentId ?? targetFromLocation();
+  if (opts?.files) {
+    void addFiles(
+      opts.files.map((file) => ({ file })),
+      parentId,
+      [],
+      {},
+      actionMark(),
+    );
+    return;
+  }
+  openPicker("files", parentId);
+};

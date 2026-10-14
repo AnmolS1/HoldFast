@@ -1,2 +1,2 @@
-// PLACEHOLDER — taken over by the explorer task (T16), which replaces this module and keeps the `routes` export.
+// The file explorer. Other features reach it through its routes only: `/` and `/folder/:id`.
 export { routes } from "./routes";

@@ -1,0 +1,9 @@
+// A fixture for the text viewer.
+export interface Greeting {
+  name: string;
+}
+
+export function greet(greeting: Greeting): string {
+  const markup = "<script>alert(1)</script>";
+  return `Hello, ${greeting.name} ${markup.length}`;
+}

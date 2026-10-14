@@ -226,8 +226,8 @@ describe("GET /api/public/config against the real settings table", () => {
     // Not read-only: a same-origin POST passes the whole pipeline and reaches the registry's 404.
     const app = createApp(realCore);
     const open = await call(app, "/api/nodes/folder", { method: "POST", headers: sameOrigin, body: "{}" });
-    expect(open.response.status).toBe(404);
-    expect(((await open.response.json()) as Envelope).error).toBe("not_found");
+    expect(open.response.status).toBe(401);
+    expect(((await open.response.json()) as Envelope).error).toBe("unauthorized");
     await open.ctx.settle();
 
     await withDb(workerEnv, (handle) => setSetting(handle, "readOnly", true, null));

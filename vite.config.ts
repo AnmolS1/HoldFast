@@ -72,6 +72,12 @@ export default defineConfig({
     // path — the font files. In the main checkout the two entries are the same tree.
     fs: { allow: [".", realpathSync("node_modules")] },
   },
+  // Vite's start-up scan crawls the HTML entry, not `new Worker(new URL(...))`: a package only a Web
+  // Worker imports (hash-wasm, in the upload's hasher) was found the first time a test hashed a
+  // file — "dependency optimized … reloading", the page reloaded in the middle of that test. With
+  // the dev server started `--force` (playwright.config.ts) that happened on every run. The workers
+  // are scanned as entries too, so their packages are known before the first page loads.
+  optimizeDeps: { entries: ["index.html", "src/client/workers/*.worker.ts"] },
   preview: { host, port, strictPort: true },
   define: {
     __GIT_SHA__: JSON.stringify(commit),

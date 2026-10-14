@@ -96,17 +96,9 @@ describe("tokens with restricted use", () => {
 // deleting their lines do not meet in a merge. Keep it when adding a line.
 const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
   account: ["routes.tsx"],
-  explorer: ["index.ts", "routes.tsx"],
   admin: ["routes.tsx"],
-  preview: ["index.ts", "routes.tsx"],
   dmca: ["routes.tsx"],
-  upload: ["index.ts", "routes.tsx", "slots.tsx"],
   interstitial: ["index.ts", "routes.tsx"],
-  recent: ["routes.tsx"],
-  search: ["index.ts", "routes.tsx"],
-  starred: ["routes.tsx"],
-  trash: ["routes.tsx"],
-  usage: ["index.ts", "routes.tsx"],
   "public-link": ["index.ts", "routes.tsx"],
   report: ["index.ts", "routes.tsx"],
   share: ["index.ts", "routes.tsx"],
