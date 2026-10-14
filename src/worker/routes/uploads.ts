@@ -280,6 +280,19 @@ async function replaceGuard(
 const NOT_ABORTED = Symbol("not aborted");
 
 /**
+ * FAIL SAFE: a path gives an upload up (and so destroys its bytes) only on a DEFINITIVE answer —
+ * the place or the target is not there for the caller, the caller may not, the state forbids
+ * it, the request is invalid. An app error or a query error of one of these codes is one; a
+ * connection error, a deadlock after its retries, a timeout or a store failure is not: the
+ * session stays `completing` with its key, for the client's retry or the stale-upload job.
+ */
+const DEFINITIVE = new Set<string>(["not_found", "forbidden", "conflict", "validation"]);
+function definitive(error: unknown): boolean {
+  const code = error instanceof AppError ? error.code : asQueryError(error)?.code;
+  return code !== undefined && DEFINITIVE.has(code);
+}
+
+/**
  * The database half of an abort, one transaction: the reservation back, then the session
  * `aborted` and its part rows gone. `open`: only a session nobody is completing (a `DELETE`);
  * `claimed`: the session this request has claimed. False — and nothing changed — when the
@@ -484,19 +497,14 @@ const OPEN_UPLOADS = "open_uploads";
  * A multipart session with its upload in the store. Init creates it right after the admission's
  * commit; a session that was left without one (the invocation ended in between) gets it here,
  * when the same file is initialised again. Whichever request records its id first wins — the
- * other's upload is aborted. If the store refuses, a session nobody has resumed yet is given up
- * (reservation back).
+ * other's upload is aborted. If the store refuses, nothing is given up (see below).
  */
 async function withMultipart(c: Ctx, session: Upload): Promise<Upload> {
   if (isSingle(session) || session.r2UploadId !== null) return session;
   const store = storage(c.env);
-  let mpu: R2MultipartUpload;
-  try {
-    mpu = await store.createMultipart(session.r2Key);
-  } catch (error) {
-    await releaseAndAbort(db(c), session, "open");
-    throw error;
-  }
+  // A store failure gives nothing up: the session stays `open` without its store upload, and
+  // the next init of the same file (a retry) creates one.
+  const mpu = await store.createMultipart(session.r2Key);
   if (await sessions.setR2UploadId(db(c), session.id, mpu.uploadId)) {
     return { ...session, r2UploadId: mpu.uploadId };
   }
@@ -864,6 +872,8 @@ async function finish(
           createdBy: uploader.id,
         }));
       } catch (error) {
+        // `replaceVersion`'s own refusals (not found, pending, blocked) — every one definitive, thrown
+        // by its checks and never by a statement. Anything else is not a refusal.
         if (error instanceof QueryError) throw new ReplaceRefused();
         throw error;
       }
@@ -1149,7 +1159,9 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
           recorded.map((part) => ({ n: part.n, etag: part.etag })),
         );
       } catch (error) {
-        await giveUp("store");
+        // Not a definitive answer (the store cannot be told apart from a 5xx): nothing is aborted;
+        // the session stays `completing` with its parts for the stale-upload job.
+        captureError(error, { kind: "upload_store_complete" });
         throw error;
       }
       assembled = true;
@@ -1204,8 +1216,8 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       }
       return place;
     } catch (error) {
-      // A refusal of the app's own — also one the driver wrapped (`asQueryError` finds it).
-      if (error instanceof AppError || asQueryError(error)) await giveUp("recheck");
+      // A definitive refusal only — also one the driver wrapped (`asQueryError` finds it).
+      if (definitive(error)) await giveUp("recheck");
       throw error;
     }
   };
