@@ -1,7 +1,7 @@
 // POST /nodes/:id/trash, POST /nodes/:id/restore and GET /trash: who may, what is marked, what
 // comes back — through the real app, against rows this file made.
 import { and, eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
   RestoreNodeResponse,
   TrashItemDto,
@@ -29,7 +29,11 @@ import {
   setNode,
   testDb,
   type Caller,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "in step": a "delete forever" here is not held by a rollback.
+beforeAll(generationInStep);
 
 const POST = { method: "POST" } as const;
 const as = (user: Awaited<ReturnType<typeof member>>): Caller => ({ user });

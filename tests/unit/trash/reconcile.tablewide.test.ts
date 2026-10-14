@@ -15,7 +15,7 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import { reconcileUsedBytes } from "../../../src/worker/db/queries/quota";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import { trash as trashQuery } from "../../../src/worker/db/queries/trash";
-import { userIdsAfter } from "../../../src/worker/db/queries/trash-jobs";
+import { advanceGenerationRow, userIdsAfter } from "../../../src/worker/db/queries/trash-jobs";
 import { nodes, settings as settingsTable } from "../../../src/worker/db/schema";
 import { purgeRoot } from "../../../src/worker/jobs/purge";
 import {
@@ -23,6 +23,7 @@ import {
   detectRollback,
   job as reconcileJob,
   GENERATION_KEY,
+  ROLLBACK_MAIL_EVERY_MS,
   ORPHAN_AREAS,
   readCursor,
   reconcileQuotas,
@@ -442,8 +443,9 @@ describe("reconcile: the orphan sweep", () => {
       await run();
       expect(await present(p.orphans)).toEqual(p.orphans);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "7"]);
+      // Recorded at every reading; mailed once — the transition — not at every run.
       expect(alerts()).toHaveLength(2);
-      expect(mails()).toHaveLength(2);
+      expect(mails()).toHaveLength(1);
 
       // The operator has looked, and moves the database's number up to the object's.
       await generations(7, 7);
@@ -627,6 +629,81 @@ describe("reconcile: the orphan sweep", () => {
         expect(await advanceGeneration(ctx.bg, { state: "rollback" })).toBe(false);
         await generations(5, 5);
       });
+    });
+
+    it("the mail: at once on the transition into a rollback, then at most every 6 hours while it lasts — the record at every reading; over, the next one mails at once", async () => {
+      const mailedAt = async (hoursAgo: number) => {
+        const stored = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<
+          string,
+          unknown
+        >;
+        await setSetting(
+          testDb(),
+          "reconcileCursor",
+          { ...stored, rollbackMailedAt: new Date(Date.now() - hoursAgo * HOUR).toISOString() },
+          null,
+        );
+      };
+      const rows = async () => (await audits("system.database_rollback", "reconcile")).length;
+      const before = await rows();
+      await generations(5, 7);
+      const reading = async () => (await detectRollback(jobContext().bg)).state;
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(1);
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(1);
+      // Five hours after the last mail: still none. Seven: the reminder.
+      await mailedAt(5);
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(1);
+      await mailedAt(7);
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(2);
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(2);
+      // Every reading is recorded: the report and the audit row.
+      expect(alerts()).toHaveLength(5);
+      expect((await rows()) - before).toBe(5);
+      expect(ROLLBACK_MAIL_EVERY_MS).toBe(6 * HOUR);
+      // Over (the operator levelled the numbers, keeping the rest of the value) — and a new
+      // rollback mails at once.
+      const stored = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<
+        string,
+        unknown
+      >;
+      await setSetting(testDb(), "reconcileCursor", { ...stored, generation: 7 }, null);
+      expect(await reading()).toBe("ok");
+      const after = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<string, unknown>;
+      expect("rollbackMailedAt" in after).toBe(false);
+      await env.FILES.put(GENERATION_KEY, "8");
+      expect(await reading()).toBe("rollback");
+      expect(mails()).toHaveLength(3);
+      await generations(8, 8);
+    });
+
+    it("the read order — object first, then the database: a count landing between the two reads is no rollback", async () => {
+      await generations(5, 5);
+      let counted = false;
+      // A writer counts in between: the database first, then the object — as advanceGeneration does.
+      const racing = new Proxy(env.FILES, {
+        get: (target, name) =>
+          name === "get"
+            ? async (key: string, options?: R2GetOptions) => {
+                const found = await target.get(key, options);
+                if (key !== GENERATION_KEY || counted || !found || !("body" in found)) return found;
+                const text = await found.text();
+                counted = true;
+                expect(await advanceGenerationRow(testDb(), 5)).toBe(true);
+                await target.put(GENERATION_KEY, "6");
+                return { ...found, body: new Response(text).body, text: async () => text };
+              }
+            : Reflect.get(target, name, target),
+      });
+      const ctx = jobContext({ env: { FILES: racing } });
+      expect(await detectRollback(ctx.bg)).toEqual({ state: "ok", database: 6 });
+      expect(counted).toBe(true);
+      expect(alerts()).toHaveLength(0);
+      await generations(6, 6);
     });
 
     it("the generation object is outside every swept area", () => {

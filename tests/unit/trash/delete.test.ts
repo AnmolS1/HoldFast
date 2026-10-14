@@ -1,7 +1,7 @@
 // DELETE /nodes/:id and DELETE /trash: permanent deletion as its owner sees it — what goes, what
 // is recorded with it, and that a hold changes nothing the owner can observe. Rows this file made.
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { EmptyTrashResponse, TrashResponse } from "../../../src/shared/schemas/node";
 import { setNodeLegalHold } from "../../../src/worker/db/queries/moderation";
 import { usageBreakdown } from "../../../src/worker/db/queries/quota";
@@ -38,7 +38,11 @@ import {
   usedBytes,
   versionsLeft,
   type Caller,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "in step": a "delete forever" here is not held by a rollback.
+beforeAll(generationInStep);
 
 const POST = { method: "POST" } as const;
 const DELETE = { method: "DELETE" } as const;

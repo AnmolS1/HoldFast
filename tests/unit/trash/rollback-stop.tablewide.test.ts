@@ -19,7 +19,11 @@ import { runJob, runScheduled } from "../../../src/worker/jobs/index";
 import { GENERATION_KEY, readCursor, runReconcile } from "../../../src/worker/jobs/reconcile";
 import { keyFor } from "../../../src/worker/services/storage";
 import {
+  api,
+  audits,
   cronEvent,
+  envelope,
+  makeFolder,
   generationInStep,
   jobContext,
   makeFile,
@@ -154,5 +158,76 @@ describe("a detected rollback stops every job that destroys", () => {
       });
     },
     3 * SLOTS.length * REAL_RUN_MS,
+  );
+});
+
+describe('a user\'s "delete forever" while the database reads as rolled back', () => {
+  const DELETE = { method: "DELETE" } as const;
+  /** An owner with a trashed file (100 bytes, its object stored) and a trashed empty folder. */
+  async function trashed() {
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const stored = await storeFile(file);
+    const folder = await makeFolder(owner.id);
+    for (const id of [file.id, folder.id]) await trashQuery(testDb(), id, owner.id);
+    return { caller: { user: owner }, owner, file, stored, folder };
+  }
+
+  it(
+    "takes the held path: nothing goes, the answer is an ordinary delete's, the request is recorded; levelled, the purge job finishes it",
+    async () => {
+      const database = await generationInStep();
+      const rolled = await trashed();
+      const normal = await trashed();
+      const emptied = await trashed();
+
+      await env.FILES.put(GENERATION_KEY, String(database + 1));
+      const a = {
+        file: await api(rolled.caller, `/nodes/${rolled.file.id}`, DELETE),
+        folder: await api(rolled.caller, `/nodes/${rolled.folder.id}`, DELETE),
+      };
+      const all = await api(emptied.caller, "/trash", DELETE);
+      await env.FILES.put(GENERATION_KEY, String(database));
+      const b = {
+        file: await api(normal.caller, `/nodes/${normal.file.id}`, DELETE),
+        folder: await api(normal.caller, `/nodes/${normal.folder.id}`, DELETE),
+      };
+
+      // The un-held twin is gone; the rolled-back one is not.
+      expect(await nodeById(normal.file.id)).toBeNull();
+      expect(await objectExists(normal.stored.object)).toBe(false);
+      for (const t of [rolled, emptied]) {
+        expect(await nodeById(t.file.id)).not.toBeNull();
+        expect(await nodeById(t.folder.id)).not.toBeNull();
+        expect(await objectExists(t.stored.object)).toBe(true);
+        expect((await audits("node.purge", t.file.id)).length).toBe(0);
+        expect((await audits("node.purge_requested", t.file.id)).length).toBe(1);
+        // To its owner it is deleted: not listed, an unknown id.
+        expect((await api(t.caller, "/trash")).body).toEqual({ items: [], nextCursor: null });
+      }
+      expect(all.status).toBe(204);
+      // The same answer as an ordinary delete: status, body, every header. The statement count
+      // is pinned, not equal: the held path undoes the deletes with a savepoint (two statements)
+      // and adds the marker (one), where an ordinary delete gives bytes back (one, when there
+      // are any) and writes `node.purge` (one) — a file costs one more, an empty folder two. A
+      // residual of the m10 kind; only response time carries it.
+      for (const [rolledBack, ordinary, extra] of [
+        [a.file, b.file, 1],
+        [a.folder, b.folder, 2],
+      ] as const) {
+        expect(rolledBack.status).toBe(204);
+        expect([envelope(rolledBack), rolledBack.headers]).toEqual([envelope(ordinary), ordinary.headers]);
+        expect(rolledBack.statements - ordinary.statements).toBe(extra);
+      }
+      // Levelled (the operator's step): the purge job finishes both requests.
+      const job = jobContext();
+      await runJob("purge", job.bg, { softDeadlineMs: 120_000 });
+      for (const t of [rolled, emptied]) {
+        expect(await nodeById(t.file.id)).toBeNull();
+        expect(await nodeById(t.folder.id)).toBeNull();
+        expect(await objectExists(t.stored.object)).toBe(false);
+      }
+    },
+    REAL_RUN_MS,
   );
 });

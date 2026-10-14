@@ -16,7 +16,8 @@
 // listing, and `not_found` by id here, for itself and for everything under it, as a purged id
 // is: the same answer for the same number of statements (`requireKnown`). The purge job
 // finishes the delete by itself once the hold is released. The request leaves the same audit
-// row either way (`node.purge_requested`), written in the transaction that acts on it.
+// row either way (`node.purge_requested`), written in the transaction that acts on it. While the
+// database reads as rolled back (jobs/reconcile.ts, the detector) every root takes that held path.
 //
 // A RESTORE THAT CANNOT HAPPEN NOW has one answer, `409 conflict` with no detail — whether the
 // folder it was in is in the trash and the caller is not the owner, or the node would leave a
@@ -36,7 +37,8 @@ import { countTrash, purgeWasRequested, requestPurge } from "../db/queries/trash
 import { effectiveAccess, effectiveTrashed, lockOwnerTree } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node } from "../db/schema";
-import { purgeRoot, recordPurgeRequest } from "../jobs/purge";
+import { purgeRoot, recordPurgeRequest, requestInstead } from "../jobs/purge";
+import { readsRolledBack } from "../jobs/reconcile";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { now } from "../services/clock";
@@ -111,10 +113,14 @@ const isTrashedRoot = (node: Node) => node.trashedRoot && node.deletedAt !== nul
  * marker on the root and the `node.purge_requested` row, in ONE transaction (the same row an
  * un-held delete writes beside its deletes — `purgeRoot`). So no request is acted on without its
  * record, and a held root's request leaves the trace an un-held one does.
+ * While the database reads as rolled back (`rolledBack`: a restore, so a hold placed after the
+ * restore point may be missing), EVERY root takes the held path; the purge job — stopped too until
+ * an operator clears the rollback — finishes it afterwards.
  * False when it was no trashed root any more by the time a transaction held it (restored in this
  * instant): nothing was deleted, nothing recorded.
  */
-async function purgeOne(c: Context<AppEnv>, rootId: string): Promise<boolean> {
+async function purgeOne(c: Context<AppEnv>, rootId: string, rolledBack: boolean): Promise<boolean> {
+  if (rolledBack) return requestInstead(c, rootId);
   const result = await purgeRoot(c, rootId, "user");
   if (result.outcome === "skipped") return false;
   if (result.outcome !== "held") return true;
@@ -141,12 +147,14 @@ router.delete("/trash", async (c) => {
   // When the request began, by the one server clock (services/clock.ts) — which a test may set
   // for its own request, and nothing else can: there is no other way to move this deadline.
   const stopAt = now(c).getTime() + EMPTY_TRASH_DEADLINE_MS;
+  // Once per request, asked whatever the answer (the same statements either way).
+  const rolledBack = await readsRolledBack(c.env, db(c));
   for (;;) {
     // Always the first page: a root that was purged, or marked as requested, has left the listing.
     const page = await listTrash(db(c), user.id, { limit: EMPTY_TRASH_BATCH });
     if (page.items.length === 0) return c.body(null, 204);
     for (const root of page.items) {
-      await purgeOne(c, root.id);
+      await purgeOne(c, root.id, rolledBack);
       if (Date.now() < stopAt) continue;
       const remaining = await countTrash(db(c), user.id);
       if (remaining === 0) return c.body(null, 204);
@@ -217,6 +225,6 @@ router.delete(`/nodes/${ID}`, async (c) => {
   await requireKnown(c, id, "owner");
   const node = await knownNode(c, id);
   if (!isTrashedRoot(node)) throw refused();
-  if (!(await purgeOne(c, id))) throw refused();
+  if (!(await purgeOne(c, id, await readsRolledBack(c.env, db(c))))) throw refused();
   return c.body(null, 204);
 });

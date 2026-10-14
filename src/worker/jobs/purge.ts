@@ -22,7 +22,7 @@ import type { Context } from "hono";
 import type { Db, Tx } from "../db/client";
 import { LegalHoldError, pgError } from "../db/errors";
 import { release } from "../db/queries/quota";
-import { lockTreeForPurge, type PurgeRule } from "../db/queries/trash-jobs";
+import { lockTreeForPurge, requestPurge, type PurgeRule } from "../db/queries/trash-jobs";
 import {
   type DeletedRows,
   deleteSubtreeRows,
@@ -162,6 +162,36 @@ export async function purgeRoot(
       );
     },
   );
+}
+
+/** Thrown inside the savepoint of `requestInstead`: undoes the deletes it just made. */
+class Undo extends Error {}
+
+/**
+ * A user's "delete forever" while the database reads as rolled back (a restore: what it says
+ * about holds may be out of date): nothing goes. The root is locked and its deletes are made as
+ * an un-held delete makes them — inside a savepoint that is then rolled back — and in the SAME
+ * transaction the root gets the purge-request marker and its `node.purge_requested` row: the
+ * held path, by the work of an ordinary delete as near as one transaction allows (it answers
+ * exactly as one does; the statement counts are pinned in the tests). The purge job finishes it
+ * once the rollback is cleared. False when it was no trashed root any more (restored meanwhile).
+ */
+export async function requestInstead(c: Context<AppEnv>, rootId: string): Promise<boolean> {
+  return inTransaction(c, async (tx) => {
+    if (!(await lockTreeForPurge(tx, rootId, RULES.user))) return false;
+    try {
+      await tx.transaction(async (savepoint) => {
+        await deleteSubtreeRows(savepoint, rootId);
+        throw new Undo();
+      });
+    } catch (error) {
+      // A held root is refused by the gate itself: undone the same way.
+      if (!(error instanceof Undo) && !(error instanceof LegalHoldError)) throw error;
+    }
+    if ((await requestPurge(tx, [rootId])) === 0) return false;
+    await recordPurgeRequest(tx, c, rootId);
+    return true;
+  });
 }
 
 /**

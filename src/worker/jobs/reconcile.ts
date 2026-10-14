@@ -34,9 +34,11 @@
 //   object  <= database    normal (the database ahead means an object write failed: it is
 //                          written again at the next count).
 //   cannot read either     `unknown`: nothing is destroyed this slot (no alert: it is no rollback).
-// On a rollback the operator is alerted and it is counted (`rollback_detected`), once per slot,
-// and NOTHING is destroyed — purge, account purge, retention, stale uploads, orphans — by this
-// slot or any later one, and the number is not counted up, until an operator brings the two
+// On a rollback it is recorded at every reading (`rollback_detected`, the report, a
+// `system.database_rollback` audit row), the operators are mailed on the transition into it and
+// then at most every 6 hours, and NOTHING is destroyed — purge, account purge, retention, stale uploads, orphans — by this
+// slot or any later one — nor by a user's "delete forever", which takes the held path (marker,
+// same answer; routes/trash.ts) — and the number is not counted up, until an operator brings the two
 // numbers level, deliberately, after looking. The non-destructive jobs and the quota half run.
 // Writers: the database is counted up by compare-and-set only (from the number that was read),
 // then the object is written; both writers hold one job lock (`GENERATION_LOCK`), so two runs do
@@ -47,11 +49,14 @@
 // Rows first, objects second everywhere else is what makes an unreferenced old object garbage:
 // a purge deletes its rows and then its objects, an upload writes its session row first.
 
+import type { Executor } from "../db/client";
 import { getSettings } from "../db/queries/settings";
 import { reconcileUsedBytes } from "../db/queries/quota";
 import {
   advanceGenerationRow,
+  clearRollbackMailed,
   knownVersions,
+  markRollbackMailed,
   referencedKeys,
   saveReconcilePlace,
   userIdsAfter,
@@ -137,34 +142,81 @@ async function writeGeneration(env: Env, generation: number): Promise<void> {
   await storage(env).put(GENERATION_KEY, body, { size: body.byteLength, contentType: "text/plain" });
 }
 
+/** How the two numbers read: the one rule for the jobs and for a request. */
+function classify(object: number | null, database: number): "ok" | "first" | "rollback" {
+  if (object === null && database === 0) return "first";
+  // A missing object while the database has counted, an unreadable one, or one ahead.
+  return object !== null && object <= database ? "ok" : "rollback";
+}
+
+/** A rollback mails the operators at once, then at most this often while it lasts. */
+export const ROLLBACK_MAIL_EVERY_MS = 6 * 3_600_000;
+
+/** When the operators were last mailed about the rollback that is going on (cursor field). */
+function lastMailed(stored: unknown): number | null {
+  const at =
+    stored && typeof stored === "object" ? (stored as { rollbackMailedAt?: unknown }).rollbackMailedAt : null;
+  const time = typeof at === "string" ? Date.parse(at) : Number.NaN;
+  return Number.isFinite(time) ? time : null;
+}
+
 /**
- * Compares the object's generation with the database's — the object first. Never throws: what
- * cannot be read is `unknown` (reported and counted). A rollback alerts here, once per reading.
+ * Compares the object's generation with the database's — the object FIRST: a writer counts the
+ * database up first and the object after, so a count in flight reads "database ahead" (normal),
+ * never "object ahead". Never throws: what cannot be read is `unknown` (reported and counted).
+ * A rollback is recorded at every reading (the metric, the report, a `system.database_rollback`
+ * audit row) and MAILED on the transition into it, then at most every 6 hours while it lasts.
  */
 export async function detectRollback(bg: BackgroundContext): Promise<Detection> {
   let object: number | null;
-  let database: number;
+  let stored: unknown;
   try {
     object = await storedGeneration(bg.env);
-    database = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor).generation;
+    stored = (await getSettings(bg.db, { fresh: true })).reconcileCursor;
   } catch (error) {
     captureError(error, { kind: "job", job: "reconcile", reason: "detector" });
     bg.metric("job", { kind: "reconcile", outcome: "detector_error" });
     return { state: "unknown" };
   }
-  if (object === null && database === 0) {
+  const database = readCursor(stored).generation;
+  const mailed = lastMailed(stored);
+  const state = classify(object, database);
+  if (state === "first") {
     try {
       await writeGeneration(bg.env, 0);
     } catch (error) {
       // Written at the first count instead.
       captureError(error, { kind: "job", job: "reconcile" });
     }
-    return { state: "first", database };
+    return { state, database };
   }
-  if (object !== null && object <= database) return { state: "ok", database };
+  if (state === "ok") {
+    // Over: the next rollback is a transition again, and mails at once.
+    if (mailed !== null) await clearRollbackMailed(bg.db);
+    return { state, database };
+  }
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
-  await alertRollback(bg);
+  await recordRollback(bg, object, database);
+  if (mailed === null || Date.now() - mailed >= ROLLBACK_MAIL_EVERY_MS) {
+    if (await mailRollback(bg)) await markRollbackMailed(bg.db, new Date());
+  }
   return { state: "rollback" };
+}
+
+/**
+ * For a request (a user's "delete forever"): does the database read as rolled back? Read the
+ * way `detectRollback` reads — the object first — and FAIL CLOSED: what cannot be read is a
+ * rollback here. Writes, counts and alerts nothing (the jobs do); one settings statement.
+ */
+export async function readsRolledBack(env: Env, db: Executor): Promise<boolean> {
+  try {
+    const object = await storedGeneration(env);
+    const database = readCursor((await getSettings(db, { fresh: true })).reconcileCursor).generation;
+    return classify(object, database) === "rollback";
+  } catch (error) {
+    captureError(error, { kind: "purge_rollback_check" });
+    return true;
+  }
 }
 
 /**
@@ -200,24 +252,48 @@ export async function advanceGeneration(bg: BackgroundContext, detection: Detect
 }
 
 /**
- * The operator's alert for a database that is older than the object store. ONE call site: the
- * critical mail to every operator (sent at once, never counted or coalesced), and the report.
- * Awaited: nothing a job starts may outlive it. A mail that cannot be sent changes nothing —
- * the jobs stay stopped, and the next reading alerts again.
+ * The record of one rollback reading — every reading: the report and an audit row (in a
+ * transaction of its own; a failure is reported, never thrown: the jobs stay stopped anyway).
  */
-async function alertRollback(bg: BackgroundContext): Promise<void> {
+async function recordRollback(bg: BackgroundContext, object: number | null, database: number): Promise<void> {
   captureError(
     new Error("reconcile: the database is older than the object store; every destructive job is stopped"),
     { kind: "job", job: "reconcile", reason: "rollback_detected" },
   );
+  try {
+    await bg.db.transaction((tx) =>
+      auditInTx(
+        tx,
+        bg,
+        "system.database_rollback",
+        { type: "job", id: "reconcile" },
+        { database, object: object === null || Number.isNaN(object) ? null : object },
+      ),
+    );
+  } catch (error) {
+    captureError(error, { kind: "job", job: "reconcile" });
+  }
+}
+
+/**
+ * The critical mail to every operator, sent at once (never counted or coalesced). ONE call
+ * site. Awaited: nothing a job starts may outlive it. True when at least one was handed over;
+ * when none was, the next reading mails again.
+ */
+async function mailRollback(bg: BackgroundContext): Promise<boolean> {
   const operators = [...adminListOf(bg.env).addresses];
-  await Promise.all(
+  const sent = await Promise.all(
     operators.map((to) =>
-      sendOperatorCritical(bg, { to, event: "database_rollback" }).catch((error: unknown) => {
-        captureError(error, { kind: "job", job: "reconcile" });
-      }),
+      sendOperatorCritical(bg, { to, event: "database_rollback" }).then(
+        () => true,
+        (error: unknown) => {
+          captureError(error, { kind: "job", job: "reconcile" });
+          return false;
+        },
+      ),
     ),
   );
+  return sent.includes(true);
 }
 
 // ── quota ───────────────────────────────────────────────────────────────────────────────────

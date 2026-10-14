@@ -5,7 +5,7 @@
 // twin, made the same way by an owner with the same tree: status, body, EVERY response header,
 // and the number of SQL statements sent before the answer existed — with ONE exception, which
 // has a case of its own below: the statement count of the "delete forever" request itself.
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { countTrash } from "../../../src/worker/db/queries/trash-jobs";
 import {
@@ -22,7 +22,11 @@ import {
   testDb,
   type Answer,
   type Caller,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "in step": a "delete forever" here is not held by a rollback.
+beforeAll(generationInStep);
 
 const POST = { method: "POST" } as const;
 const DELETE = { method: "DELETE" } as const;

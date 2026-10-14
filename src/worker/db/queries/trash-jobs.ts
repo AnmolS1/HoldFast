@@ -452,6 +452,23 @@ export async function saveReconcilePlace(
   clearSettingsCache();
 }
 
+/** Notes when the operators were last mailed about the rollback going on (kept by the merges). */
+export async function markRollbackMailed(db: Executor, at: Date): Promise<void> {
+  const fields = sql`jsonb_build_object('rollbackMailedAt', ${at.toISOString()}::text)`;
+  await db.execute(sql`
+    INSERT INTO settings (key, value, updated_by) VALUES (${CURSOR_KEY}, ${fields}, NULL)
+    ON CONFLICT (key) DO UPDATE SET value = ${storedObject} || ${fields}, updated_by = NULL, updated_at = now()`);
+  clearSettingsCache();
+}
+
+/** The rollback is over: the next one mails at once. */
+export async function clearRollbackMailed(db: Executor): Promise<void> {
+  await db.execute(sql`
+    UPDATE settings SET value = settings.value - 'rollbackMailedAt', updated_at = now()
+    WHERE key = ${CURSOR_KEY} AND jsonb_typeof(settings.value) = 'object' AND settings.value ? 'rollbackMailedAt'`);
+  clearSettingsCache();
+}
+
 /**
  * Counts the database's generation up from `from` — only if it is still `from` (compare-and-
  * set). True when this call moved it. A run that read its number before someone else moved it —
