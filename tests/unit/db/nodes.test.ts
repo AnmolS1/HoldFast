@@ -1,6 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Db } from "../../../src/worker/db/client";
+import { type Db, statementsSent } from "../../../src/worker/db/client";
 import { QueryError } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { restoreTakedown, takedownNode } from "../../../src/worker/db/queries/moderation";
@@ -13,6 +13,7 @@ import {
   listRecent,
   listStarred,
   move,
+  moveNode,
   type NodeSort,
   OWNER_VISIBLE_STATUSES,
   rename,
@@ -25,6 +26,7 @@ import {
   type SortDir,
   touchAccessed,
 } from "../../../src/worker/db/queries/nodes";
+import { trash } from "../../../src/worker/db/queries/trash";
 import { type Node, nodes, nodeVersions, type ScanStatus, user } from "../../../src/worker/db/schema";
 import {
   makeFile,
@@ -660,6 +662,83 @@ describe("createFolder, rename, move", () => {
     await expectCode(move(db, file.id, bin.id), "not_found");
   });
 
+  // A node that is hidden — taken down itself or by a folder above it, or locked — does not
+  // exist for a move, as a node or as a target: moved out, it would no longer be under what hides it.
+  it("move refuses a hidden node and a hidden target, and writes nothing", async () => {
+    const owner = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const down = await makeFolder(db, owner, null, `down-${rand()}`, {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const sub = await makeFolder(db, owner, down.id, "sub");
+    const inside = await makeFile(db, owner, down.id, "inside.txt");
+    const deep = await makeFile(db, owner, sub.id, "deep.txt");
+    const own = await makeFile(db, owner, live.id, "own.txt", {
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(db, owner, live.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const free = await makeFile(db, owner, live.id, "free.txt");
+    const before = async (ids: string[]) =>
+      Promise.all(
+        ids.map(async (id) => [(await getNode(db, id))!.parentId, (await getNode(db, id))!.updatedAt]),
+      );
+    const all = [down.id, sub.id, inside.id, deep.id, own.id, locked.id, free.id];
+    const was = await before(all);
+
+    for (const node of [inside, deep, sub, down, own, locked]) {
+      await expectCode(moveNode(db, node.id, null), "not_found");
+      await expectCode(moveNode(db, node.id, live.id), "not_found");
+    }
+    // Within the hidden folder, and to where it already is: the same answer, not a quiet no-op.
+    await expectCode(moveNode(db, deep.id, down.id), "not_found");
+    await expectCode(moveNode(db, inside.id, down.id), "not_found");
+    await expectCode(moveNode(db, own.id, live.id), "not_found");
+    // Into a hidden folder, or into a folder under one.
+    await expectCode(moveNode(db, free.id, down.id), "not_found");
+    await expectCode(moveNode(db, free.id, sub.id), "not_found");
+    await expectCode(move(db, free.id, sub.id), "not_found");
+    expect(await before(all)).toEqual(was);
+
+    // The control: the same moves once the takedown is lifted.
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, down.id));
+    expect(await moveNode(db, free.id, sub.id)).toMatchObject({
+      node: { id: free.id, parentId: sub.id },
+      previousParentId: live.id,
+      changed: true,
+    });
+    expect((await move(db, inside.id, null)).parentId).toBeNull();
+  });
+
+  it("moveNode says where the node was, and whether anything changed", async () => {
+    const owner = await makeUser(db);
+    const from = await makeFolder(db, owner, null, `from-${rand()}`);
+    const to = await makeFolder(db, owner, null, `to-${rand()}`);
+    const file = await makeFile(db, owner, from.id, "note.txt");
+
+    const moved = await moveNode(db, file.id, to.id);
+    expect(moved).toMatchObject({ previousParentId: from.id, changed: true, node: { parentId: to.id } });
+    // The same request again: nothing is written, and the caller is told so.
+    const again = await moveNode(db, file.id, to.id);
+    expect(again).toMatchObject({ previousParentId: to.id, changed: false, node: { parentId: to.id } });
+    expect(again.node.updatedAt.getTime()).toBe(moved.node.updatedAt.getTime());
+    // To the top level and back to it.
+    expect(await moveNode(db, file.id, null)).toMatchObject({ previousParentId: to.id, changed: true });
+    expect(await moveNode(db, file.id, null)).toMatchObject({ previousParentId: null, changed: false });
+    // `move` is the same move, the row only.
+    expect(await move(db, file.id, from.id)).toMatchObject({ id: file.id, parentId: from.id });
+    // Two moves of one node at once: each reports the parent IT found, so the two rows chain.
+    const [one, two] = await Promise.all([moveNode(db, file.id, to.id), moveNode(db, file.id, null)]);
+    const first = one.previousParentId === from.id ? one : two;
+    const second = first === one ? two : one;
+    expect(first).toMatchObject({ previousParentId: from.id, changed: true });
+    expect(second).toMatchObject({ previousParentId: first.node.parentId, changed: true });
+  });
+
   it("concurrent moves cannot build a cycle", async () => {
     const owner = await makeUser(db);
     const x = await makeFolder(db, owner, null, `x-${rand()}`);
@@ -723,6 +802,329 @@ describe("small writes", () => {
       .where(eq(nodes.id, file.id));
     expect(await requestRescan(db, file.id)).toBe(true);
     expect(await requestRescan(db, uuidv7())).toBe(false);
+  });
+});
+
+// A hidden node — taken down itself or by a folder above it, or locked as suspected CSAM — is not
+// written to by the small writers either, whatever their caller read a moment before.
+describe("a hidden node is not written to", () => {
+  /** live/ { plain.txt, own.txt (taken down), locked.jpg (csam) }   down/ (taken down) { sub/ { deep.txt }, inside.txt } */
+  async function hiddenFamily() {
+    const owner = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const plain = await makeFile(db, owner, live.id, "plain.txt", { scanStatus: "clean" });
+    const own = await makeFile(db, owner, live.id, "own.txt", {
+      scanStatus: "clean",
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(db, owner, live.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const down = await makeFolder(db, owner, null, `down-${rand()}`, {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const sub = await makeFolder(db, owner, down.id, "sub");
+    const inside = await makeFile(db, owner, down.id, "inside.txt", { scanStatus: "clean" });
+    const deep = await makeFile(db, owner, sub.id, "deep.txt", { scanStatus: "clean" });
+    return { owner, live, plain, down, sub, hidden: [own, locked, down, sub, inside, deep] };
+  }
+  const rowOf = async (id: string) => (await db.select().from(nodes).where(eq(nodes.id, id)))[0]!;
+
+  it("rename, setStar and touchAccessed: not_found / false, and the row is as it was", async () => {
+    const f = await hiddenFamily();
+    for (const node of f.hidden) {
+      const before = await rowOf(node.id);
+      await expectCode(rename(db, node.id, `renamed-${rand()}.txt`), "not_found");
+      expect(await setStar(db, node.id, true), node.name).toBe(false);
+      expect(await touchAccessed(db, node.id), node.name).toBe(false);
+      expect(await rowOf(node.id), node.name).toEqual(before);
+    }
+    // The control, in the same run: a visible node beside them, and the same nodes once visible.
+    expect((await rename(db, f.plain.id, "plain-2.txt")).name).toBe("plain-2.txt");
+    expect(await setStar(db, f.plain.id, true)).toBe(true);
+    expect(await touchAccessed(db, f.plain.id)).toBe(true);
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    const deep = f.hidden[5]!;
+    expect((await rename(db, deep.id, "deep-2.txt")).name).toBe("deep-2.txt");
+    expect(await setStar(db, deep.id, true)).toBe(true);
+    expect(await touchAccessed(db, deep.id)).toBe(true);
+  });
+
+  it("createFolder: a hidden parent is not_found — also when the name is taken there", async () => {
+    const f = await hiddenFamily();
+    for (const parent of [f.down, f.sub]) {
+      const args = { ownerId: f.owner, createdBy: f.owner, parentId: parent.id };
+      await expectCode(createFolder(db, { ...args, name: `new-${rand()}` }), "not_found");
+      // `sub` and `deep.txt` hold these names: the answer must not say so.
+      await expectCode(
+        createFolder(db, { ...args, name: parent.id === f.down.id ? "sub" : "deep.txt" }),
+        "not_found",
+      );
+    }
+    const children = await db.select({ id: nodes.id }).from(nodes).where(eq(nodes.parentId, f.sub.id));
+    expect(children).toHaveLength(1);
+    // The control: beside them, and inside once the takedown is lifted.
+    expect(
+      (await createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId: f.live.id, name: "ok" }))
+        .parentId,
+    ).toBe(f.live.id);
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    expect(
+      (await createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId: f.sub.id, name: "ok" }))
+        .parentId,
+    ).toBe(f.sub.id);
+  });
+
+  it("replaceVersion: a file inside a taken-down folder is not_found, like one taken down itself", async () => {
+    const f = await hiddenFamily();
+    const next = () => ({
+      r2Key: `u/${f.owner}/x/${rand(8)}`,
+      versionId: rand(8),
+      size: 9,
+      sha256: "new-hash",
+      createdBy: f.owner,
+    });
+    for (const node of f.hidden.filter((n) => n.kind === "file")) {
+      const before = await rowOf(node.id);
+      await expectCode(
+        db.transaction((tx) => replaceVersion(tx, node.id, next())),
+        "not_found",
+      );
+      expect(await rowOf(node.id), node.name).toEqual(before);
+      expect(await db.select().from(nodeVersions).where(eq(nodeVersions.nodeId, node.id))).toHaveLength(0);
+    }
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.down.id));
+    const deep = f.hidden[5]!;
+    expect(await db.transaction((tx) => replaceVersion(tx, deep.id, next()))).toEqual({
+      previousVersionId: deep.versionId,
+    });
+  });
+
+  it("requestRescan is the throttle only: it does not decide on hidden (enqueueRescan does, on the locked row)", async () => {
+    const f = await hiddenFamily();
+    // Stated, so that a change of this is a decision: false would read as "throttled" to the route.
+    expect(await requestRescan(db, f.hidden[0]!.id)).toBe(true);
+  });
+});
+
+// Hidden must answer EXACTLY as an id that was never issued: the same error, in the same order of
+// checks, for the same number of statements — in the writers too, for the instant in which a
+// node is hidden after its caller looked.
+describe("no oracle for a hidden node in the writers", () => {
+  /**
+   * live/ { plain.txt, own.txt (taken down), locked.jpg (csam), binned.txt (trashed), outer/ { inner/ (taken down) } }
+   * down/ (taken down) { sub/ { deep.txt }, inside.txt }      elsewhere/      other owner: foreign/ { theirs.txt }
+   */
+  async function family() {
+    const owner = await makeUser(db);
+    const other = await makeUser(db);
+    const live = await makeFolder(db, owner, null, `live-${rand()}`);
+    const elsewhere = await makeFolder(db, owner, null, `elsewhere-${rand()}`);
+    const plain = await makeFile(db, owner, live.id, "plain.txt", { scanStatus: "clean" });
+    const own = await makeFile(db, owner, live.id, "own.txt", {
+      scanStatus: "clean",
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    const locked = await makeFile(db, owner, live.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const binned = await makeFile(db, owner, live.id, "binned.txt", {
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    const outer = await makeFolder(db, owner, live.id, "outer");
+    const inner = await makeFolder(db, owner, outer.id, "inner", {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const down = await makeFolder(db, owner, null, `down-${rand()}`, {
+      takedownAt: new Date(),
+      takedownReason: "abuse",
+    });
+    const sub = await makeFolder(db, owner, down.id, "sub");
+    const inside = await makeFile(db, owner, down.id, "inside.txt", { scanStatus: "clean" });
+    const deep = await makeFile(db, owner, sub.id, "deep.txt", { scanStatus: "clean" });
+    const avatar = await makeFile(db, owner, null, `avatar-${rand()}`, { system: "avatar" });
+    const foreign = await makeFolder(db, other, null, `foreign-${rand()}`);
+    const theirs = await makeFile(db, other, foreign.id, "theirs.txt", { scanStatus: "clean" });
+    return {
+      owner,
+      live,
+      elsewhere,
+      plain,
+      own,
+      locked,
+      binned,
+      outer,
+      inner,
+      down,
+      sub,
+      inside,
+      deep,
+      avatar,
+      foreign,
+      theirs,
+    };
+  }
+  /** What a call answered — the error's class, code and message — and what it cost. */
+  async function asked(call: () => Promise<unknown>) {
+    const before = statementsSent(db);
+    const answer = await call().then(
+      (value) => ({ value: value === null || typeof value !== "object" ? value : "a row" }),
+      (error: unknown) => ({
+        error: (error as Error).constructor.name,
+        code: (error as QueryError).code,
+        message: (error as Error).message,
+      }),
+    );
+    return { ...answer, statements: statementsSent(db) - before };
+  }
+  const NOT_FOUND = { error: "QueryError", code: "not_found" };
+
+  it("move: a hidden node or target is the unknown id's not_found — same error, same statements, before the cycle is looked for", async () => {
+    const f = await family();
+    // The node: to the top level, and to a folder.
+    for (const target of [null, f.elsewhere.id]) {
+      const unknown = await asked(() => moveNode(db, uuidv7(), target));
+      expect(unknown).toMatchObject(NOT_FOUND);
+      expect(unknown.statements).toBeGreaterThanOrEqual(target === null ? 4 : 5);
+      const nodesAsked = {
+        own: f.own,
+        locked: f.locked,
+        underDown: f.inside,
+        twoDown: f.deep,
+        down: f.down,
+        binned: f.binned,
+        avatar: f.avatar,
+      };
+      for (const [name, node] of Object.entries(nodesAsked)) {
+        expect(await asked(() => moveNode(db, node.id, target)), `${name} → ${target}`).toEqual(unknown);
+      }
+    }
+    // The target, for a node that may be moved.
+    const unknownTarget = await asked(() => moveNode(db, f.plain.id, uuidv7()));
+    expect(unknownTarget).toMatchObject(NOT_FOUND);
+    const targets = {
+      down: f.down,
+      underDown: f.sub,
+      aFile: f.own,
+      locked: f.locked,
+      foreign: f.foreign,
+      binned: f.binned,
+      avatar: f.avatar,
+      itself: f.plain,
+    };
+    for (const [name, target] of Object.entries(targets)) {
+      expect(await asked(() => moveNode(db, f.plain.id, target.id)), `into ${name}`).toEqual(unknownTarget);
+    }
+    // Node AND target wrong: still that answer and that work.
+    expect(await asked(() => moveNode(db, f.own.id, f.down.id))).toEqual(unknownTarget);
+    expect(await asked(() => moveNode(db, uuidv7(), uuidv7()))).toEqual(unknownTarget);
+
+    // A hidden folder INSIDE the folder being moved: "cannot be moved into itself" would say it is
+    // there. It is not_found, as an unknown target is; visible, the same move is the cycle's conflict.
+    expect(await asked(() => moveNode(db, f.outer.id, f.inner.id))).toEqual(
+      await asked(() => moveNode(db, f.outer.id, uuidv7())),
+    );
+    await db.update(nodes).set({ takedownAt: null, takedownReason: null }).where(eq(nodes.id, f.inner.id));
+    expect(await asked(() => moveNode(db, f.outer.id, f.inner.id))).toMatchObject({ code: "conflict" });
+    expect((await getNode(db, f.plain.id))!.parentId).toBe(f.live.id);
+  });
+
+  it("createFolder: a hidden parent is the unknown parent's not_found, for the same two reads", async () => {
+    const f = await family();
+    const into = (parentId: string, name = `new-${rand()}`) =>
+      asked(() => createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId, name }));
+    const unknown = await into(uuidv7());
+    expect(unknown).toMatchObject({ ...NOT_FOUND, statements: 2 });
+    const parents = {
+      down: f.down,
+      underDown: f.sub,
+      innerDown: f.inner,
+      aFile: f.plain,
+      locked: f.locked,
+      foreign: f.foreign,
+      binned: f.binned,
+      avatar: f.avatar,
+    };
+    for (const [name, parent] of Object.entries(parents)) {
+      expect(await into(parent.id), name).toEqual(unknown);
+    }
+    // A name that IS taken inside the hidden folder: the same answer, not the index's.
+    expect(await into(f.down.id, "sub")).toEqual(unknown);
+    expect(await into(f.sub.id, "deep.txt")).toEqual(unknown);
+  });
+
+  it("rename, setStar, touchAccessed, trash: hidden answers as unknown does, for the same statements", async () => {
+    const f = await family();
+    const hidden = { own: f.own, locked: f.locked, underDown: f.inside, twoDown: f.deep, down: f.down };
+    const writers: Record<string, (id: string) => Promise<unknown>> = {
+      rename: (id) => rename(db, id, `renamed-${rand()}.txt`),
+      // To a name a sibling holds: not the index's answer either.
+      renameToTaken: (id) => rename(db, id, "plain.txt"),
+      setStar: (id) => setStar(db, id, true),
+      touchAccessed: (id) => touchAccessed(db, id),
+      trash: async (id) => trash(db, id, f.owner),
+    };
+    for (const [what, write] of Object.entries(writers)) {
+      const unknown = await asked(() => write(uuidv7()));
+      expect(unknown.statements, what).toBeGreaterThanOrEqual(1);
+      for (const [name, node] of Object.entries(hidden)) {
+        expect(await asked(() => write(node.id)), `${what} of ${name}`).toEqual(unknown);
+      }
+    }
+  });
+
+  it("replaceVersion: every not_found — unknown, folder, locked, held, taken down, under a taken-down folder — costs the same reads", async () => {
+    const f = await family();
+    const next = () => ({
+      r2Key: `u/${f.owner}/x/${rand(8)}`,
+      versionId: rand(8),
+      size: 9,
+      sha256: "new-hash",
+      createdBy: f.owner,
+    });
+    const heldFile = await makeFile(db, f.owner, f.live.id, "held.txt", {
+      scanStatus: "clean",
+      legalHold: true,
+    });
+    const replace = (id: string) => asked(() => db.transaction((tx) => replaceVersion(tx, id, next())));
+    const unknown = await replace(uuidv7());
+    expect(unknown).toMatchObject(NOT_FOUND);
+    const targets = {
+      own: f.own,
+      locked: f.locked,
+      underDown: f.inside,
+      twoDown: f.deep,
+      aFolder: f.live,
+      hiddenFolder: f.down,
+      avatar: f.avatar,
+      held: heldFile,
+    };
+    for (const [name, node] of Object.entries(targets)) {
+      expect(await replace(node.id), name).toEqual(unknown);
+    }
+  });
+
+  // THE ONE THING THIS CANNOT HIDE: a name. The unique index knows every live name in a folder,
+  // a hidden sibling's included, and a write that would take that name is the index's `conflict`.
+  // Pinned here so that it is a recorded residual and not a surprise (releasing the name at
+  // takedown is the only way to close it).
+  it("residual, pinned: a name held by a HIDDEN sibling is still a conflict for a visible node's write", async () => {
+    const f = await family();
+    await expectCode(rename(db, f.plain.id, "own.txt"), "conflict");
+    await expectCode(rename(db, f.plain.id, "locked.jpg"), "conflict");
+    await expectCode(
+      createFolder(db, { ownerId: f.owner, createdBy: f.owner, parentId: f.live.id, name: "own.txt" }),
+      "conflict",
+    );
+    const mover = await makeFile(db, f.owner, f.elsewhere.id, "locked.jpg", { scanStatus: "clean" });
+    await expectCode(moveNode(db, mover.id, f.live.id), "conflict");
   });
 });
 
