@@ -209,6 +209,8 @@ describe("the account stamp on the route's history state", () => {
     const navigations: string[] = [];
     const stop = router.subscribe((next) => {
       if (next.navigation.state === "loading") navigations.push(next.navigation.location?.pathname ?? "");
+      // A loop is cut off here, so the test fails on the count below instead of hanging the worker.
+      if (navigations.length > 20) router.dispose();
     });
     act(() => screen.getByText("open sample.svg").click());
     await screen.findByText("sample.svg");
