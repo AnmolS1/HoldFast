@@ -633,9 +633,33 @@ test.describe("previews (mocked API and files host)", () => {
     expectClean(arranged);
   });
 
-  test("the close button, on a cold link, goes to the file's folder", async ({ page, origins }) => {
+  test("the close button, on a cold link, goes to the file's folder — pressed as soon as the file is known", async ({
+    page,
+    origins,
+  }) => {
+    // As on a slow machine (CI): the file's answer comes late, and the replace that records its
+    // folder in the entry is still loading (the frame's loader re-reads a stale session, slowly)
+    // when Close is pressed.
+    await page.clock.install();
     await arrange(page, origins, [NODES.svg]);
+    let releaseFile!: () => void;
+    const fileHeld = new Promise<void>((resolve) => (releaseFile = resolve));
+    await page.route(`**/api/nodes/${ID.svg}`, async (route) => {
+      await fileHeld;
+      await route.fallback();
+    });
+    let slowSession = false;
+    await page.route("**/api/auth/get-session", async (route) => {
+      if (slowSession) await new Promise((resolve) => setTimeout(resolve, 1_500));
+      await route.fallback();
+    });
     await open(page, ID.svg);
+    // The session is past its 15 s by the time the file is known.
+    await page.clock.fastForward(20_000);
+    slowSession = true;
+    releaseFile();
+    // The file is known — what Close needs — and it is pressed at once.
+    await expect(dialog(page)).toHaveAccessibleName("sample.svg");
     await dialog(page).getByRole("button", { name: "Close preview" }).click();
     await expect(dialog(page)).toHaveCount(0);
     await expect(page).toHaveURL(new RegExp(`/folder/${ID.folder}$`));
