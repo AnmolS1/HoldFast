@@ -3,7 +3,7 @@
 // the write — the route answers the ordinary `404 not_found`: not a 500, no audit row, and
 // nothing that tells it from an id that was never issued.
 //
-// A file of its own because it replaces `rename`, `setStar` and `move` for the requests made
+// A file of its own because it replaces `rename`, `setStar` and `moveNode` for the requests made
 // here: each throws on demand what the real helper throws for a missing node.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api, auditFor, comparable, nodeById, sharedTree } from "./helpers";
@@ -23,9 +23,9 @@ vi.mock("../../../src/worker/db/queries/nodes", async (importOriginal) => {
       if (refuse.setStar) throw new Refusal("not_found");
       return real.setStar(...args);
     },
-    move: async (...args: Parameters<typeof real.move>) => {
+    moveNode: async (...args: Parameters<typeof real.moveNode>) => {
       if (refuse.move) throw new Refusal("not_found");
-      return real.move(...args);
+      return real.moveNode(...args);
     },
   };
 });

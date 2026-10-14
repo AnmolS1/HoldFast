@@ -69,21 +69,6 @@ export async function releaseRescan(db: Executor, nodeId: string, previous: Date
   await db.update(nodes).set({ rescanRequestedAt: previous }).where(eq(nodes.id, nodeId));
 }
 
-/**
- * Did THIS transaction re-parent the node? Asked right after T05 `nodes.move(tx, …)`, in the
- * same transaction — so still under the owner's tree lock that `move` took, where no other move
- * of the tree can come between. `move` stamps `updated_at` with the transaction's clock when, and
- * only when, it re-parents (a move to where the node already is returns the row untouched), and
- * `now()` is that same clock for the whole transaction.
- */
-export async function movedInThisTransaction(tx: Executor, nodeId: string): Promise<boolean> {
-  if (!isUuid(nodeId)) return false;
-  const result = await tx.execute<{ moved: boolean }>(
-    sql`SELECT n.updated_at = now() AS moved FROM nodes n WHERE n.id = ${nodeId}`,
-  );
-  return result.rows[0]?.moved === true;
-}
-
 export type ZipRoot = {
   id: string;
   /** The first path segment of everything under this root: its name, made unique by the caller. */

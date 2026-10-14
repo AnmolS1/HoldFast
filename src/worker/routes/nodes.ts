@@ -50,7 +50,8 @@ import {
   createFolder,
   getNode,
   listChildren,
-  move,
+  moveNode,
+  type Moved,
   OWNER_VISIBLE_STATUSES,
   SHARED_VISIBLE_STATUSES,
   UPLOADER_VISIBLE_STATUSES,
@@ -61,7 +62,6 @@ import {
 } from "../db/queries/nodes";
 import {
   liveNameHolder,
-  movedInThisTransaction,
   ownEditorShares,
   releaseRescan,
   zipManifest,
@@ -415,7 +415,7 @@ router.patch(`/nodes/${ID}`, async (c) => {
 });
 
 /**
- * The move itself. `move` takes the owner's tree lock as its first statement, so it is the first
+ * The move itself. `moveNode` takes the owner's tree lock as its first statement, so it is the first
  * thing in the transaction; the transaction is opened — and run again when Postgres ends it as a
  * deadlock victim — by `retryOnDeadlock`. DATABASE STATEMENTS ONLY inside the callback: it may
  * run more than once. The audit row and the metrics come after it has returned.
@@ -425,18 +425,11 @@ router.patch(`/nodes/${ID}`, async (c) => {
  * none of the three can be told from the others. `LegalHoldError` is caught here because
  * nothing may ever show it: not its causes, not that it happened.
  */
-async function moveNode(
-  c: Ctx,
-  nodeId: string,
-  parentId: string | null,
-): Promise<{ node: Node; changed: boolean }> {
+async function moveTo(c: Ctx, nodeId: string, parentId: string | null): Promise<Moved> {
   try {
-    return await retryOnDeadlock(deps(c).db, async (tx) => {
-      const node = await move(tx, nodeId, parentId);
-      // Whether anything moved is decided HERE, under the lock `move` holds — not from what the
-      // request read before the transaction, which another move may have overtaken.
-      return { node, changed: await movedInThisTransaction(tx, nodeId) };
-    });
+    // Where the node was and whether anything moved are decided by `moveNode` under the tree
+    // lock it holds — not from what the request read before, which another move may overtake.
+    return await retryOnDeadlock(deps(c).db, (tx) => moveNode(tx, nodeId, parentId));
   } catch (error) {
     if (error instanceof LegalHoldError) {
       metric("node", { kind: "move", outcome: "refused" });
@@ -459,12 +452,11 @@ router.post(`/nodes/${ID}/move`, async (c) => {
   } else {
     await liveNode(c, body.parentId, "editor");
   }
-  const { node: moved, changed } = await moveNode(c, id, body.parentId);
+  const { node: moved, previousParentId, changed } = await moveTo(c, id, body.parentId);
   // A move to where the node already is changes nothing and is not recorded as one: the same
-  // request sent twice, or raced, is one move and one row. Where it came FROM is not recorded:
-  // the only parent this request knows is the one it read before the lock.
+  // request sent twice, or raced, is one move and one row.
   if (changed) {
-    audit(c, "node.move", target(id), { to: moved.parentId });
+    audit(c, "node.move", target(id), { from: previousParentId, to: moved.parentId });
     metric("node", { kind: "move", outcome: "ok" });
   }
   return c.json(await toNodeDto(db(c), moved, viewOf(user, access)));

@@ -3,7 +3,7 @@
 // once, for the attempt that committed. (How many attempts, and which codes, are the helper's
 // own tests: tests/unit/db/retry.test.ts.)
 //
-// A file of its own because it replaces `nodes.move` for every request made here: the real
+// A file of its own because it replaces `nodes.moveNode` for every request made here: the real
 // function runs, and then the attempt is made to fail on demand.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api, auditFor, nodeById, sharedTree } from "./helpers";
@@ -14,10 +14,10 @@ vi.mock("../../../src/worker/db/queries/nodes", async (importOriginal) => {
   const real = await importOriginal<typeof import("../../../src/worker/db/queries/nodes")>();
   return {
     ...real,
-    move: async (...args: Parameters<typeof real.move>) => {
+    moveNode: async (...args: Parameters<typeof real.moveNode>) => {
       injected.calls += 1;
       // The whole move has run in this attempt's transaction before it is made to fail.
-      const moved = await real.move(...args);
+      const moved = await real.moveNode(...args);
       const failure = injected.failures.shift();
       if (failure) throw failure;
       return moved;

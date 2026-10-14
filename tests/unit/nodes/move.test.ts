@@ -44,8 +44,8 @@ describe("POST /nodes/:id/move", () => {
     const rows = await auditFor("node.move", t.notes.id);
     expect(rows.map((row) => [row.actorUserId, row.meta])).toEqual(
       expect.arrayContaining([
-        [t.owner.id, { to: t.dest.id }],
-        [t.owner.id, { to: null }],
+        [t.owner.id, { from: t.inner.id, to: t.dest.id }],
+        [t.owner.id, { from: t.dest.id, to: null }],
       ]),
     );
     expect(rows).toHaveLength(2);
@@ -61,7 +61,7 @@ describe("POST /nodes/:id/move", () => {
     const again = await move(t.owner.as, t.notes.id, t.dest.id);
     expect([again.status, again.body.parentId]).toEqual([200, t.dest.id]);
     const rows = await auditFor("node.move", t.notes.id);
-    expect(rows.map((row) => row.meta)).toEqual([{ to: t.dest.id }]);
+    expect(rows.map((row) => row.meta)).toEqual([{ from: t.inner.id, to: t.dest.id }]);
     // At the top level too.
     const top = await makeFile(t.owner.id, null, { scanStatus: "clean" });
     expect((await move(t.owner.as, top.id, null)).status).toBe(200);
@@ -159,8 +159,11 @@ describe("two moves of one node, raced: each real move is one node.move row, a m
     );
     expect([answer.status, answer.body.parentId]).toEqual([200, t.inner.id]);
     expect(await parentOf(t.notes.id)).toBe(t.inner.id);
-    // It did move (dest → inner): one row for it. (The overtaking move was made by the test, not a request.)
-    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([{ to: t.inner.id }]);
+    // It did move (dest → inner): one row for it, FROM where the node was under the lock — not the
+    // parent the request read. (The overtaking move was made by the test, not a request.)
+    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([
+      { from: t.dest.id, to: t.inner.id },
+    ]);
   });
 
   it("overtaken by the very move it asks for, a request moves nothing — and records nothing", async () => {
@@ -187,7 +190,9 @@ describe("two moves of one node, raced: each real move is one node.move row, a m
     );
     expect([(await first).status, second.status]).toEqual([200, 200]);
     expect(await parentOf(t.notes.id)).toBe(t.dest.id);
-    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([{ to: t.dest.id }]);
+    expect((await auditFor("node.move", t.notes.id)).map((row) => row.meta)).toEqual([
+      { from: t.inner.id, to: t.dest.id },
+    ]);
   });
 });
 
