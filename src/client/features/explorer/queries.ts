@@ -38,7 +38,9 @@ export function useListing(folderId: string | null, sort: SortKey, dir: SortDir)
     getNextPageParam: (last) => last.nextCursor ?? undefined,
     // A refetch reads every loaded page again, one request each: only a short list does that by
     // itself. A long one is marked as changed and read again when the user asks (see below).
-    refetchOnWindowFocus: (query) => (query.state.data?.pages.length ?? 0) <= MAX_REFETCH_PAGES,
+    // Nor while an optimistic edit of this parent is in flight (see `beginEdit`).
+    refetchOnWindowFocus: (query) =>
+      (query.state.data?.pages.length ?? 0) <= MAX_REFETCH_PAGES && !editing.has(String(query.queryKey[2])),
   });
 }
 
@@ -184,9 +186,65 @@ export function resetChangedForTests(): void {
 
 registerUserStatePurger(resetChangedForTests);
 
+// ---------------------------------------------------------------------------------------------
+// Optimistic edits in flight. A read of a parent that STARTS while an optimistic edit of it is
+// pending (another action's tree-changed event, window focus) would answer what the server holds
+// before that edit lands — a trashed row drawn back, an old name. So while a parent has an edit in
+// flight its listings are only marked stale, and read again once, when the last edit has settled.
+
+/** Edits in flight per parent (by scope key), and the parents whose read was held back meanwhile. */
+const editing = new Map<string, number>();
+const heldBack = new Set<string>();
+let editGeneration = 0;
+
+/**
+ * Mark an optimistic edit of these parents as in flight. Returns the function that ends it (call
+ * it exactly once, whatever the outcome): a parent with nothing left in flight whose read was held
+ * back is read again then.
+ */
+export function beginEdit(client: QueryClient, parentIds: readonly (string | null)[]): () => void {
+  const keys = Array.from(new Set(parentIds), scope);
+  const generation = editGeneration;
+  for (const key of keys) editing.set(key, (editing.get(key) ?? 0) + 1);
+  let ended = false;
+  return () => {
+    // Ended twice, or the account changed meanwhile (the purger has forgotten every edit).
+    if (ended || generation !== editGeneration) return;
+    ended = true;
+    const due: Array<string | null> = [];
+    for (const key of keys) {
+      const left = (editing.get(key) ?? 1) - 1;
+      if (left > 0) {
+        editing.set(key, left);
+        continue;
+      }
+      editing.delete(key);
+      if (heldBack.delete(key)) due.push(key === TOP ? null : key);
+    }
+    if (due.length > 0) invalidateParents(client, due);
+  };
+}
+
+/** Forget every edit in flight: run by `purgeUserState()` and by tests. */
+export function resetEditsForTests(): void {
+  editGeneration += 1;
+  editing.clear();
+  heldBack.clear();
+}
+
+registerUserStatePurger(resetEditsForTests);
+
 /** The tree changed under these parents: their listings, picker levels and details are stale. */
 export function invalidateParents(client: QueryClient, parentIds: readonly (string | null)[]): void {
   for (const parentId of new Set(parentIds)) {
+    if (editing.has(scope(parentId))) {
+      // Stale, but not read now: the edit in flight would be drawn over. Read once it settles.
+      heldBack.add(scope(parentId));
+      void client.invalidateQueries({ queryKey: explorerKeys.children(parentId), refetchType: "none" });
+      void client.invalidateQueries({ queryKey: explorerKeys.folders(parentId) });
+      if (parentId !== null) void client.invalidateQueries({ queryKey: explorerKeys.node(parentId) });
+      continue;
+    }
     const long = client
       .getQueriesData<Listing>({ queryKey: explorerKeys.children(parentId), type: "active" })
       .some(([, data]) => (data?.pages.length ?? 0) > MAX_REFETCH_PAGES);

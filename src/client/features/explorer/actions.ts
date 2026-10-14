@@ -19,7 +19,7 @@ import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { createFolder, downloadUrl, moveNode, patchNode, rescanNode, restoreNode, trashNode } from "./api";
 import { saveUrl } from "./download";
-import { cancelListings, invalidateParents, patchInListings, removeFromListings } from "./queries";
+import { beginEdit, cancelListings, invalidateParents, patchInListings, removeFromListings } from "./queries";
 import { messages, t } from "./strings";
 
 // ---------------------------------------------------------------------------------------------
@@ -169,6 +169,15 @@ export async function createFolderIn(parentId: string | null, name: string): Pro
 
 export async function renameNode(node: NodeDto, name: string): Promise<boolean> {
   const mine = stillMine();
+  const end = beginEdit(queryClient, [node.parentId]);
+  try {
+    return await renameHeld(node, name, mine);
+  } finally {
+    end();
+  }
+}
+
+async function renameHeld(node: NodeDto, name: string, mine: () => boolean): Promise<boolean> {
   await cancelListings(queryClient, node.parentId);
   if (!mine()) return false;
   patchInListings(queryClient, node.parentId, node.id, (current) => ({ ...current, name }));
@@ -201,6 +210,20 @@ export async function setStarred(nodes: readonly NodeDto[], starred: boolean): P
   if (nodes.length === 0) return;
   const mine = stillMine();
   const parents = unique(nodes.map((node) => node.parentId));
+  const end = beginEdit(queryClient, parents);
+  try {
+    await starHeld(nodes, starred, parents, mine);
+  } finally {
+    end();
+  }
+}
+
+async function starHeld(
+  nodes: readonly NodeDto[],
+  starred: boolean,
+  parents: Array<string | null>,
+  mine: () => boolean,
+): Promise<void> {
   await Promise.all(parents.map((parentId) => cancelListings(queryClient, parentId)));
   if (!mine()) return;
   for (const node of nodes) {
@@ -255,6 +278,15 @@ export async function trashNodes(nodes: readonly NodeDto[]): Promise<void> {
   if (nodes.length === 0) return;
   const mine = stillMine();
   const parents = unique(nodes.map((node) => node.parentId));
+  const end = beginEdit(queryClient, parents);
+  try {
+    await trashHeld(nodes, parents, mine);
+  } finally {
+    end();
+  }
+}
+
+async function trashHeld(nodes: readonly NodeDto[], parents: Array<string | null>, mine: () => boolean) {
   await Promise.all(parents.map((parentId) => cancelListings(queryClient, parentId)));
   if (!mine()) return;
   const putBack = parents.map((parentId) =>

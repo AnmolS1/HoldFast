@@ -8,7 +8,11 @@ import { DetailsPanel } from "../../../../src/client/components/DetailsPanel";
 import { getToasts, Toaster } from "../../../../src/client/components/Toaster";
 import { routes } from "../../../../src/client/features/explorer";
 import { announce } from "../../../../src/client/features/explorer/actions";
-import { resetChangedForTests, resetSortForTests } from "../../../../src/client/features/explorer/queries";
+import {
+  resetChangedForTests,
+  resetEditsForTests,
+  resetSortForTests,
+} from "../../../../src/client/features/explorer/queries";
 import { resetZipForTests, setZipSleepForTests } from "../../../../src/client/features/explorer/zip";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { buildRoutes } from "../../../../src/client/router";
@@ -34,6 +38,7 @@ export function setupExplorer(): void {
     resetSortForTests();
     resetZipForTests();
     resetChangedForTests();
+    resetEditsForTests();
     setZipSleepForTests(null);
     announce("");
     // The files origin a minted URL is checked against.

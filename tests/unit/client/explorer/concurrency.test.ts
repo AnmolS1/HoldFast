@@ -1,6 +1,7 @@
 // M3 — a failed optimistic action undoes ITS change, on whatever the cache holds by then, and the
 // parent is read again; a refetch under way cannot overwrite an optimistic edit.
 // M5 — many items never means many requests at once.
+import { act } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot, subscribeRibbon } from "../../../../src/client/components/TransferRibbon/store";
@@ -18,7 +19,17 @@ import type { NodeDto } from "../../../../src/shared/schemas/node";
 import { envelope, json, type MockCall } from "../shell/helpers";
 import { FakeDrive } from "./fixtures/drive";
 import { fileNode, folderNode, pageOf } from "./fixtures/nodes";
-import { deferred, recordNodesChanged, serveDrive, setupExplorer, toastMessages } from "./helpers";
+import {
+  deferred,
+  recordNodesChanged,
+  renderExplorer,
+  rowOf,
+  rows,
+  serveDrive,
+  setupExplorer,
+  toastMessages,
+  waitForRows,
+} from "./helpers";
 
 setupExplorer();
 
@@ -37,6 +48,74 @@ const answerOf = (drive: FakeDrive, call: MockCall) => {
   const answer = drive.handle(call)!;
   return json(answer.body, answer.status);
 };
+
+// m17 (review round 2): with the page mounted, a listing has an observer, so the tree-changed
+// event of a sibling action really reads it again — the seeded-cache tests above cannot see this.
+describe("m17 — a read that starts while an optimistic edit is in flight does not draw it back", () => {
+  const listingReads = (calls: MockCall[]) =>
+    calls.filter((call) => call.method === "GET" && call.path.startsWith("/api/nodes/root")).length;
+
+  it("trash A (held) → trash B (done): A stays out of the page while its trash is pending, and the list is read once after", async () => {
+    const drive = new FakeDrive([ALPHA, A, B, C]);
+    const gate = deferred<void>();
+    const calls = serveDrive(drive, async (call) => {
+      if (call.path.endsWith(`${A.id}/trash`)) await gate.promise;
+      return undefined;
+    });
+    renderExplorer("/");
+    await waitForRows(4);
+    const first = trashNodes([A]);
+    await act(async () => {
+      await turn();
+    });
+    await act(async () => {
+      await trashNodes([B]);
+    });
+    // B's event asked for a refetch; the server still lists A (its trash has not landed).
+    const readsWhileHeld = listingReads(calls);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(rowOf(A.id)).toBeNull();
+    expect(rowOf(B.id)).toBeNull();
+    expect(listingReads(calls)).toBe(readsWhileHeld);
+    gate.resolve();
+    await act(async () => {
+      await first;
+    });
+    await waitForRows(2);
+    expect(rows().map((row) => row.getAttribute("data-item-id"))).toEqual([ALPHA.id, C.id]);
+    // Read again once, after A settled — not once per event.
+    expect(listingReads(calls)).toBe(readsWhileHeld + 1);
+  });
+
+  it("a rename in flight is not drawn back to its old name by a sibling's refetch", async () => {
+    const drive = new FakeDrive([ALPHA, A, B, C]);
+    const gate = deferred<void>();
+    serveDrive(drive, async (call) => {
+      if (call.method === "PATCH" && call.path.endsWith(A.id)) await gate.promise;
+      return undefined;
+    });
+    renderExplorer("/");
+    await waitForRows(4);
+    const renaming = renameNode(A, "z.pdf");
+    await act(async () => {
+      await turn();
+    });
+    await act(async () => {
+      await trashNodes([B]);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(rowOf(A.id)!.textContent).toContain("z.pdf");
+    gate.resolve();
+    await act(async () => {
+      await renaming;
+    });
+    expect(rowOf(A.id)!.textContent).toContain("z.pdf");
+  });
+});
 
 describe("M3 — a rollback undoes one change, never the list", () => {
   it("trash A (held) → trash B (done) → A refused: B stays gone, A is back where it was, the parent is marked stale", async () => {

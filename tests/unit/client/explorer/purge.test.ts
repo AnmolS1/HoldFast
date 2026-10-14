@@ -7,6 +7,7 @@ import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot } from "../../../../src/client/components/TransferRibbon";
 import { announce, getAnnouncement } from "../../../../src/client/features/explorer/actions";
 import {
+  beginEdit,
   explorerKeys,
   getSort,
   invalidateParents,
@@ -84,5 +85,29 @@ describe("the explorer's purgers", () => {
       await runUserStatePurgers();
     });
     expect(result.current).toBe(false);
+  });
+
+  it("an edit in flight (it holds a folder's reads back) is forgotten: the next account's reads are not held", async () => {
+    const key = explorerKeys.listing(FOLDER.id, "name", "asc");
+    queryClient.setQueryData(key, { pages: [pageOf([FILE])], pageParams: [undefined] });
+    const read = vi.fn(async () => pageOf([FILE]));
+    const observer = new InfiniteQueryObserver(queryClient, {
+      queryKey: key,
+      queryFn: read,
+      initialPageParam: undefined,
+      getNextPageParam: () => undefined,
+      staleTime: Infinity,
+    });
+    const stop = observer.subscribe(() => {});
+    // An edit that never settles (its request outlived the sign-out).
+    beginEdit(queryClient, [FOLDER.id]);
+    await act(async () => invalidateParents(queryClient, [FOLDER.id]));
+    expect(read).not.toHaveBeenCalled();
+    await act(async () => {
+      await runUserStatePurgers();
+    });
+    await act(async () => invalidateParents(queryClient, [FOLDER.id]));
+    expect(read).toHaveBeenCalledTimes(1);
+    stop();
   });
 });
