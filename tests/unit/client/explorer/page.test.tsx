@@ -1077,7 +1077,13 @@ describe("underneath a preview the page is not the page in front", () => {
     expect(selectedIds()).toEqual([NOTES.id]);
     expect(findCommand(COMMAND_IDS.trash)?.disabled).toBe(false);
 
-    await act(async () => void (await router.navigate(`/preview/${NOTES.id}`, { state: { from: "/" } })));
+    // The state carries the account already: without it, T18's PreviewRoute re-issues its stamping
+    // navigation on every render while the lazy route loads and never settles (reported to the
+    // orchestrator; not this feature's).
+    const account = sessionOf().user.id;
+    await act(
+      async () => void (await router.navigate(`/preview/${NOTES.id}`, { state: { from: "/", account } })),
+    );
     await waitFor(() => expect(document.querySelector("[data-overlay]")).not.toBeNull());
     // Still mounted, selection and all — but inert, and with nothing registered to act on it.
     expect(document.querySelector('[data-background="kept"] [data-explorer]')).not.toBeNull();
@@ -1089,7 +1095,8 @@ describe("underneath a preview the page is not the page in front", () => {
     fireEvent.keyDown(document.body, { key: "F2" });
     await act(async () => {});
     expect(drive.callsTo("POST", /\/trash$/)).toHaveLength(0);
-    expect(screen.queryByRole("dialog")).toBeNull();
+    // F2 opened no rename dialog: the only dialog is the preview itself.
+    expect(screen.queryAllByRole("dialog")).toHaveLength(1);
 
     // Back in front: the same key works again.
     await act(async () => void (await router.navigate(-1)));
