@@ -144,15 +144,18 @@ describe("node.rename and node.star", () => {
       held.open(await backendPid(tx));
       await release.opened;
     });
+    // Through the API: its own connection (the test's handle is one session, which would not wait).
     let made = false;
-    const child = makeFolder(t.owner.id, t.dest.id).then((row) => {
+    const child = api(t.owner.as, "POST", "/nodes/folder", {
+      body: { parentId: t.dest.id, name: "Child" },
+    }).then((answer) => {
       made = true;
-      return row;
+      return answer;
     });
     expect(await untilBlockedBy(await held.opened, () => made)).toBe("passed");
     release.open();
     await holder;
-    expect((await child).parentId).toBe(t.dest.id);
+    expect([(await child).status, (await child).body.parentId]).toEqual([200, t.dest.id]);
   });
 
   it("raced: what changed is decided under the row lock, not from what the request read", async () => {
