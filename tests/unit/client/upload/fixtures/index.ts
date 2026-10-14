@@ -16,6 +16,12 @@ export const USER_ID = "a".repeat(32);
 export const OTHER_USER_ID = "b".repeat(32);
 
 export const AT = "2026-10-13T09:00:00.000Z";
+/**
+ * When a stand-in session ends: far ahead, never a date the calendar reaches. (It was a day after
+ * `AT`, and once that day had passed every restored row was dropped as expired.) A test about
+ * expiry sets its own time relative to now.
+ */
+export const EXPIRES = "2099-01-01T00:00:00.000Z";
 export const FOLDER_ID = "0199d3c2-7a10-7000-8000-0000000000f1";
 export const SUBFOLDER_ID = "0199d3c2-7a10-7000-8000-0000000000f2";
 export const EXISTING_ID = "0199d3c2-7a10-7000-8000-0000000000e1";
@@ -109,7 +115,7 @@ export function initResponse(
     partCount: multipart ? Math.ceil(size / partBytes) : 1,
     resumedParts: [],
     finalName: "notes.txt",
-    expiresAt: "2026-10-14T09:00:00.000Z",
+    expiresAt: EXPIRES,
     ...patch,
   });
 }
@@ -133,7 +139,7 @@ export function uploadSession(patch: Partial<UploadSessionDto> = {}): UploadSess
     uploadedParts: 0,
     fileLastModified: AT,
     createdAt: AT,
-    expiresAt: "2026-10-14T09:00:00.000Z",
+    expiresAt: EXPIRES,
     ...patch,
   });
 }
