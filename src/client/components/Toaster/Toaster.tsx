@@ -7,7 +7,8 @@ import { t } from "../../lib/i18n";
 import { hf, layout, shadows } from "../../theme/tokens";
 import { dismissToast, getToasts, subscribeToasts, type ToastEntry } from "./store";
 
-const DEFAULT_DURATION = 6000;
+/** How long a toast — the shell's standard status message — stays, in ms. */
+export const DEFAULT_DURATION = 6000;
 
 function ToastItem({ entry }: { entry: ToastEntry }) {
   useEffect(() => {
