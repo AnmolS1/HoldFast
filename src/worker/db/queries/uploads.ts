@@ -195,10 +195,16 @@ export async function trimFinished(
   return rows.length;
 }
 
-/** A `completing` session whose declared hash is blocklisted: a node is owed for its object. */
+/**
+ * A `completing` session whose declared hash is listed as CSAM: a LOCKED node is owed for its
+ * verified object (the uploads route preserves only a csam hit; another reason is refused and the
+ * object deleted, so nothing is owed and the stale job ends such a session as any other). Decided
+ * when the statement runs, so an entry RAISED to `csam` meanwhile counts.
+ */
 export function owesLockedNode(): SQL {
   return sql`(${uploads.status} = 'completing' AND ${uploads.expectedSha256} IS NOT NULL
-    AND EXISTS (SELECT 1 FROM hash_blocklist b WHERE b.sha256 = ${uploads.expectedSha256}))`;
+    AND EXISTS (SELECT 1 FROM hash_blocklist b
+                WHERE b.sha256 = ${uploads.expectedSha256} AND b.reason = 'csam'))`;
 }
 
 /**
@@ -217,7 +223,7 @@ export function owesLockedNode(): SQL {
  * deleted yet: `remainingForUser` says how many are left, and the purge job waits (`defer`).
  *
  * SO DOES EVERY `completing` SESSION: a request is working on its object right now (hashing it;
- * one whose declared hash is blocklisted owes a LOCKED node for verified bytes — the uploads
+ * one whose declared hash is listed as csam owes a LOCKED node for verified bytes — the uploads
  * route, or the repair sweep, writes it). Its row is kept (it cannot be detached: `owner_id` and
  * `uploader_id` are NOT NULL, RESTRICT — so the user row waits, as for a hold), its object is
  * NOT returned to abort and its reservation is not released here. When the request ends it

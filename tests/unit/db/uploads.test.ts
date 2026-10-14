@@ -236,8 +236,21 @@ describe("expired and trimFinished", () => {
       expectedSha256: rand(32),
     });
     const undeclared = await makeUpload(db, owner, owner, { status: "completing", completingAt: stale });
+    // Listed for another reason: nothing is owed (the route refuses and deletes such an object).
+    const otherReasons = [];
+    for (const reason of ["malware", "dmca", "admin"] as const) {
+      const sha256 = rand(32);
+      await db.insert(hashBlocklist).values({ sha256, reason });
+      otherReasons.push(
+        await makeUpload(db, owner, owner, {
+          status: "completing",
+          completingAt: stale,
+          expectedSha256: sha256,
+        }),
+      );
+    }
     const ids = (await expired(db, 100_000)).filter((u) => u.ownerId === owner).map((u) => u.id);
-    expect(ids.sort()).toEqual([unlisted.id, undeclared.id].sort());
+    expect(ids.sort()).toEqual([unlisted.id, undeclared.id, ...otherReasons.map((u) => u.id)].sort());
     expect(ids).not.toContain(owed.id);
   });
 
