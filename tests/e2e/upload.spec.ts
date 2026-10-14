@@ -312,6 +312,24 @@ async function openUploads(page: Page, search = ""): Promise<void> {
   await expect(page.getByRole("button", { name: "Choose files" })).toBeVisible();
 }
 
+/**
+ * axe once nothing on the page is still moving: a dialog or panel caught in its fade-in is a
+ * colour on a half-transparent surface, and its contrast is then measured against the page under
+ * it (a mobile run once failed "color-contrast" on the conflict dialog that way). Animations that
+ * repeat for ever (a progress line) are not waited for.
+ */
+async function axeWhenStill(page: Page): Promise<void> {
+  await page.evaluate(() =>
+    Promise.all(
+      document
+        .getAnimations()
+        .filter((animation) => animation.effect?.getComputedTiming().iterations !== Infinity)
+        .map((animation) => animation.finished.catch(() => undefined)),
+    ),
+  );
+  await expectNoA11yViolations(page);
+}
+
 async function openPanel(page: Page): Promise<Locator> {
   const toggle = ribbon(page).locator("button[aria-expanded]");
   if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
@@ -610,7 +628,7 @@ test.describe("uploads (mocked API)", () => {
       const dialog = page.getByRole("dialog", { name: "hello.txt is already here" });
       await expect(dialog).toBeVisible();
       await expect(dialog.getByRole("button", { name: "Skip" })).toBeFocused();
-      await expectNoA11yViolations(page);
+      await axeWhenStill(page);
       await dialog.getByRole("button", { name: "Replace" }).click();
       await expect.poll(() => api.completes.length).toBe(1);
       expect(api.inits[1]).toMatchObject({ onConflict: "replace", replaceNodeId: EXISTING_ID });
@@ -671,7 +689,7 @@ test.describe("uploads (mocked API)", () => {
     await expect(blocked.getByRole("button", { name: "Remove hello.txt from the list" })).toBeVisible();
     await expect(row(page, "page.html")).toContainText("That name can't be used.");
     await expect(row(page, "page.html")).toContainText("req req-upload");
-    await expectNoA11yViolations(page);
+    await axeWhenStill(page);
 
     // Keyboard: the rows' controls are reachable and removing a row keeps the focus in the panel.
     await blocked.getByRole("button", { name: "Remove hello.txt from the list" }).focus();
@@ -863,7 +881,7 @@ test.describe("uploads (mocked API)", () => {
       await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
       await expect(page.getByRole("button", { name: "Choose files" })).toHaveCount(0);
       await expect(page.locator("[data-placeholder-page]")).toHaveCount(0);
-      await expectNoA11yViolations(page);
+      await axeWhenStill(page);
       expect(problems).toEqual([]);
     });
   }
@@ -871,7 +889,7 @@ test.describe("uploads (mocked API)", () => {
   test("/uploads has no axe violations, idle and with a drop pending", async ({ page, origins }) => {
     await mockUploadApi(page, origins.port);
     await openUploads(page);
-    await expectNoA11yViolations(page);
+    await axeWhenStill(page);
     // Dragging a file over the app says where it will go.
     await page.evaluate(() => {
       const transfer = new DataTransfer();
@@ -881,7 +899,7 @@ test.describe("uploads (mocked API)", () => {
       );
     });
     await expect(page.locator("[data-upload-drop]")).toHaveText("Drop to upload to Files");
-    await expectNoA11yViolations(page);
+    await axeWhenStill(page);
   });
 
   test("dropping files on the app uploads them to the folder in the address", async ({ page, origins }) => {
