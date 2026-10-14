@@ -20,9 +20,10 @@ import {
   FAKED_TIMERS,
   freshUploader,
   installServer,
+  keepResumeListInMemory,
+  type Server,
   settle,
   smallFile,
-  type Server,
 } from "./helpers";
 
 setupShell();
@@ -70,7 +71,8 @@ describe("files the scan bound gave up on (4m1)", () => {
   it("after the hard bound the panel draws its cap and says how many are still being checked", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
-    const count = PANEL_ROWS + 300;
+    keepResumeListInMemory();
+    const count = PANEL_ROWS + 30;
     await addFiles(
       Array.from({ length: count }, (_, n) => ({ file: smallFile(`f${n}.txt`) })),
       null,
@@ -85,7 +87,7 @@ describe("files the scan bound gave up on (4m1)", () => {
     expect(document.querySelectorAll("[data-upload-row]").length).toBe(PANEL_ROWS);
     expect(document.querySelector("[data-upload-more]")).toBeNull();
     expect(document.querySelector("[data-upload-checking]")!.textContent).toBe(
-      "300 files are still being checked — they will appear when ready",
+      "30 files are still being checked — they will appear when ready",
     );
   });
 });
