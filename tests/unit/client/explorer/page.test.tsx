@@ -1077,13 +1077,10 @@ describe("underneath a preview the page is not the page in front", () => {
     expect(selectedIds()).toEqual([NOTES.id]);
     expect(findCommand(COMMAND_IDS.trash)?.disabled).toBe(false);
 
-    // The state carries the account already: without it, T18's PreviewRoute re-issues its stamping
-    // navigation on every render while the lazy route loads and never settles (reported to the
-    // orchestrator; not this feature's).
-    const account = sessionOf().user.id;
-    await act(
-      async () => void (await router.navigate(`/preview/${NOTES.id}`, { state: { from: "/", account } })),
-    );
+    // Opened by the explorer itself (a double-click on the row): its own state — siblings and
+    // `from`, no account — which the preview route stamps once.
+    fireEvent.doubleClick(rowOf(NOTES.id)!);
+
     await waitFor(() => expect(document.querySelector("[data-overlay]")).not.toBeNull());
     // Still mounted, selection and all — but inert, and with nothing registered to act on it.
     expect(document.querySelector('[data-background="kept"] [data-explorer]')).not.toBeNull();
