@@ -221,26 +221,19 @@ describe("hash workers", () => {
     expect(liveHashJobs()).toBe(1);
   });
 
-  it("the purger stops every worker, and so does the host leaving the page", async () => {
+  it("the purger stops every worker; the host leaving the page stops none (a remount is not a pause)", async () => {
     server.holdHash = true;
     server.hold = true;
     const view = renderShell(<UploadDropOverlay />);
     await act(() => addFiles(many(3), null));
     await act(() => settle(0));
     expect(liveHashJobs()).toBe(3);
+    const before = items().map((item) => [item.state, item.pauseReason]);
     view.unmount();
-    expect(liveHashJobs()).toBe(0);
-    expect(server.hashes.running).toBe(0);
-    // Nothing was lost: the files wait, paused, and can go on.
-    expect(items().map((item) => [item.state, item.pauseReason])).toEqual([
-      ["paused", "user"],
-      ["paused", "user"],
-      ["paused", "user"],
-    ]);
-
-    resumeItem(items()[0]!.id);
-    await settle(0);
-    expect(liveHashJobs()).toBe(1);
+    // Review round 3 (3M1): an unmount changes no row — the same host is back in the same commit
+    // when the frame remounts. Signing out is the purger's, below.
+    expect(liveHashJobs()).toBe(3);
+    expect(items().map((item) => [item.state, item.pauseReason])).toEqual(before);
     await purgeUploads();
     expect(liveHashJobs()).toBe(0);
     expect(server.hashes.running).toBe(0);
