@@ -38,6 +38,7 @@ import {
 import { invoke } from "../services-core/request";
 import {
   call,
+  deadlockError,
   complete,
   init,
   initBody,
@@ -941,4 +942,136 @@ describe("r3-m3 — a finished session past the trim age answers as an unknown u
     await testDb().update(nodes).set({ takedownAt: new Date(), legalHold: true }).where(eq(nodes.id, nodeId));
     expect((await complete(user, session.uploadId, { sha256 })).status).toBe(409);
   });
+});
+
+describe("fail safe — bytes are destroyed only on a definitive answer, never on a transient or unknown error", () => {
+  type Kind = {
+    what: string;
+    /** Listed (malware) with the true hash: the server hashes first, then re-checks. */
+    listed?: boolean;
+    multipart?: boolean;
+    /** The re-check's first statement fails with this. */
+    faultInRecheck?: Error;
+    fail?: string[];
+    beforeCommit?: (attempt: number) => void;
+    before?: (folderId: string) => Promise<unknown>;
+    status: number;
+    survives: boolean;
+  };
+  const kinds: Kind[] = [
+    {
+      what: "a lost database connection in the re-check",
+      listed: true,
+      faultInRecheck: new Error("test: Connection terminated unexpectedly"),
+      status: 500,
+      survives: true,
+    },
+    {
+      what: "a driver-wrapped QueryError rate_limited (not definitive)",
+      listed: true,
+      faultInRecheck: new QueryError("rate_limited"),
+      status: 429,
+      survives: true,
+    },
+    {
+      what: "a driver-wrapped QueryError not_found (definitive)",
+      listed: true,
+      faultInRecheck: new QueryError("not_found"),
+      status: 404,
+      survives: false,
+    },
+    {
+      what: "a driver-wrapped QueryError validation (definitive)",
+      listed: true,
+      faultInRecheck: new QueryError("validation"),
+      status: 400,
+      survives: false,
+    },
+    {
+      what: "a deadlock on every attempt of the node write",
+      beforeCommit: () => {
+        throw deadlockError();
+      },
+      status: 500,
+      survives: true,
+    },
+    { what: "the store fails at head", fail: ["head"], status: 500, survives: true },
+    {
+      what: "the store fails while the server hashes",
+      listed: true,
+      fail: ["get"],
+      status: 500,
+      survives: true,
+    },
+    {
+      what: "the store fails at assembling the parts",
+      multipart: true,
+      fail: ["upload.complete"],
+      status: 500,
+      survives: true,
+    },
+    {
+      what: "the folder was trashed (definitive)",
+      before: (folderId) =>
+        testDb()
+          .update(nodes)
+          .set({ deletedAt: new Date(), trashedRoot: true })
+          .where(eq(nodes.id, folderId)),
+      status: 404,
+      survives: false,
+    },
+  ];
+
+  it.each(kinds)(
+    "$what → $status; bytes survive: $survives",
+    async (kind) => {
+      const owner = await uploader();
+      const folder = await makeFolder(owner.id);
+      let parts: { n: number; etag: string }[] = [];
+      let sha256 = sha();
+      let uploadId: string;
+      if (kind.multipart) {
+        const session = await init(owner, { parentId: folder.id, size: TWO_PARTS });
+        parts = await putParts(owner, session, TWO_PARTS);
+        uploadId = session.uploadId;
+      } else {
+        const known = kind.listed ? await listed("malware") : { bytes: uniqueBytes(), sha256 };
+        sha256 = known.sha256;
+        uploadId = (await uploaded(owner, { parentId: folder.id }, known.bytes)).uploadId;
+      }
+      const row = (await sessionRow(uploadId))!;
+      await kind.before?.(folder.id);
+      const fault = { armed: false, error: kind.faultInRecheck };
+      const watched = watchedBucket(kind.fail ?? [], {
+        get: async () => {
+          if (kind.faultInRecheck) fault.armed = true;
+        },
+      });
+      const answer = await complete(
+        owner,
+        uploadId,
+        { sha256, parts },
+        {
+          env: { FILES: watched.bucket },
+          ...(kind.faultInRecheck ? { fault } : {}),
+          ...(kind.beforeCommit ? { beforeCommit: kind.beforeCommit } : {}),
+        },
+      );
+      expect(answer.status).toBe(kind.status);
+      const after = (await sessionRow(uploadId))!;
+      if (kind.survives) {
+        // Left for the client's retry or the stale-upload job: the session, its key, its bytes.
+        expect(after).toMatchObject({ status: "completing", r2Key: row.r2Key });
+        expect(watched.calls["delete"] ?? 0).toBe(0);
+        expect(watched.calls["upload.abort"] ?? 0).toBe(0);
+        if (!kind.multipart) expect(await env.FILES.head(row.r2Key)).not.toBeNull();
+        expect(await usedBytes(owner.id)).toBe(kind.multipart ? TWO_PARTS : 1000);
+      } else {
+        expect(after).toMatchObject({ status: "aborted" });
+        expect(await env.FILES.head(row.r2Key)).toBeNull();
+        expect(await usedBytes(owner.id)).toBe(0);
+      }
+    },
+    60_000,
+  );
 });
