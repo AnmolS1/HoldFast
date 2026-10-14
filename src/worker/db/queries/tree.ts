@@ -7,7 +7,7 @@
 import { and, eq, isNull, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { type Node, nodes } from "../schema";
+import { type Node, nodes, type ScanStatus } from "../schema";
 import { isActive, userState } from "./users";
 
 export type TreeRow = {
@@ -153,6 +153,51 @@ export async function effectiveHidden(db: Executor, nodeId: string): Promise<boo
                AND (n.scan_status = 'suspected_csam' OR NOT ${notEffectivelyHidden("n")})) AS hidden`);
   const row = result.rows[0];
   return !row || !row.found || row.hidden;
+}
+
+export type NodeVisibility = {
+  /** As `effectiveHidden`: taken down (itself or by an ancestor), suspected CSAM, or no such node. */
+  hidden: boolean;
+  /** As `effectiveTrashed`: in the trash (itself or by an ancestor), or no such node. */
+  trashed: boolean;
+  /** Null when there is no such node — as are the two below. */
+  kind: "file" | "folder" | null;
+  scanStatus: ScanStatus | null;
+  /** Who uploaded the CURRENT version (`replaceVersion` rewrites it); null once that account is gone. */
+  createdBy: string | null;
+};
+
+/**
+ * Everything "may this caller see the node by id?" needs besides the role, in ONE statement,
+ * whatever the answer: `effectiveHidden`'s answer, `effectiveTrashed`'s, and the three columns
+ * the partner rule reads (`nodes.partnerSees`). `permissions.getAccess` sends this for every
+ * question, so that hidden, trashed, "not shown to a partner" and "never issued" all cost the
+ * same work. Built on the listings' predicates, so the by-id answer and the listings cannot
+ * drift apart. An id that does not exist is hidden and trashed: fail closed.
+ */
+export async function nodeVisibility(db: Executor, nodeId: string): Promise<NodeVisibility> {
+  const none: NodeVisibility = { hidden: true, trashed: true, kind: null, scanStatus: null, createdBy: null };
+  if (!isUuid(nodeId)) return none;
+  const result = await db.execute<{
+    kind: "file" | "folder";
+    scan_status: ScanStatus;
+    created_by: string | null;
+    hidden: boolean;
+    trashed: boolean;
+  }>(sql`
+    SELECT n.kind, n.scan_status, n.created_by,
+           (n.scan_status = 'suspected_csam' OR NOT ${notEffectivelyHidden("n")}) AS hidden,
+           NOT ${notEffectivelyTrashed("n")} AS trashed
+    FROM nodes n WHERE n.id = ${nodeId}`);
+  const row = result.rows[0];
+  if (!row) return none;
+  return {
+    hidden: row.hidden,
+    trashed: row.trashed,
+    kind: row.kind,
+    scanStatus: row.scan_status,
+    createdBy: row.created_by,
+  };
 }
 
 type AncestryColumn = "deleted_at" | "takedown_at";
