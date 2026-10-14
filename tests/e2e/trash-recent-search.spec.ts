@@ -30,6 +30,7 @@ import {
   mockedOnly,
   mockEnvelope,
   mockShell,
+  navigateInApp,
   realOnly,
   test,
 } from "./fixtures";
@@ -674,7 +675,7 @@ test.describe("mobile layout", () => {
       await expectNoOverflow(page);
 
       // Search: the two menus live in a sheet, not in the page.
-      await page.goto("/search?q=report");
+      await navigateInApp(page, "/search?q=report");
       await expect(rows(page)).toHaveCount(3);
       expect(await height(row(page, nodeId(31)))).toBeGreaterThanOrEqual(TOUCH_ROW);
       await expect(view(page, "search").locator("select")).toHaveCount(0);
@@ -689,7 +690,7 @@ test.describe("mobile layout", () => {
       await expect(rows(page)).toHaveCount(1);
 
       for (const path of ["/recent", "/starred", "/storage"]) {
-        await page.goto(path);
+        await navigateInApp(page, path);
         await expect(page.locator("[data-frame]")).toHaveAttribute("data-frame", "mobile");
         await expect(page.locator("[data-view-page]")).toBeVisible();
         await expectNoOverflow(page);
@@ -743,8 +744,10 @@ test.describe("a page never throws on an API error", () => {
               },
             },
       );
-      for (const [path, name, title] of PAGES) {
-        await page.goto(path);
+      for (const [index, [path, name, title]] of PAGES.entries()) {
+        // One load; each other view through the app's own router.
+        if (index === 0) await page.goto(path);
+        else await navigateInApp(page, path);
         await expect(page.locator("[data-frame]")).toBeVisible();
         await expect(viewError(page, name)).toBeVisible();
         await expect(viewError(page, name).getByRole("heading", { name: title })).toBeVisible();

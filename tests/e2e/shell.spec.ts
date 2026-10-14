@@ -14,6 +14,7 @@ import {
   expectNoA11yViolations,
   mockEnvelope as envelope,
   mockShell,
+  navigateInApp,
   serveBuild,
   stubTurnstile,
   test,
@@ -585,8 +586,10 @@ test.describe("storage and layout", () => {
     origins,
   }) => {
     await mockShell(page, origins.port, { user: { role: "admin" } });
+    // One load; the other pages are visited through the app's own router (what this test is
+    // about is what they leave behind, not how they are reached).
+    await gotoFrame(page, "/");
     for (const path of [
-      "/",
       "/shared",
       "/recent",
       "/account",
@@ -594,8 +597,10 @@ test.describe("storage and layout", () => {
       "/help",
       "/preview/n1",
       "/search?q=secret",
-    ])
-      await gotoFrame(page, path);
+    ]) {
+      await navigateInApp(page, path);
+      await expect(page.locator("[data-frame]")).toBeVisible();
+    }
     await page.goto("/login?next=/recent");
     await gotoFrame(page, "/");
     // Change every preference through the UI: theme (menu or sheet) and view mode (toggle).
@@ -715,15 +720,19 @@ test.describe("storage and layout", () => {
         client: document.documentElement.clientWidth,
       }));
     await mockShell(page, origins.port);
-    for (const path of ["/", "/shared", "/account", "/help", "/storage"]) {
-      await gotoFrame(page, path);
+    // One load per session state; the other pages through the app's own router.
+    for (const [index, path] of ["/", "/shared", "/account", "/help", "/storage"].entries()) {
+      if (index === 0) await gotoFrame(page, path);
+      else await navigateInApp(page, path);
+      await expect(page.locator("[data-frame]")).toBeVisible();
       const size = await overflow();
       expect(size.scroll, path).toBeLessThanOrEqual(size.client);
     }
     await page.unroute("**/api/**");
     await mockShell(page, origins.port, { user: null });
-    for (const path of ["/login", "/signup", "/verify-email", "/dmca"]) {
-      await page.goto(path);
+    for (const [index, path] of ["/login", "/signup", "/verify-email", "/dmca"].entries()) {
+      if (index === 0) await page.goto(path);
+      else await navigateInApp(page, path);
       await expect(page.locator("main, [role=main]").first()).toBeVisible();
       const size = await overflow();
       expect(size.scroll, path).toBeLessThanOrEqual(size.client);
