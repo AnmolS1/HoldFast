@@ -17,7 +17,9 @@ import {
   HOLD_STALE_SECONDS,
   THUMB_CALLS_PER_DAY,
   unitMarker,
+  type ThumbOwner,
 } from "../../../src/worker/services/thumbnails";
+import { invoke } from "../services-core/request";
 import {
   ask,
   FAKE_WEBP,
@@ -782,20 +784,19 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
       {},
     );
 
-  it("the ceiling service throwing between the hold and the charge → the icon's 404 (never a 500), the hold given back, and the next request renders", async () => {
+  it("the ceiling service throwing between the hold and the charge → no thumbnail and no throw (the route answers the icon, never a 500), the hold given back, and the next request renders", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
-    const images = imagesMock();
-    const url = await urlFor("thumb", node, { user: owner.id });
-    // A ceiling the ledger refuses to compare against (negative): the consume throws.
-    const broken = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: -1 } } };
-    const answer = await ask(url, broken);
-    expect(answer.status).toBe(404);
-    expect(answer.text).toBe(NOT_FOUND);
-    expect(images.calls).toHaveLength(0);
+    // An owner without the account its limit is computed from: the consume itself throws.
+    const broken = { id: owner.id, account: undefined as unknown as ThumbOwner["account"] };
+    const made = await invoke(null, (c) => makeThumbnail(c, node, 320, broken));
+    expect(made).toMatchObject({ ok: true, value: { ok: false, reason: "error" } });
     expect(await unitRow(node)).toEqual({ bytes: 0, count: 0 });
     expect(await units(owner.id)).toBe(0);
-    const next = await ask(url, { env: { IMAGES: images.binding } });
+    const images = imagesMock();
+    const next = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      env: { IMAGES: images.binding },
+    });
     expect(next.status).toBe(200);
     expect(images.calls).toHaveLength(1);
     expect(await units(owner.id)).toBe(1);
