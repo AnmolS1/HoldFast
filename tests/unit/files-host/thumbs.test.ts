@@ -369,7 +369,18 @@ describe("the daily transform ceiling", () => {
       await hold.opened;
       return FAKE_WEBP;
     });
-    const options = limited({ IMAGES: images.binding });
+    // All N+5 are lined up at their cache lookup and let go together, so their unit consumes
+    // overlap: a "read the total, then add" consume would let more than N through.
+    const lineUp = gate();
+    let arrived = 0;
+    const lined = spyBucket({
+      get: (async (key: string, opts?: R2GetOptions) => {
+        if (key.startsWith("t/") && ++arrived === N + 5) lineUp.open();
+        if (key.startsWith("t/")) await lineUp.opened;
+        return spyBucket().bucket.get(key, opts);
+      }) as R2Bucket["get"],
+    });
+    const options = limited({ IMAGES: images.binding, FILES: lined.bucket });
     const urls: string[] = [];
     for (let i = 0; i < N + 5; i++) {
       urls.push(await urlFor("thumb", await picture(owner.id), { user: owner.id }));
