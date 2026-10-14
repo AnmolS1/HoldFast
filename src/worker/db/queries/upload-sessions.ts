@@ -67,12 +67,15 @@ export async function setDeclaredHash(tx: Executor, uploadId: string, sha256: st
   await tx.update(uploads).set({ expectedSha256: sha256 }).where(eq(uploads.id, uploadId));
 }
 
-/** Records the multipart upload's id on a session that is still `open`. False when it is not. */
+/**
+ * Records the multipart upload's id on a session that is still `open` and has none. False when
+ * it is not open, or another request recorded one first.
+ */
 export async function setR2UploadId(db: Executor, uploadId: string, r2UploadId: string): Promise<boolean> {
   const rows = await db
     .update(uploads)
     .set({ r2UploadId })
-    .where(and(eq(uploads.id, uploadId), eq(uploads.status, "open")))
+    .where(and(eq(uploads.id, uploadId), eq(uploads.status, "open"), isNull(uploads.r2UploadId)))
     .returning({ id: uploads.id });
   return rows.length > 0;
 }
@@ -185,7 +188,13 @@ export async function listOpen(
     .select()
     .from(uploads)
     .where(
-      and(eq(uploads.uploaderId, uploaderId), eq(uploads.status, "open"), gt(uploads.expiresAt, sql`now()`)),
+      and(
+        eq(uploads.uploaderId, uploaderId),
+        eq(uploads.status, "open"),
+        // An avatar is one small PUT: never offered for resume.
+        eq(uploads.purpose, "file"),
+        gt(uploads.expiresAt, sql`now()`),
+      ),
     )
     .orderBy(sql`${uploads.createdAt} DESC`, uploads.id);
   if (rows.length === 0) return [];

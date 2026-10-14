@@ -6,8 +6,10 @@ import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
 import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
+import { PART_BYTES } from "../../../src/shared/constants";
 import type { SessionUser } from "../../../src/worker/auth/types";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
+import { computeUsedBytes } from "../../../src/worker/db/queries/quota";
 import { hashBlocklist, nodes, reports, shares, uploadIps } from "../../../src/worker/db/schema";
 import { BLOCKED_MESSAGE, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
 import type { AppEnv } from "../../../src/worker/services/request-context";
@@ -32,8 +34,8 @@ import {
   complete,
   init,
   ledgerOf,
+  call,
   putParts,
-  ROOMY,
   sessionRow,
   sha,
   sha256Of,
@@ -44,6 +46,7 @@ import {
   uploader,
   usedBytes,
   userRow,
+  zeros,
   watchedBucket,
   type UserRow,
 } from "./helpers";
@@ -315,6 +318,7 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
     expect(view(againA)).toBe(view(againB));
     // On the rows the truth differs, where no client reads it: the server's hash, the claim.
     const [rowA, rowB] = [(await nodeById(String(a.body.id)))!, (await nodeById(String(b.body.id)))!];
+    expect(rowA.sha256).toBe(await storedSha256(storage(env), (await sessionRow(listedLie.uploadId))!.r2Key));
     expect(rowA.sha256).not.toBe(known.sha256);
     expect(await blocklist.lookup(testDb(), rowA.sha256!)).toBeNull();
     expect(rowB.sha256).toBe((await sessionRow(unlistedLie.uploadId))!.expectedSha256);
@@ -505,14 +509,13 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
   it.each([
     ["the share was revoked", 404],
     ["the folder was trashed", 404],
-    ["uploads were switched off", 503],
   ] as const)(
     "bytes the server found on the list are evidence even when complete gives the upload up (%s): a locked node of the UPLOADER's, the folder's owner untouched",
     async (what, status) => {
       const known = await listed("csam");
       const { owner, editor, folder, session, row, revoke } = await beforeComplete(known.bytes);
       const mailsBefore = operatorMails();
-      let settings = {};
+      const settings = {};
       if (what === "the share was revoked") await revoke();
       if (what === "the folder was trashed") {
         await testDb()
@@ -520,7 +523,6 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
           .set({ deletedAt: new Date(), trashedRoot: true })
           .where(eq(nodes.id, folder.id));
       }
-      if (what === "uploads were switched off") settings = { settings: { ...ROOMY, uploadsEnabled: false } };
 
       const answer = await complete(editor, session.uploadId, { sha256: known.sha256 }, settings);
       // The request is answered as the failed re-check is; nothing about the lock.
@@ -554,7 +556,10 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
       expect(await reportsOn(owner.id)).toHaveLength(0);
       expect(await nodesOf(owner.id)).toHaveLength(1); // the folder
       expect(await usedBytes(owner.id)).toBe(0);
-      expect(await usedBytes(editor.id)).toBe(0);
+      // The bytes are counted where the row is — at once, not at the next reconcile.
+      expect(await usedBytes(editor.id)).toBe(1000);
+      expect(await computeUsedBytes(testDb(), editor.id)).toBe(1000);
+      expect(await computeUsedBytes(testDb(), owner.id)).toBe(0);
       expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
       expect(await strikesOf(editor.id)).toHaveLength(0);
     },
@@ -573,7 +578,61 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(await userRow(editor.id)).toMatchObject({ legalHold: false });
   });
 
-  it("… and an unfinished multipart upload has no object to keep: it is aborted in the store", async () => {
+  it("a multipart upload whose declared hash is listed is ASSEMBLED and hashed before complete gives it up: listed bytes are preserved, not aborted unseen", async () => {
+    // 64 MiB of zeros and 32 bytes nobody else has: two parts.
+    const tail = uniqueBytes(32);
+    const size = PART_BYTES + tail.byteLength;
+    const digest = new crypto.DigestStream("SHA-256");
+    const writer = digest.getWriter();
+    const reader = zeros(PART_BYTES).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writer.write(value);
+    }
+    await writer.write(tail);
+    await writer.close();
+    const sha256 = Array.from(new Uint8Array(await digest.digest), (b) =>
+      b.toString(16).padStart(2, "0"),
+    ).join("");
+    await blocklist.upsert(testDb(), { sha256, reason: "csam" });
+
+    const { owner, editor, session, row, revoke } = await beforeComplete(new Uint8Array(0), size);
+    const parts: { n: number; etag: string }[] = [];
+    for (const [n, body, length] of [
+      [1, zeros(PART_BYTES), PART_BYTES],
+      [2, tail, tail.byteLength],
+    ] as const) {
+      const put = await call<{ n: number; etag: string }>(
+        editor,
+        "PUT",
+        `/uploads/${session.uploadId}/parts/${n}`,
+        {
+          body,
+          contentLength: length,
+        },
+      );
+      expect(put.status).toBe(200);
+      parts.push(put.body);
+    }
+    await revoke();
+    const answer = await complete(editor, session.uploadId, { sha256, parts });
+    expect(answer.status).toBe(404);
+    // Assembled, hashed by the server, and kept: a locked node of the uploader's.
+    expect((await env.FILES.head(row.r2Key))?.size).toBe(size);
+    const [held] = await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key));
+    expect(held).toMatchObject({
+      ownerId: editor.id,
+      parentId: null,
+      scanStatus: "suspected_csam",
+      legalHold: true,
+      size,
+    });
+    expect(await userRow(owner.id)).toMatchObject({ legalHold: false });
+    expect(await usedBytes(owner.id)).toBe(0);
+  }, 60_000);
+
+  it("… and the same upload with a listed hash it only DECLARES is assembled, hashed and then deleted — nothing is kept on a client's word", async () => {
     const known = await listed("csam");
     const { owner, editor, session, row, revoke } = await beforeComplete(new Uint8Array(0), TWO_PARTS);
     const parts = await putParts(editor, session, TWO_PARTS);
@@ -582,12 +641,9 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(answer.status).toBe(404);
     expect(await usedBytes(owner.id)).toBe(0);
     expect(await env.FILES.head(row.r2Key)).toBeNull();
-    const store = storage(env);
-    await expect(
-      store.uploadPart(store.resumeMultipart(row.r2Key, row.r2UploadId!), 1, new Uint8Array(8), 8),
-    ).rejects.toThrow();
     expect(await nodesOf(editor.id)).toHaveLength(0);
-  });
+    expect(await userRow(editor.id)).toMatchObject({ legalHold: false });
+  }, 60_000);
 
   it("if the node cannot be written the object still stays, and the operators are told by its session", async () => {
     const known = await listed("csam");

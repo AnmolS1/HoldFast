@@ -172,13 +172,9 @@ describe("a finished upload", () => {
     );
     // Someone else's repeat is nobody's session.
     expect((await complete(await uploader(), session.uploadId, { sha256 })).status).toBe(404);
-    // The node in the trash: what a read of it would answer — and never a second node.
-    await testDb()
-      .update(nodes)
-      .set({ deletedAt: new Date(), trashedRoot: true })
-      .where(eq(nodes.id, nodeId));
-    expect((await complete(user, session.uploadId, { sha256 })).status).toBe(404);
-    expect(await nodesIn(folder.id)).toHaveLength(1);
+    // A body that is not what completed answers what a given-up session answers.
+    const other = await complete(user, session.uploadId, { sha256: sha() });
+    expect(other.body.message).toBe("This upload is no longer open.");
   });
 
   it("a complete that meets one still running is told so: 409 with details.state", async () => {
@@ -448,17 +444,19 @@ describe("everything is checked again at complete — and a refusal gives the re
     await expectGivenUp(setup);
   });
 
-  it("uploads were switched off → 503 feature_disabled", async () => {
+  it("uploads were switched off → 503 feature_disabled BEFORE the claim: the upload is kept and completes when the switch is back", async () => {
     const setup = await editorUpload();
-    const answer = await complete(
-      setup.editor,
-      setup.uploadId,
-      {},
-      { settings: { ...ROOMY, uploadsEnabled: false } },
-    );
+    const off = { settings: { ...ROOMY, uploadsEnabled: false } };
+    const answer = await complete(setup.editor, setup.uploadId, {}, off);
     expect(answer.status).toBe(503);
     expect(answer.body).toMatchObject({ error: "feature_disabled", details: { reason: "uploads_disabled" } });
-    await expectGivenUp(setup);
+    // Nothing was given up: the session is open, its bytes stored, its reservation held.
+    expect(await sessionRow(setup.uploadId)).toMatchObject({ status: "open", expectedSha256: null });
+    expect(await env.FILES.head(setup.key)).not.toBeNull();
+    expect(await usedBytes(setup.owner.id)).toBe(1000);
+    expect((await complete(setup.editor, setup.uploadId, {}, off)).status).toBe(503);
+    expect((await complete(setup.editor, setup.uploadId)).status).toBe(201);
+    expect(await nodesIn(setup.folderId)).toHaveLength(1);
   });
 
   it("what is stored is not the declared size → 400", async () => {

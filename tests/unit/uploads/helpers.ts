@@ -364,9 +364,10 @@ export function uniqueBytes(size = 1000): Uint8Array {
 
 /**
  * The object store, with every call of the named methods counted — and, for the methods in
- * `fail`, refused. Hand it to a request as `env: { FILES: bucket }`.
+ * `fail`, refused; for the methods in `before`, preceded by what the test wants to happen at
+ * that moment. Hand it to a request as `env: { FILES: bucket }`.
  */
-export function watchedBucket(fail: string[] = []) {
+export function watchedBucket(fail: string[] = [], before: Record<string, () => Promise<unknown>> = {}) {
   const calls: Record<string, number> = {};
   const count = (name: string) => {
     calls[name] = (calls[name] ?? 0) + 1;
@@ -389,6 +390,9 @@ export function watchedBucket(fail: string[] = []) {
       if (typeof value !== "function") return value;
       return (...args: unknown[]) => {
         count(String(property));
+        // `before`: something the test makes happen just before this call reaches the store.
+        const hook = before[String(property)];
+        if (hook) return hook().then(() => (value as (...a: unknown[]) => unknown).apply(target, args));
         const result = (value as (...a: unknown[]) => unknown).apply(target, args);
         if (property === "resumeMultipartUpload") return wrapUpload(result as R2MultipartUpload);
         return result;
