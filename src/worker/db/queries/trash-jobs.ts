@@ -28,7 +28,7 @@ import { nodeProtected, userHeld } from "./holds";
 import { clearSettingsCache } from "./settings";
 import { notPurgeRequested } from "./trash";
 import { lockOwnerTree, notEffectivelyHidden } from "./tree";
-import { COMPLETING_STALE_MINUTES } from "./uploads";
+import { COMPLETING_STALE_MINUTES, owesLockedNode } from "./uploads";
 import { markStarted } from "./user-purge";
 import { lockUser } from "./users";
 
@@ -281,8 +281,8 @@ export async function deleteOldEmailWindows(
 
 /**
  * Locks one session `uploads.expired` listed and returns it — if it is STILL stale: `open` past
- * its `expiresAt`, or `completing` for longer than the grace. Null when it moved on meanwhile (a
- * client claimed it, it finished). The list is advice; this row, under its lock, decides.
+ * its `expiresAt`, or `completing` for longer than the grace and owing no locked node. Null when
+ * it moved on meanwhile (a client claimed it, it finished, its hash was csam-listed). The list is advice; this row, under its lock, decides.
  * Call it after the owner's `user` row is locked (queries/tree.ts, lock order).
  */
 export async function lockStaleUpload(tx: Executor, uploadId: string): Promise<Upload | null> {
@@ -297,6 +297,9 @@ export async function lockStaleUpload(tx: Executor, uploadId: string): Promise<U
           and(
             eq(uploads.status, "completing"),
             sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) < now() - make_interval(mins => ${COMPLETING_STALE_MINUTES})`,
+            // The same exclusion as the listing, asked again here: a hash put on the csam list
+            // after `expired()` ran makes the session the repair sweep's — never aborted here.
+            not(owesLockedNode()),
           ),
         ),
       ),

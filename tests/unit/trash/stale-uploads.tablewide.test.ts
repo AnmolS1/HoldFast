@@ -4,7 +4,7 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { lockStaleUpload } from "../../../src/worker/db/queries/trash-jobs";
-import { uploadParts, uploads } from "../../../src/worker/db/schema";
+import { hashBlocklist, uploadParts, uploads } from "../../../src/worker/db/schema";
 import { job as staleUploadsJob } from "../../../src/worker/jobs/stale-uploads";
 import {
   countingBucket,
@@ -210,6 +210,37 @@ describe("the stale-upload job", () => {
     expect(await partsOf(claimed.id)).toBe(1);
     expect(await multipartIsOpen(claimed.r2Key, claimed.r2UploadId)).toBe(true);
     expect(await usedBytes(owner.id)).toBe(900);
+  });
+
+  it("a session whose hash is put on the csam list after the job listed it is not aborted: still completing, its object kept (the repair sweep's)", async () => {
+    const owner = await member();
+    const sha256 = [...crypto.getRandomValues(new Uint8Array(32))]
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    // Stale in completing: its request died after the store completed the multipart upload.
+    const session = await makeUpload(owner.id, owner.id, {
+      status: "completing",
+      completingAt: ago(2 * HOUR),
+      size: 300,
+      expectedSha256: sha256,
+    });
+    await putObject(session.r2Key, "verified bytes that must become a locked node");
+    // After the job's list, before its first transaction: a verdict elsewhere lists the hash.
+    let listed = false;
+    const handle = hookedDb(async () => {
+      if (listed) return;
+      listed = true;
+      await testDb().insert(hashBlocklist).values({ sha256, reason: "csam", note: "made-up test entry" });
+    });
+    try {
+      await run(jobContext({ db: handle.db }));
+    } finally {
+      await handle.close();
+    }
+    expect(listed).toBe(true);
+    expect(await uploadRow(session.id)).toMatchObject({ status: "completing" });
+    expect(await objectExists(session.r2Key)).toBe(true);
+    await testDb().delete(hashBlocklist).where(eq(hashBlocklist.sha256, sha256));
   });
 
   it("the row decides, not the list: a session a client claimed meanwhile is left alone", async () => {
