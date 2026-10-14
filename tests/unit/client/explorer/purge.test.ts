@@ -21,7 +21,7 @@ import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import type { MockCall } from "../shell/helpers";
 import { FakeDrive } from "./fixtures/drive";
 import { fileNode, folderNode, pageOf } from "./fixtures/nodes";
-import { deferred, serveDrive, setupExplorer } from "./helpers";
+import { deferred, renderExplorer, serveDrive, setupExplorer } from "./helpers";
 
 setupExplorer();
 
@@ -87,27 +87,20 @@ describe("the explorer's purgers", () => {
     expect(result.current).toBe(false);
   });
 
-  it("an edit in flight (it holds a folder's reads back) is forgotten: the next account's reads are not held", async () => {
-    const key = explorerKeys.listing(FOLDER.id, "name", "asc");
-    queryClient.setQueryData(key, { pages: [pageOf([FILE])], pageParams: [undefined] });
-    const read = vi.fn(async () => pageOf([FILE]));
-    const observer = new InfiniteQueryObserver(queryClient, {
-      queryKey: key,
-      queryFn: read,
-      initialPageParam: undefined,
-      getNextPageParam: () => undefined,
-      staleTime: Infinity,
-    });
-    const stop = observer.subscribe(() => {});
+  it("an edit in flight (a folder's reads wait for it) is forgotten: a waiting read goes ahead", async () => {
+    const calls = serveDrive(new FakeDrive([FILE]));
     // An edit that never settles (its request outlived the sign-out).
-    beginEdit(queryClient, [FOLDER.id]);
-    await act(async () => invalidateParents(queryClient, [FOLDER.id]));
-    expect(read).not.toHaveBeenCalled();
+    beginEdit([null]);
+    renderExplorer("/");
+    await vi.waitFor(() =>
+      expect(queryClient.isFetching({ queryKey: explorerKeys.children(null) })).toBeGreaterThan(0),
+    );
+    expect(calls.filter((call) => call.path.startsWith("/api/nodes/root"))).toHaveLength(0);
     await act(async () => {
       await runUserStatePurgers();
     });
-    await act(async () => invalidateParents(queryClient, [FOLDER.id]));
-    expect(read).toHaveBeenCalledTimes(1);
-    stop();
+    await vi.waitFor(() =>
+      expect(calls.filter((call) => call.path.startsWith("/api/nodes/root"))).toHaveLength(1),
+    );
   });
 });

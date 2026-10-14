@@ -1,7 +1,8 @@
 // M3 — a failed optimistic action undoes ITS change, on whatever the cache holds by then, and the
 // parent is read again; a refetch under way cannot overwrite an optimistic edit.
 // M5 — many items never means many requests at once.
-import { act } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { act, fireEvent } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot, subscribeRibbon } from "../../../../src/client/components/TransferRibbon/store";
@@ -14,11 +15,12 @@ import {
   trashNodes,
 } from "../../../../src/client/features/explorer/actions";
 import { explorerKeys, type Listing } from "../../../../src/client/features/explorer/queries";
+import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import { queryClient } from "../../../../src/client/lib/query";
 import type { NodeDto } from "../../../../src/shared/schemas/node";
-import { envelope, json, type MockCall } from "../shell/helpers";
+import { envelope, intersect, json, type MockCall } from "../shell/helpers";
 import { FakeDrive } from "./fixtures/drive";
-import { fileNode, folderNode, pageOf } from "./fixtures/nodes";
+import { fileNode, folderNode, manyNodes, pageOf } from "./fixtures/nodes";
 import {
   deferred,
   recordNodesChanged,
@@ -51,42 +53,63 @@ const answerOf = (drive: FakeDrive, call: MockCall) => {
 
 // m17 (review round 2): with the page mounted, a listing has an observer, so the tree-changed
 // event of a sibling action really reads it again — the seeded-cache tests above cannot see this.
-describe("m17 — a read that starts while an optimistic edit is in flight does not draw it back", () => {
+describe("m17/m25 — a read that starts while an optimistic edit is in flight waits for it", () => {
   const listingReads = (calls: MockCall[]) =>
     calls.filter((call) => call.method === "GET" && call.path.startsWith("/api/nodes/root")).length;
-
-  it("trash A (held) → trash B (done): A stays out of the page while its trash is pending, and the list is read once after", async () => {
+  /** A read of the top-level listing has started and is waiting (nothing has been asked yet). */
+  const readWaiting = () =>
+    vi.waitFor(() =>
+      expect(queryClient.isFetching({ queryKey: explorerKeys.children(null) })).toBeGreaterThan(0),
+    );
+  /** Trash A with its request held until `gate` opens; the page is showing "/". */
+  async function heldTrash() {
     const drive = new FakeDrive([ALPHA, A, B, C]);
     const gate = deferred<void>();
     const calls = serveDrive(drive, async (call) => {
       if (call.path.endsWith(`${A.id}/trash`)) await gate.promise;
       return undefined;
     });
-    renderExplorer("/");
+    const view = renderExplorer("/");
     await waitForRows(4);
-    const first = trashNodes([A]);
-    await act(async () => {
-      await turn();
+    const trashing = trashNodes([A]);
+    // Its optimistic removal is drawn (the request is held).
+    await vi.waitFor(() => expect(rowOf(A.id)).toBeNull());
+    return { drive, gate, calls, view, trashing, readsBefore: listingReads(calls) };
+  }
+  /** The list as a remount or a focus sees it once its freshness has passed. */
+  const markStale = () =>
+    act(async () => {
+      await queryClient.invalidateQueries({ queryKey: explorerKeys.children(null), refetchType: "none" });
     });
+  async function settle(held: Awaited<ReturnType<typeof heldTrash>>) {
+    held.gate.resolve();
+    await act(async () => {
+      await held.trashing;
+    });
+    await vi.waitFor(() => expect(listingReads(held.calls)).toBe(held.readsBefore + 1));
+    await waitForRows(3);
+    expect(rowOf(A.id)).toBeNull();
+  }
+
+  it("trash A (held) → trash B (done): A stays out while its trash is pending; the list is read once, after", async () => {
+    const held = await heldTrash();
     await act(async () => {
       await trashNodes([B]);
     });
-    // B's event asked for a refetch; the server still lists A (its trash has not landed).
-    const readsWhileHeld = listingReads(calls);
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    });
+    // B's event started a read of the list; it waits for A — the server still lists A.
+    await readWaiting();
+    // B's own removal is drawn (the list draws in a transition: wait for it); A stays out.
+    await vi.waitFor(() => expect(rowOf(B.id)).toBeNull());
     expect(rowOf(A.id)).toBeNull();
-    expect(rowOf(B.id)).toBeNull();
-    expect(listingReads(calls)).toBe(readsWhileHeld);
-    gate.resolve();
+    expect(listingReads(held.calls)).toBe(held.readsBefore);
+    held.gate.resolve();
     await act(async () => {
-      await first;
+      await held.trashing;
     });
     await waitForRows(2);
     expect(rows().map((row) => row.getAttribute("data-item-id"))).toEqual([ALPHA.id, C.id]);
     // Read again once, after A settled — not once per event.
-    expect(listingReads(calls)).toBe(readsWhileHeld + 1);
+    expect(listingReads(held.calls)).toBe(held.readsBefore + 1);
   });
 
   it("a rename in flight is not drawn back to its old name by a sibling's refetch", async () => {
@@ -99,21 +122,99 @@ describe("m17 — a read that starts while an optimistic edit is in flight does 
     renderExplorer("/");
     await waitForRows(4);
     const renaming = renameNode(A, "z.pdf");
-    await act(async () => {
-      await turn();
-    });
+    await vi.waitFor(() => expect(rowOf(A.id)!.textContent).toContain("z.pdf"));
     await act(async () => {
       await trashNodes([B]);
     });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    });
+    await readWaiting();
     expect(rowOf(A.id)!.textContent).toContain("z.pdf");
     gate.resolve();
     await act(async () => {
       await renaming;
     });
     expect(rowOf(A.id)!.textContent).toContain("z.pdf");
+  });
+
+  it("a remount of the list (leave and come back) waits too", async () => {
+    const held = await heldTrash();
+    held.view.unmount();
+    await markStale();
+    renderExplorer("/");
+    await readWaiting();
+    expect(listingReads(held.calls)).toBe(held.readsBefore);
+    expect(rowOf(A.id)).toBeNull();
+    await settle(held);
+  });
+
+  // The refresh-failed Retry cannot be pressed during an edit: the edit writes the list, and with it
+  // the banner goes. The button that IS there during an edit is a long folder's Reload — the same
+  // read, from the first page.
+  it("Reload of a long folder waits too", async () => {
+    const nodes = manyNodes(900);
+    const target = nodes[5]!;
+    const drive = new FakeDrive(nodes);
+    const gate = deferred<void>();
+    const calls = serveDrive(drive, async (call) => {
+      if (call.path.endsWith(`${target.id}/trash`)) await gate.promise;
+      return undefined;
+    });
+    renderExplorer("/");
+    const count = () => document.querySelector("[data-item-count]")?.textContent ?? "";
+    await vi.waitFor(() => expect(count()).toMatch(/^200 items/));
+    for (const loaded of [400, 600, 800]) {
+      act(() => intersect((element) => element.hasAttribute("data-load-more-sentinel")));
+      await vi.waitFor(() => expect(count()).toMatch(new RegExp(`^${loaded} items`)));
+    }
+    act(() => emitNodesChanged([null]));
+    await vi.waitFor(() => expect(document.querySelector("[data-reload]")).not.toBeNull());
+    const trashing = trashNodes([target]);
+    await vi.waitFor(() => expect(rowOf(target.id)).toBeNull());
+    const reads = listingReads(calls);
+    fireEvent.click(document.querySelector<HTMLElement>("[data-reload]")!);
+    await readWaiting();
+    expect(listingReads(calls)).toBe(reads);
+    gate.resolve();
+    await act(async () => {
+      await trashing;
+    });
+    await vi.waitFor(() => expect(listingReads(calls)).toBe(reads + 1));
+    await vi.waitFor(() => expect(count()).toMatch(/^200 items/));
+    expect(rowOf(target.id)).toBeNull();
+  });
+
+  it("window focus waits too (the focus refetch goes through the same read)", async () => {
+    const held = await heldTrash();
+    await markStale();
+    act(() => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+    });
+    await readWaiting();
+    expect(listingReads(held.calls)).toBe(held.readsBefore);
+    expect(rowOf(A.id)).toBeNull();
+    await settle(held);
+    focusManager.setFocused(undefined);
+  });
+});
+
+describe("m24 — a failed trash on its own reads the parent again", () => {
+  it("one trash, refused, no other action: the row is put back and the list is read again", async () => {
+    const drive = new FakeDrive([ALPHA, A, B, C]).fail("POST", new RegExp(`${A.id}/trash$`), 500);
+    const calls = serveDrive(drive);
+    renderExplorer("/");
+    await waitForRows(4);
+    const before = calls.filter(
+      (call) => call.method === "GET" && call.path.startsWith("/api/nodes/root"),
+    ).length;
+    await act(async () => {
+      await trashNodes([A]);
+    });
+    await vi.waitFor(() =>
+      expect(
+        calls.filter((call) => call.method === "GET" && call.path.startsWith("/api/nodes/root")).length,
+      ).toBe(before + 1),
+    );
+    expect(rowOf(A.id)).not.toBeNull();
   });
 });
 

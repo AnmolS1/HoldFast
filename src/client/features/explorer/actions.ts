@@ -169,7 +169,7 @@ export async function createFolderIn(parentId: string | null, name: string): Pro
 
 export async function renameNode(node: NodeDto, name: string): Promise<boolean> {
   const mine = stillMine();
-  const end = beginEdit(queryClient, [node.parentId]);
+  const end = beginEdit([node.parentId]);
   try {
     return await renameHeld(node, name, mine);
   } finally {
@@ -210,7 +210,7 @@ export async function setStarred(nodes: readonly NodeDto[], starred: boolean): P
   if (nodes.length === 0) return;
   const mine = stillMine();
   const parents = unique(nodes.map((node) => node.parentId));
-  const end = beginEdit(queryClient, parents);
+  const end = beginEdit(parents);
   try {
     await starHeld(nodes, starred, parents, mine);
   } finally {
@@ -278,7 +278,7 @@ export async function trashNodes(nodes: readonly NodeDto[]): Promise<void> {
   if (nodes.length === 0) return;
   const mine = stillMine();
   const parents = unique(nodes.map((node) => node.parentId));
-  const end = beginEdit(queryClient, parents);
+  const end = beginEdit(parents);
   try {
     await trashHeld(nodes, parents, mine);
   } finally {

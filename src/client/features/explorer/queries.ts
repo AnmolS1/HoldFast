@@ -33,14 +33,17 @@ export type Listing = InfiniteData<NodePage, string | undefined>;
 export function useListing(folderId: string | null, sort: SortKey, dir: SortDir) {
   return useInfiniteQuery({
     queryKey: explorerKeys.listing(folderId, sort, dir),
-    queryFn: ({ pageParam, signal }) => listChildren(folderId, { sort, dir, cursor: pageParam, signal }),
+    // The one place a listing is read — so whatever starts the read (a mount, a sort, Retry,
+    // Reload, focus, reconnect, the tree-changed event), it waits for the folder's optimistic edits.
+    queryFn: async ({ pageParam, signal }) => {
+      await editsSettled(scope(folderId), signal);
+      return listChildren(folderId, { sort, dir, cursor: pageParam, signal });
+    },
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.nextCursor ?? undefined,
     // A refetch reads every loaded page again, one request each: only a short list does that by
     // itself. A long one is marked as changed and read again when the user asks (see below).
-    // Nor while an optimistic edit of this parent is in flight (see `beginEdit`).
-    refetchOnWindowFocus: (query) =>
-      (query.state.data?.pages.length ?? 0) <= MAX_REFETCH_PAGES && !editing.has(String(query.queryKey[2])),
+    refetchOnWindowFocus: (query) => (query.state.data?.pages.length ?? 0) <= MAX_REFETCH_PAGES,
   });
 }
 
@@ -188,21 +191,46 @@ registerUserStatePurger(resetChangedForTests);
 
 // ---------------------------------------------------------------------------------------------
 // Optimistic edits in flight. A read of a parent that STARTS while an optimistic edit of it is
-// pending (another action's tree-changed event, window focus) would answer what the server holds
-// before that edit lands — a trashed row drawn back, an old name. So while a parent has an edit in
-// flight its listings are only marked stale, and read again once, when the last edit has settled.
+// pending would answer what the server holds before that edit lands — a trashed row drawn back, an
+// old name. So a listing's read waits until its folder has no edit in flight (`useListing`'s
+// query function): one check, whatever started the read. A read already under way when an edit
+// starts is cancelled by the edit (`cancelListings`).
 
-/** Edits in flight per parent (by scope key), and the parents whose read was held back meanwhile. */
+/** Edits in flight per parent (by scope key), and the reads waiting for them to settle. */
 const editing = new Map<string, number>();
-const heldBack = new Set<string>();
+const waiting = new Map<string, Set<() => void>>();
 let editGeneration = 0;
+
+function release(key: string): void {
+  const reads = waiting.get(key);
+  waiting.delete(key);
+  for (const go of reads ?? []) go();
+}
+
+/** Resolves once this folder has no optimistic edit in flight; rejects when the read is aborted. */
+function editsSettled(key: string, signal: AbortSignal): Promise<void> {
+  if (!editing.has(key)) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const reads = waiting.get(key) ?? new Set<() => void>();
+    waiting.set(key, reads);
+    const onAbort = () => {
+      reads.delete(go);
+      reject(signal.reason);
+    };
+    const go = () => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    reads.add(go);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /**
  * Mark an optimistic edit of these parents as in flight. Returns the function that ends it (call
- * it exactly once, whatever the outcome): a parent with nothing left in flight whose read was held
- * back is read again then.
+ * it exactly once, whatever the outcome): reads of a parent with nothing left in flight go ahead.
  */
-export function beginEdit(client: QueryClient, parentIds: readonly (string | null)[]): () => void {
+export function beginEdit(parentIds: readonly (string | null)[]): () => void {
   const keys = Array.from(new Set(parentIds), scope);
   const generation = editGeneration;
   for (const key of keys) editing.set(key, (editing.get(key) ?? 0) + 1);
@@ -211,7 +239,6 @@ export function beginEdit(client: QueryClient, parentIds: readonly (string | nul
     // Ended twice, or the account changed meanwhile (the purger has forgotten every edit).
     if (ended || generation !== editGeneration) return;
     ended = true;
-    const due: Array<string | null> = [];
     for (const key of keys) {
       const left = (editing.get(key) ?? 1) - 1;
       if (left > 0) {
@@ -219,17 +246,16 @@ export function beginEdit(client: QueryClient, parentIds: readonly (string | nul
         continue;
       }
       editing.delete(key);
-      if (heldBack.delete(key)) due.push(key === TOP ? null : key);
+      release(key);
     }
-    if (due.length > 0) invalidateParents(client, due);
   };
 }
 
-/** Forget every edit in flight: run by `purgeUserState()` and by tests. */
+/** Forget every edit in flight, letting any read that waits go: run by `purgeUserState()` and by tests. */
 export function resetEditsForTests(): void {
   editGeneration += 1;
   editing.clear();
-  heldBack.clear();
+  for (const key of Array.from(waiting.keys())) release(key);
 }
 
 registerUserStatePurger(resetEditsForTests);
@@ -237,14 +263,6 @@ registerUserStatePurger(resetEditsForTests);
 /** The tree changed under these parents: their listings, picker levels and details are stale. */
 export function invalidateParents(client: QueryClient, parentIds: readonly (string | null)[]): void {
   for (const parentId of new Set(parentIds)) {
-    if (editing.has(scope(parentId))) {
-      // Stale, but not read now: the edit in flight would be drawn over. Read once it settles.
-      heldBack.add(scope(parentId));
-      void client.invalidateQueries({ queryKey: explorerKeys.children(parentId), refetchType: "none" });
-      void client.invalidateQueries({ queryKey: explorerKeys.folders(parentId) });
-      if (parentId !== null) void client.invalidateQueries({ queryKey: explorerKeys.node(parentId) });
-      continue;
-    }
     const long = client
       .getQueriesData<Listing>({ queryKey: explorerKeys.children(parentId), type: "active" })
       .some(([, data]) => (data?.pages.length ?? 0) > MAX_REFETCH_PAGES);
