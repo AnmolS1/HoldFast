@@ -114,7 +114,7 @@ export function ActionMenu({ open, title, entries, anchor, sheet, onClose }: Act
       data-action-menu
     >
       {entries.flatMap((entry) => [
-        entry.separated ? <Divider key={`${entry.id}-rule`} component="li" sx={{ margin: "4px 0" }} /> : null,
+        entry.separated ? <Divider key={`${entry.id}-rule`} component="li" sx={{ my: 1 }} /> : null,
         <MenuItem
           key={entry.id}
           disabled={entry.disabled}

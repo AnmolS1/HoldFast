@@ -15,7 +15,7 @@ import { t } from "./strings";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <Box sx={{ display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 }}>
+    <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5, minWidth: 0 }}>
       <Box component="dt" sx={{ color: hf.textSecondary, typography: "body2" }}>
         {label}
       </Box>

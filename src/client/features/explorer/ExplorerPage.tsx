@@ -5,6 +5,7 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
 import Tooltip from "@mui/material/Tooltip";
+import type { Theme } from "@mui/material/styles";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import {
   Clock,
@@ -207,7 +208,7 @@ function renderThumb(item: NodeDto) {
 
 function Explorer({ folderId }: { folderId: string | null }) {
   const desktop = useIsDesktop();
-  const narrow = useMediaQuery("(max-width:1279.95px)", { noSsr: true });
+  const narrow = useMediaQuery((theme: Theme) => theme.breakpoints.down("lg"), { noSsr: true });
   const prefs = usePrefs();
   const { sort, dir } = useSort();
   const navigate = useNavigate();

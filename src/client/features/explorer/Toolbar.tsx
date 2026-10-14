@@ -35,7 +35,11 @@ export interface ToolbarProps {
 }
 
 const tick = (on: boolean) => (
-  <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", width: 16, flex: "none" }}>
+  <Box
+    component="span"
+    aria-hidden="true"
+    sx={{ display: "inline-flex", width: (theme) => theme.spacing(4), flex: "none" }}
+  >
     {on ? <Check size={14} /> : null}
   </Box>
 );
@@ -133,7 +137,7 @@ export function Toolbar(props: ToolbarProps) {
             {option.label}
           </MenuItem>
         ))}
-        <Divider component="li" sx={{ margin: "4px 0" }} />
+        <Divider component="li" sx={{ my: 1 }} />
         {(["asc", "desc"] as const).map((direction) => (
           <MenuItem
             key={direction}
@@ -152,7 +156,7 @@ export function Toolbar(props: ToolbarProps) {
         {desktop
           ? null
           : [
-              <Divider key="rule" component="li" sx={{ margin: "4px 0" }} />,
+              <Divider key="rule" component="li" sx={{ my: 1 }} />,
               ...(["list", "grid"] as const).map((mode) => (
                 <MenuItem
                   key={mode}
