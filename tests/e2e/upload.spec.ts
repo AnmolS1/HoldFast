@@ -305,6 +305,10 @@ const filesInput = (page: Page) => page.locator('input[data-upload-input="files"
 
 async function openUploads(page: Page, search = ""): Promise<void> {
   await page.goto(`/uploads${search}`);
+  // The page is ready once its free-space line is there: the buttons are drawn while that read is
+  // on its way, and a failed read replaces them with the page's error state — so waiting for the
+  // buttons alone passed or failed by timing when `GET /api/account/usage` answered an error.
+  await expect(page.locator("[data-uploads-free]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Choose files" })).toBeVisible();
 }
 
