@@ -70,7 +70,7 @@ const asCaller = (user: UserRow) => ({ user: user as unknown as SessionUser });
 const readById = async (user: UserRow, nodeId: string) =>
   (await invoke(asCaller(user), (c: Context<AppEnv>) => requireRole(c, nodeId, "viewer"))).status;
 /** Status and bytes — what a client can compare. */
-const seen = (answer: Answer) => `${answer.status} ${answer.bytes}`;
+const seen = (answer: Answer<unknown>) => `${answer.status} ${answer.bytes}`;
 const list = (user: UserRow) => call<unknown[]>(user, "GET", "/uploads/open");
 
 describe("B1 — verified CSAM bytes are hidden and held from the first commit of their row", () => {
