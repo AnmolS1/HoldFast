@@ -472,9 +472,10 @@ describe("the minors", () => {
   }, 60_000);
 
   it("m5 — two identical inits at once with room for ONE more file today: one 201, one 200 with the same session — never a 429", async () => {
-    const user = await uploader();
-    const tight = { settings: { ...ROOMY, ceilings: { upload_user: { count: 1 } } } } as const;
-    const json = initBody({ name: "race.bin", size: 10 });
+    // Room for these 1000 bytes today, and not for a second 1000.
+    const user = await uploader({ quotaBytes: 1000 });
+    const tight = { settings: { ...ROOMY, ceilings: { ...ROOMY.ceilings, CEIL_UPLOAD_BYTES_DAY: 1000 } } };
+    const json = initBody({ name: "race.bin", size: 1000 });
     // The uploader's row is held, so that BOTH inits get past the first resume lookup and wait
     // for the ceilings' lock; then it is let go and one of them writes the session first.
     const release = gate();
