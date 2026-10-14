@@ -27,6 +27,7 @@ export const messages = {
   "trash.delete.done": "{count} items deleted forever",
   "trash.emptyTrash": "Empty trash",
   "trash.emptyTrash.checking": "Checking the trash…",
+  "trash.emptyTrash.withdrawn": "Empty trash cancelled.",
   "trash.batch.restore": "Restoring stopped: {done} restored, {left} left.",
   "trash.batch.delete": "Deleting stopped: {done} deleted forever, {left} left.",
   "trash.batch.wait": "Too many requests just now. You can try again shortly.",

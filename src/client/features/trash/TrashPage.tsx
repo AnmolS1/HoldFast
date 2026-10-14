@@ -35,8 +35,9 @@ import {
   usePagedView,
 } from "../starred/view-state";
 import { EmptyTrashAction } from "./EmptyTrashAction";
+import { setBatchStop, useBatchStop, type BatchStop } from "./batch-stop";
 import { usePreConfirmRead } from "./empty-run";
-import { deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
+import { announcedByClient, deleteForever, dropFromTrashCache, restoreNode, useTrash } from "./queries";
 import { t } from "./strings";
 
 type TrashRow = TrashItemDto & { secondary: string };
@@ -48,15 +49,6 @@ interface MenuTarget {
   item: TrashRow;
   /** The button the menu hangs from, or where the pointer was (context menu). */
   anchor: HTMLElement | { x: number; y: number };
-}
-
-/** A batch that was cut short: what it did, what is left, and until when the API asked for quiet. */
-interface BatchStop {
-  action: "restore" | "delete";
-  done: number;
-  left: number;
-  retryAt: number;
-  requestId: string | undefined;
 }
 
 /**
@@ -86,8 +78,9 @@ export function TrashPage() {
   const [deleting, setDeleting] = useState<TrashRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [conflict, setConflict] = useState(false);
-  const [stopped, setStopped] = useState<BatchStop | null>(null);
-  // After a `429` the two actions are not offered again before the time the API named.
+  const stopped = useBatchStop();
+  // After a `429` the two actions are not offered again before the time the API named — on this
+  // visit or a later one (the stop is the account's, batch-stop.ts).
   const batchWait = useBlockedUntil(stopped?.retryAt ?? 0);
   // The read before "Empty the trash?" is out: nothing else destructive starts meanwhile.
   const preConfirm = usePreConfirmRead();
@@ -111,12 +104,13 @@ export function TrashPage() {
   };
 
   const stop = (action: BatchStop["action"], done: number, left: number, error: unknown) =>
-    setStopped({
+    setBatchStop({
       action,
       done,
       left,
       retryAt: retryNotBefore(error, Date.now()),
       requestId: error instanceof ApiError ? error.requestId : undefined,
+      announced: announcedByClient(error),
     });
 
   // Both batches send ONE request at a time, and stop at the first answer that is about the API
@@ -125,7 +119,7 @@ export function TrashPage() {
   const restore = async (targets: readonly TrashRow[]) => {
     setMenu(null);
     setConflict(false);
-    setStopped(null);
+    setBatchStop(null);
     setBusy(true);
     let reread = false;
     let done = 0;
@@ -170,7 +164,7 @@ export function TrashPage() {
   };
 
   const purge = async (targets: readonly TrashRow[]) => {
-    setStopped(null);
+    setBatchStop(null);
     setBusy(true);
     const gone = new Set<string>();
     let itemFailure: unknown;
@@ -321,8 +315,10 @@ export function TrashPage() {
         </Box>
       ) : null}
       {stopped ? (
+        // One announcement: when the API client has said it already (a `429`, a `503` read-only
+        // or paused), this line is not a live region; otherwise it is the alert.
         <Box
-          role="alert"
+          role={stopped.announced ? undefined : "alert"}
           data-trash-stopped={stopped.action}
           sx={{
             display: "flex",
@@ -349,7 +345,7 @@ export function TrashPage() {
               </>
             ) : null}
           </Box>
-          <IconButton aria-label={t("trash.dismiss")} onClick={() => setStopped(null)} disabled={batchWait}>
+          <IconButton aria-label={t("trash.dismiss")} onClick={() => setBatchStop(null)} disabled={batchWait}>
             <X size={16} aria-hidden="true" />
           </IconButton>
         </Box>

@@ -5,7 +5,7 @@ import { hashKey, type QueryKey } from "@tanstack/react-query";
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { ApiError } from "../../lib/api";
 import { registerUserStatePurger } from "../../lib/contracts";
-import { accountEpoch, sameAccount } from "../../lib/query";
+import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 
 /** The parts of a query's state these helpers read (a plain or an infinite query has them). */
 export interface QueryLike {
@@ -71,7 +71,8 @@ export function useBlockedUntil(until: number): boolean {
 // trash) clears the query's error, and a list that read only that flag would ask for the failed
 // page again — by itself, as often as something refreshes, through a running Retry-After.
 // The rule: once a next page has failed, that list asks for no further page until the user
-// presses "Try again". It is account state: purged with the rest.
+// presses "Try again" or starts the list again from its first page — or the list is known to end
+// before that page. It is account state: purged with the rest.
 
 export interface PageFailure {
   error: unknown;
@@ -81,12 +82,59 @@ export interface PageFailure {
 
 const failures = new Map<string, PageFailure>();
 const failureListeners = new Set<() => void>();
+// A failure forgotten while the wait it came with still runs leaves that wait behind: no notice,
+// but nothing refreshes the list by itself before it is over (`isHeld`). Until when, per query.
+const quietHolds = new Map<string, number>();
 
 function setFailure(hash: string, failure: PageFailure | null): void {
   if (failure) failures.set(hash, failure);
   else if (!failures.delete(hash)) return;
   for (const listener of failureListeners) listener();
 }
+
+/** The list's failed page is no longer the list's problem; a wait the API named still holds. */
+function forgetFailure(hash: string): void {
+  const failure = failures.get(hash);
+  if (!failure) return;
+  const until = retryNotBefore(failure.error, failure.at);
+  if (until > Date.now()) quietHolds.set(hash, until);
+  setFailure(hash, null);
+}
+
+/**
+ * The failure of this list, forgotten — unless a wait it came with still runs. True when there
+ * was one to forget: the caller then reads the list again from its first page.
+ */
+export function forgetPageFailure(key: QueryKey): boolean {
+  const hash = hashKey(key);
+  const failure = failures.get(hash);
+  if (!failure || retryNotBefore(failure.error, failure.at) > Date.now()) return false;
+  setFailure(hash, null);
+  return true;
+}
+
+/** Does the query's newest data end the list (its last page has no next cursor)? */
+function endsTheList(data: unknown): boolean {
+  const pages = (data as { pages?: unknown } | undefined)?.pages;
+  if (!Array.isArray(pages)) return false;
+  const last = pages.at(-1) as { nextCursor?: unknown } | undefined;
+  return last !== undefined && last.nextCursor === null;
+}
+
+// A remembered failure lives exactly as long as it can be true: it goes when its query leaves the
+// cache (a later visit loads the list afresh), and when the list turns out to end before the page
+// that failed — written (an emptied trash) or read again (a list that shrank to one page).
+queryClient.getQueryCache().subscribe((event) => {
+  if (!failures.has(event.query.queryHash)) return;
+  if (event.type === "removed") forgetFailure(event.query.queryHash);
+  else if (
+    event.type === "updated" &&
+    event.action.type === "success" &&
+    endsTheList(event.query.state.data)
+  ) {
+    forgetFailure(event.query.queryHash);
+  }
+});
 
 const subscribeFailures = (listener: () => void) => {
   failureListeners.add(listener);
@@ -96,6 +144,7 @@ const subscribeFailures = (listener: () => void) => {
 /** Forget every failed page. Run by `purgeUserState()` and by tests. */
 export function clearPageFailures(): void {
   failures.clear();
+  quietHolds.clear();
   for (const listener of failureListeners) listener();
 }
 
@@ -119,9 +168,12 @@ export interface CachedQuery {
  */
 export function isHeld(query: CachedQuery): boolean {
   const failure = failures.get(query.queryHash);
+  const quiet = quietHolds.get(query.queryHash) ?? 0;
+  if (quiet !== 0 && quiet <= Date.now()) quietHolds.delete(query.queryHash);
   const until = Math.max(
     retryNotBefore(query.state.error, query.state.errorUpdatedAt),
     failure ? retryNotBefore(failure.error, failure.at) : 0,
+    quiet,
   );
   return until > Date.now();
 }

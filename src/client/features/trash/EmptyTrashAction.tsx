@@ -27,6 +27,29 @@ const UNKNOWN: TrashSize = { count: null, more: false };
 /** What a user does that is not "waiting for the dialog I asked for". */
 const OTHER_ACTS = ["pointerdown", "keydown", "click"] as const;
 
+/**
+ * Keys that only move the focus or are held with another key: pressing one is not doing
+ * something else — a keyboard or screen-reader user may well move on while the button says
+ * "Checking…" — so it does not withdraw the question. Every other key may act on the page.
+ */
+const PASSIVE_KEYS = new Set([
+  "Tab",
+  "Shift",
+  "Control",
+  "Alt",
+  "AltGraph",
+  "Meta",
+  "CapsLock",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
+
 function consequence(size: TrashSize): string {
   const folders = t("trash.delete.folders");
   if (size.count === null) return `${t("trash.emptyTrash.everything")} ${folders}`;
@@ -45,6 +68,8 @@ export function EmptyTrashAction() {
   const checking = usePreConfirmRead();
   // What the dialog was opened with: the trash as the server had it at that moment.
   const [asked, setAsked] = useState<TrashSize | null>(null);
+  // The question was withdrawn by something else the user did: said in the status line.
+  const [withdrawnNote, setWithdrawnNote] = useState(false);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -66,6 +91,7 @@ export function EmptyTrashAction() {
   // The count decides whether the word must be typed, so it is read again first: the list in
   // memory may be seconds old, or from before another device filled the trash.
   const ask = async () => {
+    setWithdrawnNote(false);
     // No read is possible (offline) or allowed (the API named a wait for this list): ask now,
     // with the size unknown — which asks for the word.
     const cachedQuery = queryClient.getQueryCache().find({ queryKey: viewKeys.trash });
@@ -74,14 +100,17 @@ export function EmptyTrashAction() {
       return;
     }
     // A destructive confirmation may open only as the direct continuation of the click that
-    // asked for it. While the read is out, anything else the user does — a key, a press, a
-    // click anywhere, leaving the page — withdraws the question: the answer is then dropped
-    // and nothing opens. (The click that started this is already past the document's capture
-    // phase, so it does not count.)
+    // asked for it. While the read is out, anything else the user does — a key that acts, a
+    // press, a click anywhere, leaving the page — withdraws the question: the answer is then
+    // dropped, nothing opens, and the status line says so. (The click that started this is
+    // already past the document's capture phase, so it does not count.)
     let withdrawn = false;
-    const withdraw = () => {
+    const withdraw = (event: Event) => {
+      if (event instanceof KeyboardEvent && PASSIVE_KEYS.has(event.key)) return;
+      if (withdrawn) return;
       withdrawn = true;
       setPreConfirmRead(false);
+      if (mounted.current) setWithdrawnNote(true);
     };
     for (const type of OTHER_ACTS) document.addEventListener(type, withdraw, true);
     setPreConfirmRead(true);
@@ -128,7 +157,9 @@ export function EmptyTrashAction() {
         sx={{ color: hf.textSecondary }}
       >
         {run.state !== "running"
-          ? ""
+          ? withdrawnNote
+            ? t("trash.emptyTrash.withdrawn")
+            : ""
           : run.remaining === null
             ? t("trash.emptyTrash.starting")
             : t("trash.emptyTrash.progress", { remaining: run.remaining })}

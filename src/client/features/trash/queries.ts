@@ -7,7 +7,7 @@ import {
   TrashResponse,
   type TrashItemDto,
 } from "../../../shared/schemas/node";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
 import { registerUserStatePurger } from "../../lib/contracts";
 import { queryClient } from "../../lib/query";
 import { viewKeys } from "../starred/view-queries";
@@ -52,6 +52,24 @@ export interface TrashSize {
  */
 export function needsTypedConfirm({ count, more }: TrashSize): boolean {
   return count === null || more || count > TYPED_CONFIRM_ABOVE;
+}
+
+/** The trash as the server has it once emptied: one page, no rows, no further page. */
+export const EMPTY_TRASH: InfiniteData<TrashResponse, string | null> = {
+  pages: [{ items: [], nextCursor: null }],
+  pageParams: [null],
+};
+
+/**
+ * Has the API client already said this failure out loud — its own toast for a `429`, a `503`
+ * read-only or paused, a read-only impersonation (`react()` in lib/api.ts)? Then a notice of
+ * ours is not a second live announcement.
+ */
+export function announcedByClient(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  if (error.status === 429) return true;
+  if (error.status === 503) return error.code === "read_only" || error.code === "feature_disabled";
+  return error.status === 403 && error.details?.reason === "impersonation_read_only";
 }
 
 /** `POST /api/nodes/:id/restore` → the node where it now is (maybe the top level, maybe renamed). */

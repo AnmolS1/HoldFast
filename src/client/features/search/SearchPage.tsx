@@ -12,7 +12,7 @@ import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ListNotice, NodeList, ViewError, ViewPage } from "../starred/view-kit";
 import { viewKeys } from "../starred/view-queries";
-import { hasFailed, isWaitingOffline, usePagedView } from "../starred/view-state";
+import { forgetPageFailure, hasFailed, isWaitingOffline, usePagedView } from "../starred/view-state";
 import { DEBOUNCE_MS, useSearch } from "./queries";
 import { t } from "./strings";
 import {
@@ -157,11 +157,20 @@ export function SearchPage() {
       })),
     [search.data],
   );
-  const paging = usePagedView(
-    search,
-    viewKeys.search({ q: state.q, category: state.category, scope: state.scope }),
-    items.length,
+  const key = useMemo(
+    () => viewKeys.search({ q: state.q, category: state.category, scope: state.scope }),
+    [state.q, state.category, state.scope],
   );
+  // A search started from outside the box — the header's search, a link, a filter — is the user
+  // loading the list from its first page: a page of that same search that failed before is
+  // forgotten (unless the wait the API named for it still runs) and the search is read again.
+  // Typing into the box and back / forward do not count.
+  const navigated = navigationType !== "POP" && !ownWrite;
+  const refetch = search.refetch;
+  useEffect(() => {
+    if (navigated && forgetPageFailure(key)) void refetch();
+  }, [location.key, navigated, key, refetch]);
+  const paging = usePagedView(search, key, items.length);
   const searchable = isSearchable(state);
   const count = search.hasNextPage
     ? items.length === 1

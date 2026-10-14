@@ -4,12 +4,11 @@
 // is stopped and forgotten on sign-out or an account switch.
 import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
-import { ApiError } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
-import { accountEpoch, getKnownUserId, refreshSession, sameAccount } from "../../lib/query";
+import { accountEpoch, getKnownUserId, queryClient, refreshSession, sameAccount } from "../../lib/query";
 import { refreshQueries, viewKeys } from "../starred/view-queries";
 import { retryNotBefore } from "../starred/view-state";
-import { emptyTrash, isAbort } from "./queries";
+import { announcedByClient, emptyTrash, EMPTY_TRASH, isAbort } from "./queries";
 import { t } from "./strings";
 
 export type EmptyRun =
@@ -83,17 +82,16 @@ export function startEmptyTrash(): void {
   set({ run: { state: "running", remaining: null } });
   let remaining: number | null = null;
   // Whose trash this is. `DELETE /api/trash` means "the caller's", and the caller is whoever the
-  // cookie names when the request LEAVES — so the account is checked before every request, not
-  // only when an answer arrives: against what this tab knows, and (from the second request on,
-  // each of which may follow up to twenty seconds of server work) against the session read
-  // again, because another tab may have signed somebody else in meanwhile.
+  // cookie names when the request LEAVES — so the account is checked before every request, the
+  // first included, not only when an answer arrives: against what this tab knows, and against
+  // the session read again, because another tab may have signed somebody else in meanwhile (the
+  // click may come long after the page loaded; each later batch follows up to twenty seconds of
+  // server work).
   const owner = getKnownUserId();
   const account = accountEpoch();
-  const beforeBatch = async (round: number) => {
-    if (round > 0) {
-      const session = await refreshSession();
-      if ((session?.user.id ?? null) !== owner) throw new NotThisAccount();
-    }
+  const beforeBatch = async () => {
+    const session = await refreshSession();
+    if ((session?.user.id ?? null) !== owner) throw new NotThisAccount();
     if (!sameAccount(account) || getKnownUserId() !== owner) throw new NotThisAccount();
   };
   emptyTrash(
@@ -109,8 +107,16 @@ export function startEmptyTrash(): void {
     undefined,
     beforeBatch,
   ).then(
-    () => {
+    async () => {
       if (!sameAccount(account)) return;
+      // `204`: the trash is empty, and that is known without asking. A read still out (each
+      // batch asked for one) would bring the purged rows back after this, so it is called off
+      // first; then the list is written as the server has it — whatever a failed page or a wait
+      // the API named left on it.
+      await queryClient.cancelQueries({ queryKey: viewKeys.trash });
+      if (!sameAccount(account)) return;
+      queryClient.setQueryData(viewKeys.trash, EMPTY_TRASH);
+      void refreshQueries(viewKeys.usage);
       set({ run: IDLE });
       toast({ message: t("trash.emptyTrash.done"), key: "empty-trash" });
       // No live listing changed; this feature's own trash and storage numbers did.
@@ -131,11 +137,10 @@ export function startEmptyTrash(): void {
           dismissed: false,
         },
       });
-      // Said ONCE: the API client has already announced a `429` and a `503` itself; anything
-      // else gets this toast. The line next to the button is not a live region.
-      if (!(error instanceof ApiError && (error.status === 429 || error.status === 503))) {
-        toast({ message: stoppedMessage(remaining), key: "empty-trash" });
-      }
+      // Said ONCE: what the API client has already announced itself (a `429`, a `503` read-only
+      // or paused) gets no second word; anything else gets this toast. The line next to the
+      // button is not a live region.
+      if (!announcedByClient(error)) toast({ message: stoppedMessage(remaining), key: "empty-trash" });
       // Part of it may be gone.
       emitNodesChanged([]);
     },
