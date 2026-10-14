@@ -24,7 +24,11 @@
 
 import { UUID } from "../../shared/ids";
 import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
-import { csamReportsToAnnounce, lockSuspectedCsam as lockRows } from "../db/queries/moderation";
+import {
+  csamLocksWithoutReport,
+  csamReportsToAnnounce,
+  lockSuspectedCsam as lockRows,
+} from "../db/queries/moderation";
 import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
@@ -486,23 +490,75 @@ export async function lockSuspectedCsam(
   nodeId: string,
   opts: { source: "photodna" | "system" | "admin" },
 ): Promise<{ reportId: string }> {
-  const locked = await lockRows(deps.db, nodeId, opts);
+  const locked = await lockAndOwe(deps, nodeId, opts.source, "lock");
   if (!locked) throw new AppError("not_found");
+  if (locked.owed) deps.defer(locked.owed);
+  return { reportId: locked.reportId };
+}
+
+/**
+ * The lock, and what it owes afterwards — unstarted work is never returned: `owed` is the
+ * record + alert already running (its errors captured), or null when nothing is owed. Null
+ * when there is no such file.
+ */
+async function lockAndOwe(
+  deps: ServiceDeps,
+  nodeId: string,
+  source: "photodna" | "system" | "admin",
+  via: "lock" | "sweep",
+): Promise<{ reportId: string; owed: Promise<void> | null } | null> {
+  const locked = await lockRows(deps.db, nodeId, { source });
+  if (!locked) return null;
   const { reportId } = locked;
   // A FIRST lock is always recorded and announced — also when it found a report that was
   // already being reviewed or was filed (an admin opened the case from a user's report): the
   // node is locked NOW, and the sweep, which looks at open reports only, would never make a
-  // missing record good. A REPEAT is, only while the report is open (the redelivery that repairs
-  // what was lost with an invocation); on a report someone is reviewing, or that was FILED, it
-  // mails nobody and writes no second lock row. Decided on what the lock saw under its locks.
-  if (locked.alreadyLocked && locked.reportStatus !== "open") return { reportId };
-  deps.defer(
-    (async () => {
-      await attempt(deps, "lock_record", () =>
-        recordCsamLock(deps, { reportId, nodeId, source: opts.source }, false),
-      );
-      await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via: "lock", nodeId }));
-    })(),
-  );
-  return { reportId };
+  // missing record good. A node WRITTEN locked whose report this call filed is a first lock too
+  // (`alreadyLocked` is false for it). A REPEAT is, only while the report is open (the
+  // redelivery that repairs what was lost with an invocation); on a report someone is
+  // reviewing, or that was FILED, it mails nobody and writes no second lock row. Decided on what
+  // the lock saw under its locks.
+  if (locked.alreadyLocked && locked.reportStatus !== "open") return { reportId, owed: null };
+  const owed = (async () => {
+    await attempt(deps, "lock_record", () =>
+      recordCsamLock(deps, { reportId, nodeId, source }, via === "sweep"),
+    );
+    await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via, nodeId }));
+  })();
+  return { reportId, owed };
+}
+
+/**
+ * Completes the suspected-CSAM locks nobody finished: every file that is `suspected_csam` with
+ * no `csam` case (`moderation.csamLocksWithoutReport`, oldest first, at most `limit`) is locked
+ * again — the whole job: its report is filed, the owner and every uploader held, its links
+ * paused, its upload addresses held — and then recorded (`scan.suspected_csam` with source
+ * `system` and `recoveredBy: "sweep"`) and announced (`via: "sweep"`) like a first lock, AWAITED
+ * here (a scheduled job has no request to answer first). One failing node does not stop the
+ * rest: its error is captured and counted, and the next run finds it again. A node completed by
+ * someone else in between is a repeat and costs nothing (its own lock recorded it). Wired into
+ * the hourly slot beside `sweepCsamAlerts` by the scheduled-jobs task (T22).
+ */
+export async function sweepUnrecordedCsamLocks(
+  deps: ServiceDeps,
+  opts: { limit?: number } = {},
+): Promise<{ checked: number; completed: number; failed: number }> {
+  const limit = Math.max(1, Math.min(opts.limit ?? CSAM_SWEEP_DEFAULT_LIMIT, 1_000));
+  const due = await csamLocksWithoutReport(deps.db, limit);
+  let completed = 0;
+  let failed = 0;
+  for (const { nodeId } of due) {
+    try {
+      const locked = await lockAndOwe(deps, nodeId, "system", "sweep");
+      if (locked?.owed) {
+        await locked.owed;
+        completed += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      captureError(error, { kind: "csam_alert" });
+      writeMetric(deps.env, "error", { kind: "csam_alert", reason: "sweep_lock" });
+    }
+  }
+  return { checked: due.length, completed, failed };
 }

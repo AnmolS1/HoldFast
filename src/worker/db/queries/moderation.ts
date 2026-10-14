@@ -209,9 +209,11 @@ export type CsamLockResult = {
    */
   reportStatus: "open" | "reviewing" | "actioned";
   /**
-   * The node was `suspected_csam` already when this call took its lock: a REPEAT. False for
-   * the call that locked it — which may well find a report that is already `reviewing` or
-   * `actioned` (an admin opened the case from a user's report). The caller records and
+   * The node was `suspected_csam` already when this call took its lock AND had a `csam` report
+   * that is `open`, `reviewing` or `actioned`: a REPEAT. False for the call that locked it —
+   * which may well find a report that is already `reviewing` or `actioned` (an admin opened the
+   * case from a user's report) — and for a node that was WRITTEN locked with no such report
+   * (this call filed its report: the first complete lock). The caller records and
    * announces every FIRST lock, whatever the report's status; a repeat only while the report
    * is `open` (that is how a record lost with its invocation is made good).
    */
@@ -328,8 +330,9 @@ async function lockRows(
   // A FILE only. A folder is dealt with by a takedown: this lock sets a hold that nothing may
   // inherit, and takes no tree lock (queries/tree.ts).
   if (node.kind !== "file") return null;
-  // Read under the node's lock, before anything is written: is this a repeat?
-  const alreadyLocked = node.scanStatus === "suspected_csam";
+  // Read under the node's lock, before anything is written: was it locked already? That alone
+  // does not make this a repeat — see `alreadyLocked` below.
+  const wasLocked = node.scanStatus === "suspected_csam";
   const now = await csamSubjects(sp, nodeId);
   if (!now) return null;
   const all = subjectUserIds(now);
@@ -376,16 +379,20 @@ async function lockRows(
     // The case that is still being worked on first; else the one that was filed.
     .orderBy(sql`(${reports.status} = 'actioned')`, reports.createdAt)
     .limit(1);
+  // A REPEAT is a node that was locked AND has its case: a node that is `suspected_csam` with no
+  // such report was written locked by someone who did not finish the job (the upload route
+  // inserts a server-verified object's node locked and calls this right after; that call can
+  // fail or never run) — everything above has now been done for it, and this is its FIRST lock.
   if (existing) {
     return {
       reportId: existing.id,
       ownerId: node.ownerId,
       reportStatus: existing.status as CsamLockResult["reportStatus"],
-      alreadyLocked,
+      alreadyLocked: wasLocked,
     };
   }
   const reportId = await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" });
-  return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open", alreadyLocked };
+  return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open", alreadyLocked: false };
 }
 
 export type CsamClearResult = {
@@ -830,4 +837,27 @@ export async function csamReportsToAnnounce(
     source: row.source,
     lockRecorded: row.lock_recorded === true,
   }));
+}
+
+/**
+ * Files that are `suspected_csam` with no `csam` report that is `open`, `reviewing` or
+ * `actioned` — exactly the files for which `lockSuspectedCsam` would FILE a report. Such a node
+ * was written locked by a caller that did not finish (the upload route inserts a server-verified
+ * object's node locked and calls the lock right after: that call can fail or never run): it is
+ * hidden and held, but nobody else is held, its links are not paused, there is no case and
+ * nobody was told. Oldest node first, at most `limit`. Read-only; `csamReportsToAnnounce` does
+ * not see these (it starts from a report).
+ */
+export async function csamLocksWithoutReport(db: Executor, limit: number): Promise<{ nodeId: string }[]> {
+  const result = await db.execute<{ id: string }>(sql`
+    SELECT n.id
+    FROM nodes n
+    WHERE n.scan_status = 'suspected_csam' AND n.kind = 'file'
+      AND NOT EXISTS (
+        SELECT 1 FROM reports r
+        WHERE r.node_id = n.id AND r.category = 'csam'
+          AND r.status IN ('open', 'reviewing', 'actioned'))
+    ORDER BY n.created_at, n.id
+    LIMIT ${Math.max(1, Math.floor(limit))}`);
+  return result.rows.map((row) => ({ nodeId: row.id }));
 }

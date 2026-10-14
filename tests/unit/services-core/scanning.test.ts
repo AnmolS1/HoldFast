@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
 import {
+  csamLocksWithoutReport,
   csamReportsToAnnounce,
   lockSuspectedCsam as lockRows,
   takedownNode,
@@ -38,6 +39,7 @@ import {
   STUB_SCAN_MAX_BYTES,
   stubEnabled,
   sweepCsamAlerts,
+  sweepUnrecordedCsamLocks,
 } from "../../../src/worker/services/scanning";
 import { eicarBytes, nestedEicarZipBytes } from "../../setup/fixture-bytes";
 import { makeLink } from "../auth/helpers";
@@ -1379,6 +1381,168 @@ describe("lockSuspectedCsam", () => {
     expect(alertsFor(reportId)).toHaveLength(1);
     expect(await viaOf(file.id), "via defaults to the sweep").toEqual(["sweep"]);
     expect(await lockRowsOf(file.id)).toHaveLength(1);
+  });
+
+  // The upload route inserts a server-verified CSAM object's node ALREADY locked and calls the
+  // lock right after. Until that call has run the node is hidden and held — and nothing else.
+  describe("a node written locked, with no report", () => {
+    /** A file as the upload route writes it: locked and held, nothing else done. */
+    async function writtenLocked(db: Db = testDb()) {
+      const owner = await makeUser();
+      const sha256 = rand(32);
+      // Inserted plain (committed), made locked through `db` — inside `alone` nobody else sees it.
+      const file = await makeFile(owner.id, null, { scanStatus: "pending", sha256 });
+      const link = await makeLink(file.id, owner.id);
+      await db.insert(uploadIps).values({
+        nodeId: file.id,
+        versionId: file.versionId!,
+        uploaderId: owner.id,
+        ipEncrypted: new Uint8Array(20),
+        iv: new Uint8Array(12),
+        keyVersion: 1,
+      });
+      await db
+        .update(nodes)
+        .set({ scanStatus: "suspected_csam", legalHold: true })
+        .where(eq(nodes.id, file.id));
+      return { owner, file, link, sha256 };
+    }
+    async function expectCompleted(
+      db: Db,
+      made: Awaited<ReturnType<typeof writtenLocked>>,
+      reportId: string,
+    ) {
+      const [ownerRow] = await db.select().from(user).where(eq(user.id, made.owner.id));
+      expect(ownerRow).toMatchObject({ legalHold: true, suspendedAt: null });
+      const [linkRow] = await db.select().from(shareLinks).where(eq(shareLinks.id, made.link.id));
+      expect(linkRow!.pauseReasons).toEqual(["moderation"]);
+      const ips = await db.select().from(uploadIps).where(eq(uploadIps.nodeId, made.file.id));
+      expect(ips.map((row) => row.legalHold)).toEqual([true]);
+      const [blocked] = await db.select().from(hashBlocklist).where(eq(hashBlocklist.sha256, made.sha256));
+      expect(blocked).toMatchObject({ reason: "csam", sourceNodeId: made.file.id });
+      expect(await db.select().from(reports).where(eq(reports.nodeId, made.file.id))).toMatchObject([
+        { id: reportId, category: "csam", status: "open", ownerId: made.owner.id },
+      ]);
+    }
+
+    it("one call does the whole job and is a FIRST lock: report, holds, pauses, one record, one alert; a repeat changes nothing", async () => {
+      const made = await writtenLocked();
+      expect(await csamLocksWithoutReport(testDb(), 1_000_000)).toContainEqual({ nodeId: made.file.id });
+      const first = serviceDeps();
+      const { reportId } = await lockSuspectedCsam(first.deps, made.file.id, { source: "system" });
+      await first.settle();
+      await expectCompleted(testDb(), made, reportId);
+      expect(await lockRowsOf(made.file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
+      expect((await lockRowsOf(made.file.id))[0]!.meta).not.toHaveProperty("recoveredBy");
+      expect(await viaOf(made.file.id)).toEqual(["lock"]);
+      expect(alertsFor(reportId)).toHaveLength(1);
+      expect(await csamLocksWithoutReport(testDb(), 1_000_000)).not.toContainEqual({ nodeId: made.file.id });
+
+      // The repeat: the same case, nothing new written, nobody told twice.
+      const again = serviceDeps();
+      expect(await lockSuspectedCsam(again.deps, made.file.id, { source: "system" })).toEqual({ reportId });
+      await again.settle();
+      expect(await lockRowsOf(made.file.id)).toHaveLength(1);
+      expect(alertsFor(reportId)).toHaveLength(1);
+      expect(await testDb().select().from(reports).where(eq(reports.nodeId, made.file.id))).toHaveLength(1);
+    });
+
+    it("the database half says so: alreadyLocked is false for the call that filed its report, true for the repeat", async () => {
+      const made = await writtenLocked();
+      expect(await lockRows(testDb(), made.file.id, { source: "system" })).toMatchObject({
+        reportStatus: "open",
+        alreadyLocked: false,
+      });
+      expect(await lockRows(testDb(), made.file.id, { source: "system" })).toMatchObject({
+        reportStatus: "open",
+        alreadyLocked: true,
+      });
+    });
+
+    it("the call made to fail: the sweep completes it later — the whole job, one record marked recovered, exactly one alert", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const made = await writtenLocked(db);
+        // Older than every other node: the sweep's head is this one.
+        await db
+          .update(nodes)
+          .set({ createdAt: new Date(Date.UTC(1990, 0, 1)) })
+          .where(eq(nodes.id, made.file.id));
+        const failing = depsOn();
+        failing.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "transaction") {
+              return () => Promise.reject(new Error("the database went away"));
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        await expect(lockSuspectedCsam(failing.deps, made.file.id, { source: "system" })).rejects.toThrow(
+          "the database went away",
+        );
+        expect(await db.select().from(reports).where(eq(reports.nodeId, made.file.id))).toEqual([]);
+        expect(await csamLocksWithoutReport(db, 1)).toEqual([{ nodeId: made.file.id }]);
+
+        const sweep = depsOn();
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 1 })).toEqual({
+          checked: 1,
+          completed: 1,
+          failed: 0,
+        });
+        await sweep.settle();
+        const [report] = await db.select().from(reports).where(eq(reports.nodeId, made.file.id));
+        await expectCompleted(db, made, report!.id);
+        expect(await auditIn(db, "scan.suspected_csam", made.file.id)).toMatchObject([
+          { meta: { source: "system", reportId: report!.id, recoveredBy: "sweep" } },
+        ]);
+        expect(await viaIn(db, made.file.id)).toEqual(["sweep"]);
+        expect(alertsFor(report!.id)).toHaveLength(1);
+
+        // Completed: no longer due for this sweep, nor owed anything by the alert sweep.
+        expect(await csamLocksWithoutReport(db, 1_000_000)).not.toContainEqual({ nodeId: made.file.id });
+        await oldestFirst(db, [report!.id]);
+        expect((await csamReportsToAnnounce(db, 1_000)).map((row) => row.reportId)).not.toContain(report!.id);
+        const later = depsOn();
+        await sweepUnrecordedCsamLocks(later.deps, { limit: 1 });
+        await later.settle();
+        expect(alertsFor(report!.id)).toHaveLength(1);
+        expect(await auditIn(db, "scan.suspected_csam", made.file.id)).toHaveLength(1);
+      });
+    });
+
+    it("one node that fails does not stop the rest: it is counted, captured, and found again next time", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const broken = await writtenLocked(db);
+        const fine = await writtenLocked(db);
+        for (const [index, id] of [broken.file.id, fine.file.id].entries()) {
+          await db
+            .update(nodes)
+            .set({ createdAt: new Date(Date.UTC(1990, 0, 1, 0, 0, index)) })
+            .where(eq(nodes.id, id));
+        }
+        const sweep = depsOn();
+        // The first lock's transaction fails; every later one goes through.
+        let calls = 0;
+        sweep.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "transaction" && calls++ === 0) {
+              return () => Promise.reject(new Error("the database went away"));
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 2 })).toEqual({
+          checked: 2,
+          completed: 1,
+          failed: 1,
+        });
+        await sweep.settle();
+        expect(await db.select().from(reports).where(eq(reports.nodeId, broken.file.id))).toEqual([]);
+        expect(await db.select().from(reports).where(eq(reports.nodeId, fine.file.id))).toHaveLength(1);
+        expect(await csamLocksWithoutReport(db, 1)).toEqual([{ nodeId: broken.file.id }]);
+      });
+    });
   });
 
   it("ensureCsamAlerted for something that is not a report id does nothing", async () => {
