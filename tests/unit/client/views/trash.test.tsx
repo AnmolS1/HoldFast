@@ -527,9 +527,11 @@ describe("leaving the page while the trash is being emptied", () => {
 
   it("a second start while one runs is ignored", async () => {
     const first = deferred<Response>();
-    const calls = mockFetch((call) =>
-      call.method === "DELETE" && pathOf(call) === "/api/trash" ? first.promise : undefined,
-    );
+    const calls = mockFetch((call) => {
+      if (call.method === "DELETE" && pathOf(call) === "/api/trash") return first.promise;
+      // The run reads the session before its first batch: nobody is signed in here, as it knew.
+      return pathOf(call) === "/api/auth/get-session" ? json(null) : undefined;
+    });
     startEmptyTrash();
     startEmptyTrash();
     await waitFor(() => expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1));

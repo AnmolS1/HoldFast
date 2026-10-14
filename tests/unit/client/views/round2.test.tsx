@@ -173,11 +173,17 @@ describe("A2: a failed next page is not asked for again by a refresh of the list
     },
   );
 
-  it("/trash — an Empty trash run of 8 batches refreshes the list 8 times; the failed cursor is requested once in total", async () => {
+  // n2: the end state of these two was "the notice stays" — which pinned the defect: a trash that
+  // the run has just emptied showing "Couldn't load more of this list." (or its old rows).
+  it("/trash — an Empty trash run of 8 batches refreshes the list 8 times; the failed cursor is requested once in total, and the run ends on an empty trash with no notice", async () => {
     let batches = 0;
     const { calls } = await openView("/trash", {
-      "GET /api/trash": (call) =>
-        queryOf(call).get("cursor") === "c2" ? envelope("internal", 500) : json(trashPage(TRASH.items, "c2")),
+      "GET /api/trash": (call) => {
+        if (batches > 8) return json(trashPage([]));
+        return queryOf(call).get("cursor") === "c2"
+          ? envelope("internal", 500)
+          : json(trashPage(TRASH.items, "c2"));
+      },
       "DELETE /api/trash": () => (++batches <= 8 ? json(remaining(100 - batches * 10), 202) : NO_CONTENT()),
     });
     await waitFor(() => expect(notice("trash")).not.toBeNull());
@@ -188,7 +194,77 @@ describe("A2: a failed next page is not asked for again by a refresh of the list
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(9);
     expect(cursorCalls(calls, "/api/trash", null)).toBeGreaterThan(reads);
     expect(cursorCalls(calls, "/api/trash", "c2")).toBe(1);
-    expect(notice("trash")).not.toBeNull();
+    await waitFor(() => expect(rowNames()).toEqual([]));
+    expect(notice("trash")).toBeNull();
+    expect(pageFailureOf(viewKeys.trash)).toBeNull();
+    expect(screen.getByText("Trash is empty")).toBeTruthy();
+    expect(document.querySelector<HTMLButtonElement>("[data-empty-trash-button]")!.disabled).toBe(true);
+  });
+
+  it("n2: page 2 inside a Retry-After: 30 wait, then Empty trash to 204 → the trash is empty at once, with no notice and no read inside the wait — events included", async () => {
+    let batches = 0;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": (call) =>
+        queryOf(call).get("cursor") === "c2" ? limited("30") : json(trashPage(TRASH.items, "c2")),
+      "DELETE /api/trash": () => (++batches <= 2 ? json(remaining(30 - batches * 10), 202) : NO_CONTENT()),
+    });
+    await waitFor(() => expect(notice("trash")).not.toBeNull());
+    const reads = requests(calls, "GET", "/api/trash").length;
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
+    await waitFor(() => expect(rowNames()).toEqual([]));
+    expect(getToasts().map((toast) => toast.message)).toContain("Trash emptied");
+    expect(notice("trash")).toBeNull();
+    expect(screen.getByText("Trash is empty")).toBeTruthy();
+    expect(document.querySelector<HTMLButtonElement>("[data-empty-trash-button]")!.disabled).toBe(true);
+    // The wait still holds — quietly: nothing reads the list before it is over.
+    await refreshEveryWay();
+    expect(requests(calls, "GET", "/api/trash").length).toBe(reads);
+    expect(rowNames()).toEqual([]);
+    expect(notice("trash")).toBeNull();
+  });
+
+  it("n2: a read of the list still out when the run ends does not bring the purged rows back", async () => {
+    const late = deferred<Response>();
+    let batches = 0;
+    let holdNext = false;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": () => (holdNext ? ((holdNext = false), late.promise) : json(TRASH)),
+      "DELETE /api/trash": () => {
+        batches += 1;
+        // The read this batch's progress asks for is the one left hanging.
+        if (batches === 1) holdNext = true;
+        return batches === 1 ? json(remaining(3), 202) : NO_CONTENT();
+      },
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
+    await waitFor(() => expect(rowNames()).toEqual([]));
+    late.resolve(json(TRASH));
+    await settle();
+    expect(rowNames()).toEqual([]);
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(2);
+  });
+
+  it("n2: a list that shrinks to one page forgets its failed page — no notice under a list that has no more", async () => {
+    let shrunk = false;
+    await openView("/starred", {
+      "GET /api/starred": (call) => {
+        if (shrunk) return json({ ...STARRED, nextCursor: null });
+        return queryOf(call).get("cursor") === "c2"
+          ? envelope("internal", 500)
+          : json({ ...STARRED, nextCursor: "c2" });
+      },
+    });
+    await waitFor(() => expect(notice("starred")).not.toBeNull());
+    shrunk = true;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    emitNodesChanged([null]);
+    await act(() => vi.advanceTimersByTimeAsync(INVALIDATE_WAIT_MS * 2));
+    vi.useRealTimers();
+    await waitFor(() => expect(notice("starred")).toBeNull());
+    expect(pageFailureOf(viewKeys.starred)).toBeNull();
   });
 
   it("the wait belongs to the failed page too: when the query's own error is cleared (a restore patches the list), events still read nothing during it", async () => {
@@ -269,7 +345,8 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
     await waitFor(() => expect(stopped()).not.toBeNull());
     expect(nodeCalls(calls, "POST").length).toBe(1);
     expect(nodeCalls(calls, "POST").length).toBeLessThanOrEqual(4);
-    expect(stopped()!.getAttribute("role")).toBe("alert");
+    // n5: the API client has announced the 429 (its toast): the notice is not a second alert.
+    expect(stopped()!.getAttribute("role")).toBeNull();
     expect(stopped()!.textContent).toBe(
       "Restoring stopped: 0 restored, 20 left. Too many requests just now. You can try again shortly. req req-1234",
     );
@@ -300,6 +377,8 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
     expect(nodeCalls(calls, "POST")).toHaveLength(1);
     expect(stopped()!.textContent).toBe("Restoring stopped: 0 restored, 20 left. req req-1234");
     expect(getToasts()).toEqual([]);
+    // Nobody else said it: the notice is the one announcement.
+    expect(stopped()!.getAttribute("role")).toBe("alert");
     // No wait was named: the action is offered again at once.
     expect((bar().getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(false);
   });
@@ -466,13 +545,13 @@ describe("a2: the run is checked against the signed-in account before every batc
     await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
     await settle();
     expect(batches).toBe(1);
-    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 1);
+    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 2);
     expect(getToasts()).toEqual([]);
     expect(events).toEqual([]);
     expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
   });
 
-  it("the same account: the session is read before every batch after the first, and the run goes on", async () => {
+  it("the same account: the session is read before every batch, the first included, and the run goes on", async () => {
     let batches = 0;
     const { calls } = await openView("/trash", {
       "GET /api/trash": TRASH,
@@ -483,8 +562,26 @@ describe("a2: the run is checked against the signed-in account before every batc
     act(() => startEmptyTrash());
     await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
     expect(batches).toBe(4);
-    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 3);
+    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 4);
     expect(events).toEqual([[]]);
+  });
+
+  it("n6: another account signed in from another tab BEFORE the click (this tab's session still fresh): not even the first DELETE is sent, and nothing is said", async () => {
+    let other = false;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": TRASH,
+      "GET /api/auth/get-session": () =>
+        other ? json(sessionOf({ id: "b".repeat(32), name: "Bo", timezone: "UTC" })) : undefined,
+      "DELETE /api/trash": () => NO_CONTENT(),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    other = true;
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
+    await settle();
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(0);
+    expect(getToasts()).toEqual([]);
+    expect(events).toEqual([]);
   });
 
   it("a session that cannot be read stops the run — visibly — rather than deleting for an unknown account", async () => {

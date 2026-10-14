@@ -449,7 +449,8 @@ test.describe("review fixes", () => {
       }
       if (new URL(request.url()).searchParams.get("cursor") !== "c2") {
         firstPage += 1;
-        return route.fulfill({ json: trashPage(TRASH.items, "c2") });
+        // Once the run has ended, the server's trash is empty.
+        return route.fulfill({ json: batches > 8 ? trashPage([]) : trashPage(TRASH.items, "c2") });
       }
       pageTwo += 1;
       return route.fulfill({
@@ -496,9 +497,15 @@ test.describe("review fixes", () => {
     await dialog.getByRole("button", { name: "Empty trash" }).click();
     await expect(page.getByText("Trash emptied")).toBeVisible();
     expect(batches).toBe(9);
+    // The run ended in 204: the trash is empty on screen at once — no purged rows, no notice
+    // about a page that no longer exists — and, the wait still running, nothing was read for it.
+    await expect(rows(page)).toHaveCount(0);
+    await expect(view(page, "trash").getByText("Trash is empty")).toBeVisible();
+    await expect(notice).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Empty trash" })).toBeDisabled();
     await page.waitForTimeout(500);
     expect(pageTwo, "the failed cursor, in total").toBe(1);
-    await expect(notice).toContainText("Couldn't load more of this list.");
+    expect(firstPage, "reads of the list inside its Retry-After, the run included").toBe(readsBefore);
   });
 
   test("Empty trash goes on when the user leaves the page: the trash shows the same run, then what the server has", async ({
