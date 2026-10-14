@@ -1,5 +1,5 @@
 // The breadcrumb trail store. A feature sets the trail for its page with `useBreadcrumbs([...])`.
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore, type HTMLAttributes } from "react";
 import { registerUserStatePurger } from "../../lib/contracts";
 
 export interface Crumb {
@@ -8,6 +8,8 @@ export interface Crumb {
   to?: string;
   /** Node id of a folder: ties the crumb to its list row for the folder-enter transition. */
   id?: string;
+  /** Extra attributes for this crumb's link — drag-and-drop hooks. A crumb without `to` has no link. */
+  dropProps?: HTMLAttributes<HTMLAnchorElement>;
 }
 
 let trail: Crumb[] | null = null;

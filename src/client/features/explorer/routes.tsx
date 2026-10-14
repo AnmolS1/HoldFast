@@ -1,13 +1,9 @@
-// PLACEHOLDER — taken over by the explorer task (T16), which replaces this module and keeps the `routes` export.
+// The explorer's routes: the caller's top level and any folder they have a role on.
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
+import { ExplorerPage } from "./ExplorerPage";
 
 export const routes: RouteObject[] = [
-  { index: true, element: <PlaceholderPage name={t("nav.files")} />, handle: { title: t("nav.files") } },
-  {
-    path: "folder/:id",
-    element: <PlaceholderPage name={t("nav.files")} />,
-    handle: { title: t("nav.files") },
-  },
+  { index: true, element: <ExplorerPage />, handle: { title: t("nav.files") } },
+  { path: "folder/:id", element: <ExplorerPage />, handle: { title: t("nav.files") } },
 ];
