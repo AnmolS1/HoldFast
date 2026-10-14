@@ -508,6 +508,58 @@ test.describe("review fixes", () => {
     expect(firstPage, "reads of the list inside its Retry-After, the run included").toBe(readsBefore);
   });
 
+  test("r4-1: the list's OWN Retry-After survives the emptied trash being written: after 'Trash emptied', no read of /api/trash during the wait", async ({
+    page,
+    origins,
+  }) => {
+    let reads = 0;
+    let limited = false;
+    let batches = 0;
+    await mockShell(page, origins.port, { api: (route, path) => viewsApi().api(route, path) });
+    await page.route("**/api/trash**", async (route) => {
+      const request = route.request();
+      if (request.method() === "DELETE") {
+        batches += 1;
+        if (batches === 1) {
+          // From the run's first batch on, every read of the list meets the limiter.
+          limited = true;
+          return route.fulfill({ status: 202, json: remaining(3) });
+        }
+        // The last batch answers once the first batch's refresh has met the limiter.
+        for (let wait = 0; wait < 50 && reads < 1; wait++) await new Promise((done) => setTimeout(done, 100));
+        return route.fulfill({ status: 204 });
+      }
+      if (!limited) return route.fulfill({ json: trashPage(TRASH.items) });
+      reads += 1;
+      return route.fulfill({
+        status: 429,
+        headers: { "retry-after": "30" },
+        json: mockEnvelope("rate_limited", "Too many requests."),
+      });
+    });
+    await page.goto("/trash");
+    await expect(rows(page)).toHaveCount(3);
+    await page.getByRole("button", { name: "Empty trash" }).click();
+    await page
+      .getByRole("dialog", { name: "Empty the trash?" })
+      .getByRole("button", { name: "Empty trash" })
+      .click();
+    await expect(page.getByText("Trash emptied")).toBeVisible();
+    expect(reads, "the run's own refresh met the limiter").toBe(1);
+    await expect(rows(page)).toHaveCount(0);
+    // 8 tree-changed events, each given longer than the views take to turn it into a round of
+    // reads. Absences are measured: there is no event to wait for when nothing should happen.
+    for (let index = 0; index < 8; index++) {
+      await page.evaluate(() =>
+        window.dispatchEvent(new CustomEvent("holdfast:nodes-changed", { detail: { parentIds: [null] } })),
+      );
+      await page.waitForTimeout(350);
+    }
+    expect(reads, "reads of the list inside its own Retry-After, after the run").toBe(1);
+    await expect(page.getByText(/Couldn't refresh this list/)).toHaveCount(0);
+    await expect(page.getByText(/Too many requests/)).toHaveCount(1);
+  });
+
   test("Empty trash goes on when the user leaves the page: the trash shows the same run, then what the server has", async ({
     page,
     origins,
