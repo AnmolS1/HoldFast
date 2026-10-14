@@ -82,6 +82,19 @@ describe("a helper that answers not_found after the route's own checks passed", 
     },
   );
 
+  it("{ name, starred }: the rename is done, then the star is refused — 404, and NEITHER is kept or recorded", async () => {
+    const t = await sharedTree();
+    refuse.setStar = true;
+    const answer = await api(t.owner.as, "PATCH", `/nodes/${t.notes.id}`, {
+      body: { name: "renamed-first.txt", starred: true },
+    });
+    expect([answer.status, answer.body.error]).toEqual([404, "not_found"]);
+    const after = (await nodeById(t.notes.id))!;
+    expect([after.name, after.starred]).toEqual([t.notes.name, false]);
+    expect(await auditFor("node.rename", t.notes.id)).toEqual([]);
+    expect(await auditFor("node.star", t.notes.id)).toEqual([]);
+  });
+
   it("the helper is told apart from a QueryError that IS a conflict: that one stays 409", async () => {
     const t = await sharedTree();
     // A real cycle, through the real helper.

@@ -88,6 +88,27 @@ describe("POST /nodes/:id/rescan", () => {
     }
   });
 
+  it("a second rescan while the first still decides, on a file being scanned: 409 at once, not an hour's 429", async () => {
+    // The first request has taken the hour (as `requestRescan` does) and will end in 409 and give
+    // it back; the second is told the same, and spends nothing.
+    const owner = await person();
+    const earlier = new Date(Date.now() - 61 * 60_000);
+    const file = await makeFile(owner.id, null, { scanStatus: "pending", rescanRequestedAt: earlier });
+    await testDb().insert(scanJobs).values({ nodeId: file.id, r2Key: file.r2Key! });
+    const takenNow = new Date();
+    await testDb().update(nodes).set({ rescanRequestedAt: takenNow }).where(eq(nodes.id, file.id));
+    const spy = scanQueueSpy();
+    const second = await rescan(owner.as, file.id, spy);
+    expect([second.status, second.body.error, second.headers.get("retry-after")]).toEqual([
+      409,
+      "conflict",
+      null,
+    ]);
+    expect(spy.sent).toEqual([]);
+    expect((await nodeById(file.id))!.rescanRequestedAt).toEqual(takenNow);
+    expect(await auditFor("node.rescan", file.id)).toEqual([]);
+  });
+
   it("once per node per hour: the second is 429 rate_limited with Retry-After; an hour later it is allowed", async () => {
     const owner = await person();
     const file = await makeFile(owner.id, null, { scanStatus: "error" });

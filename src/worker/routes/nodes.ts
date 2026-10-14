@@ -49,6 +49,7 @@ import { LegalHoldError, QueryError } from "../db/errors";
 import {
   createFolder,
   getNode,
+  hasLiveScanJob,
   listChildren,
   moveNode,
   type Moved,
@@ -394,9 +395,7 @@ router.patch(`/nodes/${ID}`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
   const body = parse(RenameBody, await jsonBody(c));
-  const found = await liveNode(c, id, "viewer");
-  const { access } = found;
-  let node = found.node;
+  const { access } = await liveNode(c, id, "viewer");
   // Both permissions before either write: a refused half must not leave the other half done.
   if (body.starred !== undefined && access.role !== "owner") throw new AppError("forbidden");
   if (body.name !== undefined) {
@@ -408,19 +407,19 @@ router.patch(`/nodes/${ID}`, async (c) => {
   // Both writes in one transaction, the row locked first: what each CHANGED is decided against
   // the row as it was under the lock — not as this request read it — so a rename to the name the
   // node already has, or a star it already has, writes no audit row, and a real one always does.
+  // The answer and the audit values are the row as stored after both writes, read back under the
+  // same lock (not this request's earlier read, nor its body).
   // DATABASE STATEMENTS ONLY inside the callback (it may run again); the rows are written after.
   const edit = await retryOnDeadlock(deps(c).db, async (tx) => {
     const before = await lockForEdit(tx, id);
     if (!before) throw new AppError("not_found");
-    let after = node;
-    if (body.name !== undefined) after = await rename(tx, id, body.name);
-    if (body.starred !== undefined) {
-      if (!(await setStar(tx, id, body.starred))) throw new AppError("not_found");
-      after = { ...after, starred: body.starred };
-    }
+    if (body.name !== undefined) await rename(tx, id, body.name);
+    if (body.starred !== undefined && !(await setStar(tx, id, body.starred))) throw new AppError("not_found");
+    const after = await getNode(tx, id);
+    if (!after) throw new AppError("not_found");
     return { before, after };
   });
-  node = edit.after;
+  const node = edit.after;
   if (body.name !== undefined && edit.after.name !== edit.before.name) {
     audit(c, "node.rename", target(id), null);
   }
@@ -541,6 +540,13 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
   // service answers `409` (and the hour is given back below).
   if (!RESCANNABLE.includes(node.scanStatus)) throw new AppError("conflict");
   if (!(await requestRescan(db(c), id))) {
+    // The hour is taken — perhaps by a rescan of this file still deciding. When the file is
+    // being scanned right now, that one ends in `409` and gives its hour back; so does this one,
+    // at once, rather than be told to wait for an hour nobody keeps.
+    const current = await getNode(db(c), id);
+    if (current?.scanStatus === "pending" && current.r2Key && (await hasLiveScanJob(db(c), current.r2Key))) {
+      throw new AppError("conflict");
+    }
     const since = node.rescanRequestedAt ? (now(c).getTime() - node.rescanRequestedAt.getTime()) / 1000 : 0;
     const wait = Math.min(RESCAN_EVERY_SEC, Math.max(1, Math.ceil(RESCAN_EVERY_SEC - since)));
     throw new AppError("rate_limited", undefined, undefined, { "Retry-After": String(wait) });

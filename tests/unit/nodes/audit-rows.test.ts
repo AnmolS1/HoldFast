@@ -5,6 +5,7 @@
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import type { Tx } from "../../../src/worker/db/client";
+import { lockForEdit } from "../../../src/worker/db/queries/nodes-api";
 import { nodes } from "../../../src/worker/db/schema";
 import { nameKeyOf } from "../../../src/worker/services/filename";
 import { backendPid, gate, untilBlockedBy } from "../services-core/helpers";
@@ -110,6 +111,48 @@ describe("node.rename and node.star", () => {
     expect((await nodeById(sibling.id))!.starred).toBe(false);
     expect(await auditFor("node.star", sibling.id)).toEqual([]);
     expect(await auditFor("node.rename", sibling.id)).toEqual([]);
+  });
+
+  it("{ name, starred } changing both: both kept, two rows", async () => {
+    const t = await sharedTree();
+    const answer = await patch(t.owner.as, t.notes.id, { name: "both.txt", starred: true });
+    expect([answer.status, answer.body.name, answer.body.starred]).toEqual([200, "both.txt", true]);
+    expect(await auditFor("node.rename", t.notes.id)).toHaveLength(1);
+    expect((await auditFor("node.star", t.notes.id)).map((row) => row.meta)).toEqual([{ starred: true }]);
+  });
+
+  it("a star alone answers with the row as stored — a rename that landed while it waited included", async () => {
+    const t = await sharedTree();
+    const answer = await overtakenBy(
+      t.notes.id,
+      (tx) => renameRow(tx, t.notes.id, "renamed-meanwhile.txt"),
+      () => patch(t.owner.as, t.notes.id, { starred: true }),
+    );
+    expect([answer.status, answer.body.name, answer.body.starred]).toEqual([
+      200,
+      "renamed-meanwhile.txt",
+      true,
+    ]);
+  });
+
+  it("the edit's row lock does not hold up a folder being made inside it (no key lock)", async () => {
+    const t = await sharedTree();
+    const held = gate<number>();
+    const release = gate();
+    const holder = testDb().transaction(async (tx) => {
+      expect(await lockForEdit(tx, t.dest.id)).not.toBeNull();
+      held.open(await backendPid(tx));
+      await release.opened;
+    });
+    let made = false;
+    const child = makeFolder(t.owner.id, t.dest.id).then((row) => {
+      made = true;
+      return row;
+    });
+    expect(await untilBlockedBy(await held.opened, () => made)).toBe("passed");
+    release.open();
+    await holder;
+    expect((await child).parentId).toBe(t.dest.id);
   });
 
   it("raced: what changed is decided under the row lock, not from what the request read", async () => {

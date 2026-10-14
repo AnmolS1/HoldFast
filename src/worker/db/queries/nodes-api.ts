@@ -70,7 +70,7 @@ export async function releaseRescan(db: Executor, nodeId: string, previous: Date
 }
 
 /**
- * The node's name and star as they are NOW, its row locked (`FOR UPDATE`) until the caller's
+ * The node's name and star as they are NOW, its row locked (`FOR NO KEY UPDATE`) until the caller's
  * transaction ends: a rename or star made after this in the same transaction is compared with
  * what it changed, and no other writer of the row can come between. Null: no such row.
  */
@@ -83,7 +83,9 @@ export async function lockForEdit(
     .select({ name: nodes.name, starred: nodes.starred })
     .from(nodes)
     .where(eq(nodes.id, nodeId))
-    .for("update");
+    // Not `FOR UPDATE`: neither edit changes the key, and NO KEY UPDATE does not stop a child's
+    // foreign-key check (a folder made or a file moved into this one) for the edit's duration.
+    .for("no key update");
   return row ?? null;
 }
 
