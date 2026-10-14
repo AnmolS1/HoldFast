@@ -23,7 +23,7 @@ import { job as operatorDigests } from "../../../src/worker/jobs/operator-digest
 import { job as verificationSweep } from "../../../src/worker/jobs/verification-sweep";
 import { HOURLY_CRON, NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
 import { flushOperatorDigests } from "../../../src/worker/services/email";
-import { cronEvent, gate, jobContext, rand, testDb, generationInStep } from "./helpers";
+import { cronEvent, gate, generationInStep, jobContext, makeUpload, member, rand, testDb } from "./helpers";
 
 // The rollback detector reads "ok" for the guarded jobs this file runs.
 beforeAll(generationInStep);
@@ -66,14 +66,24 @@ afterAll(async () => {
 });
 afterEach(() => vi.restoreAllMocks());
 
-/** Records every job that is run, in order. `stub`: do not run the job itself. */
+/** The jobs whose run threw, since the last `watch`. */
+let threw: string[] = [];
+
+/** Records every job that is run, in order (and in `threw`, those that threw). `stub`: do not run the job itself. */
 function watch(stub: boolean) {
   const ran: string[] = [];
+  threw = [];
   for (const job of jobs) {
     const real = job.run.bind(job);
     vi.spyOn(job, "run").mockImplementation(async (...args: Parameters<Job["run"]>) => {
       ran.push(job.name);
-      if (!stub) return real(...args);
+      if (stub) return;
+      try {
+        return await real(...args);
+      } catch (error) {
+        threw.push(job.name);
+        throw error;
+      }
     });
   }
   return ran;
@@ -214,17 +224,24 @@ describe("the four cron expressions, with the real jobs", () => {
     "every slot runs its jobs without error — through runScheduled and through scheduled() alike",
     async () => {
       for (const entry of [runScheduled, scheduled]) {
+        // A row the local store cannot settle: a stale session with a made-up multipart id.
+        const owner = await member();
+        await makeUpload(owner.id, owner.id, {
+          status: "completing",
+          completingAt: new Date(Date.now() - 2 * 3_600_000),
+          r2UploadId: "made-up-multipart-id",
+        });
         for (const [cron, names] of Object.entries(SLOTS)) {
           const ran = watch(false);
           const job = jobContext();
           await expect(entry(cronEvent(cron), env, ctx, job.bg)).resolves.toBeUndefined();
           await job.settle();
           expect(ran, `${entry.name} ${cron}`).toEqual(names);
-          // No job of the slot failed: the dispatcher counted no error, and neither did a job.
-          const errors = job.metric.mock.calls.filter(
-            ([name, tags]) => name === "job" && (tags as { outcome?: string }).outcome === "error",
-          );
-          expect(errors, `${entry.name} ${cron}`).toEqual([]);
+          // No job of the slot failed. (A job counts an error of its own for ONE row it could not
+          // settle and goes on — over whatever other files left behind, e.g. a session with a
+          // made-up multipart id, which the local store refuses with an internal error where R2
+          // answers "no such upload": the jobs' own files test that behaviour.)
+          expect(threw, `${entry.name} ${cron}`).toEqual([]);
           vi.restoreAllMocks();
         }
       }
