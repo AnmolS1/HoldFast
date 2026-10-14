@@ -24,8 +24,15 @@
 
 import { UUID } from "../../shared/ids";
 import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
-import { csamReportsToAnnounce, lockSuspectedCsam as lockRows } from "../db/queries/moderation";
-import { findByR2Key, getNode, resetToPending } from "../db/queries/nodes";
+import {
+  completeUnrecordedCsamLock,
+  csamLocksWithoutReport,
+  csamReportsToAnnounce,
+  type CsamLockResult,
+  lockSuspectedCsam as lockRows,
+} from "../db/queries/moderation";
+import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
+import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit } from "./audit";
@@ -207,14 +214,22 @@ export async function enqueueScan(
 export type RescanResult = { queued: true } | { queued: false; reason: "taken_down" | "locked" };
 
 /**
- * Rescan. What happens depends on the node's state — read from its LOCKED row, in the
- * transaction that resets it, so a takedown that lands while this runs is either seen (nothing
- * happens) or comes after the reset has committed:
+ * Rescan. What happens depends on the node's state — read under the owner's TREE LOCK and from
+ * its LOCKED row, in the transaction that resets it, so a takedown that lands while this runs —
+ * of the file, or of a folder above it — is either seen (nothing happens) or comes after the
+ * reset has committed. In this order, the first that applies:
  *
- *   taken down, whatever its status   nothing: status and verdict kept      { queued: false, reason: "taken_down" }
- *   `suspected_csam`                  nothing: status and verdict kept      { queued: false, reason: "locked" }
- *   `under_review`                    status KEPT, a message is sent        { queued: true }
- *   any other status                  back to `pending`, a message is sent  { queued: true }
+ *   taken down ITSELF, whatever its status    nothing: status and verdict kept      { queued: false, reason: "taken_down" }
+ *   `suspected_csam`                          nothing: status and verdict kept      { queued: false, reason: "locked" }
+ *   inside a TAKEN-DOWN FOLDER (any depth)    nothing: status and verdict kept      { queued: false, reason: "taken_down" }
+ *   `under_review`                            status KEPT, a message is sent        { queued: true }
+ *   `pending`, a scan of it under way         owner: `409 conflict`, nothing sent; admin: a message is sent  { queued: true }
+ *   `pending`, NO scan of it under way        a message is sent (a re-send)         { queued: true }
+ *   any other status                          back to `pending`, a message is sent  { queued: true }
+ *
+ * Hidden is inherited (queries/tree.ts): a file inside a taken-down folder is as taken down as
+ * one taken down itself. The tree lock is what makes that answer hold — `moderation.takedownNode`
+ * takes it too — and it is this transaction's FIRST lock, before the node's row (the lock order).
  *
  * A rescan must never be a way to launder a locked file back to `pending` and then `clean`. For
  * an `under_review` file the scan still runs — the real pipeline records its outcome as the status
@@ -224,6 +239,20 @@ export type RescanResult = { queued: true } | { queued: false; reason: "taken_do
  * forced claim, and an unforced rescan would leave the node `pending` with nothing to scan it —
  * so there is no option for it. The message and the audit row follow the
  * commit, and only when something was queued.
+ *
+ * A SEND THAT FAILS LEAVES THE NODE `pending` — FAIL CLOSED. The reset has committed when the
+ * queue is asked; if the send throws, the error propagates and the node stays `pending`: served
+ * to nobody. NOTHING PUTS A PREVIOUS VERDICT BACK: between the reset and any such write another
+ * rescan, a replace or an admin can have made the node `pending` for a reason of its own, and an
+ * old `clean` written over that would make the scan in flight drop its verdict (the consumer
+ * writes only to a node that is still `pending`). What makes it recoverable instead:
+ *   - a `pending` node with NO live scan job (`nodes.hasLiveScanJob`: the key's `scan_jobs` row
+ *     `running` and younger than the stale-claim time) may be rescanned again — by its owner
+ *     too: the message is simply sent (again). With a live job the owner gets `409 conflict`;
+ *   - the pending-scan sweep (T21's `sweepPendingScans`) re-sends for the same condition.
+ * A re-send can never produce two verdicts: there is ONE job row per object key, a second
+ * delivery of a running job is retried, not scanned, and a forced re-scan of a finished job
+ * finds the node no longer `pending` and writes nothing to it.
  *
  * AN OWNER NEVER LEARNS WHY. "Taken down" and "locked" are states an account holder must not be
  * able to observe, so for `by: "owner"` both are the same `404 not_found` — the very error an id
@@ -249,8 +278,10 @@ export async function enqueueRescan(
   const seen = await getNode(deps.db, nodeId);
   if (!seen || seen.kind !== "file" || !seen.r2Key) throw new AppError("not_found");
 
-  type Decision = { key: string } | { reason: "taken_down" | "locked" } | null;
+  type Decision = { key: string } | { reason: "taken_down" | "locked" } | { busy: true } | null;
   const decision = await deps.db.transaction(async (tx): Promise<Decision> => {
+    // First, before any row: a takedown of a folder above waits for this, or has been seen.
+    await lockOwnerTree(tx, seen.ownerId);
     // The row is locked through its object key. A replace that landed since the read above gave
     // the node a new key: then the node is read again and locked through that one.
     let r2Key: string | null = seen.r2Key;
@@ -260,7 +291,14 @@ export async function enqueueRescan(
         if (locked.kind !== "file") return null;
         if (locked.takedownAt !== null) return { reason: "taken_down" };
         if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
+        // Neither of the two above: what is left of "hidden" is a taken-down folder above it.
+        if (await effectiveHidden(tx, nodeId)) return { reason: "taken_down" };
         if (locked.scanStatus === "under_review") return { key: r2Key };
+        // Already `pending`: with a scan under way an owner has nothing to ask for; without one
+        // the message never arrived (or was lost), and what follows sends it (again).
+        if (locked.scanStatus === "pending" && opts.by === "owner" && (await hasLiveScanJob(tx, r2Key))) {
+          return { busy: true };
+        }
         // The statement has the same guard: it changes nothing for the two locked statuses.
         return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
       }
@@ -276,6 +314,9 @@ export async function enqueueRescan(
     return { queued: false, reason: decision.reason };
   }
 
+  if ("busy" in decision) throw new AppError("conflict");
+
+  // A failure here propagates and the node stays `pending`: see the header.
   await enqueueScan(deps, { nodeId, key: decision.key, force: true });
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by });
   return { queued: true };
@@ -451,23 +492,93 @@ export async function lockSuspectedCsam(
   nodeId: string,
   opts: { source: "photodna" | "system" | "admin" },
 ): Promise<{ reportId: string }> {
-  const locked = await lockRows(deps.db, nodeId, opts);
+  const locked = await lockAndOwe(deps, nodeId, opts.source, "lock");
   if (!locked) throw new AppError("not_found");
+  if (locked.owed) deps.defer(locked.owed);
+  return { reportId: locked.reportId };
+}
+
+/**
+ * The lock, and what it owes afterwards — unstarted work is never returned: `owed` is the
+ * record + alert already running (its errors captured), or null when nothing is owed. Null
+ * when there is no such file.
+ */
+async function lockAndOwe(
+  deps: ServiceDeps,
+  nodeId: string,
+  source: "photodna" | "system" | "admin",
+  via: "lock" | "sweep",
+): Promise<{ reportId: string; owed: Promise<void> | null } | null> {
+  const locked = await lockRows(deps.db, nodeId, { source });
+  if (!locked) return null;
+  return { reportId: locked.reportId, owed: owedAfterLock(deps, nodeId, source, via, locked) };
+}
+
+/** The record + alert a lock owes (already running, errors captured), or null when none. */
+function owedAfterLock(
+  deps: ServiceDeps,
+  nodeId: string,
+  source: "photodna" | "system" | "admin",
+  via: "lock" | "sweep",
+  locked: CsamLockResult,
+): Promise<void> | null {
   const { reportId } = locked;
   // A FIRST lock is always recorded and announced — also when it found a report that was
   // already being reviewed or was filed (an admin opened the case from a user's report): the
   // node is locked NOW, and the sweep, which looks at open reports only, would never make a
-  // missing record good. A REPEAT is, only while the report is open (the redelivery that repairs
-  // what was lost with an invocation); on a report someone is reviewing, or that was FILED, it
-  // mails nobody and writes no second lock row. Decided on what the lock saw under its locks.
-  if (locked.alreadyLocked && locked.reportStatus !== "open") return { reportId };
-  deps.defer(
-    (async () => {
-      await attempt(deps, "lock_record", () =>
-        recordCsamLock(deps, { reportId, nodeId, source: opts.source }, false),
-      );
-      await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via: "lock", nodeId }));
-    })(),
-  );
-  return { reportId };
+  // missing record good. A node WRITTEN locked whose report this call filed is a first lock too
+  // (`alreadyLocked` is false for it). A REPEAT is, only while the report is open (the
+  // redelivery that repairs what was lost with an invocation); on a report someone is
+  // reviewing, or that was FILED, it mails nobody and writes no second lock row. Decided on what
+  // the lock saw under its locks.
+  if (locked.alreadyLocked && locked.reportStatus !== "open") return null;
+  return (async () => {
+    await attempt(deps, "lock_record", () =>
+      recordCsamLock(deps, { reportId, nodeId, source }, via === "sweep"),
+    );
+    await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via, nodeId }));
+  })();
+}
+
+/**
+ * Completes the suspected-CSAM locks nobody finished: every file that is `suspected_csam` with
+ * no `csam` case (`moderation.csamLocksWithoutReport`, oldest first, at most `limit`) is
+ * completed (`moderation.completeUnrecordedCsamLock`) — the whole job: its report is filed, the
+ * owner and every uploader held, its links paused, its upload addresses held — and then recorded
+ * (`scan.suspected_csam` with source `system` and `recoveredBy: "sweep"`) and announced
+ * (`via: "sweep"`) like a first lock, AWAITED here (a scheduled job has no request to answer
+ * first). WHAT MADE IT DUE IS RE-DECIDED UNDER THE NODE'S LOCK, before anything is written: a
+ * node that is no longer `suspected_csam` (cleared since it was listed) is `skipped`, one that
+ * has its case now (completed by someone else) is `repeated` — neither is written to, recorded or
+ * announced. One failing node does not stop the rest: its error is captured and counted, and the
+ * next run finds it again. Wired into the hourly slot beside `sweepCsamAlerts` by the
+ * scheduled-jobs task (T22).
+ */
+export async function sweepUnrecordedCsamLocks(
+  deps: ServiceDeps,
+  opts: { limit?: number } = {},
+): Promise<{ checked: number; completed: number; repeated: number; skipped: number; failed: number }> {
+  const limit = Math.max(1, Math.min(opts.limit ?? CSAM_SWEEP_DEFAULT_LIMIT, 1_000));
+  const due = await csamLocksWithoutReport(deps.db, limit);
+  let completed = 0;
+  let repeated = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const { nodeId } of due) {
+    try {
+      const locked = await completeUnrecordedCsamLock(deps.db, nodeId);
+      if (locked === "has_case") repeated += 1;
+      else if (locked === null || locked === "not_locked") skipped += 1;
+      else {
+        const owed = owedAfterLock(deps, nodeId, "system", "sweep", locked);
+        if (owed) await owed;
+        completed += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      captureError(error, { kind: "csam_alert" });
+      writeMetric(deps.env, "error", { kind: "csam_alert", reason: "sweep_lock" });
+    }
+  }
+  return { checked: due.length, completed, repeated, skipped, failed };
 }

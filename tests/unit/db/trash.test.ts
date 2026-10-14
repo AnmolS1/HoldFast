@@ -115,6 +115,64 @@ describe("trash and restore", () => {
     expect(await restore(db, uuidv7())).toBeNull();
   });
 
+  // Hidden — taken down itself or by a folder above it, or locked — is not there to be trashed
+  // or restored: neither writes, and a restore to the top level cannot take a file out from
+  // under the folder that hides it.
+  it("trash and restore refuse a hidden node and write nothing", async () => {
+    const t = await tree();
+    const rowOf = async (id: string) => (await db.select().from(nodes).where(eq(nodes.id, id)))[0]!;
+    const locked = await makeFile(db, t.owner, t.root.id, "locked.jpg", {
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    const own = await makeFile(db, t.owner, t.root.id, "own.txt", {
+      takedownAt: new Date(),
+      takedownReason: "dmca",
+    });
+    // Trashed before the folder above was taken down — and one whose own row was hidden in the trash.
+    await trash(db, t.deep.id, t.owner);
+    const binnedLocked = await makeFile(db, t.owner, t.root.id, "binned.jpg", {
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    await db
+      .update(nodes)
+      .set({ scanStatus: "suspected_csam", legalHold: true })
+      .where(eq(nodes.id, binnedLocked.id));
+    expect(await takedownNode(db, t.sub.id, { reason: "abuse", by: null })).toBe(true);
+
+    // trash: the node itself hidden, a folder taken down, a file… (`deep` is trashed already).
+    for (const id of [locked.id, own.id, t.sub.id]) {
+      const before = await rowOf(id);
+      expect(await trash(db, id, t.owner)).toBeNull();
+      expect(await rowOf(id)).toEqual(before);
+    }
+    const under = await makeFile(db, t.owner, t.sub.id, "under.txt");
+    expect(await trash(db, under.id, t.owner)).toBeNull();
+    expect(await rowOf(under.id)).toMatchObject({ deletedAt: null, trashedRoot: false });
+
+    // restore: in place and to the top level alike — and for a hidden node that is not even in
+    // the trash the answer is the same not_found, not the "not restorable" null.
+    const notFound = async (promise: Promise<unknown>) => {
+      const error = await rejection(promise);
+      expect(error).toBeInstanceOf(QueryError);
+      expect((error as QueryError).code).toBe("not_found");
+    };
+    for (const id of [t.deep.id, binnedLocked.id, own.id, locked.id, t.sub.id]) {
+      const before = await rowOf(id);
+      await notFound(restore(db, id));
+      await notFound(restore(db, id, { toRoot: true }));
+      expect(await rowOf(id)).toEqual(before);
+    }
+    // The control: visible again, the same calls do what they did.
+    expect(await restoreTakedown(db, t.sub.id)).toBe(true);
+    expect(await trash(db, under.id, t.owner)).toMatchObject({ id: under.id, trashedRoot: true });
+    expect(await restore(db, t.deep.id, { toRoot: true })).toMatchObject({ id: t.deep.id, parentId: null });
+    // An unknown id and a visible node that is not in the trash are still the null they were.
+    expect(await restore(db, uuidv7())).toBeNull();
+    expect(await restore(db, t.keep.id)).toBeNull();
+  });
+
   it("a name collision on restore gets the suffix ' (restored)', before the extension", async () => {
     const t = await tree();
     await trash(db, t.keep.id, t.owner);
@@ -877,6 +935,51 @@ describe("the purge keeps a held uploader's upload sessions", () => {
   });
 });
 
+// H2 K (brief Addendum 9): a `completing` session is a request at work on its object right now —
+// for a declared blocklist hit it will preserve that object as a locked node. A purge must not
+// take the object from under it, whoever the uploader is.
+describe("the purge keeps a completing upload session", () => {
+  it("any completing session is kept, detached and still completing; its object is not returned to abort, its reservation not given back", async () => {
+    const t = await tree();
+    const heldEditor = await makeUser(db, { legalHold: true });
+    const editor = await makeUser(db);
+    const row = async (id: string) => (await db.select().from(uploads).where(eq(uploads.id, id)))[0] ?? null;
+    const plain = await makeUpload(db, t.owner, editor, {
+      parentId: t.sub.id,
+      status: "completing",
+      size: 300,
+    });
+    const held = await makeUpload(db, t.owner, heldEditor, {
+      parentId: t.sub.id,
+      status: "completing",
+      size: 200,
+    });
+    const replacing = await makeUpload(db, t.owner, t.owner, {
+      parentId: t.root.id,
+      replaceNodeId: t.keep.id,
+      nodeId: t.keep.id,
+      status: "completing",
+      size: 50,
+    });
+    // The control, in the same purge: an `open` session of the same editor goes as before.
+    const open = await makeUpload(db, t.owner, editor, { parentId: t.sub.id, status: "open", size: 70 });
+
+    const deleted = await deleteSubtreeRows(db, t.root.id);
+    expect(await getNode(db, t.root.id)).toBeNull();
+    expect(deleted.uploadsToAbort.map((u) => u.r2Key)).toEqual([open.r2Key]);
+    expect(deleted.freedBytes).toBe(60 + 40 + 70);
+    expect(await row(open.id)).toBeNull();
+    for (const session of [plain, held, replacing]) {
+      expect(await row(session.id), session.r2Key).toMatchObject({
+        status: "completing",
+        parentId: null,
+        replaceNodeId: null,
+        completedAt: null,
+      });
+    }
+  });
+});
+
 describe("deleteSubtreeRows", () => {
   it("deletes a whole subtree and reports objects, thumbnails and freed bytes", async () => {
     const t = await tree();
@@ -954,18 +1057,20 @@ describe("deleteSubtreeRows", () => {
     await db.insert(uploadParts).values({ uploadId: open.id, partNumber: 1, etag: "e", size: 700 });
 
     const result = await deleteSubtreeRows(db, t.root.id);
-    expect(result.freedBytes).toBe(60 + 40 + 700 + 300 + 50);
+    // The `completing` session is a request at work on its object (H2 K, brief Addendum 9): it is
+    // kept, detached, its object not aborted and its reservation not given back here.
+    expect(result.freedBytes).toBe(60 + 40 + 700 + 50);
     expect(result.uploadsToAbort.map((u) => u.r2Key).sort()).toEqual(
-      [open.r2Key, completing.r2Key, replacing.r2Key, avatar.r2Key].sort(),
+      [open.r2Key, replacing.r2Key, avatar.r2Key].sort(),
     );
     expect(result.uploadsToAbort.find((u) => u.r2Key === open.r2Key)!.r2UploadId).toBe("mpu-1");
-    expect(result.uploadsToAbort.find((u) => u.r2Key === completing.r2Key)!.r2UploadId).toBeNull();
 
     const left = await db
-      .select({ id: uploads.id })
+      .select({ id: uploads.id, status: uploads.status, parentId: uploads.parentId })
       .from(uploads)
       .where(inArray(uploads.id, [done.id, open.id, completing.id, replacing.id, avatar.id, elsewhere.id]));
-    expect(left.map((u) => u.id)).toEqual([elsewhere.id]);
+    expect(left.map((u) => u.id).sort()).toEqual([completing.id, elsewhere.id].sort());
+    expect(left.find((u) => u.id === completing.id)).toMatchObject({ status: "completing", parentId: null });
     expect(await db.select().from(uploadParts).where(eq(uploadParts.uploadId, open.id))).toHaveLength(0);
     expect(await getNode(db, t.root.id)).toBeNull();
   });
