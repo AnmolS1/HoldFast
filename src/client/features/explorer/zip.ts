@@ -267,15 +267,14 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
   const mine = () => sameAccount(then);
   const result: ZipResult = { outcome: "failed", leftOut: [], missing: [], truncated: false };
   const fileName = `${suggestedName}.zip`;
+  /** An archive reached the disk (set just before the outcome is said). */
+  let archived = false;
   const finish = (outcome: ZipOutcome, message: string | null, requestId?: string): ZipResult => {
     result.outcome = outcome;
     if (message !== null && mine()) {
-      // An archive was saved (a limited one too, when it holds what came before the limit).
-      const complete =
-        outcome === "saved" ||
-        outcome === "partial" ||
-        outcome === "empty" ||
-        (outcome === "limited" && result.missing.length > 0);
+      // Said only of an archive that was saved (a limited one too, when it holds what came before
+      // the limit) — never of a zip that stopped with nothing saved.
+      const complete = outcome === "saved" || outcome === "partial" || outcome === "empty" || archived;
       const parts = [
         message,
         complete ? leftOutSentence(result.leftOut) : null,
@@ -520,6 +519,7 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
       publish(sourceId, { progress: 1, sentence, status: "done" });
       setTimeout(() => publish(sourceId, null), DONE_LINGER_MS);
     }
+    archived = true;
     if (limited) return finish("limited", limitedSentence(result.missing));
     return short > 0
       ? finish("partial", missingSentence(result.missing))

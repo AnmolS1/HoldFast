@@ -853,3 +853,34 @@ describe("B2 — a zip belongs to the account that started it", () => {
     expect(getRibbonSnapshot().current).toBeNull();
   });
 });
+
+// Review round 3 (m26): a zip that stopped with nothing saved says only that — not what an archive
+// it never wrote left out or cut short.
+describe("m26 — the toast of a zip stopped before anything was saved", () => {
+  it("first file 502 three times, second refused with a daily ceiling: 'stopped', no left-out or truncated sentence", async () => {
+    noWaiting();
+    const files = filesIn(3);
+    const manifest: ZipManifest = manifestOf(
+      files.map((node) => ({ node })),
+      [{ nodeId: fileNode(90).id, path: "new.pdf", reason: "scan_pending" }],
+      true,
+    );
+    serveDrive(new FakeDrive(files), (call) => {
+      if (call.path === "/api/nodes/zip-manifest") return json(manifest);
+      if (!isFile(call)) return undefined;
+      if (idOfFile(call) === files[0]!.id) return new Response("Bad gateway.", { status: 502 });
+      return new Response("Daily limit.", { status: 429, headers: { "retry-after": "3600" } });
+    });
+    const { saved } = captureBlob();
+    const result = await startZip(
+      files.map((file) => file.id),
+      "Trip",
+    );
+    expect(result.outcome).toBe("limited");
+    expect(result.missing).toEqual([files[0]!.name]);
+    expect(saved).toHaveLength(0);
+    expect(toastMessages()).toEqual([
+      "The download limit was reached, so the zip was stopped. Try again later.",
+    ]);
+  });
+});
