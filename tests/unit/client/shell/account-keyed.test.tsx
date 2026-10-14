@@ -52,6 +52,8 @@ describe("AccountKeyed", () => {
     expect(held()).toBe("alice's file");
     current = null;
     await refreshSession();
+    // Observers are told on a later macrotask: wait for it before looking.
+    await new Promise((resolve) => setTimeout(resolve, 50));
     expect(held()).toBe("alice's file");
     current = BOB;
     await refreshSession();
