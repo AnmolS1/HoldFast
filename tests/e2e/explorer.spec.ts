@@ -358,6 +358,51 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     expect(refused).toBe(3);
   });
 
+  test("a preview opened from a row with a stale session and a slow session read: it shows, the entry is stamped once, Escape returns", async ({
+    page,
+    origins,
+  }) => {
+    mockedOnly();
+    test.skip(isMobile(page), "desktop: a double-click opens");
+    // Every replace of the history entry, counted in the page.
+    await page.addInitScript(() => {
+      const own = window as unknown as { __replaces: number };
+      own.__replaces = 0;
+      const replace = history.replaceState.bind(history);
+      history.replaceState = (...args: Parameters<History["replaceState"]>) => {
+        own.__replaces += 1;
+        replace(...args);
+      };
+    });
+    await page.clock.install();
+    await serve(page, origins.port, drive());
+    // The session read is slow, as on a real network: the navigation to the preview stays
+    // "loading" across renders — what made T18's route stamp its entry again and again.
+    let slowSession = false;
+    await page.route("**/api/auth/get-session", async (route) => {
+      if (slowSession) await new Promise((resolve) => setTimeout(resolve, 600));
+      await route.fallback();
+    });
+    await openExplorer(page);
+    // The cached session is past its 15 s: opening the preview reads it again, slowly.
+    slowSession = true;
+    await page.clock.fastForward(20_000);
+    const before = await page.evaluate(() => (window as unknown as { __replaces: number }).__replaces);
+    await row(page, "notes.pdf").dblclick();
+    const preview = page.getByRole("dialog", { name: "notes.pdf" });
+    await expect(preview).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`/preview/${NOTES.id}$`));
+    // Long enough for a loop to repeat many times; then exactly one replace (the stamp).
+    await page.clock.runFor(3_000);
+    await page.waitForTimeout(1_500);
+    const after = await page.evaluate(() => (window as unknown as { __replaces: number }).__replaces);
+    expect(after - before).toBe(1);
+    await page.keyboard.press("Escape");
+    await expect(preview).toHaveCount(0);
+    await expect(page).toHaveURL(/\/$/);
+    await expect(row(page, "notes.pdf")).toBeVisible();
+  });
+
   test("details of a file; Re-check sends it back to scanning; share is a disabled stub", async ({
     page,
     origins,
