@@ -109,3 +109,23 @@ describe("an editor and a file they may not see", () => {
     }
   });
 });
+
+describe("trash on a node already in the trash", () => {
+  it("is an unknown id at an unknown id's cost — itself in the trash, or under a trashed folder; for the owner and for an editor", async () => {
+    const t = await tree();
+    const folder = await makeFolder(t.owner.id, t.inner.id);
+    const under = await makeFile(t.owner.id, folder.id, { scanStatus: "clean" });
+    const root = await makeFile(t.owner.id, t.inner.id, { scanStatus: "clean" });
+    for (const id of [folder.id, root.id]) {
+      expect((await api(t.as.owner, `/nodes/${id}/trash`, POST)).status).toBe(200);
+    }
+    for (const caller of [t.as.owner, t.as.editor]) {
+      const unknown = await api(caller, `/nodes/${crypto.randomUUID()}/trash`, POST);
+      for (const id of [root.id, folder.id, under.id]) {
+        const again = await api(caller, `/nodes/${id}/trash`, POST);
+        expect(again.status, id).toBe(404);
+        expect(shape(again), id).toEqual(shape(unknown));
+      }
+    }
+  });
+});

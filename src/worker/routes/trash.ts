@@ -42,7 +42,7 @@ import { audit } from "../services/audit";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { toNodeDto, toTrashItemDto, toTrashItemDtos } from "../services/node-dto";
-import { assertNotTrashed, getAccess, requireRole, type Access, type Role } from "../services/permissions";
+import { getAccess, requireRole, type Access, type AccessOptions, type Role } from "../services/permissions";
 import { db, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
@@ -64,14 +64,20 @@ const refused = () => new AppError("conflict");
  * requested (or anything under one): to its owner that root is deleted, and it must answer as a
  * purged id does — by the answer and BY THE WORK. Both questions are therefore always asked,
  * whatever the first one answered: "you deleted this and it is still here" cannot be told from
- * "this id does not exist" by counting statements either.
+ * "this id does not exist" by counting statements either. `{ notTrashed: true }` adds "in the
+ * trash, itself or by a folder above" to what does not exist — from the same statements.
  */
-async function requireKnown(c: Context<AppEnv>, id: string, min: Role): Promise<Access> {
-  const access = await getAccess(c, id);
+async function requireKnown(
+  c: Context<AppEnv>,
+  id: string,
+  min: Role,
+  opts: AccessOptions = {},
+): Promise<Access> {
+  const access = await getAccess(c, id, opts);
   const gone = await purgeWasRequested(db(c), id);
   if (!access || gone) throw new AppError("not_found");
   // Answered from the request's cache: the role check only.
-  return requireRole(c, id, min);
+  return requireRole(c, id, min, opts);
 }
 
 /** The row behind a by-id route that acts on something IN the trash. Never a system node. */
@@ -153,13 +159,13 @@ router.delete("/trash", async (c) => {
 router.post(`/nodes/${ID}/trash`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
-  const access = await requireKnown(c, id, "editor");
+  // Already in the trash — itself, or with a folder above it — is not there to be trashed: an
+  // unknown id, at an unknown id's cost.
+  const access = await requireKnown(c, id, "editor", { notTrashed: true });
   // An editor may trash what is inside a shared folder, never the shared folder itself.
   if (access.role !== "owner" && access.shareRootId === id) {
     throw new AppError("forbidden", undefined, { reason: "share_root" });
   }
-  // Already in the trash — itself, or with a folder above it — is not there to be trashed.
-  await assertNotTrashed(c, id);
   const row = await retryOnDeadlock(db(c), (tx) => trash(tx, id, user.id));
   // A system node, or one that went to the trash in this instant.
   if (!row) throw new AppError("not_found");
