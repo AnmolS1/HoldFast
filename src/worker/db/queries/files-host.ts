@@ -1,6 +1,6 @@
 // The files host's own statements: what a served response adds to a link, the once-a-day claim
-// of the "link paused" mail, the account behind a ceiling, and the takeover of a thumbnail's
-// abandoned unit hold.
+// of the "link paused" mail, the account behind a ceiling, and the takeover and give-back of a
+// thumbnail's unit hold.
 //
 // Everything else the files host reads comes from the shared query modules (nodes, tree, users,
 // links, ledger). Nothing here reads or writes `share_links.downloadCount`: the download cap is
@@ -88,6 +88,34 @@ export async function takeOverStaleHold(
   const rows = await db
     .update(downloadLedger)
     .set({ bytes: at })
+    .where(
+      and(
+        eq(downloadLedger.day, day),
+        eq(downloadLedger.subjectType, "notice"),
+        eq(downloadLedger.subjectId, marker),
+        eq(downloadLedger.count, 0),
+        eq(downloadLedger.bytes, heldAt),
+      ),
+    )
+    .returning({ day: downloadLedger.day });
+  return rows.length > 0;
+}
+
+/**
+ * Gives a thumbnail's owner-unit hold back — only if it is still the hold of the request that
+ * took it at `heldAt` and was not charged: ONE conditional UPDATE. A holder that comes back
+ * after its hold was taken over (another time is in the row) changes nothing.
+ */
+export async function releaseHold(
+  db: Executor,
+  day: string,
+  marker: string,
+  heldAt: number,
+): Promise<boolean> {
+  if (!(heldAt > 0)) return false;
+  const rows = await db
+    .update(downloadLedger)
+    .set({ bytes: 0 })
     .where(
       and(
         eq(downloadLedger.day, day),

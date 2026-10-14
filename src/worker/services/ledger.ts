@@ -129,13 +129,8 @@ export async function assertAskerHasRoom(c: Context<AppEnv>, serve: Serve): Prom
   const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes });
   await told(() => refundUsage(deps(c), "download_ip", serve.ip, { bytes }, address));
   if (serve.st !== "u") return;
-  const mine = await consumeCeiling(
-    c,
-    "download_user",
-    { id: serve.sub, account: serve.account },
-    { bytes: 1 },
-  );
-  await told(() => refundUsage(deps(c), "download_user", serve.sub, { bytes: 1 }, mine));
+  const mine = await consumeCeiling(c, "download_user", { id: serve.sub, account: serve.account }, { bytes });
+  await told(() => refundUsage(deps(c), "download_user", serve.sub, { bytes }, mine));
 }
 
 /**

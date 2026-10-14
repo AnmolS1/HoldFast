@@ -37,8 +37,9 @@
 //             refused, and a call made meanwhile would pass the owner's ceiling.
 //             THE HOLD CANNOT WEDGE THE THUMBNAIL. Whatever ends the holder's turn without the
 //             charge being marked — the owner's ceiling refusing it, the ceiling service or the
-//             database throwing — gives the hold back (`finally`), and the request answers the
-//             icon. A holder that never comes back (an invocation cut between the hold and the
+//             database throwing — gives ITS OWN hold back (`finally`; a conditional UPDATE that
+//             names the hold's time, so a holder that comes back after its hold was taken over
+//             touches nothing), and the request answers the icon. A holder that never comes back (an invocation cut between the hold and the
 //             mark: no `finally` runs) leaves a hold that the first request after
 //             HOLD_STALE_SECONDS TAKES OVER — one conditional UPDATE naming that hold (its time,
 //             as read), so one winner, and never a hold given back and re-taken meanwhile. A
@@ -66,8 +67,8 @@
 
 import type { Context } from "hono";
 import { THUMB_INPUT_MAX_BYTES, type ThumbSize } from "../../shared/constants";
-import { addUsageIfUnder, subtractUsage, totalsOn, utcDay } from "../db/queries/ledger";
-import { takeOverStaleHold } from "../db/queries/files-host";
+import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
+import { releaseHold, takeOverStaleHold } from "../db/queries/files-host";
 import { getNode } from "../db/queries/nodes";
 import { effectiveHidden } from "../db/queries/tree";
 import { tryConsumeCeiling } from "./ceilings";
@@ -93,7 +94,11 @@ export const THUMB_CALLS_PER_DAY = 3;
 
 /**
  * The largest thumbnail the cache stores for a variant: four bytes a pixel — an uncompressed
- * RGBA image of `size` × `size`, which a lossy WebP at quality 80 never reaches. An output above
+ * RGBA image of `size` × `size`, which a lossy WebP at quality 80 never reaches. A thumbnail is a
+ * STILL: the output asks `anim: false` ("converts the first frame of an animated input to a still
+ * image" — developers.cloudflare.com/images/optimization/features/#anim; the binding's default
+ * keeps every frame, developers.cloudflare.com/images/optimization/binding/), so an animated GIF
+ * or WebP is one frame too and the bound holds for it. An output above
  * it is not stored or served (a failure the service gave: no further call that day). It is the
  * room an asker must have on their own day before a thumbnail is made for them.
  */
@@ -167,8 +172,10 @@ async function ownerPaid(
     return "error";
   } finally {
     if (!charged) {
-      // No call was made: the thumbnail does not lose its day. Not given back → taken over later.
-      await subtractUsage(db(c), day, "notice", marker, at).catch(() => false);
+      // No call was made: the thumbnail does not lose its day. Only THIS request's hold is given
+      // back (it names its time): a hold taken over meanwhile is someone else's and stays.
+      // Not given back → taken over later.
+      await releaseHold(db(c), day, marker, at).catch(() => false);
     }
   }
 }
@@ -267,7 +274,7 @@ async function attempt(
     }
     const result = await c.env.IMAGES.input(source.object.body)
       .transform({ width: size, height: size, fit: "scale-down" })
-      .output({ format: THUMB_TYPE, quality: QUALITY });
+      .output({ format: THUMB_TYPE, quality: QUALITY, anim: false });
     // Read whole: the store takes no stream of unknown length, and a thumbnail is small.
     buffer = await result.response().arrayBuffer();
   } catch (error) {

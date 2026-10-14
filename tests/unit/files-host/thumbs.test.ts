@@ -2,13 +2,13 @@
 // is a stand-in here that records its calls — the local one cannot decode every type the list
 // has and treats what a camera wrote into a picture differently from the deployed one, so what
 // this file proves is what the code ASKS for and what it does when the service fails.
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { addUsageIfUnder, subtractUsage } from "../../../src/worker/db/queries/ledger";
-import { takeOverStaleHold } from "../../../src/worker/db/queries/files-host";
+import { releaseHold, takeOverStaleHold } from "../../../src/worker/db/queries/files-host";
 import { nodes } from "../../../src/worker/db/schema";
 import { dayUTC } from "../../../src/worker/services/ip-hash";
 import { keyFor, thumbKey } from "../../../src/worker/services/storage";
@@ -21,6 +21,7 @@ import {
   unitMarker,
   type ThumbOwner,
 } from "../../../src/worker/services/thumbnails";
+import { backendPid, untilBlockedBy } from "../services-core/helpers";
 import { invoke } from "../services-core/request";
 import {
   ask,
@@ -79,7 +80,7 @@ describe("a miss transforms once and caches; a hit serves the cached object", ()
 
     expect(images.calls).toHaveLength(1);
     expect(images.calls[0]?.transform).toEqual({ width: 320, height: 320, fit: "scale-down" });
-    expect(images.calls[0]?.output).toEqual({ format: "image/webp", quality: 80 });
+    expect(images.calls[0]?.output).toEqual({ format: "image/webp", quality: 80, anim: false });
     for (const options of [images.calls[0]?.transform, images.calls[0]?.output]) {
       expect(Object.keys(options as object)).not.toContain("metadata");
     }
@@ -112,7 +113,7 @@ describe("a miss transforms once and caches; a hit serves the cached object", ()
     const small = await ask(await urlFor("thumb", node, { user: owner.id }, { size: 160 }), { env });
     expect(small.status).toBe(200);
     expect(images.calls[1]?.transform).toEqual({ width: 160, height: 160, fit: "scale-down" });
-    expect(images.calls[1]?.output).toEqual({ format: "image/webp", quality: 80 });
+    expect(images.calls[1]?.output).toEqual({ format: "image/webp", quality: 80, anim: false });
     expect(spy.puts[1]).toBe(`t/${node.id}/${node.versionId}/160.webp`);
     expect(await units(owner.id)).toBe(2);
   });
@@ -1136,5 +1137,141 @@ describe("an asker whose own day is used up is refused before the owner pays or 
     expect(
       (await ask(await urlFor("thumb", node, { link }), { env: { IMAGES: images.binding } })).status,
     ).toBe(200);
+  });
+});
+
+describe("fix pass 4: the signed-in asker's room, a give-back that names its own hold, a thumbnail of an animated image", () => {
+  it(`a share partner at its own user ceiling − k, for k below thumbMaxBytes, → 429 with Retry-After, no call, no unit (the review's P6); with exactly that room, made`, async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const CEIL = 10_000_000;
+    const settings = { ceilings: { CEIL_USER_BYTES_DAY: CEIL } };
+    const day = dayUTC(new Date());
+    for (const room of [5, thumbMaxBytes(320) - 1]) {
+      const partner = await makeAccount();
+      await makeShare(node.id, owner.id, partner.id);
+      await addUsageIfUnder(testDb(), day, "user", partner.id, { bytes: CEIL - room, count: 0 }, {});
+      const answer = await ask(await urlFor("thumb", node, { user: partner.id }), {
+        env: { IMAGES: images.binding },
+        settings,
+      });
+      expect(answer.status, `room ${room}`).toBe(429);
+      expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
+      // The partner's own day is as it was: the room asked for was given back.
+      expect(await ledgerRow("user", partner.id)).toEqual({ bytes: CEIL - room, count: 0 });
+    }
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(0);
+    expect(await ledgerRow("notice", unitMarker(node, 320))).toBeNull();
+    // The control: room for the largest 320 thumbnail → made, charged its real length.
+    const partner = await makeAccount();
+    await makeShare(node.id, owner.id, partner.id);
+    await addUsageIfUnder(
+      testDb(),
+      day,
+      "user",
+      partner.id,
+      { bytes: CEIL - thumbMaxBytes(320), count: 0 },
+      {},
+    );
+    const made = await ask(await urlFor("thumb", node, { user: partner.id }), {
+      env: { IMAGES: images.binding },
+      settings,
+    });
+    expect(made.status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    expect(await ledgerRow("user", partner.id)).toEqual({
+      bytes: CEIL - thumbMaxBytes(320) + FAKE_WEBP.byteLength,
+      count: 0,
+    });
+  });
+
+  it("the give-back is one conditional UPDATE naming the giver's own hold: someone else's hold, a charged one and another time are untouched", async () => {
+    const day = dayUTC(new Date());
+    const at = Math.floor(Date.now() / 1000);
+    const marker = (name: string) => `thumb_unit:test-${name}-${crypto.randomUUID()}`;
+    const seed = (id: string, bytes: number, count: number) =>
+      addUsageIfUnder(testDb(), day, "notice", id, { bytes, count }, {});
+    const mine = marker("mine");
+    await seed(mine, at, 0);
+    expect(await releaseHold(testDb(), day, mine, at)).toBe(true);
+    expect(await ledgerRow("notice", mine)).toEqual({ bytes: 0, count: 0 });
+    const theirs = marker("theirs");
+    await seed(theirs, at + 400, 0);
+    expect(await releaseHold(testDb(), day, theirs, at)).toBe(false);
+    expect(await ledgerRow("notice", theirs)).toEqual({ bytes: at + 400, count: 0 });
+    const charged = marker("charged");
+    await seed(charged, at, 1);
+    expect(await releaseHold(testDb(), day, charged, at)).toBe(false);
+    expect(await ledgerRow("notice", charged)).toEqual({ bytes: at, count: 1 });
+  });
+
+  it("the review's P4/P5 through the real pipeline: T holds and stalls in its consume, Y takes the hold over, T comes back refused — Y's hold is intact and nobody else can take it over: never two holders", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const day = dayUTC(new Date());
+    const marker = unitMarker(node, 320);
+    // The owner's day already has its one unit: T's consume waits on the row lock below, then is refused.
+    await addUsageIfUnder(testDb(), day, "transform_user", owner.id, { bytes: 0, count: 1 }, {});
+    const locked = gate<number>();
+    const release = gate();
+    const holding = testDb().transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT 1 FROM download_ledger WHERE day = ${day} AND subject_type = 'transform_user' AND subject_id = ${owner.id} FOR UPDATE`,
+      );
+      locked.open(await backendPid(tx));
+      await release.opened;
+    });
+    const pid = await locked.opened;
+    const account = { quotaBytes: owner.quotaBytes, createdAt: owner.createdAt };
+    const images = imagesMock();
+    const t = invoke(null, (c) => makeThumbnail(c, node, 320, { id: owner.id, account }), {
+      settings: { ceilings: { CEIL_TRANSFORMS_DAY: 1 } },
+      env: { IMAGES: images.binding },
+    });
+    // T holds, and waits inside its consume.
+    await untilBlockedBy(pid);
+    const held = (await ledgerRow("notice", marker))!;
+    expect(held.count).toBe(0);
+    const atT = held.bytes;
+    // T has stalled past the window as far as Y can tell: Y (its clock six minutes on) takes over.
+    const atY = atT + 400;
+    expect(await takeOverStaleHold(testDb(), day, marker, atY, atT, atY - HOLD_STALE_SECONDS)).toBe(true);
+    // T comes back: refused by the owner's ceiling, it gives back — and must not touch Y's hold.
+    release.open();
+    await holding;
+    expect(await t).toMatchObject({ ok: true, value: { ok: false, reason: "ceiling" } });
+    expect(await ledgerRow("notice", marker)).toEqual({ bytes: atY, count: 0 });
+    // Z, now: Y's hold is fresh — no takeover, and no free slot.
+    const atZ = Math.floor(Date.now() / 1000);
+    const z = (await ledgerRow("notice", marker))!.bytes;
+    expect(await takeOverStaleHold(testDb(), day, marker, atZ, z, atZ - HOLD_STALE_SECONDS)).toBe(false);
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(1);
+  });
+
+  it("an animated GIF is asked for as ONE still frame (anim: false), so its thumbnail fits thumbMaxBytes; nothing else in the request changes", async () => {
+    const owner = await makeAccount();
+    // A two-frame GIF89a (made by hand: header, a global table, NETSCAPE loop, two 1×1 frames).
+    // The stand-in service does not decode it — the local binding cannot be relied on for
+    // animation (spikes S10, S13) — so what is proven here is what is ASKED; the deployed
+    // binding's answer is a post-integration check.
+    const gif = new Uint8Array([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+      0xff, 0xff, 0x21, 0xff, 0x0b, 0x4e, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45, 0x32, 0x2e, 0x30, 0x03,
+      0x01, 0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x21, 0xf9, 0x04, 0x00, 0x0a, 0x00, 0x00,
+      0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x4c, 0x01, 0x00, 0x3b,
+    ]);
+    const node = (await storedFile(owner.id, { mime: "image/gif", name: "loop.gif", content: gif })).node;
+    const images = imagesMock();
+    const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      env: { IMAGES: images.binding },
+    });
+    expect(answer.status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    expect(images.calls[0]?.output).toEqual({ format: "image/webp", quality: 80, anim: false });
+    expect(images.calls[0]?.transform).toEqual({ width: 320, height: 320, fit: "scale-down" });
   });
 });
