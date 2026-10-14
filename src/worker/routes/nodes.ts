@@ -49,7 +49,6 @@ import { LegalHoldError, QueryError } from "../db/errors";
 import {
   createFolder,
   getNode,
-  hasLiveScanJob,
   listChildren,
   moveNode,
   type Moved,
@@ -64,6 +63,8 @@ import {
 import {
   liveNameHolder,
   lockForEdit,
+  scanUnderWay,
+  storedRow,
   ownEditorShares,
   releaseRescan,
   zipManifest,
@@ -415,7 +416,7 @@ router.patch(`/nodes/${ID}`, async (c) => {
     if (!before) throw new AppError("not_found");
     if (body.name !== undefined) await rename(tx, id, body.name);
     if (body.starred !== undefined && !(await setStar(tx, id, body.starred))) throw new AppError("not_found");
-    const after = await getNode(tx, id);
+    const after = await storedRow(tx, id);
     if (!after) throw new AppError("not_found");
     return { before, after };
   });
@@ -543,10 +544,7 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
     // The hour is taken — perhaps by a rescan of this file still deciding. When the file is
     // being scanned right now, that one ends in `409` and gives its hour back; so does this one,
     // at once, rather than be told to wait for an hour nobody keeps.
-    const current = await getNode(db(c), id);
-    if (current?.scanStatus === "pending" && current.r2Key && (await hasLiveScanJob(db(c), current.r2Key))) {
-      throw new AppError("conflict");
-    }
+    if (await scanUnderWay(db(c), id)) throw new AppError("conflict");
     const since = node.rescanRequestedAt ? (now(c).getTime() - node.rescanRequestedAt.getTime()) / 1000 : 0;
     const wait = Math.min(RESCAN_EVERY_SEC, Math.max(1, Math.ceil(RESCAN_EVERY_SEC - since)));
     throw new AppError("rate_limited", undefined, undefined, { "Retry-After": String(wait) });

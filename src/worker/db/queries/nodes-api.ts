@@ -6,8 +6,8 @@ import { and, eq, inArray, isNotNull, isNull, sql, type SQL } from "drizzle-orm"
 import type { ZipManifest } from "../../../shared/schemas/node";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { nodes, type ScanStatus, shares } from "../schema";
-import { SHARED_VISIBLE_STATUSES } from "./nodes";
+import { type Node, nodes, type ScanStatus, shares } from "../schema";
+import { getNode, hasLiveScanJob, SHARED_VISIBLE_STATUSES } from "./nodes";
 import { notEffectivelyTrashedOrHidden } from "./tree";
 
 /**
@@ -87,6 +87,20 @@ export async function lockForEdit(
     // foreign-key check (a folder made or a file moved into this one) for the edit's duration.
     .for("no key update");
   return row ?? null;
+}
+
+/**
+ * The node's row as stored, read inside the caller's transaction — after an edit made under
+ * `lockForEdit`, the row that edit left. Null: no such row.
+ */
+export async function storedRow(tx: Executor, nodeId: string): Promise<Node | null> {
+  return getNode(tx, nodeId);
+}
+
+/** Whether the file is being scanned right now: `pending`, with a live scan job for its object. */
+export async function scanUnderWay(db: Executor, nodeId: string): Promise<boolean> {
+  const node = await getNode(db, nodeId);
+  return node?.scanStatus === "pending" && node.r2Key !== null && (await hasLiveScanJob(db, node.r2Key));
 }
 
 export type ZipRoot = {
