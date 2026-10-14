@@ -1002,6 +1002,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
             height: marquee.bottom - marquee.top,
             border: `1px dashed ${hf.text}`,
             backgroundColor: hf.surface2,
+            // No token on purpose: a local wash and a stacking order inside the list, below theme.zIndex's app layers.
             opacity: 0.5,
             pointerEvents: "none",
             zIndex: 3,
