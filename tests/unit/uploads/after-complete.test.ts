@@ -150,6 +150,45 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
     expect(await usedBytes(owner.id)).toBe(1000);
   });
 
+  it("… and the lock fails after that too: the preserved node is still hidden and held, and the operators are told", async () => {
+    const owner = await uploader();
+    const known = await listed("csam");
+    const session = await uploaded(owner, {}, known.bytes);
+    const row = (await sessionRow(session.uploadId))!;
+    const mailsBefore = operatorMails();
+    // 1 = finish (fails), 2 = the preserved node's (commits), 3 = the lock's (fails).
+    const answer = await complete(
+      owner,
+      session.uploadId,
+      { sha256: known.sha256 },
+      {
+        beforeCommit: (attempt) => {
+          if (attempt === 1 || attempt === 3) throw new Error(`test: transaction ${attempt} fails`);
+        },
+      },
+    );
+    expect(answer.status).toBe(403);
+    const [kept] = await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key));
+    expect(kept).toMatchObject({ ownerId: owner.id, scanStatus: "suspected_csam", legalHold: true });
+    expect(await reportsOnNode(kept!.id)).toHaveLength(0);
+    expect(await readById(owner, kept!.id)).toBe(404);
+    expect(operatorMails()).toBe(mailsBefore + 1);
+  });
+
+  it("what was declared is on the session from the claim — before the server hashes anything (a request that dies there leaves it behind)", async () => {
+    const owner = await uploader();
+    const known = await listed("csam");
+    const session = await uploaded(owner, {}, known.bytes);
+    let during: string | null | undefined;
+    const watched = watchedBucket([], {
+      get: async () => {
+        during = (await sessionRow(session.uploadId))!.expectedSha256;
+      },
+    });
+    await complete(owner, session.uploadId, { sha256: known.sha256 }, { env: { FILES: watched.bucket } });
+    expect(during).toBe(known.sha256);
+  });
+
   it("the folder is purged while the server hashes the object: the session row is gone, and the bytes become the uploader's locked node — the folder's owner is not held", async () => {
     const owner = await uploader();
     const editor = await uploader();
