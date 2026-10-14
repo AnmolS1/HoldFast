@@ -35,12 +35,12 @@ describe("the files host's source", () => {
     ]);
   });
 
-  it("thumbnails.ts names no other output format and passes no `metadata` option", () => {
+  it("thumbnails.ts names no other output format, asks for one still frame, and passes no `metadata` option", () => {
     const text = files["services/thumbnails.ts"]!;
     expect(text).not.toMatch(/\bmetadata\s*:/);
     expect(text).not.toContain("image/jpeg");
     expect(text).toContain('THUMB_TYPE = "image/webp"');
-    expect(codeOf(text)).toMatch(/\.output\(\{ format: THUMB_TYPE, quality: QUALITY \}\)/);
+    expect(codeOf(text)).toMatch(/\.output\(\{ format: THUMB_TYPE, quality: QUALITY, anim: false \}\)/);
     // The control: the scan finds what it looks for.
     expect("  .output({ format: 'image/webp', metadata: 'none' })").toMatch(/\bmetadata\s*:/);
   });
