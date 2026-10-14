@@ -102,13 +102,9 @@ const returns = (call: () => unknown, value: unknown) => () => expect(call()).to
 // slot deletes that slot's line(s) and nothing else. The order is deliberate — lines of different
 // Wave-2 tasks are never neighbours, so two tasks deleting theirs do not meet in a merge.
 const STUBS: Array<[behaviour: string, check: () => void]> = [
-  ["PreviewDialog renders nothing", rendersNothing(<PreviewDialog {...dialog} source="owner" />)],
   ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
   ["SearchSuggestions renders nothing", rendersNothing(<SearchSuggestions query="tax" onPick={noop} />)],
   ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
-  ["UploadDropOverlay renders nothing", rendersNothing(<UploadDropOverlay />)],
-  ["requestUpload() is a no-op", returns(() => requestUpload(), undefined)],
-  ["requestUpload(opts) is a no-op", returns(() => requestUpload({ files: [], parentId: "p" }), undefined)],
   ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
   ["useUsageSummary() is null", returns(() => useUsageSummary(), null)],
 ];
