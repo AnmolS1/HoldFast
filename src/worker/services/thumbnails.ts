@@ -40,7 +40,7 @@
 //             database throwing — gives the hold back (`finally`), and the request answers the
 //             icon. A holder that never comes back (an invocation cut between the hold and the
 //             mark: no `finally` runs) leaves a hold that the first request after
-//             HOLD_STALE_SECONDS TAKES OVER — one add-if-under statement, so one winner. A
+//             HOLD_STALE_SECONDS TAKES OVER — one conditional UPDATE, so one winner. A
 //             takeover is no free call: calls are counted on the other row, and nothing gives
 //             them back.
 // A request that gets neither answers "no thumbnail" at once: no unit, no call, nothing written —
@@ -66,6 +66,7 @@
 import type { Context } from "hono";
 import { THUMB_INPUT_MAX_BYTES, type ThumbSize } from "../../shared/constants";
 import { addUsageIfUnder, subtractUsage, totalsOn, utcDay } from "../db/queries/ledger";
+import { takeOverStaleHold } from "../db/queries/files-host";
 import { getNode } from "../db/queries/nodes";
 import { effectiveHidden } from "../db/queries/tree";
 import { tryConsumeCeiling } from "./ceilings";
@@ -125,14 +126,11 @@ async function ownerPaid(
   const at = Math.floor(now(c).getTime() / 1000);
   // One statement: a hold only where there is none, and none once the unit was charged.
   const hold = (bytes: number) =>
-    addUsageIfUnder(db(c), day, "notice", marker, { bytes, count: 0 }, { bytes: at, count: 0 });
-  if (!(await hold(at))) {
-    const seen = await totalsOn(db(c), day, "notice", marker);
-    if (seen.count > 0) return "paid";
-    if (seen.bytes === 0 || seen.bytes > at - HOLD_STALE_SECONDS) return "busy";
-    // A hold nobody came back to: taken over by moving its time to now — from exactly the time
-    // read, so of two requests that read it the second finds a fresh hold and is refused.
-    if (!(await hold(at - seen.bytes))) return "busy";
+    addUsageIfUnder(db(c), day, "notice", marker, { bytes, count: 0 }, { bytes, count: 0 });
+  // Not got: a hold nobody came back to is taken over — one conditional UPDATE (held, not paid,
+  // older than HOLD_STALE_SECONDS), so exactly one of any number of requests at once wins it.
+  if (!(await hold(at)) && !(await takeOverStaleHold(db(c), day, marker, at, at - HOLD_STALE_SECONDS))) {
+    return (await totalsOn(db(c), day, "notice", marker)).count > 0 ? "paid" : "busy";
   }
   let charged = false;
   try {

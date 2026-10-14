@@ -1,14 +1,15 @@
 // The files host's own statements: what a served response adds to a link, the once-a-day claim
-// of the "link paused" mail, and the account behind a ceiling.
+// of the "link paused" mail, the account behind a ceiling, and the takeover of a thumbnail's
+// abandoned unit hold.
 //
 // Everything else the files host reads comes from the shared query modules (nodes, tree, users,
 // links, ledger). Nothing here reads or writes `share_links.downloadCount`: the download cap is
 // taken where a download URL is minted.
 
-import { eq, sql } from "drizzle-orm";
+import { and, eq, gt, lte, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { shareLinks, user } from "../schema";
+import { downloadLedger, shareLinks, user } from "../schema";
 
 /** What a daily ceiling scales with (`quotaBytes`, `createdAt`) and where a notice is sent. */
 export type ServeAccount = {
@@ -65,4 +66,35 @@ export async function claimPauseEmail(
     )
     .returning({ nodeId: shareLinks.nodeId, ownerId: shareLinks.createdBy });
   return rows[0] ?? null;
+}
+
+/**
+ * Takes over a thumbnail's owner-unit hold that was ABANDONED: the marker row (ledger subject
+ * `notice`) is held (`bytes` = the hold's time, epoch seconds, > 0), not paid (`count` = 0), and
+ * its time is at or before `staleBefore`. ONE conditional UPDATE: of any number of requests at
+ * once exactly one row update wins — the others re-check the condition against the winner's new
+ * time and match nothing. A hold that was given back meanwhile (`bytes` = 0) or paid is not taken.
+ */
+export async function takeOverStaleHold(
+  db: Executor,
+  day: string,
+  marker: string,
+  at: number,
+  staleBefore: number,
+): Promise<boolean> {
+  const rows = await db
+    .update(downloadLedger)
+    .set({ bytes: at })
+    .where(
+      and(
+        eq(downloadLedger.day, day),
+        eq(downloadLedger.subjectType, "notice"),
+        eq(downloadLedger.subjectId, marker),
+        eq(downloadLedger.count, 0),
+        gt(downloadLedger.bytes, 0),
+        lte(downloadLedger.bytes, staleBefore),
+      ),
+    )
+    .returning({ day: downloadLedger.day });
+  return rows.length > 0;
 }

@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { addUsageIfUnder } from "../../../src/worker/db/queries/ledger";
+import { takeOverStaleHold } from "../../../src/worker/db/queries/files-host";
 import { nodes } from "../../../src/worker/db/schema";
 import { dayUTC } from "../../../src/worker/services/ip-hash";
 import { keyFor, thumbKey } from "../../../src/worker/services/storage";
@@ -355,7 +356,15 @@ describe("the daily transform ceiling", () => {
   it("N+5 misses at once, for different files of one owner → exactly N transforms and N units", async () => {
     const owner = await makeAccount();
     const hold = gate();
+    // Opens once the N admitted transforms are inside the image service AND the five refused
+    // requests have answered — both events, so neither count is read early.
+    const settled = gate();
+    let inside = 0;
+    let refused = 0;
+    const check = () => inside >= N && refused === 5 && settled.open();
     const images = imagesMock(async () => {
+      inside++;
+      check();
       await hold.opened;
       return FAKE_WEBP;
     });
@@ -366,15 +375,16 @@ describe("the daily transform ceiling", () => {
     }
     // Every admitted transform is held open, so all N+5 requests are in flight together; the
     // refused ones answer on their own.
-    const refusedAll = gate();
-    let refused = 0;
     const answers = urls.map((url) =>
       ask(url, options).then((answer) => {
-        if (answer.status === 404 && ++refused === 5) refusedAll.open();
+        if (answer.status === 404) {
+          refused++;
+          check();
+        }
         return answer;
       }),
     );
-    await refusedAll.opened;
+    await settled.opened;
     expect(images.calls).toHaveLength(N);
     expect(await units(owner.id)).toBe(N);
     hold.open();
@@ -825,7 +835,7 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
     expect(await unitRow(stale)).toMatchObject({ count: 1 });
   });
 
-  it("ten requests at once find one stale hold: one takes it over — ONE unit between them, at most three calls — and none is a 5xx", async () => {
+  it("twenty requests at once find one stale hold: exactly one takes it over — ONE owner unit, at most three calls that day — and none is a 5xx (answers the security flag 'race condition / quota bypass')", async () => {
     const owner = await makeAccount();
     const node = await picture(owner.id);
     await leftHold(node, 360);
@@ -833,7 +843,7 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
     const all = gate();
     let inside = 0;
     let out = 0;
-    const check = () => inside + out === 10 && all.open();
+    const check = () => inside + out === 20 && all.open();
     const images = imagesMock(async () => {
       inside++;
       check();
@@ -841,7 +851,7 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
       return FAKE_WEBP;
     });
     const url = await urlFor("thumb", node, { user: owner.id });
-    const answers = Array.from({ length: 10 }, () =>
+    const answers = Array.from({ length: 20 }, () =>
       ask(url, { env: { IMAGES: images.binding } }).then((answer) => {
         if (answer.status === 404) {
           out++;
@@ -859,9 +869,39 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
     const statuses = (await Promise.all(answers)).map((answer) => answer.status).sort();
     expect(statuses).toEqual([
       ...Array.from({ length: made }, () => 200),
-      ...Array.from({ length: 10 - made }, () => 404),
+      ...Array.from({ length: 20 - made }, () => 404),
     ]);
+    // One takeover: one charge of the owner's unit, the hold now charged.
     expect(await units(owner.id)).toBe(1);
+    expect(await unitRow(node)).toMatchObject({ count: 1 });
+    expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: made });
+  });
+
+  it("the takeover is one conditional UPDATE: only a hold that is held, not charged and older than the window — and only once", async () => {
+    const day = dayUTC(new Date());
+    const at = Math.floor(Date.now() / 1000);
+    const marker = (name: string) => `thumb_unit:test-${name}-${crypto.randomUUID()}`;
+    const seed = (id: string, bytes: number, count: number) =>
+      addUsageIfUnder(testDb(), day, "notice", id, { bytes, count }, {});
+    const take = (id: string) => takeOverStaleHold(testDb(), day, id, at, at - HOLD_STALE_SECONDS);
+
+    const stale = marker("stale");
+    await seed(stale, at - 360, 0);
+    expect(await take(stale)).toBe(true);
+    // Now fresh: a second taker finds nothing to take.
+    expect(await take(stale)).toBe(false);
+    const fresh = marker("fresh");
+    await seed(fresh, at - 60, 0);
+    const released = marker("released");
+    await seed(released, 0, 0);
+    const charged = marker("charged");
+    await seed(charged, at - 360, 1);
+    for (const id of [fresh, released, charged, marker("none")]) expect(await take(id)).toBe(false);
+    // Twenty at once on one stale hold: exactly one wins.
+    const contested = marker("contested");
+    await seed(contested, at - 360, 0);
+    const wins = await Promise.all(Array.from({ length: 20 }, () => take(contested)));
+    expect(wins.filter(Boolean)).toHaveLength(1);
   });
 });
 
