@@ -6,9 +6,10 @@ import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
 import { api } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger, SessionShape } from "../../lib/contracts";
-import { accountEpoch, getKnownUserId, queryClient, sameAccount } from "../../lib/query";
-import { refreshQueries, viewKeys } from "../starred/view-queries";
+import { accountEpoch, getKnownUserId, queryClient, refreshSession, sameAccount } from "../../lib/query";
+import { refreshQueries, viewKeys, VIEWS_KEY } from "../starred/view-queries";
 import { retryNotBefore } from "../starred/view-state";
+import { holdUntil, waitKey } from "../starred/waits";
 import { announcedByClient, emptyTrash, EMPTY_TRASH, isAbort } from "./queries";
 import { t } from "./strings";
 
@@ -16,10 +17,13 @@ export type EmptyRun =
   | { state: "idle" }
   | { state: "running"; remaining: number | null }
   /**
-   * `retryAt`: before this time (ms) the API asked not to be called again; 0 = no wait.
-   * `dismissed`: the user closed the notice (the wait, if any, still holds).
+   * `dismissed`: the user closed the notice. A wait the API named, if any, still holds: it is in
+   * the views' one registry of waits (waits.ts), under `EMPTY_WAIT`.
    */
-  | { state: "stopped"; remaining: number | null; retryAt: number; dismissed: boolean };
+  | { state: "stopped"; remaining: number | null; dismissed: boolean };
+
+/** Where a stopped run's wait is kept in the registry (waits.ts): a key of its own. */
+export const EMPTY_WAIT = waitKey([VIEWS_KEY, "trash", "empty"]);
 
 /**
  * What the module holds: the run, and whether the read that precedes its confirmation is out
@@ -98,7 +102,12 @@ export function startEmptyTrash(): void {
   const beforeBatch = async () => {
     const session = await api("/api/auth/get-session", { schema: SessionShape });
     const now = session?.user.id ?? null;
-    if (now !== null && now !== owner) throw new NotThisAccount();
+    if (now !== null && now !== owner) {
+      // The cookie names somebody else: this tab is handed to them (the shell adopts the session
+      // and purges A's state, the frame starts again as B) — and A's run ends with it, unseen.
+      await refreshSession().catch(() => undefined);
+      throw new NotThisAccount();
+    }
     if (!sameAccount(account) || getKnownUserId() !== owner) throw new NotThisAccount();
   };
   emptyTrash(
@@ -136,11 +145,11 @@ export function startEmptyTrash(): void {
         set({ run: IDLE });
         return;
       }
+      holdUntil(EMPTY_WAIT, retryNotBefore(error, Date.now()));
       set({
         run: {
           state: "stopped",
           remaining,
-          retryAt: retryNotBefore(error, Date.now()),
           dismissed: false,
         },
       });

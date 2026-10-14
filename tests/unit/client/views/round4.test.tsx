@@ -13,7 +13,7 @@ import {
 } from "../../../../src/client/features/starred/view-state";
 import { clearWaits, holdUntil, waitKey, waitUntil } from "../../../../src/client/features/starred/waits";
 import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
-import { cancelReauth, completeReauth, isReauthPending } from "../../../../src/client/lib/api";
+import { completeReauth, isReauthPending } from "../../../../src/client/lib/api";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import {
   confirmReauthIdentity,
@@ -22,7 +22,7 @@ import {
   queryClient,
 } from "../../../../src/client/lib/query";
 import { sessionOf, setupShell } from "../shell/helpers";
-import { remaining, STARRED, TRASH } from "./fixtures";
+import { remaining, STARRED, TRASH, trashPage } from "./fixtures";
 import { deferred, envelope, json, openView, queryOf, requests, rowNames } from "./helpers";
 
 setupShell();
@@ -248,21 +248,27 @@ describe("r4-3: a session found expired before the first batch is the re-auth ca
     expect(getToasts().map((toast) => toast.message)).toContain("Trash emptied");
   });
 
-  it("re-auth cancelled: the run stops and says so", async () => {
+  // r5-3 (RULING): the re-auth dialog has no "cancel" — its way out is Sign out, which purges
+  // the account and loads /login. After a purge nothing of A may be shown, so the run is dropped
+  // in silence. (The dialog is mounted at the app root, not by this harness: the test runs what
+  // its Sign out runs after the server's sign-out — `purgeUserState()`, then /login.)
+  it("re-auth left by Sign out: the run is dropped in silence — no replay, no toast, no line", async () => {
     const { calls } = await openThenExpire();
     act(() => startEmptyTrash());
     await waitFor(() => expect(isReauthPending()).toBe(true));
-    act(() => cancelReauth());
-    await waitFor(() => expect(getEmptyRun().state).toBe("stopped"));
+    const assign = vi.fn();
+    vi.stubGlobal("location", { ...window.location, assign });
+    await act(async () => {
+      await purgeUserState();
+      window.location.assign("/login");
+    });
+    await settle();
+    expect(isReauthPending()).toBe(false);
+    expect(getEmptyRun()).toEqual({ state: "idle" });
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
-    await waitFor(() =>
-      expect(getToasts().map((toast) => toast.message)).toContain(
-        "Couldn't finish emptying the trash. Try again.",
-      ),
-    );
-    expect(document.querySelector("[data-empty-trash-stopped]")!.textContent).toContain(
-      "Couldn't finish emptying the trash.",
-    );
+    expect(getToasts().filter((toast) => toast.message.includes("emptying the trash"))).toEqual([]);
+    expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
+    expect(assign).toHaveBeenCalledWith("/login");
   });
 
   it("re-auth as ANOTHER account: nothing is replayed for it — the shell starts afresh as that account", async () => {
@@ -288,6 +294,7 @@ describe("r4-3: a session found expired before the first batch is the re-auth ca
     await settle();
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
     expect(getToasts().filter((toast) => toast.message.includes("emptying the trash"))).toEqual([]);
+    expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
   });
 });
 
@@ -338,5 +345,44 @@ describe("r4-4: 'Empty trash cancelled.' goes with the next act", () => {
     await openAndWithdraw();
     fireEvent.pointerDown(document.querySelector<HTMLElement>("[data-main]")!);
     await waitFor(() => expect(status()).toBe(""));
+  });
+});
+
+describe("r5-1: a list whose FIRST read met Retry-After is not read again by a revisit inside the wait", () => {
+  it.each([
+    ["/trash", "/api/trash", "trash"],
+    ["/starred", "/api/starred", "starred"],
+    ["/recent", "/api/recent", "recent"],
+  ] as const)("%s: leave and come back inside the wait → no request", async (path, api, view) => {
+    const { calls, router } = await openView(path, { [`GET ${api}`]: () => limited("30") });
+    await waitFor(() => expect(document.querySelector(`[data-view-error="${view}"]`)).not.toBeNull());
+    expect(requests(calls, "GET", api)).toHaveLength(1);
+    await act(() => router.navigate(path === "/recent" ? "/starred" : "/recent"));
+    await settle();
+    await act(() => router.navigate(path));
+    await waitFor(() => expect(document.querySelector(`[data-view-error="${view}"]`)).not.toBeNull());
+    await settle();
+    expect(requests(calls, "GET", api)).toHaveLength(1);
+  });
+});
+
+describe("r5-2: another account found before the first batch — the tab is handed to it", () => {
+  it("no DELETE, nothing said; the shell adopts B (A's identity and rows are gone), and A's run is not shown", async () => {
+    let other = false;
+    const B = sessionOf({ id: "b".repeat(32), name: "Bo", timezone: "UTC" });
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": () => (other ? json(trashPage([])) : json(TRASH)),
+      "GET /api/auth/get-session": () => (other ? json(B) : undefined),
+      "DELETE /api/trash": () => NO_CONTENT(),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    other = true;
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(getKnownUserId()).toBe("b".repeat(32)));
+    await waitFor(() => expect(rowNames()).toEqual([]));
+    expect(getEmptyRun()).toEqual({ state: "idle" });
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(0);
+    expect(getToasts()).toEqual([]);
+    expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
   });
 });

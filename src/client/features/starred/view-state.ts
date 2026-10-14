@@ -166,11 +166,16 @@ export function isHeld(query: CachedQuery): boolean {
 
 const unlessHeld = (query: CachedQuery): boolean => !isHeld(query);
 
-/** Spread into every query of the views: the automatic refetches respect `isHeld`. */
+/**
+ * Spread into every query of the views: the automatic refetches respect `isHeld`. A query whose
+ * read failed and that has no data is loaded on mount without asking `refetchOnMount` — that is
+ * what `retryOnMount` decides, so it asks too.
+ */
 export const AUTO_REFETCH = {
   refetchOnWindowFocus: unlessHeld,
   refetchOnReconnect: unlessHeld,
   refetchOnMount: unlessHeld,
+  retryOnMount: unlessHeld,
 } as const;
 
 // ---------------------------------------------------------------------------------------------

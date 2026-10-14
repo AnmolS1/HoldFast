@@ -12,7 +12,13 @@ import {
   STALLED_ROUNDS,
   TYPED_CONFIRM_ABOVE,
 } from "../../../../src/client/features/trash/queries";
-import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
+import {
+  EMPTY_WAIT,
+  getEmptyRun,
+  resetEmptyRun,
+  startEmptyTrash,
+} from "../../../../src/client/features/trash/empty-run";
+import { waitUntil } from "../../../../src/client/features/starred/waits";
 import { viewKeys } from "../../../../src/client/features/starred/view-queries";
 import { ApiError } from "../../../../src/client/lib/api";
 import { purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
@@ -515,7 +521,7 @@ describe("leaving the page while the trash is being emptied", () => {
     const usageBefore = usageCalls(calls);
     second.resolve(envelope("internal", 500));
     await waitFor(() =>
-      expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240, retryAt: 0, dismissed: false }),
+      expect(getEmptyRun()).toEqual({ state: "stopped", remaining: 240, dismissed: false }),
     );
     expect(getToasts().map((toast) => toast.message)).toContain(
       "Couldn't finish emptying the trash. 240 left. Try again.",
@@ -759,8 +765,8 @@ describe("review fixes on the trash page", () => {
     fireEvent.click(button());
     fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Empty trash" }));
     await waitFor(() => expect(getEmptyRun().state).toBe("stopped"));
-    const run = getEmptyRun();
-    expect(run.state === "stopped" && run.retryAt > Date.now()).toBe(true);
+    // r5-4: the run's wait is in the one registry of waits, like every other.
+    expect(waitUntil(EMPTY_WAIT)).toBeGreaterThan(Date.now());
     await waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
     expect(button().disabled).toBe(true);
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);

@@ -12,8 +12,10 @@ import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { hf } from "../../theme/tokens";
 import { viewKeys } from "../starred/view-queries";
 import { isHeld, useBlockedUntil } from "../starred/view-state";
+import { useWaitUntil } from "../starred/waits";
 import {
   dismissStopped,
+  EMPTY_WAIT,
   setPreConfirmRead,
   startEmptyTrash,
   stoppedMessage,
@@ -102,7 +104,7 @@ export function EmptyTrashAction() {
     : UNKNOWN;
   const knownEmpty = cached.count === 0 && !cached.more;
   // A run stopped by a `429` may not be started again before the time the API named.
-  const waiting = useBlockedUntil(run.state === "stopped" ? run.retryAt : 0);
+  const waiting = useBlockedUntil(useWaitUntil(EMPTY_WAIT));
 
   // The count decides whether the word must be typed, so it is read again first: the list in
   // memory may be seconds old, or from before another device filled the trash.
