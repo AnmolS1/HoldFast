@@ -198,13 +198,25 @@ describe("a row on the device has an end", () => {
     expect(await readResumeRows()).toEqual([]);
   });
 
-  it("an open session is listed under the name that was asked for: the file selected again is that one row, not a second", async () => {
-    // "Keep both" stored it as "report (1).pdf"; the session's name is still what init asked for.
-    const session = uploadSession({ uploadId: rowId(0xc7), name: "report.pdf", size: 400 });
+  it("a session the device holds is resumed by its id: listed by the server under its stored name, it is still the one row", async () => {
+    await saveResumeRow(row({ finalName: "video (1).mp4" }));
+    server.onJson = (call) =>
+      call.path === "/api/uploads/open"
+        ? json(
+            openUploadsResponse([uploadSession({ uploadId: rowId(0xb1), name: "video (1).mp4", size: 400 })]),
+          )
+        : undefined;
+    await restoreUploads({ server: true });
+    expect(items().map((item) => [item.name, item.uploadId])).toEqual([["video.mp4", rowId(0xb1)]]);
+  });
+
+  it("a row that came from the server under the session's stored name is taken over by the upload that finds that session", async () => {
+    // No device record; "Keep both" stored the session as "report (1).pdf" — the file on disk is still "report.pdf".
+    const session = uploadSession({ uploadId: rowId(0xc7), name: "report (1).pdf", size: 400 });
     server.onJson = (call) =>
       call.path === "/api/uploads/open" ? json(openUploadsResponse([session])) : undefined;
     await restoreUploads({ server: true });
-    expect(items().map((item) => item.name)).toEqual(["report.pdf"]);
+    expect(items().map((item) => item.name)).toEqual(["report (1).pdf"]);
 
     server.hold = true;
     server.partBytes = 100;
@@ -212,6 +224,7 @@ describe("a row on the device has an end", () => {
       json(initResponse(body.size, { uploadId: rowId(0xc7), partBytes: 100, finalName: "report (1).pdf" }));
     await addFiles([{ file: bigFile("report.pdf", 400, Date.parse(AT)) }], null);
     await settle();
+    // One row for one session — the waiting one is gone, on the device too.
     expect(items().map((item) => [item.name, item.file !== null, item.uploadId])).toEqual([
       ["report.pdf", true, rowId(0xc7)],
     ]);

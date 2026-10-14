@@ -622,6 +622,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
         resumeBody: null,
       });
       keepForResume(item, body, init);
+      absorbRestored(id, init.uploadId);
     }
     measure(id);
     // Only now: a file that met a conflict, a refusal or a full quota at init is never read.
@@ -1564,6 +1565,23 @@ function dropExpired(): void {
     works.delete(id);
   }
   removeItems(gone);
+}
+
+/**
+ * The session a fresh init was answered with is one a restored row was waiting on (a row the
+ * device had no record of comes from the server's list under the session's STORED name, which is
+ * not the file's after "Keep both"): that row is this upload, so it goes.
+ */
+function absorbRestored(id: string, uploadId: string): void {
+  const twins = new Set<string>();
+  for (const item of currentItems()) {
+    if (item.id !== id && item.file === null && item.uploadId === uploadId) twins.add(item.id);
+  }
+  for (const twin of twins) {
+    void dropResumeRow(twin);
+    works.delete(twin);
+  }
+  removeItems(twins);
 }
 
 /** Give a restored row its file back. Returns whether `file` was one that a row waited for. */
