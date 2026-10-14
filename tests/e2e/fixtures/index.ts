@@ -27,6 +27,9 @@ export interface HarnessFixtures {
   clientIp: string;
 }
 
+/** See the `page` fixture below. */
+export const MAX_APP_LOADS_PER_TEST = 4;
+
 /** A stable private address per test and attempt: 10.x.y.z from a hash of the test's id. */
 function addressFor(seed: string): string {
   let hash = 2166136261;
@@ -39,6 +42,32 @@ function addressFor(seed: string): string {
 }
 
 export const test = base.extend<HarnessFixtures>({
+  // Every test is held to a few loads of the app document: each is cold (see ./navigate.ts) and
+  // costs 2.3–3.3 s on a CI runner, so more than this many put a test near its 30 s on a slow
+  // machine. Plain-text answers (a 404 of the files host) are not counted.
+  page: async ({ page }, use, testInfo) => {
+    // HOLDFAST_E2E_CPU_THROTTLE=<n>: the browser runs n times slower (Chromium), to see locally
+    // what a slow CI runner does to a test.
+    const throttle = Number(process.env.HOLDFAST_E2E_CPU_THROTTLE ?? "");
+    if (throttle > 1) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send("Emulation.setCPUThrottlingRate", { rate: throttle });
+    }
+    const loads: string[] = [];
+    page.on("response", (response) => {
+      const request = response.request();
+      if (!request.isNavigationRequest() || request.frame() !== page.mainFrame()) return;
+      if (!(response.headers()["content-type"] ?? "").includes("text/html")) return;
+      loads.push(new URL(response.url()).pathname);
+    });
+    await use(page);
+    if (loads.length > MAX_APP_LOADS_PER_TEST && testInfo.status === testInfo.expectedStatus) {
+      throw new Error(
+        `${loads.length} loads of the app in one test (at most ${MAX_APP_LOADS_PER_TEST}): ${loads.join(", ")}. ` +
+          "Reach pages that are not the subject with navigateInApp (tests/e2e/fixtures/navigate.ts).",
+      );
+    }
+  },
   virtualAuthenticator: async ({ page }, use) => {
     const authenticator = await addVirtualAuthenticator(page);
     await use(authenticator);
@@ -68,6 +97,7 @@ export const test = base.extend<HarnessFixtures>({
 
 export { expect } from "@playwright/test";
 export { expectNoA11yViolations } from "./axe";
+export { navigateInApp } from "./navigate";
 export {
   E2E_DIST,
   MOCK_USER,
