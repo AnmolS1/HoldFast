@@ -30,6 +30,7 @@ import { sql, type ExtractTablesWithRelations } from "drizzle-orm";
 import { drizzle, type NodePgDatabase, type NodePgQueryResultHKT } from "drizzle-orm/node-postgres";
 import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
 import { Pool, types, type PoolClient } from "pg";
+import { QueryError } from "./errors";
 import * as schema from "./schema";
 
 /** OID of `timestamp` WITHOUT time zone. */
@@ -138,6 +139,8 @@ export function createDb(
     counted.add(client);
     const query = client.query.bind(client) as (...args: unknown[]) => unknown;
     (client as unknown as { query: (...args: unknown[]) => unknown }).query = (...args) => {
+      // A NUL in a bind value: refused here, sent nowhere and not counted (see `refuseNul`).
+      if (bindsCarryNul(args)) return refuseNul(args);
       counter.sent += 1;
       return query(...args);
     };
@@ -170,6 +173,53 @@ export function createDb(
       await ending;
     },
   };
+}
+
+// ── A NUL in a bind value is the caller's mistake, not a fault ─────────────────────────────
+//
+// Postgres refuses U+0000 in `text` (SQLSTATE 22021) and inside a `jsonb` value (22P05); every
+// other character, control characters and lone surrogates included, it stores. A NUL can arrive
+// in any string a route hands to a query — a JSON body, a query-string `%00`, a field of a
+// decoded cursor, an auth body — and as a database error it would be a 500 and a Sentry event.
+// So EVERY statement of this handle is checked here, before it is sent: a bind value that is a
+// string holding an actual U+0000, or an array (`= ANY($1)`) holding one at any depth, makes the
+// statement fail with `QueryError("validation")` — the 400 every route already answers for it,
+// with no schema author, route, cursor reader or job having to remember. Drizzle wraps what a
+// statement throws (`DrizzleQueryError`, the original as `cause`): `asQueryError` (./errors.ts)
+// finds it there.
+// - Byte data (a Buffer or typed array: `bytea`) is never inspected.
+// - JSON is not pattern-matched: Drizzle sends a `jsonb` value as JSON TEXT, where a NUL is the
+//   six characters `\u0000` and an escaped backslash followed by `u0000` is harmless — telling
+//   the two apart is Postgres's job. It refuses the first with 22P05, which `asQueryError` maps
+//   to the same `validation` (and 22021 too: the net under this check).
+// - It costs one `indexOf` per string bind and allocates nothing when there is no NUL.
+// - Outside a request (a job, the queue consumer) it is a failed statement like any other: it is
+//   thrown to the job's caller and reported there; it fails that item, never a whole batch.
+
+function carriesNul(value: unknown, depth = 0): boolean {
+  if (typeof value === "string") return value.indexOf("\u0000") !== -1;
+  if (!Array.isArray(value) || depth > 8) return false;
+  for (const item of value) if (carriesNul(item, depth + 1)) return true;
+  return false;
+}
+
+/** `client.query(text | config, values?, callback?)`: the values are `values` or `config.values`. */
+function bindsCarryNul(args: unknown[]): boolean {
+  const config = args[0];
+  if (config && typeof config === "object" && carriesNul((config as { values?: unknown }).values))
+    return true;
+  return carriesNul(args[1]);
+}
+
+/** As `client.query` reports a failure: to the callback if there is one, else a rejection. */
+function refuseNul(args: unknown[]): unknown {
+  const error = new QueryError("validation");
+  const callback = args.findLast((arg) => typeof arg === "function") as ((error: Error) => void) | undefined;
+  if (callback) {
+    queueMicrotask(() => callback(error));
+    return undefined;
+  }
+  return Promise.reject(error);
 }
 
 const statementCounters = new WeakMap<object, { sent: number }>();
