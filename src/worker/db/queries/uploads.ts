@@ -163,6 +163,9 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
     .limit(limit);
 }
 
+/** How long a finished (`done` / `aborted`) session is kept before `trimFinished` deletes it. */
+export const FINISHED_TRIM_DAYS = 7;
+
 /**
  * Deletes finished (`done` / `aborted`) sessions that ended more than `olderThanDays` ago, at
  * most `limit` per call. Returns how many were deleted.
@@ -172,7 +175,7 @@ export async function expired(db: Executor, limit: number): Promise<Upload[]> {
  */
 export async function trimFinished(
   db: Executor,
-  olderThanDays: number = 7,
+  olderThanDays: number = FINISHED_TRIM_DAYS,
   limit: number = 5000,
 ): Promise<number> {
   const doomed = db

@@ -7,6 +7,7 @@ import {
   COMPLETING_STALE_MINUTES,
   countOpen,
   expired,
+  FINISHED_TRIM_DAYS,
   findResumable,
   markAborted,
   markDone,
@@ -263,6 +264,8 @@ describe("expired and trimFinished", () => {
     const oldOpen = await makeUpload(db, owner, owner, { status: "open", createdAt: daysAgo(30) });
     const ids = [oldDone.id, oldAborted.id, recentDone.id, oldOpen.id];
 
+    // The default is the exported trim age (T12 imports it): seven days.
+    expect(FINISHED_TRIM_DAYS).toBe(7);
     expect(await trimFinished(db)).toBeGreaterThanOrEqual(2);
     const left = await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids));
     expect(left.map((u) => u.id).sort()).toEqual([recentDone.id, oldOpen.id].sort());
