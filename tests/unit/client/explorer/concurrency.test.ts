@@ -2,7 +2,7 @@
 // parent is read again; a refetch under way cannot overwrite an optimistic edit.
 // M5 — many items never means many requests at once.
 import { act } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot, subscribeRibbon } from "../../../../src/client/components/TransferRibbon/store";
 import {
@@ -294,7 +294,8 @@ describe("M5 — at most four requests in flight", () => {
     getToasts()
       .find((entry) => entry.key === "undo")!
       .action!.onClick();
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    // The undo is over when it says so: its one tree-changed event comes after the last restore.
+    await vi.waitFor(() => expect(events.events).toHaveLength(1));
     expect(seen.total).toBe(80);
     expect(seen.peak).toBe(MAX_IN_FLIGHT);
     expect(drive.trashed.size).toBe(0);
