@@ -14,6 +14,7 @@ import {
 import { clearWaits, holdUntil, waitKey, waitUntil } from "../../../../src/client/features/starred/waits";
 import { getEmptyRun, resetEmptyRun, startEmptyTrash } from "../../../../src/client/features/trash/empty-run";
 import { completeReauth, isReauthPending } from "../../../../src/client/lib/api";
+import * as contracts from "../../../../src/client/lib/contracts";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import {
   confirmReauthIdentity,
@@ -269,6 +270,19 @@ describe("r4-3: a session found expired before the first batch is the re-auth ca
     expect(getToasts().filter((toast) => toast.message.includes("emptying the trash"))).toEqual([]);
     expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
     expect(assign).toHaveBeenCalledWith("/login");
+  });
+
+  it("the same, with only the run's own check standing (the purgers do not run): its rejection after the purge says and sets nothing", async () => {
+    vi.spyOn(contracts, "runUserStatePurgers").mockResolvedValue(undefined);
+    const { calls } = await openThenExpire();
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(isReauthPending()).toBe(true));
+    vi.stubGlobal("location", { ...window.location, assign: vi.fn() });
+    await act(() => purgeUserState());
+    await settle();
+    expect(getEmptyRun()).toEqual({ state: "running", remaining: null });
+    expect(getToasts()).toEqual([]);
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
   });
 
   it("re-auth as ANOTHER account: nothing is replayed for it — the shell starts afresh as that account", async () => {
