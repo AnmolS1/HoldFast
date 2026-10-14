@@ -8,13 +8,6 @@ import { setupShell } from "../shell/helpers";
 import { node, nodeId, RECENT, RECENT_NOW, SEARCH, STARRED, TRASH } from "./fixtures";
 import { json, openView, queryOf, requests, rowNames } from "./helpers";
 
-// The preview is T18's feature: these tests check what a view WRITES when it opens a file (the
-// address and its state), so the route answers with a stand-in. The real one stamps the state
-// with the account and loads its renderers, which is T18's to test.
-vi.mock("../../../../src/client/features/preview/PreviewRoute", () => ({
-  PreviewRoute: () => <div data-preview-stand-in />,
-}));
-
 setupShell();
 afterEach(() => vi.useRealTimers());
 
@@ -60,7 +53,7 @@ describe("/recent", () => {
     await waitFor(() => expect(rowNames()).toHaveLength(4));
     fireEvent.keyDown(row(nodeId(12)), { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/preview/${nodeId(12)}`));
-    expect(router.state.location.state).toEqual({
+    expect(router.state.location.state).toMatchObject({
       siblingIds: RECENT.items.map((item) => item.id),
       from: "/recent",
     });
@@ -86,7 +79,7 @@ describe("/starred", () => {
     await waitFor(() => expect(rowNames()).toHaveLength(2));
     fireEvent.keyDown(row(nodeId(22)), { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/preview/${nodeId(22)}`));
-    expect(router.state.location.state).toEqual({ siblingIds: [nodeId(22)], from: "/starred" });
+    expect(router.state.location.state).toMatchObject({ siblingIds: [nodeId(22)], from: "/starred" });
   });
 
   it("pages with the cursor", async () => {

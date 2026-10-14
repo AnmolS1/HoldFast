@@ -22,13 +22,6 @@ import {
   rowNames,
 } from "./helpers";
 
-// The preview is T18's feature: these tests check what a view WRITES when it opens a file (the
-// address and its state), so the route answers with a stand-in. The real one stamps the state
-// with the account and loads its renderers, which is T18's to test.
-vi.mock("../../../../src/client/features/preview/PreviewRoute", () => ({
-  PreviewRoute: () => <div data-preview-stand-in />,
-}));
-
 setupShell();
 afterEach(() => vi.useRealTimers());
 
@@ -214,7 +207,7 @@ describe("/search", () => {
     await waitFor(() => expect(document.activeElement?.getAttribute("data-item-id")).toBe(nodeId(32)));
     fireEvent.keyDown(document.activeElement!, { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/preview/${nodeId(32)}`));
-    expect(router.state.location.state).toEqual({
+    expect(router.state.location.state).toMatchObject({
       siblingIds: [nodeId(31), nodeId(32)],
       from: "/search?q=report",
     });
