@@ -556,8 +556,19 @@ describe("PdfPreview — how much is drawn at once", () => {
   /** An IntersectionObserver the test drives both ways: pages come near (and into view), and leave. */
   type Report = (entries: Array<{ isIntersecting: boolean; target: Element }>) => void;
   const observed = new Map<Element, Set<Report>>();
+  // The sheets by number, looked up once per document: a selector query per call walks the
+  // whole 500-sheet tree, and the scroll test makes a thousand calls.
+  let sheets = new Map<number, Element>();
   const near = (page: number, isIntersecting: boolean) => {
-    const element = document.querySelector(`[data-pdf-page="${page}"]`)!;
+    if (!sheets.get(page)?.isConnected) {
+      sheets = new Map(
+        Array.from(document.querySelectorAll("[data-pdf-page]"), (sheet) => [
+          Number(sheet.getAttribute("data-pdf-page")),
+          sheet,
+        ]),
+      );
+    }
+    const element = sheets.get(page)!;
     for (const report of Array.from(observed.get(element) ?? []))
       report([{ isIntersecting, target: element }]);
   };

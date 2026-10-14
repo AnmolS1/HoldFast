@@ -9,7 +9,7 @@ import { getRibbonSnapshot, TransferRibbon } from "../../../../src/client/compon
 import { UploadDropOverlay } from "../../../../src/client/features/upload";
 import { addFiles, pauseAll, resumeItem } from "../../../../src/client/features/upload/manager";
 import { PANEL_ROWS, SCAN_HARD_LIMIT_MS } from "../../../../src/client/features/upload/plan";
-import { getUploads, type UploadItem } from "../../../../src/client/features/upload/store";
+import { getUploads, subscribeUploads, type UploadItem } from "../../../../src/client/features/upload/store";
 import { rowsToDraw } from "../../../../src/client/features/upload/summary";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
@@ -20,9 +20,10 @@ import {
   FAKED_TIMERS,
   freshUploader,
   installServer,
+  keepResumeListInMemory,
+  type Server,
   settle,
   smallFile,
-  type Server,
 } from "./helpers";
 
 setupShell();
@@ -70,7 +71,8 @@ describe("files the scan bound gave up on (4m1)", () => {
   it("after the hard bound the panel draws its cap and says how many are still being checked", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
-    const count = PANEL_ROWS + 300;
+    keepResumeListInMemory();
+    const count = PANEL_ROWS + 30;
     await addFiles(
       Array.from({ length: count }, (_, n) => ({ file: smallFile(`f${n}.txt`) })),
       null,
@@ -85,7 +87,7 @@ describe("files the scan bound gave up on (4m1)", () => {
     expect(document.querySelectorAll("[data-upload-row]").length).toBe(PANEL_ROWS);
     expect(document.querySelector("[data-upload-more]")).toBeNull();
     expect(document.querySelector("[data-upload-checking]")!.textContent).toBe(
-      "300 files are still being checked — they will appear when ready",
+      "30 files are still being checked — they will appear when ready",
     );
   });
 });
@@ -228,5 +230,24 @@ describe("the scan loop's wait outlives a remount and a tab switch (4m4)", () =>
     expect(polls()).toBe(at429);
     await act(() => settle(2_000));
     expect(polls()).toBeGreaterThan(at429);
+  });
+});
+
+describe("the snapshot a reader gets", () => {
+  it("shows a change at once, though the listeners are told once at the end of the burst", async () => {
+    server.hold = true;
+    await addFiles([{ file: smallFile("a.txt") }, { file: smallFile("b.txt") }], null);
+    await settle();
+    let told = 0;
+    const stop = subscribeUploads(() => (told += 1));
+    pauseAll();
+    expect(items().map((row) => [row.state, row.pauseReason])).toEqual([
+      ["paused", "user"],
+      ["paused", "user"],
+    ]);
+    expect(told).toBe(0);
+    await Promise.resolve();
+    expect(told).toBe(1);
+    stop();
   });
 });

@@ -1,12 +1,17 @@
 // A stand-in upload API for the uploader's jsdom tests: JSON routes through the shell helpers'
 // fetch router, bodies through the manager's injected transport (no XMLHttpRequest, no Worker).
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import type { ZodType } from "zod";
 import type { CompleteUploadBody, InitUploadBody } from "../../../../src/shared/schemas/upload";
 import { resetRibbonFeedForTests } from "../../../../src/client/features/upload/ribbon";
 import { purgeUploads, setUploadRuntimeForTests } from "../../../../src/client/features/upload/manager";
+import {
+  keepResumeListInMemoryForTests,
+  resumeListSettledForTests,
+} from "../../../../src/client/features/upload/resume-list";
 import type { PutOptions } from "../../../../src/client/features/upload/protocol";
 import { ApiError } from "../../../../src/client/lib/api";
+import { betterAuthClient } from "../../../../src/client/lib/auth-client";
 import {
   envelope,
   json,
@@ -266,3 +271,44 @@ export async function settle(ms = 0): Promise<void> {
 }
 
 export { envelope, json };
+
+interface LibraryStore {
+  active?: boolean;
+  [key: symbol]: unknown;
+}
+
+const librarySessionStore = (): LibraryStore =>
+  (betterAuthClient as unknown as { $store: { atoms: { session: LibraryStore } } }).$store.atoms.session;
+
+/**
+ * Whether the auth library's own session store is mounted. Every purge mounts it (the shell's
+ * purger reads it, `lib/auth-client.ts`), and it unmounts itself a second later from a timer that
+ * touches `document`.
+ */
+export function authSessionStoreMounted(): boolean {
+  return librarySessionStore().active === true;
+}
+
+/** Unmount it now, while the document is still there: the library's own clean-up, run early. */
+function unmountAuthSessionStore(): void {
+  const store = librarySessionStore();
+  if (store.active !== true) return;
+  const clean = Object.getOwnPropertySymbols(store).find((key) => key.description === "clean");
+  if (!clean) throw new Error("the auth library's session store has no clean-up to run");
+  (store[clean] as () => void)();
+}
+
+/** For tests of hundreds of files: the resume list in memory (see `keepResumeListInMemoryForTests`). */
+export function keepResumeListInMemory(): void {
+  keepResumeListInMemoryForTests(true);
+}
+
+// Nothing a test started outlives it: the resume list's writes have finished (they run on real
+// time in the stand-in database and would otherwise spill into the next test, or past the end of
+// the file), and the auth library's session store is unmounted while jsdom still exists (its
+// delayed unmount ran after the environment was gone: "document is not defined").
+afterEach(async () => {
+  await resumeListSettledForTests();
+  keepResumeListInMemoryForTests(false);
+  unmountAuthSessionStore();
+});

@@ -33,9 +33,10 @@ import {
   freshUploader,
   installServer,
   json,
+  keepResumeListInMemory,
+  type Server,
   settle,
   smallFile,
-  type Server,
 } from "./helpers";
 
 setupShell();
@@ -424,7 +425,9 @@ describe("the panel's rows when there are more than it draws", () => {
   });
 
   it("in the panel: the file in flight past row 200 can be paused", async () => {
-    renderShell(<UploadPanel />);
+    keepResumeListInMemory();
+    // The panel is drawn once the 230 have landed: drawn during them it is 230 re-renders of
+    // 200 rows, and this test is about which rows are drawn, not about drawing them often.
     await act(() =>
       addFiles(
         Array.from({ length: 230 }, (_, n) => ({ file: smallFile(`done${n}.txt`) })),
@@ -436,6 +439,7 @@ describe("the panel's rows when there are more than it draws", () => {
     server.hold = true;
     await act(() => addFiles([{ file: smallFile("moving.txt") }], null));
     await act(() => settle());
+    renderShell(<UploadPanel />);
     expect(items().length).toBeLessThanOrEqual(231);
     expect(screen.getByRole("button", { name: "Pause moving.txt" })).toBeTruthy();
   });
@@ -458,27 +462,31 @@ describe("the scan loop's bound and the queue's length", () => {
     expect(items()[0]).toMatchObject({ state: "done", scanStatus: "pending" });
   });
 
-  it("400 files waiting: none is given up without having been asked about, and each at least three times", async () => {
+  it("a queue long enough that nobody can be asked three times inside the time bound: none is given up without having been asked about, and each at least three times", async () => {
+    keepResumeListInMemory();
+    // Long enough that, at one ask a second, no file has had its third ask when the time bound
+    // passes (two rounds take 2 × 200 s > 5 min): the asks, not the time, decide.
+    const count = 200;
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
     await addFiles(
-      Array.from({ length: 400 }, (_, n) => ({ file: smallFile(`f${n}.txt`) })),
+      Array.from({ length: count }, (_, n) => ({ file: smallFile(`f${n}.txt`) })),
       null,
     );
-    for (let turn = 0; turn < 450; turn += 1) await settle(0);
-    expect(items().filter((item) => item.state === "scanning").length).toBe(400);
+    for (let turn = 0; turn < count + 50; turn += 1) await settle(0);
+    expect(items().filter((item) => item.state === "scanning").length).toBe(count);
     await settle(SCAN_FOLLOW_LIMIT_MS + 10_000);
     // Past the time bound, and still nobody is given up: not everyone has been asked three times.
     expect(items().every((item) => item.state === "scanning")).toBe(true);
-    await settle(400 * SCAN_MIN_ASKS * 1_000);
+    await settle(count * SCAN_MIN_ASKS * 1_000);
     expect(items().every((item) => item.state === "done" && item.scanStatus === "pending")).toBe(true);
     const perFile = new Map<string, number>();
     for (const call of polls()) perFile.set(call.path, (perFile.get(call.path) ?? 0) + 1);
-    expect(perFile.size).toBe(400);
+    expect(perFile.size).toBe(count);
     expect(Math.min(...perFile.values())).toBeGreaterThanOrEqual(SCAN_MIN_ASKS);
     // And still at most one request a second in all.
     expect(polls().length).toBeLessThanOrEqual(
-      (SCAN_FOLLOW_LIMIT_MS + 10_000 + 400 * SCAN_MIN_ASKS * 1_000) / 1_000 + 1,
+      (SCAN_FOLLOW_LIMIT_MS + 10_000 + count * SCAN_MIN_ASKS * 1_000) / 1_000 + 1,
     );
   });
 
