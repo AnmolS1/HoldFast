@@ -63,6 +63,13 @@ describe("who may call", () => {
     // The transactions of this route: one plain (an abort), three that are run again on a deadlock.
     expect(code.match(/\.transaction\(/g)).toHaveLength(1); // releaseAndAbort
     expect(code.match(/retryOnDeadlock\(/g)).toHaveLength(3); // the admission, complete, preserved evidence
+    // The admission's callback is database statements only: no metric inside it.
+    const admission = code.slice(
+      code.indexOf("retryOnDeadlock(db(c), async (tx) => {\n      await enforceUploadCeilings("),
+    );
+    const callback = admission.slice(0, admission.indexOf("\n    });"));
+    expect(callback).toMatch(/enforceUploadCeilings/);
+    expect(callback).not.toMatch(/metric\(/);
   });
 });
 
@@ -180,6 +187,24 @@ describe("where a file may go", () => {
       const answer = await post(user, initBody({ parentId }));
       expect(answer.status, parentId).toBe(404);
     }
+  });
+
+  it("a parent in the trash — itself or by a folder above — costs the statements an unknown id costs, and answers its bytes", async () => {
+    const user = await uploader();
+    const stranger = await uploader();
+    const trashed = await makeFolder(user.id, null, { deletedAt: new Date(), trashedRoot: true });
+    const underTrash = await makeFolder(user.id, trashed.id);
+    const foreign = await makeFolder(stranger.id);
+    const cost = async (parentId: string) => {
+      const statements = { n: 0 };
+      const answer = await post(user, initBody({ parentId, name: "same.bin" }), { statements });
+      expect(answer.status).toBe(404);
+      return { bytes: answer.bytes, statements: statements.n };
+    };
+    const unknown = await cost(uuidv7());
+    expect(unknown.statements).toBeGreaterThan(0);
+    for (const parentId of [trashed.id, underTrash.id, foreign.id])
+      expect(await cost(parentId)).toEqual(unknown);
   });
 
   it("a taken-down parent folder — itself or by an ancestor — is 404, byte for byte an unknown id", async () => {
@@ -425,6 +450,26 @@ describe("a name that is taken", () => {
     expect(JSON.stringify(answers["locked.bin"]!.body)).not.toContain(locked.id);
     // Control: a file the owner does see — whatever its scan state — is named.
     expect(answers["seen.bin"]!.body.details).toEqual({ existingId: visible.id });
+  });
+
+  it("an editor is given no id for a holder the partner rule hides (under review, someone else's pending) — and the id of a clean one", async () => {
+    const owner = await uploader();
+    const editor = await uploader();
+    const parent = await makeFolder(owner.id);
+    await makeShare(parent.id, owner.id, editor.id, { role: "editor", canUpload: true });
+    await makeFile(owner.id, parent.id, { name: "review.bin", scanStatus: "under_review" });
+    await makeFile(owner.id, parent.id, { name: "pending.bin", scanStatus: "pending" });
+    const clean = await makeFile(owner.id, parent.id, { name: "clean.bin", scanStatus: "clean" });
+    const answers: Record<string, Awaited<ReturnType<typeof post>>> = {};
+    for (const name of ["review.bin", "pending.bin", "clean.bin"]) {
+      answers[name] = await post(editor, initBody({ parentId: parent.id, name }));
+      expect(answers[name]!.status, name).toBe(409);
+    }
+    expect(answers["review.bin"]!.body.details).toBeUndefined();
+    expect(answers["pending.bin"]!.body.details).toBeUndefined();
+    expect(answers["review.bin"]!.bytes).toBe(answers["pending.bin"]!.bytes);
+    // Control: the clean one is named.
+    expect(answers["clean.bin"]!.body.details).toEqual({ existingId: clean.id });
   });
 
   it("rename → the next free 'name (n)', kept on the session; the same file again resumes it", async () => {

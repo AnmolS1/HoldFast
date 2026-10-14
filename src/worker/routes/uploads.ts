@@ -90,7 +90,7 @@ import { metric } from "../services/metrics";
 import { sendOperatorCritical } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES, thumbEligible } from "../services/mime";
 import { toNodeDto, toOwnAvatarDto } from "../services/node-dto";
-import { assertNotTrashed, requireRole, requireUpload, type Role } from "../services/permissions";
+import { requireRole, requireUpload, type Role } from "../services/permissions";
 import * as quotaRows from "../db/queries/quota";
 import * as quota from "../services/quota";
 import { db, deps, type AppEnv } from "../services/request-context";
@@ -219,11 +219,18 @@ type Place = { ownerId: string; role: Role; shareRootId: string | null };
  * the caller has no access, also to a hidden folder.
  */
 async function placeFor(c: Ctx, user: SessionUser, parentId: string | null): Promise<Place> {
-  const access = await requireUpload(c, parentId);
-  if (parentId === null) return OWN_ROOT(user);
+  if (parentId === null) {
+    await requireUpload(c, null);
+    return OWN_ROOT(user);
+  }
+  // `requireUpload`'s rule, with the trash asked by the same statements as the role: a folder in
+  // the trash (itself or above) costs exactly what an unknown id costs.
+  const access = await requireRole(c, parentId, "editor", { notTrashed: true });
+  if (access.role !== "owner" && !access.canUpload) {
+    throw new AppError("forbidden", undefined, { reason: "upload_not_allowed" });
+  }
   const parent = await getNode(db(c), parentId);
   if (!parent || parent.kind !== "folder" || parent.system !== null) throw new AppError("not_found");
-  await assertNotTrashed(c, parentId);
   return { ownerId: parent.ownerId, role: access.role, shareRootId: access.shareRootId };
 }
 

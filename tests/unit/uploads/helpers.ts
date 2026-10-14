@@ -109,6 +109,8 @@ export type CallOptions = {
    * has run and before it commits: throw from it to make that attempt fail.
    */
   beforeCommit?: (attempt: number) => void;
+  /** Every SQL statement the request sends is counted here (`n`), its deferred work included. */
+  statements?: { n: number };
 };
 
 export type Answer<T = Record<string, unknown>> = {
@@ -136,10 +138,29 @@ const allow = { limit: async () => ({ success: true }) };
 
 /** The real `createDb`, with every transaction opened on the handle observed. */
 function observedCore(options: CallOptions): Pick<CoreDeps, "createDb"> {
-  if (!options.failures && !options.beforeCommit) return { createDb: realCore.createDb };
+  if (!options.failures && !options.beforeCommit && !options.statements)
+    return { createDb: realCore.createDb };
   return {
     createDb: (...args) => {
       const handle = realCore.createDb(...args);
+      const counter = options.statements;
+      if (counter) {
+        // Every connection the pool hands out counts what it sends.
+        const pool = (
+          handle.db as unknown as { $client: { on(event: string, fn: (client: unknown) => void): void } }
+        ).$client;
+        const patched = new WeakSet<object>();
+        pool.on("acquire", (client) => {
+          const connection = client as { query: (...a: unknown[]) => unknown };
+          if (patched.has(connection)) return;
+          patched.add(connection);
+          const query = connection.query.bind(connection);
+          connection.query = (...a: unknown[]) => {
+            counter.n += 1;
+            return query(...a);
+          };
+        });
+      }
       const transaction = handle.db.transaction.bind(handle.db) as Db["transaction"];
       let attempt = 0;
       const observed: Db["transaction"] = async (run, config) => {
