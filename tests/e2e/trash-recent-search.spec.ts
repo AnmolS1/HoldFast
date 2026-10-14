@@ -287,7 +287,8 @@ test.describe("recent, starred, search, storage", () => {
     await row(page, nodeId(11)).focus();
     await page.keyboard.press("Enter");
     await expect(page).toHaveURL(new RegExp(`/preview/${nodeId(11)}$`));
-    expect(await page.evaluate(() => (history.state as { usr?: unknown }).usr)).toEqual({
+    // What the view wrote; the preview (T18) adds the account it was written for.
+    expect(await page.evaluate(() => (history.state as { usr?: unknown }).usr)).toMatchObject({
       siblingIds: RECENT.items.map((item) => item.id),
       from: "/recent",
     });
