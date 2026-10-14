@@ -7,7 +7,7 @@ import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
-import { addUsageIfUnder } from "../../../src/worker/db/queries/ledger";
+import { addUsageIfUnder, subtractUsage } from "../../../src/worker/db/queries/ledger";
 import { takeOverStaleHold } from "../../../src/worker/db/queries/files-host";
 import { nodes } from "../../../src/worker/db/schema";
 import { dayUTC } from "../../../src/worker/services/ip-hash";
@@ -17,6 +17,7 @@ import {
   makeThumbnail,
   HOLD_STALE_SECONDS,
   THUMB_CALLS_PER_DAY,
+  thumbMaxBytes,
   unitMarker,
   type ThumbOwner,
 } from "../../../src/worker/services/thumbnails";
@@ -877,31 +878,150 @@ describe("the owner-unit hold can never wedge a thumbnail", () => {
     expect(await ledgerRow("notice", failureMarker(node, 320))).toEqual({ bytes: 0, count: made });
   });
 
-  it("the takeover is one conditional UPDATE: only a hold that is held, not charged and older than the window — and only once", async () => {
+  it("the takeover is one conditional UPDATE naming the hold as read: only that hold, held, not charged and older than the window — and only once", async () => {
     const day = dayUTC(new Date());
     const at = Math.floor(Date.now() / 1000);
+    const staleBefore = at - HOLD_STALE_SECONDS;
     const marker = (name: string) => `thumb_unit:test-${name}-${crypto.randomUUID()}`;
     const seed = (id: string, bytes: number, count: number) =>
       addUsageIfUnder(testDb(), day, "notice", id, { bytes, count }, {});
-    const take = (id: string) => takeOverStaleHold(testDb(), day, id, at, at - HOLD_STALE_SECONDS);
+    const take = (id: string, heldAt: number) =>
+      takeOverStaleHold(testDb(), day, id, at, heldAt, staleBefore);
 
     const stale = marker("stale");
     await seed(stale, at - 360, 0);
-    expect(await take(stale)).toBe(true);
-    // Now fresh: a second taker finds nothing to take.
-    expect(await take(stale)).toBe(false);
+    expect(await take(stale, at - 360)).toBe(true);
+    // Now another hold (its time is `at`): a second taker naming the old one finds nothing.
+    expect(await take(stale, at - 360)).toBe(false);
     const fresh = marker("fresh");
     await seed(fresh, at - 60, 0);
-    const released = marker("released");
-    await seed(released, 0, 0);
+    expect(await take(fresh, at - 60)).toBe(false);
     const charged = marker("charged");
     await seed(charged, at - 360, 1);
-    for (const id of [fresh, released, charged, marker("none")]) expect(await take(id)).toBe(false);
+    expect(await take(charged, at - 360)).toBe(false);
+    const released = marker("released");
+    await seed(released, 0, 0);
+    expect(await take(released, 0)).toBe(false);
+    expect(await take(marker("none"), at - 360)).toBe(false);
     // Twenty at once on one stale hold: exactly one wins.
     const contested = marker("contested");
     await seed(contested, at - 360, 0);
-    const wins = await Promise.all(Array.from({ length: 20 }, () => take(contested)));
+    const wins = await Promise.all(Array.from({ length: 20 }, () => take(contested, at - 360)));
     expect(wins.filter(Boolean)).toHaveLength(1);
+  });
+
+  it("the review's P2: X and Y read one stale hold, X takes it over and gives it back, then Y's takeover fails and the slot is taken by the ordinary acquire — never two holders", async () => {
+    const day = dayUTC(new Date());
+    const at = Math.floor(Date.now() / 1000);
+    const id = `thumb_unit:test-p2-${crypto.randomUUID()}`;
+    const old = at - 360;
+    await addUsageIfUnder(testDb(), day, "notice", id, { bytes: old, count: 0 }, {});
+    const holders = new Set<string>();
+    // X and Y have both read `old`. X wins the takeover…
+    expect(await takeOverStaleHold(testDb(), day, id, at, old, at - HOLD_STALE_SECONDS)).toBe(true);
+    holders.add("X");
+    // …and gives it back (its consume threw, or the owner's ceiling refused it).
+    await subtractUsage(testDb(), day, "notice", id, at);
+    holders.delete("X");
+    // Y's takeover names the hold it read: it is gone, so Y does not hold.
+    expect(await takeOverStaleHold(testDb(), day, id, at + 1, old, at + 1 - HOLD_STALE_SECONDS)).toBe(false);
+    // Z finds a free slot and takes it as anyone takes a free slot: the ordinary acquire.
+    const acquire = (when: number) =>
+      addUsageIfUnder(testDb(), day, "notice", id, { bytes: when, count: 0 }, { bytes: when, count: 0 });
+    expect(await acquire(at + 2)).toBe(true);
+    holders.add("Z");
+    // The row is Z's hold, and Z's alone: a fresh hold that nobody can take over.
+    expect(await ledgerRow("notice", id)).toEqual({ bytes: at + 2, count: 0 });
+    expect(await takeOverStaleHold(testDb(), day, id, at + 3, at + 2, at + 3 - HOLD_STALE_SECONDS)).toBe(
+      false,
+    );
+    expect(await acquire(at + 3)).toBe(false);
+    expect([...holders]).toEqual(["Z"]);
+  });
+});
+
+describe("the hold → unit → mark → call → write pipeline does not depend on the request's own path", () => {
+  it("a request that gives up on the thumbnail the moment it has started it (its handler returns at once, as a cut request's would) still ends with the unit charged and marked and the thumbnail cached", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const account = { quotaBytes: owner.quotaBytes, createdAt: owner.createdAt };
+    const ran = await invoke(
+      null,
+      async (c) => {
+        // Not awaited: the request's own path goes no further than starting it.
+        void makeThumbnail(c, node, 320, { id: owner.id, account });
+        return "gone";
+      },
+      { env: { IMAGES: imagesMock().binding } },
+    );
+    expect(ran).toMatchObject({ ok: true, value: "gone" });
+    expect(await ledgerRow("notice", unitMarker(node, 320))).toMatchObject({ count: 1 });
+    expect(await units(owner.id)).toBe(1);
+    expect(await spyBucket().bucket.head(thumbKey(node.id, node.versionId, 320))).not.toBeNull();
+  });
+});
+
+describe("the asker's room is asked for the largest thumbnail, not one byte", () => {
+  it(`an address at its ceiling − k, for k below thumbMaxBytes (${thumbMaxBytes(320)} for 320), → 429, no call, no unit; with exactly that room, the thumbnail is made`, async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const link = await linkOn(node.id, owner.id);
+    const images = imagesMock();
+    const CEIL = 10_000_000;
+    const settings = { ceilings: { CEIL_IP_BYTES_DAY: CEIL } };
+    const filled = async (room: number) => {
+      const ip = freshIp();
+      await addUsageIfUnder(
+        testDb(),
+        dayUTC(new Date()),
+        "ip",
+        await ipSubject(ip),
+        { bytes: CEIL - room, count: 0 },
+        {},
+      );
+      return ip;
+    };
+    for (const room of [1, 100, thumbMaxBytes(320) - 1]) {
+      const answer = await ask(await urlFor("thumb", node, { link }), {
+        ip: await filled(room),
+        env: { IMAGES: images.binding },
+        settings,
+      });
+      expect(answer.status, `room ${room}`).toBe(429);
+      expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
+    }
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(0);
+    expect(await ledgerRow("notice", unitMarker(node, 320))).toBeNull();
+    // The control: room for the largest 320 thumbnail → made (and charged its real length).
+    const ip = await filled(thumbMaxBytes(320));
+    const made = await ask(await urlFor("thumb", node, { link }), {
+      ip,
+      env: { IMAGES: images.binding },
+      settings,
+    });
+    expect(made.status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    expect(await ledgerRow("ip", await ipSubject(ip))).toEqual({
+      bytes: CEIL - thumbMaxBytes(320) + FAKE_WEBP.byteLength,
+      count: 0,
+    });
+  });
+
+  it("an output above thumbMaxBytes is not stored or served, and the thumbnail is given up on for the day", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const spy = spyBucket();
+    const images = imagesMock(() => new Uint8Array(thumbMaxBytes(160) + 1));
+    const answer = await ask(await urlFor("thumb", node, { user: owner.id }, { size: 160 }), {
+      env: { IMAGES: images.binding, FILES: spy.bucket },
+    });
+    expect(answer.status).toBe(404);
+    expect(spy.puts).toEqual([]);
+    expect(await ledgerRow("notice", failureMarker(node, 160))).toEqual({
+      bytes: 0,
+      count: 1 + THUMB_CALLS_PER_DAY,
+    });
   });
 });
 

@@ -6,7 +6,7 @@
 // links, ledger). Nothing here reads or writes `share_links.downloadCount`: the download cap is
 // taken where a download URL is minted.
 
-import { and, eq, gt, lte, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { downloadLedger, shareLinks, user } from "../schema";
@@ -69,19 +69,22 @@ export async function claimPauseEmail(
 }
 
 /**
- * Takes over a thumbnail's owner-unit hold that was ABANDONED: the marker row (ledger subject
- * `notice`) is held (`bytes` = the hold's time, epoch seconds, > 0), not paid (`count` = 0), and
- * its time is at or before `staleBefore`. ONE conditional UPDATE: of any number of requests at
- * once exactly one row update wins — the others re-check the condition against the winner's new
- * time and match nothing. A hold that was given back meanwhile (`bytes` = 0) or paid is not taken.
+ * Takes over a thumbnail's owner-unit hold that was ABANDONED — exactly the hold that was read:
+ * the marker row (ledger subject `notice`) still holds `heldAt` (the hold's time, epoch seconds,
+ * > 0), is not paid (`count` = 0), and `heldAt` is at or before `staleBefore`. ONE conditional
+ * UPDATE: of any number of requests at once exactly one row update wins — the others re-check the
+ * condition against the winner's new time and match nothing; a hold given back (`bytes` 0) and
+ * taken again meanwhile has another time and is not this one.
  */
 export async function takeOverStaleHold(
   db: Executor,
   day: string,
   marker: string,
   at: number,
+  heldAt: number,
   staleBefore: number,
 ): Promise<boolean> {
+  if (!(heldAt > 0) || heldAt > staleBefore) return false;
   const rows = await db
     .update(downloadLedger)
     .set({ bytes: at })
@@ -91,8 +94,7 @@ export async function takeOverStaleHold(
         eq(downloadLedger.subjectType, "notice"),
         eq(downloadLedger.subjectId, marker),
         eq(downloadLedger.count, 0),
-        gt(downloadLedger.bytes, 0),
-        lte(downloadLedger.bytes, staleBefore),
+        eq(downloadLedger.bytes, heldAt),
       ),
     )
     .returning({ day: downloadLedger.day });

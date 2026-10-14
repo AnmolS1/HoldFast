@@ -40,7 +40,8 @@
 //             database throwing — gives the hold back (`finally`), and the request answers the
 //             icon. A holder that never comes back (an invocation cut between the hold and the
 //             mark: no `finally` runs) leaves a hold that the first request after
-//             HOLD_STALE_SECONDS TAKES OVER — one conditional UPDATE, so one winner. A
+//             HOLD_STALE_SECONDS TAKES OVER — one conditional UPDATE naming that hold (its time,
+//             as read), so one winner, and never a hold given back and re-taken meanwhile. A
 //             takeover is no free call: calls are counted on the other row, and nothing gives
 //             them back.
 // A request that gets neither answers "no thumbnail" at once: no unit, no call, nothing written —
@@ -90,6 +91,18 @@ const none = (reason: string): MadeThumbnail => ({ ok: false, reason });
 /** How many calls of the image service one thumbnail — one size of one version of a file — gets a day. */
 export const THUMB_CALLS_PER_DAY = 3;
 
+/**
+ * The largest thumbnail the cache stores for a variant: four bytes a pixel — an uncompressed
+ * RGBA image of `size` × `size`, which a lossy WebP at quality 80 never reaches. An output above
+ * it is not stored or served (a failure the service gave: no further call that day). It is the
+ * room an asker must have on their own day before a thumbnail is made for them.
+ */
+export const THUMB_BYTES_PER_PIXEL = 4;
+
+export function thumbMaxBytes(size: ThumbSize): number {
+  return size * size * THUMB_BYTES_PER_PIXEL;
+}
+
 /** A hold on the owner's unit older than this, never charged, is taken over by the next request. */
 export const HOLD_STALE_SECONDS = 300;
 
@@ -127,10 +140,21 @@ async function ownerPaid(
   // One statement: a hold only where there is none, and none once the unit was charged.
   const hold = (bytes: number) =>
     addUsageIfUnder(db(c), day, "notice", marker, { bytes, count: 0 }, { bytes, count: 0 });
-  // Not got: a hold nobody came back to is taken over — one conditional UPDATE (held, not paid,
-  // older than HOLD_STALE_SECONDS), so exactly one of any number of requests at once wins it.
-  if (!(await hold(at)) && !(await takeOverStaleHold(db(c), day, marker, at, at - HOLD_STALE_SECONDS))) {
-    return (await totalsOn(db(c), day, "notice", marker)).count > 0 ? "paid" : "busy";
+  // (The hold's time is its identity: `bytes` = `at` exactly, never a sum.)
+  if (!(await hold(at))) {
+    const seen = await totalsOn(db(c), day, "notice", marker);
+    if (seen.count > 0) return "paid";
+    if (seen.bytes === 0) {
+      // Given back since: a free slot, taken by the ordinary acquire — never by a takeover.
+      if (!(await hold(at))) return "busy";
+    } else if (seen.bytes > at - HOLD_STALE_SECONDS) {
+      return "busy";
+    } else if (!(await takeOverStaleHold(db(c), day, marker, at, seen.bytes, at - HOLD_STALE_SECONDS))) {
+      // A hold nobody came back to is taken over by ONE conditional UPDATE that names it as it
+      // was read (its time): a hold given back and taken again meanwhile is another hold, and
+      // of any number of takers at once exactly one matches.
+      return "busy";
+    }
   }
   let charged = false;
   try {
@@ -189,6 +213,30 @@ export async function makeThumbnail(
   // The image service's failure for a larger input is an untyped connection error: never ask.
   if (!Number.isFinite(node.size) || node.size > THUMB_INPUT_MAX_BYTES) return none("too_large");
 
+  // EVERYTHING from the hold on is the request's deferred work — registered (and so handed to
+  // the platform's `waitUntil`) before its first statement — as well as awaited here. A client
+  // that goes away cannot cut it between the hold and the mark, nor between the call and the
+  // cache write: "ctx.waitUntil() can extend execution for up to 30 seconds after the response
+  // is sent or the client disconnects" (developers.cloudflare.com/workers/runtime-apis/context/);
+  // awaited work that is not passed to it "may be canceled" when the client disconnects
+  // (developers.cloudflare.com/workers/platform/limits/). What remains is an isolate that dies,
+  // or work that outlives those 30 s: then a hold is taken over after HOLD_STALE_SECONDS.
+  const work = pipeline(c, node, size, owner);
+  try {
+    defer(c, work);
+  } catch {
+    // The request's deferred work is full: the pipeline runs with the request alone.
+  }
+  return work;
+}
+
+/** Hold → unit → mark → claim a call → transform → write → re-check. Never rejects. */
+async function pipeline(
+  c: Context<AppEnv>,
+  node: ThumbSource,
+  size: ThumbSize,
+  owner: ThumbOwner,
+): Promise<MadeThumbnail> {
   const day = utcDay(now(c));
   const paid = await ownerPaid(c, node, size, owner, day).catch(() => "error" as const);
   if (paid !== "paid") return none(paid === "busy" ? "unit_busy" : paid);
@@ -198,15 +246,7 @@ export async function makeThumbnail(
   } catch {
     return none("error");
   }
-
-  const work = attempt(c, node, size, marker, day);
-  try {
-    // Also the request's deferred work: it finishes — and caches — if the asker goes away.
-    defer(c, work);
-  } catch {
-    // The request's deferred work is full: the attempt runs with the request alone.
-  }
-  return work;
+  return attempt(c, node, size, marker, day);
 }
 
 /** The transform and its cache write, with what becomes of the marker. Never rejects. */
@@ -238,6 +278,10 @@ async function attempt(
   if (buffer.byteLength === 0) {
     await giveUp(c, marker, day);
     return none("empty");
+  }
+  if (buffer.byteLength > thumbMaxBytes(size)) {
+    await giveUp(c, marker, day);
+    return none("too_big");
   }
 
   const key = thumbKey(node.id, node.versionId, size);

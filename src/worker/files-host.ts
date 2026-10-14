@@ -68,7 +68,7 @@ import {
   type CoreDeps,
 } from "./services/request-context";
 import { storage, thumbKey, type GetResult } from "./services/storage";
-import { makeThumbnail, THUMB_TYPE } from "./services/thumbnails";
+import { makeThumbnail, THUMB_TYPE, thumbMaxBytes } from "./services/thumbnails";
 import { linkPwv, verifyDownloadToken, type DownloadClaims, type TokenKind } from "./services/tokens";
 
 const TEXT = { "content-type": "text/plain; charset=utf-8" };
@@ -628,8 +628,10 @@ async function charge(c: Ctx, passed: Passed, bytes: number): Promise<ServeCharg
 }
 
 /** Before a thumbnail is made: the asker's own day has room. Throws `429` like gate 5. */
-async function askerHasRoom(c: Ctx, passed: Passed): Promise<void> {
-  await refusedAsCap(c, passed, async () => assertAskerHasRoom(c, serveOf(passed, 1, await ipSubject(c))));
+async function askerHasRoom(c: Ctx, passed: Passed, size: ThumbSize): Promise<void> {
+  await refusedAsCap(c, passed, async () =>
+    assertAskerHasRoom(c, serveOf(passed, thumbMaxBytes(size), await ipSubject(c))),
+  );
 }
 
 /** A ceiling's `429` for a link is logged `denied_cap` (after the answer). */
@@ -817,7 +819,7 @@ async function serveThumb(c: Ctx, passed: Passed, size: ThumbSize): Promise<Resp
   // A HEAD makes nothing: no transform, no unit, no object written.
   if (isHeadRequest(c)) throw new AppError("not_found");
   // An asker whose own day is used up is refused before the owner pays and the service is called.
-  await askerHasRoom(c, passed);
+  await askerHasRoom(c, passed, size);
   // A miss: one transform, one attempt. Whatever goes wrong, the answer is the icon's 404.
   const made = await makeThumbnail(c, node, size, { id: passed.owner.id, account: passed.owner });
   if (!made.ok) {

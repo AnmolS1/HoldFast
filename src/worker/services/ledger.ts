@@ -118,15 +118,16 @@ export async function recordServe(c: Context<AppEnv>, serve: Serve): Promise<Ser
 }
 
 /**
- * Is there room for ONE more byte on the asker's own ledgers — the address's, and a signed-in
- * subject's? Asked before a thumbnail is made, so that an asker whose own day is used up is
+ * Is there room for `serve.bytes` — the largest the thumbnail can be (`thumbMaxBytes`) — on the
+ * asker's own ledgers: the address's, and a signed-in subject's? Asked before a thumbnail is made, so that an asker whose own day is used up is
  * refused BEFORE the owner pays a transform unit and the image service is called (the bytes of
  * a thumbnail are known only once it exists). Throws the same `429 ceiling_exceeded`, with
- * `Retry-After` to 00:00 UTC, as gate 5; otherwise the byte is given back at once.
+ * `Retry-After` to 00:00 UTC, as gate 5; otherwise the bytes are given back at once.
  */
 export async function assertAskerHasRoom(c: Context<AppEnv>, serve: Serve): Promise<void> {
-  const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes: 1 });
-  await told(() => refundUsage(deps(c), "download_ip", serve.ip, { bytes: 1 }, address));
+  const { bytes } = serve;
+  const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes });
+  await told(() => refundUsage(deps(c), "download_ip", serve.ip, { bytes }, address));
   if (serve.st !== "u") return;
   const mine = await consumeCeiling(
     c,
