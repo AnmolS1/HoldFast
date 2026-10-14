@@ -98,7 +98,6 @@ const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
   account: ["routes.tsx"],
   explorer: ["index.ts", "routes.tsx"],
   admin: ["routes.tsx"],
-  preview: ["index.ts", "routes.tsx"],
   dmca: ["routes.tsx"],
   upload: ["index.ts", "routes.tsx", "slots.tsx"],
   interstitial: ["index.ts", "routes.tsx"],
