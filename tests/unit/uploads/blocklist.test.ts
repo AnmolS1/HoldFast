@@ -645,7 +645,7 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(await userRow(editor.id)).toMatchObject({ legalHold: false });
   }, 60_000);
 
-  it("if the node cannot be written the object still stays, and the operators are told by its session", async () => {
+  it("if the node cannot be written the object still stays — its session left completing with the listed hash on it, never aborted — and the operators are told by its session", async () => {
     const known = await listed("csam");
     const { editor, session, row, revoke } = await beforeComplete(known.bytes);
     await revoke();
@@ -664,8 +664,14 @@ describe("suspected CSAM: never deleted, locked by the one shared handler", () =
     expect(answer.status).toBe(404);
     expect(await env.FILES.head(row.r2Key)).not.toBeNull();
     expect(await nodesOf(editor.id)).toHaveLength(0);
-    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(1);
+    expect(await auditFor("upload.csam_object_kept", session.uploadId)).toHaveLength(0);
+    expect(await auditFor("upload.csam_node_owed", session.uploadId)).toHaveLength(1);
     expect(operatorMails()).toBe(mailsBefore + 1);
-    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+    // Not a bare object: the session still references the key, with the listed hash on it.
+    expect(await sessionRow(session.uploadId)).toMatchObject({
+      status: "completing",
+      r2Key: row.r2Key,
+      expectedSha256: known.sha256,
+    });
   });
 });

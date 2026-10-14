@@ -396,8 +396,11 @@ const LOCKED = { scanStatus: "suspected_csam", legalHold: true } as const;
  * the folder owner's reservation goes back. (An editor with no room left is not refused: the
  * node is written uncounted and the next reconcile counts it.)
  *
- * If the node cannot be written, the object still stays: an audit row and the critical operator
- * alert name it by its session.
+ * There is no "object kept without a node": the uploader's row exists while their session does
+ * (an account purge removes the sessions first; the lock's hold stops the purge). If the node's
+ * transaction itself fails, the session is NOT ended — it stays `completing`, its key referenced
+ * and its declared (listed) hash on it from the claim, which is what keeps the object from every
+ * sweep — and the operators are told by the session's id; the node is still owed.
  */
 async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<void> {
   const uploader = requireVerified(c);
@@ -433,13 +436,15 @@ async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<
     metric("upload", { outcome: "csam_preserved", kind: modeOf(session) });
     await lockOrRecord(c, node.id, session);
   } catch (error) {
+    if (written) throw error;
     captureError(error, { kind: "upload_csam_preserve" });
-    audit(c, "upload.csam_object_kept", { type: "upload", id: session.id }, { nodeId: session.nodeId });
-    metric("upload", { outcome: "csam_object_kept", kind: modeOf(session) });
+    audit(c, "upload.csam_node_owed", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+    metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
     await tellOperators(c, session);
+    return;
   }
-  // The session ends either way (it may already be gone: a purge of its folder removed it).
-  await releaseAndAbort(db(c), session, "claimed", { keepReservation: written && own });
+  // The node is written: the session ends (it may already be gone — a purge of its folder).
+  await releaseAndAbort(db(c), session, "claimed", { keepReservation: own });
 }
 
 // ── init ────────────────────────────────────────────────────────────────────────────────────

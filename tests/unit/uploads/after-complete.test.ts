@@ -280,6 +280,73 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
   });
 });
 
+describe("Addendum 14 — no verified CSAM object is ever left without a node", () => {
+  /** A node references the key — or, while the node is owed, a session still holds it as `completing`. */
+  async function referenced(r2Key: string) {
+    const [node] = await testDb().select().from(nodes).where(eq(nodes.r2Key, r2Key));
+    if (node) return { by: "node", scanStatus: node.scanStatus, legalHold: node.legalHold };
+    const [session] = await testDb().select().from(uploads).where(eq(uploads.r2Key, r2Key));
+    return session?.status === "completing" ? { by: "completing session" } : { by: "nothing" };
+  }
+
+  const sequences: [
+    string,
+    (ctx: { revoke: () => Promise<unknown>; trash: () => Promise<unknown> }) => Promise<unknown>,
+    ((attempt: number) => void) | undefined,
+  ][] = [
+    ["re-check passes", async () => undefined, undefined],
+    ["share revoked", (x) => x.revoke(), undefined],
+    ["folder trashed", (x) => x.trash(), undefined],
+    [
+      "the node's transaction fails, the preserved one commits",
+      async () => undefined,
+      (n) => {
+        if (n === 1) throw new Error("test: finish");
+      },
+    ],
+    [
+      "share revoked and the preserved node's transaction fails",
+      (x) => x.revoke(),
+      (n) => {
+        if (n === 1) throw new Error("test: preserve");
+      },
+    ],
+    [
+      "both transactions fail",
+      async () => undefined,
+      (n) => {
+        if (n <= 2) throw new Error("test: both");
+      },
+    ],
+  ];
+
+  it.each(sequences)("%s", async (_what, before, beforeCommit) => {
+    const owner = await uploader();
+    const editor = await uploader();
+    const folder = await makeFolder(owner.id);
+    const share = await makeShare(folder.id, owner.id, editor.id, { role: "editor", canUpload: true });
+    const known = await listed("csam");
+    const session = await uploaded(editor, { parentId: folder.id }, known.bytes);
+    const row = (await sessionRow(session.uploadId))!;
+    await before({
+      revoke: () => testDb().delete(shares).where(eq(shares.id, share.id)),
+      trash: () =>
+        testDb()
+          .update(nodes)
+          .set({ deletedAt: new Date(), trashedRoot: true })
+          .where(eq(nodes.id, folder.id)),
+    });
+    await complete(editor, session.uploadId, { sha256: known.sha256 }, beforeCommit ? { beforeCommit } : {});
+    expect(await env.FILES.head(row.r2Key)).not.toBeNull();
+    const ref = await referenced(row.r2Key);
+    expect(ref.by).not.toBe("nothing");
+    if (ref.by === "node") expect(ref).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect(await auditRows({ action: "upload.csam_object_kept", targetId: session.uploadId })).toHaveLength(
+      0,
+    );
+  });
+});
+
 describe("M1 — after the blocked 403, a locked upload is not told from a refused one", () => {
   /** What the follow-ups answer for a malware refusal: the reference every reason must equal. */
   let reference: string[];
