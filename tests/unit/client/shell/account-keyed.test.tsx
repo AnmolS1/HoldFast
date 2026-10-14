@@ -4,7 +4,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it } from "vitest";
 import type { SessionShape } from "../../../../src/client/lib/contracts";
-import { queryClient, refreshSession } from "../../../../src/client/lib/query";
+import { purgeUserState, queryClient, refreshSession } from "../../../../src/client/lib/query";
 import { AccountKeyed } from "../../../../src/client/routes/frame/Frame";
 import { renderShell, sessionOf, setupShell, shellFetch } from "./helpers";
 
@@ -46,10 +46,20 @@ describe("AccountKeyed", () => {
     await refreshSession();
     await waitFor(() => expect(held()).toBe("nothing"));
 
-    // Signed out is another identity too.
+    // An EXPIRED session (read as null, nothing purged) is not another account: state is kept, so
+    // a re-auth as the same account goes on where it was.
     fireEvent.click(screen.getByRole("button"));
     expect(held()).toBe("alice's file");
     current = null;
+    await refreshSession();
+    expect(held()).toBe("alice's file");
+    current = BOB;
+    await refreshSession();
+    await waitFor(() => expect(held()).toBe("alice's file"));
+
+    // A real sign-out purges the remembered account: that is another identity.
+    current = null;
+    await purgeUserState();
     await refreshSession();
     await waitFor(() => expect(held()).toBe("nothing"));
   });
