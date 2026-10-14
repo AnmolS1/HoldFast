@@ -14,6 +14,7 @@ import {
   expectNoA11yViolations,
   mockEnvelope as envelope,
   mockShell,
+  navigateInApp,
   serveBuild,
   stubTurnstile,
   test,
@@ -48,16 +49,16 @@ interface Destination {
 // navigation state) and that no placeholder is left. The order is deliberate — lines of different
 // Wave-2 tasks are never neighbours, so two tasks flipping theirs do not meet in a merge.
 const DESTINATIONS: Destination[] = [
-  { path: "/", title: "Files", nav: "files", placeholder: true },
-  { path: "/folder/abc", title: "Files", placeholder: true },
+  { path: "/", title: "Files", nav: "files", placeholder: false },
+  { path: "/folder/abc", title: "Files", placeholder: false },
   { path: "/shared", title: "Shared with me", nav: "shared", placeholder: true },
   { path: "/uploads", title: "Uploads", placeholder: false },
   { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: true },
-  { path: "/recent", title: "Recent", nav: "recent", placeholder: true },
-  { path: "/starred", title: "Starred", nav: "starred", placeholder: true },
-  { path: "/trash", title: "Trash", nav: "trash", placeholder: true },
-  { path: "/search?q=tax", title: "Search", placeholder: true },
-  { path: "/storage", title: "Storage", placeholder: true },
+  { path: "/recent", title: "Recent", nav: "recent", placeholder: false },
+  { path: "/starred", title: "Starred", nav: "starred", placeholder: false },
+  { path: "/trash", title: "Trash", nav: "trash", placeholder: false },
+  { path: "/search?q=tax", title: "Search", placeholder: false },
+  { path: "/storage", title: "Storage", placeholder: false },
   { path: "/account/security", title: "Account", placeholder: true },
   { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: false },
   { path: "/admin/users", title: "Admin", placeholder: true },
@@ -306,15 +307,19 @@ test.describe("navigation", () => {
     await expect(page.locator('[data-bottom-nav-item="account"]')).toHaveAttribute("aria-current", "page");
   });
 
-  test("every in-frame destination renders from a deep link (both layouts)", async ({ page, origins }) => {
-    await mockShell(page, origins.port, { user: { role: "admin" } });
-    const pages = DESTINATIONS.filter((entry) => !entry.overlay);
-    expect(pages.length).toBe(12);
-    for (const entry of pages) {
+  // One test per destination: each deep link is a cold load of the whole client from the dev
+  // server (~1 s here, ~2.7 s on a CI runner). Twelve of them in one test came to more than the
+  // test's 30 s on CI, and the twelfth (/admin/users) was cut off mid-load.
+  test("every in-frame destination has a deep-link test below (both layouts)", () => {
+    expect(DESTINATIONS.filter((entry) => !entry.overlay).length).toBe(12);
+  });
+  for (const entry of DESTINATIONS.filter((destination) => !destination.overlay)) {
+    test(`renders from a deep link: ${entry.path}`, async ({ page, origins }) => {
+      await mockShell(page, origins.port, { user: { role: "admin" } });
       await gotoFrame(page, entry.path);
       await expectDestination(page, entry);
-    }
-  });
+    });
+  }
 
   test("the preview is an overlay above the page it was opened from", async ({ page, origins }) => {
     await mockShell(page, origins.port);
@@ -581,8 +586,10 @@ test.describe("storage and layout", () => {
     origins,
   }) => {
     await mockShell(page, origins.port, { user: { role: "admin" } });
+    // One load; the other pages are visited through the app's own router (what this test is
+    // about is what they leave behind, not how they are reached).
+    await gotoFrame(page, "/");
     for (const path of [
-      "/",
       "/shared",
       "/recent",
       "/account",
@@ -590,8 +597,10 @@ test.describe("storage and layout", () => {
       "/help",
       "/preview/n1",
       "/search?q=secret",
-    ])
-      await gotoFrame(page, path);
+    ]) {
+      await navigateInApp(page, path);
+      await expect(page.locator("[data-frame]")).toBeVisible();
+    }
     await page.goto("/login?next=/recent");
     await gotoFrame(page, "/");
     // Change every preference through the UI: theme (menu or sheet) and view mode (toggle).
@@ -711,15 +720,19 @@ test.describe("storage and layout", () => {
         client: document.documentElement.clientWidth,
       }));
     await mockShell(page, origins.port);
-    for (const path of ["/", "/shared", "/account", "/help", "/storage"]) {
-      await gotoFrame(page, path);
+    // One load per session state; the other pages through the app's own router.
+    for (const [index, path] of ["/", "/shared", "/account", "/help", "/storage"].entries()) {
+      if (index === 0) await gotoFrame(page, path);
+      else await navigateInApp(page, path);
+      await expect(page.locator("[data-frame]")).toBeVisible();
       const size = await overflow();
       expect(size.scroll, path).toBeLessThanOrEqual(size.client);
     }
     await page.unroute("**/api/**");
     await mockShell(page, origins.port, { user: null });
-    for (const path of ["/login", "/signup", "/verify-email", "/dmca"]) {
-      await page.goto(path);
+    for (const [index, path] of ["/login", "/signup", "/verify-email", "/dmca"].entries()) {
+      if (index === 0) await page.goto(path);
+      else await navigateInApp(page, path);
       await expect(page.locator("main, [role=main]").first()).toBeVisible();
       const size = await overflow();
       expect(size.scroll, path).toBeLessThanOrEqual(size.client);

@@ -109,16 +109,16 @@ describe("csrf", () => {
     }
   });
 
-  it("lets the app origin through to the router (placeholder → 404, not 403)", async () => {
+  it("lets the app origin through to the router (the route's own 401, not 403)", async () => {
     const fake = fakeCore();
-    // No probe router here: the real registry, where /nodes is still an empty placeholder.
+    // No probe router here: the real registry, where the nodes router asks for a session first.
     const { response, ctx } = await call(appWith(fake), "/api/nodes/folder", {
       method: "POST",
       headers: { origin: TEST_APP_ORIGIN, "content-type": "application/json" },
       body: "{}",
     });
-    expect(response.status).toBe(404);
-    expect(await response.json()).toMatchObject({ error: "not_found" });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ error: "unauthorized" });
     await ctx.settle();
   });
 

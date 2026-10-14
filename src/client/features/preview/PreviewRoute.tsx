@@ -72,11 +72,16 @@ export function PreviewRoute() {
     [opener],
   );
 
+  // The file's folder on a cold link, as soon as the file is known — before the replace that
+  // records it in the entry has landed (that replace re-runs the frame's loader, which can take a
+  // while): Close pressed in between still goes to the folder.
+  const coldParent = useRef<string | null>(null);
   const onItem = useCallback(
     (item: LoadedItem) => {
       // A cold link has no page underneath: once the file is known, its folder becomes that page.
       if (from !== undefined || !item.node) return;
       const parent = item.node.parentId === null ? "/" : `/folder/${item.node.parentId}`;
+      coldParent.current = parent;
       void navigate(location.pathname + location.search, {
         replace: true,
         state: { siblingIds, from: parent, cold: true, account },
@@ -91,7 +96,7 @@ export function PreviewRoute() {
   const onClose = () => {
     // Opened from a page of the app: that page is the entry behind this one.
     if (from !== undefined && !cold && location.key !== "default") void navigate(-1);
-    else void navigate(from ?? "/", { replace: true });
+    else void navigate(from ?? coldParent.current ?? "/", { replace: true });
   };
 
   return (

@@ -23,6 +23,7 @@ import { purgeUserState } from "../../../../src/client/lib/query";
 import { renderShell, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import {
   AT,
+  EXPIRES,
   FOLDER_ID,
   initResponse,
   openUploadsResponse,
@@ -77,7 +78,7 @@ describe("the resume list", () => {
         body: server.inits[0],
         path: "",
         finalName: "video.mp4",
-        expiresAt: "2026-10-14T09:00:00.000Z",
+        expiresAt: EXPIRES,
       },
     ]);
     expect(rows[0]!.body.fileLastModified).toBe(new Date(MODIFIED).toISOString());

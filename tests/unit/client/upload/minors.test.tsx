@@ -20,6 +20,7 @@ import { purgeUserState } from "../../../../src/client/lib/query";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import {
   AT,
+  EXPIRES,
   FOLDER_ID,
   initResponse,
   openUploadsResponse,
@@ -151,7 +152,7 @@ describe("a row on the device has an end", () => {
     server.hold = true;
     await addFiles([{ file: smallFile("a.txt") }], null);
     await settle();
-    expect((await readResumeRows())[0]!.expiresAt).toBe("2026-10-14T09:00:00.000Z");
+    expect((await readResumeRows())[0]!.expiresAt).toBe(EXPIRES);
   });
 
   it("past its expiry it is deleted at load, on any page — never offered", async () => {

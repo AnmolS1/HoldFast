@@ -26,7 +26,9 @@ defaults:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Unit ~11 min + e2e ~18 min on the runner with Wave 2 merged (run 38545385784 hit 30 min
+    # inside e2e); 60 leaves room without letting a hung run sit for the 6-hour default.
+    timeout-minutes: 60
     # One run per branch or pull request; a newer push cancels the older one. Declared on the JOB,
     # not the workflow, so that when a deploy workflow calls this file a newer push can only ever
     # cancel this job — never a deploy that is already migrating or uploading. `github.workflow`
