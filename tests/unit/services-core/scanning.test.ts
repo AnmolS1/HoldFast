@@ -5,6 +5,8 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { todayTotals, totalsOn } from "../../../src/worker/db/queries/ledger";
+import { hasLiveScanJob } from "../../../src/worker/db/queries/nodes";
+import { SCAN_CLAIM_STALE_MINUTES } from "../../../src/worker/db/queries/scan-jobs";
 import {
   csamLocksWithoutReport,
   csamReportsToAnnounce,
@@ -894,6 +896,19 @@ describe("lockSuspectedCsam", () => {
         if (error !== ROLLBACK) throw error;
       });
   }
+  /**
+   * Is this report in `csamReportsToAnnounce`? Asked in a transaction that is rolled back, with
+   * the report dated before every other and a limit of one — so the answer does not depend on how
+   * many unannounced reports other tests and runs left in the shared database.
+   */
+  async function dueToAnnounce(reportId: string): Promise<boolean> {
+    let due = false;
+    await alone(async ({ db }) => {
+      await oldestFirst(db, [reportId]);
+      due = (await csamReportsToAnnounce(db, 1)).some((row) => row.reportId === reportId);
+    });
+    return due;
+  }
   /** Dates these reports before every other in the database, in the order given. */
   async function oldestFirst(db: Db, reportIds: string[]): Promise<void> {
     for (const [index, id] of reportIds.entries()) {
@@ -1157,7 +1172,7 @@ describe("lockSuspectedCsam", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
     expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "photodna", reportId } }]);
     expect(await sentRowsOf(file.id)).toEqual([]);
-    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+    expect(await dueToAnnounce(reportId)).toBe(true);
   });
 
   it("the marker is read and claimed on ONE day — the day this call computed, not the database's", async () => {
@@ -1372,7 +1387,7 @@ describe("lockSuspectedCsam", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
     expect(await lockRowsOf(file.id)).toMatchObject([{ meta: { source: "system", reportId } }]);
     expect(await sentRowsOf(file.id)).toEqual([]);
-    expect((await csamReportsToAnnounce(testDb(), 1000)).map((row) => row.reportId)).toContain(reportId);
+    expect(await dueToAnnounce(reportId)).toBe(true);
 
     // Once there is someone to tell, the very next call tells them.
     const fixed = serviceDeps();
@@ -1628,5 +1643,30 @@ describe("lockSuspectedCsam", () => {
       expect(error).toBeInstanceOf(AppError);
       expect((error as AppError).code).toBe("not_found");
     }
+  });
+});
+
+// Review m6: "a scan under way" is exactly the claim scan-jobs.claim will not take over — a
+// `running` row younger than SCAN_CLAIM_STALE_MINUTES. Pinned on both sides of the boundary.
+describe("hasLiveScanJob", () => {
+  it("a running claim just inside the stale time is live; just outside, or finished, it is not", async () => {
+    const owner = await makeUser();
+    const at = (seconds: number) => new Date(Date.now() - SCAN_CLAIM_STALE_MINUTES * 60_000 + seconds * 1000);
+    const cases: [string, Partial<typeof scanJobs.$inferInsert>, boolean][] = [
+      ["30 s inside", { status: "running", startedAt: at(30) }, true],
+      ["30 s outside", { status: "running", startedAt: at(-30) }, false],
+      ["done", { status: "done", startedAt: at(30), finishedAt: new Date() }, false],
+      ["failed", { status: "failed", startedAt: at(30), finishedAt: new Date() }, false],
+    ];
+    for (const [name, values, live] of cases) {
+      const file = await makeFile(owner.id, null, { scanStatus: "pending" });
+      await testDb()
+        .insert(scanJobs)
+        .values({ nodeId: file.id, r2Key: file.r2Key!, ...values });
+      expect(await hasLiveScanJob(testDb(), file.r2Key!), name).toBe(live);
+    }
+    // No row at all for the key.
+    const none = await makeFile(owner.id, null, { scanStatus: "pending" });
+    expect(await hasLiveScanJob(testDb(), none.r2Key!)).toBe(false);
   });
 });
