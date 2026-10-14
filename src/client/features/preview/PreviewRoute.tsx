@@ -1,5 +1,5 @@
 // `/preview/:nodeId` as a page: the dialog over whatever was open, with the signed-in source.
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
 import { getKnownUserId } from "../../lib/query";
 import { PreviewDialogView } from "./PreviewDialog";
@@ -48,9 +48,14 @@ export function PreviewRoute() {
 
   // What an opener wrote has no account yet: it is stamped with the one signed in now. Another
   // account's state is replaced, so its ids are not left in this entry either.
+  // ONCE per history entry: the replace re-runs the frame's loader, and until it lands every
+  // render still sees the unstamped entry — asking again would cancel the replace under way and
+  // start it over, for ever.
   const unstamped = stale || (written.account === undefined && account !== undefined);
+  const stampedKey = useRef<string | null>(null);
   useEffect(() => {
-    if (!unstamped) return;
+    if (!unstamped || stampedKey.current === location.key) return;
+    stampedKey.current = location.key;
     void navigate(location.pathname + location.search, { replace: true, state: { ...state, account } });
   });
 
