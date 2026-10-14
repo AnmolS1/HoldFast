@@ -14,6 +14,7 @@ import {
   pollDelay,
   useScanPolling,
 } from "../../../../src/client/features/explorer/scan-poll";
+import { renameNode } from "../../../../src/client/features/explorer/actions";
 import { ApiError } from "../../../../src/client/lib/api";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
@@ -419,5 +420,58 @@ describe("M8 — the watch counts only time the loop could ask", () => {
     await pass(30 * 60_000);
     expect(asked()).toBe(total);
     expect(view.result.current.has(PENDING.id)).toBe(true);
+  });
+});
+
+// Review round 4.
+describe("m28 — a file first listed during a pause starts its watch when the pause ends", () => {
+  it("A pending and covered; B listed 10 minutes into the pause; back in front 30 minutes later: B asked within 5 s", async () => {
+    const LATE = fileNode(2, { name: "later.pdf", scanStatus: "pending" });
+    const LATE_DETAIL = new RegExp(`/api/nodes/${LATE.id}$`);
+    const calls = serveDrive(new FakeDrive([PENDING, LATE]));
+    const handlers = { onSettled: vi.fn(), onGone: vi.fn() };
+    const view = renderHook(({ ids, active }) => useScanPolling(ids, handlers, active), {
+      initialProps: { ids: [PENDING.id], active: false },
+    });
+    await pass(10 * 60_000);
+    view.rerender({ ids: [PENDING.id, LATE.id], active: false });
+    await pass(30 * 60_000);
+    expect(calls.filter((call) => LATE_DETAIL.test(call.path))).toHaveLength(0);
+    view.rerender({ ids: [PENDING.id, LATE.id], active: true });
+    await pass(POLL_FAST_MS + 50);
+    expect(calls.filter((call) => LATE_DETAIL.test(call.path)).length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("m29 — a scan's answer never draws back a rename in flight", () => {
+  it("a pending file renamed (PATCH held), its scan ends: the row says clean under the NEW name; the announcement names it so", async () => {
+    const drive = new FakeDrive([PENDING]);
+    let release: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await mount(drive, async (call) => {
+      if (call.method === "PATCH" && call.path.endsWith(PENDING.id)) await held;
+      return undefined;
+    });
+    let renaming: Promise<boolean> = Promise.resolve(true);
+    await act(async () => {
+      renaming = renameNode(PENDING, "renamed.pdf");
+      await Promise.resolve();
+    });
+    await pass(1);
+    expect(rowOf(PENDING.id)!.textContent).toContain("renamed.pdf");
+    // The server has finished the scan (it still has the old name: the rename has not landed).
+    drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
+    await after(5_000);
+    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
+    expect(rowOf(PENDING.id)!.textContent).toContain("renamed.pdf");
+    expect(document.querySelector("[data-explorer-live]")!.textContent).toContain("renamed.pdf");
+    release();
+    await act(async () => {
+      await renaming;
+    });
+    expect(rowOf(PENDING.id)!.textContent).toContain("renamed.pdf");
   });
 });

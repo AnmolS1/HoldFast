@@ -102,7 +102,7 @@ import {
   useListingChanged,
   useSort,
 } from "./queries";
-import { useScanPolling } from "./scan-poll";
+import { useScanPolling, withScanOf } from "./scan-poll";
 import { EMPTY_SELECTION, explorerSelectionReducer, idsInRect, rectOf, type Rect } from "./selection";
 import { t } from "./strings";
 import { Toolbar } from "./Toolbar";
@@ -545,13 +545,15 @@ function Explorer({ folderId }: { folderId: string | null }) {
     pendingIds,
     {
       onSettled: (node) => {
-        patchInListings(queryClient, folderId, node.id, () => node);
-        // A scan that ended is said once: ready, or what the row now says.
+        patchInListings(queryClient, folderId, node.id, (current) => withScanOf(current, node));
+        // A scan that ended is said once: ready, or what the row now says — by the name the row
+        // shows (a rename may be on its way).
+        const name = nodes.find((item) => item.id === node.id)?.name ?? node.name;
         const sentence = statusSentence(node.scanStatus, node.scanReason);
         announce(
           sentence === null
-            ? t("explorer.done.scanned", { name: node.name })
-            : t("explorer.done.scanEnded", { name: node.name, status: sentence }),
+            ? t("explorer.done.scanned", { name })
+            : t("explorer.done.scanEnded", { name, status: sentence }),
         );
       },
       onGone: (id) => void removeFromListings(queryClient, folderId, [id]),

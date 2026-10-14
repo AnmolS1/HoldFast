@@ -48,6 +48,24 @@ export function penaltyAfter(cause: unknown, failures: number): number {
   return Math.min(POLL_BACKOFF_MAX_MS, POLL_FAST_MS * 2 ** Math.max(0, failures - 1));
 }
 
+/**
+ * What a scan decides about a row — and nothing else: an answer of the poll is merged into the row
+ * the list holds by these fields only, so it never draws back a name (or a star) that an edit in
+ * flight has written there.
+ */
+export function withScanOf(current: NodeDto, answer: NodeDto): NodeDto {
+  return {
+    ...current,
+    scanStatus: answer.scanStatus,
+    scanReason: answer.scanReason,
+    sha256: answer.sha256,
+    thumb: answer.thumb,
+    mimeSniffed: answer.mimeSniffed,
+    mimeCategory: answer.mimeCategory,
+    pua: answer.pua,
+  };
+}
+
 export interface ScanPollHandlers {
   /** The scan ended: the node as it is now. */
   onSettled(node: NodeDto): void;
