@@ -547,7 +547,7 @@ describe("reconcile: the orphan sweep", () => {
       await env.FILES.delete(p.odd);
     });
 
-    it("an object store that cannot be read proves nothing: `unknown` — the quota half runs, nothing is swept or counted, no alert", async () => {
+    it("an object store that cannot be read proves nothing: `unknown` — the quota half runs, nothing is swept or counted, no ROLLBACK alert (its own mail instead)", async () => {
       const owner = await consistent();
       await setUsedBytes(owner.id, 3);
       await generations(2, 2, { user: justBefore(owner.id) });
@@ -566,7 +566,8 @@ describe("reconcile: the orphan sweep", () => {
       expect(await usedBytes(owner.id)).toBe(1200);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([2, "2"]);
       expect(alerts()).toHaveLength(0);
-      expect(mails()).toEqual([]);
+      // Not a rollback — the detector's own state (S14): one mail of its kind.
+      expect(mails()).toEqual([[ADMIN_EMAIL, "detector_unreadable"]]);
     });
 
     describe("the restore heartbeat (hourly)", () => {
@@ -847,10 +848,10 @@ describe("reconcile: the orphan sweep", () => {
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([9, "9"]);
     });
 
-    it("S14: a detector that cannot read is not silent — alerted on the transition, then at most every 6 hours, recorded at every reading; read again, the next failure alerts at once; a database that cannot be read leaves the report", async () => {
+    it("S14: a detector that cannot read is not silent — the operators mailed (detector_unreadable) on the transition, then at most every 6 hours, recorded at every reading; read again, the next failure alerts at once; a database that cannot be read leaves the report", async () => {
+      /** The critical mails of this state so far. */
       const unreadableAlerts = () =>
-        vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "detector_unreadable")
-          .length;
+        mails().filter(([to, event]) => to === ADMIN_EMAIL && event === "detector_unreadable").length;
       const rows = async () => (await audits("system.detector_unreadable", "reconcile")).length;
       const lastAlertAt = async (hoursAgo: number) => {
         const stored = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<

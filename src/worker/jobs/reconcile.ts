@@ -189,7 +189,7 @@ function mailDue(last: string | null): boolean {
  *   audit row) and MAILED on the transition into it, then at most every 6 hours while it lasts.
  *   What cannot be read is `unknown` — every destroyer stops — and is NOT silent either: recorded
  *   at every reading (`detector_error`, the report, a `system.detector_unreadable` row) and
- *   alerted on the transition, then at most every 6 hours (`alertUnreadable`). Its mail time is
+ *   mailed (`detector_unreadable`) on the transition, then at most every 6 hours. Its mail time is
  *   kept in the database: when the DATABASE is what cannot be read, only the report is left.
  */
 export async function detectRollback(bg: BackgroundContext): Promise<Detection> {
@@ -221,7 +221,7 @@ export async function detectRollback(bg: BackgroundContext): Promise<Detection> 
   }
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
   await recordRollback(bg, object, raw);
-  if (mailDue(fields.rollbackMailedAt) && (await mailRollback(bg))) {
+  if (mailDue(fields.rollbackMailedAt) && (await mailOperators(bg, "database_rollback"))) {
     await markDetectorMailed(bg.db, "rollbackMailedAt", new Date());
   }
   return { state: "rollback" };
@@ -318,15 +318,18 @@ async function recordRollback(
 }
 
 /**
- * The critical mail to every operator, sent at once (never counted or coalesced). ONE call
- * site. Awaited: nothing a job starts may outlive it. True when at least one was handed over;
- * when none was, the next reading mails again.
+ * The critical mail to every operator, sent at once (never counted or coalesced) — the one call
+ * site for both of the detector's states. Awaited: nothing a job starts may outlive it. True
+ * when at least one was handed over; when none was, the next reading mails again.
  */
-async function mailRollback(bg: BackgroundContext): Promise<boolean> {
+async function mailOperators(
+  bg: BackgroundContext,
+  event: "database_rollback" | "detector_unreadable",
+): Promise<boolean> {
   const operators = [...adminListOf(bg.env).addresses];
   const sent = await Promise.all(
     operators.map((to) =>
-      sendOperatorCritical(bg, { to, event: "database_rollback" }).then(
+      sendOperatorCritical(bg, { to, event }).then(
         () => true,
         (error: unknown) => {
           captureError(error, { kind: "job", job: "reconcile" });
@@ -359,28 +362,13 @@ async function recordUnreadable(
   } catch (failure) {
     captureError(failure, { kind: "job", job: "reconcile" });
   }
-  if (mailDue(fields.unknownMailedAt) && alertUnreadable()) {
+  if (mailDue(fields.unknownMailedAt) && (await mailOperators(bg, "detector_unreadable"))) {
     try {
       await markDetectorMailed(bg.db, "unknownMailedAt", new Date());
     } catch (failure) {
       captureError(failure, { kind: "job", job: "reconcile" });
     }
   }
-}
-
-/**
- * The operators' alert for a detector that cannot read. ONE call site. INTERIM until the
- * operator event kind exists in services/email.ts (QUESTION, fix pass 4): a report of its own,
- * at the mail's cadence; it becomes `sendOperatorCritical` to every operator, as `mailRollback`.
- * True when it was handed over.
- */
-function alertUnreadable(): boolean {
-  captureError(new Error("reconcile: the rollback detector cannot read; every destructive job is stopped"), {
-    kind: "job",
-    job: "reconcile",
-    reason: "detector_unreadable",
-  });
-  return true;
 }
 
 // ── quota ───────────────────────────────────────────────────────────────────────────────────
