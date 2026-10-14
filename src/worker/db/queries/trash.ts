@@ -356,8 +356,9 @@ const emptyDeleted = (ownerId: string | null): DeletedRows => ({
  * Before both it takes the owner's tree lock, so the folders above the root — whose holds reach
  * down — cannot change meanwhile and the root cannot be moved. Upload sessions
  * that point into the subtree are deleted too, finished ones included (their `parent_id`
- * reference would block the delete) — except one a hold protects (a held uploader's), which is
- * kept, detached from the folder; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
+ * reference would block the delete) — except one a hold protects (a held uploader's) and any
+ * `completing` one (a request is working on its object), which are kept, detached from the
+ * folder — a `completing` one's object is never in `uploadsToAbort`; shares, links, old versions and scan jobs go with their node. Throws `LegalHoldError` and deletes nothing when the root is held.
  */
 export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<DeletedRows> {
   if (!isUuid(rootId)) return emptyDeleted(null);
@@ -419,9 +420,15 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
     // UPLOADER's (the gate has already refused a held owner or a protected node of the subtree)
     // — is a record that must outlive the folder: it is KEPT, detached from the folder that is
     // going (`parent_id` null; `replace_node_id` is nulled by its foreign key), and if it was
-    // unfinished it is ended as `aborted`. Every other one is deleted, as before. An unfinished
-    // session is aborted in storage and its reservation given back either way: there is nowhere
-    // left for it to complete into.
+    // `open` it is ended as `aborted`. Every other one is deleted, as before. An `open` session
+    // is aborted in storage and its reservation given back either way: there is nowhere left
+    // for it to complete into.
+    // A `completing` session — ANY, held or not — is a request working on its object right now
+    // (hashing it; for a declared blocklist hit it will PRESERVE that object as a locked node):
+    // it is KEPT and detached like a held one, left `completing`, its object NOT aborted and its
+    // reservation NOT given back here. The request that holds it ends it (its give-up path
+    // aborts the object and releases the reservation when there is nowhere to complete into),
+    // or, if that request died, the stale-upload job does (`uploads.expired`).
     const sessions = await sp
       .select({
         id: uploads.id,
@@ -437,16 +444,17 @@ export async function deleteSubtreeRows(tx: Executor, rootId: string): Promise<D
       .where(or(inArray(uploads.parentId, ids), inArray(uploads.replaceNodeId, ids)))
       .orderBy(uploads.id)
       .for("update");
-    const unfinished = (s: { status: string }) => s.status === "open" || s.status === "completing";
+    const isOpen = (s: { status: string }) => s.status === "open";
+    const completing = (s: { status: string }) => s.status === "completing";
     for (const session of sessions) {
-      if (!unfinished(session)) continue;
+      if (!isOpen(session)) continue;
       out.uploadsToAbort.push({ r2Key: session.r2Key, r2UploadId: session.r2UploadId });
       if (session.purpose === "file") out.freedBytes += session.size;
     }
-    const kept = sessions.filter((s) => s.kept === true);
-    const gone = sessions.filter((s) => s.kept !== true).map((s) => s.id);
+    const kept = sessions.filter((s) => s.kept === true || completing(s));
+    const gone = sessions.filter((s) => s.kept !== true && !completing(s)).map((s) => s.id);
     if (kept.length > 0) {
-      const ended = kept.filter(unfinished).map((s) => s.id);
+      const ended = kept.filter(isOpen).map((s) => s.id);
       if (ended.length > 0) {
         await sp
           .update(uploads)
