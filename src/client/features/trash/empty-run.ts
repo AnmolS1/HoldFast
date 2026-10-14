@@ -6,7 +6,14 @@ import { useSyncExternalStore } from "react";
 import { toast } from "../../components/Toaster";
 import { api } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger, SessionShape } from "../../lib/contracts";
-import { accountEpoch, getKnownUserId, queryClient, refreshSession, sameAccount } from "../../lib/query";
+import {
+  accountEpoch,
+  adoptIdentity,
+  getKnownUserId,
+  queryClient,
+  sameAccount,
+  sessionQuery,
+} from "../../lib/query";
 import { refreshQueries, viewKeys, VIEWS_KEY } from "../starred/view-queries";
 import { retryNotBefore } from "../starred/view-state";
 import { holdUntil, waitKey } from "../starred/waits";
@@ -103,9 +110,11 @@ export function startEmptyTrash(): void {
     const session = await api("/api/auth/get-session", { schema: SessionShape });
     const now = session?.user.id ?? null;
     if (now !== null && now !== owner) {
-      // The cookie names somebody else: this tab is handed to them (the shell adopts the session
-      // and purges A's state, the frame starts again as B) — and A's run ends with it, unseen.
-      await refreshSession().catch(() => undefined);
+      // The cookie names somebody else: this tab is handed to them — with the session already in
+      // hand, as the shell's own read does it: A's state is purged first, then B's session is the
+      // cached one and the frame starts again as B. A's run ends with it, unseen.
+      await adoptIdentity(session);
+      queryClient.setQueryData(sessionQuery.queryKey, session);
       throw new NotThisAccount();
     }
     if (!sameAccount(account) || getKnownUserId() !== owner) throw new NotThisAccount();
