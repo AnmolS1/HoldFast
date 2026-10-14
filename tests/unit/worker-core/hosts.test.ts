@@ -128,6 +128,8 @@ describe("files host", () => {
     const plain = await filesCall("/");
     expect(headersOf(plain.response)).toEqual({
       "access-control-allow-origin": "http://localhost",
+      "access-control-expose-headers":
+        "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning, Retry-After",
       "cache-control": "private, no-store",
       "content-security-policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
       "content-type": "text/plain; charset=utf-8",
@@ -144,6 +146,8 @@ describe("files host", () => {
     const secure = await filesCall("/", { origin: HTTPS.FILES_ORIGIN, env: HTTPS });
     expect(headersOf(secure.response)).toEqual({
       "access-control-allow-origin": "https://app.example.test",
+      "access-control-expose-headers":
+        "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning, Retry-After",
       "cache-control": "private, no-store",
       "content-security-policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
       "content-type": "text/plain; charset=utf-8",
@@ -210,6 +214,9 @@ describe("files host", () => {
     expect(response.status).toBe(429);
     expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(response.headers.get("retry-after")).toBe("60");
+    // The app reads it across origins.
+    expect(response.headers.get("access-control-expose-headers")?.split(", ")).toContain("Retry-After");
+    expect(response.headers.get("access-control-allow-origin")).toBe(TEST_APP_ORIGIN);
     expect(seen).toEqual(["ip:203.0.113.9"]);
     expect(await response.text()).not.toContain("{");
   });
