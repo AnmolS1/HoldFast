@@ -19,7 +19,15 @@ import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel"
 import { adoptIdentity, purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import { OTHER_USER_ID, usageDto } from "./fixtures";
-import { freshUploader, installServer, json, settle, smallFile, type Server } from "./helpers";
+import {
+  authSessionStoreMounted,
+  freshUploader,
+  installServer,
+  json,
+  settle,
+  smallFile,
+  type Server,
+} from "./helpers";
 
 setupShell();
 
@@ -251,5 +259,19 @@ describe("the mark of the user's action", () => {
     expect(items()).toEqual([]);
     expect(server.inits).toEqual([]);
     expect(said()).toEqual([]);
+  });
+});
+
+// The two tests below run in this order (a file's tests run in sequence). A purge mounts the auth
+// library's own session store, which unmounts itself a second later from a timer that touches
+// `document`: after the file's last test that ran once jsdom was gone and failed the whole run.
+describe("nothing a test started outlives it", () => {
+  it("a purge leaves the auth library's session store mounted for now", async () => {
+    await purgeUserState();
+    expect(authSessionStoreMounted()).toBe(true);
+  });
+
+  it("the next test finds it unmounted: the shared clean-up did it while the document was there", () => {
+    expect(authSessionStoreMounted()).toBe(false);
   });
 });

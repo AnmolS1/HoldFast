@@ -35,9 +35,51 @@ export type ResumeRow = z.infer<typeof ResumeRow>;
 let store: UseStore | undefined;
 const resumeStore = (): UseStore => (store ??= createStore("holdfast-uploads", "resume"));
 
+interface Backend {
+  set(key: string, value: ResumeRow): Promise<void>;
+  del(key: IDBValidKey): Promise<void>;
+  entries(): Promise<Array<[IDBValidKey, unknown]>>;
+  clear(): Promise<void>;
+}
+
+const onDevice: Backend = {
+  set: (key, value) => set(key, value, resumeStore()),
+  del: (key) => del(key, resumeStore()),
+  entries: () => entries(resumeStore()),
+  clear: () => clear(resumeStore()),
+};
+let backend: Backend = onDevice;
+
+/**
+ * Tests only: the list in memory instead of on the device, for tests of hundreds of files (each
+ * row in the stand-in database costs a real wait, and those tests are not about the list). Back
+ * on the device with `false`.
+ */
+export function keepResumeListInMemoryForTests(inMemory: boolean): void {
+  if (!inMemory) {
+    backend = onDevice;
+    return;
+  }
+  const rows = new Map<IDBValidKey, unknown>();
+  backend = {
+    set: async (key, value) => void rows.set(key, value),
+    del: async (key) => void rows.delete(key),
+    entries: async () => Array.from(rows.entries()),
+    clear: async () => rows.clear(),
+  };
+}
+
 // One operation at a time, in the order they were asked for: a delete never overtakes the write
 // before it.
 let chain: Promise<unknown> = Promise.resolve();
+
+/** Tests only: every operation asked for so far has finished. */
+export async function resumeListSettledForTests(): Promise<void> {
+  for (let seen = chain; ; seen = chain) {
+    await seen;
+    if (seen === chain) return;
+  }
+}
 
 function inOrder<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
   const next = chain.then(async () => {
@@ -52,11 +94,11 @@ function inOrder<T>(operation: () => Promise<T>, fallback: T): Promise<T> {
 }
 
 export function saveResumeRow(row: ResumeRow): Promise<void> {
-  return inOrder(() => set(row.id, row, resumeStore()), undefined);
+  return inOrder(() => backend.set(row.id, row), undefined);
 }
 
 export function dropResumeRow(id: string): Promise<void> {
-  return inOrder(() => del(id, resumeStore()), undefined);
+  return inOrder(() => backend.del(id), undefined);
 }
 
 export function isExpired(expiresAt: string | null, now: number = Date.now()): boolean {
@@ -70,15 +112,15 @@ export function isExpired(expiresAt: string | null, now: number = Date.now()): b
 export function readResumeRows(): Promise<ResumeRow[]> {
   return inOrder(async () => {
     const rows: ResumeRow[] = [];
-    for (const [key, value] of await entries(resumeStore())) {
+    for (const [key, value] of await backend.entries()) {
       const parsed = ResumeRow.safeParse(value);
       if (parsed.success && !isExpired(parsed.data.expiresAt)) rows.push(parsed.data);
-      else await del(key, resumeStore());
+      else await backend.del(key);
     }
     return rows;
   }, []);
 }
 
 export function clearResumeRows(): Promise<void> {
-  return inOrder(() => clear(resumeStore()), undefined);
+  return inOrder(() => backend.clear(), undefined);
 }

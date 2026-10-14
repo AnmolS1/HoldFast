@@ -44,32 +44,81 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
+  // One pass over the queue (it can hold 10,000 rows and this runs on every change of it).
   // The batch: every file that is or was on its way. A restored row has no file yet; an empty
   // folder of a folder upload is a row of the panel but not a file of the count.
-  const batch = items.filter(
-    (item) => item.kind === "file" && !isRestored(item) && item.state !== "cancelled",
-  );
-  const total = batch.length;
-  const bytes = batch.reduce((sum, item) => sum + item.size, 0);
-  const sent = batch.reduce((sum, item) => sum + Math.min(item.size, item.sentBytes), 0);
-  const arrived = batch.filter(
-    (item) =>
-      item.state === "scanning" ||
-      item.state === "done" ||
-      item.state === "error" ||
-      item.state === "refused",
-  ).length;
+  let total = 0;
+  let bytes = 0;
+  let sent = 0;
+  let arrived = 0;
+  let sending = 0;
+  let allHashing = true;
+  let speed = 0;
+  let folders = 0;
+  let conflict: UploadItem | null = null;
+  const paused = { files: 0, folders: 0 };
+  // The first paused row whose reason is not the user's, per kind: its reason is the queue's.
+  const reasons: { files?: PauseReason | null; folders?: PauseReason | null } = {};
+  let scanning = 0;
+  let waiting = 0;
+  let unconfirmed = 0;
+  let failed = 0;
+  let stillChecking = 0;
+  let refused = 0;
+  let blocked = 0;
+  let unscanned = 0;
+  for (const item of items) {
+    const restored = isRestored(item);
+    if (item.kind === "file" && !restored && item.state !== "cancelled") {
+      total += 1;
+      bytes += item.size;
+      sent += Math.min(item.size, item.sentBytes);
+      if (
+        item.state === "scanning" ||
+        item.state === "done" ||
+        item.state === "error" ||
+        item.state === "refused"
+      ) {
+        arrived += 1;
+      }
+      if (isSending(item)) {
+        sending += 1;
+        speed += item.speed;
+        if (item.state !== "hashing") allHashing = false;
+      }
+      if (item.state === "paused") {
+        paused.files += 1;
+        if (!("files" in reasons) && item.pauseReason !== "user") reasons.files = item.pauseReason;
+      }
+    }
+    if (item.kind === "folder") {
+      if (isSending(item)) folders += 1;
+      if (item.state === "paused") {
+        paused.folders += 1;
+        if (!("folders" in reasons) && item.pauseReason !== "user") reasons.folders = item.pauseReason;
+      }
+    }
+    if (conflict === null && item.state === "conflict") conflict = item;
+    if (item.state === "scanning") scanning += 1;
+    if (restored && item.state === "paused") waiting += 1;
+    if (item.state === "error") {
+      if (item.unconfirmed) unconfirmed += 1;
+      else failed += 1;
+    }
+    if (item.state === "done" && item.scanStatus === "pending") stillChecking += 1;
+    if (item.state === "refused") refused += 1;
+    if (isBlocked(item)) blocked += 1;
+    if (isUnscanned(item)) unscanned += 1;
+  }
   // Counting each file as one extra unit keeps empty files, and a batch of them, moving the line.
   const progress = total === 0 ? 0 : (sent + arrived) / (bytes + total);
   const n = Math.min(total, arrived + 1);
   const left = formatBytes(Math.max(0, bytes - sent));
 
-  const sending = batch.filter(isSending);
-  if (sending.length > 0) {
-    if (sending.every((item) => item.state === "hashing")) {
+  if (sending > 0) {
+    if (allHashing) {
       return { progress, sentence: t("ribbon.verifying", { n, total }), status: "active" };
     }
-    const speed = sending.reduce((sum, item) => sum + item.speed, 0);
     const sentence =
       speed > 0
         ? t("ribbon.uploadingEta", { n, total, left, eta: formatEta((bytes - sent) / speed) })
@@ -77,7 +126,6 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     return { progress, sentence, status: "active" };
   }
 
-  const folders = items.filter((item) => item.kind === "folder" && isSending(item)).length;
   if (folders > 0) {
     return {
       progress,
@@ -86,30 +134,26 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  const conflict = items.find((item) => item.state === "conflict");
   if (conflict) {
     return { progress, sentence: t("ribbon.conflict", { name: conflict.name }), status: "paused" };
   }
 
-  const paused = batch.filter((item) => item.state === "paused");
-  if (paused.length > 0) {
-    const reason = paused.find((item) => item.pauseReason !== "user")?.pauseReason;
+  if (paused.files > 0) {
+    const reason = reasons.files;
     const sentence =
       reason && reason !== "user" ? t(PAUSE_SENTENCE[reason]) : t("ribbon.paused", { n, total, left });
     return { progress, sentence, status: "paused" };
   }
   // A drop of empty folders only, paused: still the ribbon's (and with it the panel's Resume all).
-  const pausedFolders = items.filter((item) => item.kind === "folder" && item.state === "paused");
-  if (pausedFolders.length > 0) {
-    const reason = pausedFolders.find((item) => item.pauseReason !== "user")?.pauseReason;
+  if (paused.folders > 0) {
+    const reason = reasons.folders;
     const sentence =
       reason && reason !== "user"
         ? t(PAUSE_SENTENCE[reason])
-        : counted("ribbon.folders.paused.one", "ribbon.folders.paused.other", pausedFolders.length);
+        : counted("ribbon.folders.paused.one", "ribbon.folders.paused.other", paused.folders);
     return { progress, sentence, status: "paused" };
   }
 
-  const scanning = items.filter((item) => item.state === "scanning").length;
   if (scanning > 0) {
     return {
       progress: 1,
@@ -118,7 +162,6 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  const waiting = items.filter((item) => isRestored(item) && item.state === "paused").length;
   if (waiting > 0) {
     return {
       progress: 0,
@@ -127,12 +170,6 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  const unconfirmed = items.filter((item) => item.state === "error" && item.unconfirmed).length;
-  const failed = items.filter((item) => item.state === "error" && !item.unconfirmed).length;
-  const stillChecking = items.filter((item) => item.state === "done" && item.scanStatus === "pending").length;
-  const refused = items.filter((item) => item.state === "refused").length;
-  const blocked = items.filter(isBlocked).length;
-  const unscanned = items.filter(isUnscanned).length;
   if (failed > 0) {
     return {
       progress: 1,
