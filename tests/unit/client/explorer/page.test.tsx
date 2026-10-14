@@ -1077,11 +1077,20 @@ describe("underneath a preview the page is not the page in front", () => {
     expect(selectedIds()).toEqual([NOTES.id]);
     expect(findCommand(COMMAND_IDS.trash)?.disabled).toBe(false);
 
+    // A navigation loop (the preview route re-stamping its entry) is cut off after 20 navigations,
+    // so it fails here by name instead of hanging the worker.
+    const navigations: string[] = [];
+    const stopCounting = router.subscribe((next) => {
+      if (next.navigation.state === "loading") navigations.push(next.navigation.location?.pathname ?? "");
+      if (navigations.length > 20) router.dispose();
+    });
     // Opened by the explorer itself (a double-click on the row): its own state — siblings and
     // `from`, no account — which the preview route stamps once.
     fireEvent.doubleClick(rowOf(NOTES.id)!);
 
     await waitFor(() => expect(document.querySelector("[data-overlay]")).not.toBeNull());
+    expect(navigations.length, "navigations while opening the preview").toBeLessThanOrEqual(3);
+    stopCounting();
     // Still mounted, selection and all — but inert, and with nothing registered to act on it.
     expect(document.querySelector('[data-background="kept"] [data-explorer]')).not.toBeNull();
     expect(selectedIds()).toEqual([NOTES.id]);
