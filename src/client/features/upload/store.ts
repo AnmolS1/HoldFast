@@ -131,20 +131,38 @@ let announcementId = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
 
+/** A change readers must see at once is waiting for the end of the current task's work. */
+let loud = false;
+/** The snapshot was renewed and the listeners have not been told yet. */
+let untold = false;
+
+function renew(): void {
+  if (!dirty) return;
+  dirty = false;
+  untold = true;
+  published = { items: currentItems(), announcements, finished };
+}
+
 function flush(): void {
   clearTimeout(timer);
   timer = undefined;
-  if (!dirty) return;
-  dirty = false;
-  published = { items: currentItems(), announcements, finished };
+  loud = false;
+  renew();
+  if (!untold) return;
+  untold = false;
   for (const listener of Array.from(listeners)) listener();
 }
 
 /** `quiet` changes (progress samples) are coalesced; everything else is published at once. */
 function touch(quiet: boolean): void {
   dirty = true;
-  if (!quiet) flush();
-  else timer ??= setTimeout(flush, PROGRESS_FLUSH_MS);
+  if (quiet) timer ??= setTimeout(flush, PROGRESS_FLUSH_MS);
+  else if (!loud) {
+    // One publication for a burst of changes (a run's steps, a pump starting three files):
+    // the listeners are told once, at the end of it. A reader in between still sees every change.
+    loud = true;
+    queueMicrotask(flush);
+  }
 }
 
 /** The queue as the manager sees it — ahead of `getUploads()` by at most one progress flush. */
@@ -196,6 +214,7 @@ export function resetStore(): void {
 }
 
 export function getUploads(): UploadSnapshot {
+  if (loud) renew();
   return published;
 }
 
