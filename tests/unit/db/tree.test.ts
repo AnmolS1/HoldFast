@@ -16,6 +16,7 @@ import {
   ownedRoots,
   subtree,
 } from "../../../src/worker/db/queries/tree";
+import { searchNames } from "../../../src/worker/db/queries/search";
 import { userState } from "../../../src/worker/db/queries/users";
 import { type Node, nodes, shares, user } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeShare, makeUser, openDb, rand } from "./_helpers";
@@ -360,22 +361,20 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, viewer, f.alpha.id)).toBeNull();
   });
 
-  it("takes the highest role over the chain, the nearest grant as share root, and the editor share's upload toggle", async () => {
+  it("takes the highest role over the chain, the share that grants it as share root, and the editor share's upload toggle", async () => {
     const f = await fixture();
     const grantee = await makeUser(db);
     await makeShare(db, f.root.id, f.owner, { userId: grantee }, { role: "editor", canUpload: false });
     await makeShare(db, f.b.id, f.owner, { userId: grantee }, { role: "viewer" });
-    // Below `b`: the viewer share is nearer, the editor share higher.
-    expect(await effectiveAccess(db, grantee, f.deep.id)).toEqual({
-      role: "editor",
-      shareRootId: f.b.id,
-      canUpload: false,
-    });
-    expect(await effectiveAccess(db, grantee, f.zeta.id)).toEqual({
-      role: "editor",
-      shareRootId: f.root.id,
-      canUpload: false,
-    });
+    // Below `b`: the viewer share is nearer, the editor share higher — and it is the editor
+    // share's folder the role comes from. `b` itself lies INSIDE it: not the grantee's share root.
+    for (const node of [f.deep, f.b, f.zeta, f.root]) {
+      expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
+        role: "editor",
+        shareRootId: f.root.id,
+        canUpload: false,
+      });
+    }
 
     const uploader = await makeUser(db);
     await makeShare(db, f.a.id, f.owner, { userId: uploader }, { role: "editor", canUpload: true });
@@ -384,6 +383,135 @@ describe("effectiveAccess", () => {
       shareRootId: f.a.id,
       canUpload: true,
     });
+  });
+
+  it("an inner share that grants MORE is the share root from there down; above it the outer one is", async () => {
+    const f = await fixture();
+    const grantee = await makeUser(db);
+    await makeShare(db, f.root.id, f.owner, { userId: grantee }, { role: "viewer" });
+    await makeShare(db, f.b.id, f.owner, { userId: grantee }, { role: "editor", canUpload: true });
+    for (const node of [f.b, f.deep]) {
+      expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
+        role: "editor",
+        shareRootId: f.b.id,
+        canUpload: true,
+      });
+    }
+    for (const node of [f.root, f.a, f.zeta, f.alpha]) {
+      expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
+        role: "viewer",
+        shareRootId: f.root.id,
+        canUpload: false,
+      });
+    }
+  });
+
+  it("several shares of the granting role: the OUTERMOST is the share root; uploads when any of them allows", async () => {
+    const f = await fixture();
+    // Editor twice, the toggle on the inner share only.
+    const inner = await makeUser(db);
+    await makeShare(db, f.root.id, f.owner, { userId: inner }, { role: "editor", canUpload: false });
+    await makeShare(db, f.b.id, f.owner, { userId: inner }, { role: "editor", canUpload: true });
+    expect(await effectiveAccess(db, inner, f.deep.id)).toEqual({
+      role: "editor",
+      shareRootId: f.root.id,
+      canUpload: true,
+    });
+    // Outside the inner share its toggle says nothing.
+    expect(await effectiveAccess(db, inner, f.zeta.id)).toEqual({
+      role: "editor",
+      shareRootId: f.root.id,
+      canUpload: false,
+    });
+    // The toggle on the outer share only: it holds for everything under it.
+    const outer = await makeUser(db);
+    await makeShare(db, f.root.id, f.owner, { userId: outer }, { role: "editor", canUpload: true });
+    await makeShare(db, f.b.id, f.owner, { userId: outer }, { role: "editor", canUpload: false });
+    expect(await effectiveAccess(db, outer, f.deep.id)).toEqual({
+      role: "editor",
+      shareRootId: f.root.id,
+      canUpload: true,
+    });
+    // Viewer twice: the outermost; a viewer share's toggle is never an upload right.
+    const viewer = await makeUser(db);
+    await makeShare(db, f.a.id, f.owner, { userId: viewer }, { role: "viewer", canUpload: true });
+    await makeShare(db, f.b.id, f.owner, { userId: viewer }, { role: "viewer" });
+    expect(await effectiveAccess(db, viewer, f.deep.id)).toEqual({
+      role: "viewer",
+      shareRootId: f.a.id,
+      canUpload: false,
+    });
+    // A viewer share that carries the toggle does not lend it to an editor share that does not.
+    const mixed = await makeUser(db);
+    await makeShare(db, f.root.id, f.owner, { userId: mixed }, { role: "viewer", canUpload: true });
+    await makeShare(db, f.b.id, f.owner, { userId: mixed }, { role: "editor", canUpload: false });
+    expect(await effectiveAccess(db, mixed, f.deep.id)).toEqual({
+      role: "editor",
+      shareRootId: f.b.id,
+      canUpload: false,
+    });
+    // A share that is not activated is no share: it is neither the root nor a toggle.
+    const pending = await makeUser(db);
+    const outerShare = await makeShare(
+      db,
+      f.root.id,
+      f.owner,
+      { userId: pending },
+      { role: "editor", canUpload: true },
+    );
+    await makeShare(db, f.b.id, f.owner, { userId: pending }, { role: "editor", canUpload: false });
+    await db.update(shares).set({ activatedAt: null }).where(eq(shares.id, outerShare.id));
+    expect(await effectiveAccess(db, pending, f.deep.id)).toEqual({
+      role: "editor",
+      shareRootId: f.b.id,
+      canUpload: false,
+    });
+    expect(await effectiveAccess(db, pending, f.zeta.id)).toBeNull();
+  });
+
+  it("agrees with the search's role on one fixture: every shared hit carries effectiveAccess's role", async () => {
+    const owner = await makeUser(db);
+    const token = `agree${rand()}`;
+    const top = await makeFolder(db, owner, null, `${token}-top`);
+    const mid = await makeFolder(db, owner, top.id, `${token}-mid`);
+    const low = await makeFolder(db, owner, mid.id, `${token}-low`);
+    const beside = await makeFolder(db, owner, top.id, `${token}-beside`);
+    const files = [
+      await makeFile(db, owner, top.id, `${token}-in-top.txt`, { scanStatus: "clean" }),
+      await makeFile(db, owner, mid.id, `${token}-in-mid.txt`, { scanStatus: "clean" }),
+      await makeFile(db, owner, low.id, `${token}-in-low.txt`, { scanStatus: "clean" }),
+      await makeFile(db, owner, beside.id, `${token}-in-beside.txt`, { scanStatus: "clean" }),
+    ];
+    // Outer editor with an inner viewer share; outer viewer with an inner editor share; both ways twice.
+    const shapes: [("viewer" | "editor")?, ("viewer" | "editor")?, ("viewer" | "editor")?][] = [
+      ["editor", "viewer", undefined],
+      ["viewer", "editor", undefined],
+      ["viewer", undefined, "editor"],
+      ["editor", "viewer", "editor"],
+      ["viewer", "editor", "viewer"],
+      [undefined, "viewer", "editor"],
+    ];
+    for (const [onTop, onMid, onLow] of shapes) {
+      const grantee = await makeUser(db);
+      if (onTop) await makeShare(db, top.id, owner, { userId: grantee }, { role: onTop });
+      if (onMid) await makeShare(db, mid.id, owner, { userId: grantee }, { role: onMid });
+      if (onLow) await makeShare(db, low.id, owner, { userId: grantee }, { role: onLow });
+      const found = await searchNames(db, grantee, token, {
+        scope: "shared",
+        visibleStatuses: ["clean"],
+        limit: 50,
+      });
+      const bySearch = new Map(found.items.map((hit) => [hit.node.id, hit.role]));
+      let reached = 0;
+      for (const node of [top, mid, low, beside, ...files]) {
+        const access = await effectiveAccess(db, grantee, node.id);
+        expect(bySearch.get(node.id) ?? null, `${[onTop, onMid, onLow]} ${node.name}`).toBe(
+          access?.role ?? null,
+        );
+        if (access) reached += 1;
+      }
+      expect(reached, `${[onTop, onMid, onLow]}`).toBeGreaterThanOrEqual(2);
+    }
   });
 
   it("a pending share grants nothing — by address, or with a user id but no activation", async () => {

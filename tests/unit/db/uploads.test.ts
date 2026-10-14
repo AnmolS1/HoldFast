@@ -7,6 +7,7 @@ import {
   COMPLETING_STALE_MINUTES,
   countOpen,
   expired,
+  FINISHED_TRIM_DAYS,
   findResumable,
   markAborted,
   markDone,
@@ -14,7 +15,7 @@ import {
   trimFinished,
 } from "../../../src/worker/db/queries/uploads";
 import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
-import { uploadParts, uploads } from "../../../src/worker/db/schema";
+import { hashBlocklist, uploadParts, uploads } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeUpload, makeUser, openDb, protectedFiles, rand } from "./_helpers";
 
 let db: Db;
@@ -217,6 +218,43 @@ describe("expired and trimFinished", () => {
     expect(one[0]).toHaveProperty("r2Key");
   });
 
+  // H2 K (the lead's ruling): a completing session whose declared hash is blocklisted owes a
+  // LOCKED node for verified bytes; the stale job would abort its object. The repair sweep owns it.
+  it("expired never hands the stale job a completing session that owes a locked node", async () => {
+    const owner = await makeUser(db);
+    const stale = new Date(Date.now() - (COMPLETING_STALE_MINUTES + 5) * 60_000);
+    const listed = rand(32);
+    await db.insert(hashBlocklist).values({ sha256: listed, reason: "csam" });
+    const owed = await makeUpload(db, owner, owner, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: listed,
+    });
+    // The controls: an unlisted hash, and no declared hash at all — still the stale job's.
+    const unlisted = await makeUpload(db, owner, owner, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: rand(32),
+    });
+    const undeclared = await makeUpload(db, owner, owner, { status: "completing", completingAt: stale });
+    // Listed for another reason: nothing is owed (the route refuses and deletes such an object).
+    const otherReasons = [];
+    for (const reason of ["malware", "dmca", "admin"] as const) {
+      const sha256 = rand(32);
+      await db.insert(hashBlocklist).values({ sha256, reason });
+      otherReasons.push(
+        await makeUpload(db, owner, owner, {
+          status: "completing",
+          completingAt: stale,
+          expectedSha256: sha256,
+        }),
+      );
+    }
+    const ids = (await expired(db, 100_000)).filter((u) => u.ownerId === owner).map((u) => u.id);
+    expect(ids.sort()).toEqual([unlisted.id, undeclared.id, ...otherReasons.map((u) => u.id)].sort());
+    expect(ids).not.toContain(owed.id);
+  });
+
   it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", async () => {
     const owner = await makeUser(db);
     const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
@@ -226,6 +264,8 @@ describe("expired and trimFinished", () => {
     const oldOpen = await makeUpload(db, owner, owner, { status: "open", createdAt: daysAgo(30) });
     const ids = [oldDone.id, oldAborted.id, recentDone.id, oldOpen.id];
 
+    // The default is the exported trim age (T12 imports it): seven days.
+    expect(FINISHED_TRIM_DAYS).toBe(7);
     expect(await trimFinished(db)).toBeGreaterThanOrEqual(2);
     const left = await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids));
     expect(left.map((u) => u.id).sort()).toEqual([recentDone.id, oldOpen.id].sort());
