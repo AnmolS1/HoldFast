@@ -80,6 +80,16 @@ describe("a NUL in a bind value", () => {
     expect((await db.execute<{ n: number }>(sql`SELECT 2::int AS n`)).rows).toEqual([{ n: 2 }]);
   });
 
+  // Review m3: outside a transaction a statement goes through `pool.query`, which ends the client
+  // it lent when the statement fails. A refusal takes no client at all: the connection stays.
+  it("a refusal outside a transaction keeps the pooled connection: the next statement runs on the same backend", async () => {
+    const pid = async () =>
+      (await db.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`)).rows[0]!.pid;
+    const before = await pid();
+    for (let i = 0; i < 3; i++) await rejection(db.execute(sql`SELECT ${"a\u0000"}::text`));
+    expect(await pid()).toBe(before);
+  });
+
   it("clean binds are sent and counted exactly as before: one statement each", async () => {
     const before = statementsSent(db);
     const rows = await db.execute<{ a: string; b: string[]; c: string }>(

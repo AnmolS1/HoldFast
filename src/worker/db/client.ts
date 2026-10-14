@@ -105,6 +105,13 @@ export function createDb(
   limits: { statementTimeoutMs?: number; idleInTransactionTimeoutMs?: number } = {},
 ): { db: Db; close: (opts?: { force?: boolean }) => Promise<void> } {
   const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString, max: 5 });
+  // Outside a transaction Drizzle sends through `pool.query`, which ENDS the client it lent when
+  // the statement fails: a NUL refused there would cost a connection although nothing was sent.
+  // So that path is refused before a client is taken (the client-level check below covers the
+  // statements of a transaction, whose client is not ended by a failed statement).
+  const poolQuery = pool.query.bind(pool) as (...args: unknown[]) => unknown;
+  (pool as unknown as { query: (...args: unknown[]) => unknown }).query = (...args) =>
+    bindsCarryNul(args) ? refuseNul(args) : poolQuery(...args);
   const db = drizzle(pool, { schema, casing: "snake_case" });
 
   // Every top-level transaction bounds itself on the SERVER, first thing: one statement may run
