@@ -374,10 +374,30 @@ async function lockOrRecord(c: Ctx, nodeId: string, session: Upload): Promise<vo
   }
 }
 
+/** The critical operator alert, by the session's id. Its own failure is logged, never thrown. */
 async function tellOperators(c: Ctx, session: Upload): Promise<void> {
-  for (const to of adminListOf(c.env).addresses) {
-    await sendOperatorCritical(deps(c), { to, event: "csam_lock", id: session.id }).catch(() => "failed");
+  try {
+    for (const to of adminListOf(c.env).addresses) {
+      await sendOperatorCritical(deps(c), { to, event: "csam_lock", id: session.id }).catch(
+        (error: unknown) => captureError(error, { kind: "upload_csam_alert" }),
+      );
+    }
+  } catch (error) {
+    captureError(error, { kind: "upload_csam_alert" });
   }
+}
+
+/**
+ * Verified CSAM bytes whose node could not be written: the NODE IS OWED. The session is left
+ * `completing` — its key referenced, its declared (listed) hash on it since the claim — which
+ * keeps the object from every sweep until the repair (T22) writes the node; the audit row comes
+ * first, then the operators are told by the session's id.
+ */
+async function oweNode(c: Ctx, session: Upload, error: unknown): Promise<void> {
+  captureError(error, { kind: "upload_csam_preserve" });
+  audit(c, "upload.csam_node_owed", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+  metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
+  await tellOperators(c, session);
 }
 
 /** `suspected_csam` and held from the row's first commit — never `pending`, not for an instant. */
@@ -437,10 +457,7 @@ async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<
     await lockOrRecord(c, node.id, session);
   } catch (error) {
     if (written) throw error;
-    captureError(error, { kind: "upload_csam_preserve" });
-    audit(c, "upload.csam_node_owed", { type: "upload", id: session.id }, { nodeId: session.nodeId });
-    metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
-    await tellOperators(c, session);
+    await oweNode(c, session, error);
     return;
   }
   // The node is written: the session ends (it may already be gone — a purge of its folder).
@@ -984,9 +1001,12 @@ const stillCompleting = () =>
 const noLongerOpen = () => new AppError("conflict", "This upload is no longer open.");
 
 /**
- * The node a `done` session wrote, as far as the caller may see it NOW: null when it is hidden
- * (taken down, locked), in the trash, deleted, replaced by a later version or out of the
- * caller's reach — never told apart. `access` is null for the caller's own avatar.
+ * The node a session wrote, as far as the caller may see it NOW: null when it is hidden (taken
+ * down, locked), in the trash, deleted, replaced by a later version, never written (a refused
+ * upload) or out of the caller's reach — never told apart, not even by the work done: the SAME
+ * reads run in every case (the node by key, then the visibility read on that node or, when there
+ * is none, on the id the session reserved), so each costs the statements of every other.
+ * `access` is null for the caller's own avatar.
  */
 async function sessionNode(
   c: Ctx,
@@ -994,17 +1014,18 @@ async function sessionNode(
   session: Upload,
 ): Promise<{ node: Node; access: { role: Role; shareRootId: string | null } | null } | null> {
   const node = await findByR2Key(db(c), session.r2Key);
+  let access: Awaited<ReturnType<typeof requireRole>> | null = null;
+  try {
+    access = await requireRole(c, node?.id ?? session.nodeId, "viewer", { notTrashed: true });
+  } catch (error) {
+    if (!(error instanceof AppError && error.code === "not_found")) throw error;
+  }
   if (!node) return null;
   if (node.system === "avatar") {
     const mine = node.ownerId === user.id && node.takedownAt === null && node.scanStatus !== "suspected_csam";
     return mine ? { node, access: null } : null;
   }
-  try {
-    return { node, access: await requireRole(c, node.id, "viewer", { notTrashed: true }) };
-  } catch (error) {
-    if (error instanceof AppError && error.code === "not_found") return null;
-    throw error;
-  }
+  return access ? { node, access } : null;
 }
 
 /**
@@ -1018,14 +1039,16 @@ async function sessionNode(
 async function completedAgain(c: Ctx, user: SessionUser, session: Upload, body: CompleteUploadBody) {
   const parts = isSingle(session) ? [] : await sessions.listParts(db(c), session.id);
   const claimed = new Map(body.parts.map((part) => [part.n, part.etag]));
-  const same =
-    session.expectedSha256 === body.sha256 &&
-    body.parts.length === parts.length &&
-    claimed.size === parts.length &&
-    parts.every((part) => claimed.get(part.n) === part.etag);
-  if (!same) throw noLongerOpen();
+  // An aborted session's part rows are gone with it: only its declared hash is compared.
+  const sameParts =
+    session.status === "aborted" ||
+    (body.parts.length === parts.length &&
+      claimed.size === parts.length &&
+      parts.every((part) => claimed.get(part.n) === part.etag));
+  if (session.expectedSha256 !== body.sha256 || !sameParts) throw noLongerOpen();
   const found = await sessionNode(c, user, session);
-  if (!found) throw noLongerOpen();
+  // A refused upload is answered after the same reads as a locked one (its node is never there).
+  if (!found || session.status === "aborted") throw noLongerOpen();
   if (!found.access) return c.json(await toOwnAvatarDto(db(c), found.node, { viewerId: user.id }), 200);
   const dto = await toNodeDto(db(c), found.node, {
     viewerId: user.id,
@@ -1042,7 +1065,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   const open = await loadSession(c);
   const body = CompleteUploadBody.parse(await jsonBody(c));
   // A complete that is sent again — a lost answer, a retry — must be safe.
-  if (open.status === "done") return completedAgain(c, user, open, body);
+  if (open.status === "done" || open.status === "aborted") return completedAgain(c, user, open, body);
   if (open.status === "completing") throw stillCompleting();
   assertOpen(c, open);
 
@@ -1090,8 +1113,14 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
 
   let assembled = single;
   let verified: Verified | null = null;
-  const giveUp = (reason: string) =>
-    abandonClaimed(c, session, { assembled, declaredCsam, verified, reason });
+  // From the moment THE SERVER'S hash is known to be listed as CSAM (`evidence`) until the bytes
+  // are handed over — to a node, or to the preserve path — any way out ends in the owed state.
+  let evidence = false;
+  let handedOver = false;
+  const giveUp = (reason: string) => {
+    if (evidence) handedOver = true;
+    return abandonClaimed(c, session, { assembled, declaredCsam, verified, reason });
+  };
 
   /**
    * The object: the multipart upload completed in the store, its size (and, for a single PUT,
@@ -1133,6 +1162,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
     }
     const hit = actual === body.sha256 ? declared : await blocklist.lookup(db(c), actual);
     verified = { sha256: actual, hit };
+    if (hit?.reason === "csam") evidence = true;
     if (declared && actual !== body.sha256) {
       // The declaration was false. Recorded here only: the answer must not say that the
       // declared value was on a list, and the upload goes on like any other.
@@ -1171,50 +1201,66 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   // multipart upload is completed and the object hashed BEFORE anything is decided — so that a
   // refusal cannot make listed bytes disappear unseen, and the re-check is about the moment the
   // hit is acted on, not about a moment seconds earlier.
-  let place: Place;
-  if (declared) {
-    await inspect();
-    place = await recheck();
-  } else {
-    place = await recheck();
-    await inspect();
-  }
-  // `verified` is assigned inside `inspect`; the compiler cannot see that across the closure.
-  const checked = verified as Verified | null;
-  const sha256 = checked?.sha256 ?? body.sha256;
-  let hit = checked?.hit ?? null;
-
-  // THE BLOCKLIST, acted on only for a hash this server computed.
-  if (hit && hit.reason !== "csam") {
-    try {
-      return await refuseBlocked(c, session, hit.reason, sha256);
-    } catch (error) {
-      if (!(error instanceof RaisedToCsam)) throw error;
-      hit = { ...hit, reason: "csam" };
+  let place!: Place;
+  let sha256!: string;
+  let hit: Verified["hit"] = null;
+  let sealed!: Awaited<ReturnType<typeof sealIp>>;
+  try {
+    if (declared) {
+      await inspect();
+      place = await recheck();
+    } else {
+      place = await recheck();
+      await inspect();
     }
-  }
+    // `verified` is assigned inside `inspect`; the compiler cannot see that across the closure.
+    const checked = verified as Verified | null;
+    sha256 = checked?.sha256 ?? body.sha256;
+    hit = checked?.hit ?? null;
 
-  const sealed = await sealIp(c.env, c.get("ip"));
+    // THE BLOCKLIST, acted on only for a hash this server computed.
+    if (hit && hit.reason !== "csam") {
+      try {
+        return await refuseBlocked(c, session, hit.reason, sha256);
+      } catch (error) {
+        if (!(error instanceof RaisedToCsam)) throw error;
+        hit = { ...hit, reason: "csam" };
+        evidence = true;
+      }
+    }
 
-  if (hit) {
-    // Suspected CSAM: nothing is deleted. The object becomes a node — for a replace a row of its
-    // own, the existing file untouched — written ALREADY LOCKED, in the transaction that creates
-    // it; the one shared handler then files the report, holds the accounts and tells the
-    // operators. Called on the database handle, after this route's transaction.
-    const values = { ...nodeValues(session, user, sha256, replacing ? uuidv7() : session.nodeId), ...LOCKED };
-    let node: Node;
-    try {
-      ({ node } = await finish(c, session, user, { as: "new", values }, sealed, body.sha256));
-    } catch (error) {
-      // The place or the session went away under the request (a purge of the folder while the
-      // object was being hashed): the bytes are evidence all the same.
-      captureError(error, { kind: "upload_csam_finish" });
-      await preserveAndEnd(c, session, sha256);
+    sealed = await sealIp(c.env, c.get("ip"));
+
+    if (hit) {
+      // Suspected CSAM: nothing is deleted. The object becomes a node — for a replace a row of its
+      // own, the existing file untouched — written ALREADY LOCKED, in the transaction that creates
+      // it; the one shared handler then files the report, holds the accounts and tells the
+      // operators. Called on the database handle, after this route's transaction.
+      const values = {
+        ...nodeValues(session, user, sha256, replacing ? uuidv7() : session.nodeId),
+        ...LOCKED,
+      };
+      let node: Node;
+      try {
+        ({ node } = await finish(c, session, user, { as: "new", values }, sealed, body.sha256));
+      } catch (error) {
+        // The place or the session went away under the request (a purge of the folder while the
+        // object was being hashed): the bytes are evidence all the same.
+        captureError(error, { kind: "upload_csam_finish" });
+        handedOver = true;
+        await preserveAndEnd(c, session, sha256);
+        throw blocked();
+      }
+      handedOver = true;
+      audit(c, "node.upload", { type: "node", id: node.id }, { uploadId: session.id, size: session.size });
+      await lockOrRecord(c, node.id, session);
       throw blocked();
     }
-    audit(c, "node.upload", { type: "node", id: node.id }, { uploadId: session.id, size: session.size });
-    await lockOrRecord(c, node.id, session);
-    throw blocked();
+  } catch (error) {
+    // An unexpected error (a key that cannot seal, a database error in the re-check) after the
+    // server found the bytes listed as CSAM: the node is owed — never a bare object, never silent.
+    if (evidence && !handedOver) await oweNode(c, session, error);
+    throw error;
   }
 
   let becomes: Becomes;
@@ -1306,7 +1352,11 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
 router.delete(`/uploads/${ID}`, verified, async (c) => {
   const user = requireVerified(c);
   const session = await loadSession(c);
-  if (session.status === "aborted") return c.body(null, 204);
+  if (session.status === "aborted") {
+    // The reads a finished upload's DELETE makes: a refused upload is not told from a locked one.
+    await sessionNode(c, user, session);
+    return c.body(null, 204);
+  }
   if (session.status === "done") {
     // A finished upload is not aborted. But when its node is not there for the caller (hidden,
     // trashed, gone), the session answers as one that was given up — which is also what makes a
