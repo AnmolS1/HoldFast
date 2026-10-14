@@ -375,9 +375,7 @@ describe("PUT /uploads/:id/parts/:n", () => {
     const tail = await env.FILES.get(row.r2Key, { range: { suffix: 4 } });
     expect(new Uint8Array(await tail!.arrayBuffer())).toEqual(filled(4, 1));
     // What a blocklist hit costs at this size: the server's own hash of the stored object.
-    const hashStarted = Date.now();
     const hashed = await storedSha256(storage(env), row.r2Key);
-    console.log(`T12 TIMING sha256 of ${size} stored bytes: ${Date.now() - hashStarted} ms wall`);
     expect(hashed).toMatch(/^[0-9a-f]{64}$/);
     // Nothing more is taken for it.
     const late = await call(user, "PUT", `/uploads/${session.uploadId}/parts/3`, {

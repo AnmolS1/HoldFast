@@ -202,8 +202,5 @@ describe("lock order", () => {
     expect(failures.every((failure) => failure.code === "40P01")).toBe(true);
     expect(await sessionsOf(owner.id)).toHaveLength(1);
     expect(await usedBytes(owner.id)).toBe(1000);
-    console.log(
-      `T12 DEADLOCK victim: ${otherFailed !== null ? "the other writer" : "the init"}; init attempts failed: ${failures.length}`,
-    );
   });
 });

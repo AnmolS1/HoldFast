@@ -71,6 +71,15 @@ const readById = async (user: UserRow, nodeId: string) =>
   (await invoke(asCaller(user), (c: Context<AppEnv>) => requireRole(c, nodeId, "viewer"))).status;
 /** Status and bytes — what a client can compare. */
 const seen = (answer: Answer<unknown>) => `${answer.status} ${answer.bytes}`;
+/** Every header but the per-response ones (date, request id). */
+const headersOf = (answer: Answer<unknown>) =>
+  [...answer.headers.entries()].filter(([name]) => name !== "date" && !name.includes("request")).sort();
+/** One request as a client can compare it: status, body, headers — and the work it cost. */
+async function observed(caller: UserRow, method: string, path: string, json?: unknown) {
+  const statements = { n: 0 };
+  const answer = await call(caller, method, path, { ...(json === undefined ? {} : { json }), statements });
+  return { seen: seen(answer), headers: headersOf(answer), statements: statements.n };
+}
 const list = (user: UserRow) => call<unknown[]>(user, "GET", "/uploads/open");
 
 describe("B1 — verified CSAM bytes are hidden and held from the first commit of their row", () => {
@@ -280,76 +289,134 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
   });
 });
 
-describe("Addendum 14 — no verified CSAM object is ever left without a node", () => {
-  /** A node references the key — or, while the node is owed, a session still holds it as `completing`. */
-  async function referenced(r2Key: string) {
-    const [node] = await testDb().select().from(nodes).where(eq(nodes.r2Key, r2Key));
-    if (node) return { by: "node", scanStatus: node.scanStatus, legalHold: node.legalHold };
-    const [session] = await testDb().select().from(uploads).where(eq(uploads.r2Key, r2Key));
-    return session?.status === "completing" ? { by: "completing session" } : { by: "nothing" };
-  }
-
-  const sequences: [
-    string,
-    (ctx: { revoke: () => Promise<unknown>; trash: () => Promise<unknown> }) => Promise<unknown>,
-    ((attempt: number) => void) | undefined,
-  ][] = [
-    ["re-check passes", async () => undefined, undefined],
-    ["share revoked", (x) => x.revoke(), undefined],
-    ["folder trashed", (x) => x.trash(), undefined],
-    [
-      "the node's transaction fails, the preserved one commits",
-      async () => undefined,
-      (n) => {
-        if (n === 1) throw new Error("test: finish");
-      },
-    ],
-    [
-      "share revoked and the preserved node's transaction fails",
-      (x) => x.revoke(),
-      (n) => {
-        if (n === 1) throw new Error("test: preserve");
-      },
-    ],
-    [
-      "both transactions fail",
-      async () => undefined,
-      (n) => {
-        if (n <= 2) throw new Error("test: both");
-      },
-    ],
+describe("Addendum 14 / r2-m2 — every verified CSAM object ends as a locked node, or as a node OWED", () => {
+  type Ends = "node" | "owed";
+  type Setup = { revoke: () => Promise<unknown>; trash: () => Promise<unknown> };
+  type Row = {
+    what: string;
+    before?: (x: Setup) => Promise<unknown>;
+    beforeCommit?: (attempt: number) => void;
+    env?: Record<string, unknown>;
+    /** Armed while the server hashes: the next statement (the re-check's first) fails. */
+    faultInRecheck?: boolean;
+    status: number;
+    ends: Ends;
+    /** An innocent upload in the same situation: the answers must be alike (status, body, headers). */
+    twin?: boolean;
+  };
+  const fail =
+    (...attempts: number[]) =>
+    (n: number) => {
+      if (attempts.includes(n)) throw new Error(`test: transaction ${n} fails`);
+    };
+  const rows: Row[] = [
+    { what: "re-check passes", status: 403, ends: "node" },
+    { what: "share revoked", before: (x) => x.revoke(), status: 404, ends: "node", twin: true },
+    { what: "folder trashed", before: (x) => x.trash(), status: 404, ends: "node", twin: true },
+    {
+      what: "the node's transaction fails, the preserved one commits",
+      beforeCommit: fail(1),
+      status: 403,
+      ends: "node",
+    },
+    {
+      what: "share revoked, the preserved node's transaction fails",
+      before: (x) => x.revoke(),
+      beforeCommit: fail(1),
+      status: 404,
+      ends: "owed",
+    },
+    { what: "both transactions fail", beforeCommit: fail(1, 2), status: 403, ends: "owed" },
+    // A made-up value that is not a key (not a credential): the client address cannot be sealed.
+    {
+      what: "the client address cannot be sealed (r2-m2)",
+      env: { IP_ENC_KEY: "not-a-key" },
+      status: 500,
+      ends: "owed",
+    },
+    {
+      what: "the re-check fails with a database error (r2-m2)",
+      faultInRecheck: true,
+      status: 500,
+      ends: "owed",
+    },
   ];
 
-  it.each(sequences)("%s", async (_what, before, beforeCommit) => {
+  async function setup() {
     const owner = await uploader();
     const editor = await uploader();
     const folder = await makeFolder(owner.id);
     const share = await makeShare(folder.id, owner.id, editor.id, { role: "editor", canUpload: true });
-    const known = await listed("csam");
-    const session = await uploaded(editor, { parentId: folder.id }, known.bytes);
-    const row = (await sessionRow(session.uploadId))!;
-    await before({
+    const x: Setup = {
       revoke: () => testDb().delete(shares).where(eq(shares.id, share.id)),
       trash: () =>
         testDb()
           .update(nodes)
           .set({ deletedAt: new Date(), trashedRoot: true })
           .where(eq(nodes.id, folder.id)),
+    };
+    return { owner, editor, folder, x };
+  }
+
+  it.each(rows)("$what → $status, ends as $ends", async (row) => {
+    const { editor, folder, x } = await setup();
+    const known = await listed("csam");
+    const session = await uploaded(editor, { parentId: folder.id }, known.bytes);
+    const r2Key = (await sessionRow(session.uploadId))!.r2Key;
+    await row.before?.(x);
+    const mailsBefore = operatorMails();
+    const fault = { armed: false };
+    const watched = watchedBucket([], {
+      get: async () => {
+        if (row.faultInRecheck) fault.armed = true;
+      },
     });
-    await complete(editor, session.uploadId, { sha256: known.sha256 }, beforeCommit ? { beforeCommit } : {});
-    expect(await env.FILES.head(row.r2Key)).not.toBeNull();
-    const ref = await referenced(row.r2Key);
-    expect(ref.by).not.toBe("nothing");
-    if (ref.by === "node") expect(ref).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    const answer = await complete(
+      editor,
+      session.uploadId,
+      { sha256: known.sha256 },
+      {
+        env: { FILES: watched.bucket, ...row.env },
+        ...(row.beforeCommit ? { beforeCommit: row.beforeCommit } : {}),
+        ...(row.faultInRecheck ? { fault } : {}),
+      },
+    );
+    expect(answer.status).toBe(row.status);
+    expect(await env.FILES.head(r2Key)).not.toBeNull();
+    const [node] = await testDb().select().from(nodes).where(eq(nodes.r2Key, r2Key));
+    const owed = await auditRows({ action: "upload.csam_node_owed", targetId: session.uploadId });
+    if (row.ends === "node") {
+      expect(node).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+      expect(owed).toHaveLength(0);
+    } else {
+      expect(node).toBeUndefined();
+      // Owed: the session still holds the key, with the listed hash; recorded, and the operators told.
+      expect(await sessionRow(session.uploadId)).toMatchObject({
+        status: "completing",
+        r2Key,
+        expectedSha256: known.sha256,
+      });
+      expect(owed).toHaveLength(1);
+      expect(operatorMails()).toBeGreaterThan(mailsBefore);
+    }
     expect(await auditRows({ action: "upload.csam_object_kept", targetId: session.uploadId })).toHaveLength(
       0,
     );
+
+    if (row.twin) {
+      const other = await setup();
+      const innocent = await uploaded(other.editor, { parentId: other.folder.id }, uniqueBytes());
+      await row.before?.(other.x);
+      const twin = await complete(other.editor, innocent.uploadId, { sha256: known.sha256 });
+      expect(seen(twin)).toBe(seen(answer));
+      expect(headersOf(twin)).toEqual(headersOf(answer));
+    }
   });
 });
 
 describe("M1 — after the blocked 403, a locked upload is not told from a refused one", () => {
   /** What the follow-ups answer for a malware refusal: the reference every reason must equal. */
-  let reference: string[];
+  let reference: Awaited<ReturnType<typeof observed>>[];
   beforeAll(async () => {
     reference = await followUps("malware");
   });
@@ -360,13 +427,16 @@ describe("M1 — after the blocked 403, a locked upload is not told from a refus
     const session = await uploaded(user, {}, known.bytes);
     const first = await complete(user, session.uploadId, { sha256: known.sha256 });
     expect(first.status).toBe(403);
+    const path = `/uploads/${session.uploadId}`;
+    const body = (sha256: string) => ({ sha256, parts: [] });
+    // Status, body, headers AND the statements each one cost (R2-M1 / r2-m1).
     return [
-      seen(await complete(user, session.uploadId, { sha256: known.sha256 })),
-      seen(await complete(user, session.uploadId, { sha256: sha() })),
-      seen(await call(user, "DELETE", `/uploads/${session.uploadId}`)),
-      seen(await call(user, "DELETE", `/uploads/${session.uploadId}`)),
-      seen(await complete(user, session.uploadId, { sha256: known.sha256 })),
-      seen(await list(user)),
+      await observed(user, "POST", `${path}/complete`, body(known.sha256)),
+      await observed(user, "POST", `${path}/complete`, body(sha())),
+      await observed(user, "DELETE", path),
+      await observed(user, "DELETE", path),
+      await observed(user, "POST", `${path}/complete`, body(known.sha256)),
+      await observed(user, "GET", "/uploads/open"),
     ];
   }
 
@@ -430,15 +500,29 @@ describe("M2 — a done session whose node is not there for the caller: one answ
     ],
   ];
 
+  /** The repeat and the DELETE as a client can compare them, statements included. */
+  async function followUps(change: (typeof changes)[number][1]) {
+    const { user, folder, session, sha256, nodeId, reference } = await finished();
+    await change(nodeId, user, folder.id);
+    const path = `/uploads/${session.uploadId}`;
+    const again = await observed(user, "POST", `${path}/complete`, { sha256, parts: [] });
+    const del = await observed(user, "DELETE", path);
+    expect(again.seen).toBe(reference);
+    expect(del.seen.startsWith("204 ")).toBe(true);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done" });
+    return { again, del };
+  }
+
+  // The cheapest way the node can be gone — deleted — is the reference every other must cost.
+  let deleted: Awaited<ReturnType<typeof followUps>>;
+  beforeAll(async () => {
+    deleted = await followUps(changes.find(([what]) => what === "deleted")![1]);
+  });
+
   it.each(changes)(
-    "%s → the plain 409 a given-up session answers, and DELETE answers 204 as for one",
+    "%s → the plain 409 a given-up session answers, DELETE 204 as for one — same headers, same statements",
     async (_what, change) => {
-      const { user, folder, session, sha256, nodeId, reference } = await finished();
-      await change(nodeId, user, folder.id);
-      const again = await complete(user, session.uploadId, { sha256 });
-      expect(seen(again)).toBe(reference);
-      expect((await call(user, "DELETE", `/uploads/${session.uploadId}`)).status).toBe(204);
-      expect(await sessionRow(session.uploadId)).toMatchObject({ status: "done" });
+      expect(await followUps(change)).toEqual(deleted);
     },
   );
 

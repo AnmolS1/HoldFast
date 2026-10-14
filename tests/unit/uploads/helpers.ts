@@ -111,6 +111,11 @@ export type CallOptions = {
   beforeCommit?: (attempt: number) => void;
   /** Every SQL statement the request sends is counted here (`n`), its deferred work included. */
   statements?: { n: number };
+  /**
+   * While `armed` is true, the NEXT statement the request sends fails (once) as a lost
+   * connection would — a database error that is not one of the app's own.
+   */
+  fault?: { armed: boolean };
 };
 
 export type Answer<T = Record<string, unknown>> = {
@@ -138,13 +143,15 @@ const allow = { limit: async () => ({ success: true }) };
 
 /** The real `createDb`, with every transaction opened on the handle observed. */
 function observedCore(options: CallOptions): Pick<CoreDeps, "createDb"> {
-  if (!options.failures && !options.beforeCommit && !options.statements)
+  if (!options.failures && !options.beforeCommit && !options.statements && !options.fault) {
     return { createDb: realCore.createDb };
+  }
   return {
     createDb: (...args) => {
       const handle = realCore.createDb(...args);
       const counter = options.statements;
-      if (counter) {
+      const fault = options.fault;
+      if (counter || fault) {
         // Every connection the pool hands out counts what it sends.
         const pool = (
           handle.db as unknown as { $client: { on(event: string, fn: (client: unknown) => void): void } }
@@ -156,7 +163,18 @@ function observedCore(options: CallOptions): Pick<CoreDeps, "createDb"> {
           patched.add(connection);
           const query = connection.query.bind(connection);
           connection.query = (...a: unknown[]) => {
-            counter.n += 1;
+            if (counter) counter.n += 1;
+            if (fault?.armed) {
+              fault.armed = false;
+              const error = new Error("test: Connection terminated unexpectedly");
+              // The driver calls back or awaits, depending on the caller.
+              const callback = a.find((arg): arg is (e: Error) => void => typeof arg === "function");
+              if (callback) {
+                queueMicrotask(() => callback(error));
+                return undefined;
+              }
+              return Promise.reject(error);
+            }
             return query(...a);
           };
         });

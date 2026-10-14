@@ -234,7 +234,8 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
     // THE ANSWER SAYS NOTHING: it is, field for field and header for header, what any other
     // wrong hash gets — one that is on no list at all.
     const control = await uploaded(editor, { parentId: other.id, name: "same.bin" }, uniqueBytes());
-    const unlisted = await complete(editor, control.uploadId, { sha256: sha() });
+    const unlistedSha = sha();
+    const unlisted = await complete(editor, control.uploadId, { sha256: unlistedSha });
     expect(comparable(answer)).toBe(comparable(unlisted));
     expect(JSON.stringify(answer.body)).not.toMatch(/block|listed|csam/i);
 
@@ -254,7 +255,7 @@ describe("a false declaration: the hash a client sends locks nobody, strikes nob
     // The declared value is kept where the scanner can compare with it — and only there.
     expect(await sessionRow(session.uploadId)).toMatchObject({ expectedSha256: known.sha256 });
     expect(await sessionRow(control.uploadId)).toMatchObject({
-      expectedSha256: unlisted.body.sha256 ?? expect.any(String),
+      expectedSha256: unlistedSha,
     });
     expect(
       await testDb().select({ id: nodes.id }).from(nodes).where(eq(nodes.sha256, known.sha256)),
