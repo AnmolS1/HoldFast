@@ -5,14 +5,14 @@
 //   - every "this upload's node is not there for you" is ONE answer, and a locked upload is not
 //     told from a refused one by anything the uploader may send afterwards.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { SessionUser } from "../../../src/worker/auth/types";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import * as quotaRows from "../../../src/worker/db/queries/quota";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
-import { nodes, reports, shares, uploads } from "../../../src/worker/db/schema";
+import { nodes, reports, shares, uploads, user as userTable } from "../../../src/worker/db/schema";
 import { RaisedToCsam, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
 import { requireRole } from "../../../src/worker/services/permissions";
 import type { AppEnv } from "../../../src/worker/services/request-context";
@@ -21,6 +21,8 @@ import { storage } from "../../../src/worker/services/storage";
 import { auditRows, serviceDeps } from "../auth/helpers";
 import {
   ADMIN_EMAIL,
+  backendPid,
+  gate,
   deliver,
   mailTo,
   makeFile,
@@ -473,10 +475,37 @@ describe("the minors", () => {
     const user = await uploader();
     const tight = { settings: { ...ROOMY, ceilings: { upload_user: { count: 1 } } } } as const;
     const json = initBody({ name: "race.bin", size: 10 });
-    const [a, b] = await Promise.all([
+    // The uploader's row is held, so that BOTH inits get past the first resume lookup and wait
+    // for the ceilings' lock; then it is let go and one of them writes the session first.
+    const release = gate();
+    const holder = gate<number>();
+    const held = testDb().transaction(async (tx) => {
+      await tx.select({ id: userTable.id }).from(userTable).where(eq(userTable.id, user.id)).for("update");
+      holder.open(await backendPid(tx));
+      await release.opened;
+    });
+    const pid = await holder.opened;
+    const racing = [
       call<{ uploadId: string }>(user, "POST", "/uploads", { json, ...tight }),
       call<{ uploadId: string }>(user, "POST", "/uploads", { json, ...tight }),
-    ]);
+    ];
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const result = await testDb().execute<{ n: number }>(
+        // Waiting for the holder — directly, or behind the other init that waits for it.
+        sql`SELECT count(*)::int AS n FROM pg_stat_activity a
+            WHERE a.datname = current_database()
+              AND (${pid} = ANY(pg_blocking_pids(a.pid))
+                OR EXISTS (SELECT 1 FROM pg_stat_activity b
+                           WHERE ${pid} = ANY(pg_blocking_pids(b.pid)) AND b.pid = ANY(pg_blocking_pids(a.pid))))`,
+      );
+      if (Number(result.rows[0]?.n) >= 2) break;
+      if (Date.now() > deadline) throw new Error("the two inits never both waited");
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    release.open();
+    await held;
+    const [a, b] = await Promise.all(racing);
     expect([a.status, b.status].sort()).toEqual([200, 201]);
     expect(a.body.uploadId).toBe(b.body.uploadId);
   });
