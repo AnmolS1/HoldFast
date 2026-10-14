@@ -37,6 +37,7 @@ import { auditInTx } from "../services/audit";
 import { deps, type AppEnv, type BackgroundContext } from "../services/request-context";
 import { storage } from "../services/storage";
 import type { Job } from "./index";
+import { mayDestroy } from "./reconcile";
 
 export type PurgeSource = Context<AppEnv> | BackgroundContext;
 export type PurgeReason = "user" | "cron" | "account";
@@ -207,7 +208,10 @@ export async function purgeVersions(
 export const job: Job = {
   name: "purge",
   cron: "17 */6 * * *",
+  guarded: true,
   async run(bg, _env, _event, opts) {
+    // A database that has gone back in time destroys nothing (reconcile.ts, the detector).
+    if (!(await mayDestroy(bg, opts?.detection, "purge"))) return { done: false };
     const stopAt = Date.now() + (opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS);
     const over = () => Date.now() >= stopAt;
     const count = (outcome: string) => bg.metric("job", { kind: "purge", outcome });

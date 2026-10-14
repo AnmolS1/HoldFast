@@ -2,7 +2,7 @@
 // admin console's "run job".
 //
 //   17 */6 * * *   purge
-//   3 * * * *      stale-uploads, abuse-hourly, operator-digests
+//   3 * * * *      restore-heartbeat, stale-uploads, abuse-hourly, operator-digests
 //   5 0 * * *      retention, unpause-midnight, verification-sweep
 //   0 2 * * *      backup, user-purge, reconcile        (backup FIRST: that night's purges must
 //                                                         still be in that night's export)
@@ -13,6 +13,13 @@
 // A job file imports from this module AS A TYPE ONLY. This module imports every job; a job that
 // imported a value from here would close a cycle, and whichever of the two is loaded first would
 // read the other's `const` before it exists.
+//
+// A DATABASE THAT HAS GONE BACK IN TIME (a restore) destroys nothing. A slot with a `guarded` job
+// reads the rollback detector once, before its first job (reconcile.ts#detectRollback), and hands
+// that reading to each guarded job, which checks it at its start (`mayDestroy`) — purge,
+// user-purge, retention, stale-uploads and the orphan sweep stop; `restore-heartbeat` and
+// reconcile do not count the generation up. The other jobs run as usual. `runJob` hands no
+// reading: a guarded job then reads for itself.
 //
 // BUDGET. Every job works in bounded batches, looks at the clock after each and stops at the
 // soft deadline it is handed, leaving the rest — which is still due — for the next tick. Nothing
@@ -25,7 +32,8 @@ import { job as abuseHourly } from "./abuse-hourly";
 import { job as backup } from "./backup";
 import { job as operatorDigests } from "./operator-digests";
 import { job as purge } from "./purge";
-import { job as reconcile } from "./reconcile";
+import { detectRollback, job as reconcile, type Detection } from "./reconcile";
+import { job as restoreHeartbeat } from "./restore-heartbeat";
 import { job as retention } from "./retention";
 import { job as staleUploads } from "./stale-uploads";
 import { job as unpauseMidnight } from "./unpause-midnight";
@@ -35,6 +43,8 @@ import { job as verificationSweep } from "./verification-sweep";
 export type JobRunOptions = {
   /** Stop starting new batches this long after the run began. */
   softDeadlineMs?: number;
+  /** The slot's reading of the rollback detector — for a `guarded` job only. */
+  detection?: Detection;
 };
 
 /** `done: false` — the job stopped at its deadline with work left; the next tick continues. */
@@ -44,6 +54,8 @@ export type Job = {
   name: string;
   /** One of the four expressions of wrangler.jsonc `triggers.crons`, exactly. */
   cron: string;
+  /** It destroys, or counts the rollback detector's generation up: it reads the detector. */
+  guarded?: true;
   /** Returning nothing means done. */
   run(
     bg: BackgroundContext,
@@ -67,6 +79,7 @@ export const softDeadlineOf = (name: string): number => SOFT_DEADLINES[name] ?? 
 /** In run order. The jobs of one cron expression run in the order they have here. */
 export const jobs: Job[] = [
   purge,
+  restoreHeartbeat,
   staleUploads,
   abuseHourly,
   operatorDigests,
@@ -83,7 +96,8 @@ export const jobNames: string[] = jobs.map((job) => job.name);
 
 /**
  * The cron entry's whole body: the jobs whose `cron` is this event's, one after the other, each
- * awaited. A job that throws is reported and counted, and the next one still runs.
+ * awaited — after one reading of the rollback detector when the slot has a guarded job. A job
+ * that throws is reported and counted, and the next one still runs.
  */
 export async function runScheduled(
   event: ScheduledController,
@@ -92,10 +106,15 @@ export async function runScheduled(
   bg: BackgroundContext,
 ): Promise<void> {
   void ctx;
-  for (const job of jobs) {
-    if (job.cron !== event.cron) continue;
+  const slot = jobs.filter((job) => job.cron === event.cron);
+  // Once per slot, before any job of it runs. (It never throws: what it cannot read is `unknown`.)
+  const detection = slot.some((job) => job.guarded) ? await detectRollback(bg) : undefined;
+  for (const job of slot) {
     try {
-      await job.run(bg, env, event, { softDeadlineMs: softDeadlineOf(job.name) });
+      await job.run(bg, env, event, {
+        softDeadlineMs: softDeadlineOf(job.name),
+        ...(job.guarded ? { detection } : {}),
+      });
     } catch (error) {
       captureError(error, { kind: "job", job: job.name });
       bg.metric("job", { kind: job.name, outcome: "error" });

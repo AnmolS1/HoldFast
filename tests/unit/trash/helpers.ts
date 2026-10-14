@@ -14,7 +14,8 @@ import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo, SessionUser } from "../../../src/worker/auth/types";
 import { createDb, statementsSent, type Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import type { Settings } from "../../../src/worker/db/queries/settings";
+import { getSettings, type Settings } from "../../../src/worker/db/queries/settings";
+import { GENERATION_KEY, readCursor } from "../../../src/worker/jobs/reconcile";
 import {
   auditLog,
   dmcaNoticeNodes,
@@ -268,6 +269,17 @@ export function jobContext(
       while (deferred.length) await Promise.allSettled(deferred.splice(0));
     },
   };
+}
+
+/**
+ * The rollback detector in step for this file: its own bucket (isolated per test file) gets the
+ * generation object with the database's number — whatever other files have counted it up to — so
+ * the guarded jobs this file runs read "ok". Writes no setting. Returns the number.
+ */
+export async function generationInStep(): Promise<number> {
+  const database = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor).generation;
+  await env.FILES.put(GENERATION_KEY, String(database));
+  return database;
 }
 
 export const cronEvent = (cron: string): ScheduledController => ({

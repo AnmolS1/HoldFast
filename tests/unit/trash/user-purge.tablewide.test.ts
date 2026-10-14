@@ -2,7 +2,7 @@
 // file runs alone; an account is made due by the date on its own pending row.
 import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { ownedRoots } from "../../../src/worker/db/queries/tree";
 import { remainingForUser } from "../../../src/worker/db/queries/uploads";
@@ -41,7 +41,11 @@ import {
   uploadRow,
   userRow,
   type JobContext,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "ok" for the guarded jobs this file runs.
+beforeAll(generationInStep);
 
 const DAY = 86_400_000;
 

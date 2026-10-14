@@ -2,7 +2,7 @@
 // runs alone; a session is made stale by backdating its own `expiresAt` / `completingAt`.
 import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { lockStaleUpload } from "../../../src/worker/db/queries/trash-jobs";
 import { uploadParts, uploads } from "../../../src/worker/db/schema";
 import { job as staleUploadsJob } from "../../../src/worker/jobs/stale-uploads";
@@ -25,7 +25,11 @@ import {
   uploadRow,
   usedBytes,
   type JobContext,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "ok" for the guarded jobs this file runs.
+beforeAll(generationInStep);
 
 const HOUR = 3_600_000;
 const ago = (ms: number) => new Date(Date.now() - ms);

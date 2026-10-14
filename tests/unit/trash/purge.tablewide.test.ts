@@ -4,7 +4,7 @@
 // `npm test`). Rows other files left behind are purged by it too; nothing here counts them, and
 // a root is made due by backdating its own `purgeAfter`, never by moving the clock.
 import { env } from "cloudflare:workers";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { usageBreakdown } from "../../../src/worker/db/queries/quota";
 import { purgeDue, restore as restoreQuery, trash as trashQuery } from "../../../src/worker/db/queries/trash";
@@ -45,7 +45,11 @@ import {
   versionsLeft,
   type Caller,
   type JobContext,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "ok" for the guarded jobs this file runs.
+beforeAll(generationInStep);
 
 const DELETE = { method: "DELETE" } as const;
 const DAY = 86_400_000;

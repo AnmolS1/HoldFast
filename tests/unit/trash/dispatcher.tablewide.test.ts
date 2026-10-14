@@ -23,7 +23,10 @@ import { job as operatorDigests } from "../../../src/worker/jobs/operator-digest
 import { job as verificationSweep } from "../../../src/worker/jobs/verification-sweep";
 import { HOURLY_CRON, NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
 import { flushOperatorDigests } from "../../../src/worker/services/email";
-import { cronEvent, gate, jobContext, rand, testDb } from "./helpers";
+import { cronEvent, gate, jobContext, rand, testDb, generationInStep } from "./helpers";
+
+// The rollback detector reads "ok" for the guarded jobs this file runs.
+beforeAll(generationInStep);
 
 vi.mock("../../../src/worker/services/email", async (original) => {
   const real = await original<typeof import("../../../src/worker/services/email")>();
@@ -37,7 +40,7 @@ vi.mock("../../../src/worker/db/queries/auth-lifecycle", async (original) => {
 /** wrangler.jsonc `triggers.crons`, and what each runs — in this order. */
 const SLOTS: Record<string, string[]> = {
   "17 */6 * * *": ["purge"],
-  "3 * * * *": ["stale-uploads", "abuse-hourly", "operator-digests"],
+  "3 * * * *": ["restore-heartbeat", "stale-uploads", "abuse-hourly", "operator-digests"],
   "5 0 * * *": ["retention", "unpause-midnight", "verification-sweep"],
   "0 2 * * *": ["backup", "user-purge", "reconcile"],
 };
@@ -95,7 +98,7 @@ const verificationLeft = async (id: string) =>
   (await testDb().select().from(verification).where(eq(verification.id, id))).length;
 
 describe("the registry", () => {
-  it("holds exactly the ten jobs, each on its expression, in run order", () => {
+  it("holds exactly the eleven jobs, each on its expression, in run order", () => {
     expect(jobs.map((job) => job.name)).toEqual(Object.values(SLOTS).flat());
     expect(jobNames).toEqual(jobs.map((job) => job.name));
     for (const [cron, names] of Object.entries(SLOTS)) {
@@ -108,23 +111,38 @@ describe("the registry", () => {
     expect(operatorDigests.cron).toBe(HOURLY_CRON);
     expect(verificationSweep.cron).toBe(NIGHTLY_CRON);
     expect([HOURLY_CRON, NIGHTLY_CRON]).toEqual(["3 * * * *", "5 0 * * *"]);
+    // Those that destroy, and those that count the rollback detector's generation up, read it.
+    expect(jobs.filter((job) => job.guarded).map((job) => job.name)).toEqual([
+      "purge",
+      "restore-heartbeat",
+      "stale-uploads",
+      "retention",
+      "user-purge",
+      "reconcile",
+    ]);
     // The two that walk every account get twice the time.
     expect(softDeadlineOf("purge")).toBe(JOB_SOFT_DEADLINE_MS);
     expect([softDeadlineOf("user-purge"), softDeadlineOf("reconcile")]).toEqual([120_000, 120_000]);
   });
 
   it.each(Object.entries(SLOTS))(
-    "%s runs exactly its jobs, in order, each handed its deadline",
+    "%s runs exactly its jobs, in order, each handed its deadline — and a guarded job the slot's one reading of the detector",
     async (cron, names) => {
       const ran = watch(true);
       const job = jobContext();
       await expect(runScheduled(cronEvent(cron), env, ctx, job.bg)).resolves.toBeUndefined();
       expect(ran).toEqual(names);
+      const readings = new Set<unknown>();
       for (const candidate of jobs.filter((entry) => entry.cron === cron)) {
-        expect(vi.mocked(candidate.run).mock.calls[0]![3]).toEqual({
-          softDeadlineMs: softDeadlineOf(candidate.name),
-        });
+        const opts = vi.mocked(candidate.run).mock.calls[0]![3]!;
+        const { detection, ...rest } = opts;
+        expect(rest).toEqual({ softDeadlineMs: softDeadlineOf(candidate.name) });
+        expect(detection === undefined, candidate.name).toBe(!candidate.guarded);
+        if (detection) readings.add(detection);
       }
+      // One reading, handed to every guarded job of the slot; this file's numbers are in step.
+      expect(readings.size).toBe(1);
+      expect([...readings][0]).toMatchObject({ state: "ok" });
       expect(job.outcomes(names[0]!)).toEqual([]);
     },
   );
@@ -144,7 +162,7 @@ describe("the registry", () => {
     );
     const job = jobContext();
     await expect(runScheduled(cronEvent("3 * * * *"), env, ctx, job.bg)).resolves.toBeUndefined();
-    expect(ran).toEqual(["abuse-hourly", "operator-digests"]);
+    expect(ran).toEqual(["restore-heartbeat", "abuse-hourly", "operator-digests"]);
     expect(job.metric.mock.calls).toContainEqual(["job", { kind: "stale-uploads", outcome: "error" }]);
     expect(job.outcomes("abuse-hourly")).toEqual([]);
   });

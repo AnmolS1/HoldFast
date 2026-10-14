@@ -39,6 +39,7 @@ import { auditInTx } from "../services/audit";
 import type { BackgroundContext } from "../services/request-context";
 import { AVATAR_PREFIX, storage } from "../services/storage";
 import type { Job } from "./index";
+import { mayDestroy } from "./reconcile";
 import { purgeRoot } from "./purge";
 
 /** Accounts taken from the queue at once. */
@@ -132,7 +133,10 @@ function failureNote(error: unknown): string {
 export const job: Job = {
   name: "user-purge",
   cron: "0 2 * * *",
+  guarded: true,
   async run(bg, _env, _event, opts) {
+    // A database that has gone back in time destroys nothing (reconcile.ts, the detector).
+    if (!(await mayDestroy(bg, opts?.detection, "user-purge"))) return { done: false };
     const stopAt = Date.now() + (opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS);
     // A row that failed or must be retried stays due: it is not taken twice in one run.
     const seen = new Set<string>();

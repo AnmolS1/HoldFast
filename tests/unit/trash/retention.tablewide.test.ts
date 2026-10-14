@@ -6,7 +6,7 @@
 // them — one case per table, each beside an un-held twin that IS deleted in the same run.
 import { env } from "cloudflare:workers";
 import { and, eq, inArray } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { expired } from "../../../src/worker/db/queries/upload-ips";
@@ -34,7 +34,11 @@ import {
   testDb,
   uploadRow,
   type JobContext,
+  generationInStep,
 } from "./helpers";
+
+// The rollback detector reads "ok" for the guarded jobs this file runs.
+beforeAll(generationInStep);
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;

@@ -1,5 +1,6 @@
 // Queries only the trash routes and the scheduled jobs make: the purge-request marker, the
-// retention deletes, and the reads the account purge and the reconcile job need.
+// retention deletes, the reads the account purge and the reconcile job need, and the rollback
+// detector's number with the lock its writers share.
 //
 // WHAT A RETENTION DELETE KEEPS is not decided here. Every delete below asks queries/holds.ts —
 // `userHeld` and `nodeProtected`, the record the purge gate is generated from — in the deleting
@@ -24,6 +25,7 @@ import {
   user,
 } from "../schema";
 import { nodeProtected, userHeld } from "./holds";
+import { clearSettingsCache } from "./settings";
 import { notPurgeRequested } from "./trash";
 import { lockOwnerTree, notEffectivelyHidden } from "./tree";
 import { COMPLETING_STALE_MINUTES } from "./uploads";
@@ -418,4 +420,89 @@ export async function knownVersions(db: Executor, nodeIds: readonly string[]): P
   for (const row of [...current, ...old])
     if (row.versionId !== null) found.add(`${row.nodeId}/${row.versionId}`);
   return found;
+}
+
+// ── the rollback detector's number, and the run lock ────────────────────────────────────────
+//
+// The reconcile job's cursor (`settings.reconcileCursor`, a JSON object) holds its place AND the
+// database's generation. They are written separately, so that neither write can undo the other:
+// the place by a merge that leaves `generation` as it is, the generation only by a
+// compare-and-set — never with a value read earlier and written back.
+
+const CURSOR_KEY = "reconcileCursor";
+
+/** The stored generation as `jobs/reconcile.ts#readCursor` reads it: anything else is 0. */
+const storedGeneration = sql`CASE
+  WHEN jsonb_typeof(settings.value -> 'generation') = 'number'
+   AND (settings.value ->> 'generation') ~ '^[0-9]{1,15}$'
+  THEN (settings.value ->> 'generation')::bigint ELSE 0 END`;
+
+/** The cursor as an object, whatever is stored (a value of another shape is the start). */
+const storedObject = sql`CASE WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value ELSE '{}'::jsonb END`;
+
+/** Saves where the next reconcile run continues. The generation in the same value is kept. */
+export async function saveReconcilePlace(
+  db: Executor,
+  place: { user: string | null; area: number; object: string | null },
+): Promise<void> {
+  const fields = sql`jsonb_build_object('user', ${place.user}::text, 'area', ${place.area}::int, 'object', ${place.object}::text)`;
+  await db.execute(sql`
+    INSERT INTO settings (key, value, updated_by) VALUES (${CURSOR_KEY}, ${fields}, NULL)
+    ON CONFLICT (key) DO UPDATE SET value = ${storedObject} || ${fields}, updated_by = NULL, updated_at = now()`);
+  clearSettingsCache();
+}
+
+/**
+ * Counts the database's generation up from `from` — only if it is still `from` (compare-and-
+ * set). True when this call moved it. A run that read its number before someone else moved it —
+ * another run, an operator, a restore — moves nothing.
+ */
+export async function advanceGenerationRow(db: Executor, from: number): Promise<boolean> {
+  const next = sql`to_jsonb(${from + 1}::bigint)`;
+  const result =
+    from === 0
+      ? // No row reads as 0, so the very first count may create it.
+        await db.execute(sql`
+          INSERT INTO settings (key, value, updated_by)
+          VALUES (${CURSOR_KEY}, jsonb_build_object('generation', ${next}), NULL)
+          ON CONFLICT (key) DO UPDATE
+            SET value = jsonb_set(${storedObject}, '{generation}', ${next}), updated_by = NULL, updated_at = now()
+            WHERE ${storedGeneration} = 0
+          RETURNING key`)
+      : await db.execute(sql`
+          UPDATE settings
+            SET value = jsonb_set(${storedObject}, '{generation}', ${next}), updated_by = NULL, updated_at = now()
+            WHERE key = ${CURSOR_KEY} AND ${storedGeneration} = ${from}
+          RETURNING key`);
+  clearSettingsCache();
+  return result.rows.length === 1;
+}
+
+/**
+ * Runs `run` while this invocation holds the job lock `name` — or not at all, when another run
+ * holds it (`{ held: false }`, at once: nothing waits).
+ *
+ * The lock is a transaction-scoped advisory lock (behind Hyperdrive's transaction pooling a
+ * session lock is not possible — db/client.ts rule 3), so its transaction stays open, idle,
+ * while `run` works: `holdMs` raises that one transaction's idle limit to cover the run, and
+ * the lock ends with it — committed when `run` returns, rolled back when it throws, and dropped
+ * by the server if this invocation dies. `run` NEVER uses the lock's transaction: it works on the
+ * handle's other pooled connections (the one deliberate exception to rule 1; the pool has five,
+ * and a run uses one or two at a time).
+ */
+export async function withJobLock<T>(
+  db: Executor,
+  name: string,
+  holdMs: number,
+  run: () => Promise<T>,
+): Promise<{ held: true; value: T } | { held: false }> {
+  let out: { held: true; value: T } | { held: false } = { held: false };
+  await db.transaction(async (tx) => {
+    const result = await tx.execute<{ got: boolean }>(sql`
+      SELECT set_config('idle_in_transaction_session_timeout', ${String(Math.trunc(holdMs))}, true),
+             pg_try_advisory_xact_lock(hashtextextended(${"job:" + name}, 0)) AS got`);
+    if (result.rows[0]?.got !== true) return;
+    out = { held: true, value: await run() };
+  });
+  return out;
 }

@@ -18,26 +18,45 @@
 //       max(500, 1 % of the objects it listed): it alerts (`orphan_threshold`) and keeps its
 //       place, so it alerts again every night until someone has looked.
 //   (c) the 48-hour floor, on the object's own upload time.
-// AND A FOURTH THAT DOES NOT LIVE IN THE DATABASE. Guard (a) is a row of the very database a
-// restore puts back (with the value it had then), and guard (b) only sees one run's window. So
-// every run that completes counts a GENERATION up — in the database (inside the cursor value)
-// and then in one small object, `sys/reconcile-generation`, outside the swept areas. A run
-// starts by reading both, before any orphan decision:
-//   object  >  database    the database has gone back in time. No orphan is deleted, by this
-//                          run or any later one; the operator is alerted and it is counted
-//                          (`rollback_detected`). It stays that way until an operator moves the
-//                          database's number up to the object's — deliberately, after looking.
-//   no object              the first run: the object is written and nothing is deleted.
+// AND A FOURTH THAT DOES NOT LIVE IN THE DATABASE — and it stops every job that destroys, not
+// only this sweep. Guard (a) is a row of the very database a restore puts back (with the value it
+// had then), and guard (b) only sees one run's window. So a GENERATION number is counted up every
+// hour (the `restore-heartbeat` job, first in the hourly slot) and by every reconcile run that
+// completes — in the database (inside the cursor value) and then in one small object,
+// `sys/reconcile-generation`, outside the swept areas. The registry reads both once per slot,
+// before any job of the slot destroys anything (`detectRollback`); a job run on its own reads them
+// itself (`mayDestroy`):
+//   object  >  database    the database has gone back in time: a ROLLBACK.
+//   no object, database>0  the object was lost, or deleted to silence the alert: treated as a
+//                          rollback, exactly.
+//   unreadable object      proves nothing either way: a rollback too.
+//   no object, database 0  the first run ever: the object is written; this sweep deletes nothing.
 //   object  <= database    normal (the database ahead means an object write failed: it is
-//                          written again at the end of the run).
-// What it cannot see: a restore to a point AFTER the last run that completed (the numbers are
-// equal). The quota half is unaffected by any of this.
+//                          written again at the next count).
+//   cannot read either     `unknown`: nothing is destroyed this slot (no alert: it is no rollback).
+// On a rollback the operator is alerted and it is counted (`rollback_detected`), once per slot,
+// and NOTHING is destroyed — purge, account purge, retention, stale uploads, orphans — by this
+// slot or any later one, and the number is not counted up, until an operator brings the two
+// numbers level, deliberately, after looking. The non-destructive jobs and the quota half run.
+// Writers: the database is counted up by compare-and-set only (from the number that was read),
+// then the object is written; both writers hold one job lock (`GENERATION_LOCK`), so two runs do
+// not overlap. Readers read the object FIRST, then the database: a count in flight can then look
+// "database ahead" (normal), never "object ahead".
+// What it cannot see: a restore to a point after the last count (≤ one hour; the restore runbook
+// pauses the jobs before restoring).
 // Rows first, objects second everywhere else is what makes an unreferenced old object garbage:
 // a purge deletes its rows and then its objects, an upload writes its session row first.
 
-import { getSettings, setSetting } from "../db/queries/settings";
+import { getSettings } from "../db/queries/settings";
 import { reconcileUsedBytes } from "../db/queries/quota";
-import { knownVersions, referencedKeys, userIdsAfter } from "../db/queries/trash-jobs";
+import {
+  advanceGenerationRow,
+  knownVersions,
+  referencedKeys,
+  saveReconcilePlace,
+  userIdsAfter,
+  withJobLock,
+} from "../db/queries/trash-jobs";
 import { captureError } from "../sentry";
 import { auditInTx } from "../services/audit";
 import { sendOperatorCritical } from "../services/email";
@@ -63,7 +82,7 @@ export type ReconcileCursor = {
   /** Index into `ORPHAN_AREAS`, and the store's list cursor inside that area (null = its start). */
   area: number;
   object: string | null;
-  /** How many runs have completed. Its twin is the object `GENERATION_KEY`. */
+  /** How many times the generation was counted up. Its twin is the object `GENERATION_KEY`. */
   generation: number;
 };
 
@@ -92,8 +111,18 @@ export function readCursor(stored: unknown): ReconcileCursor {
 
 // ── the rollback detector ───────────────────────────────────────────────────────────────────
 
-/** `ok` — sweep as usual; `first` — no object yet: nothing is deleted this run; `rollback`. */
-export type GenerationState = "ok" | "first" | "rollback";
+/** The job lock of everything that counts the generation up: this job and `restore-heartbeat`. */
+export const GENERATION_LOCK = "generation";
+/** How long the lock's idle transaction may stay open: past any run (a cron runs ≤ 15 min). */
+export const GENERATION_LOCK_HOLD_MS = 15 * 60_000;
+
+/**
+ * What one reading found. `ok` / `first`: jobs may destroy (`first`: but this sweep deletes
+ * nothing); `database` is the number read, the one a count starts from. `rollback`, `unknown`:
+ * nothing is destroyed.
+ */
+export type Detection = { state: "ok" | "first"; database: number } | { state: "rollback" | "unknown" };
+export type GenerationState = Detection["state"];
 
 /** The object's number; null when there is no object; NaN when it holds anything but a number. */
 async function storedGeneration(env: Env): Promise<number | null> {
@@ -109,30 +138,76 @@ async function writeGeneration(env: Env, generation: number): Promise<void> {
 }
 
 /**
- * Compares the database's generation with the object's, before any orphan decision. An object
- * that cannot be read as a number proves nothing either way: that is `rollback` too.
+ * Compares the object's generation with the database's — the object first. Never throws: what
+ * cannot be read is `unknown` (reported and counted). A rollback alerts here, once per reading.
  */
-export async function checkGeneration(bg: BackgroundContext, database: number): Promise<GenerationState> {
-  const object = await storedGeneration(bg.env);
-  if (object === null) {
-    await writeGeneration(bg.env, database);
-    return "first";
+export async function detectRollback(bg: BackgroundContext): Promise<Detection> {
+  let object: number | null;
+  let database: number;
+  try {
+    object = await storedGeneration(bg.env);
+    database = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor).generation;
+  } catch (error) {
+    captureError(error, { kind: "job", job: "reconcile", reason: "detector" });
+    bg.metric("job", { kind: "reconcile", outcome: "detector_error" });
+    return { state: "unknown" };
   }
-  if (object <= database) return "ok";
+  if (object === null && database === 0) {
+    try {
+      await writeGeneration(bg.env, 0);
+    } catch (error) {
+      // Written at the first count instead.
+      captureError(error, { kind: "job", job: "reconcile" });
+    }
+    return { state: "first", database };
+  }
+  if (object !== null && object <= database) return { state: "ok", database };
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
   await alertRollback(bg);
-  return "rollback";
+  return { state: "rollback" };
+}
+
+/**
+ * The gate at the start of every job that destroys: true when it may. `given` is the slot's
+ * reading (the registry's); without one the job reads for itself — never "allowed" by default.
+ */
+export async function mayDestroy(
+  bg: BackgroundContext,
+  given: Detection | undefined,
+  job: string,
+): Promise<boolean> {
+  const detection = given ?? (await detectRollback(bg));
+  if (detection.state === "ok" || detection.state === "first") return true;
+  bg.metric("job", { kind: job, outcome: "rollback_stopped" });
+  return false;
+}
+
+/**
+ * Counts the generation up from the number `detection` read: the database by compare-and-set,
+ * then — only if that moved it — the object. Never on a rollback. Call it holding
+ * `GENERATION_LOCK`. False when nothing was counted (someone else moved the number first).
+ */
+export async function advanceGeneration(bg: BackgroundContext, detection: Detection): Promise<boolean> {
+  if (detection.state !== "ok" && detection.state !== "first") return false;
+  if (!(await advanceGenerationRow(bg.db, detection.database))) {
+    bg.metric("job", { kind: "reconcile", outcome: "generation_conflict" });
+    return false;
+  }
+  // The database first, then the object: a failure in between leaves the database ahead, which
+  // reads as normal and is repaired at the next count.
+  await writeGeneration(bg.env, detection.database + 1);
+  return true;
 }
 
 /**
  * The operator's alert for a database that is older than the object store. ONE call site: the
  * critical mail to every operator (sent at once, never counted or coalesced), and the report.
  * Awaited: nothing a job starts may outlive it. A mail that cannot be sent changes nothing —
- * the sweep stays stopped, and the next run alerts again.
+ * the jobs stay stopped, and the next reading alerts again.
  */
 async function alertRollback(bg: BackgroundContext): Promise<void> {
   captureError(
-    new Error("reconcile: the database is older than the object store; orphan deletion is stopped"),
+    new Error("reconcile: the database is older than the object store; every destructive job is stopped"),
     { kind: "job", job: "reconcile", reason: "rollback_detected" },
   );
   const operators = [...adminListOf(bg.env).addresses];
@@ -150,10 +225,14 @@ async function alertRollback(bg: BackgroundContext): Promise<void> {
 export type QuotaPass = {
   next: string | null;
   done: boolean;
-  /** Accounts looked at, how many were off, and the sum of what was corrected (bytes, signed). */
+  /**
+   * Accounts looked at, how many were off, the sum of what was corrected (bytes, signed), and
+   * how many could not be reconciled (skipped; the next pass tries them again).
+   */
   accounts: number;
   drifted: number;
   delta: number;
+  failed: number;
 };
 
 /** Accounts after `after`, in id order, until the end (`done`) or `stopAt`. */
@@ -165,19 +244,28 @@ export async function reconcileQuotas(
   let accounts = 0;
   let drifted = 0;
   let delta = 0;
+  let failed = 0;
   for (;;) {
     const ids = await userIdsAfter(bg.db, after, USER_BATCH);
-    if (ids.length === 0) return { next: null, done: true, accounts, drifted, delta };
+    if (ids.length === 0) return { next: null, done: true, accounts, drifted, delta, failed };
     for (const id of ids) {
-      const result = await reconcileUsedBytes(bg.db, id);
       after = id;
       accounts += 1;
-      if (result && result.delta !== 0) {
-        drifted += 1;
-        delta += result.delta;
-        bg.metric("job", { kind: "reconcile", outcome: "drift" });
+      try {
+        const result = await reconcileUsedBytes(bg.db, id);
+        if (result && result.delta !== 0) {
+          drifted += 1;
+          delta += result.delta;
+          bg.metric("job", { kind: "reconcile", outcome: "drift" });
+        }
+      } catch (error) {
+        // One account that cannot be reconciled — a deadlock, a timeout, a row that breaks the
+        // formula — must not stop the night: it is skipped, and the next pass comes back to it.
+        failed += 1;
+        captureError(error, { kind: "job", job: "reconcile" });
+        bg.metric("job", { kind: "reconcile", outcome: "error" });
       }
-      if (Date.now() >= opts.stopAt) return { next: after, done: false, accounts, drifted, delta };
+      if (Date.now() >= opts.stopAt) return { next: after, done: false, accounts, drifted, delta, failed };
     }
   }
 }
@@ -196,7 +284,7 @@ async function recordQuotaPass(bg: BackgroundContext, pass: QuotaPass): Promise<
         bg,
         "system.reconcile",
         { type: "job", id: "reconcile" },
-        { accounts: pass.accounts, drifted: pass.drifted, delta: pass.delta },
+        { accounts: pass.accounts, drifted: pass.drifted, delta: pass.delta, failed: pass.failed },
       ),
     );
   } catch (error) {
@@ -338,54 +426,70 @@ export async function sweepOrphans(
 
 // ── the job ─────────────────────────────────────────────────────────────────────────────────
 
+export type ReconcileRun = {
+  done: boolean;
+  /** What the run read (`overlap`: another run held the lock, and this one did nothing). */
+  generation: GenerationState | "overlap";
+  sweep: OrphanSweep | null;
+};
+
 /**
- * One run. `now` is the sweep's (an object's age cannot be set: see `sweepOrphans`).
- * `completed`: the run got to its end — only then is the generation counted up.
+ * One run, holding `GENERATION_LOCK` (a second run started meanwhile exits at once, counted).
+ * `detection` is the slot's reading; without one the run reads for itself. `now` is the sweep's
+ * (an object's age cannot be set: see `sweepOrphans`).
  */
 export async function runReconcile(
   bg: BackgroundContext,
-  opts: { softDeadlineMs: number; now?: Date },
-): Promise<{ done: boolean; generation: GenerationState; sweep: OrphanSweep | null }> {
-  const startedAt = Date.now();
-  const cursor = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor);
-  // Before any orphan decision: is this database older than the object store?
-  const generation = await checkGeneration(bg, cursor.generation);
+  opts: { softDeadlineMs: number; now?: Date; detection?: Detection },
+): Promise<ReconcileRun> {
+  const locked = await withJobLock(bg.db, GENERATION_LOCK, GENERATION_LOCK_HOLD_MS, () =>
+    reconcileOnce(bg, opts),
+  );
+  if (locked.held) return locked.value;
+  bg.metric("job", { kind: "reconcile", outcome: "overlap" });
+  return { done: true, generation: "overlap", sweep: null };
+}
 
-  // Half the budget each, so a long quota pass never starves the sweep (and the reverse).
-  const quota = await reconcileQuotas(bg, {
-    after: cursor.user,
-    stopAt: startedAt + opts.softDeadlineMs / 2,
-  });
-  await recordQuotaPass(bg, quota);
+async function reconcileOnce(
+  bg: BackgroundContext,
+  opts: { softDeadlineMs: number; now?: Date; detection?: Detection },
+): Promise<ReconcileRun> {
+  const startedAt = Date.now();
+  const detection = opts.detection ?? (await detectRollback(bg));
+  const place = readCursor((await getSettings(bg.db, { fresh: true })).reconcileCursor);
+
+  let quota: QuotaPass | null = null;
   let sweep: OrphanSweep | null = null;
+  // `completed`: the run got to its end — only then is the generation counted up.
   let completed = false;
   try {
-    if (generation === "ok") {
-      sweep = await sweepOrphans(bg, {
-        from: cursor,
-        stopAt: startedAt + opts.softDeadlineMs,
-        now: opts.now,
-      });
+    // The quota half is never gated, and its failure does not stop the sweep.
+    try {
+      // Half the budget each, so a long quota pass never starves the sweep (and the reverse).
+      quota = await reconcileQuotas(bg, { after: place.user, stopAt: startedAt + opts.softDeadlineMs / 2 });
+    } catch (error) {
+      captureError(error, { kind: "job", job: "reconcile" });
+      bg.metric("job", { kind: "reconcile", outcome: "error" });
+    }
+    if (quota) await recordQuotaPass(bg, quota);
+    if (detection.state === "ok") {
+      sweep = await sweepOrphans(bg, { from: place, stopAt: startedAt + opts.softDeadlineMs, now: opts.now });
     }
     completed = true;
   } finally {
-    // Whatever the sweep did, the quota pass keeps its place. A rolled-back database's number is
-    // never counted up by the job: only an operator moves it.
-    const counted = completed && generation !== "rollback";
-    const next: ReconcileCursor = {
-      user: quota.next,
-      area: sweep ? sweep.area : cursor.area,
-      object: sweep ? sweep.object : cursor.object,
-      generation: counted ? cursor.generation + 1 : cursor.generation,
-    };
-    await setSetting(bg.db, "reconcileCursor", next, null);
-    // The database first, then the object: a failure in between leaves the database ahead,
-    // which the next run reads as normal and repairs.
-    if (counted) await writeGeneration(bg.env, next.generation);
+    // Whatever happened, each half keeps its place; the generation in the same value is not
+    // touched here.
+    await saveReconcilePlace(bg.db, {
+      user: quota ? quota.next : place.user,
+      area: sweep ? sweep.area : place.area,
+      object: sweep ? sweep.object : place.object,
+    });
   }
+  // A rolled-back (or unread) database is never counted up by the job: only an operator acts.
+  if (completed) await advanceGeneration(bg, detection);
   return {
-    done: quota.done && sweep !== null && sweep.outcome === "swept" && sweep.done,
-    generation,
+    done: quota !== null && quota.done && sweep !== null && sweep.outcome === "swept" && sweep.done,
+    generation: detection.state,
     sweep,
   };
 }
@@ -393,9 +497,11 @@ export async function runReconcile(
 export const job: Job = {
   name: "reconcile",
   cron: "0 2 * * *",
+  guarded: true,
   async run(bg, _env, _event, opts) {
     const { done } = await runReconcile(bg, {
       softDeadlineMs: opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS,
+      detection: opts?.detection,
     });
     return { done };
   },

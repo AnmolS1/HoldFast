@@ -29,6 +29,7 @@ import { captureError } from "../sentry";
 import type { BackgroundContext } from "../services/request-context";
 import { storage } from "../services/storage";
 import type { Job } from "./index";
+import { mayDestroy } from "./reconcile";
 
 export const STALE_UPLOAD_BATCH = 200;
 const DEFAULT_SOFT_DEADLINE_MS = 60_000;
@@ -83,7 +84,10 @@ async function settle(bg: BackgroundContext, listed: Upload): Promise<Settled> {
 export const job: Job = {
   name: "stale-uploads",
   cron: "3 * * * *",
+  guarded: true,
   async run(bg, _env, _event, opts) {
+    // A database that has gone back in time destroys nothing (reconcile.ts, the detector).
+    if (!(await mayDestroy(bg, opts?.detection, "stale-uploads"))) return { done: false };
     const stopAt = Date.now() + (opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS);
     const seen = new Set<string>();
     for (;;) {

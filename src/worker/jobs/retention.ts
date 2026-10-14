@@ -28,6 +28,7 @@ import { deleteExpired, UPLOAD_IP_RETENTION_DAYS } from "../db/queries/upload-ip
 import { trimFinished } from "../db/queries/uploads";
 import { captureError } from "../sentry";
 import type { Job } from "./index";
+import { mayDestroy } from "./reconcile";
 
 /** Rows per statement. */
 export const RETENTION_BATCH = 5_000;
@@ -51,7 +52,10 @@ export const RETENTION_STEPS: ReadonlyArray<{
 export const job: Job = {
   name: "retention",
   cron: "5 0 * * *",
+  guarded: true,
   async run(bg, _env, _event, opts) {
+    // A database that has gone back in time destroys nothing (reconcile.ts, the detector).
+    if (!(await mayDestroy(bg, opts?.detection, "retention"))) return { done: false };
     const stopAt = Date.now() + (opts?.softDeadlineMs ?? DEFAULT_SOFT_DEADLINE_MS);
     let done = true;
     for (const step of RETENTION_STEPS) {

@@ -12,11 +12,15 @@ import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
+import { reconcileUsedBytes } from "../../../src/worker/db/queries/quota";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import { trash as trashQuery } from "../../../src/worker/db/queries/trash";
+import { userIdsAfter } from "../../../src/worker/db/queries/trash-jobs";
 import { nodes, settings as settingsTable } from "../../../src/worker/db/schema";
 import { purgeRoot } from "../../../src/worker/jobs/purge";
 import {
+  advanceGeneration,
+  detectRollback,
   job as reconcileJob,
   GENERATION_KEY,
   ORPHAN_AREAS,
@@ -25,6 +29,7 @@ import {
   runReconcile,
   sweepOrphans,
 } from "../../../src/worker/jobs/reconcile";
+import { job as heartbeat } from "../../../src/worker/jobs/restore-heartbeat";
 import { nameKeyOf } from "../../../src/worker/services/filename";
 import { captureError } from "../../../src/worker/sentry";
 import { sendOperatorCritical } from "../../../src/worker/services/email";
@@ -34,6 +39,7 @@ import { ADMIN_EMAIL, realCore } from "../auth/helpers";
 import {
   audits,
   cronEvent,
+  gate,
   jobContext,
   keysUnder,
   makeDue,
@@ -58,6 +64,20 @@ vi.mock("../../../src/worker/sentry", async (original) => {
   const real = await original<typeof import("../../../src/worker/sentry")>();
   return { ...real, captureError: vi.fn(real.captureError) };
 });
+
+// Seams for one failing account, a failing account list, and a run held mid-way.
+vi.mock("../../../src/worker/db/queries/quota", async (original) => {
+  const real = await original<typeof import("../../../src/worker/db/queries/quota")>();
+  return { ...real, reconcileUsedBytes: vi.fn(real.reconcileUsedBytes) };
+});
+vi.mock("../../../src/worker/db/queries/trash-jobs", async (original) => {
+  const real = await original<typeof import("../../../src/worker/db/queries/trash-jobs")>();
+  return { ...real, userIdsAfter: vi.fn(real.userIdsAfter) };
+});
+const realQuota = () =>
+  vi.importActual<typeof import("../../../src/worker/db/queries/quota")>(
+    "../../../src/worker/db/queries/quota",
+  );
 
 vi.mock("../../../src/worker/services/email", async (original) => {
   const real = await original<typeof import("../../../src/worker/services/email")>();
@@ -168,8 +188,8 @@ describe("reconcile: the quota half", () => {
     const rows = (await audits("system.reconcile", "reconcile")).filter((row) => row.at >= since);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ actorType: "system", actorUserId: null, targetType: "job" });
-    const meta = rows[0]!.meta as { accounts: number; drifted: number; delta: number };
-    expect(Object.keys(meta).sort()).toEqual(["accounts", "delta", "drifted"]);
+    const meta = rows[0]!.meta as { accounts: number; drifted: number; delta: number; failed: number };
+    expect(Object.keys(meta).sort()).toEqual(["accounts", "delta", "drifted", "failed"]);
     // The whole walk: this file's three and whatever else was off — never fewer.
     expect(meta.drifted).toBeGreaterThanOrEqual(3);
     expect(meta.accounts).toBeGreaterThanOrEqual(meta.drifted);
@@ -393,6 +413,11 @@ describe("reconcile: the orphan sweep", () => {
       vi.mocked(sendOperatorCritical).mockClear();
     });
     const run = (ctx = jobContext()) => runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+    /** One hourly heartbeat, on its own. */
+    const beat = async (ctx = jobContext()) => {
+      await heartbeat.run(ctx.bg, env, cronEvent(heartbeat.cron));
+      return ctx;
+    };
 
     it("a database that has gone back in time: no orphan is deleted, by this run or the next; an alert each run; until an operator moves the number", async () => {
       const p = await planted();
@@ -469,6 +494,141 @@ describe("reconcile: the orphan sweep", () => {
       await env.FILES.delete([...p.orphans, p.odd]);
     });
 
+    it("no object while the database has counted (> 0) — lost, or deleted to silence the alert: a rollback, exactly; until an operator acts", async () => {
+      const p = await planted();
+      await generations(3, null);
+      const ctx = jobContext();
+      expect((await run(ctx)).generation).toBe("rollback");
+      expect(await present(p.orphans)).toEqual(p.orphans);
+      expect(ctx.outcomes("reconcile")).toContain("rollback_detected");
+      expect(alerts()).toHaveLength(1);
+      expect(mails()).toEqual([[ADMIN_EMAIL, "database_rollback"]]);
+      // Not re-armed by itself: the object is not written, the number not counted.
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, null]);
+      expect((await run()).generation).toBe("rollback");
+      expect(await objectGeneration()).toBeNull();
+      // The operator puts the object back with the database's number (after looking).
+      await generations(3, 3);
+      expect((await run()).generation).toBe("ok");
+      expect(await present(p.orphans)).toEqual([]);
+      await env.FILES.delete(p.odd);
+    });
+
+    it("an object store that cannot be read proves nothing: `unknown` — the quota half runs, nothing is swept or counted, no alert", async () => {
+      const owner = await consistent();
+      await setUsedBytes(owner.id, 3);
+      await generations(2, 2, { user: justBefore(owner.id) });
+      const broken = new Proxy(env.FILES, {
+        get: (target, name) =>
+          name === "get"
+            ? async () => {
+                throw new Error("R2 is unavailable");
+              }
+            : Reflect.get(target, name, target),
+      });
+      const ctx = jobContext({ env: { FILES: broken } });
+      const result = await runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+      expect(result).toMatchObject({ generation: "unknown", sweep: null });
+      expect(ctx.outcomes("reconcile")).toContain("detector_error");
+      expect(await usedBytes(owner.id)).toBe(1200);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([2, "2"]);
+      expect(alerts()).toHaveLength(0);
+      expect(mails()).toEqual([]);
+    });
+
+    describe("the restore heartbeat (hourly)", () => {
+      it("counts both numbers up by one — so a restore to any point before it reads as a rollback; a rolled-back database it does not count", async () => {
+        await generations(4, 4);
+        expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "5"]);
+        // The database is restored to a point before that heartbeat.
+        await generations(4, 5);
+        const p = await planted();
+        expect((await run()).generation).toBe("rollback");
+        expect(await present(p.orphans)).toEqual(p.orphans);
+        const ctx = await beat();
+        expect(ctx.outcomes("restore-heartbeat")).toEqual(["not_counted"]);
+        expect(ctx.outcomes("reconcile")).toContain("rollback_detected");
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([4, "5"]);
+        await generations(5, 5);
+        await env.FILES.delete([...p.orphans, p.odd]);
+      });
+
+      it("the first ever: the object is written, then both are counted", async () => {
+        await generations(0, null);
+        await beat();
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([1, "1"]);
+      });
+    });
+
+    describe("writers that overlap (m2)", () => {
+      /** Holds the run inside its quota pass, on the first account, until `held` opens. */
+      function holdFirstAccount() {
+        const held = gate();
+        const inside = gate();
+        vi.mocked(reconcileUsedBytes).mockImplementationOnce(async (...args) => {
+          inside.open();
+          await held.opened;
+          return (await realQuota()).reconcileUsedBytes(...args);
+        });
+        return { held, inside };
+      }
+
+      it("a second run, and the heartbeat, while a run holds the lock: each exits at once, counted — and the number is counted up once", async () => {
+        const owner = await consistent();
+        await generations(6, 6, { user: justBefore(owner.id) });
+        const { held, inside } = holdFirstAccount();
+        const first = runReconcile(jobContext().bg, { softDeadlineMs: 400, now: inHours(72) });
+        await inside.opened;
+        const other = jobContext();
+        expect(await runReconcile(other.bg, { softDeadlineMs: 400, now: inHours(72) })).toEqual({
+          done: true,
+          generation: "overlap",
+          sweep: null,
+        });
+        expect(other.outcomes("reconcile")).toEqual(["overlap"]);
+        expect((await beat()).outcomes("restore-heartbeat")).toEqual(["overlap"]);
+        held.open();
+        expect((await first).generation).toBe("ok");
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([7, "7"]);
+        // Once the lock is free, the next one runs.
+        expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
+      });
+
+      it("a number moved while a run works — an operator, a restore — is kept: the run's place write leaves it, and its count is a compare-and-set that loses", async () => {
+        const owner = await consistent();
+        await generations(5, 5, { user: justBefore(owner.id) });
+        const { held, inside } = holdFirstAccount();
+        const ctx = jobContext();
+        const running = runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+        await inside.opened;
+        // The operator brings the database's number to 9 while the run is in its quota pass.
+        await generations(9, 5, { user: justBefore(owner.id) });
+        held.open();
+        await running;
+        expect(ctx.outcomes("reconcile")).toContain("generation_conflict");
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([9, "5"]);
+        // …and the run still kept its own place.
+        const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
+        expect(cursor.user).not.toBe(justBefore(owner.id));
+        await generations(9, 9);
+      });
+
+      it("a count from a number that is no longer the database's counts nothing: neither number moves", async () => {
+        await generations(5, 5);
+        const ctx = jobContext();
+        const reading = await detectRollback(ctx.bg);
+        expect(reading).toEqual({ state: "ok", database: 5 });
+        // Restored (or moved) between the reading and the count.
+        await generations(3, 5);
+        expect(await advanceGeneration(ctx.bg, reading)).toBe(false);
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, "5"]);
+        // A rollback reading counts nothing at all.
+        expect(await advanceGeneration(ctx.bg, { state: "rollback" })).toBe(false);
+        await generations(5, 5);
+      });
+    });
+
     it("the generation object is outside every swept area", () => {
       for (const area of ORPHAN_AREAS) expect(GENERATION_KEY.startsWith(area)).toBe(false);
     });
@@ -530,5 +690,53 @@ describe("reconcile: the orphan sweep", () => {
     const below = await sweepOrphans(jobContext().bg, { from: START, stopAt: FAR, now: inHours(49) });
     expect(below).toMatchObject({ outcome: "swept", listed: 900, candidates: 500, deleted: 500, done: true });
     expect(await keysUnder("u/")).toEqual(referenced.map((row) => row.r2Key).sort());
+  });
+});
+
+describe("reconcile: a failure in the quota half (m3)", () => {
+  it("one account that cannot be reconciled is skipped and counted: the walk goes on, its place is saved, the sweep and the count still happen", async () => {
+    const p = await planted();
+    const bad = await consistent();
+    await setUsedBytes(bad.id, 5);
+    await generations(2, 2, { user: justBefore(bad.id) });
+    vi.mocked(reconcileUsedBytes).mockImplementationOnce(async () => {
+      throw new Error("canceling statement due to statement timeout");
+    });
+    const ctx = jobContext();
+    const since = new Date(Date.now() - 1000);
+    const result = await runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+    expect(result.generation).toBe("ok");
+    // Skipped, not corrected; counted and reported.
+    expect(await usedBytes(bad.id)).toBe(5);
+    expect(ctx.outcomes("reconcile")).toContain("error");
+    // Its place moved on past it.
+    const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
+    expect(cursor.user).not.toBe(justBefore(bad.id));
+    // The record says so.
+    const rows = (await audits("system.reconcile", "reconcile"))
+      .filter((row) => row.at >= since)
+      .sort((a, b) => a.at.getTime() - b.at.getTime());
+    expect((rows.at(-1)!.meta as { failed: number }).failed).toBe(1);
+    // The sweep ran, and the run was counted.
+    expect(await present(p.orphans)).toEqual([]);
+    expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, "3"]);
+    await env.FILES.delete(p.odd);
+  });
+
+  it("an account list that cannot be read stops the quota half only: the sweep and the count still happen, its place is kept", async () => {
+    const p = await planted();
+    await generations(2, 2, { user: "kept-place" });
+    vi.mocked(userIdsAfter).mockImplementationOnce(async () => {
+      throw new Error("connection terminated");
+    });
+    const ctx = jobContext();
+    const result = await runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+    expect(result.generation).toBe("ok");
+    expect(ctx.outcomes("reconcile")).toContain("error");
+    expect(await present(p.orphans)).toEqual([]);
+    expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, "3"]);
+    const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
+    expect(cursor.user).toBe("kept-place");
+    await env.FILES.delete(p.odd);
   });
 });
