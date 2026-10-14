@@ -1,6 +1,7 @@
 // The upload queue: a module-scope store, so it survives route changes without a provider.
 // `manager.ts` is the only writer; components read it with `useUploads()`.
 import { useSyncExternalStore } from "react";
+import { reportError } from "../../lib/sentry";
 import type { ScanReason, ScanStatus } from "../../../shared/schemas/common";
 import type { CompleteUploadBody, InitUploadBody, UploadedPart } from "../../../shared/schemas/upload";
 
@@ -131,7 +132,11 @@ let announcementId = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
 
-/** A change readers must see at once is waiting for the end of the current task's work. */
+/**
+ * A change is waiting to be told: the listeners are told once, in a microtask queued at the first
+ * change (so the changes made before the next microtask checkpoint — an `await` ends it — are one
+ * publication). `getUploads()` sees every change at once.
+ */
 let loud = false;
 /** The snapshot was renewed and the listeners have not been told yet. */
 let untold = false;
@@ -150,16 +155,27 @@ function flush(): void {
   renew();
   if (!untold) return;
   untold = false;
-  for (const listener of Array.from(listeners)) listener();
+  for (const listener of Array.from(listeners)) {
+    // Told from a microtask, a listener's failure has no caller to land in: it is reported, and
+    // the listeners after it are still told.
+    try {
+      listener();
+    } catch (cause) {
+      reportError(cause, { where: "upload store listener" });
+    }
+  }
 }
 
-/** `quiet` changes (progress samples) are coalesced; everything else is published at once. */
+/**
+ * `quiet` changes (progress samples) are told at most every `PROGRESS_FLUSH_MS`; every other
+ * change is told in a microtask after the first change of its burst. Readers see both at once.
+ */
 function touch(quiet: boolean): void {
   dirty = true;
   if (quiet) timer ??= setTimeout(flush, PROGRESS_FLUSH_MS);
   else if (!loud) {
-    // One publication for a burst of changes (a run's steps, a pump starting three files):
-    // the listeners are told once, at the end of it. A reader in between still sees every change.
+    // One publication for a burst of changes (a pump starting three files; a run's steps up to
+    // its next await). A reader in between still sees every change.
     loud = true;
     queueMicrotask(flush);
   }
