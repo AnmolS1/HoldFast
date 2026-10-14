@@ -26,7 +26,7 @@ import {
   type ErrorEnvelope,
   type InternalErrorEnvelope,
 } from "../../shared/errors";
-import { QueryError } from "../db/errors";
+import { asQueryError, QueryError } from "../db/errors";
 import { captureError } from "../sentry";
 import { writeMetric } from "./metrics";
 import type { AppEnv } from "./request-context";
@@ -121,7 +121,10 @@ function fromQueryError(error: QueryError): AppError | null {
 
 function asAppError(error: unknown): AppError | null {
   if (error instanceof AppError) return error;
-  if (error instanceof QueryError) return fromQueryError(error);
+  // Also the QueryError a statement threw INSIDE Drizzle (wrapped as `cause`), and a NUL Postgres
+  // refused (db/errors.ts#asQueryError).
+  const query = asQueryError(error);
+  if (query) return fromQueryError(query);
   if (error instanceof ZodError) {
     return new AppError("validation", undefined, {
       issues: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),

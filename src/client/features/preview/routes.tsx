@@ -1,14 +1,14 @@
-// PLACEHOLDER — taken over by the preview task (T18), which replaces this module and keeps the `routes` export.
+// `/preview/:nodeId` — a modal route. The frame renders it above the page named by `state.from`,
+// which stays mounted underneath; siblings open it with
+//   navigate("/preview/" + id, { state: { siblingIds, from } })
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
+import { PreviewRoute } from "./PreviewRoute";
 
-// An overlay route: the frame renders it above the content pane and keeps the page named by
-// `location.state.from` mounted underneath.
 export const routes: RouteObject[] = [
   {
     path: "preview/:nodeId",
-    element: <PlaceholderPage name={t("nav.preview")} />,
+    element: <PreviewRoute />,
     handle: { overlay: true, title: t("nav.preview") },
   },
 ];

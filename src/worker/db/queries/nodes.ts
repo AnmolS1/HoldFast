@@ -15,6 +15,7 @@ import {
   type Node,
   nodes,
   nodeVersions,
+  scanJobs,
   type ScanDetail,
   type ScanReason,
   type ScanStatus,
@@ -24,7 +25,16 @@ import {
   user,
 } from "../schema";
 import { lostByLeaving } from "./holds";
-import { isDescendantOrSelf, effectiveTrashed, lockOwnerTree, notEffectivelyTrashedOrHidden } from "./tree";
+import { SCAN_CLAIM_STALE_MINUTES } from "./scan-jobs";
+import {
+  effectiveHidden,
+  isDescendantOrSelf,
+  lockOwnerTree,
+  NO_SUCH_OWNER_ID,
+  nodeVisibility,
+  notEffectivelyTrashedOrHidden,
+  notHiddenRow,
+} from "./tree";
 
 export type NodeSort = "name" | "size" | "updated" | "kind";
 export type SortDir = "asc" | "desc";
@@ -365,7 +375,13 @@ async function withNameConflict<T>(db: Executor, write: (tx: Executor) => Promis
 /**
  * Creates a folder. `ownerId` is the owner of the tree, `createdBy` the caller (an editor inside
  * a shared folder is not the owner). `not_found` when the parent is not a live folder of that
- * owner; `conflict` when the name is taken; `validation` for an unusable name.
+ * owner — in the trash or hidden, itself or by a folder above it, included; `conflict` when the
+ * name is taken; `validation` for an unusable name.
+ *
+ * The parent's state is read before the insert, not under a lock: a folder created in the
+ * instant its parent is trashed or taken down is inside it, and is trashed or hidden with it.
+ * Every `not_found` costs the same two reads, whatever its reason. (`conflict` is the unique
+ * index's answer, and the index knows every live name in the folder — a hidden sibling's too.)
  */
 export async function createFolder(
   db: Executor,
@@ -373,11 +389,19 @@ export async function createFolder(
 ): Promise<Node> {
   const name = sanitizeName(args.name);
   if (args.parentId !== null) {
+    // Both reads, then the decision: a hidden parent costs what an id that was never issued costs.
     const parent = await getNode(db, args.parentId);
-    if (!parent || parent.kind !== "folder" || parent.ownerId !== args.ownerId || parent.system !== null) {
+    const place = await nodeVisibility(db, args.parentId);
+    if (
+      !parent ||
+      parent.kind !== "folder" ||
+      parent.ownerId !== args.ownerId ||
+      parent.system !== null ||
+      place.trashed ||
+      place.hidden
+    ) {
       throw new QueryError("not_found");
     }
-    if (await effectiveTrashed(db, parent.id)) throw new QueryError("not_found");
   }
   return withNameConflict(db, async (tx) => {
     const [row] = await tx
@@ -397,7 +421,11 @@ export async function createFolder(
   });
 }
 
-/** Rewrites `name`, `nameKey` and `ext` together. The object key and version do not change. */
+/**
+ * Rewrites `name`, `nameKey` and `ext` together. The object key and version do not change.
+ * `not_found` for an id that does not exist, a system node, and a HIDDEN node (`notHiddenRow`,
+ * in the statement itself): the name of a file that is locked or taken down is not altered.
+ */
 export async function rename(db: Executor, nodeId: string, rawName: string): Promise<Node> {
   const name = sanitizeName(rawName);
   if (!isUuid(nodeId)) throw new QueryError("not_found");
@@ -410,32 +438,58 @@ export async function rename(db: Executor, nodeId: string, rawName: string): Pro
         ext: sql`CASE WHEN ${nodes.kind} = 'file' THEN ${extOf(name)} ELSE '' END`,
         updatedAt: sql`now()`,
       })
-      .where(and(eq(nodes.id, nodeId), isNull(nodes.system)))
+      .where(and(eq(nodes.id, nodeId), isNull(nodes.system), notHiddenRow()))
       .returning();
     if (!row) throw new QueryError("not_found");
     return row;
   });
 }
 
+export type Moved = {
+  /** The row as it is now. */
+  node: Node;
+  /** Where it was, read under the tree lock: what an audit row's `from` is. */
+  previousParentId: string | null;
+  /** False when it already was there: nothing was written, and there is nothing to record. */
+  changed: boolean;
+};
+
 /**
  * Moves a node under another folder of the same owner (null = the top level). One transaction:
  * it takes the owner's TREE LOCK first (queries/tree.ts — two concurrent moves could otherwise
- * each pass the cycle check and together build a cycle, and a purge or a hold being placed
- * could otherwise decide on a tree that is changing), then the node and the target are locked
- * `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found` for a missing, trashed
- * (itself or under a trashed folder), system or foreign node or target.
+ * each pass the cycle check and together build a cycle, and a purge, a hold or a takedown being
+ * placed could otherwise decide on a tree that is changing), then the node and the target are
+ * locked `FOR UPDATE`. `conflict` for a cycle or a name collision; `not_found` for a missing,
+ * trashed (itself or under a trashed folder), system or foreign node or target.
+ *
+ * `not_found` as well — nothing written — for a node or a target that is HIDDEN: taken down
+ * itself or by a folder above it, or locked as suspected CSAM. Decided here, under the locks,
+ * not on what the caller read before: a takedown takes this tree lock (`moderation.takedownNode`
+ * — the admin's and a notice's alike) and the CSAM lock and the verdict writer take the node's
+ * row, so each has either committed and is seen, or waits until the move is done. Without it a
+ * file moved out of a folder as that folder is taken down would come out visible.
  *
  * `LegalHoldError` — the purge gate's own error, the cause in it, and like there NEVER to be
  * shown to the caller — when the move would take the node out from under a folder that is on
  * legal hold or named by an open notice: outside it nothing would protect the node, and it
  * could be trashed and purged. Nothing is moved.
+ *
+ * THE SAME WORK FOR EVERY `not_found`: whatever makes it one — no such node, a foreign, system,
+ * trashed or hidden node, or any of those for the target — the same statements have been sent
+ * (the tree lock of an owner no account has, when there is no node to read one from), and all of
+ * them are answered before the cycle is looked for: a hidden node or target is `not_found`
+ * exactly as an id that was never issued, never a `conflict`. What is NOT hidden by this: the
+ * name. A `conflict` on the name comes from the unique index, which knows every live name in
+ * the destination — a hidden sibling's included.
+ *
+ * Returns where the node was as well: the caller's own earlier read of the parent is not the
+ * move's (two moves racing), and `changed: false` is a move that did nothing.
  */
-export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
+export async function moveNode(db: Executor, nodeId: string, newParentId: string | null): Promise<Moved> {
   if (!isUuid(nodeId) || (newParentId !== null && !isUuid(newParentId))) throw new QueryError("not_found");
   const peek = await getNode(db, nodeId);
-  if (!peek) throw new QueryError("not_found");
   return withNameConflict(db, async (tx) => {
-    await lockOwnerTree(tx, peek.ownerId);
+    await lockOwnerTree(tx, peek ? peek.ownerId : NO_SUCH_OWNER_ID);
     const ids = newParentId === null ? [nodeId] : [nodeId, newParentId];
     const locked = await tx
       .select()
@@ -443,24 +497,42 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
       .where(inArray(nodes.id, ids))
       .orderBy(nodes.id)
       .for("update");
-    const node = locked.find((row) => row.id === nodeId);
-    if (!node || node.system !== null || node.deletedAt !== null || node.ownerId !== peek.ownerId) {
-      throw new QueryError("not_found");
-    }
+    // Read now, under the locks — and read for every question, before anything is decided.
     // Trashed by ancestry too: moving a node out of a trashed folder would be a restore that
     // skips `restore` (and takes content out of a folder whose purge may already be requested).
-    if (await effectiveTrashed(tx, nodeId)) throw new QueryError("not_found");
+    // Hidden, itself or by ancestry: at its new place it would no longer be under the folder
+    // that hides it.
+    const here = await nodeVisibility(tx, nodeId);
+    const there = newParentId === null ? null : await nodeVisibility(tx, newParentId);
+    const node = locked.find((row) => row.id === nodeId);
+    if (
+      !peek ||
+      !node ||
+      node.system !== null ||
+      node.ownerId !== peek.ownerId ||
+      here.trashed ||
+      here.hidden
+    ) {
+      throw new QueryError("not_found");
+    }
     if (newParentId !== null) {
       const target = locked.find((row) => row.id === newParentId);
-      if (!target || target.kind !== "folder" || target.system !== null || target.ownerId !== node.ownerId) {
+      if (
+        !target ||
+        target.kind !== "folder" ||
+        target.system !== null ||
+        target.ownerId !== node.ownerId ||
+        !there ||
+        there.trashed ||
+        there.hidden
+      ) {
         throw new QueryError("not_found");
       }
       if (await isDescendantOrSelf(tx, newParentId, nodeId)) {
         throw new QueryError("conflict", "a folder cannot be moved into itself");
       }
-      if (await effectiveTrashed(tx, newParentId)) throw new QueryError("not_found");
     }
-    if (node.parentId === newParentId) return node;
+    if (node.parentId === newParentId) return { node, previousParentId: node.parentId, changed: false };
     // A hold or an open notice on a folder above protects this node only while it stays under
     // it: a move that would take it OUT from under one is refused. Moving within that folder, or
     // into a protected one, is fine; a hold of the node's own travels with it.
@@ -471,22 +543,30 @@ export async function move(db: Executor, nodeId: string, newParentId: string | n
       .set({ parentId: newParentId, updatedAt: sql`now()` })
       .where(eq(nodes.id, nodeId))
       .returning();
-    return row!;
+    return { node: row!, previousParentId: node.parentId, changed: true };
   });
 }
 
-/** False when no such node exists. */
+/** `moveNode`, for a caller that only wants the row. */
+export async function move(db: Executor, nodeId: string, newParentId: string | null): Promise<Node> {
+  return (await moveNode(db, nodeId, newParentId)).node;
+}
+
+/** False when no such node exists — a hidden node (`notHiddenRow`) included: nothing is written. */
 export async function setStar(db: Executor, nodeId: string, starred: boolean): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
   const rows = await db
     .update(nodes)
     .set({ starred })
-    .where(and(eq(nodes.id, nodeId), isNull(nodes.system)))
+    .where(and(eq(nodes.id, nodeId), isNull(nodes.system), notHiddenRow()))
     .returning({ id: nodes.id });
   return rows.length > 0;
 }
 
-/** Sets `lastAccessedAt`, at most once per 10 minutes per node. True when it wrote. */
+/**
+ * Sets `lastAccessedAt`, at most once per 10 minutes per node. True when it wrote. Never on a
+ * hidden node (`notHiddenRow`): nobody opened it.
+ */
 export async function touchAccessed(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
   const rows = await db
@@ -496,6 +576,7 @@ export async function touchAccessed(db: Executor, nodeId: string): Promise<boole
       and(
         eq(nodes.id, nodeId),
         sql`(${nodes.lastAccessedAt} IS NULL OR ${nodes.lastAccessedAt} < now() - interval '10 minutes')`,
+        notHiddenRow(),
       ),
     )
     .returning({ id: nodes.id });
@@ -504,7 +585,10 @@ export async function touchAccessed(db: Executor, nodeId: string): Promise<boole
 
 /**
  * The owner-rescan throttle: one request per node per hour, taken atomically. False = throttled
- * (or no such node). Whether the node's status allows a rescan is the caller's check.
+ * (or no such node). Whether the node's status allows a rescan is the caller's check — and
+ * whether it is hidden: this stamps the throttle only, and `scanning.enqueueRescan` decides on
+ * the locked row and refuses a hidden node there. (No hidden test here on purpose: false means
+ * "throttled" to the caller, which a node hidden in this instant must not be answered with.)
  */
 export async function requestRescan(db: Executor, nodeId: string): Promise<boolean> {
   if (!isUuid(nodeId)) return false;
@@ -639,11 +723,35 @@ export async function resetToPending(db: Executor, nodeId: string): Promise<bool
 }
 
 /**
+ * Is a scan of this object key under way right now? True when its `scan_jobs` row is `running`
+ * and was claimed less than `SCAN_CLAIM_STALE_MINUTES` ago — exactly the claim `scan-jobs.claim`
+ * will NOT hand to another delivery (an older `running` row is a dead claim: it is taken over).
+ * A `pending` node whose key has no live job is waiting for a message that may never come (the
+ * send failed after the reset committed): that is the node a rescan may be re-sent for.
+ */
+export async function hasLiveScanJob(db: Executor, r2Key: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: scanJobs.id })
+    .from(scanJobs)
+    .where(
+      and(
+        eq(scanJobs.r2Key, r2Key),
+        eq(scanJobs.status, "running"),
+        sql`${scanJobs.startedAt} >= now() - make_interval(mins => ${SCAN_CLAIM_STALE_MINUTES})`,
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
+}
+
+/**
  * Replace: the node keeps its id, name, shares and links and gets a new current version; the
  * previous one moves to `node_versions` for 30 days. Guarded — allowed only while the node is
- * `clean`, `skipped` or `error`, not taken down, and neither it nor its owner is on legal hold:
+ * `clean`, `skipped` or `error`, not taken down — itself or by a folder above it — and neither
+ * it nor its owner is on legal hold:
  *   `scan_pending` for `pending`; `scan_blocked` for `infected` / `under_review`;
- *   `not_found` for `suspected_csam`, a held or taken-down node, a folder, or no node at all.
+ *   `not_found` for `suspected_csam`, a held or taken-down node (also one inside a taken-down
+ *   folder), a folder, or no node at all.
  * The new version starts `pending`. `createdBy` becomes the node's uploader.
  * Returns the previous `versionId`, so the caller can delete that version's thumbnails.
  * No quota arithmetic: the upload's reservation becomes the new version, and the old version
@@ -659,18 +767,26 @@ export async function replaceVersion(
     // Lock order: the owner's `user` row FIRST, then the node (the order of the purge, the
     // reconcile and the CSAM lock — see queries/quota.ts). Locked, not just read: a legal hold
     // being placed on the account either is seen here or waits for this Replace to commit.
+    // THE SAME READS FOR EVERY `not_found` — no such node, a folder, a system node, a locked,
+    // held or hidden one: all four are sent before anything is decided (the row of an owner no
+    // account has, when there is no node to read one from).
     const [peek] = await sp.select({ ownerId: nodes.ownerId }).from(nodes).where(eq(nodes.id, nodeId));
-    if (!peek) throw new QueryError("not_found");
     const [owner] = await sp
       .select({ legalHold: user.legalHold })
       .from(user)
-      .where(eq(user.id, peek.ownerId))
+      .where(eq(user.id, peek ? peek.ownerId : NO_SUCH_OWNER_ID))
       .for("update");
     const [node] = await sp.select().from(nodes).where(eq(nodes.id, nodeId)).for("update");
-    if (!node || node.kind !== "file" || node.system !== null || node.ownerId !== peek.ownerId) {
+    // By ancestry too, read with the row held: a file inside a taken-down folder is as hidden as
+    // one taken down itself. (No tree lock here — the owner's row is already held, and the tree
+    // lock comes before every row lock: a takedown of a folder above that commits after this
+    // read is the same as the Replace having come first.)
+    const hidden = await effectiveHidden(sp, nodeId);
+    if (!peek || !node || node.kind !== "file" || node.system !== null || node.ownerId !== peek.ownerId) {
       throw new QueryError("not_found");
     }
     if (
+      hidden ||
       node.scanStatus === "suspected_csam" ||
       node.legalHold ||
       node.takedownAt !== null ||

@@ -24,7 +24,7 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { ZodError } from "zod";
 import { INTERNAL_ERROR } from "../../shared/errors";
-import { QueryError } from "../db/errors";
+import { asQueryError } from "../db/errors";
 import { captureError } from "../sentry";
 import { audit, type AuditOptions, type AuditTarget } from "../services/audit";
 import { AppError } from "../services/errors";
@@ -146,7 +146,7 @@ export function sinkPath(urlOrPath: string): string {
 export function isAnswer(error: unknown): boolean {
   return (
     error instanceof AppError ||
-    error instanceof QueryError ||
+    asQueryError(error) !== undefined ||
     error instanceof ZodError ||
     error instanceof HTTPException
   );
