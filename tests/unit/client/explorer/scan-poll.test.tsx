@@ -15,6 +15,7 @@ import {
   useScanPolling,
 } from "../../../../src/client/features/explorer/scan-poll";
 import { ApiError } from "../../../../src/client/lib/api";
+import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import { NodeDetailDto } from "../../../../src/shared/schemas/node";
 import { envelope, json } from "../shell/helpers";
@@ -277,7 +278,7 @@ describe("a pending file", () => {
     expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
   });
 
-  it(`the watch of one visit ends after ${POLL_MAX_MS / 60_000} minutes`, async () => {
+  it(`a file is watched for ${POLL_MAX_MS / 60_000} minutes from the moment it became pending, then no longer asked for`, async () => {
     const drive = new FakeDrive([PENDING]);
     await mount(drive);
     await after(POLL_MAX_MS);
@@ -287,6 +288,31 @@ describe("a pending file", () => {
     await after(POLL_MAX_MS + 10 * 60_000);
     expect(drive.callsTo("GET", DETAIL)).toHaveLength(total);
     expect(rowOf(PENDING.id)!.querySelector("[data-still-scanning]")).not.toBeNull();
+  });
+
+  it("a file that becomes pending 25 minutes into the visit is watched for its own span: it settles at minute 32 and its row follows", async () => {
+    // The first file of the visit settles at once; the watch must not end with the visit's clock.
+    const LATE = fileNode(2, { name: "later.pdf", scanStatus: "pending" });
+    const LATE_DETAIL = new RegExp(`/api/nodes/${LATE.id}$`);
+    const drive = new FakeDrive([PENDING]);
+    await mount(drive);
+    drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
+    await after(5_000);
+    expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
+
+    await after(25 * 60_000);
+    drive.add(LATE);
+    act(() => emitNodesChanged([null]));
+    await pass(1);
+    await pass(1);
+    expect(rowOf(LATE.id)!.getAttribute("data-scan")).toBe("pending");
+    const asked = drive.callsTo("GET", LATE_DETAIL).length;
+    // Past the visit's 30 minutes it is still asked for, at its own pace (30 s after two minutes).
+    await after(32 * 60_000);
+    expect(drive.callsTo("GET", LATE_DETAIL).length).toBeGreaterThan(asked + 20);
+    drive.nodes.set(LATE.id, { ...LATE, scanStatus: "clean" });
+    await pass(POLL_SLOW_MS + 100);
+    expect(rowOf(LATE.id)!.getAttribute("data-scan")).toBe("clean");
   });
 
   it("an answer that arrives after the account changed is dropped: no cache write, nothing said", async () => {

@@ -9,8 +9,10 @@
 //  - `429` makes the whole loop wait `Retry-After`; `5xx` and a dead network back it off,
 //    doubling up to a minute — never the same rate against a server that is refusing;
 //  - nothing is asked while the tab is hidden or the page is not the one in front;
-//  - after POLL_MAX_MS the loop ends (the row keeps saying "Still scanning"; opening the folder
-//    again starts a new watch);
+//  - each file is watched for POLL_MAX_MS from the moment it became pending in this listing, and
+//    then no longer asked for (its row keeps saying "Still scanning"; opening the folder again
+//    starts a new watch). A file that becomes pending later — a new upload, a Re-check — gets its
+//    own full span: the bound is per file, never per visit;
 //  - an answer that arrives after the account changed is dropped.
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeDto } from "../../../shared/schemas/node";
@@ -23,7 +25,7 @@ export const POLL_FAST_FOR_MS = 120_000;
 export const POLL_SLOW_MS = 30_000;
 /** Files asked for in one tick. */
 export const POLL_PER_TICK = 4;
-/** How long one visit of a folder keeps watching. */
+/** How long one file is watched, from the moment it became pending in the listing. */
 export const POLL_MAX_MS = 30 * 60_000;
 /** The longest back-off after repeated `5xx` / network failures. */
 export const POLL_BACKOFF_MAX_MS = 60_000;
@@ -53,13 +55,12 @@ export interface ScanPollHandlers {
 }
 
 interface LoopState {
-  /** When each pending file was first seen. */
+  /** When each pending file was first seen. Kept while it is listed, even once its watch is over. */
   since: Map<string, number>;
   /** When each was last asked for. */
   asked: Map<string, number>;
   /** Files the server refused to show (`403`): not asked again. */
   refused: Set<string>;
-  started: number;
   lastTick: number;
   /** Failures in a row, and the time before which nothing is asked. */
   failures: number;
@@ -85,7 +86,6 @@ export function useScanPolling(
     since: new Map(),
     asked: new Map(),
     refused: new Set(),
-    started: 0,
     lastTick: 0,
     failures: 0,
     notBefore: 0,
@@ -112,16 +112,19 @@ export function useScanPolling(
       state.refused.delete(id);
     }
     if (ids.length === 0 || !active || !visible) return;
-    if (state.started === 0) {
-      state.started = now;
-      state.lastTick = now;
-    }
+    if (state.lastTick === 0) state.lastTick = now;
 
     const then = accountEpoch();
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const live = () => !stopped && sameAccount(then);
-    const watched = () => ids.filter((id) => state.since.has(id) && !state.refused.has(id));
+    // A file is asked for while its own watch lasts; one past it stays in `since` (so that it is
+    // not taken for a new one) but is not asked for again.
+    const watched = () =>
+      ids.filter(
+        (id) =>
+          state.since.has(id) && !state.refused.has(id) && Date.now() - state.since.get(id)! < POLL_MAX_MS,
+      );
     const last = (id: string) => state.asked.get(id) ?? state.since.get(id)!;
     // The wait after a question is decided by how long the file had been watched when it was asked.
     const waitOf = (id: string) => pollDelay(last(id) - state.since.get(id)!);
@@ -133,7 +136,7 @@ export function useScanPolling(
     const plan = () => {
       if (!live()) return;
       const files = watched();
-      if (files.length === 0 || Date.now() - state.started >= POLL_MAX_MS) return;
+      if (files.length === 0) return;
       const wait = Math.min(...files.map(waitOf));
       const at = Math.max(state.lastTick + wait, state.notBefore);
       timer = setTimeout(() => void tick(), Math.max(0, at - Date.now()));
