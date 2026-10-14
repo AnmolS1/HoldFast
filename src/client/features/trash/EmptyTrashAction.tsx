@@ -7,6 +7,7 @@ import { onlineManager } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
+import { DEFAULT_DURATION } from "../../components/Toaster";
 import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { hf } from "../../theme/tokens";
 import { viewKeys } from "../starred/view-queries";
@@ -73,13 +74,15 @@ export function EmptyTrashAction() {
   const [asked, setAsked] = useState<TrashSize | null>(null);
   // The question was withdrawn by something else the user did: said in the status line.
   const [withdrawnNote, setWithdrawnNote] = useState(false);
-  // It describes a moment: the user's next act (a key, a press) clears it. The polite region has
-  // announced it already. (Not on a timer: the shell exports no status-line timeout — SEAM.)
+  // It describes a moment: it goes after the shell's status timeout, or sooner with the user's
+  // next act (a key, a press). The polite region has announced it already.
   useEffect(() => {
     if (!withdrawnNote) return;
     const clear = () => setWithdrawnNote(false);
+    const timer = setTimeout(clear, DEFAULT_DURATION);
     for (const type of NEXT_ACTS) document.addEventListener(type, clear, true);
     return () => {
+      clearTimeout(timer);
       for (const type of NEXT_ACTS) document.removeEventListener(type, clear, true);
     };
   }, [withdrawnNote]);

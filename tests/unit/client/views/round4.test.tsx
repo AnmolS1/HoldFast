@@ -4,7 +4,7 @@
 import { focusManager, onlineManager } from "@tanstack/react-query";
 import { act, fireEvent, renderHook, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getToasts } from "../../../../src/client/components/Toaster";
+import { DEFAULT_DURATION, getToasts } from "../../../../src/client/components/Toaster";
 import { INVALIDATE_WAIT_MS, viewKeys } from "../../../../src/client/features/starred/view-queries";
 import {
   clearPageFailures,
@@ -311,6 +311,27 @@ describe("r4-4: 'Empty trash cancelled.' goes with the next act", () => {
     await openAndWithdraw();
     fireEvent.keyDown(document.body, { key: "Tab" });
     await waitFor(() => expect(status()).toBe(""));
+  });
+
+  it("or after the shell's status timeout, with no act at all", async () => {
+    const read = deferred<Response>();
+    let hold = false;
+    await openView("/trash", { "GET /api/trash": () => (hold ? read.promise : json(TRASH)) });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    hold = true;
+    fireEvent.click(document.querySelector<HTMLElement>("[data-empty-trash-button]")!);
+    hold = false;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(status()).toBe("Empty trash cancelled.");
+    await act(() => vi.advanceTimersByTimeAsync(DEFAULT_DURATION - 1));
+    expect(status()).toBe("Empty trash cancelled.");
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(status()).toBe("");
+    vi.useRealTimers();
+    read.resolve(json(TRASH));
+    await settle();
   });
 
   it("a press", async () => {
