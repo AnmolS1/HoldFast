@@ -25,6 +25,7 @@ import {
   ledgerBytes,
   ledgerRow,
   linkById,
+  lineUp,
   linkOn,
   mailTo,
   makeAccount,
@@ -150,7 +151,11 @@ describe("gate 5 — the ceilings are consumed atomically, the address first", (
   it("two parallel downloads that each fit under the user's ceiling alone but not together → one 200, one 429, one response's bytes on the ledger", async () => {
     const { owner, node } = await world();
     const url = await urlFor("download", node, { user: owner.id });
-    const limits = ceilings({ CEIL_USER_BYTES_DAY: SIZE + 500 });
+    // Both are lined up at their read of the object, so their charges overlap.
+    const limits = {
+      ...ceilings({ CEIL_USER_BYTES_DAY: SIZE + 500 }),
+      env: { FILES: lineUp(2, "u/").bucket },
+    };
     const answers = await Promise.all([ask(url, limits), ask(url, limits)]);
     expect(answers.map((answer) => answer.status).sort()).toEqual([200, 429]);
     const refusal = answers.find((answer) => answer.status === 429)!;

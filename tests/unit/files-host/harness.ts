@@ -33,7 +33,7 @@ import {
 } from "../../../src/worker/services/tokens";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
 import { BASE_SETTINGS, freshIp, makeLink, realCore, testDb } from "../auth/helpers";
-import { makeFile, makeUser, putObject, rand } from "../services-core/helpers";
+import { gate, makeFile, makeUser, putObject, rand } from "../services-core/helpers";
 
 export { freshIp, linkById, makeLink, mailTo, testDb } from "../auth/helpers";
 export {
@@ -418,6 +418,26 @@ export function spyBucket(
     ...overrides,
   } as unknown as R2Bucket;
   return spy;
+}
+
+/**
+ * The real bucket, whose reads of objects under `prefix` wait until `count` of them have arrived
+ * and are then let go together: requests lined up there reach what follows the read — the
+ * charge — at the same moment, so a "read the total, then add" consume would let them all
+ * through.
+ */
+export function lineUp(count: number, prefix: string): BucketSpy {
+  const all = gate();
+  let arrived = 0;
+  return spyBucket({
+    get: (async (key: string, options?: R2GetOptions) => {
+      if (key.startsWith(prefix)) {
+        if (++arrived === count) all.open();
+        await all.opened;
+      }
+      return spyBucket().bucket.get(key, options);
+    }) as R2Bucket["get"],
+  });
 }
 
 export type ImagesMock = {
