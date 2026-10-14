@@ -177,6 +177,11 @@ describe("reconcile: the quota half", () => {
     const owners = [await consistent(), await consistent(), await consistent()];
     for (const owner of owners) await setUsedBytes(owner.id, 1000);
     await generations(3, 3);
+    // The walk is this file's three accounts — not every account the shared database has
+    // collected (a whole-table walk outgrows the test's time as the database grows).
+    vi.mocked(userIdsAfter)
+      .mockImplementationOnce(async () => owners.map((owner) => owner.id))
+      .mockImplementationOnce(async () => []);
     // An invocation that can defer nothing more: what `defer` does past its hundredth task.
     const ctx = jobContext();
     ctx.bg.defer = (promise) => {
@@ -191,9 +196,7 @@ describe("reconcile: the quota half", () => {
     expect(rows[0]).toMatchObject({ actorType: "system", actorUserId: null, targetType: "job" });
     const meta = rows[0]!.meta as { accounts: number; drifted: number; delta: number; failed: number };
     expect(Object.keys(meta).sort()).toEqual(["accounts", "delta", "drifted", "failed"]);
-    // The whole walk: this file's three and whatever else was off — never fewer.
-    expect(meta.drifted).toBeGreaterThanOrEqual(3);
-    expect(meta.accounts).toBeGreaterThanOrEqual(meta.drifted);
+    expect(meta).toEqual({ accounts: 3, drifted: 3, delta: 600, failed: 0 });
     // No row per account.
     for (const owner of owners) expect(await audits("system.reconcile", owner.id)).toEqual([]);
   });
