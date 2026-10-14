@@ -400,3 +400,27 @@ describe("r5-2: another account found before the first batch — the tab is hand
     expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
   });
 });
+
+describe("r6-1: the hand-over uses the session already read", () => {
+  it("any further session read failing does not keep the tab as A's: B is adopted, A's rows purged, no DELETE, nothing said", async () => {
+    let reads = 0;
+    const B = sessionOf({ id: "b".repeat(32), name: "Bo", timezone: "UTC" });
+    let other = false;
+    const { calls } = await openView("/trash", {
+      "GET /api/trash": () => (other ? json(trashPage([])) : json(TRASH)),
+      // The read before the batch names B; every read after it fails.
+      "GET /api/auth/get-session": () =>
+        other ? (++reads === 1 ? json(B) : new Response("{}", { status: 500 })) : undefined,
+      "DELETE /api/trash": () => NO_CONTENT(),
+    });
+    await waitFor(() => expect(rowNames()).toHaveLength(3));
+    other = true;
+    act(() => startEmptyTrash());
+    await waitFor(() => expect(getKnownUserId()).toBe("b".repeat(32)));
+    expect(queryClient.getQueryData(["session"])).toEqual(B);
+    await waitFor(() => expect(rowNames()).toEqual([]));
+    expect(getEmptyRun()).toEqual({ state: "idle" });
+    expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(0);
+    expect(getToasts()).toEqual([]);
+  });
+});

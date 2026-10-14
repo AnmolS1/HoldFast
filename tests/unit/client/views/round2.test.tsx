@@ -547,8 +547,8 @@ describe("a2: the run is checked against the signed-in account before every batc
     await waitFor(() => expect(getEmptyRun()).toEqual({ state: "idle" }));
     await settle();
     expect(batches).toBe(1);
-    // Before each batch, and once more when it names B: that read hands the tab to B (r5-2).
-    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 3);
+    // Before each batch; the read that names B hands the tab to B itself (r6-1: no second read).
+    expect(requests(calls, "GET", "/api/auth/get-session").length).toBe(sessionReads + 2);
     expect(getToasts()).toEqual([]);
     expect(events).toEqual([]);
     expect(document.querySelector("[data-empty-trash-stopped]")).toBeNull();
