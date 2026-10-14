@@ -1,9 +1,11 @@
 // Helpers of the views' jsdom tests. The API is stubbed per test: `openView` renders the REAL
 // route tree (frame, sidebar, page) over a fetch router answering what the test names.
-import { waitFor } from "@testing-library/react";
+import { act } from "@testing-library/react";
+import type { QueryKey } from "@tanstack/react-query";
 import { afterEach, beforeEach } from "vitest";
 import { clearWaits } from "../../../../src/client/features/starred/waits";
 import { onNodesChanged } from "../../../../src/client/lib/contracts";
+import { queryClient } from "../../../../src/client/lib/query";
 import { buildRoutes } from "../../../../src/client/router";
 import { DESKTOP_MIN } from "../../../../src/client/theme/breakpoints";
 import {
@@ -54,10 +56,32 @@ export async function openView(path: string, answers: Answers = {}, options: Ope
     extra: answering({ "GET /api/account/usage": USAGE, ...answers }),
   });
   const view = renderRoutes(buildRoutes(), [path]);
-  await waitFor(() => {
-    if (!document.querySelector("[data-frame]")) throw new Error("the frame is not up yet");
-  });
+  // The frame is up when the router has run the frame's loader (the session and config reads)
+  // and has nothing left to load: that is the signal, awaited as an event — not a guess at how
+  // long a slower machine needs to get there.
+  await act(() => routerSettled(view.router));
+  if (!document.querySelector("[data-frame]")) {
+    const { location, errors } = view.router.state;
+    throw new Error(
+      `the frame did not come up: the router settled on ${location.pathname}, errors ${JSON.stringify(errors)}`,
+    );
+  }
   return { calls, ...view };
+}
+
+type Router = ReturnType<typeof renderRoutes>["router"];
+
+/** Resolves once the router is initialised and no navigation or loader is under way. */
+function routerSettled(router: Router): Promise<void> {
+  const settled = (state: Router["state"]) => state.initialized && state.navigation.state === "idle";
+  if (settled(router.state)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const stop = router.subscribe((state) => {
+      if (!settled(state)) return;
+      stop();
+      resolve();
+    });
+  });
 }
 
 export const requests = (calls: MockCall[], method: string, path: string): MockCall[] =>
@@ -87,3 +111,25 @@ export function deferred<T>() {
 export const viewError = (view: string) => document.querySelector(`[data-view-error="${view}"]`);
 export const rows = () => Array.from(document.querySelectorAll<HTMLElement>("[data-item-id]"));
 export const rowNames = () => rows().map((row) => row.getAttribute("data-item-id"));
+
+/**
+ * Resolves once the query under `key` has an answer and nothing of it is in flight — the signal
+ * that a page's list has arrived, awaited as an event rather than polled against a time limit.
+ */
+export async function querySettled(key: QueryKey): Promise<void> {
+  const done = () => {
+    const state = queryClient.getQueryState(key);
+    return state !== undefined && state.status !== "pending" && state.fetchStatus === "idle";
+  };
+  if (!done()) {
+    await new Promise<void>((resolve) => {
+      const stop = queryClient.getQueryCache().subscribe(() => {
+        if (!done()) return;
+        stop();
+        resolve();
+      });
+    });
+  }
+  // Let the page draw what arrived.
+  await act(async () => {});
+}

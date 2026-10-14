@@ -43,6 +43,7 @@ import {
   pathOf,
   queryOf,
   recordNodesChanged,
+  querySettled,
   requests,
   rowNames,
   type Answers,
@@ -89,7 +90,8 @@ async function openTrash(answers: Answers = {}, width = 1280) {
     },
     { width },
   );
-  await waitFor(() => expect(rowNames().length).toBeGreaterThan(0));
+  await querySettled(viewKeys.trash);
+  expect(rowNames().length).toBeGreaterThan(0);
   return view;
 }
 
