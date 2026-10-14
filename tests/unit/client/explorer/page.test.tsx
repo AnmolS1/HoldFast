@@ -172,17 +172,18 @@ describe("listing", () => {
   });
 
   it("the next page is asked for with the cursor; a change of sort or direction starts without one", async () => {
-    const drive = new FakeDrive(manyNodes(250));
+    // Pages of 3 (the client still asks for 200): a second page without drawing 200 rows a time —
+    // each row's dates cost several Intl formatters, which made this test take seconds on CI.
+    const drive = new FakeDrive(manyNodes(6));
+    drive.pageSize = 3;
     const calls = serveDrive(drive);
     renderExplorer("/");
-    await waitFor(() =>
-      expect(document.querySelector("[data-item-count]")!.textContent).toMatch(/^200 items/),
-    );
+    await waitForRows(3);
     act(() => intersect((element) => element.hasAttribute("data-load-more-sentinel")));
-    await waitFor(() => expect(document.querySelector("[data-item-count]")!.textContent).toBe("250 items"));
+    await waitForRows(6);
     expect(paths(calls)).toEqual([
       "/api/nodes/root?sort=name&dir=asc&limit=200",
-      "/api/nodes/root?sort=name&dir=asc&limit=200&cursor=200",
+      "/api/nodes/root?sort=name&dir=asc&limit=200&cursor=3",
     ]);
 
     fireEvent.click(document.querySelector("[data-sort-button]")!);
@@ -857,12 +858,14 @@ describe("downloading one file", () => {
 
 describe("reading again is bounded (m7, m8, m9)", () => {
   it("a long listing is not refetched page by page when the tree changes: it says so and offers Reload", async () => {
-    const drive = new FakeDrive(manyNodes(900));
+    // Pages of 3: five pages without drawing hundreds of rows (see "the next page is asked…").
+    const drive = new FakeDrive(manyNodes(15));
+    drive.pageSize = 3;
     const calls = serveDrive(drive);
     renderExplorer("/");
     const count = () => document.querySelector("[data-item-count]")!.textContent;
-    await waitFor(() => expect(count()).toMatch(/^200 items/));
-    for (const loaded of [400, 600, 800, 900]) {
+    await waitFor(() => expect(count()).toMatch(/^3 items/));
+    for (const loaded of [6, 9, 12, 15]) {
       act(() => intersect((element) => element.hasAttribute("data-load-more-sentinel")));
       await waitFor(() => expect(count()).toMatch(new RegExp(`^${loaded} items`)));
     }
@@ -881,7 +884,7 @@ describe("reading again is bounded (m7, m8, m9)", () => {
     fireEvent.click(document.querySelector("[data-reload]")!);
     await waitFor(() => expect(paths(calls)).toHaveLength(6));
     expect(paths(calls)[5]).toBe("/api/nodes/root?sort=name&dir=asc&limit=200");
-    await waitFor(() => expect(count()).toMatch(/^200 items/));
+    await waitFor(() => expect(count()).toMatch(/^3 items/));
     expect(document.querySelector('[data-banner="changed"]')).toBeNull();
   });
 

@@ -56,6 +56,11 @@ export class FakeDrive {
   /** Per node: answers of `download-urls` that come back as `{ nodeId, error }`, first-in first-out. */
   readonly urlErrors = new Map<string, string[]>();
   filesOrigin: string;
+  /**
+   * The most items one page answers, whatever `limit` asked (a server may answer fewer): lets a
+   * test have a second page without drawing hundreds of rows.
+   */
+  pageSize = Infinity;
   private failures: Failure[] = [];
   private nextNode = 9000;
   private nextToken = 1;
@@ -101,7 +106,7 @@ export class FakeDrive {
     const sort = query.get("sort") ?? "name";
     const sign = query.get("dir") === "desc" ? -1 : 1;
     const kind = query.get("kind");
-    const limit = Number(query.get("limit") ?? 100);
+    const limit = Math.min(Number(query.get("limit") ?? 100), this.pageSize);
     const offset = Number(query.get("cursor") ?? 0);
     const value = (node: NodeDto): string | number =>
       sort === "size"
