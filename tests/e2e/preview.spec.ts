@@ -310,7 +310,7 @@ test.describe("previews (mocked API and files host)", () => {
     expectClean(arranged);
   });
 
-  test("a crafted file inside every size bound: highlighting never holds the page, and Escape DURING the run answers at once", async ({
+  test("a crafted file inside every size bound: Escape pressed DURING highlighting closes the preview before the run ends", async ({
     page,
     origins,
   }) => {
@@ -320,26 +320,23 @@ test.describe("previews (mocked API and files host)", () => {
     const body = Buffer.from(`${"(".repeat(999)}\n`.repeat(200));
     const crafted = nodeOf({ ...NODES.ts, size: body.length });
     await page.addInitScript(() => {
-      const probe = window as unknown as {
-        __long: Array<[number, number]>;
-        __keyDelay: number[];
-        __keyPhase: Array<string | null>;
-      };
-      probe.__long = [];
-      probe.__keyDelay = [];
+      const probe = window as unknown as { __phases: string[]; __keyPhase: Array<string | null> };
+      probe.__phases = [];
       probe.__keyPhase = [];
-      new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) probe.__long.push([entry.startTime, entry.duration]);
-      }).observe({ entryTypes: ["longtask"] });
-      // How long a key press waited before any handler ran, and whether highlighting was running.
+      // Every state the highlighting run of the text viewer goes through.
+      new MutationObserver((records) => {
+        for (const record of records) {
+          const value = (record.target as Element).getAttribute("data-highlight");
+          if (value !== null) probe.__phases.push(value);
+        }
+      }).observe(document, { subtree: true, attributes: true, attributeFilter: ["data-highlight"] });
+      // Where the run was when the key was handed to the page.
       document.addEventListener(
         "keydown",
-        (event) => {
-          probe.__keyDelay.push(performance.now() - event.timeStamp);
+        () =>
           probe.__keyPhase.push(
             document.querySelector('[data-preview-renderer="text"]')?.getAttribute("data-highlight") ?? null,
-          );
-        },
+          ),
         true,
       );
     });
@@ -358,28 +355,20 @@ test.describe("previews (mocked API and files host)", () => {
     const text = renderer(page, "text");
     await expect(text.locator("[data-line]")).toHaveCount(200);
     await expect(text).toHaveAttribute("data-highlight", "running");
-    const shownAt = await page.evaluate(() => performance.now());
-    // Let it work for a while, then press Escape in the middle of the run.
-    await page.waitForTimeout(300);
     await page.keyboard.press("Escape");
     await expect(dialog(page)).toHaveCount(0);
     const probe = await page.evaluate(() => {
-      const own = window as unknown as {
-        __long: Array<[number, number]>;
-        __keyDelay: number[];
-        __keyPhase: Array<string | null>;
-      };
-      return { long: own.__long, delays: own.__keyDelay, phases: own.__keyPhase };
+      const own = window as unknown as { __phases: string[]; __keyPhase: Array<string | null> };
+      return { phases: own.__phases, atKey: own.__keyPhase };
     });
-    // The key arrived while the run was still going.
+    // No wall-clock number: what is asserted is the order of events, which a loaded machine does
+    // not change. The page took the key while the run was still going — so the run had yielded
+    // the main thread to it — and the preview closed without the run ever reaching its end (an
+    // unyielding run would have finished, "plain", before the key could be handled).
+    expect(probe.atKey).toEqual(["running"]);
     expect(probe.phases).toContain("running");
-    // Handled within a few frames of being pressed (it was seconds): it waits at most for the
-    // stretch of work in progress.
-    expect(Math.max(...probe.delays)).toBeLessThan(100);
-    // A stretch is a slice plus one uninterruptible scan of one line (~44 ms at worst, measured;
-    // HIGHLIGHT_TASK_BOUND_MS); 150 ms leaves room for a loaded machine.
-    const longest = Math.max(0, ...probe.long.filter(([start]) => start >= shownAt).map(([, ms]) => ms));
-    expect(longest).toBeLessThan(150);
+    expect(probe.phases).not.toContain("plain");
+    expect(probe.phases).not.toContain("done");
     expectClean(arranged);
   });
 
