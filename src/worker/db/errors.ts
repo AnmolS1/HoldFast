@@ -70,3 +70,22 @@ export function isUniqueViolation(error: unknown, constraints?: readonly string[
   if (!pg || pg.code !== "23505") return false;
   return !constraints || (pg.constraint !== undefined && constraints.includes(pg.constraint));
 }
+
+/** SQLSTATEs of a NUL Postgres refused: in `text` (22021), inside a `jsonb` value (22P05). */
+const NUL_REFUSED = new Set(["22021", "22P05"]);
+
+/**
+ * The `QueryError` behind a failure, or undefined. Drizzle wraps whatever a statement threw in a
+ * `DrizzleQueryError` with the original as `cause` — so the one `db/client.ts` throws for a NUL
+ * in a bind value is found on the cause chain. A NUL that reached Postgres anyway (in JSON text,
+ * where only Postgres can tell it from an escaped backslash) is the same `validation`.
+ */
+export function asQueryError(error: unknown): QueryError | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current && typeof current === "object"; depth++) {
+    if (current instanceof QueryError) return current;
+    current = (current as { cause?: unknown }).cause;
+  }
+  const pg = pgError(error);
+  return pg && NUL_REFUSED.has(pg.code) ? new QueryError("validation") : undefined;
+}
