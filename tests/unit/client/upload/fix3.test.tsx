@@ -12,7 +12,6 @@ import { getUploads, type UploadItem } from "../../../../src/client/features/upl
 import { rowsToDraw, summarise } from "../../../../src/client/features/upload/summary";
 import { completeReauth, isReauthPending } from "../../../../src/client/lib/api";
 import {
-  adoptIdentity,
   confirmReauthIdentity,
   purgeUserState,
   queryClient,
@@ -46,8 +45,9 @@ const items = () => getUploads().items;
 const rows = () => items().map((item) => [item.name, item.state, item.pauseReason]);
 
 describe("a remount of the frame is not the user pausing (3M1)", () => {
-  it("the reviewer's order with the shell's real timing: a body 401, the session read as null, the same account signs in again — the queue goes on and lands", async () => {
-    await adoptIdentity(sessionOf());
+  it("the reviewer's order with the shell's real timing: a body 401, the session read as null, the same account signs in again — the host is remounted and the queue goes on and lands", async () => {
+    // No identity adopted beforehand, as in the reviewer's R2: the null read and the re-auth each
+    // remount the frame (with one adopted, the shell's AccountKeyed keeps it mounted — its own test).
     server.hold = true;
     renderShell(
       <AccountKeyed>
@@ -61,6 +61,7 @@ describe("a remount of the frame is not the user pausing (3M1)", () => {
       ),
     );
     await act(() => settle());
+    const host = document.querySelector('input[data-upload-input="files"]');
     let current: unknown = sessionOf();
     let expired = true;
     server.onJson = (call) => {
@@ -88,6 +89,7 @@ describe("a remount of the frame is not the user pausing (3M1)", () => {
     // The observers are told on a later macrotask: give every remount its chance.
     await act(() => settle());
     await act(() => settle());
+    expect(document.querySelector('input[data-upload-input="files"]')).not.toBe(host);
     expect(items().some((item) => item.pauseReason === "user")).toBe(false);
     expect(items().every((item) => item.state === "queued" || item.state === "uploading")).toBe(true);
     server.hold = false;
