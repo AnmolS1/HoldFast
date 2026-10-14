@@ -39,7 +39,30 @@ const rowsLeft = async (ids: string[]) =>
     .map((row) => row.id)
     .sort();
 
+/**
+ * This environment resets its database on every run while the dev server's bucket persists in
+ * `.wrangler/state` — a database restore, by definition, the moment an earlier run's hourly slot
+ * (harness.spec.ts) left the rollback detector's object behind: "delete forever" would then take
+ * the held path, as it must after a real restore. So the numbers are levelled first, as the
+ * operator would: the database's generation set ahead of any object an earlier run can have
+ * written (each run's heartbeats add one at a time; this is the time in milliseconds), the rest
+ * of the cursor kept.
+ */
+async function levelRollbackDetector(): Promise<void> {
+  await localDb((db) =>
+    db.query(
+      `INSERT INTO settings (key, value) VALUES ('reconcileCursor', jsonb_build_object('generation', $1::bigint))
+       ON CONFLICT (key) DO UPDATE SET value =
+         (CASE WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value ELSE '{}'::jsonb END)
+         || jsonb_build_object('generation', $1::bigint), updated_at = now()`,
+      [Date.now()],
+    ),
+  );
+}
+
 test.describe("the trash API", () => {
+  test.beforeAll(levelRollbackDetector);
+
   test("trash, list, restore, delete for good — and a live node is not deleted", async ({
     request,
     clientIp,
