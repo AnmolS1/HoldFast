@@ -34,6 +34,13 @@ export const SCAN_FILE_WAIT_MS = [1_000, 1_000, 2_000, 2_000, 3_000, 5_000] as c
  */
 export const SCAN_FOLLOW_LIMIT_MS = 5 * 60_000;
 export const SCAN_MIN_ASKS = 3;
+/**
+ * And whatever the asks, no file is followed longer than this after it landed: a long queue
+ * waiting on a stuck scanner costs at most this many seconds of one request a second (1,800),
+ * then every row says "still being checked". (Inside it, 600 files are each asked three times.)
+ * A batch status route is the real answer for long queues.
+ */
+export const SCAN_HARD_LIMIT_MS = 30 * 60_000;
 export const SCAN_BACKOFF_MAX_MS = 60_000;
 
 /** A rate limit pauses the queue for its `Retry-After`: this when none is given, and never longer than the cap. */

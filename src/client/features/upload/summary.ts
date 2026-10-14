@@ -44,8 +44,11 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
     };
   }
 
-  // The batch: every file that is or was on its way. A restored row has no file yet.
-  const batch = items.filter((item) => !isRestored(item) && item.state !== "cancelled");
+  // The batch: every file that is or was on its way. A restored row has no file yet; an empty
+  // folder of a folder upload is a row of the panel but not a file of the count.
+  const batch = items.filter(
+    (item) => item.kind === "file" && !isRestored(item) && item.state !== "cancelled",
+  );
   const total = batch.length;
   const bytes = batch.reduce((sum, item) => sum + item.size, 0);
   const sent = batch.reduce((sum, item) => sum + Math.min(item.size, item.sentBytes), 0);
@@ -72,6 +75,15 @@ export function summarise(snapshot: UploadSnapshot): RibbonState | null {
         ? t("ribbon.uploadingEta", { n, total, left, eta: formatEta((bytes - sent) / speed) })
         : t("ribbon.uploading", { n, total, left });
     return { progress, sentence, status: "active" };
+  }
+
+  const folders = items.filter((item) => item.kind === "folder" && isSending(item)).length;
+  if (folders > 0) {
+    return {
+      progress,
+      sentence: counted("ribbon.folders.one", "ribbon.folders.other", folders),
+      status: "active",
+    };
   }
 
   const conflict = items.find((item) => item.state === "conflict");
@@ -207,9 +219,11 @@ export function describeItem(item: UploadItem): string | null {
 }
 
 /**
- * Which rows the panel draws when the queue is longer than `cap`. Rows in flight and rows that
- * failed are always drawn — they are the ones a person can act on; then, up to the cap, paused
- * rows, waiting rows and finished rows, in that order of claim. The queue's own order is kept.
+ * Which rows the panel draws when the queue is longer than `cap`. Rows in flight, rows that failed
+ * or were refused, conflicts and flagged files are always drawn — they are the ones a person can
+ * act on (there are at most a few in flight; failures are the person's to see). Then, up to the
+ * cap: paused rows, rows waiting on the scanner (no action, so a thousand of them are counted, not
+ * drawn), waiting rows and finished rows, in that order of claim. The queue's own order is kept.
  */
 export function rowsToDraw(items: readonly UploadItem[], cap: number): UploadItem[] {
   if (items.length <= cap) return [...items];
@@ -218,24 +232,25 @@ export function rowsToDraw(items: readonly UploadItem[], cap: number): UploadIte
       case "uploading":
       case "hashing":
       case "completing":
-      case "scanning":
       case "error":
       case "refused":
       case "conflict":
         return 0;
       case "paused":
         return 1;
-      case "queued":
+      case "scanning":
         return 2;
-      case "done":
-        return item.scanStatus === null || item.scanStatus === "clean" ? 3 : 0;
-      case "cancelled":
+      case "queued":
         return 3;
+      case "done":
+        return item.scanStatus === null || item.scanStatus === "clean" ? 4 : 0;
+      case "cancelled":
+        return 4;
     }
   };
   const chosen = new Set<string>();
   for (const item of items) if (rank(item) === 0) chosen.add(item.id);
-  for (let wanted = 1; wanted <= 3 && chosen.size < cap; wanted += 1) {
+  for (let wanted = 1; wanted <= 4 && chosen.size < cap; wanted += 1) {
     for (const item of items) {
       if (chosen.size >= cap) break;
       if (rank(item) === wanted) chosen.add(item.id);

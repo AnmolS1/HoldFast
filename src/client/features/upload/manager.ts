@@ -52,6 +52,7 @@ import {
   SCAN_BACKOFF_MAX_MS,
   SCAN_FILE_WAIT_MS,
   SCAN_FOLLOW_LIMIT_MS,
+  SCAN_HARD_LIMIT_MS,
   SCAN_INTERVAL_MS,
   SCAN_MIN_ASKS,
   sortedParts,
@@ -311,7 +312,14 @@ function retryAfterMs(cause: unknown, cap: number): number {
   return Math.min(cap, cause.retryAfter * 1000);
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
+/**
+ * Whether the work that waits is still wanted: the run's `current`, or the batch's mark. Asked at
+ * the moment a wait ends, before anything is sent — a timer does not trust the purger to have
+ * aborted it in time (the shell moves the account epoch before the purgers run).
+ */
+type Wanted = () => boolean;
+
+function sleep(ms: number, signal: AbortSignal, wanted: Wanted): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
       reject(abortError());
@@ -323,21 +331,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
     };
     const timer = setTimeout(() => {
       signal.removeEventListener("abort", stop);
-      resolve();
+      if (wanted()) resolve();
+      else reject(abortError());
     }, ms);
     signal.addEventListener("abort", stop, { once: true });
   });
 }
 
 /** Run `request`; on a retryable failure wait and run it again, through the whole schedule. */
-async function retrying<T>(request: () => Promise<T>, signal: AbortSignal): Promise<T> {
+async function retrying<T>(request: () => Promise<T>, signal: AbortSignal, wanted: Wanted): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     try {
+      if (attempt > 0 && !wanted()) throw abortError();
       return await request();
     } catch (cause) {
       const delay = RETRY_DELAYS_MS[attempt];
       if (delay === undefined || !isRetryable(cause)) throw cause;
-      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal);
+      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal, wanted);
     }
   }
 }
@@ -516,10 +526,11 @@ function keepForResume(item: UploadItem, body: InitUploadBody, init: InitUploadR
  * abort the bodies in flight (they would only be sent again): they finish, and nothing NEW is
  * asked until the pause ends. `complete` also waits out being offline this way.
  */
-async function gate(signal: AbortSignal, reasons: readonly PauseReason[]): Promise<void> {
+async function gate(signal: AbortSignal, reasons: readonly PauseReason[], wanted: Wanted): Promise<void> {
   while (reasons.some((reason) => queuePauses.has(reason))) {
     await unlessAborted(new Promise<void>((resolve) => pauseWaiters.push(resolve)), signal);
   }
+  if (!wanted()) throw abortError();
 }
 const SOFT: readonly PauseReason[] = ["limited"];
 
@@ -534,7 +545,7 @@ async function runFolder(
   patchItem(id, { state: "uploading", pauseReason: null, message: null, requestId: null });
   const batch = batches.get(item.batchId);
   if (!batch) throw new FolderProblem(t("folder.failed", { name: item.name }), false);
-  await gate(signal, SOFT);
+  await gate(signal, SOFT, () => current() !== null);
   await ensureFolder(batch, folderPathOf(item), signal);
   if (!current()) return;
   patchItem(id, { state: "done", progress: 1 });
@@ -547,6 +558,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
     if (!live(then) || signal.aborted) return null;
     return findItem(id) ?? null;
   };
+  const wanted: Wanted = () => current() !== null;
   let item = current();
   if (!item) return;
   if (item.kind === "folder") {
@@ -588,7 +600,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
       const sent = JSON.stringify(body);
       let flying = work.init?.body === sent ? work.init : null;
       if (!flying) {
-        await gate(signal, SOFT);
+        await gate(signal, SOFT, wanted);
         const asked = initUpload(body);
         flying = { body: sent, asked };
         work.init = flying;
@@ -606,7 +618,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
       // The first try is the one in flight; later tries (a 5xx, the network) are the run's own.
       let tries = 0;
       const init = await unlessAborted(
-        retrying(() => (tries++ === 0 ? first : initUpload(body, signal)), signal),
+        retrying(() => (tries++ === 0 ? first : initUpload(body, signal)), signal, wanted),
         signal,
       );
       item = current();
@@ -634,7 +646,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
     const sending = item.uploadId;
     if (item.mode === "single") {
       if (item.parts.length === 0) {
-        await gate(signal, SOFT);
+        await gate(signal, SOFT, wanted);
         const { etag } = await retrying(
           () =>
             putSingle(runtime.put, sending, file, {
@@ -646,6 +658,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
               },
             }),
           signal,
+          wanted,
         );
         if (!current()) return;
         // The mark that the body is with the server; `complete` sends no parts for a single PUT.
@@ -699,7 +712,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
   }
   let node: NodeDto;
   try {
-    node = await confirmComplete(item.uploadId, body, signal);
+    node = await confirmComplete(item.uploadId, body, signal, wanted);
   } catch (cause) {
     if (!(cause instanceof LandedUnseen)) throw cause;
     if (current()) landedUnseen(id, item.uploadId);
@@ -719,6 +732,7 @@ async function confirmComplete(
   uploadId: string,
   body: CompleteUploadBody,
   signal: AbortSignal,
+  wanted: Wanted,
 ): Promise<NodeDto> {
   const began = Date.now();
   let lost = 0;
@@ -726,7 +740,7 @@ async function confirmComplete(
   for (;;) {
     // Not into a rate limit, and not into a connection the browser says is gone: offline is
     // waited out here instead of counting the tries down.
-    await gate(signal, ["limited", "offline"]);
+    await gate(signal, ["limited", "offline"], wanted);
     try {
       return await completeUpload(uploadId, body, signal);
     } catch (cause) {
@@ -742,7 +756,7 @@ async function confirmComplete(
       }
       if (cause instanceof ApiError && cause.status === 409 && cause.details?.state === "completing") {
         if (Date.now() - began >= COMPLETE_WAIT_LIMIT_MS) throw new Unconfirmed();
-        await sleep(COMPLETE_WAIT_MS[Math.min(waits, COMPLETE_WAIT_MS.length - 1)]!, signal);
+        await sleep(COMPLETE_WAIT_MS[Math.min(waits, COMPLETE_WAIT_MS.length - 1)]!, signal, wanted);
         waits += 1;
         continue;
       }
@@ -750,7 +764,7 @@ async function confirmComplete(
       const delay = RETRY_DELAYS_MS[lost];
       if (delay === undefined) throw new Unconfirmed();
       lost += 1;
-      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal);
+      await sleep(Math.max(delay, retryAfterMs(cause, RETRY_AFTER_CAP_MS)), signal, wanted);
     }
   }
 }
@@ -775,9 +789,12 @@ async function sendParts(
   let failed = false;
   const lane = async (): Promise<void> => {
     for (;;) {
-      await gate(group.signal, SOFT).catch(() => {});
+      const still = await gate(group.signal, SOFT, () => current() !== null).then(
+        () => true,
+        () => false,
+      );
       const n = waiting.shift();
-      if (n === undefined || failed || group.signal.aborted) return;
+      if (n === undefined || failed || group.signal.aborted || !still) return;
       const { start: from, end: to } = partRange(n, partBytes, size);
       try {
         const answer = await retrying(
@@ -791,6 +808,7 @@ async function sendParts(
               },
             }),
           group.signal,
+          () => current() !== null,
         );
         const now = current();
         if (!now) return;
@@ -857,6 +875,7 @@ function ensureFolder(batch: Batch, path: string, signal: AbortSignal): Promise<
         const node = await retrying(
           () => createFolder({ parentId, name }, controller.signal),
           controller.signal,
+          () => live(batch.mark),
         );
         if (live(batch.mark)) emitNodesChanged([parentId]);
         batch.made.set(path, node.id);
@@ -984,13 +1003,17 @@ const tabHidden = (): boolean => typeof document !== "undefined" && document.vis
 
 function scheduleScan(wait: number): void {
   if (scanTimer !== undefined || scanBusy || scanQueue.length === 0 || tabHidden() || !frameUp) return;
-  scanTimer = setTimeout(() => void scanTick(), wait);
+  // The account whose files these are is the one that schedules the ask: a tick that fires after
+  // the shell's epoch moved (before the purger stops it) sends nothing.
+  const then = mark();
+  scanTimer = setTimeout(() => void scanTick(then), wait);
 }
 
 /**
  * The next file that is due, taken out of the queue — or how long until one is. Files that are
- * gone or past their bound are dealt with on the way. The bound is time AND asks: a file is never
- * given up without having been asked about, however long the queue.
+ * gone or past their bound are dealt with on the way. The bound is time AND asks — a file is not
+ * given up without having been asked about — up to a hard time limit that holds however long the
+ * queue.
  */
 function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait: number } | null {
   let soonest = Infinity;
@@ -1001,7 +1024,8 @@ function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait:
       scanQueue.splice(index, 1);
       continue;
     }
-    if (now - entry.since >= SCAN_FOLLOW_LIMIT_MS && entry.asks >= SCAN_MIN_ASKS) {
+    const waited = now - entry.since;
+    if ((waited >= SCAN_FOLLOW_LIMIT_MS && entry.asks >= SCAN_MIN_ASKS) || waited >= SCAN_HARD_LIMIT_MS) {
       // Still running after the bound: the row says so and nothing more is asked.
       scanQueue.splice(index, 1);
       patchItem(entry.id, { state: "done", scanStatus: "pending" });
@@ -1017,9 +1041,9 @@ function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait:
   return soonest === Infinity ? null : { wait: soonest - now };
 }
 
-async function scanTick(): Promise<void> {
+async function scanTick(then: Mark): Promise<void> {
   scanTimer = undefined;
-  const then = mark();
+  if (!live(then)) return;
   const next = nextScan(Date.now());
   if (next === null) {
     sweep();
@@ -1062,9 +1086,11 @@ async function scanTick(): Promise<void> {
 }
 
 /**
- * The frame came or went. Without it there is no ribbon and no panel: uploads in flight are
- * paused (no worker reads a file, no body is sent) and the scan is not asked about. A `complete`
- * that was already sent still runs to its answer.
+ * The frame came or went. While it is gone the scan is not asked about (nobody sees the answer).
+ * No row changes: the frame also goes and comes back in one commit when it remounts (the session
+ * read again, the same account), and a remount is not the user pausing. Uploads go on and are
+ * there when the frame is back; what belongs to an account that signed out is stopped by the
+ * purger, not here.
  */
 export function frameMounted(up: boolean): void {
   frameUp = up;
@@ -1072,7 +1098,6 @@ export function frameMounted(up: boolean): void {
     scheduleScan(SCAN_INTERVAL_MS);
     return;
   }
-  pauseAll();
   clearTimeout(scanTimer);
   scanTimer = undefined;
 }

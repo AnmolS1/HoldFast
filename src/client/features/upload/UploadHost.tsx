@@ -42,8 +42,8 @@ export function UploadHost() {
     if (userId) void restoreUploads();
   }, [userId]);
 
-  // Leaving the frame (a public page, the sign-in screen) stops what is running: nothing reads a
-  // file or sends a body for a page that shows no progress. The rows wait, paused.
+  // Only the scan's asking follows the frame. An unmount never pauses a row: a remount of the
+  // frame (the same account read again) is not the user pressing Pause; a sign-out is the purger's.
   useEffect(() => {
     frameMounted(true);
     return () => frameMounted(false);

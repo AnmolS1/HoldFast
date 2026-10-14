@@ -33,6 +33,8 @@ export const messages = {
   "ribbon.uploading": "Uploading {n} of {total} · {left} left",
   "ribbon.uploadingEta": "Uploading {n} of {total} · {left} left · ~{eta}",
   "ribbon.verifying": "Verifying {n} of {total}…",
+  "ribbon.folders.one": "Creating 1 folder",
+  "ribbon.folders.other": "Creating {count} folders",
   "ribbon.scanning.one": "Scanning 1 file",
   "ribbon.scanning.other": "Scanning {count} files",
   "ribbon.paused": "Paused · {n} of {total} · {left} left",
