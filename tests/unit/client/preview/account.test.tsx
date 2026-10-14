@@ -12,7 +12,7 @@ import TextPreview from "../../../../src/client/features/preview/renderers/TextP
 import { openScope, openScopeCount } from "../../../../src/client/features/preview/scope";
 import { SCAN_POLL_MS } from "../../../../src/client/features/preview/useItem";
 import { usePreviewUrl } from "../../../../src/client/features/preview/usePreviewUrl";
-import { purgeUserState, refreshSession } from "../../../../src/client/lib/query";
+import { adoptIdentity, purgeUserState, refreshSession } from "../../../../src/client/lib/query";
 import { Frame } from "../../../../src/client/routes/frame/Frame";
 import { renderRoutes, seedConfig, seedSession, sessionOf } from "../shell/helpers";
 import { ID, NODES, nodeOf } from "./fixtures";
@@ -502,6 +502,44 @@ describe("in the real frame: the session re-read names another account, with no 
       expect(network.files().length).toBe(before);
     },
   );
+
+  it("what account A put in history state (prev/next ids, the page underneath) is not offered to B", async () => {
+    let who = sessionOf();
+    const api = ownerApi([NODES.ts, NODES.png, NODES.pdf]);
+    installFetch({
+      api: (call) => {
+        if (call.url.pathname === "/api/auth/get-session") return json(who);
+        if (call.url.pathname === "/api/account/deletion-status") return json({ scheduledFor: null });
+        if (who.user.id === B && call.url.pathname.startsWith("/api/nodes"))
+          return envelope("not_found", 404);
+        return api.handler(call);
+      },
+    });
+    seedSession(who);
+    seedConfig();
+    await act(async () => void (await adoptIdentity(who)));
+    const opened = { from: `/folder/${ID.folder}`, siblingIds: [ID.ts, ID.png, ID.pdf] };
+    const { router } = renderRoutes(routes, [{ pathname: `/preview/${ID.png}`, state: opened }]);
+    await screen.findByText(NODES.png.name);
+    expect(screen.getByRole("button", { name: "Next file" })).toBeTruthy();
+    // The opener's state is stamped with the account it was written for.
+    await waitFor(() =>
+      expect(router.state.location.state).toMatchObject({ ...opened, account: who.user.id }),
+    );
+
+    who = sessionOf({ id: B, name: "Bea Other", email: "bea@example.com" });
+    await act(async () => void (await refreshSession()));
+    await waitFor(() => expect(state()).toBe("error"));
+    await settle(10);
+
+    expect(screen.queryByRole("button", { name: "Previous file" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next file" })).toBeNull();
+    // Nor are A's ids left in the entry; and Close does not go to A's folder.
+    expect(JSON.stringify(router.state.location.state)).not.toContain(ID.ts);
+    expect(router.state.location.state).toEqual({ account: B });
+    fireEvent.click(screen.getByRole("button", { name: "Close preview" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+  });
 
   it("a sign-out with the preview open: after the purge the dialog asks the API nothing (there is no session to ask with)", async () => {
     await preloadRenderers();

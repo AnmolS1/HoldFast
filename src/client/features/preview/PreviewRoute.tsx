@@ -1,6 +1,7 @@
 // `/preview/:nodeId` as a page: the dialog over whatever was open, with the signed-in source.
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
+import { getKnownUserId } from "../../lib/query";
 import { PreviewDialogView } from "./PreviewDialog";
 import type { LoadedItem } from "./source";
 
@@ -11,6 +12,11 @@ interface PreviewRouteState {
   from?: string;
   /** Set here: `from` was worked out from the file's folder on a cold link, nothing is behind us. */
   cold?: boolean;
+  /**
+   * Set here: the account this state was written for. History state outlives an account change
+   * (no purger reaches it), so another account's ids and folder are never offered.
+   */
+  account?: string;
 }
 
 function readState(value: unknown): PreviewRouteState {
@@ -25,6 +31,7 @@ function readState(value: unknown): PreviewRouteState {
     state.from = raw.from;
   }
   if (raw.cold === true) state.cold = true;
+  if (typeof raw.account === "string") state.account = raw.account;
   return state;
 }
 
@@ -32,8 +39,20 @@ export function PreviewRoute() {
   const { nodeId = null } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
-  const state = readState(location.state);
+  const account = getKnownUserId() ?? undefined;
+  const written = readState(location.state);
+  // Written for another account: none of it is ours to use.
+  const stale = written.account !== undefined && written.account !== account;
+  const state: PreviewRouteState = stale ? {} : written;
   const { siblingIds, from, cold } = state;
+
+  // What an opener wrote has no account yet: it is stamped with the one signed in now. Another
+  // account's state is replaced, so its ids are not left in this entry either.
+  const unstamped = stale || (written.account === undefined && account !== undefined);
+  useEffect(() => {
+    if (!unstamped) return;
+    void navigate(location.pathname + location.search, { replace: true, state: { ...state, account } });
+  });
 
   // Focus goes back to whatever opened the preview (a row of the list underneath).
   const [opener] = useState(() =>
@@ -55,14 +74,14 @@ export function PreviewRoute() {
       const parent = item.node.parentId === null ? "/" : `/folder/${item.node.parentId}`;
       void navigate(location.pathname + location.search, {
         replace: true,
-        state: { siblingIds, from: parent, cold: true },
+        state: { siblingIds, from: parent, cold: true, account },
       });
     },
-    [from, siblingIds, navigate, location.pathname, location.search],
+    [from, siblingIds, account, navigate, location.pathname, location.search],
   );
 
   const onNavigate = (id: string) =>
-    void navigate(`/preview/${encodeURIComponent(id)}`, { replace: true, state });
+    void navigate(`/preview/${encodeURIComponent(id)}`, { replace: true, state: { ...state, account } });
 
   const onClose = () => {
     // Opened from a page of the app: that page is the entry behind this one.
