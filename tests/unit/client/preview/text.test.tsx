@@ -228,6 +228,14 @@ describe("TextPreview — refusals", () => {
   });
 });
 
+/**
+ * For the tests about WHICH tokens come out: the clock stands still, so the grammar's per-line
+ * time limit (it reads `Date.now()`) and the run's slices never trip. On a loaded machine a
+ * short line could otherwise be cut short by preemption alone and come back partly plain —
+ * right for the viewer, wrong for a test of the tokens.
+ */
+const clockStandsStill = () => vi.useFakeTimers({ toFake: ["Date", "performance"] });
+
 describe("highlighting", () => {
   // The grammar and the engine are loaded once, before the tests that wait for colours — so none
   // of them waits on a cold import.
@@ -237,6 +245,7 @@ describe("highlighting", () => {
 
   it("a line longer than the limit is left plain, by the grammar's own limit and before it is even asked", async () => {
     const long = `const s = "${"x".repeat(HIGHLIGHT_MAX_LINE_LENGTH)}";`;
+    clockStandsStill();
     const lines = (await highlight(`const a = 1;\n${long}\n`, "typescript"))!;
     expect(lines[0]!.some((piece) => piece.token === "keyword")).toBe(true);
     // The long line comes back as it is, with no token on any piece.
@@ -264,6 +273,7 @@ describe("highlighting", () => {
 
   it("the highlighter's result is pieces of text with a token name — the file's text, unchanged", async () => {
     const code = 'const tag: string = "<script>alert(1)</script>"; // done\n\nexport default tag;\n';
+    clockStandsStill();
     const lines = (await highlight(code, "typescript"))!;
     expect(lines.map((line) => line.map((piece) => piece.text).join("")).join("\n")).toBe(code);
     const tokens = new Set(lines.flat().map((piece) => piece.token));
@@ -362,6 +372,7 @@ describe("highlighting — its bounds are decided before it starts", () => {
 
   it("the grammar's state is carried from line to line: the middle of a block comment is a comment", async () => {
     const source = ["const a = 1; /* opens here", "still inside", "*/ const after = 1;"];
+    clockStandsStill();
     const lines = (await highlight(source.join("\n"), "typescript"))!;
     expect(lines.map((line) => line.map((piece) => piece.text).join(""))).toEqual(source);
     expect(lines[1]!.every((piece) => piece.token === "comment")).toBe(true);
