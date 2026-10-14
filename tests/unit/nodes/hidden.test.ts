@@ -237,5 +237,7 @@ describe("the route file itself", () => {
     expect(ROUTE_SOURCE).not.toContain("assertNotTrashed");
     expect(ROUTE_SOURCE).not.toContain("effectiveTrashed");
     expect(ROUTE_SOURCE).not.toMatch(/function partnerSees|createdBy ===/);
+    // …and no status list of its own: the listings' lists are the ones `nodes.partnerSees` uses.
+    expect(ROUTE_SOURCE).not.toMatch(/VISIBLE_STATUSES(\s*:[^=;\n]*)?\s*=[^=]/);
   });
 });

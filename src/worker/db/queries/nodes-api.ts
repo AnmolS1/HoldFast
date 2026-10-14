@@ -7,6 +7,7 @@ import type { ZipManifest } from "../../../shared/schemas/node";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { nodes, type ScanStatus, shares } from "../schema";
+import { SHARED_VISIBLE_STATUSES } from "./nodes";
 import { notEffectivelyTrashedOrHidden } from "./tree";
 
 /**
@@ -111,7 +112,8 @@ export type ZipLimits = {
   /**
    * Under a root the caller does NOT own, a file that is not `clean` exists for them only when
    * they uploaded it (`created_by`) and it is in one of these states; every other such file is
-   * in neither list. The rule is the route's (`partnerSees`); it hands its two terms in here.
+   * in neither list. The rule is `nodes.partnerSees`: `clean` is `SHARED_VISIBLE_STATUSES`, the
+   * route hands in the viewer and `UPLOADER_VISIBLE_STATUSES`.
    * Absent: nothing but `clean` under such a root.
    */
   partner?: { viewerId: string; uploaderSees: readonly ScanStatus[] };
@@ -167,6 +169,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
   // An id no account has, and no status: nothing matches the uploader's exception.
   const viewerId = limits.partner?.viewerId ?? "";
   const uploaderSees = (limits.partner?.uploaderSees ?? []).join(",");
+  const anyoneSees = SHARED_VISIBLE_STATUSES.join(",");
   const given = roots.filter((root) => isUuid(root.id));
   if (given.length === 0) return { entries: [], totalBytes: 0, skipped: [], truncated: false };
   // One parameter, whatever the number of roots.
@@ -176,7 +179,7 @@ export async function zipManifest(db: Executor, roots: ZipRoot[], limits: ZipLim
     const row = sql.raw(alias);
     return sql`(${row}.kind = 'folder' OR (
       ${row}.scan_status <> 'suspected_csam' AND ${row}.version_id IS NOT NULL
-      AND (${owner} OR ${row}.scan_status = 'clean'
+      AND (${owner} OR ${row}.scan_status::text = ANY (string_to_array(${anyoneSees}, ','))
            OR (${row}.created_by = ${viewerId}
                AND ${row}.scan_status::text = ANY (string_to_array(${uploaderSees}, ','))))))`;
   };

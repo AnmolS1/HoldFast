@@ -52,6 +52,7 @@ import {
   listChildren,
   move,
   OWNER_VISIBLE_STATUSES,
+  SHARED_VISIBLE_STATUSES,
   UPLOADER_VISIBLE_STATUSES,
   rename,
   requestRescan,
@@ -69,7 +70,7 @@ import {
 import { usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
-import type { Node, ScanStatus } from "../db/schema";
+import type { Node } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
@@ -90,9 +91,6 @@ type Ctx = Context<AppEnv>;
 
 const ID = `:id{${UUID_PARAM}}`;
 const RESCAN_EVERY_SEC = 3_600;
-
-/** What a share partner's listing shows: verdicts other than `clean` are the owner's business. */
-const SHARED_VISIBLE_STATUSES: ScanStatus[] = ["clean"];
 
 function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
