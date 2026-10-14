@@ -1487,6 +1487,8 @@ describe("lockSuspectedCsam", () => {
         expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 1 })).toEqual({
           checked: 1,
           completed: 1,
+          repeated: 0,
+          skipped: 0,
           failed: 0,
         });
         await sweep.settle();
@@ -1535,12 +1537,79 @@ describe("lockSuspectedCsam", () => {
         expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 2 })).toEqual({
           checked: 2,
           completed: 1,
+          repeated: 0,
+          skipped: 0,
           failed: 1,
         });
         await sweep.settle();
         expect(await db.select().from(reports).where(eq(reports.nodeId, broken.file.id))).toEqual([]);
         expect(await db.select().from(reports).where(eq(reports.nodeId, fine.file.id))).toHaveLength(1);
         expect(await csamLocksWithoutReport(db, 1)).toEqual([{ nodeId: broken.file.id }]);
+      });
+    });
+    // Review m1 / m5: what made a node due is re-decided under its lock. Between the sweep's
+    // listing and its lock one node is CLEARED (a false positive — never locked again) and the
+    // other is COMPLETED by someone else (a repeat — counted as one, nothing written twice).
+    it("a node cleared, or completed elsewhere, after the listing: skipped / repeated, nothing written", async () => {
+      await alone(async ({ db, depsOn }) => {
+        const cleared = await writtenLocked(db);
+        const elsewhere = await writtenLocked(db);
+        for (const [index, id] of [cleared.file.id, elsewhere.file.id].entries()) {
+          await db
+            .update(nodes)
+            .set({ createdAt: new Date(Date.UTC(1990, 0, 1, 0, 0, index)) })
+            .where(eq(nodes.id, id));
+        }
+        expect(await csamLocksWithoutReport(db, 2)).toEqual([
+          { nodeId: cleared.file.id },
+          { nodeId: elsewhere.file.id },
+        ]);
+        const sweep = depsOn();
+        // Right after the listing (the sweep's one `execute`): the clear, and the other lock.
+        let fired = false;
+        let elsewhereReport = "";
+        sweep.deps.db = new Proxy(db, {
+          get(target, property, receiver) {
+            if (property === "execute" && !fired) {
+              return async (...args: unknown[]) => {
+                const result: unknown = await (target.execute as (...a: unknown[]) => Promise<unknown>)(
+                  ...args,
+                );
+                fired = true;
+                await db
+                  .update(nodes)
+                  .set({ scanStatus: "pending", legalHold: false })
+                  .where(eq(nodes.id, cleared.file.id));
+                elsewhereReport = (await lockRows(db, elsewhere.file.id, { source: "system" }))!.reportId;
+                return result;
+              };
+            }
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+          },
+        });
+        expect(await sweepUnrecordedCsamLocks(sweep.deps, { limit: 2 })).toEqual({
+          checked: 2,
+          completed: 0,
+          repeated: 1,
+          skipped: 1,
+          failed: 0,
+        });
+        await sweep.settle();
+        // The cleared node stays cleared: no lock, no case, its link not paused, nobody told.
+        expect(await db.select().from(nodes).where(eq(nodes.id, cleared.file.id))).toMatchObject([
+          { scanStatus: "pending", legalHold: false },
+        ]);
+        expect(await db.select().from(reports).where(eq(reports.nodeId, cleared.file.id))).toEqual([]);
+        const [link] = await db.select().from(shareLinks).where(eq(shareLinks.id, cleared.link.id));
+        expect(link!.pauseReasons).toEqual([]);
+        expect(await auditIn(db, "scan.suspected_csam", cleared.file.id)).toEqual([]);
+        // The other: its one case, and the sweep neither recorded nor announced it.
+        expect(await db.select().from(reports).where(eq(reports.nodeId, elsewhere.file.id))).toMatchObject([
+          { id: elsewhereReport },
+        ]);
+        expect(await auditIn(db, "scan.suspected_csam", elsewhere.file.id)).toEqual([]);
+        expect(alertsFor(elsewhereReport)).toHaveLength(0);
       });
     });
   });

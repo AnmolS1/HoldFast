@@ -25,8 +25,10 @@
 import { UUID } from "../../shared/ids";
 import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import {
+  completeUnrecordedCsamLock,
   csamLocksWithoutReport,
   csamReportsToAnnounce,
+  type CsamLockResult,
   lockSuspectedCsam as lockRows,
 } from "../db/queries/moderation";
 import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
@@ -509,6 +511,17 @@ async function lockAndOwe(
 ): Promise<{ reportId: string; owed: Promise<void> | null } | null> {
   const locked = await lockRows(deps.db, nodeId, { source });
   if (!locked) return null;
+  return { reportId: locked.reportId, owed: owedAfterLock(deps, nodeId, source, via, locked) };
+}
+
+/** The record + alert a lock owes (already running, errors captured), or null when none. */
+function owedAfterLock(
+  deps: ServiceDeps,
+  nodeId: string,
+  source: "photodna" | "system" | "admin",
+  via: "lock" | "sweep",
+  locked: CsamLockResult,
+): Promise<void> | null {
   const { reportId } = locked;
   // A FIRST lock is always recorded and announced — also when it found a report that was
   // already being reviewed or was filed (an admin opened the case from a user's report): the
@@ -518,40 +531,47 @@ async function lockAndOwe(
   // redelivery that repairs what was lost with an invocation); on a report someone is
   // reviewing, or that was FILED, it mails nobody and writes no second lock row. Decided on what
   // the lock saw under its locks.
-  if (locked.alreadyLocked && locked.reportStatus !== "open") return { reportId, owed: null };
-  const owed = (async () => {
+  if (locked.alreadyLocked && locked.reportStatus !== "open") return null;
+  return (async () => {
     await attempt(deps, "lock_record", () =>
       recordCsamLock(deps, { reportId, nodeId, source }, via === "sweep"),
     );
     await attempt(deps, "alert", () => ensureCsamAlerted(deps, reportId, { via, nodeId }));
   })();
-  return { reportId, owed };
 }
 
 /**
  * Completes the suspected-CSAM locks nobody finished: every file that is `suspected_csam` with
- * no `csam` case (`moderation.csamLocksWithoutReport`, oldest first, at most `limit`) is locked
- * again — the whole job: its report is filed, the owner and every uploader held, its links
- * paused, its upload addresses held — and then recorded (`scan.suspected_csam` with source
- * `system` and `recoveredBy: "sweep"`) and announced (`via: "sweep"`) like a first lock, AWAITED
- * here (a scheduled job has no request to answer first). One failing node does not stop the
- * rest: its error is captured and counted, and the next run finds it again. A node completed by
- * someone else in between is a repeat and costs nothing (its own lock recorded it). Wired into
- * the hourly slot beside `sweepCsamAlerts` by the scheduled-jobs task (T22).
+ * no `csam` case (`moderation.csamLocksWithoutReport`, oldest first, at most `limit`) is
+ * completed (`moderation.completeUnrecordedCsamLock`) — the whole job: its report is filed, the
+ * owner and every uploader held, its links paused, its upload addresses held — and then recorded
+ * (`scan.suspected_csam` with source `system` and `recoveredBy: "sweep"`) and announced
+ * (`via: "sweep"`) like a first lock, AWAITED here (a scheduled job has no request to answer
+ * first). WHAT MADE IT DUE IS RE-DECIDED UNDER THE NODE'S LOCK, before anything is written: a
+ * node that is no longer `suspected_csam` (cleared since it was listed) is `skipped`, one that
+ * has its case now (completed by someone else) is `repeated` — neither is written to, recorded or
+ * announced. One failing node does not stop the rest: its error is captured and counted, and the
+ * next run finds it again. Wired into the hourly slot beside `sweepCsamAlerts` by the
+ * scheduled-jobs task (T22).
  */
 export async function sweepUnrecordedCsamLocks(
   deps: ServiceDeps,
   opts: { limit?: number } = {},
-): Promise<{ checked: number; completed: number; failed: number }> {
+): Promise<{ checked: number; completed: number; repeated: number; skipped: number; failed: number }> {
   const limit = Math.max(1, Math.min(opts.limit ?? CSAM_SWEEP_DEFAULT_LIMIT, 1_000));
   const due = await csamLocksWithoutReport(deps.db, limit);
   let completed = 0;
+  let repeated = 0;
+  let skipped = 0;
   let failed = 0;
   for (const { nodeId } of due) {
     try {
-      const locked = await lockAndOwe(deps, nodeId, "system", "sweep");
-      if (locked?.owed) {
-        await locked.owed;
+      const locked = await completeUnrecordedCsamLock(deps.db, nodeId);
+      if (locked === "has_case") repeated += 1;
+      else if (locked === null || locked === "not_locked") skipped += 1;
+      else {
+        const owed = owedAfterLock(deps, nodeId, "system", "sweep", locked);
+        if (owed) await owed;
         completed += 1;
       }
     } catch (error) {
@@ -560,5 +580,5 @@ export async function sweepUnrecordedCsamLocks(
       writeMetric(deps.env, "error", { kind: "csam_alert", reason: "sweep_lock" });
     }
   }
-  return { checked: due.length, completed, failed };
+  return { checked: due.length, completed, repeated, skipped, failed };
 }
