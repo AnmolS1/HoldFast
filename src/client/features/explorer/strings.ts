@@ -135,6 +135,8 @@ export const messages = {
   "explorer.download.pending": "Still scanning. Try again in a moment.",
   "explorer.download.blocked": "This file is blocked and can't be downloaded.",
   "explorer.download.refused": "The download link wasn't one of ours, so it wasn't opened. Try again.",
+  "explorer.download.popup":
+    "Your browser didn't open the download. Allow pop-ups for this site, then try again.",
 
   "explorer.empty.first": "Upload files or make a folder. Everything is scanned before it can be shared.",
   "explorer.empty.folder.title": "This folder is empty",

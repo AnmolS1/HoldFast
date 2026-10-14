@@ -20,11 +20,10 @@ export function isFilesUrl(url: string): boolean {
   }
 }
 
-function clickLink(href: string, attributes: { download?: string; target?: string }): void {
+function clickLink(href: string, download: string): void {
   const link = document.createElement("a");
   link.href = href;
-  if (attributes.download !== undefined) link.download = attributes.download;
-  if (attributes.target) link.target = attributes.target;
+  link.download = download;
   link.rel = "noopener noreferrer";
   link.hidden = true;
   document.body.append(link);
@@ -32,22 +31,55 @@ function clickLink(href: string, attributes: { download?: string; target?: strin
   link.remove();
 }
 
+export type DownloadOpened = "opened" | "refused" | "blocked";
+
+/** The tab one download will be shown in, opened before its URL is known. */
+export interface DownloadTab {
+  /** Point the tab at a minted files-host URL; a refused URL closes it instead. */
+  go(url: string): DownloadOpened;
+  /** Nothing to download after all: the tab goes again. */
+  close(): void;
+}
+
 /**
- * Start the download of a minted files-host URL (its `Content-Disposition` names the file).
- * In a tab of its own: when the files host answers with an error instead of an attachment, that
- * page shows there — the app, its uploads and its zips stay where they are, and the token never
- * enters this tab's history. False when the URL was refused.
+ * A tab of its own for one download (its `Content-Disposition` names the file): when the files
+ * host answers with an error instead of an attachment, that page shows there — the app, its
+ * uploads and its zips stay where they are, and the token never enters this tab's history.
+ *
+ * It is opened in the click itself, before the URL is asked for: a tab opened after an awaited
+ * request is outside the click's activation and a browser may block it as a pop-up (Safari,
+ * Firefox). Opened empty and cut from this page (`opener = null`); the page's own referrer policy
+ * (strict-origin-when-cross-origin) lets the files host see the app's origin at most.
  */
-export function saveUrl(url: string): boolean {
-  if (!isFilesUrl(url)) return false;
-  clickLink(url, { target: "_blank" });
-  return true;
+export function openDownloadTab(): DownloadTab {
+  let tab: Window | null = null;
+  try {
+    tab = window.open("", "_blank");
+  } catch {
+    tab = null;
+  }
+  if (tab) tab.opener = null;
+  return {
+    go(url) {
+      if (!isFilesUrl(url)) {
+        tab?.close();
+        return "refused";
+      }
+      // Refused by the browser at the click, or closed by the user meanwhile.
+      if (!tab || tab.closed) return "blocked";
+      tab.location.replace(url);
+      return "opened";
+    },
+    close() {
+      tab?.close();
+    },
+  };
 }
 
 /** Save bytes built in the page under the given name. */
 export function saveBlob(blob: Blob, fileName: string): void {
   const url = URL.createObjectURL(blob);
-  clickLink(url, { download: fileName });
+  clickLink(url, fileName);
   // The download has been handed over by the click; the object can go once the browser took it.
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }

@@ -18,7 +18,7 @@ import { ApiError, toastApiError } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
 import { createFolder, downloadUrl, moveNode, patchNode, rescanNode, restoreNode, trashNode } from "./api";
-import { saveUrl } from "./download";
+import { openDownloadTab } from "./download";
 import { beginEdit, cancelListings, invalidateParents, patchInListings, removeFromListings } from "./queries";
 import { messages, t } from "./strings";
 
@@ -366,19 +366,32 @@ export async function moveNodes(nodes: readonly NodeDto[], target: MoveTarget): 
   });
 }
 
-/** One file, through a short-lived files-host URL. */
+/**
+ * One file, through a short-lived files-host URL. Called in the click: the tab it is shown in is
+ * opened before anything is awaited (see `openDownloadTab`), and closed again on every way that
+ * ends without a download.
+ */
 export async function downloadNode(node: NodeDto): Promise<void> {
+  const tab = openDownloadTab();
   const mine = stillMine();
   try {
     const answer = await downloadUrl(node.id, "download");
-    if (!mine()) return;
-    if (!saveUrl(answer.url)) {
-      toast({ message: t("explorer.download.refused"), key: "download" });
+    if (!mine()) {
+      tab.close();
+      return;
+    }
+    const opened = tab.go(answer.url);
+    if (opened !== "opened") {
+      toast({
+        message: t(opened === "refused" ? "explorer.download.refused" : "explorer.download.popup"),
+        key: "download",
+      });
       return;
     }
     if (answer.warning === "unscanned")
       toast({ message: t("explorer.download.unscanned"), key: "unscanned" });
   } catch (cause) {
+    tab.close();
     if (!mine()) return;
     if (cause instanceof ApiError && cause.code === "scan_pending")
       toast({ message: t("explorer.download.pending"), requestId: cause.requestId });

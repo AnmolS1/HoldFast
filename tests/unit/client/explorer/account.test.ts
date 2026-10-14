@@ -2,7 +2,7 @@
 // action: the request is held, the account's state is purged (sign-out, or another identity), and
 // only then does the request end — well or badly. Afterwards the cache holds nothing of the old
 // account, nothing is toasted or announced, no event is sent and nothing is downloaded.
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot } from "../../../../src/client/components/TransferRibbon";
 import {
@@ -21,7 +21,7 @@ import type { NodeDto } from "../../../../src/shared/schemas/node";
 import { envelope, json } from "../shell/helpers";
 import { FakeDrive } from "./fixtures/drive";
 import { fileNode, folderNode, pageOf } from "./fixtures/nodes";
-import { deferred, recordNodesChanged, serveDrive, setupExplorer } from "./helpers";
+import { deferred, recordNodesChanged, serveDrive, setupExplorer, stubDownloadTab } from "./helpers";
 
 setupExplorer();
 
@@ -85,7 +85,7 @@ describe.each(CASES)("$name, in flight when the account's state is purged", ({ h
       await gate.promise;
       return answer(drive, call);
     });
-    const clicks = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const { tab } = stubDownloadTab();
     const seen = recordNodesChanged();
     seed([FOLDER, DIARY, SALARY]);
 
@@ -110,7 +110,7 @@ describe.each(CASES)("$name, in flight when the account's state is purged", ({ h
     expect(getRibbonSnapshot().current).toBeNull();
     // No sibling view is told to refresh, and nothing is downloaded.
     expect(seen.events).toEqual([]);
-    expect(clicks).not.toHaveBeenCalled();
+    expect(tab.sentTo).toEqual([]);
     seen.stop();
   });
 });

@@ -2,7 +2,7 @@
 // stub; the page is rendered at its real routes inside a small stand-in for the app frame.
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { Outlet, type RouteObject } from "react-router";
-import { beforeEach, expect } from "vitest";
+import { beforeEach, expect, vi } from "vitest";
 import { Breadcrumbs } from "../../../../src/client/components/Breadcrumbs";
 import { DetailsPanel } from "../../../../src/client/components/DetailsPanel";
 import { getToasts, Toaster } from "../../../../src/client/components/Toaster";
@@ -43,6 +43,8 @@ export function setupExplorer(): void {
     announce("");
     // The files origin a minted URL is checked against.
     seedConfig();
+    // jsdom has no tabs: a download's tab is refused unless a test stands one in (stubDownloadTab).
+    vi.spyOn(window, "open").mockReturnValue(null);
   });
 }
 
@@ -149,4 +151,22 @@ export function deferred<T>() {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+/**
+ * `window.open` for a single download: a stand-in tab that records where it was sent and whether
+ * it was closed. `blocked` makes the browser refuse it, as a pop-up blocker does.
+ */
+export function stubDownloadTab(options: { blocked?: boolean } = {}) {
+  const tab = {
+    opener: {} as unknown,
+    closed: false,
+    sentTo: [] as string[],
+    location: { replace: (url: string) => void tab.sentTo.push(url) },
+    close: () => void (tab.closed = true),
+  };
+  const open = vi
+    .spyOn(window, "open")
+    .mockImplementation(() => (options.blocked ? null : (tab as unknown as Window)));
+  return { tab, open };
 }

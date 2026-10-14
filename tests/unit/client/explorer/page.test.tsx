@@ -36,6 +36,7 @@ import {
   selectedIds,
   serveDrive,
   setupExplorer,
+  stubDownloadTab,
   toastMessages,
   waitForRows,
 } from "./helpers";
@@ -763,25 +764,56 @@ describe("details", () => {
 });
 
 describe("downloading one file", () => {
-  it("asks for a download URL and opens it in a tab of its own, through a hidden link", async () => {
+  it("asks for a download URL and shows it in a tab of its own, opened in the click (m19)", async () => {
     const drive = top();
-    serveDrive(drive);
-    const clicked: Array<{ href: string; target: string; rel: string }> = [];
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
-      clicked.push({ href: this.href, target: this.target, rel: this.rel });
+    let openedBeforeRequest: boolean | null = null;
+    serveDrive(drive, (call) => {
+      if (call.path.endsWith("/download-url")) openedBeforeRequest = open.mock.calls.length === 1;
+      return undefined;
     });
+    const { tab, open } = stubDownloadTab();
     renderExplorer("/");
     await waitForRows(4);
     await menuAction(NOTES.id, "download");
-    await waitFor(() => expect(clicked).toHaveLength(1));
+    await waitFor(() => expect(tab.sentTo).toHaveLength(1));
     expect(drive.callsTo("POST", /\/download-url$/)[0]!.body).toEqual({ kind: "download" });
-    expect(clicked[0]!.href).toMatch(new RegExp(`^http://files\\.localhost:3000/d/${NOTES.id}/token-`));
+    // The tab was opened before the request left: inside the click, where a pop-up blocker allows it.
+    expect(openedBeforeRequest).toBe(true);
+    expect(open).toHaveBeenCalledWith("", "_blank");
     // Its own tab: an error page from the files host never replaces the app, and the token never
-    // enters this tab's history. No opener, no referrer.
-    expect(clicked[0]!.target).toBe("_blank");
-    expect(clicked[0]!.rel).toBe("noopener noreferrer");
-    // Nothing of the URL stays in the document.
+    // enters this tab's history. Cut from the opener.
+    expect(tab.opener).toBeNull();
+    expect(tab.sentTo[0]).toMatch(new RegExp(`^http://files\\.localhost:3000/d/${NOTES.id}/token-`));
+    expect(tab.closed).toBe(false);
+    // Nothing of the URL is in the document.
     expect(document.querySelector(`a[href*="token-"]`)).toBeNull();
+    expect(toastMessages()).toEqual([]);
+  });
+
+  it("a tab the browser refused (a pop-up blocker) is said, not silently lost (m19)", async () => {
+    serveDrive(top());
+    stubDownloadTab({ blocked: true });
+    renderExplorer("/");
+    await waitForRows(4);
+    await menuAction(NOTES.id, "download");
+    await waitFor(() =>
+      expect(toastMessages()).toEqual([
+        "Your browser didn't open the download. Allow pop-ups for this site, then try again.",
+      ]),
+    );
+  });
+
+  it.each([
+    ["scan_pending", 409],
+    ["internal", 500],
+  ])("a request answered %s closes the tab it had opened", async (code, status) => {
+    serveDrive(top().fail("POST", /\/download-url$/, status, Infinity, code));
+    const { tab } = stubDownloadTab();
+    renderExplorer("/");
+    await waitForRows(4);
+    await menuAction(NOTES.id, "download");
+    await waitFor(() => expect(tab.closed).toBe(true));
+    expect(tab.sentTo).toEqual([]);
   });
 
   it.each([
@@ -793,7 +825,7 @@ describe("downloading one file", () => {
     serveDrive(top(), (call) =>
       call.path.endsWith("/download-url") ? json({ url, expiresAt: "2026-10-02T12:00:00.000Z" }) : undefined,
     );
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const { tab } = stubDownloadTab();
     renderExplorer("/");
     await waitForRows(4);
     await menuAction(NOTES.id, "download");
@@ -802,13 +834,14 @@ describe("downloading one file", () => {
         "The download link wasn't one of ours, so it wasn't opened. Try again.",
       ]),
     );
-    expect(click).not.toHaveBeenCalled();
+    expect(tab.sentTo).toEqual([]);
+    expect(tab.closed).toBe(true);
   });
 
   it("an unscanned file downloads for its owner with the warning", async () => {
     const unscanned = fileNode(9, { name: "big.iso", scanStatus: "skipped", scanReason: "size" });
     serveDrive(top().add(unscanned));
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    stubDownloadTab();
     renderExplorer("/");
     await waitForRows(5);
     const { menu } = await openMenu(unscanned.id);
