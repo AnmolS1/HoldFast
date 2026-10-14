@@ -3,7 +3,7 @@
 // same by `asQueryError` (db/errors.ts).
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
 import { z } from "zod";
 import * as account from "../../../src/shared/schemas/account";
@@ -17,7 +17,8 @@ import * as share from "../../../src/shared/schemas/share";
 import * as upload from "../../../src/shared/schemas/upload";
 import { statementsSent } from "../../../src/worker/db/client";
 import { asQueryError, QueryError } from "../../../src/worker/db/errors";
-import { openDb, rejection } from "./_helpers";
+import { user } from "../../../src/worker/db/schema";
+import { makeUser, openDb, rejection } from "./_helpers";
 
 const { db, close } = openDb();
 afterAll(() => close());
@@ -65,6 +66,24 @@ describe("a NUL in a bind value", () => {
     )})`;
     expect((await classified(db.execute(spread))).query).toEqual(VALIDATION);
     expect(statementsSent(db)).toBe(before);
+  });
+
+  // Review round 2, n1: inside a transaction the statement goes to the lent CLIENT (not
+  // `pool.query`), so it is the client-level check that refuses it. Nothing is sent — the
+  // transaction is not aborted: the caller may catch the refusal, go on and commit.
+  it("inside a transaction: refused by the client-level check, nothing sent, the transaction goes on and commits", async () => {
+    const id = await makeUser(db);
+    const renamed = await db.transaction(async (tx) => {
+      const before = statementsSent(db);
+      const refused = await rejection(tx.execute(sql`SELECT ${"a\u0000b"}::text`));
+      expect(asQueryError(refused)?.code).toBe("validation");
+      expect(statementsSent(db)).toBe(before);
+      await tx.update(user).set({ name: "after the refusal" }).where(eq(user.id, id));
+      return (await tx.execute<{ v: string }>(sql`SELECT ${"still open"}::text AS v`)).rows[0]!.v;
+    });
+    expect(renamed).toBe("still open");
+    const [row] = await db.select({ name: user.name }).from(user).where(eq(user.id, id));
+    expect(row!.name).toBe("after the refusal");
   });
 
   it("the handle goes on: the next statement runs; a transaction with such a statement rolls back like any failed one", async () => {
