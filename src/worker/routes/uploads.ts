@@ -66,7 +66,7 @@ import {
 } from "../../shared/schemas/upload";
 import type { SessionUser } from "../auth/types";
 import type { Db } from "../db/client";
-import { LegalHoldError, QueryError } from "../db/errors";
+import { asQueryError, LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
 import { findByR2Key, getNode, replaceVersion } from "../db/queries/nodes";
@@ -1204,7 +1204,8 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       }
       return place;
     } catch (error) {
-      if (error instanceof AppError || error instanceof QueryError) await giveUp("recheck");
+      // A refusal of the app's own — also one the driver wrapped (`asQueryError` finds it).
+      if (error instanceof AppError || asQueryError(error)) await giveUp("recheck");
       throw error;
     }
   };
@@ -1310,7 +1311,14 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   try {
     finished = await finish(c, session, user, becomes, sealed, body.sha256);
   } catch (error) {
-    if (!(error instanceof ReplaceRefused)) throw error;
+    if (!(error instanceof ReplaceRefused)) {
+      // The place may have gone while this request held the session — a purge of the folder
+      // keeps a `completing` session (and its object) for the request to end. Asked again: a
+      // place that is gone gives the upload up (object, reservation) with the plain answer; any
+      // other failure is the failure it was.
+      await recheck();
+      throw error;
+    }
     // The target changed under the upload (a scan, a hold, a takedown): the same answer for all.
     await giveUp("replace");
     throw replaceRefused();

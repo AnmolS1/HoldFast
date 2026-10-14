@@ -11,12 +11,12 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { SessionUser } from "../../../src/worker/auth/types";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
+import { QueryError } from "../../../src/worker/db/errors";
 import * as quotaRows from "../../../src/worker/db/queries/quota";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { nodes, reports, shares, uploads, user as userTable } from "../../../src/worker/db/schema";
-import { FINISHED_TRIM_DAYS } from "../../../src/worker/db/queries/upload-sessions";
+import { FINISHED_TRIM_DAYS } from "../../../src/worker/db/queries/uploads";
 import { operatorAlert, RaisedToCsam, refuseBlocked, storedSha256 } from "../../../src/worker/routes/uploads";
-import trimSource from "../../../src/worker/db/queries/uploads.ts?raw";
 import { requireRole } from "../../../src/worker/services/permissions";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
@@ -84,6 +84,27 @@ async function observed(caller: UserRow, method: string, path: string, json?: un
   return { seen: seen(answer), headers: headersOf(answer), statements: statements.n };
 }
 const list = (user: UserRow) => call<unknown[]>(user, "GET", "/uploads/open");
+
+/**
+ * A purge of a folder as the purger does it (T14's delete-forever / purge job, not on this
+ * branch): the rows and the freed bytes in one transaction, then — after the commit — every
+ * object the rows named deleted, and every unfinished upload it handed over aborted.
+ */
+async function purge(folderId: string, ownerId: string) {
+  const removed = await testDb().transaction(async (tx) => {
+    const rows = await deleteSubtreeRows(tx, folderId);
+    await quotaRows.release(tx, ownerId, rows.freedBytes);
+    return rows;
+  });
+  const store = storage(env);
+  if (removed.r2Keys.length > 0) await store.delete(removed.r2Keys);
+  for (const upload of removed.uploadsToAbort) {
+    await env.FILES.delete(upload.r2Key);
+    if (upload.r2UploadId)
+      await store.abort(store.resumeMultipart(upload.r2Key, upload.r2UploadId)).catch(() => undefined);
+  }
+  return removed;
+}
 
 describe("B1 — verified CSAM bytes are hidden and held from the first commit of their row", () => {
   it("the lock's own transaction fails: the node exists, suspected_csam and held, 404 to its owner; a repeat does not return it; the stub cannot clean it; the handler called again completes the job", async () => {
@@ -203,7 +224,7 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
     expect(during).toBe(known.sha256);
   });
 
-  it("the folder is purged while the server hashes the object: the session row is gone, and the bytes become the uploader's locked node — the folder's owner is not held", async () => {
+  it("the folder is purged — rows AND objects, as the purger does — while the server hashes the object: the evidence survives as the uploader's locked node; the folder's owner is not held", async () => {
     const owner = await uploader();
     const editor = await uploader();
     const folder = await makeFolder(owner.id);
@@ -216,11 +237,9 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
       get: async () => {
         if (purged) return;
         purged = true;
-        // What a purge does: the rows, and the freed bytes off the meter, in one transaction.
-        await testDb().transaction(async (tx) => {
-          const removed = await deleteSubtreeRows(tx, folder.id);
-          await quotaRows.release(tx, owner.id, removed.freedBytes);
-        });
+        const removed = await purge(folder.id, owner.id);
+        // The completing session is kept by the purge: its key is not handed to the purger.
+        expect(removed.uploadsToAbort.map((u) => u.r2Key)).not.toContain(row.r2Key);
       },
     });
     const answer = await complete(
@@ -233,7 +252,8 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
     );
     expect(purged).toBe(true);
     expect(answer.status).toBe(404);
-    expect(await sessionRow(session.uploadId)).toBeNull();
+    // Kept by the purge, detached; ended by this request once the node was written.
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted", parentId: null });
     expect(await env.FILES.head(row.r2Key)).not.toBeNull();
     const [kept] = await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key));
     expect(kept).toMatchObject({
@@ -246,6 +266,52 @@ describe("B1 — verified CSAM bytes are hidden and held from the first commit o
     expect(await userRow(editor.id)).toMatchObject({ legalHold: true });
     expect(await usedBytes(owner.id)).toBe(0);
     expect(await usedBytes(editor.id)).toBe(1000);
+  });
+
+  it("ordinary bytes whose folder is purged while complete runs: given up — the plain 404, the object deleted, the reservation back, no node", async () => {
+    const owner = await uploader();
+    const folder = await makeFolder(owner.id);
+    const session = await uploaded(owner, { parentId: folder.id });
+    const row = (await sessionRow(session.uploadId))!;
+    let purged = false;
+    // The re-check has passed; the purge lands before the node is written.
+    const watched = watchedBucket([], {
+      head: async () => {
+        if (purged) return;
+        purged = true;
+        await purge(folder.id, owner.id);
+      },
+    });
+    const answer = await complete(owner, session.uploadId, {}, { env: { FILES: watched.bucket } });
+    expect(purged).toBe(true);
+    expect(answer.status).toBe(404);
+    expect(await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key))).toHaveLength(0);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+    expect(await env.FILES.head(row.r2Key)).toBeNull();
+    expect(await usedBytes(owner.id)).toBe(0);
+  });
+
+  it("a re-check refused by a QueryError the driver wrapped gives the upload up, as an unwrapped one does", async () => {
+    const owner = await uploader();
+    const folder = await makeFolder(owner.id);
+    // Listed as malware, the true hash: the server hashes first, then re-checks.
+    const known = await listed("malware");
+    const session = await uploaded(owner, { parentId: folder.id }, known.bytes);
+    const fault = { armed: false, error: new QueryError("validation") as Error };
+    const watched = watchedBucket([], {
+      get: async () => {
+        fault.armed = true;
+      },
+    });
+    const answer = await complete(
+      owner,
+      session.uploadId,
+      { sha256: known.sha256 },
+      { env: { FILES: watched.bucket }, fault },
+    );
+    expect(answer.status).toBe(400);
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+    expect(await usedBytes(owner.id)).toBe(0);
   });
 
   it("a share revoked WHILE the server hashes the object: the re-check follows the hash, so the folder's owner is not held (m12)", async () => {
@@ -832,10 +898,6 @@ describe("r3-m2 — the operator alert failing changes nothing but the alert", (
 });
 
 describe("r3-m3 — a finished session past the trim age answers as an unknown upload id, kept by a hold or not", () => {
-  it("FINISHED_TRIM_DAYS is the trim's own default (T05 uploads.trimFinished)", () => {
-    expect(trimSource).toMatch(new RegExp(`olderThanDays: number = ${FINISHED_TRIM_DAYS},`));
-  });
-
   it("held-and-kept, trimmed, never existed: one answer — status, body, headers, statements — for a repeat and a DELETE", async () => {
     const user = await uploader();
     const old = new Date(Date.now() - (FINISHED_TRIM_DAYS + 1) * 86_400_000);

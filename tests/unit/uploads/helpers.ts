@@ -115,7 +115,7 @@ export type CallOptions = {
    * While `armed` is true, the NEXT statement the request sends fails (once) as a lost
    * connection would — a database error that is not one of the app's own.
    */
-  fault?: { armed: boolean };
+  fault?: { armed: boolean; error?: Error };
 };
 
 export type Answer<T = Record<string, unknown>> = {
@@ -166,7 +166,7 @@ function observedCore(options: CallOptions): Pick<CoreDeps, "createDb"> {
             if (counter) counter.n += 1;
             if (fault?.armed) {
               fault.armed = false;
-              const error = new Error("test: Connection terminated unexpectedly");
+              const error = fault.error ?? new Error("test: Connection terminated unexpectedly");
               // The driver calls back or awaits, depending on the caller.
               const callback = a.find((arg): arg is (e: Error) => void => typeof arg === "function");
               if (callback) {

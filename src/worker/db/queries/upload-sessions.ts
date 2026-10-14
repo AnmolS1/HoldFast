@@ -9,6 +9,7 @@ import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import { isUuid } from "../ids";
+import { FINISHED_TRIM_DAYS } from "./uploads";
 import { type Node, nodes, type Upload, uploadParts, uploads, user } from "../schema";
 
 const LIVE_NAME_INDEXES = ["nodes_live_name_root_uq", "nodes_live_name_child_uq"] as const;
@@ -17,12 +18,6 @@ const LIVE_NAME_INDEXES = ["nodes_live_name_root_uq", "nodes_live_name_child_uq"
 export type NewNode = typeof nodes.$inferInsert;
 
 export type SessionPart = { n: number; etag: string; size: number };
-
-/**
- * The age after which T05's `uploads.trimFinished` deletes a finished session (its default
- * `olderThanDays`; SEAM: T05 to export it as a constant — until then a test pins the two equal).
- */
-export const FINISHED_TRIM_DAYS = 7;
 
 /**
  * A `done` / `aborted` session older than the trim age — measured as the trim measures it,
