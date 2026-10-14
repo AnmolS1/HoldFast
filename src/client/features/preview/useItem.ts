@@ -85,7 +85,7 @@ export function useSiblingIds(
     const scope = openScope();
     queueMicrotask(() => {
       if (!scope.alive()) return;
-      listSiblingIds(parentId, scope.signal).then(
+      listSiblingIds(parentId, scope).then(
         (ids) => {
           if (scope.alive()) setListed({ parentKey: wanted, ids });
         },

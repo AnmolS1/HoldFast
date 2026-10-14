@@ -10,6 +10,7 @@ import ImagePreview from "../../../../src/client/features/preview/renderers/Imag
 import MediaPreview from "../../../../src/client/features/preview/renderers/MediaPreview";
 import TextPreview from "../../../../src/client/features/preview/renderers/TextPreview";
 import { openScope, openScopeCount } from "../../../../src/client/features/preview/scope";
+import { listSiblingIds } from "../../../../src/client/features/preview/source";
 import { SCAN_POLL_MS } from "../../../../src/client/features/preview/useItem";
 import { usePreviewUrl } from "../../../../src/client/features/preview/usePreviewUrl";
 import { adoptIdentity, purgeUserState, refreshSession } from "../../../../src/client/lib/query";
@@ -305,7 +306,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     }
   });
 
-  it("the folder listing for prev/next stops at the page it was on", async () => {
+  it("the folder listing for prev/next: a page that answers after the purge leads to no next page (its transfer is aborted with the scope)", async () => {
     const gate = held<null>();
     const a = accountA([NODES.svg]);
     let pages = 0;
@@ -326,6 +327,22 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     await settle(30);
     // Page one answered after the purge: page two is never asked for.
     expect(pages).toBe(1);
+  });
+});
+
+describe("the folder listing's own check", () => {
+  it("asks for no next page once its scope is over — even before the scope's signal is aborted (a purge's first moment)", async () => {
+    let alive = true;
+    const network = installFetch({
+      api: () => {
+        // The account goes while page one is on its way; the purger has not aborted anything yet.
+        alive = false;
+        return json({ items: [], nextCursor: "more" });
+      },
+    });
+    const scope = { signal: new AbortController().signal, alive: () => alive };
+    expect(await listSiblingIds(ID.folder, scope)).toEqual([]);
+    expect(network.api().length).toBe(1);
   });
 });
 
@@ -363,6 +380,28 @@ describe("an element's own handlers after a purge (a renderer that is still moun
     await settle(30);
     expect(shown()!.getAttribute("data-highlighted")).toBe("false");
     expect(view.container.querySelector("[data-token]")).toBeNull();
+  });
+
+  it("text: an account that goes while the highlighter is on its way — no run starts, and nothing is left 'running'", async () => {
+    const module = await import("../../../../src/client/features/preview/renderers/highlight");
+    const run = vi.spyOn(module, "highlight");
+    const languageFor = module.languageFor;
+    let purging: Promise<void> | undefined;
+    // The purge starts as the highlighter arrives: the account epoch has moved, the purger (which
+    // aborts the scope's signal) has not run yet, and nothing remounts the renderer.
+    vi.spyOn(module, "languageFor").mockImplementation((ext) => {
+      purging ??= purgeUserState();
+      return languageFor(ext);
+    });
+    const api = ownerApi([NODES.ts]);
+    installFetch({ api: api.handler, files: () => new Response("const secret = 1;\n") });
+    const view = renderPreview(<TextPreview source="owner" item={loadedOf(NODES.ts)} />);
+    await waitFor(() => expect(purging).toBeDefined());
+    await act(async () => void (await purging));
+    await settle(30);
+    expect(run).not.toHaveBeenCalled();
+    const shown = view.container.querySelector('[data-preview-renderer="text"]');
+    expect(shown?.getAttribute("data-highlight") ?? "none").toBe("none");
   });
 
   it("control: without a purge the same colours are applied", async () => {

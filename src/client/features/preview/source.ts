@@ -12,6 +12,7 @@ import {
 import type { PreviewItem, PublicPreviewSource } from "../../components/slots";
 import type { ScanStatus } from "../../components/types";
 import { api } from "../../lib/api";
+import type { ViewScope } from "./scope";
 
 export type PreviewSource = "owner" | PublicPreviewSource;
 
@@ -98,18 +99,25 @@ export const SIBLING_LIMIT = 1000;
 const SIBLING_PAGE = 200;
 
 /** The files next to a node, in the folder's default order — for prev/next on a cold link. */
-export async function listSiblingIds(parentId: string | null, signal: AbortSignal): Promise<string[]> {
+export async function listSiblingIds(
+  parentId: string | null,
+  scope: Pick<ViewScope, "signal" | "alive">,
+): Promise<string[]> {
   const base = parentId === null ? "/api/nodes/root" : `${nodePath(parentId)}/children`;
   const ids: string[] = [];
   let cursor: string | null = null;
   let pages = 0;
   do {
     // The next page is asked for only while the view that wanted the list is still there (its
-    // scope ends with the view and with the account).
-    if (signal.aborted) return [];
+    // scope ends with the view and with the account — the account already when the purge starts,
+    // before the purger has aborted the signal).
+    if (!scope.alive()) return [];
     const query = new URLSearchParams({ kind: "file", limit: String(SIBLING_PAGE) });
     if (cursor) query.set("cursor", cursor);
-    const page: NodePage = await api(`${base}?${query.toString()}`, { schema: NodePage, signal });
+    const page: NodePage = await api(`${base}?${query.toString()}`, {
+      schema: NodePage,
+      signal: scope.signal,
+    });
     for (const node of page.items) ids.push(node.id);
     cursor = page.nextCursor;
     pages += 1;

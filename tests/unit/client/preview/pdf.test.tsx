@@ -387,7 +387,7 @@ describe("PdfPreview across a purge of the account — at each stage", () => {
     expect(engine.pagesAsked.filter((page) => page > 1)).toEqual([]);
   });
 
-  it("a page that arrives after the purge is released, not shown; a link list that arrives late is dropped", async () => {
+  it("a page that arrives after the purge is released, not shown (and nothing of it is drawn)", async () => {
     let givePage!: () => void;
     let giveLinks!: (links: PdfLink[]) => void;
     const released: number[] = [];
@@ -424,6 +424,61 @@ describe("PdfPreview across a purge of the account — at each stage", () => {
     expect(view.container.querySelector("[data-pdf-link]")).toBeNull();
   });
 
+  it("a jump inside the document answered in the purge's first moment moves nothing (the renderer alone, still mounted)", async () => {
+    let answer!: (page: number) => void;
+    engine.openPdf.mockImplementation(async () => ({
+      ...fakeDocument(3, { 1: [{ left: 0, top: 0, width: 10, height: 10, dest: "later" }] }),
+      pageOfDest: () => new Promise<number>((resolve) => (answer = resolve)),
+    }));
+    const { view } = await alone();
+    await waitFor(() => expect(shown(view)).not.toBeNull());
+    await see(1);
+    const internal = () => view.container.querySelector<HTMLElement>('[data-pdf-link="internal"]');
+    await waitFor(() => expect(internal()).not.toBeNull());
+    fireEvent.click(internal()!);
+    const scrolled = vi.spyOn(Element.prototype, "scrollTop", "set");
+    let moved = -1;
+    await act(async () => {
+      // The epoch moves at once; the purger, and the unmount it leads to, come later.
+      const purging = purgeUserState();
+      answer(3);
+      await purging;
+      moved = scrolled.mock.calls.length;
+    });
+    expect(moved).toBe(0);
+  });
+
+  it("links asked for at the old zoom that answer after a zoom are dropped (the drawing's scope ended, nothing unmounted)", async () => {
+    const held: Array<(links: PdfLink[]) => void> = [];
+    engine.openPdf.mockImplementation(async () => ({
+      ...fakeDocument(3),
+      page: async (number: number) => ({
+        width: 612,
+        height: 792,
+        render: (_canvas: HTMLCanvasElement, _text: HTMLElement, scale: number) => {
+          engine.rendered.push({ page: number, scale });
+          return { done: Promise.resolve(), cancel: () => {} };
+        },
+        // The first drawing's links are held; every later one has none.
+        links: () =>
+          number === 1 && held.length === 0
+            ? new Promise<PdfLink[]>((resolve) => held.push(resolve))
+            : Promise.resolve([]),
+        release: () => {},
+      }),
+    }));
+    const { view } = await alone();
+    await waitFor(() => expect(shown(view)).not.toBeNull());
+    await see(1);
+    await waitFor(() => expect(held.length).toBe(1));
+    fireEvent.click(within(view.container).getByRole("button", { name: "Zoom in" }));
+    await waitFor(() => expect(engine.rendered.length).toBe(2));
+    await settle(5);
+    await act(async () => held[0]!([{ left: 0, top: 0, width: 10, height: 10, url: EXTERNAL }]));
+    await settle(20);
+    expect(view.container.querySelector("[data-pdf-link]")).toBeNull();
+  });
+
   it("mid-render: the drawing under way is cancelled", async () => {
     const cancelled: number[] = [];
     engine.openPdf.mockImplementation(async () => ({
@@ -448,7 +503,7 @@ describe("PdfPreview across a purge of the account — at each stage", () => {
     expect(engine.destroyed).toBe(1);
   });
 
-  it("a jump inside the document that resolves after the purge moves nothing", async () => {
+  it("in the dialog: a jump that resolves after the purge finds the document destroyed and the dialog reading again", async () => {
     let answer!: (page: number) => void;
     engine.openPdf.mockImplementation(async () => ({
       ...fakeDocument(3, { 1: [{ left: 0, top: 0, width: 10, height: 10, dest: "later" }] }),
