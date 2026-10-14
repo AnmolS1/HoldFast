@@ -150,9 +150,11 @@ describe("m17/m25 — a read that starts while an optimistic edit is in flight w
   // the banner goes. The button that IS there during an edit is a long folder's Reload — the same
   // read, from the first page.
   it("Reload of a long folder waits too", async () => {
-    const nodes = manyNodes(900);
-    const target = nodes[5]!;
+    // Pages of 3: a long folder (over three pages) without drawing hundreds of rows.
+    const nodes = manyNodes(15);
+    const target = nodes[1]!;
     const drive = new FakeDrive(nodes);
+    drive.pageSize = 3;
     const gate = deferred<void>();
     const calls = serveDrive(drive, async (call) => {
       if (call.path.endsWith(`${target.id}/trash`)) await gate.promise;
@@ -160,8 +162,8 @@ describe("m17/m25 — a read that starts while an optimistic edit is in flight w
     });
     renderExplorer("/");
     const count = () => document.querySelector("[data-item-count]")?.textContent ?? "";
-    await vi.waitFor(() => expect(count()).toMatch(/^200 items/));
-    for (const loaded of [400, 600, 800]) {
+    await vi.waitFor(() => expect(count()).toMatch(/^3 items/));
+    for (const loaded of [6, 9, 12]) {
       act(() => intersect((element) => element.hasAttribute("data-load-more-sentinel")));
       await vi.waitFor(() => expect(count()).toMatch(new RegExp(`^${loaded} items`)));
     }
@@ -178,7 +180,7 @@ describe("m17/m25 — a read that starts while an optimistic edit is in flight w
       await trashing;
     });
     await vi.waitFor(() => expect(listingReads(calls)).toBe(reads + 1));
-    await vi.waitFor(() => expect(count()).toMatch(/^200 items/));
+    await vi.waitFor(() => expect(count()).toMatch(/^3 items/));
     expect(rowOf(target.id)).toBeNull();
   });
 
