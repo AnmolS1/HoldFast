@@ -231,6 +231,31 @@ describe("a timer asks whether its work is still wanted when it sends (3m2)", ()
     expect(server.completes.length).toBe(1);
   });
 
+  it("a complete waiting at the offline gate is not sent when the connection comes back inside the window", async () => {
+    let answer!: (response: Response) => void;
+    server.onComplete = (_, n) =>
+      n === 1 ? new Promise<Response>((resolve) => (answer = resolve)) : undefined;
+    await act(() => addFiles([{ file: smallFile("a.txt") }], null));
+    for (let turn = 0; turn < 5 && server.completes.length === 0; turn += 1) await act(() => settle());
+    expect(server.completes.length).toBe(1);
+    await act(async () => {
+      window.dispatchEvent(new Event("offline"));
+    });
+    // The answer is lost; the next try waits at the gate until the browser is back online.
+    await act(async () => answer(envelope("internal", 503)));
+    await act(() => settle());
+    expect(server.completes.length).toBe(1);
+    const close = openWindow();
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await act(() => settle());
+    expect(server.completes.length).toBe(1);
+    await act(close);
+    await act(() => settle());
+    expect(server.completes.length).toBe(1);
+  });
+
   it("a folder whose parent is answered inside the window is not asked for, nor is a folder in its retry wait", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     let answer!: () => void;

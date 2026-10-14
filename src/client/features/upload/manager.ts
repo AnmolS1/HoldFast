@@ -342,7 +342,6 @@ function sleep(ms: number, signal: AbortSignal, wanted: Wanted): Promise<void> {
 async function retrying<T>(request: () => Promise<T>, signal: AbortSignal, wanted: Wanted): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      if (attempt > 0 && !wanted()) throw abortError();
       return await request();
     } catch (cause) {
       const delay = RETRY_DELAYS_MS[attempt];
