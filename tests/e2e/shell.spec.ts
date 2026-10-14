@@ -59,7 +59,7 @@ const DESTINATIONS: Destination[] = [
   { path: "/search?q=tax", title: "Search", placeholder: false },
   { path: "/storage", title: "Storage", placeholder: false },
   { path: "/account/security", title: "Account", placeholder: true },
-  { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: true },
+  { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: false },
   { path: "/admin/users", title: "Admin", placeholder: true },
 ];
 
