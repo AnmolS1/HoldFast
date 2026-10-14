@@ -27,9 +27,10 @@ import {
   freshUploader,
   installServer,
   json,
+  keepResumeListInMemory,
+  type Server,
   settle,
   smallFile,
-  type Server,
 } from "./helpers";
 
 setupShell();
@@ -328,12 +329,14 @@ describe("rows waiting on the scanner (3m1)", () => {
   it("a long queue on a stuck scanner is followed for at most the hard bound, at one request a second, then every row says still being checked", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
-    const count = 1_000;
+    keepResumeListInMemory();
+    // More files than three asks each fit in the hard bound (3 × 700 s > 30 min): the bound decides.
+    const count = 700;
     await addFiles(
       Array.from({ length: count }, (_, n) => ({ file: smallFile(`f${n}.txt`) })),
       null,
     );
-    for (let turn = 0; turn < 1_100 && items().some((row) => row.state !== "scanning"); turn += 1) {
+    for (let turn = 0; turn < count + 100 && items().some((row) => row.state !== "scanning"); turn += 1) {
       await settle(0);
     }
     expect(items().filter((row) => row.state === "scanning").length).toBe(count);

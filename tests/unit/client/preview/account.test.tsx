@@ -227,7 +227,11 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     const a = accountA([NODES.ts]);
     installFetch({
       api: async (call) => {
-        if (!a.gone.now && call.url.pathname.endsWith("/download-url")) await gate.promise;
+        // A's mint, sent before the account changed, answers after it — with A's URL.
+        if (!a.gone.now && call.url.pathname.endsWith("/download-url")) {
+          await gate.promise;
+          return a.api.handler(call);
+        }
         return a.handler(call);
       },
     });
@@ -241,8 +245,15 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     await advance(0);
     expect(state()).toBe("error");
     expect(screen.queryByText("sample.ts")).toBeNull();
+    // The late answer arms nothing: a URL taken would schedule its refresh at once, so the
+    // property is "no new timer", not "nothing happened in an hour" (fake time is not free: the
+    // open dialog's focus trap ticks every 50 ms, and each fake tick is a real turn of the event
+    // loop — an hour of them took seconds on a loaded machine).
+    const timers = vi.getTimerCount();
     gate.release(null);
-    await advance(60 * 60_000);
+    await advance(0);
+    await advance(0);
+    expect(vi.getTimerCount()).toBe(timers);
     expect(state()).toBe("error");
   });
 

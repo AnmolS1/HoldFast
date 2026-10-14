@@ -22,9 +22,10 @@ import {
   FAKED_TIMERS,
   freshUploader,
   installServer,
+  keepResumeListInMemory,
+  type Server,
   settle,
   smallFile,
-  type Server,
 } from "./helpers";
 
 setupShell();
@@ -45,6 +46,7 @@ describe("429 rate_limited", () => {
     let limited = true;
     server.onInit = () =>
       limited ? envelope("rate_limited", 429, undefined, { "retry-after": "30" }) : undefined;
+    keepResumeListInMemory();
     await addFiles(many(200), null);
     await settle(0);
     // The three that were already on their way when the answer came; not one more.
