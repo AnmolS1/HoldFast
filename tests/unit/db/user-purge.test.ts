@@ -257,12 +257,17 @@ describe("hard delete of a user", () => {
     await expect(db.delete(user).where(eq(user.id, editor))).rejects.toThrow();
 
     const toAbort = await deleteForUser(db, editor);
-    expect(toAbort.sort((a, b) => a.r2Key.localeCompare(b.r2Key))).toEqual(
-      [
-        { r2Key: open.r2Key, r2UploadId: "mpu-9" },
-        { r2Key: own.r2Key, r2UploadId: null },
-      ].sort((a, b) => a.r2Key.localeCompare(b.r2Key)),
-    );
+    // The editor's `completing` session is a request at work on its object (H2 K, the lead's
+    // ruling): kept, not returned to abort — the user row waits until that request ends it.
+    expect(toAbort).toEqual([{ r2Key: open.r2Key, r2UploadId: "mpu-9" }]);
+    expect(await remainingForUser(db, editor)).toBe(1);
+    await expect(db.delete(user).where(eq(user.id, editor))).rejects.toThrow();
+    await db
+      .update(uploads)
+      .set({ status: "aborted", completedAt: new Date() })
+      .where(eq(uploads.id, own.id));
+    expect(await deleteForUser(db, editor)).toEqual([]);
+    expect(await remainingForUser(db, editor)).toBe(0);
     const left = await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.ownerId, owner));
     expect(left.map((u) => u.id)).toEqual([ownersOwn.id]);
     expect(done.id).not.toBe(ownersOwn.id);
@@ -339,43 +344,39 @@ describe("hard delete of a user", () => {
   // H2 K extension: a `completing` session whose declared hash is on the blocklist owes a locked
   // node for verified bytes (the uploads route's "csam node owed" state, repaired later by a
   // sweep). The account purge must not take its row or its object.
-  it("uploads.deleteForUser keeps a completing session whose expected hash is blocklisted: no key to abort, row kept, the user row waits", async () => {
+  it("uploads.deleteForUser keeps every completing session — one with a blocklisted hash owes a locked node: no key to abort, row kept, the user row waits", async () => {
     const leaving = await makeUser(db, { quotaBytes: 100_000, usedBytes: 300 });
     const editor = await makeUser(db);
     const listed = randomBytes(32).toString("hex");
     await db.insert(hashBlocklist).values({ sha256: listed, reason: "csam" });
-    const owed = [
-      // Into the leaving user's folder, by an editor; and the leaving user's own.
+    const kept = [
+      // Owed nodes: into the leaving user's folder, by an editor; and the leaving user's own.
       await makeUpload(db, leaving, editor, { status: "completing", expectedSha256: listed, size: 200 }),
       await makeUpload(db, leaving, leaving, { status: "completing", expectedSha256: listed, size: 100 }),
-    ];
-    // The controls, same call: completing with an unlisted hash, and an OPEN session with the listed one.
-    const gone = [
+      // Any completing session is a request at work on its object (the lead's ruling): an unlisted hash too.
       await makeUpload(db, leaving, editor, {
         status: "completing",
         expectedSha256: randomBytes(32).toString("hex"),
         r2UploadId: "mpu-unlisted",
       }),
-      await makeUpload(db, leaving, editor, {
-        status: "open",
-        expectedSha256: listed,
-        r2UploadId: "mpu-open",
-      }),
     ];
-    const present = async (id: string) =>
-      (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+    // The control, same call: an OPEN session, even with the listed hash, goes as before.
+    const open = await makeUpload(db, leaving, editor, {
+      status: "open",
+      expectedSha256: listed,
+      r2UploadId: "mpu-open",
+    });
 
     const toAbort = await deleteForUser(db, leaving);
-    expect(toAbort.map((u) => u.r2UploadId).sort()).toEqual(["mpu-open", "mpu-unlisted"]);
-    for (const session of owed) {
-      expect(toAbort.map((u) => u.r2Key)).not.toContain(session.r2Key);
+    expect(toAbort.map((u) => u.r2UploadId)).toEqual(["mpu-open"]);
+    for (const session of kept) {
       expect(await db.select().from(uploads).where(eq(uploads.id, session.id))).toMatchObject([
-        { status: "completing", expectedSha256: listed },
+        { status: "completing", expectedSha256: session.expectedSha256 },
       ]);
     }
-    for (const session of gone) expect(await present(session.id)).toBe(false);
+    expect(await db.select().from(uploads).where(eq(uploads.id, open.id))).toEqual([]);
     // The rows reference the user (NOT NULL, RESTRICT): it cannot be deleted, and the job can tell.
-    expect(await remainingForUser(db, leaving)).toBe(2);
+    expect(await remainingForUser(db, leaving)).toBe(3);
     await expect(db.delete(user).where(eq(user.id, leaving))).rejects.toThrow();
   });
 });

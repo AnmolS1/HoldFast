@@ -212,13 +212,14 @@ export function owesLockedNode(): SQL {
  * under an open notice. Such a row still references the user, so the `user` row cannot be
  * deleted yet: `remainingForUser` says how many are left, and the purge job waits (`defer`).
  *
- * SO DOES A SESSION THAT OWES A LOCKED NODE: one in `completing` whose `expected_sha256` is on
- * the blocklist (any reason) — the server verified bytes it must preserve and the node for them
- * is not written yet (the uploads route, or a later sweep, writes it locked). Its row is kept
- * (it cannot be detached: `owner_id` and `uploader_id` are NOT NULL, RESTRICT — so the user row
- * waits, as for a hold), its object is NOT returned to abort and its reservation is not
- * released here. Once the node is written the csam lock holds the owner and the uploader, and
- * the account is not purged at all.
+ * SO DOES EVERY `completing` SESSION: a request is working on its object right now (hashing it;
+ * one whose declared hash is blocklisted owes a LOCKED node for verified bytes — the uploads
+ * route, or the repair sweep, writes it). Its row is kept (it cannot be detached: `owner_id` and
+ * `uploader_id` are NOT NULL, RESTRICT — so the user row waits, as for a hold), its object is
+ * NOT returned to abort and its reservation is not released here. When the request ends it
+ * (done or aborted) the next run deletes it; a request that died leaves it to the stale-upload
+ * job (`expired`) — except an owed one, which the repair sweep owns. Once an owed node is
+ * written the csam lock holds the owner and the uploader, and the account is not purged at all.
  */
 export async function deleteForUser(
   db: Executor,
@@ -233,7 +234,7 @@ export async function deleteForUser(
           not(userHeld(sql`${uploads.ownerId}`)),
           not(userHeld(sql`${uploads.uploaderId}`)),
           not(nodeProtected(sql`${uploads.nodeId}`)),
-          not(owesLockedNode()),
+          ne(uploads.status, "completing"),
         ),
       )
       .returning({
@@ -244,7 +245,7 @@ export async function deleteForUser(
         r2Key: uploads.r2Key,
         r2UploadId: uploads.r2UploadId,
       });
-    const unfinished = rows.filter((r) => r.status === "open" || r.status === "completing");
+    const unfinished = rows.filter((r) => r.status === "open");
     const owed = new Map<string, number>();
     for (const row of unfinished) {
       if (row.ownerId !== userId && row.purpose === "file")
