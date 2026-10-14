@@ -118,6 +118,26 @@ export async function recordServe(c: Context<AppEnv>, serve: Serve): Promise<Ser
 }
 
 /**
+ * Is there room for ONE more byte on the asker's own ledgers — the address's, and a signed-in
+ * subject's? Asked before a thumbnail is made, so that an asker whose own day is used up is
+ * refused BEFORE the owner pays a transform unit and the image service is called (the bytes of
+ * a thumbnail are known only once it exists). Throws the same `429 ceiling_exceeded`, with
+ * `Retry-After` to 00:00 UTC, as gate 5; otherwise the byte is given back at once.
+ */
+export async function assertAskerHasRoom(c: Context<AppEnv>, serve: Serve): Promise<void> {
+  const address = await consumeCeiling(c, "download_ip", { id: serve.ip }, { bytes: 1 });
+  await told(() => refundUsage(deps(c), "download_ip", serve.ip, { bytes: 1 }, address));
+  if (serve.st !== "u") return;
+  const mine = await consumeCeiling(
+    c,
+    "download_user",
+    { id: serve.sub, account: serve.account },
+    { bytes: 1 },
+  );
+  await told(() => refundUsage(deps(c), "download_user", serve.sub, { bytes: 1 }, mine));
+}
+
+/**
  * A request that was charged and then serves NOTHING — a later ledger refused it, or something
  * failed before its first byte — gives back at once what it charged to SOMEONE ELSE's budget:
  * the owner's cap and the link. With no pause to end them, refusals at a full link would

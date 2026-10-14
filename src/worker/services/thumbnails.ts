@@ -28,19 +28,33 @@
 //             (a coded failure: its quota, an input it cannot decode; an empty output) — or its
 //             source object is missing — the count is pushed past the cap: no call until the
 //             next UTC day.
-//   `thumb_unit:…`    the owner's `transform_user` unit for this thumbnail today. `bytes` = 1
-//             while one request holds the right to take it (given back when the owner's ceiling
-//             refuses it — no call was made, so the thumbnail keeps its day); `count` = 1 once it
-//             was taken, which is final for the day. Every further call for the thumbnail that
-//             day is free to the owner (the frozen `consumeCeiling` refunds no count, so a unit
-//             is never taken twice instead of taken and given back). A request that finds the
-//             unit held but not yet taken does not call: the owner might yet be refused, and a
-//             call made meanwhile would pass the owner's ceiling.
+//   `thumb_unit:…`    the owner's `transform_user` unit for this thumbnail today. `bytes` = the
+//             time (epoch seconds) one request took the right to charge it — the HOLD; `count` =
+//             1 once it was charged, which is final for the day. Every further call for the
+//             thumbnail that day is free to the owner (the frozen `consumeCeiling` refunds no
+//             count, so a unit is never taken twice instead of taken and given back). A request
+//             that finds the unit held but not yet charged does not call: the owner might yet be
+//             refused, and a call made meanwhile would pass the owner's ceiling.
+//             THE HOLD CANNOT WEDGE THE THUMBNAIL. Whatever ends the holder's turn without the
+//             charge being marked — the owner's ceiling refusing it, the ceiling service or the
+//             database throwing — gives the hold back (`finally`), and the request answers the
+//             icon. A holder that never comes back (an invocation cut between the hold and the
+//             mark: no `finally` runs) leaves a hold that the first request after
+//             HOLD_STALE_SECONDS TAKES OVER — one add-if-under statement, so one winner. A
+//             takeover is no free call: calls are counted on the other row, and nothing gives
+//             them back.
 // A request that gets neither answers "no thumbnail" at once: no unit, no call, nothing written —
 // the page's next load finds the cached thumbnail or the marker. So per thumbnail per day: at
 // most 3 calls and 1 unit, whoever asks, however often and however they leave; a known failure
 // costs 1 call; after 3 calls without a cached result the thumbnail is the icon until 00:00 UTC.
 // A new version of the file has new keys and so a fresh day; so has another size.
+//
+// NOTHING IS LEFT BEHIND FOR A FILE THAT CHANGED MEANWHILE. A Replace, a purge or an admin
+// deletion that runs while a transform is in flight deletes the node's thumbnails before this
+// one is written. So the cache object is written FIRST and the node read AFTER it (it still
+// exists, is not hidden, and is still at the version that was transformed); if not, the object
+// just written is deleted and the answer is the icon. (Put-then-check: a change that commits
+// after a check made before the write would delete before the write lands.)
 //
 // THE CALL DOES NOT DEPEND ON THE ASKER STAYING. Once claimed, the transform and its cache write
 // are handed to the request's deferred work as well as awaited: an asker who goes away
@@ -52,6 +66,8 @@
 import type { Context } from "hono";
 import { THUMB_INPUT_MAX_BYTES, type ThumbSize } from "../../shared/constants";
 import { addUsageIfUnder, subtractUsage, totalsOn, utcDay } from "../db/queries/ledger";
+import { getNode } from "../db/queries/nodes";
+import { effectiveHidden } from "../db/queries/tree";
 import { tryConsumeCeiling } from "./ceilings";
 import { now } from "./clock";
 import { db, defer, type AppEnv } from "./request-context";
@@ -73,6 +89,9 @@ const none = (reason: string): MadeThumbnail => ({ ok: false, reason });
 /** How many calls of the image service one thumbnail — one size of one version of a file — gets a day. */
 export const THUMB_CALLS_PER_DAY = 3;
 
+/** A hold on the owner's unit older than this, never charged, is taken over by the next request. */
+export const HOLD_STALE_SECONDS = 300;
+
 type Key = Pick<ThumbSource, "id" | "versionId">;
 
 /** The id of a thumbnail's call marker (ledger subject `notice`). */
@@ -91,9 +110,9 @@ const hasCode = (error: unknown): boolean => {
 };
 
 /**
- * The owner's unit for this thumbnail today: taken by the one request that holds it, or already
- * taken. `false`: no call may be made now (the owner's ceiling refused it, or another request is
- * still taking it).
+ * The owner's unit for this thumbnail today: charged by the one request that holds it, or
+ * already charged. Anything else — the owner's ceiling refused it, another request holds it,
+ * the charge failed — means no call may be made now. Never throws.
  */
 async function ownerPaid(
   c: Context<AppEnv>,
@@ -101,33 +120,35 @@ async function ownerPaid(
   size: ThumbSize,
   owner: ThumbOwner,
   day: string,
-): Promise<"paid" | "ceiling" | "busy"> {
+): Promise<"paid" | "ceiling" | "busy" | "error"> {
   const marker = unitMarker(node, size);
-  // One statement: at most one request holds the unit at a time, and none once it was taken.
-  const held = await addUsageIfUnder(
-    db(c),
-    day,
-    "notice",
-    marker,
-    { bytes: 1, count: 0 },
-    { bytes: 1, count: 0 },
-  );
-  if (!held) return (await totalsOn(db(c), day, "notice", marker)).count > 0 ? "paid" : "busy";
-  const unit = await tryConsumeCeiling(c, "transform_user", owner, { count: 1 });
-  if (!unit.ok) {
-    // No call was made: the thumbnail does not lose its day to the owner's ceiling.
-    try {
-      await subtractUsage(db(c), day, "notice", marker, 1);
-    } catch {
-      // Not given back: this thumbnail waits for the next UTC day.
-    }
-    return "ceiling";
+  const at = Math.floor(now(c).getTime() / 1000);
+  // One statement: a hold only where there is none, and none once the unit was charged.
+  const hold = (bytes: number) =>
+    addUsageIfUnder(db(c), day, "notice", marker, { bytes, count: 0 }, { bytes: at, count: 0 });
+  if (!(await hold(at))) {
+    const seen = await totalsOn(db(c), day, "notice", marker);
+    if (seen.count > 0) return "paid";
+    if (seen.bytes === 0 || seen.bytes > at - HOLD_STALE_SECONDS) return "busy";
+    // A hold nobody came back to: taken over by moving its time to now — from exactly the time
+    // read, so of two requests that read it the second finds a fresh hold and is refused.
+    if (!(await hold(at - seen.bytes))) return "busy";
   }
-  // Taken: final for the day. Not recorded → the thumbnail waits for the next UTC day, uncharged again.
-  await addUsageIfUnder(db(c), day, "notice", marker, { bytes: 0, count: 1 }, { count: 1 }).catch(
-    () => false,
-  );
-  return "paid";
+  let charged = false;
+  try {
+    const unit = await tryConsumeCeiling(c, "transform_user", owner, { count: 1 });
+    if (!unit.ok) return "ceiling";
+    await addUsageIfUnder(db(c), day, "notice", marker, { bytes: 0, count: 1 }, { count: 1 });
+    charged = true;
+    return "paid";
+  } catch {
+    return "error";
+  } finally {
+    if (!charged) {
+      // No call was made: the thumbnail does not lose its day. Not given back → taken over later.
+      await subtractUsage(db(c), day, "notice", marker, at).catch(() => false);
+    }
+  }
 }
 
 /** Claims one of today's calls of the image service. Never given back. */
@@ -171,10 +192,14 @@ export async function makeThumbnail(
   if (!Number.isFinite(node.size) || node.size > THUMB_INPUT_MAX_BYTES) return none("too_large");
 
   const day = utcDay(now(c));
-  const paid = await ownerPaid(c, node, size, owner, day);
-  if (paid !== "paid") return none(paid === "ceiling" ? "ceiling" : "unit_busy");
+  const paid = await ownerPaid(c, node, size, owner, day).catch(() => "error" as const);
+  if (paid !== "paid") return none(paid === "busy" ? "unit_busy" : paid);
   const marker = failureMarker(node, size);
-  if (!(await claimCall(c, marker, day))) return none("attempted_today");
+  try {
+    if (!(await claimCall(c, marker, day))) return none("attempted_today");
+  } catch {
+    return none("error");
+  }
 
   const work = attempt(c, node, size, marker, day);
   try {
@@ -217,14 +242,29 @@ async function attempt(
     return none("empty");
   }
 
+  const key = thumbKey(node.id, node.versionId, size);
   let stored: R2Object | null = null;
   try {
-    stored = await store.put(thumbKey(node.id, node.versionId, size), buffer, {
-      size: buffer.byteLength,
-      contentType: THUMB_TYPE,
-    });
+    stored = await store.put(key, buffer, { size: buffer.byteLength, contentType: THUMB_TYPE });
   } catch {
     stored = null;
   }
+  // Written first, checked after: see the header.
+  if (!(await stillCurrent(c, node))) {
+    if (stored) await store.delete([key]).catch(() => {});
+    return none("superseded");
+  }
   return { ok: true, buffer, stored };
+}
+
+/** The node still exists, is not hidden, and is at the version that was transformed. */
+async function stillCurrent(c: Context<AppEnv>, node: ThumbSource): Promise<boolean> {
+  try {
+    const row = await getNode(db(c), node.id);
+    if (!row || row.versionId !== node.versionId) return false;
+    return !(await effectiveHidden(db(c), node.id));
+  } catch {
+    // Unknown: the object stays (it is keyed by version), and the purge's sweep finds an orphan.
+    return true;
+  }
 }

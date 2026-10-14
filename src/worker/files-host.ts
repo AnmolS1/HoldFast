@@ -44,7 +44,14 @@ import type { ErrorCode } from "../shared/errors";
 import { now } from "./services/clock";
 import { AppError, handlePlainError } from "./services/errors";
 import { dayUTC, ipHashDaily } from "./services/ip-hash";
-import { recordServe, refundOthers, settleServe, type Serve, type ServeCharge } from "./services/ledger";
+import {
+  assertAskerHasRoom,
+  recordServe,
+  refundOthers,
+  settleServe,
+  type Serve,
+  type ServeCharge,
+} from "./services/ledger";
 import { metric } from "./services/metrics";
 import { contentDisposition, inlineKindAllowed, serveType, thumbEligible } from "./services/mime";
 import {
@@ -65,7 +72,8 @@ import { makeThumbnail, THUMB_TYPE } from "./services/thumbnails";
 import { linkPwv, verifyDownloadToken, type DownloadClaims, type TokenKind } from "./services/tokens";
 
 const TEXT = { "content-type": "text/plain; charset=utf-8" };
-const EXPOSED = "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning";
+/** What the app may read of an answer from this host: `Retry-After` for every 429 included. */
+const EXPOSED = "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning, Retry-After";
 
 type Ctx = Context<AppEnv>;
 type LinkOutcome = Parameters<typeof logAccess>[1]["outcome"];
@@ -403,7 +411,6 @@ function objectHeaders(meta: Meta | null, shown: Shown): Headers {
     "Accept-Ranges": "bytes",
     "Content-Type": shown.type,
     "Content-Disposition": shown.disposition,
-    "Access-Control-Expose-Headers": EXPOSED,
   });
   if (meta) {
     headers.set("ETag", meta.httpEtag);
@@ -415,7 +422,6 @@ function objectHeaders(meta: Meta | null, shown: Shown): Headers {
 
 function notModified(meta: Meta): Response {
   const headers = new Headers({ ETag: meta.httpEtag, "Last-Modified": meta.uploaded.toUTCString() });
-  headers.set("Access-Control-Expose-Headers", EXPOSED);
   return new Response(null, { status: 304, headers });
 }
 
@@ -463,7 +469,6 @@ const settleInRequestMs = (c: Ctx) =>
  * over-counts, it never under-counts — and is counted.
  */
 function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
-  let state: "open" | "in-time" | "late" | "done" = "open";
   let inTime!: (sent: number | null) => void;
   const early = new Promise<number | null>((resolve) => (inTime = resolve));
   const failed = () => {
@@ -477,13 +482,36 @@ function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
     c,
     early.then((sent) => (sent === null ? undefined : settleServe(source, charge, sent))).catch(failed),
   );
+  const { env, executionCtx } = c;
+  const core = coreOf(c);
+  return settleOnce(settleInRequestMs(c), inTime, (sent) => {
+    // The request's own drain is over: `defer` would be refused. The background context opens,
+    // drains and closes a pool of its own, so nothing request-scoped is held by this promise.
+    // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
+    executionCtx.waitUntil(
+      runBackground(env, executionCtx, (bg) => settleServe(bg, charge, sent), core).catch(failed),
+    );
+  });
+}
+
+/**
+ * The once-guard of a settle. The function it returns may be called any number of times; the
+ * FIRST call decides, every later one does nothing:
+ *   within `afterMs`   `inTime(sent)` — and the timer is cleared;
+ *   after it           the timer has called `inTime(null)` ("nothing in time"), and the first
+ *                      call is `late(sent)`.
+ */
+export function settleOnce(
+  afterMs: number,
+  inTime: (sent: number | null) => void,
+  late: (sent: number) => void,
+): (sent: number) => void {
+  let state: "open" | "in-time" | "late" | "done" = "open";
   const timer = setTimeout(() => {
     if (state !== "open") return;
     state = "late";
     inTime(null);
-  }, settleInRequestMs(c));
-  const { env, executionCtx } = c;
-  const core = coreOf(c);
+  }, afterMs);
   return (sent) => {
     if (state === "open") {
       state = "in-time";
@@ -491,12 +519,7 @@ function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
       inTime(sent);
     } else if (state === "late") {
       state = "done";
-      // The request's own drain is over: `defer` would be refused. The background context opens,
-      // drains and closes a pool of its own, so nothing request-scoped is held by this promise.
-      // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
-      executionCtx.waitUntil(
-        runBackground(env, executionCtx, (bg) => settleServe(bg, charge, sent), core).catch(failed),
-      );
+      late(sent);
     }
   };
 }
@@ -585,21 +608,34 @@ function logDenied(c: Ctx, nodeId: string | null, log: NonNullable<Refusal["log"
   );
 }
 
+function serveOf(passed: Passed, bytes: number, ip: string): Serve {
+  return passed.subject.st === "u"
+    ? { st: "u", sub: passed.subject.account.id, account: passed.subject.account, bytes, ip }
+    : {
+        st: "l",
+        sub: passed.subject.link.id,
+        owner: { id: passed.owner.id, account: passed.owner },
+        bytes,
+        ip,
+      };
+}
+
 /** Gate 5: charges the body this response will send. Throws `429` — after logging a link's. */
 async function charge(c: Ctx, passed: Passed, bytes: number): Promise<ServeCharge> {
-  const ip = bytes === 0 ? "" : await ipSubject(c);
-  const serve: Serve =
-    passed.subject.st === "u"
-      ? { st: "u", sub: passed.subject.account.id, account: passed.subject.account, bytes, ip }
-      : {
-          st: "l",
-          sub: passed.subject.link.id,
-          owner: { id: passed.owner.id, account: passed.owner },
-          bytes,
-          ip,
-        };
+  return refusedAsCap(c, passed, async () =>
+    recordServe(c, serveOf(passed, bytes, bytes === 0 ? "" : await ipSubject(c))),
+  );
+}
+
+/** Before a thumbnail is made: the asker's own day has room. Throws `429` like gate 5. */
+async function askerHasRoom(c: Ctx, passed: Passed): Promise<void> {
+  await refusedAsCap(c, passed, async () => assertAskerHasRoom(c, serveOf(passed, 1, await ipSubject(c))));
+}
+
+/** A ceiling's `429` for a link is logged `denied_cap` (after the answer). */
+async function refusedAsCap<T>(c: Ctx, passed: Passed, run: () => Promise<T>): Promise<T> {
   try {
-    return await recordServe(c, serve);
+    return await run();
   } catch (error) {
     if (passed.subject.st === "l" && error instanceof AppError && error.code === "ceiling_exceeded") {
       logDenied(c, passed.node.id, { linkId: passed.subject.link.id, outcome: "denied_cap" });
@@ -780,6 +816,8 @@ async function serveThumb(c: Ctx, passed: Passed, size: ThumbSize): Promise<Resp
 
   // A HEAD makes nothing: no transform, no unit, no object written.
   if (isHeadRequest(c)) throw new AppError("not_found");
+  // An asker whose own day is used up is refused before the owner pays and the service is called.
+  await askerHasRoom(c, passed);
   // A miss: one transform, one attempt. Whatever goes wrong, the answer is the icon's 404.
   const made = await makeThumbnail(c, node, size, { id: passed.owner.id, account: passed.owner });
   if (!made.ok) {
@@ -834,6 +872,20 @@ function route(kind: TokenKind) {
   };
 }
 
+/** Every answer — an object, a 304, a refusal, the rate limiter's 429 — says what the app may read. */
+const exposeHeaders = async (c: Ctx, next: () => Promise<void>) => {
+  await next();
+  const headers = new Headers(c.res.headers);
+  headers.set("Access-Control-Expose-Headers", EXPOSED);
+  const replacement = new Response(c.res.body, {
+    status: c.res.status,
+    statusText: c.res.statusText,
+    headers,
+  });
+  c.res = undefined;
+  c.res = replacement;
+};
+
 export function createFilesHost(core: CoreDeps): Hono<AppEnv> {
   registerCoreDeps(core);
   const app = new Hono<AppEnv>();
@@ -845,6 +897,7 @@ export function createFilesHost(core: CoreDeps): Hono<AppEnv> {
   app.use("*", requestContext(core));
   app.use("*", answeredWhenDone);
   app.use("*", filesHostHeaders);
+  app.use("*", exposeHeaders);
   app.use("*", rateLimitByIp("RL_FILES"));
 
   // CORS preflight: only the app origin may ask. Anything else gets the ordinary 404.

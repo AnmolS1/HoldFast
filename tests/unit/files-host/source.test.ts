@@ -98,9 +98,10 @@ describe("the files host's source", () => {
       const code = codeOf(text);
       expect(code, file).not.toMatch(/\bkeyFor\s*\(/);
       const puts = [...code.matchAll(/\.put\((\w+\([^)]*\)|[^,]+),/g)].map((match) => match[1]!.trim());
-      if (file === "services/thumbnails.ts")
-        expect(puts).toEqual(["thumbKey(node.id, node.versionId, size)"]);
-      else expect(puts, file).toEqual([]);
+      if (file === "services/thumbnails.ts") {
+        expect(puts).toEqual(["key"]);
+        expect(code).toMatch(/\bconst key = thumbKey\(node\.id, node\.versionId, size\);/);
+      } else expect(puts, file).toEqual([]);
     }
   });
 });

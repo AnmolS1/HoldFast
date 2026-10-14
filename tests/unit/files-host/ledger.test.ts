@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { addUsage, utcDay } from "../../../src/worker/db/queries/ledger";
 import { auditLog, downloadLedger } from "../../../src/worker/db/schema";
+import { settleOnce } from "../../../src/worker/files-host";
 import {
   notifyLinkLimitOnce,
   notifyLinkPausedOnce,
@@ -18,6 +19,7 @@ import {
   ask,
   FAKE_WEBP,
   freshIp,
+  gate,
   imagesMock,
   ipSubject,
   ledgerBytes,
@@ -155,6 +157,8 @@ describe("gate 5 — the ceilings are consumed atomically, the address first", (
     expect(refusal.text).toBe(MESSAGES.ceiling_exceeded);
     expect(Number(refusal.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(Number(refusal.headers.get("retry-after"))).toBeLessThanOrEqual(86_400);
+    // The app reads it across origins (Addendum 12).
+    expect(refusal.headers.get("access-control-expose-headers")?.split(", ")).toContain("Retry-After");
     expect(await ledgerBytes("user", owner.id)).toBe(SIZE);
   });
 
@@ -775,5 +779,43 @@ describe("what a reservation can and cannot do", () => {
     // A charge of nothing (a response without a body) settles to nothing.
     await settleServe(deps, { bytes: 0, charges: [], linkId: link.id }, 0);
     expect((await linkById(link.id)).bytesServed).toBe(SIZE * 3 + 250);
+  });
+});
+
+describe("the settle's once-guard", () => {
+  it("in time: the first call settles through the request, every later call does nothing", () => {
+    const inTime: Array<number | null> = [];
+    const late: number[] = [];
+    const end = settleOnce(
+      60_000,
+      (sent) => inTime.push(sent),
+      (sent) => late.push(sent),
+    );
+    end(5);
+    end(7);
+    end(5);
+    expect(inTime).toEqual([5]);
+    expect(late).toEqual([]);
+  });
+
+  it("late: once the window is over, the first call settles in the background, every later call does nothing", async () => {
+    const inTime: Array<number | null> = [];
+    const late: number[] = [];
+    const over = gate();
+    const end = settleOnce(
+      0,
+      (sent) => {
+        inTime.push(sent);
+        if (sent === null) over.open();
+      },
+      (sent) => late.push(sent),
+    );
+    // The window closing is an event: "nothing came in time".
+    await over.opened;
+    end(3);
+    end(4);
+    end(3);
+    expect(inTime).toEqual([null]);
+    expect(late).toEqual([3]);
   });
 });

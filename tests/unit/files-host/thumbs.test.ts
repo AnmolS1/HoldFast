@@ -2,15 +2,19 @@
 // is a stand-in here that records its calls — the local one cannot decode every type the list
 // has and treats what a camera wrote into a picture differently from the deployed one, so what
 // this file proves is what the code ASKS for and what it does when the service fails.
+import { eq } from "drizzle-orm";
 import type { Context } from "hono";
 import { describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
+import { addUsageIfUnder } from "../../../src/worker/db/queries/ledger";
+import { nodes } from "../../../src/worker/db/schema";
 import { dayUTC } from "../../../src/worker/services/ip-hash";
 import { keyFor, thumbKey } from "../../../src/worker/services/storage";
 import {
   failureMarker,
   makeThumbnail,
+  HOLD_STALE_SECONDS,
   THUMB_CALLS_PER_DAY,
   unitMarker,
 } from "../../../src/worker/services/thumbnails";
@@ -19,6 +23,7 @@ import {
   FAKE_WEBP,
   freshIp,
   gate,
+  testDb,
   newCtx,
   imagesMock,
   ipSubject,
@@ -182,8 +187,9 @@ describe("degrade, never fail: whatever the image service does, the answer is th
       expect(spy.puts).toEqual([]);
       expect(await spy.bucket.head(thumbKey(node.id, node.versionId, 320))).toBeNull();
       expect(await units(owner.id)).toBe(1);
-      // No byte was charged for a response that carried none of the file.
-      expect(await ledgerRow("user", owner.id)).toBeNull();
+      // No byte was charged for a response that carried none of the file. (The asker's own room
+      // was asked for one byte before the transform, and given back.)
+      expect((await ledgerRow("user", owner.id))?.bytes ?? 0).toBe(0);
     },
   );
 
@@ -407,7 +413,7 @@ describe("one thumbnail per day: at most three calls of the image service and on
   const unitRow = (node: { id: string; versionId: string }) => ledgerRow("notice", unitMarker(node, 320));
   const callRow = (node: { id: string; versionId: string }) => ledgerRow("notice", failureMarker(node, 320));
 
-  it("thirteen requests for one failing thumbnail — a link, a share partner, an address already over its own ceiling — cost the owner ONE unit and the account ONE call; nobody is charged a byte", async () => {
+  it("thirteen requests for one failing thumbnail — a link and a share partner alternating, then an address already over its own ceiling — cost the owner ONE unit and the account ONE call; the exhausted address is refused before either; nobody is charged a byte", async () => {
     const owner = await makeAccount();
     const partner = await makeAccount();
     const node = await picture(owner.id);
@@ -435,22 +441,25 @@ describe("one thumbnail per day: at most three calls of the image service and on
       });
       statuses.push(answer.status);
     }
-    expect(statuses).toEqual(Array.from({ length: 13 }, () => 404));
+    // The exhausted address: its own refusal, before the owner's unit or the image service.
+    expect(statuses).toEqual([...Array.from({ length: 10 }, () => 404), 429, 429, 429]);
     expect(images.calls).toHaveLength(1);
     expect(await ledgerRow("transform_user", owner.id)).toEqual({ bytes: 0, count: 1 });
     // One call made, then given up on for the day: the count is past the cap.
     expect(await callRow(node)).toEqual({ bytes: 0, count: 1 + THUMB_CALLS_PER_DAY });
-    expect(await unitRow(node)).toEqual({ bytes: 1, count: 1 });
+    expect(await unitRow(node)).toMatchObject({ count: 1 });
     expect(spy.puts).toEqual([]);
     // The file itself was read once: for the one call.
     expect(spy.gets.filter((call) => call.key === node.r2Key)).toHaveLength(1);
+    // The askers' own ledgers were asked for one byte of room and given it back; nobody else's.
     for (const row of [
       await ledgerRow("ip", await ipSubject(ip)),
       await ledgerRow("ip", await ipSubject(over)),
       await ledgerRow("user", partner.id),
-      await ledgerRow("link", link.id),
-      await ledgerRow("link_owner", owner.id),
     ]) {
+      expect(row?.bytes ?? 0).toBe(0);
+    }
+    for (const row of [await ledgerRow("link", link.id), await ledgerRow("link_owner", owner.id)]) {
       expect(row).toBeNull();
     }
   });
@@ -514,7 +523,7 @@ describe("one thumbnail per day: at most three calls of the image service and on
     // Five of the six were cache hits: they claimed nothing.
     expect(fine.calls).toHaveLength(1);
     expect(await callRow(good)).toEqual({ bytes: 0, count: 1 });
-    expect(await unitRow(good)).toEqual({ bytes: 1, count: 1 });
+    expect(await unitRow(good)).toMatchObject({ count: 1 });
 
     const gone = await picture(owner.id, { content: null, node: { size: 2000 } });
     const empty = await picture(owner.id);
@@ -585,7 +594,7 @@ describe("one thumbnail per day: at most three calls of the image service and on
     expect(cut.calls).toHaveLength(THUMB_CALLS_PER_DAY);
     expect(await units(owner.id)).toBe(1);
     // The asking address paid nothing in bytes: no response carried any.
-    expect(await ledgerRow("ip", await ipSubject(ip))).toBeNull();
+    expect((await ledgerRow("ip", await ipSubject(ip)))?.bytes ?? 0).toBe(0);
 
     // Today the thumbnail is the icon, even for its owner and with a service that now works.
     const working = imagesMock();
@@ -757,5 +766,203 @@ describe("one thumbnail per day: at most three calls of the image service and on
     expect(answer.status).toBe(200);
     expect(deferredBefore).toBe(0);
     expect(deferredDuring).toBe(1);
+  });
+});
+
+describe("the owner-unit hold can never wedge a thumbnail", () => {
+  const unitRow = (node: { id: string; versionId: string }) => ledgerRow("notice", unitMarker(node, 320));
+  /** A hold left behind by a request that never came back, `ageSeconds` ago. */
+  const leftHold = (node: { id: string; versionId: string }, ageSeconds: number) =>
+    addUsageIfUnder(
+      testDb(),
+      dayUTC(new Date()),
+      "notice",
+      unitMarker(node, 320),
+      { bytes: Math.floor(Date.now() / 1000) - ageSeconds, count: 0 },
+      {},
+    );
+
+  it("the ceiling service throwing between the hold and the charge → the icon's 404 (never a 500), the hold given back, and the next request renders", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const images = imagesMock();
+    const url = await urlFor("thumb", node, { user: owner.id });
+    // A ceiling the ledger refuses to compare against (negative): the consume throws.
+    const broken = { env: { IMAGES: images.binding }, settings: { ceilings: { CEIL_TRANSFORMS_DAY: -1 } } };
+    const answer = await ask(url, broken);
+    expect(answer.status).toBe(404);
+    expect(answer.text).toBe(NOT_FOUND);
+    expect(images.calls).toHaveLength(0);
+    expect(await unitRow(node)).toEqual({ bytes: 0, count: 0 });
+    expect(await units(owner.id)).toBe(0);
+    const next = await ask(url, { env: { IMAGES: images.binding } });
+    expect(next.status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    expect(await units(owner.id)).toBe(1);
+  });
+
+  it(`a hold nobody came back to (a cut invocation) is taken over after ${HOLD_STALE_SECONDS} s: six minutes old → the next request renders; one minute old → the icon, no call`, async () => {
+    const owner = await makeAccount();
+    const images = imagesMock();
+    const fresh = await picture(owner.id);
+    await leftHold(fresh, 60);
+    const busy = await ask(await urlFor("thumb", fresh, { user: owner.id }), {
+      env: { IMAGES: images.binding },
+    });
+    expect(busy.status).toBe(404);
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(0);
+
+    const stale = await picture(owner.id);
+    await leftHold(stale, 360);
+    const taken = await ask(await urlFor("thumb", stale, { user: owner.id }), {
+      env: { IMAGES: images.binding },
+    });
+    expect(taken.status).toBe(200);
+    expect(images.calls).toHaveLength(1);
+    expect(await units(owner.id)).toBe(1);
+    expect(await unitRow(stale)).toMatchObject({ count: 1 });
+  });
+
+  it("ten requests at once find one stale hold: one takes it over — ONE unit between them, at most three calls — and none is a 5xx", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    await leftHold(node, 360);
+    const hold = gate();
+    const all = gate();
+    let inside = 0;
+    let out = 0;
+    const check = () => inside + out === 10 && all.open();
+    const images = imagesMock(async () => {
+      inside++;
+      check();
+      await hold.opened;
+      return FAKE_WEBP;
+    });
+    const url = await urlFor("thumb", node, { user: owner.id });
+    const answers = Array.from({ length: 10 }, () =>
+      ask(url, { env: { IMAGES: images.binding } }).then((answer) => {
+        if (answer.status === 404) {
+          out++;
+          check();
+        }
+        return answer;
+      }),
+    );
+    // Every request is inside the image service, held there, or has answered.
+    await all.opened;
+    const made = images.calls.length;
+    expect(made).toBeGreaterThanOrEqual(1);
+    expect(made).toBeLessThanOrEqual(THUMB_CALLS_PER_DAY);
+    hold.open();
+    const statuses = (await Promise.all(answers)).map((answer) => answer.status).sort();
+    expect(statuses).toEqual([
+      ...Array.from({ length: made }, () => 200),
+      ...Array.from({ length: 10 - made }, () => 404),
+    ]);
+    expect(await units(owner.id)).toBe(1);
+  });
+});
+
+describe("a transform in flight across a Replace, a purge or a takedown leaves nothing behind", () => {
+  /** Replaces the file: a new version, a new object, the node pointing at it. */
+  const replace = async (node: { id: string; ownerId: string }) => {
+    const versionId = crypto.randomUUID();
+    const r2Key = keyFor(node.ownerId, node.id, versionId);
+    await spyBucket().bucket.put(r2Key, pattern(2000, 5));
+    await updateNode(node.id, { versionId, r2Key });
+  };
+
+  for (const [when, before] of [
+    ["between the transform and the cache write", true],
+    ["between the cache write and the re-read", false],
+  ] as const) {
+    it(`a Replace ${when} → the object just written is deleted and the answer is the icon`, async () => {
+      const owner = await makeAccount();
+      const node = await picture(owner.id);
+      const key = thumbKey(node.id, node.versionId, 320);
+      const real = spyBucket();
+      const spy = spyBucket({
+        put: (async (k: string, value: ArrayBuffer, options?: R2PutOptions) => {
+          if (before) await replace(node);
+          const written = await real.bucket.put(k, value, options);
+          if (!before) await replace(node);
+          return written;
+        }) as unknown as R2Bucket["put"],
+      });
+      const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+        env: { IMAGES: imagesMock().binding, FILES: spy.bucket },
+      });
+      expect(answer.status).toBe(404);
+      expect(spy.deletes).toEqual([key]);
+      expect(await real.bucket.head(key)).toBeNull();
+    });
+  }
+
+  it("a takedown between the cache write and the re-read → deleted, the icon; a node purged meanwhile → the same", async () => {
+    const owner = await makeAccount();
+    for (const change of [
+      (id: string) => updateNode(id, { takedownAt: new Date(), takedownReason: "admin" }),
+      (id: string) => testDb().delete(nodes).where(eq(nodes.id, id)),
+    ]) {
+      const node = await picture(owner.id);
+      const key = thumbKey(node.id, node.versionId, 320);
+      const real = spyBucket();
+      const spy = spyBucket({
+        put: (async (k: string, value: ArrayBuffer, options?: R2PutOptions) => {
+          const written = await real.bucket.put(k, value, options);
+          await change(node.id);
+          return written;
+        }) as unknown as R2Bucket["put"],
+      });
+      const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+        env: { IMAGES: imagesMock().binding, FILES: spy.bucket },
+      });
+      expect(answer.status).toBe(404);
+      expect(await real.bucket.head(key)).toBeNull();
+    }
+  });
+
+  it("the control: nothing changed meanwhile → the object stays and is served", async () => {
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const spy = spyBucket();
+    const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      env: { IMAGES: imagesMock().binding, FILES: spy.bucket },
+    });
+    expect(answer.status).toBe(200);
+    expect(spy.deletes).toEqual([]);
+    expect(await spy.bucket.head(thumbKey(node.id, node.versionId, 320))).not.toBeNull();
+  });
+});
+
+describe("an asker whose own day is used up is refused before the owner pays or the service is called", () => {
+  it("an exhausted address (link) and an exhausted signed-in user → 429 with Retry-After (readable by the app), no call, no unit, no hold", async () => {
+    const owner = await makeAccount();
+    const partner = await makeAccount();
+    const node = await picture(owner.id);
+    await makeShare(node.id, owner.id, partner.id);
+    const link = await linkOn(node.id, owner.id);
+    const images = imagesMock();
+    for (const [subject, ceilings] of [
+      [{ link }, { CEIL_IP_BYTES_DAY: 0 }],
+      [{ user: partner.id }, { CEIL_USER_BYTES_DAY: 0 }],
+    ] as const) {
+      const answer = await ask(await urlFor("thumb", node, subject), {
+        env: { IMAGES: images.binding },
+        settings: { ceilings },
+      });
+      expect(answer.status).toBe(429);
+      expect(Number(answer.headers.get("retry-after"))).toBeGreaterThan(0);
+      expect(Number(answer.headers.get("retry-after"))).toBeLessThanOrEqual(86_400);
+      expect(answer.headers.get("access-control-expose-headers")?.split(", ")).toContain("Retry-After");
+    }
+    expect(images.calls).toHaveLength(0);
+    expect(await units(owner.id)).toBe(0);
+    expect(await ledgerRow("notice", unitMarker(node, 320))).toBeNull();
+    // With room, the same thumbnail is made.
+    expect(
+      (await ask(await urlFor("thumb", node, { link }), { env: { IMAGES: images.binding } })).status,
+    ).toBe(200);
   });
 });

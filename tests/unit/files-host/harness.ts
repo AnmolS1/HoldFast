@@ -340,6 +340,7 @@ export type BucketSpy = {
   gets: Array<{ key: string; options: R2GetOptions | undefined }>;
   heads: string[];
   puts: string[];
+  deletes: string[];
   /** How many bodies handed out by `get` were cancelled before their end. */
   cancelled: number;
 };
@@ -355,7 +356,14 @@ export function spyBucket(
   behaviour: { splitAt?: number } = {},
 ): BucketSpy {
   const real = env.FILES;
-  const spy: BucketSpy = { bucket: null as unknown as R2Bucket, gets: [], heads: [], puts: [], cancelled: 0 };
+  const spy: BucketSpy = {
+    bucket: null as unknown as R2Bucket,
+    gets: [],
+    heads: [],
+    puts: [],
+    deletes: [],
+    cancelled: 0,
+  };
   spy.bucket = {
     head: (key: string) => {
       spy.heads.push(key);
@@ -402,6 +410,10 @@ export function spyBucket(
     put: (key: string, ...rest: unknown[]) => {
       spy.puts.push(key);
       return (real.put as (...args: unknown[]) => unknown)(key, ...rest);
+    },
+    delete: (keys: string | string[]) => {
+      spy.deletes.push(...(Array.isArray(keys) ? keys : [keys]));
+      return real.delete(keys);
     },
     ...overrides,
   } as unknown as R2Bucket;

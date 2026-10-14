@@ -56,7 +56,7 @@ describe("headers", () => {
     const own = {
       "accept-ranges": "bytes",
       "access-control-expose-headers":
-        "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning",
+        "Content-Length, Content-Range, ETag, Accept-Ranges, X-Holdfast-Warning, Retry-After",
       etag: "<validator>",
       "last-modified": "<validator>",
     };
