@@ -533,7 +533,7 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
     replaceNodeId,
   };
   const open = await findResumable(db(c), match);
-  if (open) return c.json(await initResponse(c, open, partBytes), 200);
+  if (open) return c.json(await initResponse(c, await withMultipart(c, open), partBytes), 200);
 
   let finalName = name;
   if (replaceNodeId !== null) {
