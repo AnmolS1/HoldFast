@@ -25,7 +25,8 @@
 import { UUID } from "../../shared/ids";
 import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import { csamReportsToAnnounce, lockSuspectedCsam as lockRows } from "../db/queries/moderation";
-import { findByR2Key, getNode, resetToPending, restoreScanState, type ScanState } from "../db/queries/nodes";
+import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
+import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit } from "./audit";
@@ -207,14 +208,22 @@ export async function enqueueScan(
 export type RescanResult = { queued: true } | { queued: false; reason: "taken_down" | "locked" };
 
 /**
- * Rescan. What happens depends on the node's state — read from its LOCKED row, in the
- * transaction that resets it, so a takedown that lands while this runs is either seen (nothing
- * happens) or comes after the reset has committed:
+ * Rescan. What happens depends on the node's state — read under the owner's TREE LOCK and from
+ * its LOCKED row, in the transaction that resets it, so a takedown that lands while this runs —
+ * of the file, or of a folder above it — is either seen (nothing happens) or comes after the
+ * reset has committed. In this order, the first that applies:
  *
- *   taken down, whatever its status   nothing: status and verdict kept      { queued: false, reason: "taken_down" }
- *   `suspected_csam`                  nothing: status and verdict kept      { queued: false, reason: "locked" }
- *   `under_review`                    status KEPT, a message is sent        { queued: true }
- *   any other status                  back to `pending`, a message is sent  { queued: true }
+ *   taken down ITSELF, whatever its status    nothing: status and verdict kept      { queued: false, reason: "taken_down" }
+ *   `suspected_csam`                          nothing: status and verdict kept      { queued: false, reason: "locked" }
+ *   inside a TAKEN-DOWN FOLDER (any depth)    nothing: status and verdict kept      { queued: false, reason: "taken_down" }
+ *   `under_review`                            status KEPT, a message is sent        { queued: true }
+ *   `pending`, a scan of it under way         owner: `409 conflict`, nothing sent; admin: a message is sent  { queued: true }
+ *   `pending`, NO scan of it under way        a message is sent (a re-send)         { queued: true }
+ *   any other status                          back to `pending`, a message is sent  { queued: true }
+ *
+ * Hidden is inherited (queries/tree.ts): a file inside a taken-down folder is as taken down as
+ * one taken down itself. The tree lock is what makes that answer hold — `moderation.takedownNode`
+ * takes it too — and it is this transaction's FIRST lock, before the node's row (the lock order).
  *
  * A rescan must never be a way to launder a locked file back to `pending` and then `clean`. For
  * an `under_review` file the scan still runs — the real pipeline records its outcome as the status
@@ -225,15 +234,19 @@ export type RescanResult = { queued: true } | { queued: false; reason: "taken_do
  * so there is no option for it. The message and the audit row follow the
  * commit, and only when something was queued.
  *
- * A SEND THAT FAILS DOES NOT STRAND THE NODE. The reset has committed when the queue is asked;
- * if the send throws, the node would be `pending` with no message — and an owner's retry would
- * be refused (a `pending` file is not one they may rescan). So what the locked row had — status,
- * reason, detail, scan time — is put back, only while the node is still `pending` on the same
- * object key (a replace, a lock, a report or a verdict in between wins), and the send's error
- * is rethrown: nothing was queued, no audit row. If putting it back fails too (or the process
- * dies between the commit and the send), the node stays `pending`: served to nobody, and found
- * by the pending-scan sweep (T21's `sweepPendingScans`), which re-sends for a node that is
- * `pending` with no live job. The two do not overlap: a node put back is not `pending`.
+ * A SEND THAT FAILS LEAVES THE NODE `pending` — FAIL CLOSED. The reset has committed when the
+ * queue is asked; if the send throws, the error propagates and the node stays `pending`: served
+ * to nobody. NOTHING PUTS A PREVIOUS VERDICT BACK: between the reset and any such write another
+ * rescan, a replace or an admin can have made the node `pending` for a reason of its own, and an
+ * old `clean` written over that would make the scan in flight drop its verdict (the consumer
+ * writes only to a node that is still `pending`). What makes it recoverable instead:
+ *   - a `pending` node with NO live scan job (`nodes.hasLiveScanJob`: the key's `scan_jobs` row
+ *     `running` and younger than the stale-claim time) may be rescanned again — by its owner
+ *     too: the message is simply sent (again). With a live job the owner gets `409 conflict`;
+ *   - the pending-scan sweep (T21's `sweepPendingScans`) re-sends for the same condition.
+ * A re-send can never produce two verdicts: there is ONE job row per object key, a second
+ * delivery of a running job is retried, not scanned, and a forced re-scan of a finished job
+ * finds the node no longer `pending` and writes nothing to it.
  *
  * AN OWNER NEVER LEARNS WHY. "Taken down" and "locked" are states an account holder must not be
  * able to observe, so for `by: "owner"` both are the same `404 not_found` — the very error an id
@@ -259,9 +272,10 @@ export async function enqueueRescan(
   const seen = await getNode(deps.db, nodeId);
   if (!seen || seen.kind !== "file" || !seen.r2Key) throw new AppError("not_found");
 
-  // `before`: what the reset cleared — present only when it reset something.
-  type Decision = { key: string; before?: ScanState } | { reason: "taken_down" | "locked" } | null;
+  type Decision = { key: string } | { reason: "taken_down" | "locked" } | { busy: true } | null;
   const decision = await deps.db.transaction(async (tx): Promise<Decision> => {
+    // First, before any row: a takedown of a folder above waits for this, or has been seen.
+    await lockOwnerTree(tx, seen.ownerId);
     // The row is locked through its object key. A replace that landed since the read above gave
     // the node a new key: then the node is read again and locked through that one.
     let r2Key: string | null = seen.r2Key;
@@ -271,15 +285,16 @@ export async function enqueueRescan(
         if (locked.kind !== "file") return null;
         if (locked.takedownAt !== null) return { reason: "taken_down" };
         if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
+        // Neither of the two above: what is left of "hidden" is a taken-down folder above it.
+        if (await effectiveHidden(tx, nodeId)) return { reason: "taken_down" };
         if (locked.scanStatus === "under_review") return { key: r2Key };
-        const before: ScanState = {
-          scanStatus: locked.scanStatus,
-          scanReason: locked.scanReason,
-          scanDetail: locked.scanDetail,
-          scannedAt: locked.scannedAt,
-        };
+        // Already `pending`: with a scan under way an owner has nothing to ask for; without one
+        // the message never arrived (or was lost), and what follows sends it (again).
+        if (locked.scanStatus === "pending" && opts.by === "owner" && (await hasLiveScanJob(tx, r2Key))) {
+          return { busy: true };
+        }
         // The statement has the same guard: it changes nothing for the two locked statuses.
-        return (await resetToPending(tx, nodeId)) ? { key: r2Key, before } : { reason: "locked" };
+        return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
       }
       r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
     }
@@ -293,19 +308,10 @@ export async function enqueueRescan(
     return { queued: false, reason: decision.reason };
   }
 
-  try {
-    await enqueueScan(deps, { nodeId, key: decision.key, force: true });
-  } catch (error) {
-    if (decision.before) {
-      try {
-        await restoreScanState(deps.db, nodeId, decision.key, decision.before);
-      } catch (restoreError) {
-        // The node stays `pending` (fail closed); the send's error is the one the caller gets.
-        captureError(restoreError, { kind: "rescan_restore" });
-      }
-    }
-    throw error;
-  }
+  if ("busy" in decision) throw new AppError("conflict");
+
+  // A failure here propagates and the node stays `pending`: see the header.
+  await enqueueScan(deps, { nodeId, key: decision.key, force: true });
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by });
   return { queued: true };
 }
