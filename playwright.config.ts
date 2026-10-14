@@ -68,7 +68,14 @@ export default defineConfig({
     { name: "mobile-chrome", use: { ...devices["Pixel 7"] } },
   ],
   webServer: {
-    command: `npm run dev -- --port ${port} --strictPort`,
+    // `--force`: Vite's dependency cache is re-optimised from a full scan at every start. A cache
+    // left by an earlier run is reused as long as the lockfile and this config are unchanged —
+    // also when the code now imports a package it did not import then (pdfjs-dist and shiki,
+    // reached only through lazy chunks). Vite then discovers the package while a TEST loads that
+    // chunk, re-optimises and RELOADS the page in the middle of it: a URL minted twice, a viewer
+    // not there within its 5 s. With a full scan at start, every such package is known before the
+    // first page loads (it costs well under a second of the warm-up).
+    command: `npm run dev -- --port ${port} --strictPort --force`,
     // `localhost`, not 127.0.0.1: the Worker answers any other host with 421. /__meta is
     // answered by the Worker itself, so "ready" means the Worker is up, not just Vite — and it
     // does not depend on the database, which /api/health does (503 when the database is down).

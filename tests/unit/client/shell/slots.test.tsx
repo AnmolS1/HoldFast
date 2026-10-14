@@ -104,9 +104,6 @@ const returns = (call: () => unknown, value: unknown) => () => expect(call()).to
 const STUBS: Array<[behaviour: string, check: () => void]> = [
   ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
   ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
-  ["UploadDropOverlay renders nothing", rendersNothing(<UploadDropOverlay />)],
-  ["requestUpload() is a no-op", returns(() => requestUpload(), undefined)],
-  ["requestUpload(opts) is a no-op", returns(() => requestUpload({ files: [], parentId: "p" }), undefined)],
   ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
 ];
 

@@ -125,6 +125,40 @@ describe("getAccess", () => {
     expect(await value(t.editor, (c) => getAccess(c, t.file.id))).toBeNull();
   });
 
+  it("nested shares: the highest role, the folder it comes from, and an upload right any editor share gives", async () => {
+    const t = await tree();
+    const user = await makeUser();
+    const caller: Caller = { user };
+    // Editor of `shared/` without uploads; ALSO a viewer share on `inner/` (the review's case).
+    await makeShare(t.shared.id, t.ids.owner, user.id, { role: "editor", canUpload: false });
+    const innerShare = await makeShare(t.inner.id, t.ids.owner, user.id, { role: "viewer" });
+    for (const node of [t.shared, t.inner, t.file]) {
+      expect(await value(caller, (c) => getAccess(c, node.id))).toEqual({
+        role: "editor",
+        shareRootId: t.shared.id,
+        canUpload: false,
+        via: "share",
+      });
+    }
+    // `inner/` lies inside the folder their role comes from: an editor's question about it passes
+    // and it is not their share root (what a rename or a move of it asks).
+    expect(await value(caller, (c) => requireRole(c, t.inner.id, "editor"))).toMatchObject({
+      shareRootId: t.shared.id,
+    });
+    expect(await outcome(caller, (c) => requireUpload(c, t.inner.id))).toBe("403 forbidden");
+    // The inner share becomes an editor share that allows uploads: it does, from `inner/` down.
+    await testDb()
+      .update(shares)
+      .set({ role: "editor", canUpload: true })
+      .where(eq(shares.id, innerShare.id));
+    expect(await value(caller, (c) => requireUpload(c, t.inner.id))).toMatchObject({
+      role: "editor",
+      shareRootId: t.shared.id,
+      canUpload: true,
+    });
+    expect(await outcome(caller, (c) => requireUpload(c, t.shared.id))).toBe("403 forbidden");
+  });
+
   it("is cached for the request: the second answer for a node costs no statement", async () => {
     const t = await tree();
     const counts = await value(t.viewer, async (c) => {

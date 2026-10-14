@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
@@ -6,7 +7,13 @@ import { getById, pauseLinks } from "../../../src/worker/db/queries/links";
 import { release } from "../../../src/worker/db/queries/quota";
 import { deleteSubtreeRows } from "../../../src/worker/db/queries/trash";
 import { ownedRoots } from "../../../src/worker/db/queries/tree";
-import { deleteForUser, remainingForUser } from "../../../src/worker/db/queries/uploads";
+import {
+  COMPLETING_STALE_MINUTES,
+  deleteForUser,
+  expired,
+  markAborted,
+  remainingForUser,
+} from "../../../src/worker/db/queries/uploads";
 import {
   cancel,
   defer,
@@ -17,7 +24,7 @@ import {
   schedule,
 } from "../../../src/worker/db/queries/user-purge";
 import { userState } from "../../../src/worker/db/queries/users";
-import { nodes, pendingUserPurges, uploads, user } from "../../../src/worker/db/schema";
+import { hashBlocklist, nodes, pendingUserPurges, uploads, user } from "../../../src/worker/db/schema";
 import {
   baId,
   makeFile,
@@ -256,12 +263,17 @@ describe("hard delete of a user", () => {
     await expect(db.delete(user).where(eq(user.id, editor))).rejects.toThrow();
 
     const toAbort = await deleteForUser(db, editor);
-    expect(toAbort.sort((a, b) => a.r2Key.localeCompare(b.r2Key))).toEqual(
-      [
-        { r2Key: open.r2Key, r2UploadId: "mpu-9" },
-        { r2Key: own.r2Key, r2UploadId: null },
-      ].sort((a, b) => a.r2Key.localeCompare(b.r2Key)),
-    );
+    // The editor's `completing` session is a request at work on its object (H2 K, the lead's
+    // ruling): kept, not returned to abort — the user row waits until that request ends it.
+    expect(toAbort).toEqual([{ r2Key: open.r2Key, r2UploadId: "mpu-9" }]);
+    expect(await remainingForUser(db, editor)).toBe(1);
+    await expect(db.delete(user).where(eq(user.id, editor))).rejects.toThrow();
+    await db
+      .update(uploads)
+      .set({ status: "aborted", completedAt: new Date() })
+      .where(eq(uploads.id, own.id));
+    expect(await deleteForUser(db, editor)).toEqual([]);
+    expect(await remainingForUser(db, editor)).toBe(0);
     const left = await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.ownerId, owner));
     expect(left.map((u) => u.id)).toEqual([ownersOwn.id]);
     expect(done.id).not.toBe(ownersOwn.id);
@@ -332,6 +344,86 @@ describe("hard delete of a user", () => {
     expect(aborted).toHaveLength(1);
     expect(await remainingForUser(db, leaving)).toBe(0);
     expect(await used(heldOwner)).toBe(0);
+    await db.delete(user).where(eq(user.id, leaving));
+    expect(await userState(db, leaving)).toBeNull();
+  });
+  // H2 K extension: a `completing` session whose declared hash is on the blocklist owes a locked
+  // node for verified bytes (the uploads route's "csam node owed" state, repaired later by a
+  // sweep). The account purge must not take its row or its object.
+  it("uploads.deleteForUser keeps every completing session — one with a blocklisted hash owes a locked node: no key to abort, row kept, the user row waits", async () => {
+    const leaving = await makeUser(db, { quotaBytes: 100_000, usedBytes: 300 });
+    const editor = await makeUser(db);
+    const listed = randomBytes(32).toString("hex");
+    await db.insert(hashBlocklist).values({ sha256: listed, reason: "csam" });
+    const kept = [
+      // Owed nodes: into the leaving user's folder, by an editor; and the leaving user's own.
+      await makeUpload(db, leaving, editor, { status: "completing", expectedSha256: listed, size: 200 }),
+      await makeUpload(db, leaving, leaving, { status: "completing", expectedSha256: listed, size: 100 }),
+      // Any completing session is a request at work on its object (the lead's ruling): an unlisted hash too.
+      await makeUpload(db, leaving, editor, {
+        status: "completing",
+        expectedSha256: randomBytes(32).toString("hex"),
+        r2UploadId: "mpu-unlisted",
+      }),
+    ];
+    // The control, same call: an OPEN session, even with the listed hash, goes as before.
+    const open = await makeUpload(db, leaving, editor, {
+      status: "open",
+      expectedSha256: listed,
+      r2UploadId: "mpu-open",
+    });
+
+    const toAbort = await deleteForUser(db, leaving);
+    expect(toAbort.map((u) => u.r2UploadId)).toEqual(["mpu-open"]);
+    for (const session of kept) {
+      expect(await db.select().from(uploads).where(eq(uploads.id, session.id))).toMatchObject([
+        { status: "completing", expectedSha256: session.expectedSha256 },
+      ]);
+    }
+    expect(await db.select().from(uploads).where(eq(uploads.id, open.id))).toEqual([]);
+    // The rows reference the user (NOT NULL, RESTRICT): it cannot be deleted, and the job can tell.
+    expect(await remainingForUser(db, leaving)).toBe(3);
+    await expect(db.delete(user).where(eq(user.id, leaving))).rejects.toThrow();
+  });
+  // H2 review M1: a completing session whose declared hash is listed for a reason OTHER than csam
+  // owes nothing. The purge keeps it while its request may be alive, the stale job ends it once it
+  // is stale, and the purge then goes on — a csam-listed one stays the repair sweep's.
+  it("a stale completing session with a non-csam listed hash: kept by the purge, ended by the stale job, then the user goes", async () => {
+    const leaving = await makeUser(db);
+    const stale = new Date(Date.now() - (COMPLETING_STALE_MINUTES + 5) * 60_000);
+    const malware = randomBytes(32).toString("hex");
+    const csam = randomBytes(32).toString("hex");
+    await db.insert(hashBlocklist).values([
+      { sha256: malware, reason: "malware" },
+      { sha256: csam, reason: "csam" },
+    ]);
+    const other = await makeUpload(db, leaving, leaving, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: malware,
+    });
+    const owed = await makeUpload(db, leaving, leaving, {
+      status: "completing",
+      completingAt: stale,
+      expectedSha256: csam,
+    });
+
+    expect(await deleteForUser(db, leaving)).toEqual([]);
+    expect(await remainingForUser(db, leaving)).toBe(2);
+    // The stale job's list: the non-csam one is there, the owed one is not.
+    const due = (await expired(db, 100_000)).map((u) => u.id);
+    expect(due).toContain(other.id);
+    expect(due).not.toContain(owed.id);
+    // The stale job ends it (what its settle does to the row).
+    expect(await markAborted(db, other.id)).toBe(true);
+    // The next purge run takes it; only the owed session still holds the user row.
+    expect(await deleteForUser(db, leaving)).toEqual([]);
+    expect(await remainingForUser(db, leaving)).toBe(1);
+    expect(await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, other.id))).toEqual([]);
+    // Once the repair has ended the owed one too, the user row can go.
+    expect(await markAborted(db, owed.id)).toBe(true);
+    await deleteForUser(db, leaving);
+    expect(await remainingForUser(db, leaving)).toBe(0);
     await db.delete(user).where(eq(user.id, leaving));
     expect(await userState(db, leaving)).toBeNull();
   });

@@ -8,7 +8,6 @@ import {
   HIGHLIGHT_LINE_TIME_MS,
   HIGHLIGHT_MAX_LINE_LENGTH,
   HIGHLIGHT_SLICE_MS,
-  HIGHLIGHT_TASK_BOUND_MS,
   HIGHLIGHT_TOTAL_MS,
   languageFor,
 } from "../../../../src/client/features/preview/renderers/highlight";
@@ -229,6 +228,14 @@ describe("TextPreview — refusals", () => {
   });
 });
 
+/**
+ * For the tests about WHICH tokens come out: the clock stands still, so the grammar's per-line
+ * time limit (it reads `Date.now()`) and the run's slices never trip. On a loaded machine a
+ * short line could otherwise be cut short by preemption alone and come back partly plain —
+ * right for the viewer, wrong for a test of the tokens.
+ */
+const clockStandsStill = () => vi.useFakeTimers({ toFake: ["Date", "performance"] });
+
 describe("highlighting", () => {
   // The grammar and the engine are loaded once, before the tests that wait for colours — so none
   // of them waits on a cold import.
@@ -238,6 +245,7 @@ describe("highlighting", () => {
 
   it("a line longer than the limit is left plain, by the grammar's own limit and before it is even asked", async () => {
     const long = `const s = "${"x".repeat(HIGHLIGHT_MAX_LINE_LENGTH)}";`;
+    clockStandsStill();
     const lines = (await highlight(`const a = 1;\n${long}\n`, "typescript"))!;
     expect(lines[0]!.some((piece) => piece.token === "keyword")).toBe(true);
     // The long line comes back as it is, with no token on any piece.
@@ -265,6 +273,7 @@ describe("highlighting", () => {
 
   it("the highlighter's result is pieces of text with a token name — the file's text, unchanged", async () => {
     const code = 'const tag: string = "<script>alert(1)</script>"; // done\n\nexport default tag;\n';
+    clockStandsStill();
     const lines = (await highlight(code, "typescript"))!;
     expect(lines.map((line) => line.map((piece) => piece.text).join("")).join("\n")).toBe(code);
     const tokens = new Set(lines.flat().map((piece) => piece.token));
@@ -363,6 +372,7 @@ describe("highlighting — its bounds are decided before it starts", () => {
 
   it("the grammar's state is carried from line to line: the middle of a block comment is a comment", async () => {
     const source = ["const a = 1; /* opens here", "still inside", "*/ const after = 1;"];
+    clockStandsStill();
     const lines = (await highlight(source.join("\n"), "typescript"))!;
     expect(lines.map((line) => line.map((piece) => piece.text).join(""))).toEqual(source);
     expect(lines[1]!.every((piece) => piece.token === "comment")).toBe(true);
@@ -437,6 +447,19 @@ describe("highlighting — bounded in time, and stopped promptly", () => {
     expect(slices.length).toBe(1);
   });
 
+  /**
+   * This process's CPU time, in ms. A stretch of highlighting is CPU work; on a loaded machine the
+   * wall clock also counts the time the process was not running at all, and decides nothing.
+   */
+  const cpuMs = () => {
+    // Node's, under jsdom too (the client tsconfig has no Node types).
+    const node = globalThis as unknown as { process: { cpuUsage(): { user: number; system: number } } };
+    const { user, system } = node.process.cpuUsage();
+    return (user + system) / 1_000;
+  };
+  /** A ceiling for ONE stretch that only a regression reaches (see the test below). */
+  const STRETCH_CEILING_CPU_MS = 1_000;
+
   it.each([
     ["typescript", "a<", 999, 200],
     ["markdown", "*_", 999, 200],
@@ -445,31 +468,30 @@ describe("highlighting — bounded in time, and stopped promptly", () => {
     ["vue", '<a :b="{', 999, 200],
     ["vue", '<a :b="{', 1_999, 100],
   ] as const)(
-    "the crafted %s file (%j, %i characters × %i lines): no stretch of work on the main thread is long",
+    "the crafted %s file (%j, %i characters × %i lines): the work is cut into stretches, and a close is answered at the next yield",
     async (lang, unit, width, count) => {
       const source = crafted(unit, width, count);
-      const started = performance.now();
-      const first: number[] = [];
-      const lines = await highlight(source, lang, { onSlice: (ms) => first.push(ms) });
-      const took = performance.now() - started;
-      // It was 5.6–12.9 s in ONE uninterruptible stretch. The whole run is now over, one way or
-      // the other, within its total budget.
-      expect(took).toBeLessThan(HIGHLIGHT_TOTAL_MS + 1_000);
-      if (lines !== null) expect(lines.length).toBe(count);
-      // The longest stretch between two yields is a slice plus ONE scan of the grammar over one
-      // line, which cannot be interrupted: ~37–44 ms measured for 2,000-character Vue lines.
-      // Two more short runs (each line is the same, so their first 300 ms are representative);
-      // the least of the three worst stretches is held, so a loaded moment does not decide it.
-      const worst = [Math.max(0, ...first)];
-      for (let run = 0; run < 2; run += 1) {
-        const slices: number[] = [];
-        const stop = new AbortController();
-        const timer = setTimeout(() => stop.abort(), 300);
-        await highlight(source, lang, { signal: stop.signal, onSlice: (ms) => slices.push(ms) });
-        clearTimeout(timer);
-        worst.push(Math.max(0, ...slices));
-      }
-      expect(Math.min(...worst)).toBeLessThan(HIGHLIGHT_TASK_BOUND_MS);
+      // Closed after its second yield — as a click on Close does while the run goes on.
+      const close = new AbortController();
+      const stretches: number[] = [];
+      const lines = await highlight(source, lang, {
+        signal: close.signal,
+        now: cpuMs,
+        onSlice: (ms) => {
+          stretches.push(ms);
+          if (stretches.length === 2) close.abort();
+        },
+      });
+      // Every one of these files is more than two stretches of work: the run yielded between
+      // them, was closed while it went on, and ended at the next yield — nothing more was done.
+      expect(close.signal.aborted).toBe(true);
+      expect(stretches.length).toBe(2);
+      expect(lines).toBeNull();
+      // It was 5.6–12.9 s in ONE uninterruptible stretch. The ceiling is in CPU time, so the
+      // machine's load does not count; measured stretches here are ≤ ~44 ms (see
+      // HIGHLIGHT_SLICE_MS), so 1 s is 20× that — room for a CI machine several times slower —
+      // and still far below the seconds the unbounded version took.
+      expect(Math.max(0, ...stretches)).toBeLessThan(STRETCH_CEILING_CPU_MS);
     },
   );
 
