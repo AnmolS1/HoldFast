@@ -9,10 +9,11 @@
 //  - `429` makes the whole loop wait `Retry-After`; `5xx` and a dead network back it off,
 //    doubling up to a minute — never the same rate against a server that is refusing;
 //  - nothing is asked while the tab is hidden or the page is not the one in front;
-//  - each file is watched for POLL_MAX_MS from the moment it became pending in this listing, and
-//    then no longer asked for (its row keeps saying "Still scanning"; opening the folder again
-//    starts a new watch). A file that becomes pending later — a new upload, a Re-check — gets its
-//    own full span: the bound is per file, never per visit;
+//  - each file is watched for POLL_MAX_MS of time the loop could ASK — from the moment it became
+//    pending in this listing, not counting any time the loop was paused (tab hidden, page covered)
+//    — and then no longer asked for; its row says "Still scanning" from then on (opening the folder
+//    again starts a new watch). A file that becomes pending later — a new upload, a Re-check — gets
+//    its own full span: the bound is per file, never per visit;
 //  - an answer that arrives after the account changed is dropped.
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeDto } from "../../../shared/schemas/node";
@@ -55,13 +56,18 @@ export interface ScanPollHandlers {
 }
 
 interface LoopState {
-  /** When each pending file was first seen. Kept while it is listed, even once its watch is over. */
+  /**
+   * When each pending file was first seen, moved forward by every pause since: `now - since` is
+   * the time the loop could ask about it. Kept while it is listed, even once its watch is over.
+   */
   since: Map<string, number>;
   /** When each was last asked for. */
   asked: Map<string, number>;
   /** Files the server refused to show (`403`): not asked again. */
   refused: Set<string>;
   lastTick: number;
+  /** Since when the loop has been paused (hidden, or not the page in front); null while it runs. */
+  pausedSince: number | null;
   /** Failures in a row, and the time before which nothing is asked. */
   failures: number;
   notBefore: number;
@@ -87,6 +93,7 @@ export function useScanPolling(
     asked: new Map(),
     refused: new Set(),
     lastTick: 0,
+    pausedSince: null,
     failures: 0,
     notBefore: 0,
   });
@@ -104,14 +111,25 @@ export function useScanPolling(
     const ids = key === "" ? [] : key.split(",");
     const listed = new Set(ids);
     const now = Date.now();
-    for (const id of ids) if (!state.since.has(id)) state.since.set(id, now);
+    const paused = !active || !visible;
+    if (paused) state.pausedSince ??= now;
+    // A file first seen during a pause starts its watch when the pause ends.
+    for (const id of ids) if (!state.since.has(id)) state.since.set(id, state.pausedSince ?? now);
     for (const id of Array.from(state.since.keys())) {
       if (listed.has(id)) continue;
       state.since.delete(id);
       state.asked.delete(id);
       state.refused.delete(id);
     }
-    if (ids.length === 0 || !active || !visible) return;
+    if (paused) return;
+    if (state.pausedSince !== null) {
+      // Paused time does not count against any file's watch. (It does count as time since a file
+      // was last asked: one that was due meanwhile is asked as soon as the page is back.)
+      const pause = now - state.pausedSince;
+      for (const [id, at] of state.since) state.since.set(id, at + pause);
+      state.pausedSince = null;
+    }
+    if (ids.length === 0) return;
     if (state.lastTick === 0) state.lastTick = now;
 
     const then = accountEpoch();
@@ -133,8 +151,22 @@ export function useScanPolling(
       state.asked.delete(id);
     };
 
+    // "Still scanning": every listed file watched for over two minutes — one whose watch has run
+    // out included, so a file is never left without it once it is no longer asked about.
+    const markSlow = (at: number) => {
+      const overdue = ids.filter(
+        (id) =>
+          state.since.has(id) && !state.refused.has(id) && at - state.since.get(id)! >= POLL_FAST_FOR_MS,
+      );
+      if (overdue.length === 0) return;
+      setSlow((current) =>
+        overdue.every((id) => current.has(id)) ? current : new Set([...current, ...overdue]),
+      );
+    };
+
     const plan = () => {
       if (!live()) return;
+      markSlow(Date.now());
       const files = watched();
       if (files.length === 0) return;
       const wait = Math.min(...files.map(waitOf));
@@ -147,12 +179,7 @@ export function useScanPolling(
       const at = Date.now();
       state.lastTick = at;
       const files = watched();
-      const overdue = files.filter((id) => at - state.since.get(id)! >= POLL_FAST_FOR_MS);
-      if (overdue.length > 0) {
-        setSlow((current) =>
-          overdue.every((id) => current.has(id)) ? current : new Set([...current, ...overdue]),
-        );
-      }
+      markSlow(at);
       const due = files
         // 50 ms of grace: a timer may fire a little early or late against the file's own clock.
         .filter((id) => at - last(id) >= waitOf(id) - 50)

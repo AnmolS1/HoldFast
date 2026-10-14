@@ -366,3 +366,58 @@ describe("a pending file", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+// Review round 3 (M8): a file's 30 minutes count only time the loop could ask — not a hidden tab,
+// not a page covered by a preview. When they do run out, the row says "Still scanning".
+describe("M8 — the watch counts only time the loop could ask", () => {
+  function watch(initial: { active: boolean }) {
+    const calls = serveDrive(new FakeDrive([PENDING]));
+    const handlers = { onSettled: vi.fn(), onGone: vi.fn() };
+    const view = renderHook(({ active }) => useScanPolling([PENDING.id], handlers, active), {
+      initialProps: initial,
+    });
+    const asked = () => calls.filter((call) => DETAIL.test(call.path)).length;
+    return { view, asked };
+  }
+
+  it("pending while the page is covered for longer than the watch, then in front: asked within 5 s", async () => {
+    const { view, asked } = watch({ active: false });
+    await pass(POLL_MAX_MS + 60_000);
+    expect(asked()).toBe(0);
+    view.rerender({ active: true });
+    await pass(POLL_FAST_MS + 50);
+    expect(asked()).toBe(1);
+    // The fast pace, as for a file just seen: twelve a minute.
+    await pass(60_000);
+    expect(asked()).toBe(13);
+  });
+
+  it("pending while the tab is hidden for 31 minutes, then shown: asked, not dropped", async () => {
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const { asked } = watch({ active: true });
+    await pass(31 * 60_000);
+    expect(asked()).toBe(0);
+    hidden.mockReturnValue(false);
+    await act(async () => void document.dispatchEvent(new Event("visibilitychange")));
+    await pass(POLL_FAST_MS + 50);
+    expect(asked()).toBeGreaterThanOrEqual(1);
+  });
+
+  it("20 active minutes, an hour covered, then more: asked until 30 ACTIVE minutes, then no more — and marked Still scanning", async () => {
+    const { view, asked } = watch({ active: true });
+    await pass(20 * 60_000);
+    const before = asked();
+    view.rerender({ active: false });
+    await pass(60 * 60_000);
+    expect(asked()).toBe(before);
+    view.rerender({ active: true });
+    // Ten more active minutes are left: one question every 30 s.
+    await pass(9 * 60_000);
+    expect(asked()).toBeGreaterThanOrEqual(before + 17);
+    await pass(2 * 60_000);
+    const total = asked();
+    await pass(30 * 60_000);
+    expect(asked()).toBe(total);
+    expect(view.result.current.has(PENDING.id)).toBe(true);
+  });
+});
