@@ -326,6 +326,8 @@ describe("PdfPreview — refusals", () => {
 
 describe("PdfPreview across a purge of the account — at each stage", () => {
   const purge = () => act(async () => void (await purgeUserState()));
+  /** In the dialog the purge is another account's: it reads again for that one. */
+  const switchAccount = () => act(async () => void (await purgeUserState({ keepSession: true })));
   const item = loadedOf(NODES.pdf);
   /** The renderer alone: no dialog remounts it, so what stops the work is its own scope. */
   async function alone(files: () => Response | Promise<Response> = () => new Response(BYTES)) {
@@ -465,7 +467,7 @@ describe("PdfPreview across a purge of the account — at each stage", () => {
     await waitFor(() => expect(dialog()!.querySelector('[data-pdf-link="internal"]')).not.toBeNull());
     fireEvent.click(dialog()!.querySelector<HTMLElement>('[data-pdf-link="internal"]')!);
     a.gone = true;
-    await purge();
+    await switchAccount();
     answer(3);
     await waitFor(() => expect(state()).toBe("error"));
     expect(renderer()).toBeNull();
@@ -483,7 +485,7 @@ describe("PdfPreview across a purge of the account — at each stage", () => {
     renderPreview(<PreviewDialog open nodeId={ID.pdf} onClose={noop} source="owner" />);
     await waitFor(() => expect(renderer()).toBe("pdf"));
     a.gone = true;
-    await purge();
+    await switchAccount();
     await waitFor(() => expect(state()).toBe("error"));
     expect(dialog()!.querySelectorAll("[data-pdf-page]").length).toBe(0);
     expect(screen.queryByText("three-pages.pdf")).toBeNull();

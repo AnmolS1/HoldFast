@@ -23,7 +23,7 @@ import { ErrorState, PreviewSkeleton } from "./parts";
 import { rendererFor } from "./renderer-map";
 import { NoPreview } from "./renderers/NoPreview";
 import type { RendererProps } from "./renderers/types";
-import { openScope, usePurgeCount } from "./scope";
+import { nobodySignedIn, openScope, usePurgeCount } from "./scope";
 import { mintUrl, type LoadedItem, type PreviewSource } from "./source";
 import { t } from "./strings";
 import { useItem, useSiblingIds } from "./useItem";
@@ -356,7 +356,8 @@ export function PreviewDialogView(props: ViewProps) {
         },
       }}
     >
-      {nodeId !== null ? (
+      {/* After a sign-out the dialog reads nothing more: there is no session to read with. */}
+      {nodeId !== null && !(source === "owner" && nobodySignedIn()) ? (
         <Body
           key={purges}
           nodeId={nodeId}

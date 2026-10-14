@@ -13,7 +13,7 @@
 // and this module's purger running is stopped too.
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { registerUserStatePurger } from "../../lib/contracts";
-import { accountEpoch, sameAccount } from "../../lib/query";
+import { accountEpoch, getCachedSession, getKnownUserId, sameAccount } from "../../lib/query";
 
 export interface ViewScope {
   /** Aborted when the view ends or the account is purged. */
@@ -27,7 +27,8 @@ export interface ViewScope {
 // there have been. Neither holds anything of an account — only the means to stop its work.
 const openScopes = new Set<AbortController>();
 const listeners = new Set<() => void>();
-const purges = { count: 0 };
+// `signedOut`: the last purge left nobody signed in (a sign-out, not another identity).
+const purges = { count: 0, signedOut: false };
 
 export function openScope(): ViewScope {
   const controller = new AbortController();
@@ -52,6 +53,9 @@ export function openScope(): ViewScope {
 /** Stop everything the preview has under way and tell the dialog to start over. */
 export function purgePreview(): void {
   purges.count += 1;
+  // Purgers run after `purgeUserState` has forgotten the session and the remembered account on a
+  // sign-out; on an identity change both are still there.
+  purges.signedOut = getCachedSession() === null && getKnownUserId() === null;
   for (const controller of Array.from(openScopes)) controller.abort();
   openScopes.clear();
   for (const listener of Array.from(listeners)) listener();
@@ -71,6 +75,15 @@ export function usePurgeCount(): number {
     () => purges.count,
     () => purges.count,
   );
+}
+
+/**
+ * Nobody is signed in since the last purge: the authenticated source has no one to read for, and
+ * the page is about to be navigated away (to sign-in). Until an account is known again, the
+ * dialog asks the API nothing.
+ */
+export function nobodySignedIn(): boolean {
+  return purges.signedOut && getKnownUserId() === null && getCachedSession() === null;
 }
 
 /** For tests: how many scopes are open. */

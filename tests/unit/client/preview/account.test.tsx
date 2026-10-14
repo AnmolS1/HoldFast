@@ -36,7 +36,10 @@ import {
 setupPreview();
 
 const noop = () => {};
+/** A sign-out: the session and the remembered account are forgotten. */
 const purge = () => act(async () => void (await purgeUserState()));
+/** Another account adopted (what `adoptIdentity` does): the session stays for the new one. */
+const switchAccount = () => act(async () => void (await purgeUserState({ keepSession: true })));
 
 /** A response the test releases when it chooses. */
 function held<T>() {
@@ -174,7 +177,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     renderPreview(<PreviewDialog open nodeId={ID.svg} onClose={noop} source="owner" />);
     await screen.findByText("sample.svg");
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     await waitFor(() => expect(state()).toBe("error"));
     expect(screen.queryByText("sample.svg")).toBeNull();
     expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
@@ -191,7 +194,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     renderPreview(<PreviewDialog open nodeId={ID.ts} onClose={noop} source="owner" />);
     await waitFor(() => expect(dialog()?.querySelector("pre")?.textContent).toContain("secret"));
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     await waitFor(() => expect(state()).toBe("error"));
     expect(document.body.textContent).not.toContain("secret");
     expect(dialog()!.querySelector("pre")).toBeNull();
@@ -207,7 +210,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     const signal = network.files()[0]!.signal!;
     expect(signal.aborted).toBe(false);
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     expect(signal.aborted).toBe(true);
     gate.release(new Response("const secret = 1;\n"));
     await settle(50);
@@ -232,7 +235,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     await advance(0);
     expect(state()).toBe("loading");
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     await advance(0);
     await advance(0);
     expect(state()).toBe("error");
@@ -252,7 +255,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     const video = dialog()!.querySelector("video")!;
     expect(video.getAttribute("src")).toContain(`/i/${ID.mp4}/`);
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     await waitFor(() => expect(state()).toBe("error"));
     expect(video.isConnected).toBe(false);
     expect(video.hasAttribute("src")).toBe(false);
@@ -269,7 +272,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     await advance(0);
     expect(state()).toBe("scanning");
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     await advance(0);
     const after = network.api(`/api/nodes/${ID.png}`).length;
     expect(state()).toBe("error");
@@ -293,7 +296,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
       await screen.findByText("sample.svg");
       fireEvent.click(screen.getByRole("button", { name: "Download" }));
       await settle(5);
-      await purge();
+      await switchAccount();
       gate.release(null);
       await settle(20);
       expect(click).not.toHaveBeenCalled();
@@ -318,7 +321,7 @@ describe("the dialog across a purge: nothing of the old account stays, and nothi
     await screen.findByText("sample.svg");
     await waitFor(() => expect(pages).toBe(1));
     a.gone.now = true;
-    await purge();
+    await switchAccount();
     gate.release(null);
     await settle(30);
     // Page one answered after the purge: page two is never asked for.
@@ -499,4 +502,35 @@ describe("in the real frame: the session re-read names another account, with no 
       expect(network.files().length).toBe(before);
     },
   );
+
+  it("a sign-out with the preview open: after the purge the dialog asks the API nothing (there is no session to ask with)", async () => {
+    await preloadRenderers();
+    const api = ownerApi([NODES.svg]);
+    const network = installFetch({
+      api: (call) => {
+        if (call.url.pathname === "/api/auth/get-session") return json(null);
+        if (call.url.pathname === "/api/account/deletion-status") return json({ scheduledFor: null });
+        return api.handler(call);
+      },
+    });
+    seedSession(sessionOf());
+    seedConfig();
+    renderRoutes(routes, [`/preview/${ID.svg}`]);
+    await screen.findByText(NODES.svg.name);
+    await settle(10);
+    const before = network.api("/api/nodes").length;
+
+    // What the sign-out action does before it navigates to /login: the purge, without keepSession.
+    await act(async () => void (await purgeUserState()));
+    await settle(30);
+
+    expect(
+      network
+        .api("/api/nodes")
+        .slice(before)
+        .map((call) => call.url.pathname),
+    ).toEqual([]);
+    expect(screen.queryByText(NODES.svg.name)).toBeNull();
+    expect(state()).toBeNull();
+  });
 });
