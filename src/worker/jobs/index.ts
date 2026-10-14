@@ -107,8 +107,19 @@ export async function runScheduled(
 ): Promise<void> {
   void ctx;
   const slot = jobs.filter((job) => job.cron === event.cron);
-  // Once per slot, before any job of it runs. (It never throws: what it cannot read is `unknown`.)
-  const detection = slot.some((job) => job.guarded) ? await detectRollback(bg) : undefined;
+  // Once per slot, before any job of it runs. It is not meant to throw (what it cannot read is
+  // `unknown`); should it all the same, the slot goes on as `unknown` — recorded — so the jobs
+  // that destroy stop and the others still run.
+  let detection: Detection | undefined;
+  if (slot.some((job) => job.guarded)) {
+    try {
+      detection = await detectRollback(bg);
+    } catch (error) {
+      captureError(error, { kind: "job", job: "detector" });
+      bg.metric("job", { kind: "reconcile", outcome: "detector_error" });
+      detection = { state: "unknown" };
+    }
+  }
   for (const job of slot) {
     try {
       await job.run(bg, env, event, {

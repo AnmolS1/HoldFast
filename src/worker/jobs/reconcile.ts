@@ -211,20 +211,34 @@ export async function detectRollback(bg: BackgroundContext): Promise<Detection> 
     return { state: "unknown" };
   }
   // Read again: that state is over, and the next time is a transition.
-  if (fields.unknownMailedAt !== null) await clearDetectorMailed(bg.db, "unknownMailedAt");
+  if (fields.unknownMailedAt !== null) await bookkeeping(() => clearDetectorMailed(bg.db, "unknownMailedAt"));
   const raw = fields.generation;
   const database = databaseNumber(raw);
   const state = classify(object, database);
   if (state !== "rollback") {
-    if (fields.rollbackMailedAt !== null) await clearDetectorMailed(bg.db, "rollbackMailedAt");
+    if (fields.rollbackMailedAt !== null) {
+      await bookkeeping(() => clearDetectorMailed(bg.db, "rollbackMailedAt"));
+    }
     return { state, database, raw };
   }
   bg.metric("job", { kind: "reconcile", outcome: "rollback_detected" });
   await recordRollback(bg, object, raw);
   if (mailDue(fields.rollbackMailedAt) && (await mailOperators(bg, "database_rollback"))) {
-    await markDetectorMailed(bg.db, "rollbackMailedAt", new Date());
+    await bookkeeping(() => markDetectorMailed(bg.db, "rollbackMailedAt", new Date()));
   }
   return { state: "rollback" };
+}
+
+/**
+ * A mail time written or removed after the reading was made: its failure is reported and changes
+ * nothing about the reading (at worst one mail more or one fewer) — the reading never throws.
+ */
+async function bookkeeping(write: () => Promise<void>): Promise<void> {
+  try {
+    await write();
+  } catch (error) {
+    captureError(error, { kind: "job", job: "reconcile", reason: "detector_bookkeeping" });
+  }
 }
 
 /**

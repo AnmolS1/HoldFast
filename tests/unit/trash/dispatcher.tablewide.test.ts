@@ -20,13 +20,25 @@ import {
   type Job,
 } from "../../../src/worker/jobs/index";
 import { job as operatorDigests } from "../../../src/worker/jobs/operator-digests";
+import { detectRollback } from "../../../src/worker/jobs/reconcile";
 import { job as verificationSweep } from "../../../src/worker/jobs/verification-sweep";
 import { HOURLY_CRON, NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
+import { captureError } from "../../../src/worker/sentry";
 import { flushOperatorDigests } from "../../../src/worker/services/email";
 import { cronEvent, gate, generationInStep, jobContext, makeUpload, member, rand, testDb } from "./helpers";
 
 // The rollback detector reads "ok" for the guarded jobs this file runs.
 beforeAll(generationInStep);
+
+// The slot's one reading, made to throw once (m2-R5); and what the dispatcher reports.
+vi.mock("../../../src/worker/jobs/reconcile", async (original) => {
+  const real = await original<typeof import("../../../src/worker/jobs/reconcile")>();
+  return { ...real, detectRollback: vi.fn(real.detectRollback) };
+});
+vi.mock("../../../src/worker/sentry", async (original) => {
+  const real = await original<typeof import("../../../src/worker/sentry")>();
+  return { ...real, captureError: vi.fn(real.captureError) };
+});
 
 vi.mock("../../../src/worker/services/email", async (original) => {
   const real = await original<typeof import("../../../src/worker/services/email")>();
@@ -163,6 +175,24 @@ describe("the registry", () => {
       await runScheduled(cronEvent(cron), env, ctx, jobContext().bg);
     }
     expect(ran).toEqual([]);
+  });
+
+  it("m2-R5: a slot whose reading of the detector THROWS is not skipped: recorded, read as unknown — the guarded jobs are handed `unknown` (and stop), the others run", async () => {
+    const ran = watch(true);
+    vi.mocked(detectRollback).mockRejectedValueOnce(new Error("connection lost after a good reading"));
+    const reported = vi.mocked(captureError).mock.calls.length;
+    const job = jobContext();
+    await expect(runScheduled(cronEvent("3 * * * *"), env, ctx, job.bg)).resolves.toBeUndefined();
+    expect(ran).toEqual(["restore-heartbeat", "stale-uploads", "abuse-hourly", "operator-digests"]);
+    for (const candidate of jobs.filter((entry) => entry.cron === "3 * * * *")) {
+      const opts = vi.mocked(candidate.run).mock.calls[0]![3]!;
+      expect(opts.detection, candidate.name).toEqual(candidate.guarded ? { state: "unknown" } : undefined);
+    }
+    expect(job.metric.mock.calls).toContainEqual(["job", { kind: "reconcile", outcome: "detector_error" }]);
+    expect(vi.mocked(captureError).mock.calls.slice(reported)).toContainEqual([
+      expect.objectContaining({ message: "connection lost after a good reading" }),
+      { kind: "job", job: "detector" },
+    ]);
   });
 
   it("a job that throws is counted and reported, and the next one still runs", async () => {

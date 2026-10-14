@@ -670,6 +670,97 @@ describe("reconcile: the orphan sweep", () => {
         await generations(9, 9);
       });
 
+      it("the compare-and-set compares TEXT, not numbers: a numerically equal non-canonical value written between the reading and the count (5.0 over 5) is not overwritten — an anomaly, read as such next", async () => {
+        await generations(5, 5);
+        let statements = 0;
+        const between = new Proxy(testDb(), {
+          get: (target, name) =>
+            name === "execute"
+              ? async (...args: Parameters<ReturnType<typeof testDb>["execute"]>) => {
+                  statements += 1;
+                  if (statements === 2) {
+                    await target.execute(
+                      sql`UPDATE settings SET value = jsonb_set(value, '{generation}', '5.0'::jsonb) WHERE key = 'reconcileCursor'`,
+                    );
+                  }
+                  return target.execute(...args);
+                }
+              : Reflect.get(target, name, target),
+        });
+        const ctx = jobContext({ db: between as unknown as ReturnType<typeof testDb> });
+        expect(await advanceGeneration(ctx.bg)).toBe(false);
+        expect(ctx.outcomes("reconcile")).toEqual(["generation_conflict"]);
+        const stored = await testDb().execute<{ g: string }>(
+          sql`SELECT (value -> 'generation')::text AS g FROM settings WHERE key = 'reconcileCursor'`,
+        );
+        expect(stored.rows[0]!.g).toBe("5.0");
+        expect(await objectGeneration()).toBe("5");
+        expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
+        await generations(5, 5);
+      });
+
+      it('a generation created between a "none stored" reading and the count is never overwritten', async () => {
+        // No generation field, no object: the first count.
+        await setSetting(testDb(), "reconcileCursor", { user: null, area: 0, object: null }, null);
+        await env.FILES.delete(GENERATION_KEY);
+        let statements = 0;
+        const between = new Proxy(testDb(), {
+          get: (target, name) =>
+            name === "execute"
+              ? async (...args: Parameters<ReturnType<typeof testDb>["execute"]>) => {
+                  statements += 1;
+                  if (statements === 2) {
+                    await target.execute(
+                      sql`UPDATE settings SET value = value || '{"generation": 7}'::jsonb WHERE key = 'reconcileCursor'`,
+                    );
+                  }
+                  return target.execute(...args);
+                }
+              : Reflect.get(target, name, target),
+        });
+        const ctx = jobContext({ db: between as unknown as ReturnType<typeof testDb> });
+        expect(await advanceGeneration(ctx.bg)).toBe(false);
+        expect(ctx.outcomes("reconcile")).toEqual(["generation_conflict"]);
+        expect(await databaseGeneration()).toBe(7);
+        await generations(7, 7);
+      });
+
+      it("m2-R5: a mail time that cannot be written or removed after a good reading changes nothing: the reading stands, the failure is reported, nothing is thrown", async () => {
+        await generations(4, 4);
+        const stored = (await getSettings(testDb(), { fresh: true })).reconcileCursor as Record<
+          string,
+          unknown
+        >;
+        await setSetting(
+          testDb(),
+          "reconcileCursor",
+          { ...stored, unknownMailedAt: new Date().toISOString() },
+          null,
+        );
+        let statements = 0;
+        const failing = new Proxy(testDb(), {
+          get: (target, name) =>
+            name === "execute"
+              ? async (...args: Parameters<ReturnType<typeof testDb>["execute"]>) => {
+                  statements += 1;
+                  if (statements === 2) throw new Error("connection lost on the clear");
+                  return target.execute(...args);
+                }
+              : Reflect.get(target, name, target),
+        });
+        const reports = () =>
+          vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "detector_bookkeeping")
+            .length;
+        const before = reports();
+        const reading = await detectRollback(
+          jobContext({ db: failing as unknown as ReturnType<typeof testDb> }).bg,
+        );
+        expect(reading).toEqual({ state: "ok", database: 4, raw: "4" });
+        expect(statements).toBe(2);
+        expect(reports()).toBe(before + 1);
+        await generations(4, 4);
+      });
+
       it("m1-R3: a count is never made from the slot's early reading — a heartbeat, then a restore to before it, while the nightly slot is in flight: reconcile and the heartbeat count nothing, and it reads as a rollback", async () => {
         await generations(5, 5);
         // 02:00 — the slot reads 5/5.
@@ -842,6 +933,25 @@ describe("reconcile: the orphan sweep", () => {
         alerted += 1;
         expect(alerts()).toHaveLength(alerted);
       }
+      // An anomaly in the database with the object at 1, or with no object — the corner where
+      // "first" would otherwise be read and the next count would overwrite it.
+      for (const [form, object] of [
+        ["8.5", 1],
+        ["8.5", null],
+        ["null", null],
+      ] as const) {
+        await generations(8, object);
+        await raw(form);
+        expect((await detectRollback(jobContext().bg)).state, `${form} / ${object}`).toBe("rollback");
+        const ctx = await beat();
+        expect(ctx.outcomes("restore-heartbeat"), `${form} / ${object}`).toEqual(["not_counted"]);
+        alerted += 2;
+        expect(alerts()).toHaveLength(alerted);
+        const stored = await testDb().execute<{ g: string }>(
+          sql`SELECT (value -> 'generation')::text AS g FROM settings WHERE key = 'reconcileCursor'`,
+        );
+        expect(stored.rows[0]!.g, `${form} / ${object}`).toBe(form);
+      }
       // Mended by the operator (an integer, written as one): counted again.
       await generations(8, 8);
       expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
@@ -912,8 +1022,13 @@ describe("reconcile: the orphan sweep", () => {
       });
       const ctx = jobContext({ db: brokenDb as unknown as ReturnType<typeof testDb> });
       const rowsBefore = await rows();
+      const reports = () =>
+        vi.mocked(captureError).mock.calls.filter(([, tags]) => tags?.reason === "detector").length;
+      const reportsBefore = reports();
       expect((await detectRollback(ctx.bg)).state).toBe("unknown");
       expect(ctx.outcomes("reconcile")).toEqual(["detector_error"]);
+      // The report is what is left: it is made.
+      expect(reports()).toBe(reportsBefore + 1);
       expect(await rows()).toBe(rowsBefore);
       expect(unreadableAlerts()).toBe(3);
       await generations(4, 4);
