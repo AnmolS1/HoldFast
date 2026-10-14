@@ -19,6 +19,7 @@ import { advanceGenerationRow, userIdsAfter } from "../../../src/worker/db/queri
 import { nodes, settings as settingsTable } from "../../../src/worker/db/schema";
 import { purgeRoot } from "../../../src/worker/jobs/purge";
 import {
+  advanceGeneration,
   detectRollback,
   job as reconcileJob,
   GENERATION_KEY,
@@ -644,6 +645,28 @@ describe("reconcile: the orphan sweep", () => {
         const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
         expect(cursor.user).not.toBe(justBefore(owner.id));
         await generations(10, 10);
+      });
+
+      it("the compare-and-set compares the stored text it read: a number moved between the reading and the count (here, by the operator) wins — nothing counted, the object not written", async () => {
+        await generations(5, 5);
+        // The count's own reading is the database's first statement; the compare-and-set its second.
+        let statements = 0;
+        const between = new Proxy(testDb(), {
+          get: (target, name) =>
+            name === "execute"
+              ? async (...args: Parameters<ReturnType<typeof testDb>["execute"]>) => {
+                  statements += 1;
+                  if (statements === 2) await generations(9, 5);
+                  return target.execute(...args);
+                }
+              : Reflect.get(target, name, target),
+        });
+        const ctx = jobContext({ db: between as unknown as ReturnType<typeof testDb> });
+        expect(await advanceGeneration(ctx.bg)).toBe(false);
+        expect(statements).toBe(2);
+        expect(ctx.outcomes("reconcile")).toEqual(["generation_conflict"]);
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([9, "5"]);
+        await generations(9, 9);
       });
 
       it("m1-R3: a count is never made from the slot's early reading — a heartbeat, then a restore to before it, while the nightly slot is in flight: reconcile and the heartbeat count nothing, and it reads as a rollback", async () => {
