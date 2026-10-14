@@ -107,11 +107,18 @@ export function readCursor(stored: unknown): ReconcileCursor {
     user: typeof value.user === "string" && value.user !== "" ? value.user : null,
     area: inRange ? area : 0,
     object: inRange && typeof value.object === "string" && value.object !== "" ? value.object : null,
-    generation:
-      typeof value.generation === "number" && Number.isSafeInteger(value.generation) && value.generation >= 0
-        ? value.generation
-        : 0,
+    generation: asGeneration(value.generation) ?? 0,
   };
+}
+
+/**
+ * THE rule for a generation number, wherever it is read: a non-negative safe integer, else
+ * null. The database's copy is read by this (above) and by its SQL twin
+ * (trash-jobs.ts#storedGeneration: a jsonb number, integral, 0 … 2^53 − 1) — `7.0` is 7 in both,
+ * `7.5` nothing in both. The object's text must be digits that pass it.
+ */
+export function asGeneration(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 // ── the rollback detector ───────────────────────────────────────────────────────────────────
@@ -134,7 +141,8 @@ async function storedGeneration(env: Env): Promise<number | null> {
   const found = await storage(env).get(GENERATION_KEY);
   if (found === null || found.kind !== "body") return null;
   const text = (await found.object.text()).trim();
-  return /^\d{1,15}$/.test(text) ? Number(text) : Number.NaN;
+  // Anything else proves nothing either way: an anomaly, read as a rollback.
+  return (/^[0-9]+$/.test(text) ? asGeneration(Number(text)) : null) ?? Number.NaN;
 }
 
 async function writeGeneration(env: Env, generation: number): Promise<void> {
@@ -142,9 +150,15 @@ async function writeGeneration(env: Env, generation: number): Promise<void> {
   await storage(env).put(GENERATION_KEY, body, { size: body.byteLength, contentType: "text/plain" });
 }
 
-/** How the two numbers read: the one rule for the jobs and for a request. */
+/**
+ * How the two numbers read: the one rule for the jobs and for a request. `first`: nothing has
+ * been counted yet — no object, or the "1" the very first count writes BEFORE it moves the
+ * database 0 → 1 (an object write that failed leaves the database at 0, a database write that
+ * failed leaves this: either way the next count simply tries again, and no transient failure
+ * reads as a rollback). Accepted: a restore to before that first count is not seen.
+ */
 function classify(object: number | null, database: number): "ok" | "first" | "rollback" {
-  if (object === null && database === 0) return "first";
+  if (database === 0 && (object === null || object === 1)) return "first";
   // A missing object while the database has counted, an unreadable one, or one ahead.
   return object !== null && object <= database ? "ok" : "rollback";
 }
@@ -181,15 +195,8 @@ export async function detectRollback(bg: BackgroundContext): Promise<Detection> 
   const database = readCursor(stored).generation;
   const mailed = lastMailed(stored);
   const state = classify(object, database);
-  if (state === "first") {
-    try {
-      await writeGeneration(bg.env, 0);
-    } catch (error) {
-      // Written at the first count instead.
-      captureError(error, { kind: "job", job: "reconcile" });
-    }
-    return { state, database };
-  }
+  // A reading writes no number: only a count, under the lock, does.
+  if (state === "first") return { state, database };
   if (state === "ok") {
     // Over: the next rollback is a transition again, and mails at once.
     if (mailed !== null) await clearRollbackMailed(bg.db);
@@ -235,20 +242,32 @@ export async function mayDestroy(
 }
 
 /**
- * Counts the generation up from the number `detection` read: the database by compare-and-set,
- * then — only if that moved it — the object. Never on a rollback. Call it holding
- * `GENERATION_LOCK`. False when nothing was counted (someone else moved the number first).
+ * Counts the generation up. Call it holding `GENERATION_LOCK`. It counts from a reading taken
+ * HERE, under the lock, immediately before — never from the slot's earlier one: a restore that
+ * landed since (back past a heartbeat that counted meanwhile) reads as a rollback now, and nothing
+ * is counted (the rollback path: recorded, alerted). Then:
+ *   first  the object "1" FIRST, then the database 0 → 1 by compare-and-set;
+ *   ok     the database by compare-and-set, then — only if that moved it — the object (a failure
+ *          in between leaves the database ahead of an object that exists: normal, repaired at
+ *          the next count).
+ * False when nothing was counted.
  */
-export async function advanceGeneration(bg: BackgroundContext, detection: Detection): Promise<boolean> {
-  if (detection.state !== "ok" && detection.state !== "first") return false;
-  if (!(await advanceGenerationRow(bg.db, detection.database))) {
-    bg.metric("job", { kind: "reconcile", outcome: "generation_conflict" });
-    return false;
+export async function advanceGeneration(bg: BackgroundContext): Promise<boolean> {
+  const reading = await detectRollback(bg);
+  if (reading.state === "first") {
+    await writeGeneration(bg.env, 1);
+    return countRow(bg, 0);
   }
-  // The database first, then the object: a failure in between leaves the database ahead, which
-  // reads as normal and is repaired at the next count.
-  await writeGeneration(bg.env, detection.database + 1);
+  if (reading.state !== "ok") return false;
+  if (!(await countRow(bg, reading.database))) return false;
+  await writeGeneration(bg.env, reading.database + 1);
   return true;
+}
+
+async function countRow(bg: BackgroundContext, from: number): Promise<boolean> {
+  if (await advanceGenerationRow(bg.db, from)) return true;
+  bg.metric("job", { kind: "reconcile", outcome: "generation_conflict" });
+  return false;
 }
 
 /**
@@ -562,7 +581,8 @@ async function reconcileOnce(
     });
   }
   // A rolled-back (or unread) database is never counted up by the job: only an operator acts.
-  if (completed) await advanceGeneration(bg, detection);
+  // Counted from a reading taken now, under the lock (the slot's one only gated the sweep).
+  if (completed && (detection.state === "ok" || detection.state === "first")) await advanceGeneration(bg);
   return {
     done: quota !== null && quota.done && sweep !== null && sweep.outcome === "swept" && sweep.done,
     generation: detection.state,

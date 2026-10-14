@@ -434,11 +434,17 @@ export async function knownVersions(db: Executor, nodeIds: readonly string[]): P
 
 const CURSOR_KEY = "reconcileCursor";
 
-/** The stored generation as `jobs/reconcile.ts#readCursor` reads it: anything else is 0. */
-const storedGeneration = sql`CASE
-  WHEN jsonb_typeof(settings.value -> 'generation') = 'number'
-   AND (settings.value ->> 'generation') ~ '^[0-9]{1,15}$'
-  THEN (settings.value ->> 'generation')::bigint ELSE 0 END`;
+/**
+ * The stored generation by the rule `jobs/reconcile.ts#asGeneration` states — a jsonb number,
+ * integral, 0 … 2^53 − 1 — as an integer; anything else is 0, as `readCursor` reads it.
+ */
+const storedGeneration = sql`CASE WHEN jsonb_typeof(settings.value -> 'generation') = 'number'
+  THEN CASE
+    -- Nested: the casts run only on a number (AND does not promise an order).
+    WHEN (settings.value -> 'generation')::numeric BETWEEN 0 AND 9007199254740991
+     AND (settings.value -> 'generation')::numeric = trunc((settings.value -> 'generation')::numeric)
+    THEN (settings.value -> 'generation')::numeric::bigint ELSE 0 END
+  ELSE 0 END`;
 
 /** The cursor as an object, whatever is stored (a value of another shape is the start). */
 const storedObject = sql`CASE WHEN jsonb_typeof(settings.value) = 'object' THEN settings.value ELSE '{}'::jsonb END`;

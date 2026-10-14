@@ -4,9 +4,9 @@
 // The jobs that destroy nothing still run.
 //
 // TABLE-WIDE: real slots run real jobs over everything other files left behind. The rollback is
-// made in this file's OWN bucket (isolated per test file): the generation object one ahead of the
-// database's number — no setting is written for it. The control brings the two level and runs
-// the same jobs again; they count the database's number up (the heartbeat, reconcile), so
+// made in this file's OWN bucket (isolated per test file): the generation object two ahead of
+// the database's number (one ahead of a database at 0 reads as an unfinished first count) — no
+// setting is written for it. The control brings the two level and runs the same jobs again; they count the database's number up (the heartbeat, reconcile), so
 // `settings.reconcileCursor` is put back in `afterAll`.
 import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
@@ -124,7 +124,7 @@ describe("a detected rollback stops every job that destroys", () => {
     async () => {
       const plants = await due();
       const database = await generationInStep();
-      await env.FILES.put(GENERATION_KEY, String(database + 1));
+      await env.FILES.put(GENERATION_KEY, String(database + 2));
 
       const job = jobContext();
       await runEverything(job);
@@ -143,7 +143,7 @@ describe("a detected rollback stops every job that destroys", () => {
       expect(job.outcomes("restore-heartbeat")).toEqual(["not_counted"]);
       expect([await databaseGeneration(), await objectGeneration()]).toEqual([
         database,
-        String(database + 1),
+        String(database + 2),
       ]);
 
       // Control: the two numbers level again (the operator's step) — the same jobs delete all five.
@@ -181,7 +181,7 @@ describe('a user\'s "delete forever" while the database reads as rolled back', (
       const normal = await trashed();
       const emptied = await trashed();
 
-      await env.FILES.put(GENERATION_KEY, String(database + 1));
+      await env.FILES.put(GENERATION_KEY, String(database + 2));
       const a = {
         file: await api(rolled.caller, `/nodes/${rolled.file.id}`, DELETE),
         folder: await api(rolled.caller, `/nodes/${rolled.folder.id}`, DELETE),
@@ -227,6 +227,56 @@ describe('a user\'s "delete forever" while the database reads as rolled back', (
         expect(await nodeById(t.folder.id)).toBeNull();
         expect(await objectExists(t.stored.object)).toBe(false);
       }
+    },
+    REAL_RUN_MS,
+  );
+});
+
+describe("a detector that cannot read the object store (`unknown`) lets nothing be destroyed", () => {
+  /** This file's bucket, whose `get` fails (every other method works, on the binding itself). */
+  const unreadable = new Proxy(env.FILES, {
+    get: (target, name) =>
+      name === "get"
+        ? async () => {
+            throw new Error("R2 is unavailable");
+          }
+        : (Reflect.get(target, name, target) as () => unknown).bind(target),
+  });
+
+  it(
+    "the four jobs stop (runJob reads for itself); a user's delete forever takes the held path; control: readable, all go",
+    async () => {
+      await generationInStep();
+      const plants = await due();
+      const owner = await member();
+      const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+      const stored = await storeFile(file);
+      await trashQuery(testDb(), file.id, owner.id);
+
+      const job = jobContext({ env: { FILES: unreadable } });
+      for (const name of DESTROYING) await runJob(name, job.bg, { softDeadlineMs: 120_000 });
+      await job.settle();
+      for (const name of DESTROYING) expect(job.outcomes(name), name).toEqual(["rollback_stopped"]);
+      expect(job.outcomes("reconcile").filter((o) => o === "detector_error")).toHaveLength(DESTROYING.length);
+      const answer = await api({ user: owner }, `/nodes/${file.id}`, {
+        method: "DELETE",
+        env: { FILES: unreadable },
+      });
+      expect(answer.status).toBe(204);
+      const { orphans: _orphans, ...four } = await plants.state();
+      void _orphans;
+      expect(four).toEqual({ purge: true, "user-purge": true, retention: true, "stale-uploads": true });
+      expect(await nodeById(file.id)).not.toBeNull();
+      expect(await objectExists(stored.object)).toBe(true);
+      expect((await audits("node.purge_requested", file.id)).length).toBe(1);
+
+      // Control: the store readable again — the same jobs delete all four, and the requested root.
+      const again = jobContext();
+      for (const name of DESTROYING) await runJob(name, again.bg, { softDeadlineMs: 120_000 });
+      const { orphans: _o, ...after } = await plants.state();
+      void _o;
+      expect(after).toEqual({ purge: false, "user-purge": false, retention: false, "stale-uploads": false });
+      expect(await nodeById(file.id)).toBeNull();
     },
     REAL_RUN_MS,
   );

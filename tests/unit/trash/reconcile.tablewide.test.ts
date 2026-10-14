@@ -19,13 +19,13 @@ import { advanceGenerationRow, userIdsAfter } from "../../../src/worker/db/queri
 import { nodes, settings as settingsTable } from "../../../src/worker/db/schema";
 import { purgeRoot } from "../../../src/worker/jobs/purge";
 import {
-  advanceGeneration,
   detectRollback,
   job as reconcileJob,
   GENERATION_KEY,
   ROLLBACK_MAIL_EVERY_MS,
   ORPHAN_AREAS,
   readCursor,
+  readsRolledBack,
   reconcileQuotas,
   runReconcile,
   sweepOrphans,
@@ -600,7 +600,7 @@ describe("reconcile: the orphan sweep", () => {
         expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
       });
 
-      it("a number moved while a run works — an operator, a restore — is kept: the run's place write leaves it, and its count is a compare-and-set that loses", async () => {
+      it("a number moved while a run works — an operator — is kept: the run's place write leaves it, and the run counts from it (its count reads again, under the lock)", async () => {
         const owner = await consistent();
         await generations(5, 5, { user: justBefore(owner.id) });
         const { held, inside } = holdFirstAccount();
@@ -611,26 +611,32 @@ describe("reconcile: the orphan sweep", () => {
         await generations(9, 5, { user: justBefore(owner.id) });
         held.open();
         await running;
-        expect(ctx.outcomes("reconcile")).toContain("generation_conflict");
-        expect([await databaseGeneration(), await objectGeneration()]).toEqual([9, "5"]);
+        expect(ctx.outcomes("reconcile")).not.toContain("generation_conflict");
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([10, "10"]);
         // …and the run still kept its own place.
         const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
         expect(cursor.user).not.toBe(justBefore(owner.id));
-        await generations(9, 9);
+        await generations(10, 10);
       });
 
-      it("a count from a number that is no longer the database's counts nothing: neither number moves", async () => {
+      it("m1-R3: a count is never made from the slot's early reading — a heartbeat, then a restore to before it, while the nightly slot is in flight: reconcile and the heartbeat count nothing, and it reads as a rollback", async () => {
         await generations(5, 5);
+        // 02:00 — the slot reads 5/5.
+        const slot = await detectRollback(jobContext().bg);
+        expect(slot).toEqual({ state: "ok", database: 5 });
+        // 02:03 — a heartbeat counts.
+        expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([6, "6"]);
+        // 02:05 — the database is restored to a point before that heartbeat.
+        await generations(5, 6);
+        // Reconcile, then a heartbeat, still holding the 02:00 reading.
+        await runReconcile(jobContext().bg, { softDeadlineMs: 400, now: inHours(72), detection: slot });
         const ctx = jobContext();
-        const reading = await detectRollback(ctx.bg);
-        expect(reading).toEqual({ state: "ok", database: 5 });
-        // Restored (or moved) between the reading and the count.
-        await generations(3, 5);
-        expect(await advanceGeneration(ctx.bg, reading)).toBe(false);
-        expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, "5"]);
-        // A rollback reading counts nothing at all.
-        expect(await advanceGeneration(ctx.bg, { state: "rollback" })).toBe(false);
-        await generations(5, 5);
+        await heartbeat.run(ctx.bg, env, cronEvent(heartbeat.cron), { detection: slot });
+        expect(ctx.outcomes("restore-heartbeat")).toEqual(["not_counted"]);
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([5, "6"]);
+        expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
+        await generations(6, 6);
       });
     });
 
@@ -684,29 +690,94 @@ describe("reconcile: the orphan sweep", () => {
       await generations(8, 8);
     });
 
-    it("the read order — object first, then the database: a count landing between the two reads is no rollback", async () => {
+    it("the read order — object first, then the database — in both readers: a count landing between the two reads is no rollback", async () => {
+      /** A store whose read of the generation object lets one writer count FIRST (the database, then the object — as advanceGeneration does), then answers. */
+      const racing = (from: number) => {
+        let counted = false;
+        const bucket = new Proxy(env.FILES, {
+          get: (target, name) =>
+            name === "get"
+              ? async (key: string, options?: R2GetOptions) => {
+                  if (key === GENERATION_KEY && !counted) {
+                    counted = true;
+                    expect(await advanceGenerationRow(testDb(), from)).toBe(true);
+                    await target.put(GENERATION_KEY, String(from + 1));
+                  }
+                  return target.get(key, options);
+                }
+              : Reflect.get(target, name, target),
+        });
+        return { bucket, counted: () => counted };
+      };
+      // Read in the other order, the database would say 5 and the object 6: a false rollback.
       await generations(5, 5);
-      let counted = false;
-      // A writer counts in between: the database first, then the object — as advanceGeneration does.
-      const racing = new Proxy(env.FILES, {
-        get: (target, name) =>
-          name === "get"
-            ? async (key: string, options?: R2GetOptions) => {
-                const found = await target.get(key, options);
-                if (key !== GENERATION_KEY || counted || !found || !("body" in found)) return found;
-                const text = await found.text();
-                counted = true;
-                expect(await advanceGenerationRow(testDb(), 5)).toBe(true);
-                await target.put(GENERATION_KEY, "6");
-                return { ...found, body: new Response(text).body, text: async () => text };
-              }
-            : Reflect.get(target, name, target),
+      const jobs = racing(5);
+      expect(await detectRollback(jobContext({ env: { FILES: jobs.bucket } }).bg)).toEqual({
+        state: "ok",
+        database: 6,
       });
-      const ctx = jobContext({ env: { FILES: racing } });
-      expect(await detectRollback(ctx.bg)).toEqual({ state: "ok", database: 6 });
-      expect(counted).toBe(true);
+      expect(jobs.counted()).toBe(true);
+      await generations(5, 5);
+      const request = racing(5);
+      expect(await readsRolledBack({ ...env, FILES: request.bucket } as unknown as Env, testDb())).toBe(
+        false,
+      );
+      expect(request.counted()).toBe(true);
       expect(alerts()).toHaveLength(0);
       await generations(6, 6);
+    });
+
+    it("m2-R3: the first deployment with the object store failing — no rollback, ever: the database stays 0 until the object is written, and the next slot counts", async () => {
+      await generations(0, null);
+      const failing = new Proxy(env.FILES, {
+        get: (target, name) =>
+          name === "put"
+            ? async () => {
+                throw new Error("R2 is unavailable");
+              }
+            : // A binding's methods must be called on the binding itself.
+              (Reflect.get(target, name, target) as () => unknown).bind(target),
+      });
+      for (let slot = 0; slot < 2; slot++) {
+        await expect(
+          heartbeat.run(jobContext({ env: { FILES: failing } }).bg, env, cronEvent(heartbeat.cron)),
+        ).rejects.toThrow("R2 is unavailable");
+        expect([await databaseGeneration(), await objectGeneration()]).toEqual([0, null]);
+        expect((await detectRollback(jobContext().bg)).state).toBe("first");
+      }
+      // The store is back.
+      expect((await beat()).outcomes("restore-heartbeat")).toEqual(["counted"]);
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([1, "1"]);
+      // A bootstrap that wrote its object and then lost its database write reads as first too.
+      await generations(0, 1);
+      expect((await detectRollback(jobContext().bg)).state).toBe("first");
+      await beat();
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([1, "1"]);
+      expect(alerts()).toHaveLength(0);
+      expect(mails()).toEqual([]);
+    });
+
+    it('m4-R3: the generation is an integer read the same way in both places — jsonb 7.0 is 7 for the count too; 7.5 and an object of "7.0" are anomalies: a rollback, alerted', async () => {
+      const raw = (value: string) =>
+        testDb().execute(
+          sql`UPDATE settings SET value = jsonb_set(value, '{generation}', ${value}::jsonb) WHERE key = 'reconcileCursor'`,
+        );
+      await generations(7, 7);
+      await raw("7.0");
+      expect((await detectRollback(jobContext().bg)).state).toBe("ok");
+      const ctx = await beat();
+      expect(ctx.outcomes("restore-heartbeat")).toEqual(["counted"]);
+      expect(ctx.outcomes("reconcile")).not.toContain("generation_conflict");
+      expect([await databaseGeneration(), await objectGeneration()]).toEqual([8, "8"]);
+      // Not an integer in the database: it reads as 0, below the object — a rollback.
+      await raw("8.5");
+      expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
+      expect(alerts()).toHaveLength(1);
+      // Not an integer in the object: an anomaly.
+      await generations(8, "8.0");
+      expect((await detectRollback(jobContext().bg)).state).toBe("rollback");
+      expect(alerts()).toHaveLength(2);
+      await generations(8, 8);
     });
 
     it("the generation object is outside every swept area", () => {

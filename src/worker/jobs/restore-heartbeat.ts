@@ -6,7 +6,7 @@
 // reading that failed) it counts nothing — counting would make the restored database look current.
 
 import type { Job } from "./index";
-import { advanceGeneration, detectRollback, GENERATION_LOCK, GENERATION_LOCK_HOLD_MS } from "./reconcile";
+import { advanceGeneration, GENERATION_LOCK, GENERATION_LOCK_HOLD_MS } from "./reconcile";
 import { withJobLock } from "../db/queries/trash-jobs";
 
 export const job: Job = {
@@ -15,8 +15,10 @@ export const job: Job = {
   guarded: true,
   async run(bg, _env, _event, opts) {
     const locked = await withJobLock(bg.db, GENERATION_LOCK, GENERATION_LOCK_HOLD_MS, async () => {
-      const detection = opts?.detection ?? (await detectRollback(bg));
-      const counted = await advanceGeneration(bg, detection);
+      // The slot's reading says whether to try; the count reads again, under the lock.
+      const slot = opts?.detection;
+      const counted =
+        slot && slot.state !== "ok" && slot.state !== "first" ? false : await advanceGeneration(bg);
       bg.metric("job", { kind: "restore-heartbeat", outcome: counted ? "counted" : "not_counted" });
     });
     if (!locked.held) bg.metric("job", { kind: "restore-heartbeat", outcome: "overlap" });
