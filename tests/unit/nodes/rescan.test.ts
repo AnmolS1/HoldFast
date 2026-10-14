@@ -2,7 +2,7 @@
 // answers exactly as an id that does not exist, whenever it became such a file.
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { nodes } from "../../../src/worker/db/schema";
+import { nodes, scanJobs } from "../../../src/worker/db/schema";
 import { backendPid, gate, untilBlockedBy } from "../services-core/helpers";
 import {
   api,
@@ -44,9 +44,9 @@ describe("POST /nodes/:id/rescan", () => {
     }
   });
 
-  it("only `error` and `skipped`: any other status is 409 conflict, and does not use up the hour", async () => {
+  it("only `error`, `skipped` and `pending`: any other status is 409 conflict, and does not use up the hour", async () => {
     const owner = await person();
-    for (const status of ["pending", "clean", "infected", "under_review"] as const) {
+    for (const status of ["clean", "infected", "under_review"] as const) {
       const file = await makeFile(owner.id, null, { scanStatus: status });
       const spy = scanQueueSpy();
       const answer = await rescan(owner.as, file.id, spy);
@@ -58,6 +58,34 @@ describe("POST /nodes/:id/rescan", () => {
     }
     const folder = await makeFolder(owner.id);
     expect((await rescan(owner.as, folder.id)).status).toBe(404);
+  });
+
+  it("a `pending` file with no scan under way (its message never arrived): 202, the forced message is sent again, one node.rescan row", async () => {
+    const owner = await person();
+    const file = await makeFile(owner.id, null, { scanStatus: "pending" });
+    const spy = scanQueueSpy();
+    const answer = await rescan(owner.as, file.id, spy);
+    expect([answer.status, answer.body]).toEqual([202, { ok: true }]);
+    expect(spy.sent).toEqual([{ v: 1, nodeId: file.id, key: file.r2Key, force: true }]);
+    const row = (await nodeById(file.id))!;
+    expect([row.scanStatus, row.rescanRequestedAt !== null]).toEqual(["pending", true]);
+    expect(await auditFor("node.rescan", file.id)).toHaveLength(1);
+  });
+
+  it("a `pending` file whose scan IS under way: 409 conflict from the service, nothing sent — and the hour is given back", async () => {
+    const owner = await person();
+    const earlier = new Date(Date.now() - 61 * 60_000);
+    for (const before of [null, earlier]) {
+      const file = await makeFile(owner.id, null, { scanStatus: "pending", rescanRequestedAt: before });
+      await testDb().insert(scanJobs).values({ nodeId: file.id, r2Key: file.r2Key! });
+      const spy = scanQueueSpy();
+      const answer = await rescan(owner.as, file.id, spy);
+      expect([answer.status, answer.body.error]).toEqual([409, "conflict"]);
+      expect(spy.sent).toEqual([]);
+      const row = (await nodeById(file.id))!;
+      expect([row.scanStatus, row.rescanRequestedAt]).toEqual(["pending", before]);
+      expect(await auditFor("node.rescan", file.id)).toEqual([]);
+    }
   });
 
   it("once per node per hour: the second is 429 rate_limited with Retry-After; an hour later it is allowed", async () => {

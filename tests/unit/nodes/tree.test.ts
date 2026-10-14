@@ -611,6 +611,36 @@ describe("the share root", () => {
     ).toBe(200);
   });
 
+  it("with two shares on the path, the root is the folder whose share GRANTS the role — not the nearest", async () => {
+    // Outer EDITOR share on `shared`, inner VIEWER share on `inner`, both to the same person: the
+    // role is editor, granted at `shared` — so `inner` is inside their root and theirs to rename
+    // and move, and `shared` is the root they may not.
+    const t = await sharedTree();
+    await makeShare(t.inner.id, t.owner.id, t.editor.id, { role: "viewer" });
+    const rename = await api(t.editor.as, "PATCH", `/nodes/${t.inner.id}`, {
+      body: { name: "Inner, renamed" },
+    });
+    expect(rename.status).toBe(200);
+    const moved = await api(t.editor.as, "POST", `/nodes/${t.inner.id}/move`, {
+      body: { parentId: t.dest.id },
+    });
+    expect(moved.status).toBe(200);
+    const root = await api(t.editor.as, "PATCH", `/nodes/${t.shared.id}`, { body: { name: "Ours now" } });
+    expect([root.status, root.body.error]).toEqual([403, "forbidden"]);
+
+    // The other way round — outer VIEWER on `shared`, inner EDITOR on `inner`: editor rights
+    // start at `inner`, so `inner` is the root they may not rename or move.
+    const u = await sharedTree();
+    await makeShare(u.inner.id, u.owner.id, u.viewer.id, { role: "editor" });
+    const innerRename = await api(u.viewer.as, "PATCH", `/nodes/${u.inner.id}`, { body: { name: "Nope" } });
+    expect([innerRename.status, innerRename.body.error]).toEqual([403, "forbidden"]);
+    const innerMove = await api(u.viewer.as, "POST", `/nodes/${u.inner.id}/move`, {
+      body: { parentId: u.dest.id },
+    });
+    expect([innerMove.status, innerMove.body.error]).toEqual([403, "forbidden"]);
+    expect((await nodeById(u.inner.id))!.parentId).toBe(u.shared.id);
+  });
+
   it("a share on a FILE: its editor may read it, not rename or move it", async () => {
     const owner = await person();
     const editor = await person();

@@ -70,7 +70,7 @@ import {
 import { usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
-import type { Node } from "../db/schema";
+import type { Node, ScanStatus } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
@@ -91,6 +91,8 @@ type Ctx = Context<AppEnv>;
 
 const ID = `:id{${UUID_PARAM}}`;
 const RESCAN_EVERY_SEC = 3_600;
+/** What an owner may ask to have scanned again (see the rescan route). */
+const RESCANNABLE: readonly ScanStatus[] = ["error", "skipped", "pending"];
 
 function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
@@ -520,8 +522,10 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
   const id = c.req.param("id");
   const { node } = await liveNode(c, id, "owner");
   if (node.kind !== "file") throw new AppError("not_found");
-  // Before the throttle: a request that cannot be granted must not use up the hour.
-  if (node.scanStatus !== "error" && node.scanStatus !== "skipped") throw new AppError("conflict");
+  // Before the throttle: a request that cannot be granted must not use up the hour. `pending` goes
+  // through: with no live scan job its message never arrived and is sent again; with one, the
+  // service answers `409` (and the hour is given back below).
+  if (!RESCANNABLE.includes(node.scanStatus)) throw new AppError("conflict");
   if (!(await requestRescan(db(c), id))) {
     const since = node.rescanRequestedAt ? (now(c).getTime() - node.rescanRequestedAt.getTime()) / 1000 : 0;
     const wait = Math.min(RESCAN_EVERY_SEC, Math.max(1, Math.ceil(RESCAN_EVERY_SEC - since)));
@@ -531,9 +535,11 @@ router.post(`/nodes/${ID}/rescan`, async (c) => {
   try {
     await enqueueRescan(deps(c), id, { by: "owner" });
   } catch (error) {
-    // Not a refusal: the message could not be sent. The hour it took is given back, so that
-    // the failure is not also a throttle.
-    if (!(error instanceof AppError)) await releaseRescan(db(c), id, node.rescanRequestedAt);
+    // The message could not be sent, or a scan is already under way (`409`): the hour it took is
+    // given back, so that neither is also a throttle. (A `404` — the file was hidden meanwhile —
+    // keeps it: that answer must equal an unknown id's, which writes nothing back.)
+    const giveBack = !(error instanceof AppError) || error.code === "conflict";
+    if (giveBack) await releaseRescan(db(c), id, node.rescanRequestedAt);
     throw error;
   }
   audit(c, "node.rescan", target(id), null);
