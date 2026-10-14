@@ -306,15 +306,19 @@ test.describe("navigation", () => {
     await expect(page.locator('[data-bottom-nav-item="account"]')).toHaveAttribute("aria-current", "page");
   });
 
-  test("every in-frame destination renders from a deep link (both layouts)", async ({ page, origins }) => {
-    await mockShell(page, origins.port, { user: { role: "admin" } });
-    const pages = DESTINATIONS.filter((entry) => !entry.overlay);
-    expect(pages.length).toBe(12);
-    for (const entry of pages) {
+  // One test per destination: each deep link is a cold load of the whole client from the dev
+  // server (~1 s here, ~2.7 s on a CI runner). Twelve of them in one test came to more than the
+  // test's 30 s on CI, and the twelfth (/admin/users) was cut off mid-load.
+  test("every in-frame destination has a deep-link test below (both layouts)", () => {
+    expect(DESTINATIONS.filter((entry) => !entry.overlay).length).toBe(12);
+  });
+  for (const entry of DESTINATIONS.filter((destination) => !destination.overlay)) {
+    test(`renders from a deep link: ${entry.path}`, async ({ page, origins }) => {
+      await mockShell(page, origins.port, { user: { role: "admin" } });
       await gotoFrame(page, entry.path);
       await expectDestination(page, entry);
-    }
-  });
+    });
+  }
 
   test("the preview is an overlay above the page it was opened from", async ({ page, origins }) => {
     await mockShell(page, origins.port);
