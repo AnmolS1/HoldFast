@@ -357,6 +357,23 @@ describe("scanner errors (step 2e): job failed, message retried with the delay f
     }
   });
 
+  it("Addendum 4 m1: a verdict without the server's sha256 is no verdict — retried, job failed/engine, node pending, scannedAt null", async () => {
+    for (const status of ["clean", "infected"] as const) {
+      const bytes = cleanBytes(status);
+      const { file } = await uploadedFile(bytes);
+      vi.mocked(scanObject).mockResolvedValueOnce(await shim(bytes, { status, sha256: "" }));
+      expect(await deliver([{ body: explicit(file) }], OFF), status).toEqual([
+        { outcome: "retry", delaySeconds: 30 },
+      ]);
+      expect(await jobsFor(file.r2Key!), status).toMatchObject([{ status: "failed", lastError: "engine" }]);
+      expect(await nodeById(file.id), status).toMatchObject({
+        scanStatus: "pending",
+        scannedAt: null,
+        sha256: file.sha256,
+      });
+    }
+  });
+
   it("the stub's HF-STUB-NOT-READY marker: not_ready, retried, pending (no Docker needed)", async () => {
     const { file } = await uploadedFile(enc("HF-STUB-NOT-READY and nothing else"));
     expect(await deliver([{ body: explicit(file) }])).toEqual([{ outcome: "retry", delaySeconds: 30 }]);

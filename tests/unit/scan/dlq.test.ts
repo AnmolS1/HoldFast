@@ -10,8 +10,10 @@ import { captureError } from "../../../src/worker/sentry";
 import { metric } from "../../../src/worker/services/metrics";
 import { keyFor } from "../../../src/worker/services/storage";
 import { uuidv7 } from "../../../src/worker/db/ids";
+import { enqueueRescan } from "../../../src/worker/services/scanning";
 import {
   cleanBytes,
+  serviceDeps,
   deliver,
   enc,
   explicit,
@@ -129,6 +131,48 @@ describe("the dead-letter table", () => {
       vi.mocked(metric).mockClear();
       vi.mocked(captureError).mockClear();
     }
+  });
+
+  it("Addendum 4 m2: the job is marked requeuedFromDlq BEFORE the message is sent (the once-guard does not rest on a race)", async () => {
+    const { file } = await uploadedFile(cleanBytes());
+    await jobIn(file, { status: "failed", lastError: "reset" });
+    const seenAtSend: unknown[] = [];
+    const queueSpy = {
+      SCAN_QUEUE: {
+        send: async () => {
+          // What a delivery that claimed the job this very moment would find.
+          seenAtSend.push((await jobsFor(file.r2Key!))[0]!.verdict);
+          // …and the claim itself: the row is `running` from here on.
+          await testDb().update(scanJobs).set({ status: "running" }).where(eq(scanJobs.r2Key, file.r2Key!));
+        },
+      },
+    };
+    expect(await deliver([{ body: explicit(file) }], queueSpy, DLQ)).toEqual(ack);
+    expect(seenAtSend).toEqual([expect.objectContaining({ requeuedFromDlq: true })]);
+    expect((await jobsFor(file.r2Key!))[0]!.verdict).toMatchObject({ requeuedFromDlq: true });
+  });
+
+  it("Addendum 4 m3: requeuedFromDlq is per scan CYCLE — a rescan months later gets its own one re-send, not error at once", async () => {
+    const { file } = await uploadedFile(cleanBytes());
+    const sent: { v: 1; nodeId: string; key: string; force: boolean }[] = [];
+    const queueSpy = { SCAN_QUEUE: { send: async (m: (typeof sent)[number]) => void sent.push(m) } };
+    // Cycle 1: a deploy reset dead-letters, the DLQ re-sends, the re-sent scan reaches a verdict.
+    await jobIn(file, { status: "failed", lastError: "reset" });
+    expect(await deliver([{ body: explicit(file) }], queueSpy, DLQ)).toEqual(ack);
+    expect(await deliver([{ body: sent[0] }])).toEqual(ack);
+    expect((await nodeById(file.id))!.scanStatus).toBe("clean");
+    // Cycle 2, much later: a rescan; its scan is cut by another deploy reset and dead-letters.
+    const rescan = serviceDeps({ SCAN_QUEUE: queueSpy.SCAN_QUEUE });
+    expect(await enqueueRescan(rescan.deps, file.id, { by: "admin" })).toEqual({ queued: true });
+    await testDb()
+      .update(scanJobs)
+      .set({ status: "failed", lastError: "reset" })
+      .where(eq(scanJobs.r2Key, file.r2Key!));
+    expect(await deliver([{ body: explicit(file) }], queueSpy, DLQ)).toEqual(ack);
+    // Re-sent again (its own one), still pending — not `error`.
+    expect(sent).toHaveLength(3);
+    expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+    expect(dlqMetrics().filter((r) => r === "requeued")).toHaveLength(2);
   });
 
   it("CONTROL: failed with last error timeout → error/timeout at once, no re-enqueue", async () => {

@@ -165,6 +165,9 @@ async function scanClaimed(
   let verdict: ScanVerdict;
   if (head.size > SCAN_MAX_BYTES) {
     // The declared hash stays: a Worker-side hash of an object this large does not fit the limits.
+    // NOTE: `setScanResult` then sets `scannedAt` over a client hash — the one place the "scannedAt
+    // means a server hash" promise (queries/scan.ts) is not kept. Unreachable in v1 (R2 pins
+    // MAX_FILE_BYTES ≤ SCAN_MAX_BYTES); a cap raise must revisit f.4's "verified before" here.
     verdict = {
       status: "skipped",
       reason: "size",
@@ -385,9 +388,11 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
     node.scanStatus === "pending" &&
     !requeuedBefore
   ) {
-    // Sent first, marked after: a lost mark costs one more scan, never a lost one.
-    await enqueueScan(bg, { nodeId: node.id, key: scan.key, force: true });
+    // Marked FIRST, then sent: the once-guard holds however fast the re-sent message is claimed
+    // (review m2). A send that throws after the mark leaves a `pending` node with no live job —
+    // the dead letter is retried, and in the end the pending-scan sweep sends it.
     await markRequeuedFromDlq(bg.db, job.id);
+    await enqueueScan(bg, { nodeId: node.id, key: scan.key, force: true });
     bg.metric("scan", { outcome: "dlq", reason: "requeued" });
     message.ack();
     return;

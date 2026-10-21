@@ -17,6 +17,7 @@ import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanDetail, type ScanJob, scanJobs, uploads, user } from "../schema";
 import type { ScanReason } from "../schema";
+import { notEffectivelyHidden } from "./tree";
 
 /** The scan job of an object key, or null. `forUpdate` locks the row (after the node's row). */
 export async function lockJob(
@@ -122,9 +123,11 @@ export async function failJob(tx: Executor, jobId: string, error: string): Promi
 }
 
 /**
- * Marks a `failed` job as re-enqueued once from the dead-letter queue: `verdict.requeuedFromDlq`.
- * A second dead letter for the key then ends the scan instead of looping. False when the row was
- * not `failed`.
+ * Marks a job as re-enqueued once from the dead-letter queue in THIS scan cycle:
+ * `verdict.requeuedFromDlq`. A second dead letter in the cycle then ends the scan instead of
+ * looping. A jsonb merge on the row whatever its status — the dead-letter consumer marks BEFORE it
+ * sends, so a re-sent message claimed at once (`running`) cannot make the mark miss (review m2);
+ * `finish('failed')` keeps the column and the verdict carries it. False when there is no such row.
  */
 export async function markRequeuedFromDlq(db: Executor, jobId: string): Promise<boolean> {
   if (!isUuid(jobId)) return false;
@@ -133,16 +136,28 @@ export async function markRequeuedFromDlq(db: Executor, jobId: string): Promise<
     .set({
       verdict: sql`COALESCE(${scanJobs.verdict}, '{}'::jsonb) || '{"requeuedFromDlq": true}'::jsonb`,
     })
-    .where(and(eq(scanJobs.id, jobId), eq(scanJobs.status, "failed")))
+    .where(eq(scanJobs.id, jobId))
     .returning({ id: scanJobs.id });
   return rows.length > 0;
+}
+
+/**
+ * A new scan cycle of this key starts (a rescan): its once-per-cycle dead-letter re-send is
+ * available again (ruling, Addendum 4 m3). The rest of the job's verdict — the effects ledger —
+ * is kept. Call it on the locked node's transaction, after the node row (the lock order).
+ */
+export async function clearRequeuedFromDlq(tx: Executor, r2Key: string): Promise<void> {
+  await tx
+    .update(scanJobs)
+    .set({ verdict: sql`${scanJobs.verdict} - 'requeuedFromDlq'` })
+    .where(and(eq(scanJobs.r2Key, r2Key), sql`${scanJobs.verdict} ? 'requeuedFromDlq'`));
 }
 
 export type PendingScanCandidate = { nodeId: string; ownerId: string; r2Key: string };
 
 /**
  * The pending-scan sweep's candidates, oldest first, at most `limit`: current file versions
- * under `u/` that are `pending`, not taken down themselves, and QUIET for more than
+ * under `u/` that are `pending`, not taken down (themselves or by a folder above), and QUIET for more than
  * `olderThanMinutes` — measured from the latest of the node's own times and its key's job
  * (claimed, finished). `resetToPending` touches neither of the node's times, so the job's are
  * what keeps a rescan under way from looking old. A live job is younger than this by
@@ -163,7 +178,10 @@ export async function pendingScanCandidates(
       and(
         eq(nodes.kind, "file"),
         eq(nodes.scanStatus, "pending"),
-        sql`${nodes.takedownAt} IS NULL`,
+        // Not taken down, itself OR by a folder above (the listings' one definition): a hidden
+        // node is never sent, and must never take a place in the batch either — oldest first,
+        // a hundred of them would hold the sweep off every other node for good (review M1).
+        notEffectivelyHidden("nodes"),
         sql`starts_with(${nodes.r2Key}, 'u/')`,
         sql`${quietSince} < now() - make_interval(mins => ${olderThanMinutes})`,
       ),

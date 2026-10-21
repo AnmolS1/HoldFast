@@ -96,6 +96,31 @@ describe("sweepPendingScans", () => {
     }
   });
 
+  it("Addendum 4 M1: pending files under a taken-down folder never use up the limit — a due node behind ≥ limit of them is still sent", async () => {
+    const owner = await makeUser();
+    const folder = await makeFolder(owner.id, null, { takedownAt: new Date(), takedownReason: "abuse" });
+    made.push(folder.id);
+    const LIMIT = 3;
+    // The oldest pending files in the table: all hidden by the folder above them.
+    for (let n = 0; n < LIMIT; n++) {
+      await quiet(cleanBytes(), new Date(Date.UTC(1960, 0, 1, 0, 0, n)), { owner, parentId: folder.id });
+    }
+    const due = await quiet(cleanBytes(), new Date("1961-01-01T00:00:00.000Z"));
+    for (let run = 0; run < 2; run++) {
+      const sweep = recording();
+      await sweepPendingScans(sweep.deps, { limit: LIMIT });
+      expect(
+        mine(sweep.sent, [due.file.id]).map((m) => m.nodeId),
+        `run ${run}`,
+      ).toEqual([due.file.id]);
+    }
+    // Settled, so this file's later oldest-first tests do not meet it.
+    await testDb()
+      .update(nodes)
+      .set({ scanStatus: "clean" })
+      .where(inArray(nodes.id, [due.file.id]));
+  });
+
   it("an old job row counts as quiet too; a job claimed recently (rescan reset) keeps a long-quiet node out", async () => {
     const stale = await quiet();
     await claim(testDb(), { nodeId: stale.file.id, r2Key: stale.file.r2Key! });

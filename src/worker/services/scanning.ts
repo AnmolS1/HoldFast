@@ -35,7 +35,7 @@ import {
   lockSuspectedCsam as lockRows,
 } from "../db/queries/moderation";
 import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
-import { pendingScanCandidates } from "../db/queries/scan";
+import { clearRequeuedFromDlq, pendingScanCandidates } from "../db/queries/scan";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
 import { scannerOver } from "../scan/adapter";
@@ -350,14 +350,20 @@ export async function enqueueRescan(
         if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
         // Neither of the two above: what is left of "hidden" is a taken-down folder above it.
         if (await effectiveHidden(tx, nodeId)) return { reason: "taken_down" };
-        if (locked.scanStatus === "under_review") return { key: r2Key };
+        // Every rescan that sends starts a new scan CYCLE: its own one dead-letter re-send.
+        if (locked.scanStatus === "under_review") {
+          await clearRequeuedFromDlq(tx, r2Key);
+          return { key: r2Key };
+        }
         // Already `pending`: with a scan under way an owner has nothing to ask for; without one
         // the message never arrived (or was lost), and what follows sends it (again).
         if (locked.scanStatus === "pending" && opts.by === "owner" && (await hasLiveScanJob(tx, r2Key))) {
           return { busy: true };
         }
         // The statement has the same guard: it changes nothing for the two locked statuses.
-        return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
+        if (!(await resetToPending(tx, nodeId))) return { reason: "locked" };
+        await clearRequeuedFromDlq(tx, r2Key);
+        return { key: r2Key };
       }
       r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
     }
