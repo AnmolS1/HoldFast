@@ -228,20 +228,20 @@ export async function trimFinished(
 }
 
 /**
- * A `completing` session that owes a LOCKED node for its verified object: its hash on the session
- * is listed as CSAM (the uploads route writes THE SERVER's csam hash there when it owes the node —
- * Addendum 2, T22; before that, the declared one), OR the route recorded `upload.csam_node_owed`
- * for it — the backstop for a session owed before that write existed, or whose write failed (a
- * client that declared a hash listed for another reason over csam bytes must never be taken by
- * the stale job). The uploads route preserves only a csam hit; another reason is refused and the
- * object deleted, so nothing is owed and the stale job ends such a session as any other. Decided
- * when the statement runs, so an entry RAISED to `csam` meanwhile counts.
+ * A `completing` session that is the REPAIR SWEEP's (T22), never the stale job's to end blindly:
+ *   - the hash on the session is listed — with ANY reason (Addendum 3, m5). The uploads route
+ *     writes the server's csam hash there when it owes a locked node (Addendum 2); otherwise it is
+ *     the client's declaration, and a request that died (or a database that failed) between the
+ *     server's hash and its decision may have left verified bytes behind a declaration listed for
+ *     another reason. The sweep hashes the stored bytes first and branches on THAT: csam → the
+ *     locked node; another reason → the route's refusal; not listed → ended as any stale session;
+ *   - or the route recorded `upload.csam_node_owed` for it (Addendum 2's backstop).
+ * Decided when the statement runs, so an entry listed meanwhile counts.
  */
 export function owesLockedNode(): SQL {
   return sql`(${uploads.status} = 'completing' AND (
     (${uploads.expectedSha256} IS NOT NULL
-      AND EXISTS (SELECT 1 FROM hash_blocklist b
-                  WHERE b.sha256 = ${uploads.expectedSha256} AND b.reason = 'csam'))
+      AND EXISTS (SELECT 1 FROM hash_blocklist b WHERE b.sha256 = ${uploads.expectedSha256}))
     OR EXISTS (SELECT 1 FROM audit_log a
                WHERE a.action = 'upload.csam_node_owed' AND a.target_type = 'upload'
                  AND a.target_id = ${uploads.id}::text)))`;

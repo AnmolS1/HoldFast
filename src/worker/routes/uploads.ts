@@ -447,7 +447,7 @@ async function tellOperators(c: Ctx, session: Upload): Promise<void> {
  * client's declaration (Addendum 2, T22): that is what makes it owed (`owesLockedNode`) and keeps
  * the object from every sweep until the repair (T22) writes the node, whatever the client
  * declared (a hash listed for another reason, or none listed). The declaration is kept in the
- * audit row (`declaredSha256`). Should that write fail too, the audit row is the backstop
+ * audit row (`declaredSha256`), which is held from retention (`legalHold`). Should that write fail too, the audit row is the backstop
  * (`owesLockedNode` also matches it). Then the operators are told by the session's id.
  */
 async function oweNode(
@@ -468,7 +468,13 @@ async function oweNode(
     c,
     "upload.csam_node_owed",
     { type: "upload", id: session.id },
-    { nodeId: session.nodeId, ...(hashes.declared !== null ? { declaredSha256: hashes.declared } : {}) },
+    {
+      nodeId: session.nodeId,
+      ...(hashes.declared !== null ? { declaredSha256: hashes.declared } : {}),
+      // Kept past the audit retention (trash-jobs deleteOldAudit): it is the backstop that keeps
+      // the session from the stale job until the node is written (Addendum 3, m4).
+      legalHold: true,
+    },
   );
   metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
   await tellOperators(c, session);
