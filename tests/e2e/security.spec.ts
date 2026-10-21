@@ -12,9 +12,10 @@
 // Workers: under `vite dev` a worker's script is not an /assets/ file, so it carries no policy of
 // its own (the built app's do: tests/unit/security/csp.test.ts, and `vite preview` in the report).
 // Here each worker script is served WITH the page's own policy — taken from the document's
-// header — to show that the policy, applied to a worker, lets the hash worker and pdf.js's worker
-// run with no violation; and, the control, that a policy without 'wasm-unsafe-eval' on the hash
-// worker's script makes it fail. So the header does govern the worker.
+// header, less `report-to` so that its reports are sent (see `policyOnScripts`) — to show that the
+// policy, applied to a worker, lets the hash worker and pdf.js's worker run with no violation
+// reported; and, the control, that a policy without 'wasm-unsafe-eval' on the hash worker's script
+// makes it fail AND is reported. So the header does govern the worker, and "no report" is evidence.
 //
 // Also: a cross-site form POST to the API is refused (item 5); a planted violation carries its
 // sample (`'report-sample'`); and a burst of violations on one page is counted as the browser
@@ -88,23 +89,25 @@ function documentPolicy(page: Page): () => string {
   return () => policy;
 }
 
-/** Serve every script whose path matches `pattern` with `policyOf()` as its own CSP header. */
+/**
+ * Serve every script whose path matches `pattern` with `policyOf()` as its own CSP header — WITHOUT
+ * `report-to`: with it Chromium ignores `report-uri`, and on http it sends no report at all (see
+ * the burst test), so a worker's violation would be invisible and "no report" would prove nothing.
+ * With `report-uri` alone a worker's violation reaches the report endpoint, where `watch` sees it.
+ */
 async function policyOnScripts(page: Page, pattern: RegExp, policyOf: () => string): Promise<string[]> {
   const served: string[] = [];
   await page.route(
     (url) => pattern.test(url.pathname),
     async (route) => {
       const response = await route.fetch();
-      const policy = policyOf();
+      const policy = policyOf().replace("; report-to csp", "");
       expect(policy, "the document's policy, read before the worker starts").toContain("script-src 'nonce-");
+      expect(policy).toContain("report-uri /api/public/csp-report");
       served.push(new URL(route.request().url()).pathname);
       await route.fulfill({
         response,
-        headers: {
-          ...response.headers(),
-          "content-security-policy": policy,
-          "reporting-endpoints": 'csp="/api/public/csp-report"',
-        },
+        headers: { ...response.headers(), "content-security-policy": policy },
       });
     },
   );
@@ -270,7 +273,21 @@ test.describe("the policy in a real browser (mocked API)", () => {
       .poll(() => video.evaluate((el: HTMLVideoElement) => el.readyState))
       .toBeGreaterThanOrEqual(1);
     expect(watched.problems).toEqual([]);
-    expect(watched.reports).toEqual([]);
+    // Under `vite dev` pdf.js's worker is served through Vite, which puts its HMR client in it; that
+    // client's socket to ws://127.0.0.1 is outside `connect-src 'self'` (the page is on localhost).
+    // A dev-only artefact (the built worker has no Vite client) — and the proof that a WORKER's
+    // violation does reach the endpoint here, so that no other report is evidence.
+    const viteHmr = (body: string) => {
+      const report = (JSON.parse(body) as { "csp-report"?: Record<string, string> })["csp-report"] ?? {};
+      return (
+        report["effective-directive"] === "connect-src" &&
+        /^ws:\/\/127\.0\.0\.1:\d+\//.test(report["blocked-uri"] ?? "") &&
+        /\/@vite\/client$/.test(report["source-file"] ?? "") &&
+        /pdf\.worker/.test(report["document-uri"] ?? "")
+      );
+    };
+    await expect.poll(() => watched.reports.filter(viteHmr).length).toBeGreaterThan(0);
+    expect(watched.reports.filter((body) => !viteHmr(body))).toEqual([]);
   });
 
   test("the public link page: no violation", async ({ page, origins }) => {
@@ -325,7 +342,10 @@ test.describe("a worker runs under its own script's policy", () => {
     expect(result.sha256).toBeUndefined();
     // The worker's own refusal: WebAssembly compilation blocked by the policy of ITS script.
     expect(result.message).toMatch(/content security policy|unsafe-eval|blocked by CSP/i);
-    // The document saw nothing of it: the worker's policy is not the page's.
+    // …naming the policy it ran under: the worker's own `script-src`, which lacks the source.
+    expect(result.message).toMatch(/script-src 'nonce-[^']+' 'strict-dynamic' 'report-sample'/);
+    // The document saw nothing of it. (This Chromium sends no report for a worker's wasm-eval
+    // refusal — seen: 0 in 3 s; a worker's connect-src violation it does report: the PDF test.)
     expect(watched.problems).toEqual([]);
   });
 });
