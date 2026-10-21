@@ -25,6 +25,14 @@
 // `DATA_COLLECTION` — and redaction is what cleans the REST, not what keeps a body in.
 // (`sendDefaultPii` no longer exists in 11.x; `dataCollection` is the only switch.)
 //
+// TRACING STAYS OFF (`tracesSampleRate: 0`, T27 R-3). It may be switched on only after span
+// redaction exists: under the stream lifecycle @sentry/cloudflare 11.5 does not call
+// `beforeSendTransaction`, so spans would leave with their names, URLs and attributes unscanned.
+// Turning it on needs (1) redaction moved to `beforeSendSpan` through the same shared function,
+// (2) a seeded generative test of spans written FIRST (estate rule, topics/telemetry-redaction),
+// and (3) the three tests that pin 0 changed on purpose (worker-core/services, sentry-data-
+// collection, sentry-final-walk). The V1.1 item is in runbooks/alerts.md.
+//
 // Defence in depth, relied on by nothing: `captureError` — the one explicit exit to Sentry for
 // the whole Worker — never hands over the object it was given. It sends `safeError(error)`: the
 // class, the code, the scanned message and the stack frames. A driver error's own fields
@@ -63,7 +71,7 @@ export function sentryOptions(env: SentryEnv): Sentry.CloudflareOptions | undefi
     dsn: env.SENTRY_DSN,
     environment: env.SENTRY_ENVIRONMENT,
     release: buildMeta().commit,
-    // Errors only. Tracing is switched on, if ever, by the observability task.
+    // Errors only — see TRACING STAYS OFF in the header.
     tracesSampleRate: 0,
     dataCollection: DATA_COLLECTION,
     beforeSend: (event) => redactEvent(event, failed),
