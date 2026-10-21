@@ -439,15 +439,14 @@ describe("(a) the strike sweep in abuse-hourly", () => {
           return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target_) : value;
         },
       });
-      const real = original.sweepStrikeThresholds;
-      let swept: Awaited<ReturnType<typeof real>> | null = null;
-      parts.sweepStrikeThresholds = async (...args: Parameters<typeof real>) => (swept = await real(...args));
       await runJob(racing as Db, ops.env);
       expect(raced).toBe(true);
       const [row] = await db.select().from(userTable).where(eq(userTable.id, target.id));
       expect(row!.suspendedReason).toBe("admin");
       expect(mailTo(target.email).filter((m) => /suspend/i.test(m.subject))).toEqual([]);
-      expect(swept!.suspended).toBe(0);
+      // Not suspended by the sweep a second time: no `account.suspended` row of its own. (Its count
+      // is not asserted: in a whole run other files leave users at the threshold that it suspends.)
+      expect(await auditsOf(db, "account.suspended", target.id)).toEqual([]);
     });
   });
 
