@@ -85,12 +85,14 @@ describe("what the page says", () => {
     expect(document.querySelector("[data-public-file], [data-public-folder]")).toBeNull();
   });
 
-  it("is marked noindex while it is shown", async () => {
+  it("is marked noindex and no-referrer while it is shown", async () => {
     const { unmount } = await openPublic({ [`GET ${publicPath()}`]: info(publicFile()) });
     await screen.findByRole("heading", { name: "report.txt" });
     expect(document.head.querySelector('meta[name="robots"]')?.getAttribute("content")).toContain("noindex");
+    // The token is in the address: nothing this page loads or opens is sent it as a Referer.
+    expect(document.head.querySelector('meta[name="referrer"]')?.getAttribute("content")).toBe("no-referrer");
     unmount();
-    expect(document.head.querySelector('meta[name="robots"][data-public-link-noindex]')).toBeNull();
+    expect(document.head.querySelector("meta[data-public-link-noindex]")).toBeNull();
   });
 
   it("a file: its card with the scan line; no Preview when the owner turned previews off", async () => {

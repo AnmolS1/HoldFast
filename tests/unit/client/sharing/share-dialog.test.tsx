@@ -215,7 +215,7 @@ describe("ShareDialog", () => {
 });
 
 describe("ShareDialog — an account change while a change is in flight", () => {
-  type Start = (dialog: HTMLElement) => void | Promise<void>;
+  type Start = (dialog: HTMLElement) => unknown;
   const pausedOwn = sharing({
     links: [link({ state: "paused", pausedReasons: ["owner"], canUnpause: true })],
   });
@@ -241,22 +241,30 @@ describe("ShareDialog — an account change while a change is in flight", () => 
     [
       "turn a person's uploads off",
       "PATCH",
-      (dialog) => fireEvent.click(within(dialog).getByLabelText("Can add files")),
+      (dialog) => {
+        fireEvent.click(within(dialog).getByLabelText("Can add files"));
+      },
     ],
     [
       "remove a person",
       "DELETE",
-      (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Remove friend@example.test" })),
+      (dialog) => {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Remove friend@example.test" }));
+      },
     ],
     [
       "pause a link",
       "PATCH",
-      (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Pause" })),
+      (dialog) => {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Pause" }));
+      },
     ],
     [
       "resume a link",
       "PATCH",
-      (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Resume" })),
+      (dialog) => {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Resume" }));
+      },
       pausedOwn,
     ],
     [
@@ -272,7 +280,9 @@ describe("ShareDialog — an account change while a change is in flight", () => 
     [
       "create a link",
       "POST",
-      (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Create link" })),
+      (dialog) => {
+        fireEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
+      },
     ],
     [
       "revoke a link",

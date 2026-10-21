@@ -89,15 +89,24 @@ function saveBlob(blob: Blob, fileName: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-/** `<meta name="robots" content="noindex">` while the page is shown. */
+/**
+ * While the page is shown: `noindex` (the app host also sends `X-Robots-Tag` for /s/*), and
+ * `no-referrer` — the token is in this page's address, and nothing it loads or opens is sent it.
+ */
 function useNoIndex(): void {
   useEffect(() => {
-    const meta = document.createElement("meta");
-    meta.name = "robots";
-    meta.content = "noindex, nofollow";
-    meta.setAttribute("data-public-link-noindex", "");
-    document.head.appendChild(meta);
-    return () => meta.remove();
+    const tags = [
+      ["robots", "noindex, nofollow"],
+      ["referrer", "no-referrer"],
+    ].map(([name, content]) => {
+      const meta = document.createElement("meta");
+      meta.name = name!;
+      meta.content = content!;
+      meta.setAttribute("data-public-link-noindex", "");
+      document.head.appendChild(meta);
+      return meta;
+    });
+    return () => tags.forEach((meta) => meta.remove());
   }, []);
 }
 

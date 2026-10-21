@@ -164,7 +164,9 @@ describe("Shared by me — an account change while a change to a person is in fl
     [
       "remove the person",
       "DELETE",
-      async () => fireEvent.click(screen.getByRole("button", { name: "Remove friend@example.test" })),
+      async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Remove friend@example.test" }));
+      },
     ],
   ] as const)("%s: the late answer says nothing and reads nothing again", async (_name, method, start) => {
     const answer = deferred<Response>();
