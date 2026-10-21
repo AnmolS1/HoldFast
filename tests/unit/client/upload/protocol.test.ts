@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PartResponse } from "../../../../src/shared/schemas/upload";
 import { putBody } from "../../../../src/client/features/upload/protocol";
-import { ApiError } from "../../../../src/client/lib/api";
+import { ApiError, configureApi, IDENTITY_HEADER, resetApiForTests } from "../../../../src/client/lib/api";
 import { errorBody } from "./fixtures";
 
 class FakeXhr {
@@ -65,6 +65,18 @@ const caught = (promise: Promise<unknown>) =>
   );
 
 describe("putBody", () => {
+  it("names the account the upload is for (the identity pin), when one is known", async () => {
+    configureApi({ userId: () => "a".repeat(32) });
+    try {
+      const promise = putBody(path, blob, PartResponse);
+      expect(FakeXhr.made[0]!.headers[IDENTITY_HEADER]).toBe("a".repeat(32));
+      FakeXhr.made[0]!.answer(200, { n: 2, etag: "abc" });
+      await promise;
+    } finally {
+      resetApiForTests();
+    }
+  });
+
   it("sends the blob itself with PUT — a body of known length, never a stream", async () => {
     const promise = putBody(path, blob, PartResponse);
     const [xhr] = FakeXhr.made;

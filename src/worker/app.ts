@@ -10,6 +10,7 @@ import { metaResponse } from "./meta";
 import { cookieGuard } from "./middleware/cookie-guard";
 import { csrf } from "./middleware/csrf";
 import { htmlNonce } from "./middleware/html-nonce";
+import { identityPin } from "./middleware/identity-pin";
 import { impersonationReadOnly } from "./middleware/impersonation";
 import { killSwitch } from "./middleware/kill-switch";
 import { rateLimit } from "./middleware/rate-limit";
@@ -30,6 +31,7 @@ export type PipelineStep = { name: string; path: string; handler: MiddlewareHand
  *  2 securityHeaders         the header set of every response
  *  3 csrf                    cross-site state changes → 403
  *  4 session                 who is asking; suspension, bans, scheduled deletion
+ *    identityPin             the account the client names is the session's (else 403)
  *  5 impersonationReadOnly   an impersonated session cannot change anything
  *  6 termsGate               stale terms → 403 terms_required on a state change
  *  7 killSwitch              settings.readOnly → 503 read_only on a state change
@@ -44,6 +46,9 @@ export function buildPipeline(core: CoreDeps): PipelineStep[] {
     // In front of everything that reads a cookie: one strict reading of the header.
     { name: "cookieGuard", path: "/api/*", handler: cookieGuard },
     { name: "session", path: "/api/*", handler: session },
+    // Before anything of the session's account is consulted: a request the client made for
+    // ANOTHER account (another tab signed in since) never runs as this one.
+    { name: "identityPin", path: "/api/*", handler: identityPin },
     { name: "impersonationReadOnly", path: "/api/*", handler: impersonationReadOnly },
     { name: "termsGate", path: "/api/*", handler: termsGate },
     { name: "killSwitch", path: "/api/*", handler: killSwitch },

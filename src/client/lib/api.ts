@@ -62,6 +62,14 @@ export interface ApiEnvironment {
   clearSession(): void;
   /** Reflect a kill switch learned from a 503 into the cached public config. */
   patchConfig(patch: { readOnly?: boolean; uploadsEnabled?: boolean; linksEnabled?: boolean }): void;
+  /** The account the client's state belongs to (sent as `X-Holdfast-User`), or null. */
+  userId(): string | null;
+  /**
+   * The browser is signed in to another account than the one this client's state belongs to
+   * (the API refused a request with `identity_mismatch`): purge, and adopt the account the
+   * session now names. The API client then starts again at `/`.
+   */
+  identityChanged(): Promise<void>;
 }
 
 const defaultEnvironment: ApiEnvironment = {
@@ -72,6 +80,8 @@ const defaultEnvironment: ApiEnvironment = {
     typeof location === "undefined" ? "/" : location.pathname + location.search + location.hash,
   clearSession: () => {},
   patchConfig: () => {},
+  userId: () => null,
+  identityChanged: async () => {},
 };
 
 let environment: ApiEnvironment = { ...defaultEnvironment };
@@ -85,6 +95,7 @@ export function resetApiForTests(): void {
   environment = { ...defaultEnvironment };
   reauth = null;
   terms = null;
+  adopting = null;
   emitGates();
 }
 
@@ -228,6 +239,48 @@ export function cancelTermsGate(): void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The identity pin (W2S4). The session cookie is the browser's, shared by every tab: another tab
+// signing in as someone else changes who THIS tab's next request runs as. Each request names the
+// account this client's state belongs to; the API refuses one whose session is another account
+// (403 forbidden, `identity_mismatch`, src/worker/middleware/identity-pin.ts), and the client then
+// adopts the account the browser is signed in as — the request is never replayed.
+
+/** The header name; the Worker's middleware reads the same (a test pins the two together). */
+export const IDENTITY_HEADER = "x-holdfast-user";
+
+/** Paths that never act for an account's data: the pin is not sent there. */
+function pinned(path: string): boolean {
+  const pathname = pathnameOf(path);
+  return (
+    pathname.startsWith("/api/") && !pathname.startsWith("/api/auth/") && !pathname.startsWith("/api/public/")
+  );
+}
+
+/** For a request made outside `api()` (the upload bodies, through XMLHttpRequest). */
+export function identityHeaders(): Record<string, string> {
+  const userId = environment.userId();
+  return userId === null ? {} : { [IDENTITY_HEADER]: userId };
+}
+
+export function isIdentityMismatch(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && error.details?.reason === "identity_mismatch";
+}
+
+let adopting: Promise<void> | null = null;
+
+/** Once, however many requests were refused at the same time: purge, adopt, start again at `/`. */
+function adoptBrowserIdentity(): void {
+  if (adopting) return;
+  adopting = environment
+    .identityChanged()
+    .catch(() => {})
+    .then(() => environment.navigate("/", { replace: true }))
+    .finally(() => {
+      adopting = null;
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
 
 export interface ApiOptions<T> {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -363,8 +416,9 @@ export async function toApiError(response: Response): Promise<ApiError> {
   );
 }
 
-async function send(path: string, options: ApiOptions<unknown>): Promise<Response> {
+async function send(path: string, options: ApiOptions<unknown>, userId: string | null): Promise<Response> {
   const headers: Record<string, string> = { accept: "application/json", ...options.headers };
+  if (userId !== null && pinned(path)) headers[IDENTITY_HEADER] = userId;
   let body: BodyInit | undefined;
   if (options.body !== undefined && options.body !== null) {
     if (isBodyInit(options.body)) {
@@ -417,6 +471,10 @@ function waitWords(seconds: number): string {
 /** Side effects of a failure that is not replayed. `silent`: codes whose toast the caller shows. */
 function react(error: ApiError, silent: readonly ApiErrorCode[] = []): void {
   const quiet = silent.includes(error.code);
+  if (isIdentityMismatch(error)) {
+    adoptBrowserIdentity();
+    return;
+  }
   const reason = typeof error.details?.reason === "string" ? error.details.reason : undefined;
   if (error.status === 403 && reason === "account_suspended") {
     environment.clearSession();
@@ -477,9 +535,11 @@ function react(error: ApiError, silent: readonly ApiErrorCode[] = []): void {
 export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}): Promise<T> {
   // Captured before the request leaves: a session that ends while it is in flight still counts.
   const hadSession = environment.hadSession();
+  // The account this request is made for — the same on a replay after re-auth.
+  const userId = environment.userId();
   let replayed = false;
   for (;;) {
-    const response = await send(path, options);
+    const response = await send(path, options, userId);
     if (response.ok) {
       if (options.empty) {
         // Not read: release the connection's body without parsing it.
@@ -517,8 +577,9 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
 /** The standard error toast: the message, and the request id so support can find the call. */
 export function toastApiError(error: unknown): void {
   if (error instanceof ApiError) {
-    // These were already announced by `react`.
-    if (error.status === 429 || error.status === 503) return;
+    // These were already announced by `react`; an identity change says nothing (the page starts
+    // again as the account the browser is signed in as).
+    if (error.status === 429 || error.status === 503 || isIdentityMismatch(error)) return;
     toast({ message: error.message, requestId: error.requestId });
     return;
   }

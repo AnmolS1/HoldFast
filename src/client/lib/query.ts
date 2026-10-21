@@ -304,6 +304,12 @@ function connectApi(): void {
   configureApi({
     hadSession: () => Boolean(getCachedSession()),
     clearSession,
+    userId: getKnownUserId,
+    // The API refused a request: the browser's session is another account now (another tab).
+    identityChanged: async () => {
+      await purgeUserState({ keepSession: true });
+      await refreshSession();
+    },
     patchConfig: (patch) => {
       queryClient.setQueryData(publicConfigQuery.queryKey, (current) =>
         current ? { ...current, ...patch } : current,

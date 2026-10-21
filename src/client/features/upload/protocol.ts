@@ -14,7 +14,7 @@ import {
   type CompleteUploadBody,
   type InitUploadBody,
 } from "../../../shared/schemas/upload";
-import { api, ApiError, apiErrorOf } from "../../lib/api";
+import { api, ApiError, apiErrorOf, identityHeaders } from "../../lib/api";
 import { t } from "./strings";
 
 export function initUpload(body: InitUploadBody, signal?: AbortSignal): Promise<InitUploadResponse> {
@@ -112,6 +112,9 @@ export const putBody: PutBody = (path, body, schema, options = {}) =>
     xhr.responseType = "text";
     xhr.setRequestHeader("accept", "application/json");
     xhr.setRequestHeader("content-type", "application/octet-stream");
+    // The account this upload is for: a body sent after another tab signed in as someone else is
+    // refused (identity_mismatch), not stored in that account.
+    for (const [name, value] of Object.entries(identityHeaders())) xhr.setRequestHeader(name, value);
     xhr.upload.onprogress = (event) => onProgress?.(event.loaded);
     xhr.onload = () => {
       settle();
