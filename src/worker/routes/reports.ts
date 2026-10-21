@@ -95,18 +95,25 @@ async function provingLink(c: Ctx, token: string | undefined): Promise<ShareLink
 }
 
 /**
- * The public route's proof: the node is the link's root or under it, exists, is not in the
- * trash and not hidden (taken down, itself or above; locked as suspected CSAM) — all `404` — and
- * is a FILE (a folder: `400`). Its scan state is not asked: a file another visitor's report has
- * just put under review is still reportable by whoever was shown it.
+ * The public route's proof: the node is there for this link exactly as the public link routes
+ * see it — `getAccess` (not in the trash) under the link scope `resolveLink` set: under the link,
+ * not hidden, and a file only when `clean` (pending, infected, skipped, error: there for nobody
+ * behind a link) — with ONE exception, decided here: `under_review`, because a file another
+ * visitor's report has just put under review is still reportable by whoever was shown it. Every
+ * other refusal is `404`, from the same statements whatever the answer; a folder is `400`.
  */
 async function proveByLink(c: Ctx, body: ReportBody): Promise<Proven> {
   const link = await provingLink(c, body.linkToken);
-  const [under, seen] = await Promise.all([
+  // ALWAYS ALL THREE, never "the exception only when access failed": the work must not depend on
+  // the answer.
+  const [access, under, seen] = await Promise.all([
+    getAccess(c, body.nodeId, { notTrashed: true }),
     isDescendantOrSelf(db(c), body.nodeId, link.nodeId),
     nodeVisibility(db(c), body.nodeId),
   ]);
-  if (!under || seen.hidden || seen.trashed || seen.kind === null) throw missing();
+  const reviewed =
+    under && !seen.hidden && !seen.trashed && seen.kind === "file" && seen.scanStatus === "under_review";
+  if (!access && !reviewed) throw missing();
   if (seen.kind !== "file") throw new AppError("validation", FOLDER_MESSAGE, { fields: ["nodeId"] });
   const node = await getNode(db(c), body.nodeId);
   if (!node || node.system !== null) throw missing();
