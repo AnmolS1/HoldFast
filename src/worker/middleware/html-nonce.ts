@@ -18,7 +18,8 @@ const CONDITIONAL = ["if-none-match", "if-modified-since", "if-match", "if-unmod
 function unconditional(request: Request): Request {
   const headers = new Headers(request.headers);
   for (const name of CONDITIONAL) headers.delete(name);
-  return new Request(request.url, { method: request.method, headers });
+  // The same request (its URL and method copied, not read) without the validators.
+  return new Request(request, { headers });
 }
 
 async function stamped(res: Response, c: Context<AppEnv>): Promise<Response> {
