@@ -987,19 +987,6 @@ export async function updateNotice(
   return row ?? null;
 }
 
-/**
- * Claims the notice's owner mail: sets `ownerNotifiedAt` if it is not set yet. True for the one
- * call that set it — so a repeated or concurrent takedown sends no second mail.
- */
-export async function claimOwnerNotified(db: Executor, noticeId: string): Promise<boolean> {
-  const rows = await db
-    .update(dmcaNotices)
-    .set({ ownerNotifiedAt: sql`now()` })
-    .where(and(eq(dmcaNotices.id, noticeId), isNull(dmcaNotices.ownerNotifiedAt)))
-    .returning({ id: dmcaNotices.id });
-  return rows.length > 0;
-}
-
 export const NOTICE_OPEN: readonly DmcaNotice["status"][] = OPEN_NOTICE_STATUSES;
 
 // ── invites ─────────────────────────────────────────────────────────────────────────────────

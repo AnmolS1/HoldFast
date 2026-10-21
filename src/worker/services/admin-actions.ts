@@ -996,9 +996,9 @@ const TAKEDOWN_FROM: readonly DmcaNotice["status"][] = ["received", "incomplete"
  * names, ascending; (1) the transition as a conditional write — no row = already actioned (a
  * double-click, a retry) or never allowed, and nothing below runs; (2) `takedownNode` and the
  * subtree's links paused `moderation` (paused, not revoked), the `dmca` blocklist rows; (3) the
- * strike in the same transaction (`addStrike(…, { tx })`) and `strikeId` on the notice. After the
- * commit: the strike's audit row and threshold, then the owner's mail — once (`ownerNotifiedAt`
- * is claimed before the mail is sent). A repeat answers the notice as it stands.
+ * strike in the same transaction (`addStrike(…, { tx })`) and `strikeId` on the notice;
+ * `ownerNotifiedAt` is set with the transition. After the commit: the strike's audit row and
+ * threshold, then the owner's mail — sent by this call only. A repeat answers the notice as it stands.
  */
 async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes, note: string | null) {
   const uploader = await firstUploader(c, notice);
@@ -1007,6 +1007,9 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
     const moved = await adminQ.transitionNotice(tx, notice.id, TAKEDOWN_FROM, {
       status: "actioned",
       takedownAt: now(c),
+      // Claimed WITH the transition: a request that lost the race reads the notice after this
+      // commit, so both answer the same body — and only the winner mails (`notifyOwner`).
+      ownerNotifiedAt: now(c),
       handledBy: admin.id,
     });
     if (!moved) return null;
@@ -1049,7 +1052,7 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       reason: note,
     },
   );
-  await notifyOwnerOnce(c, current);
+  await notifyOwner(c, current);
   return (await adminQ.noticeById(db(c), notice.id))!;
 }
 
@@ -1075,10 +1078,9 @@ async function ownerOf(c: C, notice: adminQ.NoticeWithNodes) {
   return null;
 }
 
-/** The "content removed" mail, once per notice: `ownerNotifiedAt` is claimed first. */
-async function notifyOwnerOnce(c: C, notice: adminQ.NoticeWithNodes) {
-  const claimed = await adminQ.claimOwnerNotified(db(c), notice.id);
-  if (!claimed) return;
+/** The "content removed" mail — sent by the one takedown that moved the notice. */
+async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
+  // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
   const found = await ownerOf(c, notice);
   if (!found) return;
   deps(c).defer(
