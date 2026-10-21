@@ -1,25 +1,130 @@
 // TanStack Query setup and the shell's own queries: the session, the public config and the
 // deletion status. Loaders use `queryClient.fetchQuery`, components the hooks — one cache.
-import { QueryClient, queryOptions, useQuery } from "@tanstack/react-query";
+import {
+  hashKey,
+  QueryClient,
+  queryOptions,
+  useQuery,
+  type DefaultOptions,
+  type QueryKey,
+} from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
 import { api, ApiError, cancelReauth, cancelTermsGate, configureApi } from "./api";
 import { DeletionStatusShape, PublicConfig, runUserStatePurgers, SessionShape } from "./contracts";
 import { t } from "./i18n";
 
 export const STALE_MS = 15_000;
 
+// ---------------------------------------------------------------------------------------------
+// Retry-After. Every wait the API named, in ONE place, per query hash (or a key of a caller's
+// own, e.g. a batch): until when that query must not be asked again. Not in the query cache: any
+// write to the cache (an emptied trash, a row taken out after a restore) clears a query's error,
+// and a wait read from the error would go with it. A wait goes only when its time has passed, or
+// with the account (`purgeUserState`).
+
+const waits = new Map<string, number>();
+const waitListeners = new Set<() => void>();
+
+const subscribeWaits = (listener: () => void) => {
+  waitListeners.add(listener);
+  return () => waitListeners.delete(listener);
+};
+
+function emitWaits(): void {
+  for (const listener of waitListeners) listener();
+}
+
+/**
+ * Until when the API asked not to be called again: a failure that came with `Retry-After` (a
+ * `429`, a `503`) names a number of seconds. 0 = no wait.
+ */
+export function retryNotBefore(error: unknown, since: number): number {
+  return error instanceof ApiError && error.retryAfter !== undefined ? since + error.retryAfter * 1000 : 0;
+}
+
+/** Record a wait for this hash (a query's `queryHash`) ending at `until` (ms). A longer one stays. */
+export function holdUntil(hash: string, until: number): void {
+  if (until <= Date.now() || (waits.get(hash) ?? 0) >= until) return;
+  waits.set(hash, until);
+  emitWaits();
+}
+
+/** Until when (ms) this hash must wait; 0 when it need not (a wait that has passed is dropped). */
+export function waitUntil(hash: string): number {
+  const until = waits.get(hash) ?? 0;
+  if (until === 0) return 0;
+  if (until > Date.now()) return until;
+  waits.delete(hash);
+  return 0;
+}
+
+/** The hash a query key is held under: the same as the query's `queryHash`. */
+export const waitKey = (key: QueryKey): string => hashKey(key);
+
+/** The end of this hash's wait, re-read when a wait is recorded (pair with a timer of its own). */
+export function useWaitUntil(hash: string): number {
+  return useSyncExternalStore(
+    subscribeWaits,
+    () => waitUntil(hash),
+    () => 0,
+  );
+}
+
+/** Forget every wait. Run by `purgeUserState()` and by tests. */
+export function clearWaits(): void {
+  waits.clear();
+  emitWaits();
+}
+
+/** What `refetchOn…` options and an invalidation's predicate are handed: a query of the cache. */
+export interface CachedQuery {
+  queryHash: string;
+}
+
+/**
+ * Is this query inside a wait the API named? While it is, NOTHING refreshes it by itself: not the
+ * tab coming back, not a reconnect, not a remount, not the load an errored query without data gets
+ * on mount. (After the wait, the next such trigger does.)
+ */
+export function isHeld(query: CachedQuery): boolean {
+  return waitUntil(query.queryHash) > 0;
+}
+
+export const unlessHeld = (query: CachedQuery): boolean => !isHeld(query);
+
+/**
+ * The client's defaults. Every automatic refetch asks `isHeld` first — `retryOnMount` too: a
+ * query in the error state with NO data is loaded on mount without asking `refetchOnMount`
+ * (query-core `shouldLoadOnMount`), so a list whose FIRST read drew a `429` would otherwise be read
+ * again on every visit inside the wait.
+ */
+export const QUERY_DEFAULTS = {
+  queries: {
+    staleTime: STALE_MS,
+    refetchOnWindowFocus: unlessHeld,
+    refetchOnReconnect: unlessHeld,
+    refetchOnMount: unlessHeld,
+    retryOnMount: unlessHeld,
+    // A 4xx is an answer, not a blip: only network errors and 5xx get one more try — and not one
+    // that named a wait (a `503` with `Retry-After`): that wait is honoured, not retried through.
+    retry: (failures: number, error: unknown) =>
+      failures < 1 &&
+      !(error instanceof ApiError && error.status >= 400 && error.status < 500) &&
+      retryNotBefore(error, 0) === 0,
+  },
+  mutations: { retry: false },
+} satisfies DefaultOptions;
+
 export function createQueryClient(): QueryClient {
-  return new QueryClient({
-    defaultOptions: {
-      queries: {
-        staleTime: STALE_MS,
-        refetchOnWindowFocus: true,
-        // A 4xx is an answer, not a blip: only network errors and 5xx get one more try.
-        retry: (failures, error) =>
-          failures < 1 && !(error instanceof ApiError && error.status >= 400 && error.status < 500),
-      },
-      mutations: { retry: false },
-    },
+  const client = new QueryClient({ defaultOptions: QUERY_DEFAULTS });
+  // Every failure of a query — a first read, a refresh, a next page — that names a wait goes into
+  // the registry, where no later write to the cache can lift it.
+  client.getQueryCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "error") {
+      holdUntil(event.query.queryHash, retryNotBefore(event.action.error, Date.now()));
+    }
   });
+  return client;
 }
 
 export const queryClient = createQueryClient();
@@ -81,6 +186,7 @@ export async function purgeUserState(options: { keepSession?: boolean } = {}): P
   await queryClient.cancelQueries({ predicate: (query) => userScoped(query.queryKey) });
   queryClient.removeQueries({ predicate: (query) => userScoped(query.queryKey) });
   queryClient.getMutationCache().clear();
+  clearWaits();
   if (!options.keepSession) {
     queryClient.setQueryData([SESSION_KEY], null);
     knownUserId = null;
