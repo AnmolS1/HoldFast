@@ -63,6 +63,29 @@ describe("zip entry paths", () => {
   });
 });
 
+describe("zip entry paths stay unique after the reserved-name rename (delta review D-m1)", () => {
+  it("nul.txt and nul_.txt in one folder: two different entries, on a public link and in the explorer", async () => {
+    const owner = await member();
+    const root = await makeFolder(owner.id, null, { name: "Box" });
+    for (const name of ["nul.txt", "nul_.txt", "NUL_.TXT (x)"])
+      await makeFile(owner.id, root.id, { name, scanStatus: "clean" });
+    const link = await linkTo(owner, root.id, { maxDownloads: 100 });
+    const visitor = await visit(link.token, "/zip-manifest", { method: "POST" });
+    const explorer = await api(asCaller(owner), "/nodes/zip-manifest", {
+      json: { nodeIds: [root.id] },
+      settings: settingsWith(),
+    });
+    for (const answer of [visitor, explorer]) {
+      expect(answer.status).toBe(200);
+      const got = paths(answer);
+      expect(got).toHaveLength(3);
+      expect(new Set(got.map((path) => path.toLowerCase())).size).toBe(3);
+      expect(got).toContain("Box/nul_.txt");
+      expect(got.some((path) => /^Box\/nul_ \(2\)\.txt$/.test(path))).toBe(true);
+    }
+  });
+});
+
 describe("a restore into a taken name", () => {
   it("a 255-byte name restored twice stays within 255 bytes, its extension and suffix kept", async () => {
     const owner = await member();

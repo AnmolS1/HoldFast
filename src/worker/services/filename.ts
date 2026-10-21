@@ -100,3 +100,25 @@ export function downloadName(name: string): string {
 export function zipPath(path: string): string {
   return path.split("/").map(downloadName).join("/");
 }
+
+/**
+ * Zip entry paths as they are saved (`zipPath`), then made unique without regard to case: the
+ * rename can make two stored names one ("nul.txt" and "nul_.txt" both become "nul_.txt"), and a
+ * zip must not hold one path twice. A repeat gets " (n)" before the extension of its last segment,
+ * cut to the name limit. Order is kept; the first one keeps its name.
+ */
+export function uniqueZipPaths(paths: readonly string[]): string[] {
+  const taken = new Set<string>();
+  return paths.map((raw) => {
+    const path = zipPath(raw);
+    const slash = path.lastIndexOf("/");
+    const dir = path.slice(0, slash + 1);
+    const last = path.slice(slash + 1);
+    const dot = last.lastIndexOf(".");
+    const [stem, ext] = dot > 0 ? [last.slice(0, dot), last.slice(dot)] : [last, ""];
+    let candidate = path;
+    for (let n = 2; taken.has(candidate.toLowerCase()); n++) candidate = dir + fitName(stem, ` (${n})${ext}`);
+    taken.add(candidate.toLowerCase());
+    return candidate;
+  });
+}
