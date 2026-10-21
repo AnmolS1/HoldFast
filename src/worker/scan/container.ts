@@ -9,9 +9,25 @@
 
 import { Container, getContainer } from "@cloudflare/containers";
 
+/** The scan's budget in ms, sent by the helpers so the Durable Object can enforce it itself. */
+export const BUDGET_HEADER = "X-Scan-Budget-Ms";
+
 export class ScannerContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "10m";
+
+  /**
+   * Forwards to the container, cut off at the caller's budget. The caller's own abort does not reach
+   * the container through the Durable Object (integration run: the shim kept its large-scan slot
+   * after the Worker gave up), so the object aborts its request into the container itself — the shim
+   * then stops and frees the slot (review m4).
+   */
+  override async fetch(request: Request): Promise<Response> {
+    const budget = Number(request.headers.get(BUDGET_HEADER));
+    if (!Number.isFinite(budget) || budget <= 0) return super.fetch(request);
+    const signal = AbortSignal.timeout(Math.min(budget, SCAN_TIMEOUT_MS));
+    return super.fetch(new Request(request, { signal }));
+  }
 }
 
 /**
@@ -104,6 +120,22 @@ export class ScannerTransportError extends Error {
   }
 }
 
+/**
+ * The shim refused this body for what it is (413: above the cap or longer than declared; 400: shorter
+ * than declared, or a bad X-Scan-Size). Sending the same body again gives the same answer: not
+ * retryable (review m7). `reason` is the shim's `error` field when it could be read.
+ */
+export class ScannerRefusedError extends Error {
+  readonly status: 400 | 413;
+  readonly reason: string | null;
+  constructor(status: 400 | 413, reason: string | null) {
+    super(`scanner refused the body (${status}${reason ? ` ${reason}` : ""})`);
+    this.name = "ScannerRefusedError";
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
 /** What the helpers need of a Durable Object stub. */
 export interface ScannerStub {
   fetch(input: string, init?: RequestInit): Promise<Response>;
@@ -146,7 +178,8 @@ function retryAfterOf(response: Response, fallback: number): number {
 
 const VERDICT_STATUSES = new Set(["clean", "infected", "limits_exceeded", "encrypted", "error"]);
 
-function isVerdict(value: unknown): value is ShimVerdict {
+/** A verdict, and one about a body of exactly `size` bytes (review m3). */
+function isVerdict(value: unknown, size: number): value is ShimVerdict {
   if (value === null || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
@@ -155,7 +188,8 @@ function isVerdict(value: unknown): value is ShimVerdict {
     Array.isArray(v.signatures) &&
     Array.isArray(v.pua) &&
     typeof v.sha256 === "string" &&
-    typeof v.bytes === "number"
+    /^[0-9a-f]{64}$/.test(v.sha256) &&
+    v.bytes === size
   );
 }
 
@@ -181,11 +215,15 @@ async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => vo
  * it answers before reading the upload, the status and headers arrive but the body is lost
  * ("Network connection lost." — integration run).
  */
-async function verdictOf(response: Response): Promise<ShimVerdict> {
+async function verdictOf(response: Response, size: number): Promise<ShimVerdict> {
   if (response.status === 200) {
     const body: unknown = await response.json().catch(() => null);
-    if (isVerdict(body)) return body;
-    throw new ScannerTransportError("engine", "scanner answered 200 without a verdict");
+    if (isVerdict(body, size)) return body;
+    throw new ScannerTransportError("engine", "scanner answered 200 without a verdict for this body");
+  }
+  if (response.status === 413 || response.status === 400) {
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    throw new ScannerRefusedError(response.status, typeof body?.error === "string" ? body.error : null);
   }
   if (response.status === 503) {
     let status = response.headers.get("X-Scan-Status");
@@ -231,6 +269,7 @@ class ReplayableBody {
   #replayable = true;
   #attempt = 0;
   #inflight: Promise<unknown> | null = null;
+  #broken = false;
 
   constructor(source: ReadableStream<Uint8Array>, maxBytes: number) {
     this.#reader = source.getReader();
@@ -239,6 +278,11 @@ class ReplayableBody {
 
   get replayable(): boolean {
     return this.#replayable;
+  }
+
+  /** A later attempt lost part of the body: what it sends is incomplete. */
+  get broken(): boolean {
+    return this.#broken;
   }
 
   /** A fresh stream of the whole body; the previous attempt's stream ends where it is. */
@@ -252,6 +296,8 @@ class ReplayableBody {
             // A read the previous attempt started lands in the record first.
             if (this.#inflight) await this.#inflight.catch(() => {});
             if (id !== this.#attempt) return controller.close();
+            if (this.#broken)
+              return controller.error(new ScannerBusyError(BUSY_RETRY_SECONDS, "body replay broke"));
             if (this.#replayable && index < this.#recorded.length) {
               controller.enqueue(this.#recorded[index++]!);
               return;
@@ -263,6 +309,8 @@ class ReplayableBody {
             if (!result.done && this.#replayable) {
               this.#recordedBytes += result.value.byteLength;
               if (this.#recordedBytes > this.#maxBytes) {
+                // A superseded attempt read this chunk: the current one can no longer get it (review m2).
+                if (id !== this.#attempt) this.#broken = true;
                 this.#replayable = false;
                 this.#recorded = [];
               } else {
@@ -296,32 +344,39 @@ async function scanOn(
   size: number,
   timeoutMs: number,
 ): Promise<ShimVerdict> {
+  // Aborting at the deadline ends the request into the container, so the shim stops and frees its
+  // large-scan slot (review m4).
+  const abort = new AbortController();
   const call = (async () => {
     let response: Response;
     try {
       response = await stub.fetch("http://scanner/scan", {
         method: "POST",
-        headers: { "X-Scan-Size": String(size), "Content-Type": "application/octet-stream" },
+        headers: {
+          "X-Scan-Size": String(size),
+          [BUDGET_HEADER]: String(timeoutMs),
+          "Content-Type": "application/octet-stream",
+        },
         body,
+        signal: abort.signal,
       });
     } catch (error) {
       // e.g. "Durable Object reset because its code was updated." on every deploy (S9): retryable.
       throw new ScannerTransportError("engine", "scanner call failed", { cause: error });
     }
-    return verdictOf(response);
+    return verdictOf(response, size);
   })();
   // Once the deadline has passed, the call's own outcome no longer matters.
   call.catch(() => {});
-  return withDeadline(call, timeoutMs, () => {
-    if (body instanceof ReadableStream) body.cancel("scan timed out").catch(() => {});
-  });
+  return withDeadline(call, timeoutMs, () => abort.abort(new Error("scan timed out")));
 }
 
 /**
  * Scans one object, streaming `body` (exactly `size` bytes) into the container. Tries the key's
  * preferred instance, and the other one once if the first is busy. Throws `RangeError` above
- * `SCAN_MAX_BYTES` (no container call), `ScannerBusyError`, `ScannerNotReadyError` or
- * `ScannerTransportError`. At most two container calls; never retries otherwise.
+ * `SCAN_MAX_BYTES` (no container call), `ScannerBusyError`, `ScannerNotReadyError`,
+ * `ScannerRefusedError` (not retryable) or `ScannerTransportError`. At most two container calls;
+ * never retries otherwise.
  */
 export async function scanObject(
   env: ScannerEnv,
@@ -344,6 +399,8 @@ export async function scanObject(
     return await scanOn(stub(otherInstance(first)), replay.next(), size, timeoutMs);
   } catch (error) {
     await replay.cancel(error);
+    // The second send lost part of the body (whatever it ended as): capacity, not a verdict.
+    if (replay.broken) throw new ScannerBusyError(BUSY_RETRY_SECONDS, "body replay broke");
     throw error;
   }
 }

@@ -151,5 +151,27 @@ for f in a b; do
   if [ -z "$got" ] || [ "$got" = "$want" ]; then ok "large-$f sha256 ${got:+= shasum}${got:-(no verdict)}"; else bad "large-$f sha256 $got ≠ $want"; fi
 done
 
+echo "== the budget's abort reaches the container and frees its large-scan slot (review m4)"
+# A large object (> 8 MiB) that uploads in a moment but takes clamd minutes: 1.9 GB of zeros
+# deflated, next to 10 MB stored. The budget expires during clamd's scan, after the whole body was
+# sent — only the abort can tell the shim to stop.
+head -c 1900000000 /dev/zero >"$work/zeros.bin"
+head -c 10000000 /dev/urandom >"$work/pad.bin"
+(cd "$work" && zip -q -X slow.zip zeros.bin && zip -q -X -0 slow.zip pad.bin && rm zeros.bin pad.bin)
+key_c="$(get '/t/keys?instance=scanner-1&count=1' | jq -r '.keys[0]')"
+started=$(date +%s)
+scan "/t/scan-object" "$work/slow.zip" "$key_c&timeoutMs=20000" >"$work/c.json"
+echo "slow.zip ($(wc -c <"$work/slow.zip" | tr -d ' ') bytes) with a 20 s budget: $(jq -c '{error: .error, calls, pulledBytes}' "$work/c.json") after $(($(date +%s) - started)) s"
+freed=""
+for _ in $(seq 1 30); do
+  if get "/t/health?name=scanner-1" | jq -e '.verdict.busy == false' >/dev/null 2>&1; then freed=$(($(date +%s) - started)); break; fi
+  sleep 1
+done
+if jq -e '.error.name == "ScannerTransportError" and .error.reason == "timeout" and .pulledBytes > 8388608' "$work/c.json" >/dev/null && [ -n "$freed" ]; then
+  ok "budget expired during clamd's scan → timeout; scanner-1's large slot free $freed s after the scan started"
+else
+  bad "timeout/abort: $(cat "$work/c.json"); slot freed within 30 s of the timeout: ${freed:-no}"
+fi
+
 echo "integration: $failures failure(s)"
 [ "$failures" = 0 ]

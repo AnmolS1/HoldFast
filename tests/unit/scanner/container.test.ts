@@ -3,13 +3,16 @@
 // binding itself is never called here (containers are off in tests).
 import { describe, expect, it } from "vitest";
 import {
+  BUDGET_HEADER,
   CAPACITY_RETRY_SECONDS,
   fnv1a,
   preferredInstance,
   SCAN_MAX_BYTES,
+  SCAN_TIMEOUT_MS,
   SCANNER_INSTANCES,
   ScannerBusyError,
   ScannerNotReadyError,
+  ScannerRefusedError,
   ScannerTransportError,
   scanObject,
   scannerHealth,
@@ -182,6 +185,69 @@ describe("busy", () => {
     expect(calls.map((c) => c.name)).toEqual(["scanner-0"]);
   });
 
+  it("a read the first attempt left pending lands in the second attempt in order (in-flight guard, review m1)", async () => {
+    // The source's second chunk arrives late; the first instance asks for it, then answers busy
+    // without waiting. The second attempt must replay chunk 0, then that pending chunk 1, then the rest.
+    const chunk = 64 * 1024;
+    const bytes = bytesOf(chunk * 6);
+    let index = 0;
+    const source = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (index >= 6) return controller.close();
+        if (index === 1) await new Promise((resolve) => setTimeout(resolve, 20));
+        controller.enqueue(bytes.slice(index * chunk, (index + 1) * chunk));
+        index++;
+      },
+    });
+    const leavePending: Answer = async (request) => {
+      const reader = request.body!.getReader();
+      await reader.read(); // chunk 0
+      void reader.read(); // chunk 1: still pending when busy is answered
+      return busy();
+    };
+    const { calls, stub } = fakeScanner({ "scanner-0": leavePending, "scanner-1": readAll });
+    const result = await scanObject(
+      env,
+      { key: keyFor("scanner-0"), size: bytes.length, body: source },
+      { stub },
+    );
+    expect(calls.map((c) => c.name)).toEqual(["scanner-0", "scanner-1"]);
+    expect(result).toMatchObject({ bytes: bytes.length, sha256: await sha256Hex(bytes) });
+  });
+
+  it("a replay record that overflows after the fall-over started is busy, never a body with a hole (review m2)", async () => {
+    // As above, but the pending chunk takes the record past its bound once the second attempt has
+    // begun: the second send cannot be completed, so the outcome is ScannerBusyError.
+    const chunk = 64 * 1024;
+    const bytes = bytesOf(chunk * 6);
+    let index = 0;
+    const source = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (index >= 6) return controller.close();
+        if (index === 1) await new Promise((resolve) => setTimeout(resolve, 20));
+        controller.enqueue(bytes.slice(index * chunk, (index + 1) * chunk));
+        index++;
+      },
+    });
+    const leavePending: Answer = async (request) => {
+      const reader = request.body!.getReader();
+      await reader.read();
+      void reader.read();
+      return busy();
+    };
+    const second: Answer = async (request) => {
+      const body = new Uint8Array(await request.arrayBuffer()); // errors when the replay breaks
+      return json(200, verdict({ bytes: body.length, sha256: await sha256Hex(body) }));
+    };
+    const { stub } = fakeScanner({ "scanner-0": leavePending, "scanner-1": second });
+    const thrown = await scanObject(
+      env,
+      { key: keyFor("scanner-0"), size: bytes.length, body: source },
+      { stub, replayMaxBytes: chunk + chunk / 2 },
+    ).catch((e) => e);
+    expect(thrown).toBeInstanceOf(ScannerBusyError);
+  });
+
   it("is read from the headers when the 503's body is lost (the shim answered before reading the upload)", async () => {
     const bytes = bytesOf(1_000_000);
     const lost = async () => headersOnly(503, { "Retry-After": "15", "X-Scan-Status": "busy" });
@@ -298,8 +364,16 @@ describe("not ready, transport and limits", () => {
     expect(second).toMatchObject({ name: "ScannerNotReadyError", reason: "clamd_loading", retryAfter: 30 });
   });
 
-  it("no answer within the budget throws ScannerTransportError('timeout')", async () => {
-    const { calls, stub } = fakeScanner({ "scanner-0": () => new Promise<Response>(() => {}) });
+  it("no answer within the budget throws ScannerTransportError('timeout') and aborts the call", async () => {
+    // The abort is what frees the instance's large-scan slot (review m4): the shim sees the
+    // connection go and stops.
+    let signal: AbortSignal | null | undefined;
+    const stub = () => ({
+      fetch: (_input: string, init?: RequestInit) => {
+        signal = init?.signal;
+        return new Promise<Response>(() => {});
+      },
+    });
     const error = await scanObject(
       env,
       { key: keyFor("scanner-0"), size: 3, body: streamOf(bytesOf(3)) },
@@ -307,7 +381,21 @@ describe("not ready, transport and limits", () => {
     ).catch((e) => e);
     expect(error).toBeInstanceOf(ScannerTransportError);
     expect(error.reason).toBe("timeout");
-    expect(calls).toHaveLength(1);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("sends its budget to the Durable Object, which cuts the container request off at it", async () => {
+    const budgets: (string | null)[] = [];
+    const stub = () => ({
+      fetch: async (input: string, init?: RequestInit) => {
+        budgets.push(new Request(input, init).headers.get(BUDGET_HEADER));
+        return json(200, verdict({ bytes: 3 }));
+      },
+    });
+    await scanObject(env, { key: "u/b", size: 3, body: streamOf(bytesOf(3)) }, { stub });
+    await scanObject(env, { key: "u/b", size: 3, body: streamOf(bytesOf(3)) }, { stub, timeoutMs: 30_000 });
+    await scanSmall(env, bytesOf(3), { stub });
+    expect(budgets).toEqual([String(SCAN_TIMEOUT_MS), "30000", String(SCAN_TIMEOUT_MS)]);
   });
 
   it("a deploy's 'Durable Object reset because its code was updated.' rejection is a retryable engine failure", async () => {
@@ -328,14 +416,38 @@ describe("not ready, transport and limits", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("413 and 400 are refusals of this body — ScannerRefusedError, not retryable, no other instance tried", async () => {
+    for (const [status, error] of [
+      [413, "overrun"],
+      [413, "size"],
+      [400, "short"],
+      [400, "X-Scan-Size"],
+    ] as const) {
+      const { calls, stub } = fakeScanner({
+        "scanner-0": async () => json(status, { error }),
+        "scanner-1": readAll,
+      });
+      const thrown = await scanObject(
+        env,
+        { key: keyFor("scanner-0"), size: 3, body: streamOf(bytesOf(3)) },
+        { stub },
+      ).catch((e) => e);
+      expect(thrown).toBeInstanceOf(ScannerRefusedError);
+      expect(thrown).toMatchObject({ status, reason: error });
+      expect(calls).toHaveLength(1);
+    }
+  });
+
   it("any other answer is an engine failure, never a verdict", async () => {
     for (const answer of [
       async () => new Response("Internal Server Error", { status: 500 }),
-      async () => json(413, { error: "overrun" }),
-      async () => json(400, { error: "short" }),
       async () => json(503, { status: "something" }),
       async () => new Response("not json", { status: 200 }),
       async () => json(200, { status: "fine" }),
+      // A 200 verdict that is not about this body (review m3): another length, or no real hash.
+      async () => json(200, verdict({ bytes: 4, sha256: "a".repeat(64) })),
+      async () => json(200, verdict({ bytes: 3, sha256: "not-a-hash" })),
+      async () => json(200, verdict({ bytes: 3, sha256: "A".repeat(64) })),
     ]) {
       const { stub } = fakeScanner({ "scanner-0": answer, "scanner-1": readAll });
       const error = await scanObject(
@@ -358,8 +470,8 @@ describe("not ready, transport and limits", () => {
       }),
       verdict({ status: "encrypted", reason: "encrypted", signatures: ["Heuristics.Encrypted.Zip"] }),
       verdict({ status: "error", reason: "timeout" }),
-      verdict({ status: "clean", pua: ["PUA.Win.Packer.Upx-1"] }),
-    ]) {
+      verdict({ status: "clean" }),
+    ].map((v) => ({ ...v, bytes: 3 }))) {
       const { stub } = fakeScanner({
         "scanner-0": async () => json(200, v),
         "scanner-1": async () => json(200, v),
@@ -370,8 +482,8 @@ describe("not ready, transport and limits", () => {
 
   it("above SCAN_MAX_BYTES throws RangeError and makes no container call; at it, it scans", async () => {
     const { calls, stub } = fakeScanner({
-      "scanner-0": async () => json(200, verdict()),
-      "scanner-1": async () => json(200, verdict()),
+      "scanner-0": async () => json(200, verdict({ bytes: SCAN_MAX_BYTES })),
+      "scanner-1": async () => json(200, verdict({ bytes: SCAN_MAX_BYTES })),
     });
     for (const size of [SCAN_MAX_BYTES + 1, -1, 1.5, Number.NaN]) {
       await expect(

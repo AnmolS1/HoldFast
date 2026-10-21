@@ -95,7 +95,10 @@ export default {
           },
           { highWaterMark: 0 },
         );
-        const response = await run(scanObject(env, { key, size, body }, { stub }), calls);
+        const timeoutMs = url.searchParams.has("timeoutMs")
+          ? Number(url.searchParams.get("timeoutMs"))
+          : undefined;
+        const response = await run(scanObject(env, { key, size, body }, { stub, timeoutMs }), calls);
         const result = await response.json();
         result.pulledBytes = pulled;
         return Response.json(result);
