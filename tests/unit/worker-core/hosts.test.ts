@@ -5,7 +5,7 @@ import { Hono } from "hono";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../../src/worker/app";
 import { createFilesHost } from "../../../src/worker/files-host";
-import { filesHostHeaders, htmlCsp } from "../../../src/worker/middleware/security-headers";
+import { buildCsp, filesHostHeaders } from "../../../src/worker/middleware/security-headers";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
 import { WARM_UP_TIMEOUT_MS, warmWorker } from "../harness/workers/warm-up";
@@ -155,7 +155,7 @@ describe("files host", () => {
       "cross-origin-resource-policy": "cross-origin",
       "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
       "referrer-policy": "no-referrer",
-      "strict-transport-security": "max-age=86400",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
       vary: "Origin",
       "x-content-type-options": "nosniff",
       "x-robots-tag": "noindex, nofollow, noarchive",
@@ -259,16 +259,18 @@ describe("app host headers", () => {
       }),
   };
 
+  // The nonce is per response: compared as the token <NONCE> (normalised by `withNonceToken`).
+  const withNonceToken = (csp: string | undefined) => csp?.replace(/'nonce-[A-Za-z0-9+/]{22}=='/g, "'nonce-<NONCE>'");
   const CSP_HTTP =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com; " +
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://files.localhost; " +
+    "default-src 'self'; script-src 'nonce-<NONCE>' 'strict-dynamic' 'wasm-unsafe-eval' 'report-sample' https://challenges.cloudflare.com; " +
+    "style-src 'self' 'nonce-<NONCE>' 'report-sample'; img-src 'self' data: blob: http://files.localhost; " +
     "media-src http://files.localhost blob:; connect-src 'self' http://files.localhost https://challenges.cloudflare.com; " +
     "frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; manifest-src 'self'; font-src 'self'; " +
     "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; " +
     "report-uri /api/public/csp-report; report-to csp";
   const CSP_HTTPS =
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com; " +
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://files.example.test; " +
+    "default-src 'self'; script-src 'nonce-<NONCE>' 'strict-dynamic' 'wasm-unsafe-eval' 'report-sample' https://challenges.cloudflare.com; " +
+    "style-src 'self' 'nonce-<NONCE>' 'report-sample'; img-src 'self' data: blob: https://files.example.test; " +
     "media-src https://files.example.test blob:; " +
     "connect-src 'self' https://files.example.test https://challenges.cloudflare.com https://o123.ingest.sentry.example.test; " +
     "frame-src https://challenges.cloudflare.com; worker-src 'self' blob:; manifest-src 'self'; font-src 'self'; " +
@@ -292,6 +294,7 @@ describe("app host headers", () => {
     const headers = headersOf(response);
     expect(headers["content-type"]).toMatch(/^text\/html/);
     delete headers["content-type"];
+    headers["content-security-policy"] = withNonceToken(headers["content-security-policy"])!;
     expect(headers).toEqual({ ...HTML_COMMON, "content-security-policy": CSP_HTTP });
     await response.text();
   });
@@ -300,16 +303,17 @@ describe("app host headers", () => {
     const { response } = await appCall("/", { origin: HTTPS.APP_ORIGIN, env: HTTPS });
     const headers = headersOf(response);
     delete headers["content-type"];
+    headers["content-security-policy"] = withNonceToken(headers["content-security-policy"])!;
     expect(headers).toEqual({
       ...HTML_COMMON,
       "content-security-policy": CSP_HTTPS,
-      "strict-transport-security": "max-age=86400",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
     });
     await response.text();
   });
 
   it("names no host that did not come from the environment", () => {
-    const csp = htmlCsp({ APP_ORIGIN: "https://a.test", FILES_ORIGIN: "https://f.test", SENTRY_DSN_WEB: "" });
+    const csp = buildCsp({ APP_ORIGIN: "https://a.test", FILES_ORIGIN: "https://f.test", SENTRY_DSN_WEB: "" }, "n");
     const hosts = [...csp.matchAll(/https?:\/\/[^\s;]+/g)].map((match) => match[0]);
     // Turnstile is the one third party the policy names by design.
     expect([...new Set(hosts)].sort()).toEqual(["https://challenges.cloudflare.com", "https://f.test"]);
@@ -343,11 +347,15 @@ describe("app host headers", () => {
     }
   });
 
-  it("static assets: nosniff; hashed files immutable, everything else no-cache; no CSP", async () => {
+  it("static assets: nosniff; hashed files immutable, everything else no-cache; the policy on /assets/ scripts only", async () => {
     const hashed = await appCall("/assets/index-abc123.js", { env: { ASSETS: script } });
-    expect(headersOf(hashed.response)).toEqual({
+    const hashedHeaders = headersOf(hashed.response);
+    hashedHeaders["content-security-policy"] = withNonceToken(hashedHeaders["content-security-policy"])!;
+    expect(hashedHeaders).toEqual({
       "cache-control": "public, max-age=31536000, immutable",
+      "content-security-policy": CSP_HTTP,
       "content-type": "text/javascript",
+      "reporting-endpoints": 'csp="/api/public/csp-report"',
       "x-content-type-options": "nosniff",
     });
     await hashed.response.text();
@@ -360,7 +368,7 @@ describe("app host headers", () => {
     await other.response.text();
     // A missing hashed file falls back to the shell: that is HTML, and must not be cached as immutable.
     const missing = await appCall("/assets/missing-000.js");
-    expect(missing.response.headers.get("cache-control")).toBe("no-cache");
+    expect(missing.response.headers.get("cache-control")).toBe("no-store");
     await missing.response.text();
   });
 
@@ -380,40 +388,38 @@ describe("app host headers", () => {
       const secure = await appCall(path, { origin: HTTPS.APP_ORIGIN, env: HTTPS });
       expect(headersOf(secure.response), path).toEqual({
         ...expected,
-        "strict-transport-security": "max-age=86400",
+        "strict-transport-security": "max-age=31536000; includeSubDomains",
       });
       await secure.response.text();
       await secure.ctx.settle();
     }
   });
 
-  it("local dev only: the Vite React-refresh preamble is allowed by its hash — and nothing else, never on https", async () => {
+  it("every <script> and <style> of the served shell carries the response's nonce — the Vite preamble too; no 'unsafe-inline', no hash", async () => {
     const preamble =
       'import { injectIntoGlobalHook } from "/@react-refresh";\ninjectIntoGlobalHook(window);\nwindow.$RefreshReg$ = () => {};';
     const other = 'document.documentElement.dataset.theme = "dark";';
     const page =
-      `<!doctype html><script type="module">${preamble}</script><script>${other}</script>` +
-      '<script type="module" src="/x.js"></script>';
+      `<!doctype html><html><head><script type="module">${preamble}</script><script>${other}</script>` +
+      '<style>a{}</style><script type="module" src="/x.js"></script></head><body></body></html>';
     const ASSETS = { fetch: async () => new Response(page, { headers: { "content-type": "text/html" } }) };
-    const hashOf = async (body: string) => {
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
-      return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
-    };
 
-    const local = await appCall("/", { env: { ASSETS } });
-    const localCsp = local.response.headers.get("content-security-policy") ?? "";
-    expect(localCsp).toContain(
-      `script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com ${await hashOf(preamble)};`,
-    );
-    // Any other inline script stays blocked locally, exactly as it is on a deploy.
-    expect(localCsp).not.toContain(await hashOf(other));
-    expect(localCsp.match(/'sha256-/g)).toHaveLength(1);
-    expect(localCsp).not.toMatch(/script-src[^;]*'unsafe-inline'/);
-    expect(await local.response.text()).toBe(page);
-
-    const deployed = await appCall("/", { origin: HTTPS.APP_ORIGIN, env: { ...HTTPS, ASSETS } });
-    expect(deployed.response.headers.get("content-security-policy")).toBe(CSP_HTTPS);
-    await deployed.response.text();
+    for (const options of [{ env: { ASSETS } }, { origin: HTTPS.APP_ORIGIN, env: { ...HTTPS, ASSETS } }]) {
+      const { response } = await appCall("/", options);
+      const csp = response.headers.get("content-security-policy") ?? "";
+      const nonce = /script-src 'nonce-([^']+)'/.exec(csp)?.[1];
+      expect(nonce).toMatch(/^[A-Za-z0-9+/]{22}==$/);
+      expect(csp).not.toContain("'unsafe-inline'");
+      expect(csp).not.toMatch(/'sha(256|384|512)-/);
+      const html = await response.text();
+      // The header's nonce is the meta's nonce.
+      expect(html).toContain(`<meta name="csp-nonce" content="${nonce}">`);
+      const tags = [...html.matchAll(/<(?:script|style)[\s>][^>]*>?/g)].map((match) => match[0]);
+      expect(tags).toHaveLength(4);
+      for (const tag of tags) expect(tag).toContain(`nonce="${nonce}"`);
+      expect(html).toContain(preamble);
+      expect(html).toContain(other);
+    }
   });
 
   it("keeps every Set-Cookie of an auth response intact", async () => {
