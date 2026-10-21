@@ -3,46 +3,64 @@
 // http://localhost get working previews from the same code.
 //
 // App host, by kind of response:
-//   HTML (the SPA shell)   the full policy below. Applied to HTML only, so it is not inherited by
-//                          Web Workers through script responses.
-//   static assets          nosniff; hashed files under /assets/ are immutable, the rest no-cache.
+//   HTML (the SPA shell)   the full policy below, with a nonce of its own; never stored.
+//   /assets/ JavaScript    the same policy less `report-to` (a fresh nonce nothing uses): a Web Worker runs under
+//                          the policy of its own script response, not the page's — without it a
+//                          worker could eval, compile wasm and fetch anywhere. Still immutable.
+//   other static assets    nosniff; hashed files under /assets/ are immutable, the rest no-cache.
 //   /api/* and /__meta     nosniff, no-store, `default-src 'none'`, no-referrer.
 // Files host: one fixed set on every response, and never a cookie.
 //
-// `style-src 'unsafe-inline'` is the one temporary directive (runtime-injected styles); the
-// hardening task replaces it and `script-src 'self'` with nonces. `'wasm-unsafe-eval'` stays.
+// Scripts run only by nonce: `'strict-dynamic'` hands the trust of a nonced script to the scripts
+// it loads, and `'self'` / host sources are ignored by every browser that honours it (Turnstile's
+// host stays for the others). There is no `'unsafe-inline'` anywhere and no hash. Styles: our own
+// stylesheets ('self') and nonced <style> elements (Emotion reads the nonce from the meta tag
+// html-nonce.ts writes). `'wasm-unsafe-eval'` stays: hash-wasm compiles WebAssembly.
 // A later policy must keep every directive here that it does not deliberately tighten.
 
-import { requestMethod, requestPath } from "./canonical";
-import type { MiddlewareHandler } from "hono";
+import { requestPath } from "./canonical";
+import type { Context, MiddlewareHandler } from "hono";
 import type { AppEnv } from "../services/request-context";
 
 type HeaderEnv = Pick<Env, "APP_ORIGIN" | "FILES_ORIGIN" | "SENTRY_DSN_WEB">;
 
 const TURNSTILE = "https://challenges.cloudflare.com";
 const CSP_REPORT_PATH = "/api/public/csp-report";
-/** Raised by the hardening task after the first production deploy. */
-const HSTS = "max-age=86400";
+/** One year, every subdomain, no preload (the preload list is a commitment the zone owner makes). */
+const HSTS = "max-age=31536000; includeSubDomains";
+const REPORTING_ENDPOINTS = `csp="${CSP_REPORT_PATH}"`;
 
 const isHttps = (env: HeaderEnv) => env.APP_ORIGIN.startsWith("https://");
 
 function sentryOrigin(env: HeaderEnv): string | null {
   if (!env.SENTRY_DSN_WEB) return null;
   try {
-    return new URL(env.SENTRY_DSN_WEB).origin;
+    const url = new URL(env.SENTRY_DSN_WEB);
+    // An origin the browser can actually connect to, or none at all — never a widening value.
+    return url.protocol === "https:" || url.protocol === "http:" ? url.origin : null;
   } catch {
     return null;
   }
 }
 
-/** The Content-Security-Policy of an HTML response. `scriptHashes` is for local dev only. */
-export function htmlCsp(env: HeaderEnv, scriptHashes: readonly string[] = []): string {
+/** 128 random bits, base64. One per response. */
+export function newNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return btoa(String.fromCharCode(...bytes));
+}
+
+/**
+ * The Content-Security-Policy of the app host's HTML and of its /assets/ scripts. `reportTo: false`
+ * (the scripts) leaves `report-to` out: with it Chromium ignores `report-uri`, and that a dedicated
+ * worker's Reporting-API reports arrive is shown nowhere; `report-uri` is (the e2e).
+ */
+export function buildCsp(env: HeaderEnv, nonce: string, options: { reportTo?: boolean } = {}): string {
   const files = env.FILES_ORIGIN;
   const sentry = sentryOrigin(env);
   const directives = [
     "default-src 'self'",
-    ["script-src 'self' 'wasm-unsafe-eval'", TURNSTILE, ...scriptHashes.map((hash) => `'${hash}'`)].join(" "),
-    "style-src 'self' 'unsafe-inline'",
+    `script-src 'nonce-${nonce}' 'strict-dynamic' 'wasm-unsafe-eval' 'report-sample' ${TURNSTILE}`,
+    `style-src 'self' 'nonce-${nonce}' 'report-sample'`,
     `img-src 'self' data: blob: ${files}`,
     `media-src ${files} blob:`,
     ["connect-src 'self'", files, TURNSTILE, ...(sentry ? [sentry] : [])].join(" "),
@@ -55,20 +73,26 @@ export function htmlCsp(env: HeaderEnv, scriptHashes: readonly string[] = []): s
     "form-action 'self'",
     "frame-ancestors 'none'",
     `report-uri ${CSP_REPORT_PATH}`,
-    "report-to csp",
+    ...(options.reportTo === false ? [] : ["report-to csp"]),
+    // Only on https: locally it would rewrite the http://files.localhost origin.
     ...(isHttps(env) ? ["upgrade-insecure-requests"] : []),
   ];
   return directives.join("; ");
 }
 
-export function htmlHeaders(
-  env: HeaderEnv,
-  path: string,
-  scriptHashes: readonly string[] = [],
-): Record<string, string> {
+// The nonce html-nonce.ts wrote into this request's HTML, for the header set after `next()`.
+// Keyed by the request's Hono Context: one per request, and gone with it.
+const responseNonces = new WeakMap<Context<AppEnv>, string>();
+
+/** Called by html-nonce.ts with the nonce it stamped into the page. */
+export function useNonceFor(c: Context<AppEnv>, nonce: string): void {
+  responseNonces.set(c, nonce);
+}
+
+export function htmlHeaders(env: HeaderEnv, path: string, nonce: string): Record<string, string> {
   const headers: Record<string, string> = {
-    "Content-Security-Policy": htmlCsp(env, scriptHashes),
-    "Reporting-Endpoints": `csp="${CSP_REPORT_PATH}"`,
+    "Content-Security-Policy": buildCsp(env, nonce),
+    "Reporting-Endpoints": REPORTING_ENDPOINTS,
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -76,7 +100,9 @@ export function htmlHeaders(
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy":
       "camera=(), microphone=(), geolocation=(), payment=(), usb=(), publickey-credentials-get=(self), publickey-credentials-create=(self)",
-    "Cache-Control": "no-cache",
+    // The nonce is per response: a stored or revalidated copy would pair an old body with a new
+    // header (or the reverse), and nothing on the page would run.
+    "Cache-Control": "no-store",
   };
   if (isHttps(env)) headers["Strict-Transport-Security"] = HSTS;
   // Public-link pages and the admin console stay out of search indexes.
@@ -88,11 +114,32 @@ export function htmlHeaders(
   return headers;
 }
 
+/** Validators of an HTML response: with them a browser would revalidate a body whose nonces are stale. */
+const HTML_DROPPED = ["etag", "last-modified"];
+
+const JAVASCRIPT = /^(text|application)\/(javascript|ecmascript)\b/i;
+
+/** A script under /assets/: the bundle, its chunks, the workers (`.js` and `.mjs` alike). */
+export function isAssetScript(path: string, response: Response): boolean {
+  return path.startsWith("/assets/") && JAVASCRIPT.test(response.headers.get("content-type") ?? "");
+}
+
 export function assetHeaders(path: string, status: number): Record<string, string> {
   const hashed = path.startsWith("/assets/") && (status === 200 || status === 304);
   return {
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": hashed ? "public, max-age=31536000, immutable" : "no-cache",
+  };
+}
+
+/**
+ * An /assets/ script: the asset set plus the page's policy, so a worker started from it is bound
+ * too — without `report-to` (and so without Reporting-Endpoints): its reports go by `report-uri`.
+ */
+export function assetScriptHeaders(env: HeaderEnv, path: string, status: number): Record<string, string> {
+  return {
+    ...assetHeaders(path, status),
+    "Content-Security-Policy": buildCsp(env, newNonce(), { reportTo: false }),
   };
 }
 
@@ -128,28 +175,6 @@ export function filesHeaders(env: HeaderEnv): Record<string, string> {
 const isHtml = (response: Response) => (response.headers.get("content-type") ?? "").startsWith("text/html");
 const isApiPath = (path: string) => path === "/api" || path.startsWith("/api/") || path === "/__meta";
 
-/**
- * LOCAL DEV ONLY (an http:// APP_ORIGIN — every deploy is https). The Vite dev server injects an
- * inline React-refresh preamble into index.html; under `script-src 'self'` it is blocked and the
- * SPA never renders. Instead of loosening the policy, that one script is allowed by its hash.
- *
- * Only the preamble: any OTHER inline script stays blocked locally exactly as it is on a deploy,
- * so a script added to index.html fails here first instead of only in production.
- */
-const VITE_REACT_PREAMBLE = "/@react-refresh";
-
-async function vitePreambleHashes(html: string): Promise<string[]> {
-  const hashes: string[] = [];
-  for (const match of html.matchAll(/<script(\s[^>]*)?>([\s\S]*?)<\/script>/gi)) {
-    const attributes = match[1] ?? "";
-    const body = match[2] ?? "";
-    if (/\ssrc\s*=/i.test(attributes) || !body.includes(VITE_REACT_PREAMBLE)) continue;
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body));
-    hashes.push(`sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}`);
-  }
-  return hashes;
-}
-
 function rebuilt(
   response: Response,
   body: BodyInit | null,
@@ -173,12 +198,11 @@ export const securityHeaders: MiddlewareHandler<AppEnv> = async (c, next) => {
   if (isApiPath(path)) {
     replacement = rebuilt(response, response.body, apiHeaders(c.env));
   } else if (isHtml(response)) {
-    if (!isHttps(c.env) && response.body && requestMethod(c) === "GET") {
-      const html = await response.text();
-      replacement = rebuilt(response, html, htmlHeaders(c.env, path, await vitePreambleHashes(html)));
-    } else {
-      replacement = rebuilt(response, response.body, htmlHeaders(c.env, path));
-    }
+    // HTML that did not come through html-nonce.ts gets a nonce no element carries: nothing in it runs.
+    const nonce = responseNonces.get(c) ?? newNonce();
+    replacement = rebuilt(response, response.body, htmlHeaders(c.env, path, nonce), HTML_DROPPED);
+  } else if (isAssetScript(path, response)) {
+    replacement = rebuilt(response, response.body, assetScriptHeaders(c.env, path, response.status));
   } else {
     replacement = rebuilt(response, response.body, assetHeaders(path, response.status));
   }

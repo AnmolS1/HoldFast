@@ -15,6 +15,7 @@
 import { fileTypeFromBuffer } from "file-type";
 import { INLINE_TYPES, PREVIEW_TEXT_TYPES, THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import { BARE_TYPE, inlineAllowed, OCTET_STREAM } from "../../shared/mime";
+import { downloadName } from "./filename";
 
 // The pure half of the policy — the lists and every predicate that only looks at a type, an
 // extension and a size — lives in `src/shared` (the SPA's viewers ask the same code). It is
@@ -122,6 +123,8 @@ export type DispositionKind = "download" | "inline" | "thumb";
  * the header.
  */
 export function contentDisposition(kind: DispositionKind, name: string, servedType: string): string {
+  // A reserved Windows device name (CON, NUL, COM1, …) is saved as "CON_.txt" (services/filename.ts).
+  name = downloadName(name);
   const disposition = kind === "inline" && inlineAllowed(servedType) ? "inline" : "attachment";
   const clean =
     name

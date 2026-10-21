@@ -11,8 +11,9 @@
     <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <title>Holdfast</title>
-    <!-- Render-blocking and external on purpose: it sets the colour scheme before first paint,
-         and the page's script policy allows 'self' only (no inline script). -->
+    <!-- Render-blocking and external on purpose: it sets the colour scheme before first paint.
+         The Worker stamps every script of this page with the response's CSP nonce
+         (src/worker/middleware/html-nonce.ts); the policy allows no inline script without it. -->
     <script src="/color-scheme-init.js"></script>
   </head>
   <body>
