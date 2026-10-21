@@ -17,11 +17,23 @@
 //    failed that way under load with a cold server; a single one took 21 s instead of 4.)
 //    So the one-off cost is paid HERE, once, with a budget of its own, before any test's clock
 //    starts. No test timeout is raised: a test that is slow once the server is warm still fails.
+//
+// 3. FORGET THE ROLLBACK DETECTOR'S OBJECT. The bucket in `.wrangler/state` outlives the database
+//    reset of step 1, and the hourly slot an earlier run fired (harness.spec.ts) left the detector's
+//    generation object in it (src/worker/jobs/reconcile.ts, GENERATION_KEY). A fresh database (0)
+//    behind a left-over object (n > 0) is exactly what a restore looks like: every destroy of the
+//    run — "delete forever", a purge — would take the held path. Deleted with the reset, the two
+//    agree again ("first run ever"). Through wrangler's local mode on the dev server's own state
+//    directory: it works while the dev server is up, and it never reaches Cloudflare (`--local`).
 import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type FullConfig } from "@playwright/test";
 import { localDbName } from "./local-env";
+
+/** The local bucket (wrangler.jsonc, top-level `r2_buckets`) and the detector's key in it. */
+export const LOCAL_BUCKET = "holdfast-files-dev";
+export const GENERATION_OBJECT = "sys/reconcile-generation";
 
 /** Every screen a test opens first, and the API modules behind them. */
 const WARM_PAGES = ["/login", "/signup", "/forgot-password", "/verify-email", "/reset-password", "/"];
@@ -66,6 +78,12 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
     stdio: "inherit",
     env: { ...process.env, HOLDFAST_DB: localDbName() },
   });
+  // A missing object is no error; a failing wrangler fails the run (a held destroy would mislead).
+  execFileSync(
+    resolve(root, "node_modules/.bin/wrangler"),
+    ["r2", "object", "delete", `${LOCAL_BUCKET}/${GENERATION_OBJECT}`, "--local"],
+    { cwd: root, stdio: "inherit", env: { ...process.env, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false" } },
+  );
   const baseURL = config.projects[0]?.use.baseURL;
   if (!baseURL) throw new Error("e2e warm-up: no baseURL");
   await warm(baseURL);
