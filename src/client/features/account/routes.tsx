@@ -1,12 +1,16 @@
-// PLACEHOLDER — taken over by the account task (T23), which replaces this module and keeps the `routes` export.
+// The account feature: `/account/*`. Loading this module also starts the preferences sync for
+// whichever account signs in (./prefs-sync.ts).
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
+import { AccountPage } from "./AccountPage";
+import { startPrefsSync } from "./prefs-sync";
+
+startPrefsSync();
 
 export const routes: RouteObject[] = [
   {
     path: "account/*",
-    element: <PlaceholderPage name={t("nav.account")} />,
+    element: <AccountPage />,
     handle: { title: t("nav.account"), details: false },
   },
 ];
