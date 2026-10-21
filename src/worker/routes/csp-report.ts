@@ -21,7 +21,8 @@
 //     request, whatever the body holds;
 //   - at most SENTRY_MESSAGES_PER_MINUTE messages a minute leave one isolate;
 //   - the endpoint has a bucket of its own on RL_API (`csp:<address>`); over it a report is
-//     dropped (204). The pipeline's RL_API by address applies first (over it: 429).
+//     dropped (204). The pipeline's RL_API by address skips this path (middleware/rate-limit.ts),
+//     so a page with a repeating violation never spends its address's budget for the API.
 //   - a body over the cap leaves one `oversize` data point, so the loss is visible.
 
 import * as Sentry from "@sentry/cloudflare";

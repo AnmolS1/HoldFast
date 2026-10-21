@@ -286,8 +286,27 @@ describe("no session, no cookie, limited by address", () => {
       headers: { "cf-connecting-ip": "203.0.113.7" },
       env: { RL_API },
     });
-    // The pipeline's RL_API by address, then the endpoint's own bucket (F9).
-    expect(keys).toEqual(["ip:203.0.113.7", "csp:203.0.113.7"]);
+    // The endpoint's own bucket alone: the pipeline's RL_API by address is skipped for this path.
+    expect(keys).toEqual(["csp:203.0.113.7"]);
+  });
+
+  it("an address over RL_API's count still has its reports answered by the csp bucket; other routes are refused", async () => {
+    const RL_API = {
+      limit: async ({ key }: { key: string }) => ({ success: !key.startsWith("ip:") }),
+    };
+    const report = await post({ body: legacy({ "violated-directive": "img-src" }), env: { RL_API } });
+    expect(report.response.status).toBe(204);
+    expect(metricReasons()).toEqual(["csp:img-src"]);
+    // The same address, the same limiter, any other API path: 429.
+    const ctx = fakeCtx();
+    const other = await appWith(fakeCore()).fetch(
+      new Request(`${TEST_APP_ORIGIN}/api/public/config`),
+      testEnv({ ...ALLOW_ALL, RL_API }),
+      ctx,
+    );
+    expect(other.status).toBe(429);
+    await other.text();
+    await ctx.settle();
   });
 });
 
