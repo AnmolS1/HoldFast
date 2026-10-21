@@ -138,8 +138,8 @@ describe("csrf", () => {
   it("exempts /api/public/* and /api/auth/* but not /api/auth-intent", async () => {
     const { send } = setup();
     const evil = { origin: "https://evil.example" };
-    expect((await send("/api/public/report", { method: "POST", headers: evil })).body.reached).toBe(
-      "/api/public/report",
+    expect((await send("/api/public/_probe", { method: "POST", headers: evil })).body.reached).toBe(
+      "/api/public/_probe",
     );
     expect((await send("/api/auth/sign-in/email", { method: "POST", headers: evil })).body.reached).toBe(
       "/api/auth/sign-in/email",
@@ -732,7 +732,7 @@ describe("terms gate", () => {
     signIn(fake, { termsVersion: "2025-01-01" });
     fake.state.termsVersionInDb = "2025-01-01";
     // Stand-in routes answer with their own path: the request passed every middleware.
-    for (const path of ["/api/auth/sign-out", "/api/public/report", "/api/account/deletion"]) {
+    for (const path of ["/api/auth/sign-out", "/api/public/_probe", "/api/account/deletion"]) {
       const sent = await post(path);
       expect(sent.status, path).toBe(200);
       expect(sent.body.reached, path).toBe(path);
