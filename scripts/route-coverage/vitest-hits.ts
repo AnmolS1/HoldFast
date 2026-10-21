@@ -1,6 +1,7 @@
 // Route coverage, the Vitest half, INSIDE the test (a setup file of the Workers config): a hit is
 // recorded when a ROUTE'S HANDLER runs — the last handler of every route any Hono app registers
-// (`get`/`post`/…/`all`/`on`) is wrapped as it is registered. A request a middleware answers
+// (`get`/`post`/…/`all`/`on`) is wrapped as it is registered, when the Worker's own code
+// (src/worker/**) registers it — a test's probe router never counts. A request a middleware answers
 // first (the pipeline's 401/403/429, a CSRF refusal, the impersonation guard) runs no handler and
 // covers nothing (review M2). The list is put on the test's `meta`, which Vitest carries to the
 // reporter in the main process (./vitest-reporter.ts writes the hit file).
@@ -51,6 +52,16 @@ vi.mock("hono", async (importOriginal) => {
     };
     return [...args.slice(0, index), wrapped, ...args.slice(index + 1)];
   };
+  /**
+   * Was this route registered by the Worker's own code (src/worker/**)? A test's own probe router
+   * (`router.all("/*", …)` in pipeline.test.ts) answers every path, and its handler running is not
+   * the route's (review D1). The caller is the first frame outside this file and Hono.
+   */
+  const registeredByWorker = (): boolean => {
+    const frames = (new Error().stack ?? "").split("\n").slice(1);
+    const caller = frames.find((frame) => !/vitest-hits|\/hono\//.test(frame));
+    return caller !== undefined && /\/src\/worker\//.test(caller);
+  };
   class Hono<E extends import("hono").Env = import("hono").Env> extends hono.Hono<E> {
     constructor(...args: ConstructorParameters<typeof hono.Hono<E>>) {
       super(...args);
@@ -58,11 +69,11 @@ vi.mock("hono", async (importOriginal) => {
       const self = this as unknown as Record<string, (...given: unknown[]) => unknown>;
       for (const method of ["get", "post", "put", "delete", "options", "patch", "all"]) {
         const register = self[method]!;
-        self[method] = (...given: unknown[]) => register(...wrapLast(given));
+        self[method] = (...given: unknown[]) => register(...(registeredByWorker() ? wrapLast(given) : given));
       }
       const on = self.on!;
       self.on = (method: unknown, path: unknown, ...handlers: unknown[]) =>
-        on(method, path, ...wrapLast(handlers));
+        on(method, path, ...(registeredByWorker() ? wrapLast(handlers) : handlers));
     }
   }
   return { ...hono, Hono };
