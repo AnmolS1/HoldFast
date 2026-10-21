@@ -357,9 +357,9 @@ describe("app host headers", () => {
     hashedHeaders["content-security-policy"] = withNonceToken(hashedHeaders["content-security-policy"])!;
     expect(hashedHeaders).toEqual({
       "cache-control": "public, max-age=31536000, immutable",
-      "content-security-policy": CSP_HTTP,
+      // The page's policy less `report-to` (worker reports go by report-uri).
+      "content-security-policy": CSP_HTTP.replace("; report-to csp", ""),
       "content-type": "text/javascript",
-      "reporting-endpoints": 'csp="/api/public/csp-report"',
       "x-content-type-options": "nosniff",
     });
     await hashed.response.text();
