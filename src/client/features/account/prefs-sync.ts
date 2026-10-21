@@ -2,15 +2,15 @@
 // signed in — once per account, from this feature's entry module.
 //
 // It follows the session query: when the server's session answer names an account the sync is not
-// registered for,
-// the server copy is loaded and wins, and from then on each change is saved to the server
-// debounced (lib/prefs.ts). An account change purges first (lib/query.ts `adoptIdentity`): the
+// registered for, the server copy is loaded and wins — over everything but a change made while it
+// was loading, which is newer — and from then on each change is saved to the server debounced
+// (lib/prefs.ts). An account change purges first (lib/query.ts `adoptIdentity`): the
 // purge drops the sync and any save still waiting (lib/prefs.ts's own purger, and this file's),
 // and the next session answer registers it again for the new account. A save is only ever sent
 // for the account it was registered for.
 import type { PrefsDto } from "../../../shared/schemas/account";
 import { registerUserStatePurger, type SessionShape } from "../../lib/contracts";
-import { registerPrefsSync, type Prefs, type PrefsSync } from "../../lib/prefs";
+import { getPrefs, registerPrefsSync, type Prefs, type PrefsSync } from "../../lib/prefs";
 import { getKnownUserId, queryClient, sessionQuery } from "../../lib/query";
 import { patchPrefs, prefsQuery } from "./api";
 
@@ -24,7 +24,11 @@ const toPrefs = (dto: PrefsDto): Prefs => ({
 export function prefsSyncFor(userId: string): PrefsSync {
   return {
     async load() {
+      const before = getPrefs();
       const dto = await queryClient.fetchQuery({ ...prefsQuery, staleTime: 0 });
+      // The person changed something while the server's copy was on its way: that change is
+      // newer than the copy and is the one being saved — the copy must not undo it.
+      if (getPrefs() !== before) return null;
       return toPrefs(dto);
     },
     async save(prefs) {

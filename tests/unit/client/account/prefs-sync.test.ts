@@ -150,6 +150,30 @@ describe("the preferences sync", () => {
   });
 });
 
+describe("a change made while the server copy is loading", () => {
+  it("is kept — the server copy does not undo it — and is what gets saved", async () => {
+    let answer: (response: Response) => void = () => {};
+    const calls = mockFetch((call: MockCall) => {
+      if (call.path === "/api/auth/get-session") return json(sessionOf({ id: A, email: "aaaa@example.com" }));
+      if (call.path === "/api/account/prefs" && call.method === "GET")
+        return new Promise<Response>((resolve) => (answer = resolve));
+      if (call.path === "/api/account/prefs" && call.method === "PATCH")
+        return json(prefsOf(call.body as Record<string, unknown>));
+      return undefined;
+    });
+    browserSession = A;
+    await queryClient.fetchQuery({ ...sessionQuery, staleTime: 0 });
+    await waitFor(() => expect(calls.some((call) => call.path === "/api/account/prefs")).toBe(true));
+    // The person picks Dark before the server's copy has arrived.
+    setPrefs({ theme: "dark" });
+    answer(json(prefsOf({ theme: "light", density: "comfortable" })));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(getPrefs().theme).toBe("dark");
+    await waitFor(() => expect(patches(calls)).toHaveLength(1), { timeout: SYNC_DEBOUNCE_MS * 4 });
+    expect(patches(calls)[0]!.body).toMatchObject({ theme: "dark" });
+  });
+});
+
 describe("what the sync follows", () => {
   it("a session written into the cache by hand (a seed, a sign-out's null) registers nothing", async () => {
     const { calls } = server({ [A]: {} });
