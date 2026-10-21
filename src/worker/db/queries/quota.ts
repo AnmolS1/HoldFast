@@ -22,7 +22,7 @@
 // signal — and the account is shown full (`holderUsage`). It never stores more than its quota
 // plus that multiple of it (one last upload past the line included).
 
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
 import { QueryError } from "../errors";
 import { user } from "../schema";
@@ -67,11 +67,28 @@ export async function keptBackstopReached(db: Executor, ownerId: string): Promis
 }
 
 /**
+ * The accounts past the backstop NOW — kept deleted-for-good bytes above `KEPT_MAX_QUOTAS` × their
+ * quota, by the same expression `keptBackstopReached` and `reserve` use — ascending by id, at most
+ * `limit`. For the backup job's daily state alarm (T27 R-6/R-8). One statement: only accounts with
+ * a purge-requested root are looked at, each with its own correlated kept-tree.
+ */
+export async function ownersPastKeptBackstop(db: Executor, opts: { limit: number }): Promise<string[]> {
+  const limit = Math.max(1, Math.min(1000, Math.trunc(opts.limit)));
+  const result = await db.execute<{ id: string }>(sql`
+    SELECT u.id FROM "user" u
+    WHERE EXISTS (SELECT 1 FROM nodes p WHERE p.owner_id = u.id AND p.purge_requested_at IS NOT NULL)
+      AND ${deletedKeptBytesSql(sql`u.id`)} > ${KEPT_MAX_QUOTAS} * u.quota_bytes
+    ORDER BY u.id
+    LIMIT ${limit}`);
+  return result.rows.map((row) => row.id);
+}
+
+/**
  * Every root the owner deleted for good that is still stored (`purge_requested_at` set — a purged
  * root's rows are gone), and everything under it, once each — nested requested roots included
  * once. (Inside, the name `asked` is taken.)
  */
-const deletedKeptTree = (ownerId: string) => sql`
+const deletedKeptTree = (ownerId: string | SQL) => sql`
   WITH RECURSIVE asked(id) AS (
     SELECT n.id FROM nodes n
     WHERE n.owner_id = ${ownerId} AND n.purge_requested_at IS NOT NULL
@@ -84,7 +101,7 @@ const keptFilesSql = sql`(SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN aske
 const keptVersionsSql = sql`(SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)`;
 
 /** `deletedKeptBytes` as one SQL expression (bigint), for a statement of its own. */
-function deletedKeptBytesSql(ownerId: string) {
+function deletedKeptBytesSql(ownerId: string | SQL) {
   return sql`(
     ${deletedKeptTree(ownerId)}
     SELECT ${keptFilesSql} + ${keptVersionsSql}
