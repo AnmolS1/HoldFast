@@ -109,7 +109,11 @@ export async function readPage(
   shape: TableShape,
   after: string | null,
   limit: number,
+  /** Columns left out of every line (the restore then loads them as NULL). Never a key column. */
+  omit: readonly string[] = [],
 ): Promise<string[]> {
+  if (omit.some((column) => shape.key.includes(column)))
+    throw new Error("backup: a key column cannot be omitted");
   const table = sql.raw(ident(shape.name));
   const keyOf = (alias: string) => sql.raw(shape.key.map((column) => `${alias}.${ident(column)}`).join(", "));
   const where =
@@ -117,7 +121,7 @@ export async function readPage(
       ? sql``
       : sql`WHERE (${keyOf("t")}) > (SELECT ${keyOf("c")} FROM jsonb_populate_record(NULL::${table}, ${after}::jsonb) c)`;
   const result = await db.execute<{ line: string }>(sql`
-    SELECT to_jsonb(t)::text AS line FROM ${table} t
+    SELECT (to_jsonb(t)${sql.raw(omit.map((column) => ` - '${column.replace(/'/g, "''")}'`).join(""))})::text AS line FROM ${table} t
     ${where}
     ORDER BY ${keyOf("t")}
     LIMIT ${limit}`);
@@ -134,4 +138,49 @@ export async function transformUnits(db: Executor, from: string, to: string): Pr
     SELECT COALESCE(SUM(count), 0)::bigint AS units FROM download_ledger
     WHERE subject_type = 'transform_user' AND day >= ${from}::date AND day < ${to}::date`);
   return Number(result.rows[0]?.units ?? 0);
+}
+
+/**
+ * Each table's columns, in their order, as `name:type` (`udt_name`: enums by their own name) —
+ * what the restore compares with its target, so that a renamed, dropped or added column refuses
+ * the set instead of loading it silently wrong.
+ */
+export async function tableColumns(db: Executor, names: string[]): Promise<Map<string, string[]>> {
+  const result = await db.execute<{ table: string; columns: string[] }>(sql`
+    SELECT table_name::text AS "table",
+           array_agg(column_name::text || ':' || udt_name::text ORDER BY ordinal_position) AS columns
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+    GROUP BY table_name`);
+  const wanted = new Set(names);
+  return new Map(result.rows.filter((row) => wanted.has(row.table)).map((row) => [row.table, row.columns]));
+}
+
+/**
+ * The database's migration level: the `created_at` of the last migration drizzle applied, which
+ * drizzle sets to that migration's journal `when` (drizzle/meta/_journal.json). Null when none.
+ */
+export async function migrationLevel(db: Executor): Promise<number | null> {
+  const result = await db.execute<{ when: string | number | null }>(
+    sql`SELECT max(created_at)::bigint AS "when" FROM drizzle.__drizzle_migrations`,
+  );
+  const raw = result.rows[0]?.when;
+  return raw === null || raw === undefined ? null : Number(raw);
+}
+
+/** For each account, the last UTC day the kept-bytes alarm named it (its `notice` marker), if ever. */
+export async function lastKeptAlerts(
+  db: Executor,
+  ownerIds: readonly string[],
+): Promise<Map<string, string>> {
+  if (ownerIds.length === 0) return new Map();
+  const keys = sql.join(
+    ownerIds.map((id) => sql`${`kept_backstop:${id}`}`),
+    sql`, `,
+  );
+  const result = await db.execute<{ key: string; day: string }>(sql`
+    SELECT subject_id AS key, max(day)::text AS day FROM download_ledger
+    WHERE subject_type = 'notice' AND subject_id IN (${keys})
+    GROUP BY subject_id`);
+  return new Map(result.rows.map((row) => [row.key.slice("kept_backstop:".length), row.day]));
 }

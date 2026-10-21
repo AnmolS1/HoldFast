@@ -6,43 +6,61 @@
 //
 // WHAT IT REFUSES, before it writes anything:
 //   - a date without `_manifest.json` (an incomplete set: the export writes the manifest last);
-//   - an object whose size or SHA-256 differs from the manifest's;
-//   - a manifest whose tables are not exactly the target's (another schema version);
-//   - a target with any row in any table (it loads only into an empty migrated database);
 //   - a set written while the rollback detector read anything but "ok", unless the caller says it
-//     has seen the warning (`acceptDetection`).
+//     has seen the warning (`acceptDetection`);
+//   - ANOTHER SCHEMA VERSION: the target's tables are not exactly the set's (every table of the
+//     target's schema counts — an operator's scratch table too), its migration level is not the
+//     set's (drizzle's last applied migration), or any table's columns — names, order, types —
+//     differ. `jsonb_populate_recordset` would otherwise load such a set SILENTLY wrong (a renamed
+//     column's data dropped, a new column NULL instead of its default). Migrate the empty target to
+//     the set's level first, restore, then run the newer migrations;
+//   - a target with any row in any table;
+//   - an object whose size or SHA-256 differs from the manifest's.
 //
 // HOW IT LOADS — ONE TRANSACTION, so a failure leaves the target as empty as it found it:
 //   1. every table's lines into a staging copy (`CREATE TEMP TABLE … (LIKE …)`, no constraints),
 //      through `jsonb_populate_recordset(NULL::<table>, …)` — Postgres reads its own `to_jsonb`
-//      output back, types and all;
-//   2. DANGLING ROWS. A set is written over several passes, so a row can name a parent that was
-//      removed between them (standing check (a): an account purged between two passes). Each
-//      such row gets what the database itself did to it when the parent went: its foreign key's
-//      ON DELETE rule — SET NULL nulls the reference; CASCADE, RESTRICT and NO ACTION drop the row
-//      (and whatever then names IT, to a fixed point). Every row so changed is NAMED (table,
-//      constraint, primary key) in the result; nothing is dropped silently;
-//   3. into the real tables, parents first; a table that references itself (`nodes.parent_id`, a
-//      NON-deferrable foreign key) level by level: the rows whose parent is already loaded, until
-//      a round loads none;
-//   4. `session` and `verification` are emptied: no restored session token comes back to life,
-//      everyone signs in again;
+//      output back, types and all — then `ANALYZE`d for the anti-joins below;
+//   2. DANGLING ROWS. A set written by this project's job is one snapshot and has none; a set from
+//      elsewhere (an older format, a hand-made one) may name a parent it lacks. Each such row gets
+//      what the database itself does when a parent goes: its foreign key's ON DELETE rule — SET
+//      NULL nulls the reference; CASCADE, RESTRICT and NO ACTION drop the row (and whatever then
+//      names IT, to a fixed point). Every row so changed is NAMED (table, constraint, primary key —
+//      masked where the key is itself a secret). NEVER SILENTLY UNDER A HOLD: a dropped row that a
+//      legal hold protects (its node's, an ancestor folder's, its owner's, or its own flag) REFUSES
+//      the restore unless the caller says to drop it anyway (`dropHeldDangling`);
+//   3. into the real tables, parents first; a table that references itself (`nodes.parent_id`)
+//      level by level — the rows whose parent is already loaded, until a round loads none. (Not
+//      for the foreign key, which Postgres checks at the end of each statement: for the partial
+//      unique indexes on live names, which ARE checked row by row — loading children before their
+//      folder exists would make them top-level names for a moment.);
+//   4. `session` and `verification` are emptied (the job exports them with no rows anyway): no
+//      restored session token comes back to life, everyone signs in again;
 //   5. every table's count is checked against the manifest's, less the rows step 2 dropped.
 
 export type RestoreSql = {
   query<Row = Record<string, unknown>>(text: string, params?: unknown[]): Promise<{ rows: Row[] }>;
 };
 
-export type ManifestTable = { name: string; rows: number; bytes: number; sha256: string };
+export type ManifestTable = { name: string; rows: number; bytes: number; sha256: string; columns?: string[] };
 export type RestoreManifest = {
   commit: string;
   startedAt: string;
   finishedAt: string;
   detection?: string;
+  migration?: { tag: string | null; when: number | null };
   tables: ManifestTable[];
 };
 
-export type Dangling = { table: string; constraint: string; action: "set_null" | "dropped"; key: string };
+export type Dangling = {
+  table: string;
+  constraint: string;
+  action: "set_null" | "dropped";
+  /** The primary key, comma-joined — or `sha256:<12 hex>` where the key is itself a secret. */
+  key: string;
+  /** A legal hold protects the row (its node, an ancestor folder, its owner, or its own flag). */
+  held: boolean;
+};
 
 export type RestoreResult = {
   manifest: RestoreManifest;
@@ -57,6 +75,8 @@ export class RestoreRefusal extends Error {}
 /** Tables emptied after the load: nobody's session comes back. */
 export const SIGNED_OUT_TABLES = ["session", "verification"] as const;
 const BATCH_LINES = 500;
+/** Tables whose primary key is itself a secret (a live invite code; a blocked file's hash): never printed. */
+export const SECRET_KEY_TABLES = ["invites", "hash_blocklist"] as const;
 
 export const setKey = (date: string, name: string) => `b/db/${date}/${name}`;
 
@@ -66,6 +86,12 @@ const stage = (name: string) => ident(`_restore_${name}`);
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** What may be shown of a row's key: the key, or a short hash of it for a secret key. */
+export async function printableKey(table: string, key: string): Promise<string> {
+  if (!(SECRET_KEY_TABLES as readonly string[]).includes(table)) return key;
+  return `sha256:${(await sha256Hex(new TextEncoder().encode(key))).slice(0, 12)}`;
 }
 
 async function gunzipText(bytes: Uint8Array): Promise<string> {
@@ -152,6 +178,8 @@ export type RestoreOptions = {
   sql: RestoreSql;
   /** The set was written while the detector read rollback (or anything but ok): load it anyway. */
   acceptDetection?: boolean;
+  /** Dangling rows under a legal hold would be dropped: drop them anyway (after recording them). */
+  dropHeldDangling?: boolean;
   log?: (line: string) => void;
 };
 
@@ -190,8 +218,39 @@ export async function restoreSet(options: RestoreOptions): Promise<RestoreResult
   const extra = listed.filter((name) => !targetTables.includes(name));
   if (missing.length || extra.length) {
     throw new RestoreRefusal(
-      `the set and the target differ in tables (not in the set: ${missing.join(", ") || "none"}; not in the target: ${extra.join(", ") || "none"}) — another schema version`,
+      `another schema version: the set and the target differ in tables (not in the set: ${missing.join(", ") || "none"}; not in the target: ${extra.join(", ") || "none"}). Every table of the target's schema counts, a scratch table too`,
     );
+  }
+  let targetWhen: number | null = null;
+  try {
+    const level = await sql.query<{ when: string | number | null }>(
+      `SELECT max(created_at)::bigint AS "when" FROM drizzle.__drizzle_migrations`,
+    );
+    const raw = level.rows[0]?.when;
+    targetWhen = raw === null || raw === undefined ? null : Number(raw);
+  } catch {
+    targetWhen = null;
+  }
+  const setWhen = manifest.migration?.when ?? null;
+  if (setWhen === null || targetWhen !== setWhen) {
+    throw new RestoreRefusal(
+      `another schema version: the set's migration level is ${manifest.migration?.tag ?? "not recorded"} (${String(setWhen)}), the target's is ${String(targetWhen)} — migrate the empty target to the set's level first, restore, then run the newer migrations`,
+    );
+  }
+  const columnRows = await sql.query<{ table: string; columns: string[] }>(
+    `SELECT table_name::text AS "table",
+            array_agg(column_name::text || ':' || udt_name::text ORDER BY ordinal_position) AS columns
+     FROM information_schema.columns WHERE table_schema = current_schema() GROUP BY table_name`,
+  );
+  const targetColumns = new Map(columnRows.rows.map((row) => [row.table, row.columns]));
+  for (const table of manifest.tables) {
+    const set = (table.columns ?? []).join(", ");
+    const target = (targetColumns.get(table.name) ?? []).join(", ");
+    if (set !== target) {
+      throw new RestoreRefusal(
+        `another schema version: the columns of ${table.name} differ (set: ${set || "not recorded"}; target: ${target})`,
+      );
+    }
   }
   for (const name of targetTables) {
     const rows = await sql.query<{ any: boolean }>(`SELECT EXISTS (SELECT 1 FROM ${ident(name)}) AS any`);
@@ -239,7 +298,37 @@ export async function restoreSet(options: RestoreOptions): Promise<RestoreResult
       if (lines.length !== expected)
         throw new RestoreRefusal(`${name}: ${lines.length} lines, the manifest says ${expected}`);
       loaded[name] = lines.length;
+      await sql.query(`ANALYZE ${stage(name)}`);
     }
+
+    // What a legal hold protects, read BEFORE anything is dropped (the folder that carries a hold
+    // may be among the dropped rows): held accounts, and held nodes — their own flag, their
+    // owner's, or any ancestor's (inherited, as db/queries/holds.ts reaches down from a folder).
+    const heldUsers = new Set<string>();
+    const heldNodes = new Set<string>();
+    if (order.includes("user")) {
+      const users = await sql.query<{ id: string }>(
+        `SELECT id::text AS id FROM ${stage("user")} WHERE legal_hold`,
+      );
+      for (const row of users.rows) heldUsers.add(row.id);
+    }
+    if (order.includes("nodes") && order.includes("user")) {
+      const held = await sql.query<{ id: string }>(`
+        WITH RECURSIVE held(id) AS (
+          SELECT n.id FROM ${stage("nodes")} n LEFT JOIN ${stage("user")} u ON u.id = n.owner_id
+          WHERE n.legal_hold OR COALESCE(u.legal_hold, false)
+          UNION
+          SELECT c.id FROM ${stage("nodes")} c JOIN held h ON c.parent_id = h.id)
+        SELECT id::text AS id FROM held`);
+      for (const row of held.rows) heldNodes.add(row.id);
+    }
+    const isHeld = (table: string, row: Record<string, unknown>): boolean =>
+      row.legal_hold === true ||
+      (table === "nodes" && heldNodes.has(String(row.id))) ||
+      (typeof row.node_id === "string" && heldNodes.has(row.node_id)) ||
+      ["owner_id", "user_id"].some(
+        (column) => typeof row[column] === "string" && heldUsers.has(row[column] as string),
+      );
 
     // 2. dangling rows, to a fixed point
     for (let changed = true; changed;) {
@@ -255,19 +344,36 @@ export async function restoreSet(options: RestoreOptions): Promise<RestoreResult
         const statement =
           key.onDelete === "n"
             ? `UPDATE ${stage(key.table)} s SET ${key.columns.map((c) => `${ident(c)} = NULL`).join(", ")}
-               WHERE ${missingParent} RETURNING ${keyText} AS key`
-            : `DELETE FROM ${stage(key.table)} s WHERE ${missingParent} RETURNING ${keyText} AS key`;
-        const touched = await sql.query<{ key: string }>(statement);
+               WHERE ${missingParent} RETURNING ${keyText} AS key, to_jsonb(s) AS row`
+            : `DELETE FROM ${stage(key.table)} s WHERE ${missingParent} RETURNING ${keyText} AS key, to_jsonb(s) AS row`;
+        const touched = await sql.query<{ key: string; row: Record<string, unknown> }>(statement);
         for (const row of touched.rows) {
           dangling.push({
             table: key.table,
             constraint: key.name,
             action: key.onDelete === "n" ? "set_null" : "dropped",
-            key: row.key,
+            key: await printableKey(key.table, row.key),
+            held: isHeld(key.table, row.row),
           });
         }
         if (touched.rows.length) changed = true;
       }
+    }
+
+    // Never a held row dropped without the caller's word for it.
+    const heldDropped = dangling.filter((row) => row.held && row.action === "dropped");
+    if (heldDropped.length) {
+      const named = heldDropped
+        .slice(0, 20)
+        .map((row) => `${row.table} ${row.key}`)
+        .join("; ");
+      const message = `${heldDropped.length} dangling row(s) under a legal hold would be dropped (${named}${heldDropped.length > 20 ? "; …" : ""})`;
+      if (!options.dropHeldDangling) {
+        throw new RestoreRefusal(
+          `${message} — record them for runbook step 3(a), then pass the acknowledgement to drop them`,
+        );
+      }
+      warnings.push(message);
     }
 
     // 3. into the real tables, parents first; a self-referencing table level by level

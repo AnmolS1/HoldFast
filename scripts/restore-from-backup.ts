@@ -15,9 +15,12 @@
 //
 //   --accept-detection   the manifest says the set was written while the rollback detector read
 //                        something other than "ok": load it anyway (runbooks/backup-restore.md)
+//   --drop-held-dangling a row the set cannot place (its parent is missing) is under a legal hold:
+//                        drop it anyway — only after recording it for runbook step 3(a)
 //   --database-is-remote the database is not on this machine (refused otherwise, as create-invite does)
 //
-// What is printed: counts, table names, the dangling rows' table/constraint/primary key, and the
+// What is printed: counts, table names, the dangling rows' table/constraint/primary key (a key that is
+// itself a secret — an invite code, a blocked file's hash — only as `sha256:<12 hex>`), and the
 // database NAME and class. Never a row's content, never the host or the URL. The export holds
 // password hashes and TOTP secrets: never restore a PRODUCTION set into the dev database or any
 // shared place.
@@ -85,6 +88,7 @@ async function main(): Promise<void> {
     date?: string;
     remote?: boolean;
     "accept-detection"?: boolean;
+    "drop-held-dangling"?: boolean;
     "database-is-remote"?: boolean;
   };
   try {
@@ -94,6 +98,7 @@ async function main(): Promise<void> {
         date: { type: "string" },
         remote: { type: "boolean" },
         "accept-detection": { type: "boolean" },
+        "drop-held-dangling": { type: "boolean" },
         "database-is-remote": { type: "boolean" },
       },
       strict: true,
@@ -125,11 +130,14 @@ async function main(): Promise<void> {
       read: (key) => wranglerGet(values.bucket!, key, values.remote === true),
       sql: { query: async (text, params) => ({ rows: (await client.query(text, params)).rows }) },
       acceptDetection: values["accept-detection"] === true,
+      dropHeldDangling: values["drop-held-dangling"] === true,
       log: (line) => process.stderr.write(`restore: ${line}\n`),
     });
     for (const warning of result.warnings) process.stderr.write(`restore: WARNING ${warning}\n`);
     for (const row of result.dangling) {
-      process.stdout.write(`dangling\t${row.table}\t${row.constraint}\t${row.action}\t${row.key}\n`);
+      process.stdout.write(
+        `dangling\t${row.table}\t${row.constraint}\t${row.action}\t${row.key}${row.held ? "\tHELD" : ""}\n`,
+      );
     }
     for (const table of result.manifest.tables) {
       process.stdout.write(

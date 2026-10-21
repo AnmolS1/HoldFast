@@ -9,19 +9,23 @@
 // copy) — with the connection's search_path on that schema, exactly as the CLI runs against an
 // empty migrated database. Credentials and secrets here are made up.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { RestoreRefusal, restoreSet, type RestoreSql } from "../../../scripts/ops/restore-core";
+import journal from "../../../drizzle/meta/_journal.json";
+import { restoreSet, type RestoreSql } from "../../../scripts/ops/restore-core";
 import { hashPassword, verifyPassword } from "../../../src/worker/auth/password";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { schemaTableNames } from "../../../src/worker/db/queries/backup";
+import { withJobLock } from "../../../src/worker/db/queries/trash-jobs";
 import { account, auditLog, nodes, nodeVersions, session, user } from "../../../src/worker/db/schema";
 import {
   BACKUP_PART_BYTES,
   backupPass,
+  EMPTIED_TABLES,
   job,
   manifestKey,
+  NULLED_COLUMNS,
   tableKey,
   type Manifest,
 } from "../../../src/worker/jobs/backup";
@@ -29,6 +33,7 @@ import { cronEvent, jobContext } from "../trash/helpers";
 import { makeFile, makeFolder, makeUser, rand, testDb } from "../services-core/helpers";
 
 const PASSWORD = "made-up restore password 7"; // made up
+const OAUTH_SENTINEL = `made-up-oauth-token-${rand(8)}`; // made up
 const OPERATOR = `t27-backup-${rand()}@example.test`; // made up
 const today = new Date().toISOString().slice(0, 10);
 const ctx = () => jobContext({ env: { ADMIN_EMAILS: OPERATOR } });
@@ -36,7 +41,7 @@ const ctx = () => jobContext({ env: { ADMIN_EMAILS: OPERATOR } });
 type Seeded = { userId: string; folder: string; child: string; file: string; versionId: string };
 
 /** A signed-up account: a password, a session, a folder in a folder holding a file with an old version. */
-async function seedAccount(): Promise<Seeded> {
+async function seedAccount(options: { folderHeld?: boolean } = {}): Promise<Seeded> {
   const owner = await makeUser();
   const now = new Date();
   await testDb()
@@ -47,6 +52,8 @@ async function seedAccount(): Promise<Seeded> {
       providerId: "credential",
       userId: owner.id,
       password: await hashPassword(PASSWORD),
+      accessToken: OAUTH_SENTINEL,
+      refreshToken: OAUTH_SENTINEL,
       createdAt: now,
       updatedAt: now,
     });
@@ -60,7 +67,7 @@ async function seedAccount(): Promise<Seeded> {
       createdAt: now,
       updatedAt: now,
     } as typeof session.$inferInsert);
-  const folder = await makeFolder(owner.id);
+  const folder = await makeFolder(owner.id, null, { legalHold: options.folderHeld === true });
   const child = await makeFolder(owner.id, folder.id);
   const file = await makeFile(owner.id, child.id, { size: 10 });
   const versionId = uuidv7();
@@ -115,6 +122,44 @@ async function gunzip(key: string): Promise<string> {
   return new Response(object!.body.pipeThrough(new DecompressionStream("gzip"))).text();
 }
 
+async function readManifest(date: string): Promise<Manifest> {
+  return (await (await env.FILES.get(manifestKey(date)))!.json()) as Manifest;
+}
+
+async function writeManifest(date: string, manifest: Manifest) {
+  await env.FILES.put(manifestKey(date), JSON.stringify(manifest));
+}
+
+const hex = (buffer: ArrayBuffer) =>
+  [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** Copies set `from` to set `to`, with one table's lines filtered — a set as a straddle would leave it. */
+async function copySet(
+  from: string,
+  to: string,
+  filter: { table?: string; drop?: (line: string) => boolean } = {},
+) {
+  const manifest = await readManifest(from);
+  for (const table of manifest.tables) {
+    let bytes = new Uint8Array(await (await env.FILES.get(tableKey(from, table.name)))!.arrayBuffer());
+    if (table.name === filter.table) {
+      const lines = (await gunzip(tableKey(from, table.name))).split("\n").filter(Boolean);
+      const kept = lines.filter((line) => !filter.drop!(line));
+      const text = kept.map((line) => `${line}\n`).join("");
+      bytes = new Uint8Array(
+        await new Response(
+          new Blob([text]).stream().pipeThrough(new CompressionStream("gzip")),
+        ).arrayBuffer(),
+      );
+      table.rows = kept.length;
+      table.bytes = bytes.byteLength;
+      table.sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
+    }
+    await env.FILES.put(tableKey(to, table.name), bytes);
+  }
+  await writeManifest(to, manifest);
+}
+
 // ── the scratch schemas ───────────────────────────────────────────────────────────────────────
 
 const schemas: string[] = [];
@@ -153,12 +198,31 @@ const readLocal = async (key: string) => {
   return object ? new Uint8Array(await object.arrayBuffer()) : null;
 };
 
+/** A store that fails `put` of one key — an invocation killed at that table. */
+function failingPut(failKey: string): R2Bucket {
+  return new Proxy(env.FILES, {
+    get(target, property) {
+      if (property === "put") {
+        return async (key: string, ...rest: unknown[]) => {
+          if (key === failKey) throw new Error("the invocation was killed");
+          return (target.put as (...args: unknown[]) => unknown)(key, ...rest);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as R2Bucket;
+}
+
 let a: Seeded;
 let b: Seeded;
+let held: Seeded;
+const extraNodes: string[] = [];
 
 beforeAll(async () => {
   a = await seedAccount();
   b = await seedAccount();
+  held = await seedAccount({ folderHeld: true });
   await seedFiller(12);
 }, 120_000);
 
@@ -169,7 +233,11 @@ afterAll(async () => {
   for (const schema of schemas) await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
   await admin.end();
   await testDb().delete(auditLog).where(eq(auditLog.action, AUDIT_ACTION));
-  for (const seeded of [a, b]) if (seeded) await purgeAccount(seeded);
+  if (extraNodes.length) {
+    await testDb().update(nodes).set({ parentId: null }).where(inArray(nodes.id, extraNodes));
+    await testDb().delete(nodes).where(inArray(nodes.id, extraNodes));
+  }
+  for (const seeded of [a, b, held]) if (seeded) await purgeAccount(seeded);
 }, 120_000);
 
 describe("the nightly export, run as the cron slot runs it", () => {
@@ -190,8 +258,7 @@ describe("the nightly export, run as the cron slot runs it", () => {
     expect(added.length).toBeGreaterThan(0);
     for (const key of added) expect(key.startsWith(`b/db/${today}/`), key).toBe(true);
 
-    const object = await env.FILES.get(manifestKey(today));
-    manifest = (await object!.json()) as Manifest;
+    manifest = await readManifest(today);
     expect(manifest.tables.map((table) => table.name).sort()).toEqual(schemaTableNames());
     expect(manifest.detection).toBe("ok");
     for (const table of manifest.tables) {
@@ -206,6 +273,28 @@ describe("the nightly export, run as the cron slot runs it", () => {
     expect(await gunzip(tableKey(today, "user"))).toContain(a.userId);
     expect(await gunzip(tableKey(today, "nodes"))).toContain(a.file);
   }, 600_000);
+
+  it("M4: session and verification leave as ZERO-row tables; the OAuth tokens of `account` are not exported", async () => {
+    expect([...EMPTIED_TABLES].sort()).toEqual(["session", "verification"]);
+    for (const name of EMPTIED_TABLES) {
+      expect(manifest.tables.find((table) => table.name === name)!.rows, name).toBe(0);
+      expect(await gunzip(tableKey(today, name)), name).toBe("");
+    }
+    expect(manifest.emptied).toEqual([...EMPTIED_TABLES]);
+    expect(manifest.nulled).toEqual(NULLED_COLUMNS);
+    const accounts = await gunzip(tableKey(today, "account"));
+    expect(accounts).toContain(a.userId);
+    expect(accounts).not.toContain(OAUTH_SENTINEL);
+  });
+
+  it("M2: the manifest records the migration level and every table's columns", async () => {
+    const last = journal.entries[journal.entries.length - 1]!;
+    expect(manifest.migration).toEqual({ tag: last.tag, when: last.when });
+    const nodesColumns = manifest.tables.find((table) => table.name === "nodes")!.columns;
+    expect(nodesColumns).toContain("parent_id:uuid");
+    expect(nodesColumns).toContain("legal_hold:bool");
+    for (const table of manifest.tables) expect(table.columns.length, table.name).toBeGreaterThan(0);
+  });
 
   it("a second pass the same day finds the set complete and writes nothing", async () => {
     const before = await listAll(`b/db/${today}/`);
@@ -225,15 +314,15 @@ describe("the nightly export, run as the cron slot runs it", () => {
       const { rows } = await target.client.query<{ n: number }>(
         `SELECT count(*)::int AS n FROM "${table.name}"`,
       );
-      const expected = ["session", "verification"].includes(table.name) ? 0 : table.rows;
-      expect(rows[0]!.n, table.name).toBe(expected);
+      expect(rows[0]!.n, table.name).toBe(table.rows);
     }
-    const restored = await target.client.query<{ password: string }>(
-      `SELECT password FROM account WHERE user_id = $1 AND provider_id = 'credential'`,
+    const restored = await target.client.query<{ password: string; access_token: string | null }>(
+      `SELECT password, access_token FROM account WHERE user_id = $1 AND provider_id = 'credential'`,
       [a.userId],
     );
     expect(await verifyPassword({ hash: restored.rows[0]!.password, password: PASSWORD })).toBe(true);
     expect(await verifyPassword({ hash: restored.rows[0]!.password, password: "not it" })).toBe(false);
+    expect(restored.rows[0]!.access_token).toBeNull();
     const tree = await target.client.query<{ id: string; parent_id: string | null }>(
       `SELECT id, parent_id FROM nodes WHERE owner_id = $1`,
       [a.userId],
@@ -261,13 +350,104 @@ describe("the nightly export, run as the cron slot runs it", () => {
       /nodes: SHA-256 differs/,
     );
     await target.client.query(`INSERT INTO pending_user_purges (user_id, scheduled_for) VALUES ('x', now())`);
-    await expect(restoreSet({ date: today, read: readLocal, sql: target.sql })).rejects.toBeInstanceOf(
-      RestoreRefusal,
+    await expect(restoreSet({ date: today, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /is not empty/,
     );
+  }, 300_000);
+
+  it("B1/R-10: a set written while the detector did not read ok is refused — loaded only when acknowledged", async () => {
+    const date = "2099-04-01";
+    await copySet(today, date);
+    await writeManifest(date, { ...(await readManifest(date)), detection: "rollback" });
+    const target = await scratchTarget();
+    await expect(restoreSet({ date, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /rollback detector read "rollback"/,
+    );
+    const { rows } = await target.client.query<{ n: number }>(`SELECT count(*)::int AS n FROM "user"`);
+    expect(rows[0]!.n).toBe(0);
+    const loaded = await restoreSet({ date, read: readLocal, sql: target.sql, acceptDetection: true });
+    expect(loaded.warnings).toEqual([expect.stringContaining('read "rollback"')]);
+  }, 300_000);
+
+  it("B1/M2: another schema version is refused — a table missing or extra, another migration level", async () => {
+    const target = await scratchTarget();
+    const date = "2099-04-02";
+    await copySet(today, date);
+    const base = await readManifest(date);
+    await writeManifest(date, {
+      ...base,
+      tables: base.tables.filter((table) => table.name !== "user_prefs"),
+    });
+    await expect(restoreSet({ date, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /another schema version.*not in the set: user_prefs/,
+    );
+    await writeManifest(date, {
+      ...base,
+      tables: [...base.tables, { ...base.tables[0]!, name: "gone_table" }],
+    });
+    await expect(restoreSet({ date, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /another schema version.*not in the target: gone_table/,
+    );
+    await writeManifest(date, { ...base, migration: { tag: "0007_jit_off", when: 1 } });
+    await expect(restoreSet({ date, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /migration level.*0007_jit_off/,
+    );
+  }, 300_000);
+
+  it("M2: a column renamed, dropped or added in the target is refused, naming the table", async () => {
+    const target = await scratchTarget();
+    const change = async (ddl: string, undo: string, expected: RegExp) => {
+      await target.client.query(ddl);
+      await expect(restoreSet({ date: today, read: readLocal, sql: target.sql })).rejects.toThrow(expected);
+      await target.client.query(undo);
+    };
+    await change(
+      `ALTER TABLE user_prefs RENAME COLUMN theme TO theme_renamed`,
+      `ALTER TABLE user_prefs RENAME COLUMN theme_renamed TO theme`,
+      /columns of user_prefs differ/,
+    );
+    await change(
+      `ALTER TABLE invites ADD COLUMN extra text`,
+      `ALTER TABLE invites DROP COLUMN extra`,
+      /columns of invites differ/,
+    );
+    await change(`ALTER TABLE invites DROP COLUMN note`, `SELECT 1`, /columns of invites differ/);
   }, 300_000);
 });
 
-describe("a pass that dies, and passes that straddle an account purge", () => {
+describe("passes: the deadline, a death, the lock, the read-back, one snapshot", () => {
+  it("B1: a pass cut by its soft deadline leaves no manifest and nothing at the cut table; the next pass starts over and completes", async () => {
+    const date = "2099-05-01";
+    let skew = 0;
+    const clock = () => Date.now() + skew;
+    const { bg, outcomes } = ctx();
+    const first = await backupPass(bg, {
+      date,
+      softDeadlineMs: 600_000,
+      pageRows: 2,
+      clock,
+      afterPage: (table, page) => {
+        // The deadline passes while `nodes` is being read, after its first page.
+        if (table === "nodes" && page === 1) skew = 3_600_000;
+      },
+    });
+    expect(first).toMatchObject({ done: false, outcome: "partial" });
+    expect(first.written).not.toContain("nodes");
+    expect(outcomes("backup")).toContain("partial");
+    expect(outcomes("backup")).not.toContain("ok");
+    expect(await env.FILES.head(tableKey(date, "nodes"))).toBeNull();
+    expect(await env.FILES.head(manifestKey(date))).toBeNull();
+
+    const second = await backupPass(ctx().bg, { date, softDeadlineMs: 600_000 });
+    expect(second).toMatchObject({ done: true, outcome: "ok" });
+    // M1: the set is ONE snapshot — the second pass wrote every table again, not only what was left.
+    expect([...second.written].sort()).toEqual(schemaTableNames());
+    expect(first.written.length).toBeGreaterThan(0);
+    const manifest = await readManifest(date);
+    expect(manifest.attempt).toBe(second.attempt);
+    expect(manifest.attempt).not.toBe(first.attempt);
+  }, 600_000);
+
   it("killed mid-table: that upload is aborted, no manifest, the earlier complete set untouched", async () => {
     const date = "2099-02-01";
     const earlier = await listAll(`b/db/${today}/`);
@@ -306,45 +486,131 @@ describe("a pass that dies, and passes that straddle an account purge", () => {
     expect(await listAll(`b/db/${today}/`)).toEqual(earlier);
   }, 600_000);
 
-  it("an account purged between two passes: the set restores, its rows named and resolved by ON DELETE", async () => {
-    const date = "2099-03-01";
-    // Pass 1 dies at the `user` table: the tables written before it (children first) hold B's rows.
-    const failing = new Proxy(env.FILES, {
+  it("B1: the manifest is read back and every object head()ed — a short object fails the pass, no ok", async () => {
+    const date = "2099-05-02";
+    const lying = new Proxy(env.FILES, {
       get(target, property) {
-        if (property === "put") {
-          return async (key: string, ...rest: unknown[]) => {
-            if (key === tableKey(date, "user")) throw new Error("the invocation was killed");
-            return (target.put as (...args: unknown[]) => unknown)(key, ...rest);
+        if (property === "head") {
+          return async (key: string) => {
+            const head = await target.head(key);
+            if (head && key === tableKey(date, "nodes")) return { ...head, size: head.size - 1 };
+            return head;
           };
         }
         const value = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
       },
     }) as R2Bucket;
-    const { bg } = ctx();
-    await expect(backupPass(bg, { date, bucket: failing, softDeadlineMs: 600_000 })).rejects.toThrow();
-    expect(await gunzip(tableKey(date, "nodes"))).toContain(b.file);
+    const { bg, outcomes } = ctx();
+    await expect(backupPass(bg, { date, bucket: lying, softDeadlineMs: 600_000 })).rejects.toThrow(
+      /missing or short/,
+    );
+    expect(outcomes("backup")).not.toContain("ok");
+  }, 600_000);
 
-    // Between the passes, B's account is purged.
-    await purgeAccount(b);
+  it("B1: one pass at a time — while another holds the lock, a pass does nothing and answers overlap", async () => {
+    const date = "2099-05-03";
+    const { bg, outcomes } = ctx();
+    const locked = await withJobLock(testDb(), "backup", 60_000, async () =>
+      backupPass(bg, { date, softDeadlineMs: 600_000 }),
+    );
+    expect(locked).toMatchObject({ held: true, value: { done: false, outcome: "overlap", written: [] } });
+    expect(outcomes("backup")).toEqual(["overlap"]);
+    expect(await listAll(`b/db/${date}/`)).toEqual(new Map());
+  }, 120_000);
 
-    // Pass 2 resumes: only what pass 1 did not finish is written; then the manifest.
+  it("standing check (a): an account purged after a dead pass — the next pass starts over, the set restores with no dangling row", async () => {
+    const date = "2099-03-01";
+    const victim = await seedAccount();
+    await expect(
+      backupPass(ctx().bg, { date, bucket: failingPut(tableKey(date, "user")), softDeadlineMs: 600_000 }),
+    ).rejects.toThrow();
+    await purgeAccount(victim);
     const second = await backupPass(ctx().bg, { date, softDeadlineMs: 600_000 });
     expect(second.done).toBe(true);
-    expect(second.written).toContain("user");
-    expect(second.written).not.toContain("nodes");
-
+    expect(second.written).toContain("nodes");
     const target = await scratchTarget();
     const result = await restoreSet({ date, read: readLocal, sql: target.sql });
-    // B's nodes named B as owner (RESTRICT): dropped, and named; their version went with them.
-    const droppedNodes = result.dangling.filter((row) => row.table === "nodes").map((row) => row.key);
-    expect(droppedNodes).toEqual(expect.arrayContaining([b.folder, b.child, b.file]));
+    expect(result.dangling).toEqual([]);
     expect(
-      result.dangling.some((row) => row.table === "node_versions" && row.key.includes(b.versionId)),
-    ).toBe(true);
-    const left = await target.client.query(`SELECT 1 FROM nodes WHERE owner_id = $1`, [b.userId]);
-    expect(left.rows).toHaveLength(0);
-    const kept = await target.client.query(`SELECT 1 FROM nodes WHERE owner_id = $1`, [a.userId]);
-    expect(kept.rows).toHaveLength(3);
+      (await target.client.query(`SELECT 1 FROM nodes WHERE owner_id = $1`, [victim.userId])).rows,
+    ).toHaveLength(0);
+  }, 600_000);
+
+  it("M1: a move between two pages of `nodes` cannot make a cycle — every row of a set is one snapshot", async () => {
+    const date = "2099-06-01";
+    const owner = await makeUser();
+    // Fourteen folders; A is the first in key order and B the last, so twelve rows lie between
+    // them and they land on different pages. A sits in B.
+    const made: string[] = [];
+    for (let i = 0; i < 14; i++) made.push((await makeFolder(owner.id)).id);
+    extraNodes.push(...made);
+    const sorted = (
+      await testDb().select({ id: nodes.id }).from(nodes).where(inArray(nodes.id, made)).orderBy(nodes.id)
+    ).map((row) => row.id);
+    const nodeA = { id: sorted[0]! };
+    const nodeB = { id: sorted[sorted.length - 1]! };
+    await testDb().update(nodes).set({ parentId: nodeB.id }).where(eq(nodes.id, nodeA.id));
+    let moved = false;
+    const result = await backupPass(ctx().bg, {
+      date,
+      softDeadlineMs: 600_000,
+      pageRows: 5,
+      afterPage: async (table, _page, lines) => {
+        const ids = lines.map((line) => (JSON.parse(line) as { id: string }).id);
+        if (moved || table !== "nodes" || !ids.includes(nodeA.id)) return;
+        if (ids.includes(nodeB.id)) throw new Error("A and B on one page: the test proves nothing");
+        moved = true;
+        // A to the top level, then B into A — each legal at its moment.
+        await testDb().update(nodes).set({ parentId: null }).where(eq(nodes.id, nodeA.id));
+        await testDb().update(nodes).set({ parentId: nodeA.id }).where(eq(nodes.id, nodeB.id));
+      },
+    });
+    expect(moved).toBe(true);
+    expect(result.done).toBe(true);
+    const target = await scratchTarget();
+    await restoreSet({ date, read: readLocal, sql: target.sql });
+    const pair = await target.client.query<{ id: string; parent_id: string | null }>(
+      `SELECT id, parent_id FROM nodes WHERE id = ANY($1::uuid[])`,
+      [[nodeA.id, nodeB.id]],
+    );
+    // The tree as it was when the pass began: A in B, B at the top.
+    expect(new Map(pair.rows.map((row) => [row.id, row.parent_id]))).toEqual(
+      new Map([
+        [nodeA.id, nodeB.id],
+        [nodeB.id, null],
+      ]),
+    );
+    await testDb().update(nodes).set({ parentId: null }).where(eq(nodes.id, nodeB.id));
+  }, 600_000);
+
+  it("M1: a dangling row is reported; one under a legal hold refuses the restore unless dropHeldDangling", async () => {
+    // Sets as a straddle would leave them: B's (not held) and HELD's (folder on legal hold) user rows gone.
+    const plain = "2099-07-01";
+    await copySet(today, plain, { table: "user", drop: (line) => line.includes(`"${b.userId}"`) });
+    const plainTarget = await scratchTarget();
+    const loaded = await restoreSet({ date: plain, read: readLocal, sql: plainTarget.sql });
+    const bNodes = loaded.dangling.filter((row) => row.table === "nodes").map((row) => row.key);
+    expect(bNodes).toEqual(expect.arrayContaining([b.folder, b.child, b.file]));
+    expect(loaded.dangling.every((row) => !row.held)).toBe(true);
+
+    const withHold = "2099-07-02";
+    await copySet(today, withHold, { table: "user", drop: (line) => line.includes(`"${held.userId}"`) });
+    const heldTarget = await scratchTarget();
+    await expect(restoreSet({ date: withHold, read: readLocal, sql: heldTarget.sql })).rejects.toThrow(
+      /legal hold/,
+    );
+    const { rows } = await heldTarget.client.query<{ n: number }>(`SELECT count(*)::int AS n FROM nodes`);
+    expect(rows[0]!.n).toBe(0);
+    const forced = await restoreSet({
+      date: withHold,
+      read: readLocal,
+      sql: heldTarget.sql,
+      dropHeldDangling: true,
+    });
+    const heldRows = forced.dangling.filter((row) => row.held).map((row) => row.key);
+    // The held folder, and everything under it (held by inheritance).
+    expect(heldRows).toEqual(expect.arrayContaining([held.folder, held.child, held.file]));
+    expect(forced.warnings.some((warning) => /legal hold/.test(warning))).toBe(true);
   }, 600_000);
 });
