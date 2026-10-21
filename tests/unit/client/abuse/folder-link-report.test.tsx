@@ -117,6 +117,33 @@ describe("reporting from a password link", () => {
     });
   });
 
+  it("a password FILE link, unlocked: the footer's Report carries the link session header", async () => {
+    let open = false;
+    const { calls } = await openPublic({
+      "GET /api/public/config": CONFIG_WITH_KEY,
+      [`GET ${publicPath()}`]: () =>
+        json(open ? info(publicFile(), { requiresPassword: true }) : info(null, { requiresPassword: true })),
+      [`POST ${publicPath("/unlock")}`]: () => {
+        open = true;
+        return json({ linkSession: SESSION, expiresAt: "2099-01-01T00:00:00.000Z" });
+      },
+      "POST /api/public/report": json({ received: true }, 202),
+    });
+    fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "made-up right one" } });
+    fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    await screen.findByRole("heading", { name: "report.txt" });
+    fireEvent.click(document.querySelector<HTMLElement>("footer [data-report-link]")!);
+    const dialog = await screen.findByRole("dialog", { name: "Report this file" });
+    await waitFor(() => expect(dialog.querySelector("[data-turnstile='ready']")).not.toBeNull());
+    fireEvent.click(within(dialog).getByLabelText("Spam"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Send report" }));
+    await within(dialog).findByText("Thanks. The file is hidden while we review it.");
+    const sent = calls.filter((call) => call.method === "POST" && call.path === "/api/public/report");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.headers[HEADER_LINK_SESSION]).toBe(SESSION);
+    expect(sent[0]!.body).toMatchObject({ nodeId: FILE_ID, linkToken: TOKEN });
+  });
+
   it("sendReport: the header goes to the public route only — never to the signed-in one", async () => {
     const calls = mockFetchCalls(() => json({ received: true }, 202));
     const input = { category: "spam" as const, details: "", turnstileToken: DUMMY_TOKEN };
