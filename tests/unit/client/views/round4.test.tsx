@@ -140,7 +140,7 @@ describe("r4-1: no write to the cache lifts the list's own Retry-After", () => {
     await holdTheListByItsOwnRefresh();
     const reads = trashReads(calls);
     fireEvent.click(screen.getByRole("button", { name: `More actions for ${report.name}` }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).not.toContain(report.id));
     await refreshEveryWay();
     expect(trashReads(calls)).toBe(reads);

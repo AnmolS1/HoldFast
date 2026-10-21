@@ -178,6 +178,7 @@ export const en = {
   "shortcuts.help": "Show this list",
   "shortcuts.newFolder": "New folder",
   "shortcuts.rename": "Rename",
+  "shortcuts.restore": "Restore from trash",
   "shortcuts.upload": "Upload files",
   "shortcuts.theme": "Switch theme",
 

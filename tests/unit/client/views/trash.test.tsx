@@ -144,13 +144,43 @@ describe("the list", () => {
 });
 
 describe("restore", () => {
+  // D01 §7: every action has a shortcut, shown where the action is offered.
+  it("Shift+R restores the selection, and the menu and the selection bar show the shortcut", async () => {
+    const { calls } = await openTrash({
+      [`POST /api/nodes/${NOTES.id}/restore`]: restored(NOTES),
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select notes.txt" }));
+    const bar = within(document.querySelector<HTMLElement>("[data-selection-bar]")!);
+    expect(bar.getByRole("button", { name: /^Restore/ }).querySelector("kbd")?.textContent).toBe("Shift+R");
+    fireEvent.keyDown(document.body, { key: "R", shiftKey: true });
+    await waitFor(() => expect(rowNames()).not.toContain(NOTES.id));
+    expect(requests(calls, "POST", `/api/nodes/${NOTES.id}/restore`)).toHaveLength(1);
+    openMenu("report.pdf");
+    const item = await screen.findByRole("menuitem", { name: /^Restore/ });
+    expect(item.querySelector("kbd")?.textContent).toBe("Shift+R");
+  });
+
+  it("Shift+R does nothing through a dialog, nor with nothing selected", async () => {
+    const { calls } = await openTrash({
+      [`POST /api/nodes/${NOTES.id}/restore`]: restored(NOTES),
+    });
+    fireEvent.keyDown(document.body, { key: "R", shiftKey: true });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select notes.txt" }));
+    fireEvent.keyDown(document.body, { key: "Delete" });
+    await screen.findByRole("dialog", { name: "Delete notes.txt forever?" });
+    fireEvent.keyDown(document.body, { key: "R", shiftKey: true });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requests(calls, "POST", `/api/nodes/${NOTES.id}/restore`)).toHaveLength(0);
+    expect(rowNames()).toContain(NOTES.id);
+  });
+
   it("calls the API, drops the row, and emits exactly [restored.parentId]", async () => {
     const { calls } = await openTrash({
       [`POST /api/nodes/${REPORT.id}/restore`]: restored(REPORT),
     });
     const usageBefore = usageCalls(calls);
     openMenu("report.pdf");
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).not.toContain(REPORT.id));
     expect(events).toEqual([[FOLDER_ID]]);
     expect(getToasts().map((toast) => toast.message)).toContain("report.pdf restored");
@@ -166,7 +196,7 @@ describe("restore", () => {
       }),
     });
     openMenu("report.pdf");
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(events).toEqual([[null]]));
     expect(getToasts().map((toast) => toast.message)).toContain("report (restored).pdf restored");
   });
@@ -179,7 +209,7 @@ describe("restore", () => {
       [`POST /api/nodes/${REPORT.id}/restore`]: () => envelope("conflict", 409, details),
     });
     openMenu("report.pdf");
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     const notice = await waitFor(() => {
       const found = document.querySelector("[data-trash-conflict]");
       if (!found) throw new Error("no conflict notice yet");
@@ -207,7 +237,7 @@ describe("restore", () => {
     for (const name of ["report.pdf", "notes.txt", "Old projects"])
       fireEvent.click(screen.getByRole("checkbox", { name: `Select ${name}` }));
     const bar = document.querySelector<HTMLElement>("[data-selection-bar]")!;
-    fireEvent.click(within(bar).getByRole("button", { name: "Restore" }));
+    fireEvent.click(within(bar).getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).toEqual([NOTES.id]));
     expect(events).toEqual([[FOLDER_ID], [null]]);
     expect(document.querySelector("[data-trash-conflict]")!.textContent).toBe(
@@ -571,7 +601,7 @@ describe("an account switch that leaves the page mounted", () => {
   it("an open confirmation, the selection and the conflict notice of the first account are gone", async () => {
     await openTrash({ [`POST /api/nodes/${NOTES.id}/restore`]: () => envelope("conflict", 409) });
     openMenu("notes.txt");
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(document.querySelector("[data-trash-conflict]")).not.toBeNull());
     fireEvent.click(screen.getByRole("checkbox", { name: "Select report.pdf" }));
     openMenu("report.pdf");
@@ -611,7 +641,7 @@ describe("nothing of one account reaches the next through late work", () => {
       fireEvent.click(screen.getByRole("checkbox", { name: `Select ${name}` }));
     fireEvent.click(
       within(document.querySelector<HTMLElement>("[data-selection-bar]")!).getByRole("button", {
-        name: "Restore",
+        name: /^Restore/,
       }),
     );
     await waitFor(() => expect(requests(calls, "POST", `/api/nodes/${REPORT.id}/restore`)).toHaveLength(1));
@@ -707,7 +737,7 @@ describe("review fixes on the trash page", () => {
     const before = requests(calls, "GET", "/api/trash").length;
     purgedElsewhere = true;
     openMenu("report.pdf");
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).toEqual([NOTES.id, FOLDER.id]));
     expect(requests(calls, "GET", "/api/trash").length).toBe(before + 1);
     expect(getToasts().map((toast) => toast.requestId)).toContain("req-1234");
@@ -822,7 +852,7 @@ describe("mobile", () => {
     openMenu("report.pdf");
     const sheet = await screen.findByRole("dialog", { name: "report.pdf" });
     expect(sheet.className).toContain("MuiDrawer-paper");
-    fireEvent.click(within(sheet).getByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(within(sheet).getByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).not.toContain(REPORT.id));
   });
 
@@ -838,7 +868,7 @@ describe("mobile", () => {
     vi.useRealTimers();
     expect(row.getAttribute("aria-selected")).toBe("true");
     const bar = document.querySelector<HTMLElement>("[data-selection-bar]")!;
-    expect(within(bar).getByRole("button", { name: "Restore" })).toBeTruthy();
+    expect(within(bar).getByRole("button", { name: /^Restore/ })).toBeTruthy();
     expect(within(bar).getByRole("button", { name: "Delete forever" })).toBeTruthy();
   });
 });
