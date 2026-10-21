@@ -109,8 +109,8 @@ export interface AuthTable {
 
 /**
  * The routes among a mounted app's entries (dump-routes.ts says what is left out and why): an
- * `ALL …/*` entry is a middleware or a fallback, and Better Auth's `ALL <prefix>/*` stands for the
- * endpoints of `auth`.
+ * `ALL …/*` entry is a middleware or a fallback, Better Auth's `ALL <prefix>/*` stands for the
+ * endpoints of `auth`, and a HEAD entry beside a GET one for the same path is that GET route.
  */
 export function routesOf(host: Host, entries: readonly HonoEntry[], auth: AuthTable): Route[] {
   const seen = new Set<string>();
@@ -121,7 +121,11 @@ export function routesOf(host: Host, entries: readonly HonoEntry[], auth: AuthTa
     seen.add(key);
     routes.push({ host, method, path });
   };
+  // Hono answers a HEAD request with the GET route (hono-base.js dispatches HEAD as GET), so a
+  // HEAD entry declared next to a GET one for the same path is never reached on its own.
+  const gets = new Set(entries.filter((entry) => entry.method === "GET").map((entry) => entry.path));
   for (const { method, path } of entries) {
+    if (method === "HEAD" && gets.has(path)) continue;
     if (method === "ALL" && path === `${auth.prefix}/*`) {
       for (const [methods, relative] of auth.endpoints) {
         for (const one of methods.split(",")) add(one, `${auth.prefix}${relative}`);

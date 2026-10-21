@@ -170,7 +170,7 @@ describe("routesOf: the routes among a mounted app's entries", () => {
     ] as const,
   };
 
-  it("middleware and fallbacks are left out, validator entries are one route, Better Auth is its endpoints", () => {
+  it("middleware and fallbacks are left out, validator entries are one route, Better Auth is its endpoints, HEAD beside GET is the GET route", () => {
     const app = new Hono();
     app.use("*", async (_c, next) => next());
     app.use("/api/*", async (_c, next) => next());
@@ -185,6 +185,8 @@ describe("routesOf: the routes among a mounted app's entries", () => {
     app.route("/api", api);
     app.all("/api/*", (c) => c.notFound());
     app.get("/__meta", (c) => c.text("meta"));
+    app.on(["GET", "HEAD"], "/d/*", (c) => c.text("bytes"));
+    app.on("HEAD", "/only-head", (c) => c.text(""));
     app.all("*", (c) => c.text("spa"));
     expect(routesOf("app", app.routes, auth)).toEqual([
       { host: "app", method: "GET", path: "/api/nodes/root" },
@@ -193,6 +195,9 @@ describe("routesOf: the routes among a mounted app's entries", () => {
       { host: "app", method: "POST", path: "/api/auth/get-session" },
       { host: "app", method: "POST", path: "/api/auth/sign-in/email" },
       { host: "app", method: "GET", path: "/__meta" },
+      // GET + HEAD on one path is the GET route (Hono serves HEAD through it); a lone HEAD stays.
+      { host: "app", method: "GET", path: "/d/*" },
+      { host: "app", method: "HEAD", path: "/only-head" },
     ]);
   });
 });
