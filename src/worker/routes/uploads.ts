@@ -607,6 +607,10 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
   const versionId = uuidv7();
   const r2Key = avatar ? avatarKey(user.id, nodeId) : keyFor(place.ownerId, nodeId, versionId);
   const at = now(c);
+  // The uploader's address, sealed as for `upload_ips`: kept on the session while it is unfinished,
+  // for the repair sweep that may finish it without a request (T22). Sealed here, outside the
+  // admission: its callback is database statements only.
+  const sealedIp = await sealIp(c.env, c.get("ip"));
 
   // The admission. Database statements only: a transaction Postgres ends as a deadlock victim is
   // run again (a refusal throws, and is never run twice).
@@ -645,6 +649,7 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
         purpose: body.purpose,
         fileLastModified: match.fileLastModified,
         expiresAt: expiresAtFor(at, body.size),
+        sealedIp,
       });
       return { session, created: true };
     });

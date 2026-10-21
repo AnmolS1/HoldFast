@@ -109,12 +109,41 @@ export async function claimCompleting(
   return row ?? null;
 }
 
+/**
+ * What EVERY move of a session to a terminal status writes, in its own UPDATE: the status, when,
+ * and the uploader's sealed address cleared — it is kept only while the session is unfinished
+ * (the repair sweep reads it from a `completing` one), never longer than `upload_ips` keeps it.
+ * A terminal UPDATE of `uploads` sets `ended(…)`, never a status of its own
+ * (tests/unit/db/upload-ip.test.ts scans for one).
+ */
+export function ended(status: "done" | "aborted") {
+  return { status, completedAt: sql`now()`, ipEncrypted: null, ipIv: null, ipKeyVersion: null };
+}
+
+/**
+ * A sealed address in its three parts — the shape of `Sealed` in services/tokens.ts (`sealIp`
+ * returns it, `openIp` takes it). Not imported from there: a query module stays free of the
+ * Workers runtime types that module needs (the db tests type-check without them).
+ */
+export type SealedIp = { ciphertext: Uint8Array; iv: Uint8Array; keyVersion: number };
+
+/**
+ * The uploader's address as init sealed it on the session — the three parts `openIp` and
+ * `uploadIps.record` take — or null: a session from before the column, a finished one (cleared),
+ * or a partial triple, which is never handed on.
+ */
+export function sealedIpOf(session: Pick<Upload, "ipEncrypted" | "ipIv" | "ipKeyVersion">): SealedIp | null {
+  const { ipEncrypted, ipIv, ipKeyVersion } = session;
+  if (ipEncrypted === null || ipIv === null || ipKeyVersion === null) return null;
+  return { ciphertext: ipEncrypted, iv: ipIv, keyVersion: ipKeyVersion };
+}
+
 /** Terminal: the session's node exists. False when the session was already finished. */
 export async function markDone(tx: Executor, uploadId: string): Promise<boolean> {
   if (!isUuid(uploadId)) return false;
   const rows = await tx
     .update(uploads)
-    .set({ status: "done", completedAt: sql`now()` })
+    .set(ended("done"))
     .where(and(eq(uploads.id, uploadId), inArray(uploads.status, [...UNFINISHED])))
     .returning({ id: uploads.id });
   return rows.length > 0;
@@ -129,7 +158,7 @@ export async function markAborted(tx: Executor, uploadId: string): Promise<boole
   return tx.transaction(async (sp) => {
     const rows = await sp
       .update(uploads)
-      .set({ status: "aborted", completedAt: sql`now()` })
+      .set(ended("aborted"))
       .where(and(eq(uploads.id, uploadId), inArray(uploads.status, [...UNFINISHED])))
       .returning({ id: uploads.id });
     if (rows.length === 0) return false;

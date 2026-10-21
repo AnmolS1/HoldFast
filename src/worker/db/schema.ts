@@ -338,6 +338,14 @@ export const uploads = pgTable(
     completingAt: ts(),
     /** When the session reached a terminal status (`done` or `aborted`). */
     completedAt: ts(),
+    /**
+     * The uploader's address, sealed at init as for `upload_ips` (AES-GCM under `IP_ENC_KEY`),
+     * for the repair sweep that finishes a `completing` session without a request. All three or
+     * none; NULLed by every terminal transition (`uploads.ended`). Null on sessions from before.
+     */
+    ipEncrypted: bytea(),
+    ipIv: bytea(),
+    ipKeyVersion: smallint(),
   },
   (t) => [
     index("uploads_resume_idx")
