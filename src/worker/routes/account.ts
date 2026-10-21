@@ -40,7 +40,7 @@ import {
 import type { LinkState } from "../../shared/schemas/link";
 import type { ThumbUrlResponse } from "../../shared/schemas/node";
 import { hasSecondFactor } from "../auth/second-factor";
-import { heldPurgeBytes } from "../db/queries/quota";
+import { legalHoldKeptBytes, visibleUsedBytes } from "../db/queries/quota";
 import { captureError } from "../sentry";
 import {
   ACTIVITY_LIMIT,
@@ -323,7 +323,7 @@ router.get("/account/export", async (c) => {
       sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
       exportLinks(handle, user.id),
       recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
-      heldPurgeBytes(handle, user.id),
+      legalHoldKeptBytes(handle, user.id),
     ]);
     if (!account) throw new AppError("not_found");
     const owners = await displayNames(
@@ -341,8 +341,8 @@ router.get("/account/export", async (c) => {
         timezone: account.timezone,
         locale: account.locale,
         quotaBytes: account.quotaBytes,
-        // The account holder's figure: without what a hold keeps (quota.ts `heldPurgeBytes`).
-        usedBytes: Math.max(0, account.usedBytes - held.files - held.versions),
+        // The account holder's figure, the one quota is enforced against (quota.ts).
+        usedBytes: visibleUsedBytes(account.usedBytes, held.files + held.versions, account.quotaBytes),
         termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
         termsVersion: account.termsVersion,
       },
@@ -374,7 +374,7 @@ router.get("/account/export", async (c) => {
     });
     head = `${JSON.stringify(rest).slice(0, -1)},"nodes":[`;
   } catch (error) {
-    await releaseExport(handle, user.id);
+    await releaseExport(handle, user.id, admitted.token);
     throw error;
   }
   audit(c, "account.export", self(user.id));
@@ -407,7 +407,7 @@ router.get("/account/export", async (c) => {
         // The client went away (the write is refused), or a read failed: the body ends here.
         await writer.abort(error).catch(() => {});
       } finally {
-        await releaseExport(bg.db, user.id);
+        await releaseExport(bg.db, user.id, admitted.token);
       }
     },
     coreOf(c),

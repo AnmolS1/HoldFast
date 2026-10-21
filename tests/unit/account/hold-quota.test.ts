@@ -4,7 +4,7 @@
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { usageBreakdown } from "../../../src/worker/db/queries/quota";
-import { nodeVersions, user } from "../../../src/worker/db/schema";
+import { nodeVersions, uploads, user } from "../../../src/worker/db/schema";
 import { getSession, send, testDb, verifiedUser } from "../auth/helpers";
 import { generationInStep } from "../trash/helpers";
 import { api, makeFile, makeFolder, person } from "../nodes/helpers";
@@ -78,6 +78,86 @@ describe("M2: quota is enforced against the figure the account holder sees", () 
       versionsBytes: 40,
     });
     expect((await api(held.as, "GET", "/account/usage")).body).toMatchObject({ usedBytes: 100 });
+  });
+});
+
+describe("Addendum 4: only a LEGAL hold is left out, and only up to a backstop", () => {
+  it("bytes kept for another reason (a file under review) still count, held account or not", async () => {
+    const owner = await person();
+    await testDb().update(user).set({ quotaBytes: 500, usedBytes: 340 }).where(eq(user.id, owner.id));
+    await makeFile(owner.id, null, { name: "kept.txt", scanStatus: "clean", size: 100 });
+    const reviewed = await makeFile(owner.id, null, {
+      name: "reviewed.txt",
+      scanStatus: "under_review",
+      size: 240,
+    });
+    expect((await api(owner.as, "POST", `/nodes/${reviewed.id}/trash`)).status).toBe(200);
+    expect((await api(owner.as, "DELETE", `/nodes/${reviewed.id}`)).status).toBe(204);
+    // Kept by the review, not by a legal hold: still the account's bytes.
+    expect((await api(owner.as, "GET", "/account/usage")).body).toMatchObject({ usedBytes: 340 });
+    expect((await init(owner, 400)).status).toBe(413);
+    expect((await init(owner, 160)).status).toBe(201);
+  });
+
+  /** A held account whose deleted-for-good, hold-kept bytes are `kept`, nothing else stored. */
+  async function retaining(kept: number) {
+    const owner = await person({ legalHold: true });
+    await testDb().update(user).set({ quotaBytes: 500, usedBytes: kept }).where(eq(user.id, owner.id));
+    await makeFile(owner.id, null, {
+      name: "kept.bin",
+      scanStatus: "clean",
+      size: kept,
+      deletedAt: new Date(),
+      trashedRoot: true,
+      purgeRequestedAt: new Date(),
+    });
+    return owner;
+  }
+
+  it("past 2 × quota of hold-kept bytes, uploads are refused with the ORDINARY full-account answer; at it, they are not", async () => {
+    const atLimit = await retaining(1000);
+    expect((await init(atLimit, 400)).status).toBe(201);
+    const past = await retaining(1001);
+    const refused = await init(past, 1);
+    // The same answer as an ordinary full account's.
+    const full = await person();
+    await testDb().update(user).set({ quotaBytes: 500, usedBytes: 500 }).where(eq(user.id, full.id));
+    const ordinary = await init(full, 1);
+    expect(refused.status).toBe(413);
+    expect({ ...refused.body, requestId: null }).toEqual({ ...ordinary.body, requestId: null });
+    // And it is shown as what it is answered as: full.
+    const shown = (await api(past.as, "GET", "/account/usage")).body;
+    const fullShown = (await api(full.as, "GET", "/account/usage")).body;
+    expect([shown.usedBytes, shown.quotaBytes]).toEqual([fullShown.usedBytes, fullShown.quotaBytes]);
+  });
+
+  it("the loop is bounded: upload, delete forever, repeat — a held account stops at quota + 2 × quota retained", async () => {
+    const owner = await person({ legalHold: true });
+    await testDb().update(user).set({ quotaBytes: 500, usedBytes: 0 }).where(eq(user.id, owner.id));
+    let rounds = 0;
+    for (; rounds < 10; rounds += 1) {
+      const started = await init(owner, 500);
+      if (started.status !== 201) {
+        expect(started.status).toBe(413);
+        break;
+      }
+      // The upload as it would complete: the reservation becomes a 500-byte file …
+      const file = await makeFile(owner.id, null, {
+        name: `round-${rounds}.bin`,
+        scanStatus: "clean",
+        size: 500,
+      });
+      await testDb().delete(uploads).where(eq(uploads.id, started.body.uploadId));
+      // … which is then deleted for good (and kept by the hold).
+      expect((await api(owner.as, "POST", `/nodes/${file.id}/trash`)).status).toBe(200);
+      expect((await api(owner.as, "DELETE", `/nodes/${file.id}`)).status).toBe(204);
+    }
+    expect(rounds).toBe(3);
+    const [row] = await testDb()
+      .select({ usedBytes: user.usedBytes })
+      .from(user)
+      .where(eq(user.id, owner.id));
+    expect(row!.usedBytes).toBeLessThanOrEqual(500 + 2 * 500);
   });
 });
 

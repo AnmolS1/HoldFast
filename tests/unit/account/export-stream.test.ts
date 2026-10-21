@@ -15,7 +15,12 @@ import { ExportManifest } from "../../../src/shared/schemas/account";
 import { createApp } from "../../../src/worker/app";
 import type { Auth, SessionInfo } from "../../../src/worker/auth/types";
 import { statementsSent, type Db } from "../../../src/worker/db/client";
-import { EXPORT_DAILY_LIMIT, EXPORT_PAGE, exportSlotKeys } from "../../../src/worker/db/queries/account";
+import {
+  EXPORT_DAILY_LIMIT,
+  EXPORT_PAGE,
+  EXPORT_RUNNING_MAX_S,
+  exportSlotKeys,
+} from "../../../src/worker/db/queries/account";
 import type { CoreDeps } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
 import { BASE_SETTINGS, realCore, testDb } from "../auth/helpers";
@@ -154,5 +159,31 @@ describe("the export limiter", () => {
     const keys = exportSlotKeys(who.id);
     const rows = await testDb().execute(sql`SELECT count FROM rate_limit WHERE key = ${keys.running}`);
     expect(rows.rows).toEqual([]);
+  });
+
+  it("a late release frees only its own slot: an export that outlived the slot does not end its successor's", async () => {
+    const who = await person();
+    const keys = exportSlotKeys(who.id);
+    const first = await startExport(who);
+    expect(first.response.status).toBe(200);
+    // The first export outlives its slot (a stream that has run past EXPORT_RUNNING_MAX_S).
+    await testDb().execute(
+      sql`UPDATE rate_limit SET last_request = last_request - ${(EXPORT_RUNNING_MAX_S + 1) * 1000} WHERE key = ${keys.running}`,
+    );
+    const second = await startExport(who);
+    expect(second.response.status).toBe(200);
+    const slot = async () =>
+      (await testDb().execute<{ id: string }>(sql`SELECT id FROM rate_limit WHERE key = ${keys.running}`))
+        .rows;
+    const held = await slot();
+    expect(held).toHaveLength(1);
+    // The first export ends now — its release must leave the second's slot alone.
+    await readAll(first.response);
+    await first.settle();
+    expect(await slot()).toEqual(held);
+    expect((await startExport(who)).response.status).toBe(429);
+    await readAll(second.response);
+    await second.settle();
+    expect(await slot()).toEqual([]);
   });
 });

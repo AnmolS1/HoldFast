@@ -420,24 +420,64 @@ async function admitWindow(
 }
 
 /**
- * Takes the account's running slot, then counts the export on its day. Refused (the other export
- * is still running, or the day's budget is spent): seconds to wait, and nothing is held.
+ * The account's running slot, held under `token`: taken when free or when the holder's time ran
+ * out (EXPORT_RUNNING_MAX_S) — a slot taken over that way carries the new token, so the old
+ * holder's late release frees nothing (Addendum 4).
+ */
+async function takeRunningSlot(
+  db: Executor,
+  key: string,
+  token: string,
+): Promise<{ ok: true } | { ok: false; retryAfterSeconds: number }> {
+  const windowMs = EXPORT_RUNNING_MAX_S * 1000;
+  const result = await db.execute<{ taken: string | null; wait_ms: string | number | null }>(sql`
+    WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
+    held AS (
+      SELECT r.last_request + ${windowMs} - clock.ms AS wait_ms FROM rate_limit r, clock WHERE r.key = ${key}
+    ),
+    taken AS (
+      INSERT INTO rate_limit AS r (id, key, count, last_request)
+      SELECT ${token}, ${key}, 1, clock.ms FROM clock
+      ON CONFLICT (key) DO UPDATE SET id = ${token}, count = 1, last_request = (SELECT ms FROM clock)
+      WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs}
+      RETURNING r.id
+    )
+    SELECT (SELECT id FROM taken) AS taken, (SELECT wait_ms FROM held) AS wait_ms`);
+  const row = result.rows[0];
+  if (row?.taken === token) return { ok: true };
+  const waitMs = row?.wait_ms != null ? Number(row.wait_ms) : windowMs;
+  return {
+    ok: false,
+    retryAfterSeconds: Math.min(EXPORT_RUNNING_MAX_S, Math.max(1, Math.ceil(waitMs / 1000))),
+  };
+}
+
+/**
+ * Takes the account's running slot, then counts the export on its day. Admitted: the token of
+ * THIS admission, which `releaseExport` needs. Refused (the other export is still running, or the
+ * day's budget is spent): seconds to wait, and nothing is held.
  */
 export async function admitExport(
   db: Executor,
   userId: string,
-): Promise<{ ok: true } | { ok: false; retryAfterSeconds: number }> {
+): Promise<{ ok: true; token: string } | { ok: false; retryAfterSeconds: number }> {
   const keys = exportSlotKeys(userId);
-  const running = await admitWindow(db, keys.running, 1, EXPORT_RUNNING_MAX_S);
+  const token = crypto.randomUUID();
+  const running = await takeRunningSlot(db, keys.running, token);
   if (!running.ok) return running;
   const day = await admitWindow(db, keys.day, EXPORT_DAILY_LIMIT, EXPORT_DAY_S);
-  if (!day.ok) await releaseExport(db, userId);
-  return day;
+  if (!day.ok) {
+    await releaseExport(db, userId, token);
+    return day;
+  }
+  return { ok: true, token };
 }
 
-/** Gives the running slot back (the stream ended, however it ended). */
-export async function releaseExport(db: Executor, userId: string): Promise<void> {
-  await db.execute(sql`DELETE FROM rate_limit WHERE key = ${exportSlotKeys(userId).running}`);
+/** Gives back the running slot THIS admission took (`token`) — never one another export holds now. */
+export async function releaseExport(db: Executor, userId: string, token: string): Promise<void> {
+  await db.execute(
+    sql`DELETE FROM rate_limit WHERE key = ${exportSlotKeys(userId).running} AND id = ${token}`,
+  );
 }
 
 /** The shares the user gave, pending ones included, on nodes of the export's set. */
