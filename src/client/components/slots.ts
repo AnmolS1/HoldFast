@@ -46,6 +46,11 @@ export interface PublicPreviewSource {
     kind: "inline" | "thumb",
     size?: number,
   ): Promise<{ url: string; expiresAt: string }>;
+  /**
+   * What the preview's Report targets for this file: on a public page, the link's token is the
+   * proof of access (fold-w3 #20). Absent: the signed-in report route.
+   */
+  reportTarget?(nodeId: string): ReportTarget;
 }
 
 export interface PreviewDialogProps {

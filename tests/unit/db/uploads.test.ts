@@ -237,7 +237,7 @@ describe("expired and trimFinished", () => {
       expectedSha256: rand(32),
     });
     const undeclared = await makeUpload(db, owner, owner, { status: "completing", completingAt: stale });
-    // Listed for another reason: nothing is owed (the route refuses and deletes such an object).
+    // Listed for another reason: the repair sweep's too (Addendum 3 m5: it hashes first).
     const otherReasons = [];
     for (const reason of ["malware", "dmca", "admin"] as const) {
       const sha256 = rand(32);
@@ -251,7 +251,8 @@ describe("expired and trimFinished", () => {
       );
     }
     const ids = (await expired(db, 100_000)).filter((u) => u.ownerId === owner).map((u) => u.id);
-    expect(ids.sort()).toEqual([unlisted.id, undeclared.id, ...otherReasons.map((u) => u.id)].sort());
+    expect(ids.sort()).toEqual([unlisted.id, undeclared.id].sort());
+    for (const session of otherReasons) expect(ids).not.toContain(session.id);
     expect(ids).not.toContain(owed.id);
   });
 

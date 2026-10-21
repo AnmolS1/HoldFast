@@ -1,11 +1,10 @@
 // The typed slot stubs exist at their fixed paths with exactly the contract's props, and behave
 // as the placeholder table says. The assignments below are checked by `tsc` (npm run typecheck).
-import { render } from "@testing-library/react";
 import { createAuthClient } from "better-auth/react";
 import { adminClient, twoFactorClient } from "better-auth/client/plugins";
 import { passkeyClient } from "@better-auth/passkey/client";
-import type { ComponentType, ReactElement } from "react";
-import { describe, expect, it, vi } from "vitest";
+import type { ComponentType } from "react";
+import { describe, expect, it } from "vitest";
 import type * as Slots from "../../../../src/client/components/slots";
 import type { FileListItem, MimeCategory, ScanStatus } from "../../../../src/client/components/types";
 import { featureRoutes, publicRoutes } from "../../../../src/client/features";
@@ -93,38 +92,16 @@ const realClient = () => createAuthClient({ plugins: [passkeyClient(), twoFactor
 const asContract = (): AuthClientContract => realClient();
 void asContract;
 
-const target = { nodeId: "n1", linkToken: "tok" };
-const noop = () => {};
-const rendersNothing = (element: ReactElement) => () => expect(render(element).container.innerHTML).toBe("");
-
 // What each slot does while it is still the shell's stub. ONE STUB PER LINE: the task that fills a
 // slot deletes that slot's line(s) and nothing else. The order is deliberate — lines of different
 // Wave-2 tasks are never neighbours, so two tasks deleting theirs do not meet in a merge.
-const STUBS: Array<[behaviour: string, check: () => void]> = [
-  ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
-  ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
-];
+const STUBS: Array<[behaviour: string, check: () => void]> = [];
 
 describe("slot stubs", () => {
   it.each(STUBS)("%s", (_behaviour, check) => check());
 
   it("every slot component is usable by a consumer of the contract's props", () => {
     expect(consumers.length).toBe(7);
-  });
-
-  it("the interstitial stub passes straight through: onContinue once, on mount", () => {
-    const onContinue = vi.fn();
-    const onCancel = vi.fn();
-    const view = render(
-      <DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />,
-    );
-    expect(onContinue).toHaveBeenCalledTimes(1);
-    view.rerender(
-      <DangerousFileInterstitial fileName="setup.exe" onContinue={onContinue} onCancel={onCancel} />,
-    );
-    expect(onContinue).toHaveBeenCalledTimes(1);
-    expect(onCancel).not.toHaveBeenCalled();
-    expect(view.container.innerHTML).toBe("");
   });
 
   it("the frame's upload slots come from features/upload/slots.tsx and index.ts re-exports the same objects", () => {

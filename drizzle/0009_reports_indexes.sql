@@ -1,0 +1,2 @@
+CREATE INDEX "reports_reporter_created_idx" ON "reports" USING btree ("reporter_ip_hash_stable","created_at");--> statement-breakpoint
+CREATE INDEX "reports_link_status_idx" ON "reports" USING btree ("link_id","status");

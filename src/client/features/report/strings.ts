@@ -1,0 +1,35 @@
+import { defineMessages } from "../../lib/i18n";
+
+export const messages = {
+  "report.link": "Report",
+  "report.title": "Report this file",
+  "report.intro": "Tell us what is wrong with this file. We review every report.",
+  "report.category": "What is the problem?",
+  "report.category.malware": "Malware or a virus",
+  "report.category.csam": "Child sexual abuse material",
+  "report.category.copyright": "Copyright infringement",
+  "report.category.phishing": "Phishing or a scam",
+  "report.category.spam": "Spam",
+  "report.category.other": "Something else",
+  "report.details": "Details (optional)",
+  "report.details.help": "What you saw, and where. Up to 4,000 characters.",
+  "report.email": "Your email (optional)",
+  "report.email.help": "Only if you want us to be able to reach you about this report.",
+  "report.email.invalid": "Enter a valid email address, or leave it empty.",
+  "report.pick": "Choose what the problem is.",
+  "report.human.wait": "Wait for the check to finish, then send the report.",
+  "report.human.failed": "The check didn't pass. Try again.",
+  "report.human.unavailable": "The check could not be completed. Try again in a moment.",
+  "report.human.missing": "Reports can't be sent from here right now.",
+  "report.send": "Send report",
+  "report.sending": "Sending…",
+  "report.cancel": "Cancel",
+  "report.close": "Close",
+  "report.done": "Thanks. The file is hidden while we review it.",
+  "report.gone": "This file can't be reported from here any more.",
+  "report.limit": "You have sent several reports today. Try again later.",
+  "report.limit.until": "You have sent several reports today. You can send another after {time}.",
+  "report.failed": "Couldn't send the report. Try again.",
+} as const;
+
+export const t = defineMessages(messages);

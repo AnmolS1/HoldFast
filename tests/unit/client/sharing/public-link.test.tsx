@@ -244,13 +244,16 @@ describe("the preview", () => {
 });
 
 describe("downloads", () => {
-  it("a dangerous type: the interstitial first (T22's stub passes through), and the one mint carries dangerousAck", async () => {
+  it("a dangerous type: the interstitial first (confirmed with a click), and the one mint carries dangerousAck", async () => {
     const { calls } = await openPublic({
       [`GET ${publicPath()}`]: info(publicFile({ name: "setup.exe", ext: "exe" }), { dangerous: true }),
       [`POST ${publicPath("/download-url")}`]: json(minted()),
     });
     await screen.findByRole("heading", { name: "setup.exe" });
     fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    const warning = await screen.findByRole("button", { name: "Download anyway" });
+    expect(publicCalls(calls)).not.toContain("POST /download-url");
+    fireEvent.click(warning);
     await waitFor(() => expect(publicCalls(calls)).toContain("POST /download-url"));
     const mints = calls.filter((call) => call.path === publicPath("/download-url"));
     expect(mints.map((call) => call.body)).toEqual([
@@ -439,6 +442,7 @@ describe("a folder", () => {
     });
     await screen.findByRole("button", { name: "Download a.txt" });
     fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Download anyway" }));
     expect(await screen.findByText("Zip saved.")).toBeTruthy();
     const batches = calls
       .filter((call) => call.path === publicPath("/download-urls"))

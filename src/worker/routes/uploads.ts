@@ -65,7 +65,7 @@ import {
   type SinglePutResponse,
 } from "../../shared/schemas/upload";
 import type { SessionUser } from "../auth/types";
-import type { Db } from "../db/client";
+import type { Executor } from "../db/client";
 import { asQueryError, LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
@@ -74,7 +74,14 @@ import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/quer
 import { lockOwnerTree } from "../db/queries/tree";
 import * as uploadIps from "../db/queries/upload-ips";
 import * as sessions from "../db/queries/upload-sessions";
-import { claimCompleting, countOpen, findResumable, markAborted, markDone } from "../db/queries/uploads";
+import {
+  claimCompleting,
+  countOpen,
+  findResumable,
+  markAborted,
+  markDone,
+  type SealedIp,
+} from "../db/queries/uploads";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node, Upload } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
@@ -94,7 +101,7 @@ import { toNodeDto, toOwnAvatarDto } from "../services/node-dto";
 import { requireRole, requireUpload, type Role } from "../services/permissions";
 import * as quotaRows from "../db/queries/quota";
 import * as quota from "../services/quota";
-import { db, deps, type AppEnv } from "../services/request-context";
+import { db, deps, type AppEnv, type ServiceDeps } from "../services/request-context";
 import { adminListOf } from "../services/signup-policy";
 import { enqueueScan, lockSuspectedCsam, scanSmallObject, type ScanVerdict } from "../services/scanning";
 import { avatarKey, keyFor, storage, thumbKey, type Storage, type UploadedPart } from "../services/storage";
@@ -312,7 +319,7 @@ function definitive(error: unknown): boolean {
  * of the same owner).
  */
 async function releaseAndAbort(
-  exec: Db,
+  exec: Executor,
   session: Upload,
   state: "open" | "claimed",
   opts: { keepReservation?: boolean } = {},
@@ -373,7 +380,14 @@ type Verified = { sha256: string; hit: Awaited<ReturnType<typeof blocklist.looku
 async function abandonClaimed(
   c: Ctx,
   session: Upload,
-  opts: { assembled: boolean; declaredCsam: boolean; verified?: Verified | null; reason: string },
+  opts: {
+    assembled: boolean;
+    declaredCsam: boolean;
+    verified?: Verified | null;
+    reason: string;
+    /** What the client declared: kept in the owed audit row if the node cannot be written. */
+    declaredSha256: string;
+  },
 ): Promise<void> {
   let csamSha: string | null = opts.verified?.hit?.reason === "csam" ? opts.verified.sha256 : null;
   if (!opts.verified && opts.declaredCsam && (opts.assembled || !session.r2UploadId)) {
@@ -382,7 +396,7 @@ async function abandonClaimed(
   }
   metric("upload", { outcome: "aborted", kind: modeOf(session), reason: opts.reason });
   if (csamSha !== null) {
-    await preserveAndEnd(c, session, csamSha);
+    await preserveAndEnd(c, session, csamSha, opts.declaredSha256);
     return;
   }
   await releaseAndAbort(db(c), session, "claimed");
@@ -429,13 +443,39 @@ async function tellOperators(c: Ctx, session: Upload): Promise<void> {
 
 /**
  * Verified CSAM bytes whose node could not be written: the NODE IS OWED. The session is left
- * `completing` — its key referenced, its declared (listed) hash on it since the claim — which
- * keeps the object from every sweep until the repair (T22) writes the node; the audit row comes
- * first, then the operators are told by the session's id.
+ * `completing` — its key referenced — and THE SERVER'S csam hash is written on it in place of the
+ * client's declaration (Addendum 2, T22): that is what makes it owed (`owesLockedNode`) and keeps
+ * the object from every sweep until the repair (T22) writes the node, whatever the client
+ * declared (a hash listed for another reason, or none listed). The declaration is kept in the
+ * audit row (`declaredSha256`), which is held from retention (`legalHold`). Should that write fail too, the audit row is the backstop
+ * (`owesLockedNode` also matches it). Then the operators are told by the session's id.
  */
-async function oweNode(c: Ctx, session: Upload, error: unknown): Promise<void> {
+async function oweNode(
+  c: Ctx,
+  session: Upload,
+  error: unknown,
+  hashes: { server: string | null; declared: string | null },
+): Promise<void> {
   captureError(error, { kind: "upload_csam_preserve" });
-  audit(c, "upload.csam_node_owed", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+  if (hashes.server !== null) {
+    try {
+      await sessions.setDeclaredHash(db(c), session.id, hashes.server);
+    } catch (writeError) {
+      captureError(writeError, { kind: "upload_csam_owed_hash" });
+    }
+  }
+  audit(
+    c,
+    "upload.csam_node_owed",
+    { type: "upload", id: session.id },
+    {
+      nodeId: session.nodeId,
+      ...(hashes.declared !== null ? { declaredSha256: hashes.declared } : {}),
+      // Kept past the audit retention (trash-jobs deleteOldAudit): it is the backstop that keeps
+      // the session from the stale job until the node is written (Addendum 3, m4).
+      legalHold: true,
+    },
+  );
   metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
   await tellOperators(c, session);
 }
@@ -462,7 +502,12 @@ const LOCKED = { scanStatus: "suspected_csam", legalHold: true } as const;
  * and its declared (listed) hash on it from the claim, which is what keeps the object from every
  * sweep — and the operators are told by the session's id; the node is still owed.
  */
-async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<void> {
+async function preserveAndEnd(
+  c: Ctx,
+  session: Upload,
+  sha256: string,
+  declaredSha256: string,
+): Promise<void> {
   const uploader = requireVerified(c);
   const own = session.ownerId === uploader.id;
   let written = false;
@@ -470,38 +515,69 @@ async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<
     const store = storage(c.env);
     const size = (await store.head(session.r2Key))?.size ?? session.size;
     const sealed = await sealIp(c.env, c.get("ip"));
-    const values: NodeValues = {
-      ...nodeValues(session, uploader, sha256, session.replaceNodeId === null ? session.nodeId : uuidv7()),
-      ...LOCKED,
-      ownerId: uploader.id,
-      parentId: null,
-      size,
-    };
-    const node = await retryOnDeadlock(db(c), async (tx) => {
-      // The `user` row before the node.
-      if (!own && session.purpose === "file") await quotaRows.reserve(tx, uploader.id, size);
-      const row = await insertNamed(tx, values);
-      await uploadIps.record(tx, {
-        nodeId: row.id,
-        versionId: session.versionId,
-        uploaderId: uploader.id,
-        ipEncrypted: sealed.ciphertext,
-        iv: sealed.iv,
-        keyVersion: sealed.keyVersion,
-      });
-      return row;
-    });
+    const node = await writeLockedNode(deps(c), session, { uploaderId: uploader.id, sha256, size, sealed });
     written = true;
     audit(c, "upload.csam_preserved", { type: "node", id: node.id }, { uploadId: session.id });
     metric("upload", { outcome: "csam_preserved", kind: modeOf(session) });
     await lockOrRecord(c, node.id, session);
   } catch (error) {
     if (written) throw error;
-    await oweNode(c, session, error);
+    await oweNode(c, session, error, { server: sha256, declared: declaredSha256 });
     return;
   }
   // The node is written: the session ends (it may already be gone — a purge of its folder).
-  await releaseAndAbort(db(c), session, "claimed", { keepReservation: own });
+  await endPreserved(db(c), session, own);
+}
+
+/**
+ * The database half of preserving: the session's verified CSAM bytes become a file node of the
+ * UPLOADER's own, at their top level, `LOCKED` from the row's first commit — one transaction
+ * (`retryOnDeadlock`; on a transaction it runs in a savepoint): the editor's reservation (the
+ * `user` row before the node), the node under the next free name, and the uploader's address
+ * when there is one (`sealed` null: recorded without). DATABASE STATEMENTS ONLY — the caller
+ * reads the size, seals the address, writes the audit row and calls the lock. Shared by
+ * `preserveAndEnd` and the repair sweep (jobs/abuse-hourly.ts), so the two write one row.
+ */
+export async function writeLockedNode(
+  deps: { db: Executor },
+  session: Upload,
+  opts: { uploaderId: string; sha256: string; size: number; sealed: SealedIp | null },
+): Promise<Node> {
+  const { uploaderId, sha256, size, sealed } = opts;
+  const own = session.ownerId === uploaderId;
+  const values: NodeValues = {
+    ...nodeValues(session, uploaderId, sha256, session.replaceNodeId === null ? session.nodeId : uuidv7()),
+    ...LOCKED,
+    ownerId: uploaderId,
+    parentId: null,
+    size,
+  };
+  return retryOnDeadlock(deps.db, async (tx) => {
+    // The `user` row before the node.
+    if (!own && session.purpose === "file") await quotaRows.reserve(tx, uploaderId, size);
+    const row = await insertNamed(tx, values);
+    if (sealed) {
+      await uploadIps.record(tx, {
+        nodeId: row.id,
+        versionId: session.versionId,
+        uploaderId,
+        ipEncrypted: sealed.ciphertext,
+        iv: sealed.iv,
+        keyVersion: sealed.keyVersion,
+      });
+    }
+    return row;
+  });
+}
+
+/**
+ * Ends a session whose bytes became a preserved node: `aborted` (its node is not the one it
+ * reserved), the folder owner's reservation released — kept when the uploader is the owner
+ * (`own`: the bytes are counted on the node, same account). False when the session was not
+ * `completing` any more (nothing changed). Never touches the store.
+ */
+export async function endPreserved(db: Executor, session: Upload, own: boolean): Promise<boolean> {
+  return releaseAndAbort(db, session, "claimed", { keepReservation: own });
 }
 
 // ── init ────────────────────────────────────────────────────────────────────────────────────
@@ -943,11 +1019,11 @@ async function finish(
   });
 }
 
-function nodeValues(session: Upload, uploader: SessionUser, sha256: string, id = session.nodeId): NodeValues {
+function nodeValues(session: Upload, uploaderId: string, sha256: string, id = session.nodeId): NodeValues {
   return {
     id,
     ownerId: session.ownerId,
-    createdBy: uploader.id,
+    createdBy: uploaderId,
     parentId: session.parentId,
     kind: "file",
     name: session.name,
@@ -1005,18 +1081,42 @@ export async function refuseBlocked(
   reason: "malware" | "dmca" | "admin",
   sha256: string,
 ): Promise<never> {
-  // Asked again right before the delete: a lock elsewhere may have raised this entry to CSAM
-  // since the request read it, and such bytes are never deleted.
-  if ((await blocklist.lookup(db(c), sha256))?.reason === "csam") throw new RaisedToCsam();
   // While the database reads as rolled back the object is kept (unreferenced: the orphan sweep's
   // once the rollback is cleared); everything else — and the answer — is as usual.
-  if (!(await readsRolledBack(c.env, db(c)))) await storage(c.env).delete([session.r2Key]);
-  if (await releaseAndAbort(db(c), session, "claimed")) {
-    audit(c, "upload.blocked", { type: "upload", id: session.id }, { reason, nodeId: session.nodeId });
-    metric("upload", { outcome: "blocked", kind: modeOf(session), reason });
-  }
+  await refuseBlockedSession(deps(c), session, reason, sha256, {
+    mayDelete: async () => !(await readsRolledBack(c.env, db(c))),
+    onEnded: () => {
+      audit(c, "upload.blocked", { type: "upload", id: session.id }, { reason, nodeId: session.nodeId });
+      metric("upload", { outcome: "blocked", kind: modeOf(session), reason });
+    },
+  });
+  throw blocked();
+}
+
+/**
+ * `refuseBlocked` without the request: the refused session's object deleted — only when
+ * `mayDelete()` says so, asked right before the delete (PLAN §6 rule 17; refused: the object is
+ * kept, unreferenced, for the orphan sweep) — the reservation released, the session `aborted`,
+ * and the UPLOADER struck once per content. `RaisedToCsam` when the entry has become a CSAM
+ * entry since the caller read it (nothing is deleted or ended). `onEnded` runs right after the
+ * session was ended by THIS call (the caller's audit row and metric); true in that case. Shared
+ * by the route and the repair sweep (jobs/abuse-hourly.ts).
+ */
+export async function refuseBlockedSession(
+  deps: ServiceDeps,
+  session: Upload,
+  reason: "malware" | "dmca" | "admin",
+  sha256: string,
+  opts: { mayDelete: () => Promise<boolean>; onEnded?: () => void },
+): Promise<boolean> {
+  // Asked again right before the delete: a lock elsewhere may have raised this entry to CSAM
+  // since the request read it, and such bytes are never deleted.
+  if ((await blocklist.lookup(deps.db, sha256))?.reason === "csam") throw new RaisedToCsam();
+  if (await opts.mayDelete()) await storage(deps.env).delete([session.r2Key]);
+  const ended = await releaseAndAbort(deps.db, session, "claimed");
+  if (ended) opts.onEnded?.();
   try {
-    await addStrike(deps(c), {
+    await addStrike(deps, {
       userId: session.uploaderId,
       kind: reason === "admin" ? "abuse" : reason,
       nodeId: session.nodeId,
@@ -1027,7 +1127,7 @@ export async function refuseBlocked(
     captureError(error, { kind: "upload_strike" });
     metric("error", { kind: "upload_strike" });
   }
-  throw blocked();
+  return ended;
 }
 
 /**
@@ -1174,7 +1274,13 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   let handedOver = false;
   const giveUp = (reason: string) => {
     if (evidence) handedOver = true;
-    return abandonClaimed(c, session, { assembled, declaredCsam, verified, reason });
+    return abandonClaimed(c, session, {
+      assembled,
+      declaredCsam,
+      verified,
+      reason,
+      declaredSha256: body.sha256,
+    });
   };
 
   /**
@@ -1295,7 +1401,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       // it; the one shared handler then files the report, holds the accounts and tells the
       // operators. Called on the database handle, after this route's transaction.
       const values = {
-        ...nodeValues(session, user, sha256, replacing ? uuidv7() : session.nodeId),
+        ...nodeValues(session, user.id, sha256, replacing ? uuidv7() : session.nodeId),
         ...LOCKED,
       };
       let node: Node;
@@ -1306,7 +1412,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
         // object was being hashed): the bytes are evidence all the same.
         captureError(error, { kind: "upload_csam_finish" });
         handedOver = true;
-        await preserveAndEnd(c, session, sha256);
+        await preserveAndEnd(c, session, sha256, body.sha256);
         throw blocked();
       }
       handedOver = true;
@@ -1317,7 +1423,10 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   } catch (error) {
     // An unexpected error (a key that cannot seal, a database error in the re-check) after the
     // server found the bytes listed as CSAM: the node is owed — never a bare object, never silent.
-    if (evidence && !handedOver) await oweNode(c, session, error);
+    if (evidence && !handedOver) {
+      const server = (verified as Verified | null)?.sha256 ?? null;
+      await oweNode(c, session, error, { server, declared: body.sha256 });
+    }
     throw error;
   }
 
@@ -1336,7 +1445,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       as: "avatar",
       current: verdict.status === "clean",
       values: {
-        ...nodeValues(session, user, sha256),
+        ...nodeValues(session, user.id, sha256),
         scanStatus: verdict.status,
         scanReason: verdict.reason ?? null,
         scanDetail: {
@@ -1348,7 +1457,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       },
     };
   } else {
-    becomes = { as: "new", values: nodeValues(session, user, sha256) };
+    becomes = { as: "new", values: nodeValues(session, user.id, sha256) };
   }
 
   let finished: Finished;

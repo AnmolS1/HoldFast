@@ -594,6 +594,10 @@ export const reports = pgTable(
       .where(sql`status IN ('open', 'reviewing')`),
     index("reports_status_created_idx").on(t.status, t.createdAt),
     index("reports_node_idx").on(t.nodeId),
+    // The report intake's per-reporter cap (count in the last 24 h) and per-link alert cap
+    // (open reports through one link) — T22, migration 0009.
+    index("reports_reporter_created_idx").on(t.reporterIpHashStable, t.createdAt),
+    index("reports_link_status_idx").on(t.linkId, t.status),
   ],
 );
 

@@ -1,16 +1,3 @@
-// PLACEHOLDER — taken over by the abuse-controls task (T22), which keeps both names and props.
-import type { ReportDialogProps, ReportLinkProps } from "../../components/slots";
-
+// The abuse report (T22): T08's `ReportLink` and `ReportDialog` slots, same names and props.
 export { routes } from "./routes";
-
-/** Stub: renders nothing. */
-export function ReportLink(props: ReportLinkProps): null {
-  void props;
-  return null;
-}
-
-/** Stub: renders nothing. */
-export function ReportDialog(props: ReportDialogProps): null {
-  void props;
-  return null;
-}
+export { ReportDialog, ReportLink } from "./ReportDialog";
