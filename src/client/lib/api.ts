@@ -70,6 +70,8 @@ export interface ApiEnvironment {
    * session now names. The API client then starts again at `/`.
    */
   identityChanged(): Promise<void>;
+  /** Load the app again from `to` (a full page load): what is left when the session cannot be read. */
+  reload(to: string): void;
 }
 
 const defaultEnvironment: ApiEnvironment = {
@@ -82,6 +84,9 @@ const defaultEnvironment: ApiEnvironment = {
   patchConfig: () => {},
   userId: () => null,
   identityChanged: async () => {},
+  reload: (to) => {
+    if (typeof window !== "undefined") window.location.assign(to);
+  },
 };
 
 let environment: ApiEnvironment = { ...defaultEnvironment };
@@ -268,16 +273,33 @@ export function isIdentityMismatch(error: unknown): boolean {
 
 let adopting: Promise<void> | null = null;
 
-/** Once, however many requests were refused at the same time: purge, adopt, start again at `/`. */
+/**
+ * Once, however many requests were refused at the same time: purge, adopt, start again at `/`.
+ * When the session cannot be read, the app is loaded again from `/` instead: the account it
+ * remembers would still be the old one, and every request made for it would be refused again —
+ * and adopted again — without end.
+ */
 function adoptBrowserIdentity(): void {
   if (adopting) return;
   adopting = environment
     .identityChanged()
-    .catch(() => {})
-    .then(() => environment.navigate("/", { replace: true }))
+    .then(
+      () => environment.navigate("/", { replace: true }),
+      () => environment.reload("/"),
+    )
     .finally(() => {
       adopting = null;
     });
+}
+
+/**
+ * For a request made outside `api()` (the upload bodies): when its failure says the browser is
+ * signed in to another account, adopt it, as `api()` does. Returns whether it did.
+ */
+export function noteIdentityMismatch(error: unknown): boolean {
+  if (!isIdentityMismatch(error)) return false;
+  adoptBrowserIdentity();
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------------

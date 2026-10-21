@@ -14,7 +14,7 @@ import {
   type CompleteUploadBody,
   type InitUploadBody,
 } from "../../../shared/schemas/upload";
-import { api, ApiError, apiErrorOf, identityHeaders } from "../../lib/api";
+import { api, ApiError, apiErrorOf, identityHeaders, noteIdentityMismatch } from "../../lib/api";
 import { t } from "./strings";
 
 export function initUpload(body: InitUploadBody, signal?: AbortSignal): Promise<InitUploadResponse> {
@@ -88,10 +88,13 @@ function parseJson(text: string): unknown {
 
 /** The failure of a body request: the ApiError the API client throws for the same answer. */
 function errorOf(xhr: XMLHttpRequest): ApiError {
-  return apiErrorOf(
+  const error = apiErrorOf(
     { status: xhr.status, body: xhr.responseText, retryAfter: xhr.getResponseHeader("retry-after") },
     t("row.failed"),
   );
+  // Refused as another account's (another tab signed in since): the client adopts that account.
+  noteIdentityMismatch(error);
+  return error;
 }
 
 /**

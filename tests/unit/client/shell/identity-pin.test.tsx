@@ -94,6 +94,25 @@ describe("refused as another account", () => {
     expect(calls.filter((call) => call.path === "/api/auth/get-session")).toHaveLength(1);
   });
 
+  it("the session cannot be read during the adoption: the app starts over once (a reload), it does not ask again", async () => {
+    browser = BOB;
+    const reloaded: string[] = [];
+    configureApi({ reload: (to) => void reloaded.push(to) });
+    const calls = mockFetch((call) => {
+      if (call.path === "/api/auth/get-session") return envelope("internal", 503);
+      if (call.path.startsWith("/api/nodes")) return MISMATCH();
+      return undefined;
+    });
+    await api("/api/nodes").catch(() => {});
+    await expect.poll(() => reloaded).toEqual(["/"]);
+    // Nothing more is asked by itself: no loop of refusals and session reads.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(reloaded).toEqual(["/"]);
+    expect(navigated).toEqual([]);
+    expect(calls.filter((call) => call.path === "/api/auth/get-session").length).toBeLessThanOrEqual(1);
+    expect(calls.filter((call) => call.path.startsWith("/api/nodes"))).toHaveLength(1);
+  });
+
   it("control: another 403 forbidden (no reason) adopts nothing and keeps its toast path", async () => {
     browser = BOB;
     server(() => envelope("forbidden", 403));

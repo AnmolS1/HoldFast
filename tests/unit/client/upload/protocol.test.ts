@@ -65,6 +65,26 @@ const caught = (promise: Promise<unknown>) =>
   );
 
 describe("putBody", () => {
+  it("a body refused as another account's (identity_mismatch) starts the adoption, once", async () => {
+    const identityChanged = vi.fn(async () => {});
+    const navigated: string[] = [];
+    configureApi({ identityChanged, navigate: (to) => void navigated.push(to) });
+    try {
+      const promise = caught(putBody(path, blob, PartResponse));
+      FakeXhr.made[0]!.answer(403, {
+        error: "forbidden",
+        message: "x",
+        requestId: "r",
+        details: { reason: "identity_mismatch" },
+      });
+      expect(await promise).toMatchObject({ status: 403, details: { reason: "identity_mismatch" } });
+      await vi.waitFor(() => expect(navigated).toEqual(["/"]));
+      expect(identityChanged).toHaveBeenCalledTimes(1);
+    } finally {
+      resetApiForTests();
+    }
+  });
+
   it("names the account the upload is for (the identity pin), when one is known", async () => {
     configureApi({ userId: () => "a".repeat(32) });
     try {
