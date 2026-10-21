@@ -16,6 +16,9 @@
 //   legalHold        a hold must not be observable by the account holder
 //   invitedBy        another account's id
 //   suspendedReason  an operator's note
+//   usedBytes        the stored counter keeps the bytes a legal hold keeps of what was deleted for
+//                    good, so beside GET /api/account/usage (which leaves them out) it would tell a
+//                    held account apart (T23 review M1); the usage route is the one usage answer
 
 /** 5 GB (5,000,000,000 bytes), the beta quota. The real value is written at sign-up from `QUOTA_BYTES`. */
 const DEFAULT_QUOTA_BYTES = 5_000_000_000;
@@ -28,7 +31,7 @@ export const userAdditionalFields = {
     defaultValue: DEFAULT_QUOTA_BYTES,
     input: false,
   },
-  usedBytes: { type: "number", bigint: true, required: true, defaultValue: 0, input: false },
+  usedBytes: { type: "number", bigint: true, required: true, defaultValue: 0, input: false, returned: false },
   ageVerifiedAt: { type: "date", required: false, input: false },
   termsAcceptedAt: { type: "date", required: false, input: false },
   termsVersion: { type: "string", required: false, input: false },
