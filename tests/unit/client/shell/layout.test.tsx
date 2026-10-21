@@ -248,7 +248,8 @@ describe("mobile frame", () => {
       "DMCA",
       "Sign out",
     ]);
-    expect(within(sheet).getByLabelText("Loading storage use")).toBeTruthy();
+    // The shell's mock answers usage 404: the sheet's storage part says it is unavailable.
+    expect(await within(sheet).findByText("Storage use unavailable")).toBeTruthy();
     expect(within(sheet).getByRole("radiogroup", { name: "Theme" })).toBeTruthy();
     fireEvent.click(within(sheet).getByText("Account settings"));
     await waitFor(() => expect(router.state.location.pathname).toBe("/account"));

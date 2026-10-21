@@ -31,7 +31,8 @@ exact<PropsOf<typeof DangerousFileInterstitial>, Slots.DangerousFileInterstitial
 exact<PropsOf<typeof PreviewDialog>, Slots.PreviewDialogProps>(true);
 exact<PropsOf<typeof ShareDialog>, Slots.ShareDialogProps>(true);
 exact<PropsOf<typeof SearchSuggestions>, Slots.SearchSuggestionsProps>(true);
-exact<ReturnType<typeof useUsageSummary>, Slots.UsageSummary | null>(true);
+exact<ReturnType<typeof useUsageSummary>, Slots.UsageSlotValue>(true);
+exact<Slots.UsageSlotValue, Slots.UsageSummary | "unavailable" | null>(true);
 exact<typeof requestUpload, Slots.RequestUpload>(true);
 exact<Parameters<typeof UploadDropOverlay>, []>(true);
 

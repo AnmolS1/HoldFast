@@ -123,7 +123,7 @@ describe("Breadcrumbs", () => {
         />
       </div>
     );
-    const duplicateWarnings = (spy: ReturnType<typeof vi.spyOn>) =>
+    const duplicateWarnings = (spy: { mock: { calls: unknown[][] } }) =>
       spy.mock.calls.filter((call) => typeof call[0] === "string" && DUPLICATE.test(call[0]));
 
     it("the row of the folder the trail ends in carries no name while its crumb is mounted", () => {

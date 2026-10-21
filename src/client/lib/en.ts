@@ -76,6 +76,7 @@ export const en = {
   "storage.of": "{used} of {quota}",
   "storage.aria": "{used} of {quota} used",
   "storage.loading": "Loading storage use",
+  "storage.unavailable": "Storage use unavailable",
   "storage.almostFull": "Almost full",
   "storage.full": "Storage is full",
 
