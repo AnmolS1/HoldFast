@@ -24,7 +24,7 @@ import {
   openDb,
   protectedFiles,
   rand,
-  withTrimLock,
+  useTrimLock,
 } from "./_helpers";
 
 let db: Db;
@@ -265,8 +265,9 @@ describe("expired and trimFinished", () => {
     expect(ids).not.toContain(owed.id);
   });
 
-  it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", () =>
-    withTrimLock(async () => {
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", async () => {
       const owner = await makeUser(db);
       const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
       const oldDone = await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(8) });
@@ -303,12 +304,18 @@ describe("expired and trimFinished", () => {
         // Nothing of this test is left behind, older than everything, for the next run's trims.
         await db.delete(uploads).where(inArray(uploads.id, [...ids, ...batch]));
       }
-    }));
+    });
+  });
 
-  it("trimFinished keeps a finished session while its owner or uploader is held or its node is one the purge gate protects; the count is of rows actually deleted", () =>
-    withTrimLock(async () => {
-      // An age no other row in the (shared) database has, so the counts below are exact.
-      const days = 10_000 + Math.floor(Math.random() * 100_000);
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("trimFinished keeps a finished session while its owner or uploader is held or its node is one the purge gate protects; the count is of rows actually deleted", async () => {
+      // An age above every row in the (shared) database — a row an earlier, failed run of this test
+      // left is younger than it — so the counts below are of this test's rows only (review m5).
+      const oldest = await db.execute<{ days: number | null }>(
+        sql`SELECT max(extract(epoch FROM now() - COALESCE(completed_at, created_at)) / 86400)::float AS days FROM uploads`,
+      );
+      const days = Math.ceil(Number(oldest.rows[0]?.days ?? 0)) + 1;
       const ended = new Date(Date.now() - days * 86_400_000 - 43_200_000);
       const held = await makeUser(db, { legalHold: true });
       const free = await makeUser(db);
@@ -331,21 +338,27 @@ describe("expired and trimFinished", () => {
       const control = await done(free, other);
       const present = async (id: string) =>
         (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+      const own = [control, ...Object.values(kept)];
+      try {
+        expect(await trimFinished(db, days)).toBe(1);
+        expect(await present(control)).toBe(false);
+        for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
+        expect(await trimFinished(db, days)).toBe(0);
 
-      expect(await trimFinished(db, days)).toBe(1);
-      expect(await present(control)).toBe(false);
-      for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
-      expect(await trimFinished(db, days)).toBe(0);
-
-      // Each cause lifted, exactly its session goes on the next call.
-      for (const [cause, { release }] of Object.entries(files)) {
-        await release();
-        expect(await trimFinished(db, days), cause).toBe(1);
-        expect(await present(kept[cause]!), cause).toBe(false);
+        // Each cause lifted, exactly its session goes on the next call.
+        for (const [cause, { release }] of Object.entries(files)) {
+          await release();
+          expect(await trimFinished(db, days), cause).toBe(1);
+          expect(await present(kept[cause]!), cause).toBe(false);
+        }
+        await setUserLegalHold(db, held, false);
+        expect(await trimFinished(db, days)).toBe(2);
+        expect(await present(kept.owner_held!)).toBe(false);
+        expect(await present(kept.uploader_held!)).toBe(false);
+      } finally {
+        // Nothing of this test is left behind (older than everything) for the next run's trims.
+        await db.delete(uploads).where(inArray(uploads.id, own));
       }
-      await setUserLegalHold(db, held, false);
-      expect(await trimFinished(db, days)).toBe(2);
-      expect(await present(kept.owner_held!)).toBe(false);
-      expect(await present(kept.uploader_held!)).toBe(false);
-    }));
+    });
+  });
 });

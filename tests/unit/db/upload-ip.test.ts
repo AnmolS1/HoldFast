@@ -24,7 +24,7 @@ import {
 } from "../../../src/worker/db/queries/uploads";
 import { type Upload, uploads, user } from "../../../src/worker/db/schema";
 import { stripComments } from "./_sql-rule-scan";
-import { makeFolder, makeUpload, makeUser, openDb, withTrimLock } from "./_helpers";
+import { makeFolder, makeUpload, makeUser, openDb, useTrimLock } from "./_helpers";
 
 let db: Db;
 let close: () => Promise<void>;
@@ -136,8 +136,9 @@ describe("every terminal transition clears it", () => {
     expect(await row(session.id)).toMatchObject({ status: "aborted", ...NONE });
   });
 
-  it("EXCEPTION (ruling 2026-10-21, legal-hold preservation — T29 :119): a session deleteSubtreeRows keeps BECAUSE of a hold is ended as aborted with its address KEPT; trimFinished deletes the row, address and all, once the hold is lifted", () =>
-    withTrimLock(async () => {
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("EXCEPTION (ruling 2026-10-21, legal-hold preservation — T29 :119): a session deleteSubtreeRows keeps BECAUSE of a hold is ended as aborted with its address KEPT; trimFinished deletes the row, address and all, once the hold is lifted", async () => {
       const owner = await makeUser(db);
       const heldEditor = await makeUser(db, { legalHold: true });
       const folder = await makeFolder(db, owner, null, "purged");
@@ -157,10 +158,12 @@ describe("every terminal transition clears it", () => {
       await db.update(user).set({ legalHold: false }).where(eq(user.id, heldEditor));
       await trimFinished(db, 7, 100_000);
       expect(await row(kept.id)).toBeNull();
-    }));
+    });
+  });
 
-  it("the rows that are deleted take it with them: trimFinished, deleteForUser, deleteSubtreeRows", () =>
-    withTrimLock(async () => {
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("the rows that are deleted take it with them: trimFinished, deleteForUser, deleteSubtreeRows", async () => {
       const owner = await makeUser(db);
       // trimFinished — a finished session past the trim age. (Cleared at its end already; this is
       // a row written before that rule, which the trim still removes whole.)
@@ -180,7 +183,8 @@ describe("every terminal transition clears it", () => {
       const free = await sealedSession(owner, owner, { parentId: folder.id });
       await deleteSubtreeRows(db, folder.id);
       expect(await row(free.id)).toBeNull();
-    }));
+    });
+  });
 });
 
 describe("an unfinished session keeps it — the repair sweep reads it from there", () => {
