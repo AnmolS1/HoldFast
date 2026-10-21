@@ -1,10 +1,16 @@
 // Route guards, including the open-redirect cases of `next`.
 import { screen, waitFor } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { buildRoutes } from "../../../../src/client/router";
 import { safeNext } from "../../../../src/client/routes/auth";
 import { renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
 import { buildRoutesWithTestPage, TEST_PAGE, testPage } from "./test-page";
+
+// The router runs /admin/*'s lazy loader before its guard renders, for any role; the console's first
+// import can outlast a find's 1 s on a slow runner. Import it once up front (see admin/helpers.tsx).
+beforeAll(async () => {
+  await import("../../../../src/client/features/admin/AdminConsole");
+}, 60_000);
 
 setupShell();
 

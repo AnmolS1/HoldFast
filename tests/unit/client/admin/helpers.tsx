@@ -1,7 +1,7 @@
 // Shared by the admin console's jsdom tests: an admin session, a scripted /api/admin/* and
 // fixtures that parse as the shared admin contracts.
 import { screen, waitFor } from "@testing-library/react";
-import { expect } from "vitest";
+import { beforeAll, expect } from "vitest";
 import { buildRoutes } from "../../../../src/client/router";
 import { json, renderRoutes, sessionOf, shellFetch, type MockCall, type MockHandler } from "../shell/helpers";
 
@@ -248,6 +248,13 @@ export function adminFetch(extra: MockHandler = () => undefined, fixtures = DEFA
     },
   });
 }
+
+// The console is a lazy chunk; its first import (the transform of the whole console) can outlast a
+// find's 1 s on a slow runner, leaving the page on "Loading". Every file that opens it imports it
+// once first, so each test waits on the console, not on the module graph.
+beforeAll(async () => {
+  await import("../../../../src/client/features/admin/AdminConsole");
+}, 60_000);
 
 export function openConsole(path: string) {
   return renderRoutes(buildRoutes(), [path]);
