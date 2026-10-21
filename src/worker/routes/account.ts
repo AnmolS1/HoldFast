@@ -306,7 +306,7 @@ router.get("/account/export", async (c) => {
       locale: account.locale,
       quotaBytes: account.quotaBytes,
       // Without what a hold keeps of roots deleted for good (see `purgeRequestedBytes`).
-      usedBytes: Math.max(0, account.usedBytes - asked),
+      usedBytes: Math.max(0, account.usedBytes - asked.files - asked.versions),
       termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
       termsVersion: account.termsVersion,
     },
