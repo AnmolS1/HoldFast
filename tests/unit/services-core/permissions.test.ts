@@ -76,6 +76,7 @@ describe("getAccess", () => {
       expect(await value(t.owner, (c) => getAccess(c, node.id))).toEqual({
         role: "owner",
         shareRootId: null,
+        viewRootId: null,
         canUpload: true,
         via: "owner",
       });
@@ -83,18 +84,21 @@ describe("getAccess", () => {
       expect(await value(t.editor, (c) => getAccess(c, node.id))).toEqual({
         role: "editor",
         shareRootId: t.shared.id,
+        viewRootId: t.shared.id,
         canUpload: true,
         via: "share",
       });
       expect(await value(t.editorNoUpload, (c) => getAccess(c, node.id))).toEqual({
         role: "editor",
         shareRootId: t.shared.id,
+        viewRootId: t.shared.id,
         canUpload: false,
         via: "share",
       });
       expect(await value(t.viewer, (c) => getAccess(c, node.id))).toEqual({
         role: "viewer",
         shareRootId: t.shared.id,
+        viewRootId: t.shared.id,
         canUpload: false,
         via: "share",
       });
@@ -136,6 +140,7 @@ describe("getAccess", () => {
       expect(await value(caller, (c) => getAccess(c, node.id))).toEqual({
         role: "editor",
         shareRootId: t.shared.id,
+        viewRootId: t.shared.id,
         canUpload: false,
         via: "share",
       });
@@ -275,6 +280,7 @@ describe("requireUpload", () => {
     expect(await value(t.viewer, (c) => requireUpload(c, null))).toEqual({
       role: "owner",
       shareRootId: null,
+      viewRootId: null,
       canUpload: true,
       via: "owner",
     });
@@ -286,7 +292,13 @@ describe("link scope", () => {
   it("is viewer for the link's root and its descendants, and nothing for any other node", async () => {
     const t = await tree();
     const scope = { linkId: crypto.randomUUID(), rootNodeId: t.shared.id };
-    const linkAccess = { role: "viewer", shareRootId: t.shared.id, canUpload: false, via: "link" };
+    const linkAccess = {
+      role: "viewer",
+      shareRootId: t.shared.id,
+      viewRootId: t.shared.id,
+      canUpload: false,
+      via: "link",
+    };
     // A stranger, a signed-out visitor — and the OWNER — all get exactly the link's access.
     for (const caller of [null, t.stranger, t.owner, t.editor]) {
       const seen = await value(caller, async (c) => {
