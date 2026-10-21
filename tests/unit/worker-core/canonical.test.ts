@@ -9,6 +9,7 @@ import {
   canonicalMethod,
   canonicalPath,
   existsOnAppHost,
+  isHeadRequest,
   MAX_PATH_CHARS,
   requestMethod,
   requestPath,
@@ -115,6 +116,37 @@ describe("the canonical form of a path", () => {
     expect(canonicalMethod("get")).toBe("GET");
     for (const method of ["TRACE", "CONNECT", "PROPFIND", "FOO", ""])
       expect(canonicalMethod(method)).toBeNull();
+  });
+
+  it("isHeadRequest: true for a HEAD and for nothing else — while requestMethod still reads it as a GET", async () => {
+    const seen: Array<{ sent: string; method: string; head: boolean }> = [];
+    const probe = new Hono<AppEnv>();
+    probe.all("/*", (c) => {
+      seen.push({ sent: c.req.header("x-sent") ?? "", method: requestMethod(c), head: isHeadRequest(c) });
+      return c.text("ok");
+    });
+    for (const sent of ["GET", "HEAD", "head", "POST", "OPTIONS"]) {
+      await probe.request(at("/d/abc/def"), { method: sent, headers: { "x-sent": sent } });
+    }
+    expect(seen).toEqual([
+      { sent: "GET", method: "GET", head: false },
+      { sent: "HEAD", method: "GET", head: true },
+      { sent: "head", method: "GET", head: true },
+      { sent: "POST", method: "POST", head: false },
+      { sent: "OPTIONS", method: "OPTIONS", head: false },
+    ]);
+    // The control: without the accessor a HEAD and a GET are the same request to a handler.
+    expect(seen[0]?.method).toBe(seen[1]?.method);
+    expect(seen[0]?.head).not.toBe(seen[1]?.head);
+  });
+
+  it("isHeadRequest: a request that has no canonical form has no answer (404), like the other accessors", async () => {
+    const probe = new Hono<AppEnv>();
+    probe.all("/*", (c) => c.text(String(isHeadRequest(c))));
+    probe.onError((error) => new Response((error as { code?: string }).code ?? "error", { status: 500 }));
+    expect(await (await probe.request(at("/d/abc/def"), { method: "HEAD" })).text()).toBe("");
+    expect(await (await probe.request(at("/d/abc/def"))).text()).toBe("false");
+    expect(await (await probe.request(at("/d/abc/def/"))).text()).toBe("not_found");
   });
 
   it("under /api/auth only the table's exact (method, path) pairs exist — and unknown /admin/ paths, for the audited refusal", () => {
@@ -346,8 +378,8 @@ describe("files host: the same step, first", () => {
 
   it("the control: the canonical token path reaches its route and is counted", async () => {
     const { send, seen } = filesHost();
-    expect((await send("/d/abcDEF123")).status).toBe(501);
-    expect((await send("/d/abcDEF123", "HEAD")).status).toBe(501);
+    expect((await send("/d/abcDEF123")).status).toBe(403);
+    expect((await send("/d/abcDEF123", "HEAD")).status).toBe(403);
     expect(seen).toHaveLength(2);
   });
 });

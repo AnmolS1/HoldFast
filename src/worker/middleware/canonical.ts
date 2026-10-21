@@ -96,7 +96,7 @@ export function existsOnAppHost(method: string, path: string): boolean {
   return isAdminPluginPath(relative) && !isAuthPath(relative);
 }
 
-type Canonical = { path: string; method: string };
+type Canonical = { path: string; method: string; head: boolean };
 const read = new WeakMap<Request, Canonical | null>();
 
 function canonicalOf(c: Context<AppEnv>): Canonical | null {
@@ -105,7 +105,8 @@ function canonicalOf(c: Context<AppEnv>): Canonical | null {
   if (found === undefined) {
     const path = canonicalPath(request.url);
     const method = canonicalMethod(request.method);
-    found = path !== null && method !== null ? { path, method } : null;
+    const head = request.method.toUpperCase() === "HEAD";
+    found = path !== null && method !== null ? { path, method, head } : null;
     read.set(request, found);
   }
   return found;
@@ -123,6 +124,17 @@ export function requestMethod(c: Context<AppEnv>): string {
   const found = canonicalOf(c);
   if (!found) throw new AppError("not_found");
   return found.method;
+}
+
+/**
+ * Was the request sent as a HEAD? ONLY for deciding whether a body is produced — a handler that
+ * would open a stream or charge for bytes it then does not send. It is no gate: for every
+ * decision about what a request may do, a HEAD is a GET (`requestMethod`).
+ */
+export function isHeadRequest(c: Context<AppEnv>): boolean {
+  const found = canonicalOf(c);
+  if (!found) throw new AppError("not_found");
+  return found.head;
 }
 
 async function drain(request: Request): Promise<void> {
