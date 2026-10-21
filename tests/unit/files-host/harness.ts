@@ -56,17 +56,53 @@ export type Ctx = ExecutionContext & {
   settle(): Promise<void>;
   /** Resolves when the next promise is handed to `waitUntil` — an event to wait for, not a time. */
   next(): Promise<void>;
+  /**
+   * The client goes away. Modelled on the runtime: the invocation then lives on only while a
+   * promise handed to `waitUntil` is still pending (workerd's drain waits for its `waitUntil` set
+   * to empty, and a registration made meanwhile joins it); once none is, the context is cancelled
+   * and nothing registered after that runs. Such a registration lands in `lost`, not `pending`.
+   * (On the runtime the code that registers it never runs at all; here it does, so a test asserts
+   * `lost` is empty rather than reading only the ledger.)
+   */
+  disconnect(): void;
+  lost: Promise<unknown>[];
+  /** How many promises were handed to `waitUntil` so far, settled or not (`lost` ones too). */
+  readonly registered: number;
 };
 
 export function newCtx(): Ctx {
   const pending: Promise<unknown>[] = [];
+  const lost: Promise<unknown>[] = [];
   const waiting: Array<() => void> = [];
+  let unsettled = 0;
+  let disconnected = false;
+  let cancelled = false;
+  let registered = 0;
   return {
     pending,
+    lost,
+    get registered() {
+      return registered;
+    },
     next: () => new Promise<void>((resolve) => waiting.push(resolve)),
     waitUntil: (promise: Promise<unknown>) => {
+      registered += 1;
+      if (cancelled) {
+        lost.push(promise);
+        return;
+      }
+      unsettled += 1;
+      const settled = () => {
+        unsettled -= 1;
+        if (disconnected && unsettled === 0) cancelled = true;
+      };
+      promise.then(settled, settled);
       pending.push(promise);
       for (const resolve of waiting.splice(0)) resolve();
+    },
+    disconnect() {
+      disconnected = true;
+      if (unsettled === 0) cancelled = true;
     },
     passThroughOnException() {},
     props: {},
@@ -98,7 +134,7 @@ const allow = { limit: async () => ({ success: true }) };
 /** How many database clients the requests of this file opened (a refused token must open none). */
 export const opened = { clients: 0 };
 
-function coreFor(options: AskOptions, handles: Db[] = []): CoreDeps {
+function coreFor(options: AskOptions, handles: Db[] = [], closed: () => void = () => {}): CoreDeps {
   return {
     ...realCore,
     limits: options.limits,
@@ -106,7 +142,9 @@ function coreFor(options: AskOptions, handles: Db[] = []): CoreDeps {
       opened.clients += 1;
       const made = realCore.createDb(...args);
       handles.push(made.db);
-      return made;
+      // The request's own client is the first one opened.
+      const first = handles.length === 1;
+      return { db: made.db, close: (opts) => made.close(opts).finally(() => (first ? closed() : undefined)) };
     },
     getSettings: async () => ({ ...BASE_SETTINGS, ...options.settings }),
   };
@@ -124,10 +162,13 @@ export async function open(path: string, options: AskOptions = {}) {
   const request = new Request(`${TEST_FILES_ORIGIN}${path}`, { method: options.method ?? "GET", headers });
   const requestEnv = { ...env, RL_FILES: allow, ...options.env } as unknown as Env;
   const handles: Db[] = [];
-  const response = await createFilesHost(coreFor(options, handles)).fetch(request, requestEnv, ctx);
+  let closed!: () => void;
+  /** Resolves when the request's own deferred work has drained and its database client closed. */
+  const drained = new Promise<void>((resolve) => (closed = resolve));
+  const response = await createFilesHost(coreFor(options, handles, closed)).fetch(request, requestEnv, ctx);
   /** The statements this request has sent so far (its deferred work's too, once settled). */
   const statements = () => handles.reduce((sum, handle) => sum + statementsSent(handle), 0);
-  return { response, ctx, answered: statements(), statements };
+  return { response, ctx, drained, answered: statements(), statements };
 }
 
 export type Answer = {

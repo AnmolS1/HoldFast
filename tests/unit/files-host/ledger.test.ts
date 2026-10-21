@@ -656,43 +656,98 @@ describe("the settle runs once, on the request's client or — for a long stream
     const { owner, node, link } = await world();
     const ip = freshIp();
     const chunked = spyBucket({}, { splitAt: N });
-    const { response, ctx } = await open(await urlFor("download", node, { link }), {
+    const { response, ctx, drained } = await open(await urlFor("download", node, { link }), {
       ip,
       limits,
       env: { FILES: chunked.bucket },
     });
+    const registered = ctx.registered;
     // The request's deferred work drains and its client closes while the body is still open.
-    await ctx.settle();
+    await drained;
     expect(await ledgerBytes("link", link.id)).toBe(SIZE);
-    const handed = ctx.next();
     expect(await readThenCancel(response, N)).toBe(N);
-    // The settle is handed to the context at the moment the stream ends — once.
-    await handed;
-    expect(ctx.pending).toHaveLength(1);
     await ctx.settle();
+    // Everything the settle needs was handed to the context before the handler returned: the
+    // stream's end registers nothing (a registration made then is what a disconnect cancels).
+    expect(ctx.registered).toBe(registered);
     expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(N);
     expect(await ledgerBytes("link_owner", owner.id)).toBe(N);
     expect(await ledgerBytes("link", link.id)).toBe(N);
     expect((await linkById(link.id)).bytesServed).toBe(N);
   });
 
+  it("a client that leaves after the request's drain is settled to the bytes it took — by work the invocation was already waiting for when it left", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    const chunked = spyBucket({}, { splitAt: N });
+    const { response, ctx, drained } = await open(await urlFor("download", node, { link }), {
+      ip,
+      limits,
+      env: { FILES: chunked.bucket },
+    });
+    // The request's deferred work drains and its client closes while the body is still open.
+    await drained;
+    expect(await ledgerBytes("link", link.id)).toBe(SIZE);
+    const reader = response.body!.getReader();
+    let read = 0;
+    while (read < N) read += (await reader.read()).value!.byteLength;
+    // The client goes away: what the invocation is not waiting for at this moment is cancelled.
+    ctx.disconnect();
+    await reader.cancel();
+    try {
+      await ctx.settle();
+      expect(ctx.lost).toHaveLength(0);
+      expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(N);
+      expect(await ledgerBytes("link_owner", owner.id)).toBe(N);
+      expect(await ledgerBytes("link", link.id)).toBe(N);
+      expect((await linkById(link.id)).bytesServed).toBe(N);
+    } finally {
+      await Promise.allSettled(ctx.lost);
+    }
+  });
+
+  it("a client that leaves within the in-time window is settled on the request's own client", async () => {
+    const { owner, node, link } = await world();
+    const ip = freshIp();
+    const chunked = spyBucket({}, { splitAt: N });
+    const { response, ctx } = await open(await urlFor("download", node, { link }), {
+      ip,
+      env: { FILES: chunked.bucket },
+    });
+    const reader = response.body!.getReader();
+    let read = 0;
+    while (read < N) read += (await reader.read()).value!.byteLength;
+    ctx.disconnect();
+    await reader.cancel();
+    try {
+      await ctx.settle();
+      expect(ctx.lost).toHaveLength(0);
+      expect(await ledgerBytes("ip", await ipSubject(ip))).toBe(N);
+      expect(await ledgerBytes("link_owner", owner.id)).toBe(N);
+      expect(await ledgerBytes("link", link.id)).toBe(N);
+    } finally {
+      await Promise.allSettled(ctx.lost);
+    }
+  });
+
   it("the same stream read to its end keeps the full charge — and settles exactly once on either path", async () => {
     const { owner, node, link } = await world();
     const late = await open(await urlFor("download", node, { link }), { limits });
-    await late.ctx.settle();
-    const handed = late.ctx.next();
+    const registered = late.ctx.registered;
+    await late.drained;
     expect(new Uint8Array(await late.response.arrayBuffer())).toHaveLength(SIZE);
-    await handed;
-    expect(late.ctx.pending).toHaveLength(1);
     await late.ctx.settle();
+    expect(late.ctx.registered).toBe(registered);
     expect(await ledgerBytes("link", link.id)).toBe(SIZE);
     expect((await linkById(link.id)).bytesServed).toBe(SIZE);
 
-    // In time: nothing is handed to the context when the stream ends — the settle was deferred
-    // before the handler returned.
+    // In time: nothing is handed to the context when the stream ends either — the settle was
+    // deferred before the handler returned.
     const early = await open(await urlFor("download", node, { link }));
+    const before = early.ctx.registered;
     expect(new Uint8Array(await early.response.arrayBuffer())).toHaveLength(SIZE);
     await early.ctx.settle();
+    expect(early.ctx.registered).toBe(before);
     expect(await ledgerBytes("link", link.id)).toBe(SIZE * 2);
     expect(await ledgerBytes("link_owner", owner.id)).toBe(SIZE * 2);
     expect((await linkById(link.id)).bytesServed).toBe(SIZE * 2);

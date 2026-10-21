@@ -458,19 +458,27 @@ const settleInRequestMs = (c: Ctx) =>
   Math.floor((coreOf(c).limits?.drainDeadlineMs ?? DRAIN_DEADLINE_MS) / 4);
 
 /**
- * Arranges the ONE settle of a response's charge and returns the function to call when its
- * stream has ended — completed, cancelled or failed — with the body bytes that were sent.
- * It settles exactly once, however often and however late it is called:
- *   in time   through `defer`, on the request's client (registered here, before the handler
- *             returns — never from inside the stream);
- *   late      the request's client is closed by then: `runBackground` (a pool of its own),
- *             handed to `waitUntil` at the moment the stream ends.
+ * Arranges the ONE settle of a response's charge. `ended` is called when the stream has ended —
+ * completed, cancelled or failed — with the body bytes that were sent; `abandon` when the stream
+ * will never be built (the caller then gives the charge back itself).
+ * It settles exactly once, however often and however late `ended` is called:
+ *   in time   through `defer`, on the request's client;
+ *   late      the request's client is closed by then: `runBackground` (a pool of its own).
+ * Both are arranged HERE, before the handler returns — never from inside the stream. A client
+ * that disconnects cancels whatever the invocation is not waiting for, and when no `waitUntil`
+ * promise is pending at that moment the stream's own continuation never runs again. So one
+ * `waitUntil` promise is registered now and stays pending until the settle is done on either
+ * path: it keeps the invocation alive past the disconnect, the cancelled write then fails, and
+ * `ended` runs. The platform gives it 30 s from the disconnect (or the end of the body).
  * A settle that fails leaves the reservation in place until the day rolls over — the ledger
  * over-counts, it never under-counts — and is counted.
  */
-function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
+function settleLater(c: Ctx, charge: ServeCharge): { ended: (sent: number) => void; abandon: () => void } {
   let inTime!: (sent: number | null) => void;
   const early = new Promise<number | null>((resolve) => (inTime = resolve));
+  // What is left to settle once the in-time window has passed: `null` when nothing is.
+  let finish!: (late: number | null) => void;
+  const finished = new Promise<number | null>((resolve) => (finish = resolve));
   const failed = () => {
     metric("download", { outcome: "settle_failed" });
     console.warn("files host: a served response was not settled");
@@ -484,14 +492,26 @@ function settleLater(c: Ctx, charge: ServeCharge): (sent: number) => void {
   );
   const { env, executionCtx } = c;
   const core = coreOf(c);
-  return settleOnce(settleInRequestMs(c), inTime, (sent) => {
-    // The request's own drain is over: `defer` would be refused. The background context opens,
-    // drains and closes a pool of its own, so nothing request-scoped is held by this promise.
-    // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
-    executionCtx.waitUntil(
-      runBackground(env, executionCtx, (bg) => settleServe(bg, charge, sent), core).catch(failed),
-    );
-  });
+  // The request's own drain ends long before a long stream does, so this promise holds nothing
+  // of the request's: a late settle opens, drains and closes a pool of its own.
+  // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
+  executionCtx.waitUntil(
+    finished.then((late) =>
+      late === null
+        ? undefined
+        : runBackground(env, executionCtx, (bg) => settleServe(bg, charge, late), core).catch(failed),
+    ),
+  );
+  const ended = settleOnce(
+    settleInRequestMs(c),
+    (sent) => {
+      inTime(sent);
+      // Settled on the request's client: nothing is left for the late path.
+      if (sent !== null) finish(null);
+    },
+    (sent) => finish(sent),
+  );
+  return { ended, abandon: () => finish(null) };
 }
 
 /**
@@ -664,9 +684,12 @@ async function streamed(
     await body.cancel().catch(() => {});
     return null;
   }
+  let settle: ReturnType<typeof settleLater> | undefined;
   try {
-    return counted(body, bytes, settleLater(c, charged));
+    settle = settleLater(c, charged);
+    return counted(body, bytes, settle.ended);
   } catch (error) {
+    settle?.abandon();
     // Charged, and now nothing will be sent (the settle could not be arranged): the owner and
     // the link get their bytes back here, because no settle will.
     await body.cancel().catch(() => {});
