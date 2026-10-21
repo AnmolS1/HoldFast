@@ -6,7 +6,7 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { QueryError, pgError } from "../errors";
-import { isUuid } from "../ids";
+import { isUuid, uuidv7 } from "../ids";
 import {
   downloadLedger,
   linkAccessLog,
@@ -74,24 +74,43 @@ export type NewShare = {
 };
 
 /**
- * Inserts one share. `conflict` when the node already has a share to that address or to that
- * account (one share per node and grantee).
+ * Inserts one share — at most `max` per node, pending ones included — in the caller's
+ * transaction, in two statements whatever the answer:
+ *   1. the node's row is locked (`FOR UPDATE`): creations on one node run one after the other,
+ *      so the count below sees every share an earlier one inserted (LOCK ORDER: only the node);
+ *   2. one conditional INSERT … SELECT: the row goes in only while the node has fewer than `max`.
+ * A VERIFIED account that already holds a share on the node by account (it changed its address
+ * since) gets the new row as a PENDING one (no `granteeUserId`): the answer and the work are those
+ * of any address, and the row grants nothing it does not already have — a `409` here would tell
+ * the owner that the new address is the account they shared with before.
+ * `{ refused: "limit" }` at the cap; `{ refused: "gone" }` when the node is gone; `conflict` when
+ * the node already has a share to that exact address.
  */
-export async function insertShare(db: Executor, share: NewShare): Promise<Share> {
+export async function insertShare(
+  tx: Executor,
+  share: NewShare,
+  max: number,
+): Promise<{ share: Share } | { refused: "limit" | "gone" }> {
+  if (!isUuid(share.nodeId)) return { refused: "gone" };
+  const locked = await tx.execute(sql`SELECT id FROM nodes WHERE id = ${share.nodeId} FOR UPDATE`);
+  if (locked.rows.length === 0) return { refused: "gone" };
+  const user = share.granteeUserId;
   try {
-    const [row] = await db
-      .insert(shares)
-      .values({
-        nodeId: share.nodeId,
-        grantedBy: share.grantedBy,
-        granteeEmail: share.email,
-        granteeUserId: share.granteeUserId,
-        activatedAt: share.granteeUserId === null ? null : sql`now()`,
-        role: share.role,
-        canUpload: share.canUpload,
-      })
-      .returning();
-    return row!;
+    const result = await tx.execute<Record<string, unknown>>(sql`
+      INSERT INTO shares (id, node_id, granted_by, grantee_email, grantee_user_id, activated_at, role, can_upload)
+      SELECT ${uuidv7()}::uuid, ${share.nodeId}, ${share.grantedBy}, ${share.email},
+             CASE WHEN held.by_account THEN NULL ELSE ${user}::text END,
+             CASE WHEN held.by_account OR ${user}::text IS NULL THEN NULL ELSE now() END,
+             ${share.role}::share_role, ${share.canUpload}
+      FROM (SELECT count(*) AS n,
+                   bool_or(s.grantee_user_id IS NOT DISTINCT FROM ${user}::text AND ${user}::text IS NOT NULL) AS by_account
+            FROM shares s WHERE s.node_id = ${share.nodeId}) held
+      WHERE held.n < ${max}
+      RETURNING id`);
+    const id = result.rows[0]?.id;
+    if (typeof id !== "string") return { refused: "limit" };
+    const [row] = await tx.select().from(shares).where(eq(shares.id, id));
+    return { share: row! };
   } catch (error) {
     if (pgError(error)?.code === UNIQUE_VIOLATION) throw new QueryError("conflict");
     throw error;

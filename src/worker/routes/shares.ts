@@ -28,6 +28,7 @@ import {
   type SharesMineDto,
 } from "../../shared/schemas/share";
 import { QueryError } from "../db/errors";
+import { retryOnDeadlock } from "../db/retry";
 import { SHARED_VISIBLE_STATUSES } from "../db/queries/nodes";
 import { countGrantees, sharedByMe, sharedWithMe } from "../db/queries/shares";
 import {
@@ -135,6 +136,7 @@ router.post(`/nodes/${ID}/shares`, async (c) => {
   if (body.email.toLowerCase() === user.email.toLowerCase()) {
     throw new AppError("validation", "You cannot share with yourself.", { reason: "self_share" });
   }
+  // A first look, so that a full node charges no ceiling; the insert decides again under a lock.
   if ((await countGrantees(db(c), node.id)) >= MAX_GRANTEES) {
     throw new AppError("conflict", "This item is shared with as many people as it can be.", {
       reason: "grantee_limit",
@@ -151,16 +153,33 @@ router.post(`/nodes/${ID}/shares`, async (c) => {
     { id: user.id, account: { quotaBytes: user.quotaBytes, createdAt: user.createdAt } },
     { count: 1 },
   );
+  const grantees = () =>
+    new AppError("conflict", "This item is shared with as many people as it can be.", {
+      reason: "grantee_limit",
+    });
   let share: Share;
   try {
-    share = await insertShare(db(c), {
-      nodeId: node.id,
-      grantedBy: user.id,
-      email: body.email,
-      granteeUserId: active ? recipient.id : null,
-      role: body.role,
-      canUpload: body.canUpload ?? true,
-    });
+    // The cap is decided again under the node's row lock, with the insert: two creations at 99
+    // cannot both pass. DATABASE STATEMENTS ONLY inside (it may run again).
+    const made = await retryOnDeadlock(deps(c).db, (tx) =>
+      insertShare(
+        tx,
+        {
+          nodeId: node.id,
+          grantedBy: user.id,
+          email: body.email,
+          granteeUserId: active ? recipient.id : null,
+          role: body.role,
+          canUpload: body.canUpload ?? true,
+        },
+        MAX_GRANTEES,
+      ),
+    );
+    if ("refused" in made) {
+      if (made.refused === "gone") throw new AppError("not_found");
+      throw grantees();
+    }
+    share = made.share;
   } catch (error) {
     if (error instanceof QueryError && error.code === "conflict") {
       throw new AppError("conflict", "This item is already shared with that address.", {

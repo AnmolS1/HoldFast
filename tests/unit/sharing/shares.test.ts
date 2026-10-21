@@ -198,6 +198,51 @@ describe("POST /nodes/:id/shares", () => {
     expect(await sharesOn(full.id)).toHaveLength(100);
   });
 
+  it("the 100-grantee cap holds under concurrency: at 99, two parallel creations → one 201, one 409, 100 rows", async () => {
+    const owner = await member();
+    const full = await makeFolder(owner.id);
+    await testDb()
+      .insert(shares)
+      .values(
+        Array.from({ length: 99 }, (_, i) => ({
+          nodeId: full.id,
+          grantedBy: owner.id,
+          granteeEmail: `pending-${i}-${full.id}@made-up.example.test`,
+          role: "viewer" as const,
+        })),
+      );
+    const both = await Promise.all([
+      create(owner, full.id, { email: freshEmail(), role: "viewer" }),
+      create(owner, full.id, { email: freshEmail(), role: "viewer" }),
+    ]);
+    expect(both.map((answer) => answer.status).sort()).toEqual([201, 409]);
+    expect(await sharesOn(full.id)).toHaveLength(100);
+  });
+
+  it("a grantee who changed address: sharing to the new address answers like any address — 201, same work, pending (no 409 that links the two)", async () => {
+    const owner = await member();
+    const grantee = await member();
+    const folder = await makeFolder(owner.id);
+    const other = await makeFolder(owner.id);
+    expect((await create(owner, folder.id, { email: grantee.email, role: "viewer" })).status).toBe(201);
+    const newAddress = freshEmail();
+    await testDb().update(user).set({ email: newAddress }).where(eq(user.id, grantee.id));
+    const again = await create(owner, folder.id, { email: newAddress, role: "editor" });
+    const stranger = await create(owner, other.id, { email: freshEmail(), role: "editor" });
+    expect([again.status, stranger.status]).toEqual([201, 201]);
+    expect(Object.keys(again.body as object).sort()).toEqual(Object.keys(stranger.body as object).sort());
+    expect(again.statements).toBe(stranger.statements);
+    const rows = await sharesOn(folder.id);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.granteeEmail === newAddress)).toMatchObject({
+      granteeUserId: null,
+      activatedAt: null,
+    });
+    // The grantee's access is the first share's, unchanged: viewer.
+    const detail = await api(asCaller({ ...grantee, email: newAddress }), `/nodes/${folder.id}`);
+    expect((detail.body as { node: { role: string } }).node.role).toBe("viewer");
+  });
+
   it("share_user: a refused consume is the thrown 429, no row, no mail", async () => {
     const owner = await member();
     const folder = await makeFolder(owner.id);
