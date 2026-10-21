@@ -440,15 +440,18 @@ describe("the declared hash is never acted on: the server's decides", () => {
     }
   });
 
-  it("a multipart stale session: its upload aborted and its object deleted — while rolled back, NOTHING happens (left for the next run)", async () => {
+  it("a multipart stale session: its upload aborted and its object deleted — while rolled back the session is ended all the same (reservation back) and the store is left as it is", async () => {
     const database = await databaseGeneration();
     for (const rolled of [true, false]) {
       await env.FILES.put(GENERATION_KEY, String(rolled ? database! + 2 : database));
       await rolledBack(async (db) => {
         const made = await owed(db, { stored: null, declared: "other-csam", multipart: true });
-        const result = (await sweepOnce(db)).result;
-        expect(result).toMatchObject(rolled ? { skipped: 1 } : { stale: 1 });
-        expect((await read.session(db, made.session.id))!.status).toBe(rolled ? "completing" : "aborted");
+        expect((await sweepOnce(db)).result).toMatchObject({ stale: 1 });
+        expect(await read.session(db, made.session.id)).toMatchObject({
+          status: "aborted",
+          ipEncrypted: null,
+        });
+        expect((await read.user(db, made.owner.id)).usedBytes).toBe(0);
         expect(await exists(made.session.r2Key)).toBe(rolled);
         let open = true;
         try {

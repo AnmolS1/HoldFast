@@ -31,7 +31,7 @@
 //                        only when `mayDestroy` allows, the session aborted, the uploader struck;
 //   not listed, or gone  ended like a stale session (`aborted`, the reservation back; the
 //                        multipart upload aborted and its object deleted only when `mayDestroy`
-//                        allows — else the session waits for the next run).
+//                        allows — else both are left, unreferenced, for the store and the sweep).
 // Every decision is made again under the session's row lock: one that is no longer `completing`
 // is skipped. "Already written" is a NODE on the session's key — never "a node with the session's
 // id": for a replace upload that id is the existing file. A hash that fails leaves the session
@@ -222,8 +222,10 @@ async function refuseOwed(
 /**
  * Not listed (or no object): ended the way the stale-upload job ends a `completing` session — a
  * node or kept version on the key means it did commit (`done`); otherwise `aborted`, the owner's
- * reservation back, then the multipart upload aborted and the object it may have become deleted.
- * A multipart session waits for the next run while `mayDestroy` says no.
+ * reservation back, then the multipart upload aborted and the object it may have become deleted —
+ * only when `mayDestroy` says so, asked right before: while it says no the session is ended all
+ * the same and the store is left as it is (unreferenced: the store ends an unfinished upload at
+ * seven days, the orphan sweep the object — the held path `discardStored` takes).
  */
 async function endStale(
   bg: BackgroundContext,
@@ -231,7 +233,6 @@ async function endStale(
   sha256: string | null,
   mayDelete: () => Promise<boolean>,
 ): Promise<Outcome> {
-  if (listed.r2UploadId !== null && !(await mayDelete())) return "skipped";
   const ended = await retryOnDeadlock(bg.db, async (tx) => {
     // The owner's row before the session's (lock order), and before the reservation is released.
     await lockUser(tx, listed.ownerId);
@@ -250,6 +251,7 @@ async function endStale(
   if (ended === null || ended === "raced") return "skipped";
   const { session } = ended;
   if (ended.as === "done" || session.r2UploadId === null) return "stale";
+  if (!(await mayDelete())) return "stale";
   const store = storage(bg.env);
   let failure: unknown = null;
   try {
