@@ -597,8 +597,10 @@ test.describe("storage and layout", () => {
       "/account",
       "/admin",
       "/help",
-      "/preview/n1",
       "/search?q=secret",
+      // Last: leaving an open preview by a synthetic history step races the preview's own history
+      // handling on a slow runner (run 39605712439, mobile-chrome); this test is about storage.
+      "/preview/n1",
     ]) {
       await navigateInApp(page, path);
       await expect(page.locator("[data-frame]")).toBeVisible();
