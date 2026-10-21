@@ -133,6 +133,33 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // Every Data Grid goes through ONE wrapper that hands it the CSP nonce (T25; spike S5: the grid
+    // inserts its own <style> outside Emotion, one style-src-elem violation per grid otherwise).
+    files: ["src/client/**/*.{ts,tsx}"],
+    ignores: ["src/client/features/admin/components/AdminDataGrid.tsx"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "@mui/x-data-grid",
+              importNames: ["DataGrid"],
+              message:
+                "Use AdminDataGrid (features/admin/components): it passes the CSP nonce to the grid's own <style>.",
+            },
+          ],
+          patterns: [
+            {
+              regex: "^@mui/x-data-grid/",
+              message: "Import the Data Grid only through AdminDataGrid (features/admin/components).",
+            },
+          ],
+        },
+      ],
+    },
+  },
   // observe.ts is the exit to Sentry, metrics and the audit log — not to the console.
   { files: ["src/worker/auth/observe.ts"], rules: { "no-console": "error" } },
   {
