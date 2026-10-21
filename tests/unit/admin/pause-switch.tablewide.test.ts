@@ -127,7 +127,13 @@ async function due() {
   };
 }
 const ALL_THERE = { purge: true, "user-purge": true, retention: true, "stale-uploads": true, orphans: true };
-const ALL_GONE = { purge: false, "user-purge": false, retention: false, "stale-uploads": false, orphans: false };
+const ALL_GONE = {
+  purge: false,
+  "user-purge": false,
+  retention: false,
+  "stale-uploads": false,
+  orphans: false,
+};
 
 async function runEverything(job: JobContext) {
   for (const cron of SLOTS) await runScheduled(cronEvent(cron), env, ctx, job.bg);
