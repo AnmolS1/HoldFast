@@ -87,18 +87,33 @@ export async function ownersPastKeptBackstop(db: Executor, opts: { limit: number
  * Every root the owner deleted for good that is still stored (`purge_requested_at` set — a purged
  * root's rows are gone), and everything under it, once each — nested requested roots included
  * once. (Inside, the name `asked` is taken.)
+ *
+ * Each row carries its own bytes (a file's size; the sum of the node's kept old versions), read
+ * where the walk finds the row, so nothing joins the tree back to `nodes` or `node_versions`: a
+ * join to a CTE is planned as a hash over the WHOLE table (PERFFIX: 222k nodes, ≈ 50 ms on every
+ * `reserve`). The walk starts at `nodes_owner_purge_requested_idx` and looks up each row's
+ * children by `parent_id`, one lookup per row (the LATERAL with OFFSET 0 is not flattened, so it
+ * cannot become a hash join over all of `nodes` either) — the cost is the owner's kept tree,
+ * whatever the rest of the table holds. The bytes depend on the id alone within the statement,
+ * so UNION still keeps each node once.
  */
+const keptNodeBytes = (n: SQL) => sql`
+  ${n}.id,
+  CASE WHEN ${n}.kind = 'file' AND ${n}.system IS NULL THEN ${n}.size ELSE 0 END,
+  (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v WHERE v.node_id = ${n}.id)`;
+
 const deletedKeptTree = (ownerId: string | SQL) => sql`
-  WITH RECURSIVE asked(id) AS (
-    SELECT n.id FROM nodes n
+  WITH RECURSIVE asked(id, file_bytes, version_bytes) AS (
+    SELECT ${keptNodeBytes(sql`n`)} FROM nodes n
     WHERE n.owner_id = ${ownerId} AND n.purge_requested_at IS NOT NULL
     UNION
-    SELECT c.id FROM nodes c JOIN asked ON c.parent_id = asked.id
+    SELECT c.* FROM asked a CROSS JOIN LATERAL (
+      SELECT ${keptNodeBytes(sql`c`)} FROM nodes c WHERE c.parent_id = a.id OFFSET 0
+    ) c
   )`;
 
-const keptFilesSql = sql`(SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
-  WHERE n.kind = 'file' AND n.system IS NULL)`;
-const keptVersionsSql = sql`(SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)`;
+const keptFilesSql = sql`(SELECT COALESCE(SUM(a.file_bytes), 0) FROM asked a)`;
+const keptVersionsSql = sql`(SELECT COALESCE(SUM(a.version_bytes), 0) FROM asked a)`;
 
 /** `deletedKeptBytes` as one SQL expression (bigint), for a statement of its own. */
 function deletedKeptBytesSql(ownerId: string | SQL) {
