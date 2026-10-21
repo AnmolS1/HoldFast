@@ -25,7 +25,7 @@
 //    run — "delete forever", a purge — would take the held path. Deleted with the reset, the two
 //    agree again ("first run ever"). Through wrangler's local mode on the dev server's own state
 //    directory: it works while the dev server is up, and it never reaches Cloudflare (`--local`).
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type FullConfig } from "@playwright/test";
@@ -71,6 +71,34 @@ async function warm(baseURL: string): Promise<void> {
   }
 }
 
+/**
+ * Step 3. A missing object is no error; a failing wrangler fails the run. And it is READ BACK: an
+ * object still there after the delete (the CLI and the dev server no longer sharing one state
+ * directory, a key spelled differently) fails the run loudly — otherwise every destroy of the run
+ * would take the held path while the setup said nothing.
+ */
+function forgetGenerationObject(root: string): void {
+  const wrangler = resolve(root, "node_modules/.bin/wrangler");
+  const env = { ...process.env, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false" };
+  const target = `${LOCAL_BUCKET}/${GENERATION_OBJECT}`;
+  execFileSync(wrangler, ["r2", "object", "delete", target, "--local"], { cwd: root, stdio: "inherit", env });
+  const read = spawnSync(wrangler, ["r2", "object", "get", target, "--local", "--pipe"], {
+    cwd: root,
+    env,
+    encoding: "utf8",
+  });
+  if (read.status === 0) {
+    throw new Error(
+      `e2e setup: ${target} is still in the local bucket after its delete — the rollback detector would hold every destroy of this run`,
+    );
+  }
+  if (!/The specified key does not exist/.test(`${read.stderr}${read.stdout}`)) {
+    throw new Error(
+      `e2e setup: could not read ${target} back from the local bucket (wrangler exit ${read.status})`,
+    );
+  }
+}
+
 export default async function globalSetup(config: FullConfig): Promise<void> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   execFileSync(resolve(root, "scripts/db-reset.sh"), {
@@ -78,12 +106,7 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
     stdio: "inherit",
     env: { ...process.env, HOLDFAST_DB: localDbName() },
   });
-  // A missing object is no error; a failing wrangler fails the run (a held destroy would mislead).
-  execFileSync(
-    resolve(root, "node_modules/.bin/wrangler"),
-    ["r2", "object", "delete", `${LOCAL_BUCKET}/${GENERATION_OBJECT}`, "--local"],
-    { cwd: root, stdio: "inherit", env: { ...process.env, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false" } },
-  );
+  forgetGenerationObject(root);
   const baseURL = config.projects[0]?.use.baseURL;
   if (!baseURL) throw new Error("e2e warm-up: no baseURL");
   await warm(baseURL);
