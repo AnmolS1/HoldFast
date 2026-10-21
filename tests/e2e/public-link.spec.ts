@@ -206,12 +206,15 @@ test.describe("a folder link's zip (mocked API)", () => {
             zipGrant: "made-up-grant",
           });
         }
-        if (path === `${base}/download-url`) {
-          const body = route.request().postDataJSON() as { nodeId: string; zipGrant?: string };
+        if (path === `${base}/download-urls`) {
+          const body = route.request().postDataJSON() as { nodeIds: string[]; zipGrant: string };
           expect(body.zipGrant).toBe("made-up-grant");
           return json({
-            url: `http://files.localhost:${port}/d/${body.nodeId}/made-up-token`,
-            expiresAt: "2099-01-01T00:00:00.000Z",
+            items: body.nodeIds.map((nodeId) => ({
+              nodeId,
+              url: `http://files.localhost:${port}/d/${nodeId}/made-up-token`,
+              expiresAt: "2099-01-01T00:00:00.000Z",
+            })),
           });
         }
         return false;
@@ -223,7 +226,10 @@ test.describe("a folder link's zip (mocked API)", () => {
     return token;
   }
 
-  test("Download all as zip: one archive, each file minted under the grant", async ({ page, origins }) => {
+  test("Download all as zip: one archive, the window minted in one batch under the grant", async ({
+    page,
+    origins,
+  }) => {
     const token = await mockFolderLink(page, origins.port);
     await page.goto(`/s/${token}`);
     await expect(page.getByRole("list", { name: "Files in Holiday" })).toBeVisible();
