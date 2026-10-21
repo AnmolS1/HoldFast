@@ -195,10 +195,30 @@ describe("the public route: proof of access, in order", () => {
       expect.soft(await reportsOn(file.id), status).toEqual([]);
       expect.soft((await nodeById(file.id))!.scanStatus, status).toBe(status);
     }
+    // Another visitor's report put a CLEAN file under review: what this visitor was shown.
     const reviewed = await deepLink("under_review");
+    await setNodeRow(reviewed.file.id, { scanStatusPrev: "clean" });
     const again = await publicReport({ nodeId: reviewed.file.id, linkToken: reviewed.link.token });
     expect(again.status).toBe(202);
     expect(await reportsOn(reviewed.file.id)).toHaveLength(1);
+  });
+
+  it("under_review is reportable through a link only when it was CLEAN before the review: from pending, infected, error, skipped or nothing recorded → 404 identical to a random id, in the same statements", async () => {
+    const reference = await publicReport({
+      nodeId: crypto.randomUUID(),
+      linkToken: (await deepLink()).link.token,
+    });
+    for (const prev of ["pending", "infected", "error", "skipped", null] as const) {
+      const { file, link } = await deepLink("under_review");
+      await setNodeRow(file.id, { scanStatusPrev: prev });
+      const answer = await publicReport({ nodeId: file.id, linkToken: link.token });
+      const random = await publicReport({ nodeId: crypto.randomUUID(), linkToken: link.token });
+      const name = String(prev);
+      // Soft: a red names every earlier state that still lets the report through.
+      expect.soft(envelope(answer), name).toEqual(envelope(reference));
+      expect.soft(answer.statements, name).toBe(random.statements);
+      expect.soft(await reportsOn(file.id), name).toEqual([]);
+    }
   });
 
   it("a file hidden by inheritance two levels down (its outer folder taken down) or in the trash above → 404; control: the same file before → 202", async () => {
