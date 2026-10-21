@@ -3,7 +3,7 @@
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { activatePendingShares } from "../../../src/worker/db/queries/shares";
-import { nodes, shares, user } from "../../../src/worker/db/schema";
+import { nodes, shares, user, userPrefs } from "../../../src/worker/db/schema";
 import { freshEmail, verifiedUser } from "../auth/helpers";
 import {
   api,
@@ -86,6 +86,21 @@ describe("POST /nodes/:id/shares", () => {
     // The pending row grants nothing.
     const [row] = await sharesOn(b.id);
     expect(row).toMatchObject({ granteeUserId: null, activatedAt: null, granteeEmail: unknown });
+  });
+
+  it("parity holds for an account that switched share mails off: the same statements as an unknown address, and no mail", async () => {
+    const owner = await member();
+    const quiet = await member();
+    await testDb().insert(userPrefs).values({ userId: quiet.id, emailShares: false });
+    const unknown = freshEmail();
+    const a = await makeFolder(owner.id);
+    const b = await makeFolder(owner.id);
+    const toQuiet = await create(owner, a.id, { email: quiet.email, role: "viewer" });
+    const toUnknown = await create(owner, b.id, { email: unknown, role: "viewer" });
+    expect([toQuiet.status, toUnknown.status]).toEqual([201, 201]);
+    expect(toQuiet.statements).toBe(toUnknown.statements);
+    expect(mailTo(quiet.email, "shareInvitation")).toHaveLength(0);
+    expect(mailTo(unknown, "shareInvitation")).toHaveLength(1);
   });
 
   it("an unverified account's address stays pending, and grants that account nothing", async () => {

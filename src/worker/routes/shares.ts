@@ -171,21 +171,26 @@ router.post(`/nodes/${ID}/shares`, async (c) => {
   }
   audit(c, "share.create", target(node.id), { shareId: share.id, role: share.role });
   metric("share", { kind: "create", outcome: "ok" });
-  // After the answer, and the same for both kinds of address. An account that switched share
-  // mails off gets none (the notice is theirs to refuse; a stranger's invitation is not).
-  if (!active || recipient.emailShares) {
-    defer(
-      c,
-      sendShareInvitation(deps(c), {
-        to: body.email,
-        sharerName: user.name,
-        itemName: node.name,
-        role: share.role,
-        hasAccount: active,
-        senderId: user.id,
-      }).catch(() => {}),
-    );
-  }
+  // The mail is decided in deferred work that starts the SAME way for every address — one read
+  // of the address, then a mail or none — so neither the answer nor the work before it says
+  // whether an account has it, or whether that account switched share mails off (the notice is
+  // theirs to refuse; a stranger's invitation is not).
+  const notify = async () => {
+    const now = await shareRecipient(deps(c).db, body.email);
+    if (now !== null && now.emailVerified && !now.emailShares) return;
+    await sendShareInvitation(deps(c), {
+      to: body.email,
+      sharerName: user.name,
+      itemName: node.name,
+      role: share.role,
+      hasAccount: active,
+      senderId: user.id,
+    });
+  };
+  defer(
+    c,
+    notify().catch(() => {}),
+  );
   return c.json(shareDto(share), 201);
 });
 
