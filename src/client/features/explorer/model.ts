@@ -7,7 +7,7 @@ import type { SortDir, SortKey } from "./api";
 import { messages, t } from "./strings";
 
 /** Sharing arrives with the sharing task; until then the action is shown disabled. */
-export const SHARING_READY = false;
+export const SHARING_READY = true;
 
 export type ExplorerAction =
   "open" | "rename" | "move" | "star" | "download" | "zip" | "share" | "trash" | "recheck";
