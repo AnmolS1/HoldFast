@@ -1,0 +1,14 @@
+# The scanner image's base digests (containers/clamav/Dockerfile pins `tag@sha256`): a bump PR
+# when a tag moves, so ClamAV engine fixes are not frozen out by the pin (T20 review m5). Each PR
+# rebuilds the image, which runs the shim's Go tests.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /containers/clamav
+    schedule:
+      interval: weekly
+    groups:
+      scanner-images:
+        patterns: ["*"]
+    commit-message:
+      prefix: "scanner image"

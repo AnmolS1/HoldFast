@@ -27,8 +27,9 @@ name: scanner-image
 
 on:
   schedule:
-    # Mondays 05:23 UTC.
-    - cron: "23 5 * * 1"
+    # Daily 05:23 UTC (T20: shared cloud egress is likely rate-limited by ClamAV's mirror, so each
+    # instance wake should find signatures under 24 h old and only check, not download).
+    - cron: "23 5 * * *"
   # No inputs: there is nothing to choose.
   workflow_dispatch:
 

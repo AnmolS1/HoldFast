@@ -26,6 +26,9 @@
     "invite": "tsx scripts/create-invite.ts",
     "cf-typegen": "wrangler types src/worker/env.d.ts --env-file .dev.vars.example --include-runtime=false --strict-vars=false && node --input-type=module -e \"import fs from 'node:fs'; const f = 'src/worker/env.d.ts'; fs.writeFileSync(f, fs.readFileSync(f, 'utf8').replace(/^(\\s*(?:PHOTODNA_SUBSCRIPTION_KEY|CF_ANALYTICS_TOKEN)): string;/gm, (_, k) => k + '?: string;'));\"",
     "test:c2": "node scripts/c2-abort-test.mjs",
+    "scan:fixtures": "containers/clamav/test/fixtures.sh",
+    "scan:cap": "containers/clamav/test/cap.sh",
+    "scan:integration": "containers/clamav/test/integration.sh",
     "verify": "npm run typecheck && npm run lint && npm run build"
   },
   "dependencies": {

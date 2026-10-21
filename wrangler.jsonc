@@ -99,7 +99,7 @@
       "class_name": "ScannerContainer",
       "image": "./containers/clamav/Dockerfile",
       "max_instances": 2,
-      // Provisional (smallest type with 4 GiB). Revisit once the real scanner image exists.
+      // standard-1 confirmed by T20 (cap scan RSS ≤ 1.4 GiB, spool ≈ 1.9 GB of 8 GB).
       "instance_type": "standard-1",
     },
   ],
@@ -186,7 +186,7 @@
           "class_name": "ScannerContainer",
           "image": "./containers/clamav/Dockerfile",
           "max_instances": 2,
-          // Provisional (smallest type with 4 GiB). Revisit once the real scanner image exists.
+          // standard-1 confirmed by T20 (cap scan RSS ≤ 1.4 GiB, spool ≈ 1.9 GB of 8 GB).
           "instance_type": "standard-1",
         },
       ],
