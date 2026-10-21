@@ -413,6 +413,44 @@ describe("(a) the strike sweep in abuse-hourly", () => {
     });
   });
 
+  it("decided again at the act (standing check a): a user suspended by someone else between the listing and the sweep's suspension is not suspended again, mailed again or counted", async () => {
+    await rolledBack(async (db) => {
+      const ops = operators();
+      only("sweepStrikeThresholds");
+      const target = await member();
+      await strikesFor(db, target.id, 3, { daysAgo: 364.95 });
+      // Right before the sweep's suspension transaction: an admin suspends the account.
+      let raced = false;
+      const racing = new Proxy(db, {
+        get(target_, property, receiver) {
+          if (property === "transaction") {
+            return async (...args: unknown[]) => {
+              if (!raced) {
+                raced = true;
+                await target_
+                  .update(userTable)
+                  .set({ suspendedAt: new Date(), suspendedReason: "admin" })
+                  .where(eq(userTable.id, target.id));
+              }
+              return (target_.transaction as (...a: unknown[]) => unknown).apply(target_, args);
+            };
+          }
+          const value: unknown = Reflect.get(target_, property, receiver);
+          return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target_) : value;
+        },
+      });
+      const real = original.sweepStrikeThresholds;
+      let swept: Awaited<ReturnType<typeof real>> | null = null;
+      parts.sweepStrikeThresholds = async (...args: Parameters<typeof real>) => (swept = await real(...args));
+      await runJob(racing as Db, ops.env);
+      expect(raced).toBe(true);
+      const [row] = await db.select().from(userTable).where(eq(userTable.id, target.id));
+      expect(row!.suspendedReason).toBe("admin");
+      expect(mailTo(target.email).filter((m) => /suspend/i.test(m.subject))).toEqual([]);
+      expect(swept!.suspended).toBe(0);
+    });
+  });
+
   it("no starvation through the job: more users whose suspension FAILS than the job's limit, then one ordinary user → suspended in one run", async () => {
     await rolledBack(async (db) => {
       const ops = operators();
