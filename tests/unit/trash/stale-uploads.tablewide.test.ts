@@ -216,7 +216,7 @@ describe("the stale-upload job", () => {
     expect(await usedBytes(owner.id)).toBe(900);
   });
 
-  it('a session whose hash is put on the csam list after the job listed it is not aborted: still completing, its object kept (the repair sweep\'s) — and one malware-listed by the same hook IS ended (the shared predicate, not "any listing")', async () => {
+  it("a session whose hash is put on the csam list after the job listed it is not aborted: still completing, its object kept (the repair sweep's) — and one malware-listed by the same hook is left too (Addendum 3 m5: any listed declaration is the repair sweep's, hashed first — tests/unit/abuse/owed-sweep.tablewide.test.ts \"Addendum 3 m5\" ends that shape through refuseBlocked)", async () => {
     const owner = await member();
     const hex = () =>
       [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -255,8 +255,9 @@ describe("the stale-upload job", () => {
     expect(listed).toBe(true);
     expect(await uploadRow(owed.id)).toMatchObject({ status: "completing" });
     expect(await objectExists(owed.r2Key)).toBe(true);
-    // Ended like any stale session (a single-PUT one: its object is the orphan sweep's).
-    expect(await uploadRow(ended.id)).toMatchObject({ status: "aborted" });
+    // Not the stale job's either: the repair sweep hashes it first.
+    expect(await uploadRow(ended.id)).toMatchObject({ status: "completing" });
+    expect(await objectExists(ended.r2Key)).toBe(true);
     await testDb()
       .delete(hashBlocklist)
       .where(inArray(hashBlocklist.sha256, [csam, malware]));
