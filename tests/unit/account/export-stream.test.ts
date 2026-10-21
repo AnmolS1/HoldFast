@@ -17,6 +17,7 @@ import type { Auth, SessionInfo } from "../../../src/worker/auth/types";
 import { statementsSent, type Db } from "../../../src/worker/db/client";
 import {
   EXPORT_DAILY_LIMIT,
+  EXPORT_MAX_RUNTIME_S,
   EXPORT_PAGE,
   EXPORT_RUNNING_MAX_S,
   exportSlotKeys,
@@ -185,5 +186,26 @@ describe("the export limiter", () => {
     await readAll(second.response);
     await second.settle();
     expect(await slot()).toEqual([]);
+  });
+
+  it("an export that fails on our side does not spend one of the day's exports, nor hold the slot", async () => {
+    const who = await person();
+    const keys = exportSlotKeys(who.id);
+    // The account row is gone by the time the export reads it: its reads fail before anything is
+    // handed over.
+    await testDb().execute(sql`DELETE FROM "user" WHERE id = ${who.id}`);
+    const failed = await startExport(who);
+    expect(failed.response.status).toBeGreaterThanOrEqual(400);
+    await failed.settle();
+    const day = await testDb().execute<{ count: number }>(
+      sql`SELECT count FROM rate_limit WHERE key = ${keys.day}`,
+    );
+    expect(day.rows.map((row) => Number(row.count))).toEqual([0]);
+    const running = await testDb().execute(sql`SELECT 1 FROM rate_limit WHERE key = ${keys.running}`);
+    expect(running.rows).toEqual([]);
+  });
+
+  it("an export ends by its own maximum runtime before its slot could be taken over (two never overlap)", () => {
+    expect(EXPORT_MAX_RUNTIME_S).toBeLessThan(EXPORT_RUNNING_MAX_S);
   });
 });

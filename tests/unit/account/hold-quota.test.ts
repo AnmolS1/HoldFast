@@ -3,9 +3,13 @@
 // The bytes a hold keeps are the operator's: `quota.usageBreakdown` and the stored counter keep them.
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
-import { usageBreakdown } from "../../../src/worker/db/queries/quota";
+import { env } from "cloudflare:workers";
+import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
+import { deletedKeptBytes, usageBreakdown } from "../../../src/worker/db/queries/quota";
+import { purgeRoot } from "../../../src/worker/jobs/purge";
+import { runBackground } from "../../../src/worker/services/request-context";
 import { nodeVersions, uploads, user } from "../../../src/worker/db/schema";
-import { getSession, send, testDb, verifiedUser } from "../auth/helpers";
+import { getSession, realCore, send, testDb, verifiedUser } from "../auth/helpers";
 import { generationInStep } from "../trash/helpers";
 import { api, makeFile, makeFolder, person } from "../nodes/helpers";
 
@@ -81,27 +85,158 @@ describe("M2: quota is enforced against the figure the account holder sees", () 
   });
 });
 
-describe("Addendum 4: only a LEGAL hold is left out, and only up to a backstop", () => {
-  it("bytes kept for another reason (a file under review) still count, held account or not", async () => {
+describe("Addendum 5: every still-present deletion is left out — a hold placed or lifted moves nothing", () => {
+  type Owner = Awaited<ReturnType<typeof person>>;
+  const shown = async (owner: Owner) => (await api(owner.as, "GET", "/account/usage")).body;
+  /** What the holder sees and may do: the usage answer, and whether 401 bytes (one over the room) are refused. */
+  const view = async (owner: Owner) => ({ usage: await shown(owner), over: (await init(owner, 401)).status });
+  const deleteForGood = async (owner: Owner, id: string) => {
+    expect((await api(owner.as, "POST", `/nodes/${id}/trash`)).status).toBe(200);
+    expect((await api(owner.as, "DELETE", `/nodes/${id}`)).status).toBe(204);
+  };
+  /** 500 of quota; a kept file of 100; 240 bytes deleted for good and KEPT by `keep`, `toggle` then flips what keeps them. */
+  async function scenario(
+    keep: (owner: Owner) => Promise<{ root: string; toggle: () => Promise<void> }>,
+  ): Promise<{ owner: Owner; root: string; toggle: () => Promise<void> }> {
     const owner = await person();
-    await testDb().update(user).set({ quotaBytes: 500, usedBytes: 340 }).where(eq(user.id, owner.id));
+    await testDb().update(user).set({ quotaBytes: 500 }).where(eq(user.id, owner.id));
     await makeFile(owner.id, null, { name: "kept.txt", scanStatus: "clean", size: 100 });
-    const reviewed = await makeFile(owner.id, null, {
-      name: "reviewed.txt",
-      scanStatus: "under_review",
-      size: 240,
-    });
-    expect((await api(owner.as, "POST", `/nodes/${reviewed.id}/trash`)).status).toBe(200);
-    expect((await api(owner.as, "DELETE", `/nodes/${reviewed.id}`)).status).toBe(204);
-    // Kept by the review, not by a legal hold: still the account's bytes.
-    expect((await api(owner.as, "GET", "/account/usage")).body).toMatchObject({ usedBytes: 340 });
-    expect((await init(owner, 400)).status).toBe(413);
-    expect((await init(owner, 160)).status).toBe(201);
+    const made = await keep(owner);
+    await testDb().update(user).set({ usedBytes: 340 }).where(eq(user.id, owner.id));
+    await deleteForGood(owner, made.root);
+    return { owner, ...made };
+  }
+
+  const KINDS: Array<[string, (owner: Owner) => Promise<{ root: string; toggle: () => Promise<void> }>]> = [
+    [
+      "the owner's legal hold, lifted",
+      async (owner) => {
+        await setUserLegalHold(testDb(), owner.id, true);
+        const file = await makeFile(owner.id, null, { name: "gone.bin", scanStatus: "clean", size: 240 });
+        return {
+          root: file.id,
+          toggle: async () => void (await setUserLegalHold(testDb(), owner.id, false)),
+        };
+      },
+    ],
+    [
+      "a node hold on the root, lifted",
+      async (owner) => {
+        const file = await makeFile(owner.id, null, { name: "gone.bin", scanStatus: "clean", size: 240 });
+        await setNodeLegalHold(testDb(), file.id, true);
+        return { root: file.id, toggle: async () => void (await setNodeLegalHold(testDb(), file.id, false)) };
+      },
+    ],
+    [
+      "a node hold on a folder above the root, lifted",
+      async (owner) => {
+        const folder = await makeFolder(owner.id, null, { name: "held-above" });
+        const file = await makeFile(owner.id, folder.id, {
+          name: "gone.bin",
+          scanStatus: "clean",
+          size: 240,
+        });
+        await setNodeLegalHold(testDb(), folder.id, true);
+        return {
+          root: file.id,
+          toggle: async () => void (await setNodeLegalHold(testDb(), folder.id, false)),
+        };
+      },
+    ],
+    [
+      "a node hold on a file under the root, lifted",
+      async (owner) => {
+        const folder = await makeFolder(owner.id, null, { name: "gone" });
+        const file = await makeFile(owner.id, folder.id, {
+          name: "held.bin",
+          scanStatus: "clean",
+          size: 240,
+        });
+        await setNodeLegalHold(testDb(), file.id, true);
+        return {
+          root: folder.id,
+          toggle: async () => void (await setNodeLegalHold(testDb(), file.id, false)),
+        };
+      },
+    ],
+    [
+      "a file under review — then the owner's legal hold PLACED",
+      async (owner) => {
+        const file = await makeFile(owner.id, null, {
+          name: "reviewed.bin",
+          scanStatus: "under_review",
+          size: 240,
+        });
+        return { root: file.id, toggle: async () => void (await setUserLegalHold(testDb(), owner.id, true)) };
+      },
+    ],
+  ];
+
+  it.each(KINDS)(
+    "%s: shown usage and the room to upload are the same before and after",
+    async (_name, keep) => {
+      const { owner, toggle } = await scenario(keep);
+      const before = await view(owner);
+      expect(before.usage).toMatchObject({ usedBytes: 100, trashBytes: 0 });
+      expect(before.over).toBe(413);
+      await toggle();
+      expect(await view(owner)).toEqual(before);
+      expect((await init(owner, 400)).status).toBe(201);
+    },
+  );
+
+  it("once the purge runs (the hold lifted), the counter drops by exactly what was left out: released once, nothing shown moves", async () => {
+    const { owner, root, toggle } = await scenario(KINDS[0]![1]);
+    await toggle();
+    const before = await shown(owner);
+    const purged = await runBackground(
+      env,
+      { waitUntil: () => {} },
+      (bg) => purgeRoot(bg, root, "cron"),
+      realCore,
+    );
+    expect(purged.outcome).toBe("purged");
+    const [row] = await testDb()
+      .select({ usedBytes: user.usedBytes })
+      .from(user)
+      .where(eq(user.id, owner.id));
+    expect(row!.usedBytes).toBe(100);
+    expect(await shown(owner)).toEqual(before);
+    expect(await deletedKeptBytes(testDb(), owner.id)).toEqual({ files: 0, versions: 0 });
   });
 
-  /** A held account whose deleted-for-good, hold-kept bytes are `kept`, nothing else stored. */
+  it("the kept set, branch by branch: the requested root, everything under it, the old versions, a requested root nested inside counted once", async () => {
+    const owner = await person();
+    const at = { deletedAt: new Date() };
+    const requested = { ...at, trashedRoot: true, purgeRequestedAt: new Date() };
+    const root = await makeFolder(owner.id, null, { name: "root", ...requested });
+    const a = await makeFile(owner.id, root.id, { name: "a.bin", scanStatus: "clean", size: 100, ...at });
+    await testDb()
+      .insert(nodeVersions)
+      .values({
+        nodeId: a.id,
+        versionId: `old-${a.id}`,
+        r2Key: `u/${owner.id}/${a.id}/old`,
+        size: 40,
+        purgeAfter: new Date(Date.now() + 86_400_000),
+      });
+    const sub = await makeFolder(owner.id, root.id, { name: "sub", ...at });
+    await makeFile(owner.id, sub.id, { name: "b.bin", scanStatus: "clean", size: 50, ...requested });
+    // Not deleted for good: neither counted.
+    await makeFile(owner.id, null, { name: "live.bin", scanStatus: "clean", size: 7 });
+    await makeFile(owner.id, null, {
+      name: "trashed.bin",
+      scanStatus: "clean",
+      size: 9,
+      deletedAt: new Date(),
+      trashedRoot: true,
+    });
+    expect(await deletedKeptBytes(testDb(), owner.id)).toEqual({ files: 150, versions: 40 });
+  });
+
+  /** An account whose kept deleted-for-good bytes are `kept` — no hold at all (a purge not yet run). */
   async function retaining(kept: number) {
-    const owner = await person({ legalHold: true });
+    const owner = await person();
     await testDb().update(user).set({ quotaBytes: 500, usedBytes: kept }).where(eq(user.id, owner.id));
     await makeFile(owner.id, null, {
       name: "kept.bin",
@@ -114,21 +249,22 @@ describe("Addendum 4: only a LEGAL hold is left out, and only up to a backstop",
     return owner;
   }
 
-  it("past 2 × quota of hold-kept bytes, uploads are refused with the ORDINARY full-account answer; at it, they are not", async () => {
+  it("the backstop counts every kept root: past 2 × quota, the ORDINARY full-account answer, and shown full with parts that add up", async () => {
     const atLimit = await retaining(1000);
     expect((await init(atLimit, 400)).status).toBe(201);
     const past = await retaining(1001);
     const refused = await init(past, 1);
-    // The same answer as an ordinary full account's.
     const full = await person();
     await testDb().update(user).set({ quotaBytes: 500, usedBytes: 500 }).where(eq(user.id, full.id));
+    await makeFile(full.id, null, { name: "full.bin", scanStatus: "clean", size: 500 });
     const ordinary = await init(full, 1);
     expect(refused.status).toBe(413);
     expect({ ...refused.body, requestId: null }).toEqual({ ...ordinary.body, requestId: null });
-    // And it is shown as what it is answered as: full.
-    const shown = (await api(past.as, "GET", "/account/usage")).body;
-    const fullShown = (await api(full.as, "GET", "/account/usage")).body;
-    expect([shown.usedBytes, shown.quotaBytes]).toEqual([fullShown.usedBytes, fullShown.quotaBytes]);
+    const pastShown = await shown(past);
+    expect(pastShown).toEqual(await shown(full));
+    const parts =
+      pastShown.filesBytes + pastShown.trashBytes + pastShown.versionsBytes + pastShown.reservedBytes;
+    expect(parts).toBe(pastShown.usedBytes);
   });
 
   it("the loop is bounded: upload, delete forever, repeat — a held account stops at quota + 2 × quota retained", async () => {
@@ -149,8 +285,7 @@ describe("Addendum 4: only a LEGAL hold is left out, and only up to a backstop",
       });
       await testDb().delete(uploads).where(eq(uploads.id, started.body.uploadId));
       // … which is then deleted for good (and kept by the hold).
-      expect((await api(owner.as, "POST", `/nodes/${file.id}/trash`)).status).toBe(200);
-      expect((await api(owner.as, "DELETE", `/nodes/${file.id}`)).status).toBe(204);
+      await deleteForGood(owner, file.id);
     }
     expect(rounds).toBe(3);
     const [row] = await testDb()

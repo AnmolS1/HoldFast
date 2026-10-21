@@ -380,7 +380,12 @@ export async function exportNodePage(
 /** Exports per account in a day. */
 export const EXPORT_DAILY_LIMIT = 10;
 const EXPORT_DAY_S = 86_400;
-/** How long a running slot is held at most (a stream that never ended frees it then). */
+/** How long an export may run: it ends itself then (routes/account.ts). */
+export const EXPORT_MAX_RUNTIME_S = 25 * 60;
+/**
+ * How long a running slot is held at most (a stream that never ended frees it then) — longer than
+ * an export may run, so a slot is never taken over from an export still running.
+ */
 export const EXPORT_RUNNING_MAX_S = 30 * 60;
 
 export const exportSlotKeys = (userId: string) => ({
@@ -471,6 +476,13 @@ export async function admitExport(
     return day;
   }
   return { ok: true, token };
+}
+
+/** Gives the day's count back for an export that failed on our side (nothing was handed over). */
+export async function refundExportDay(db: Executor, userId: string): Promise<void> {
+  await db.execute(
+    sql`UPDATE rate_limit SET count = greatest(count - 1, 0) WHERE key = ${exportSlotKeys(userId).day}`,
+  );
 }
 
 /** Gives back the running slot THIS admission took (`token`) — never one another export holds now. */

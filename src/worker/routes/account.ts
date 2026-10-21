@@ -40,7 +40,7 @@ import {
 import type { LinkState } from "../../shared/schemas/link";
 import type { ThumbUrlResponse } from "../../shared/schemas/node";
 import { hasSecondFactor } from "../auth/second-factor";
-import { legalHoldKeptBytes, visibleUsedBytes } from "../db/queries/quota";
+import { deletedKeptBytes, holderUsedBytes } from "../db/queries/quota";
 import { captureError } from "../sentry";
 import {
   ACTIVITY_LIMIT,
@@ -50,6 +50,7 @@ import {
   deleteOwnSession,
   activeShareBetween,
   admitExport,
+  EXPORT_MAX_RUNTIME_S,
   EXPORT_PAGE,
   exportLinks,
   exportNodePage,
@@ -60,6 +61,7 @@ import {
   getProfile,
   ownSessions,
   recentActivity,
+  refundExportDay,
   releaseExport,
   updatePrefs,
   updateProfile,
@@ -323,7 +325,7 @@ router.get("/account/export", async (c) => {
       sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
       exportLinks(handle, user.id),
       recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
-      legalHoldKeptBytes(handle, user.id),
+      deletedKeptBytes(handle, user.id),
     ]);
     if (!account) throw new AppError("not_found");
     const owners = await displayNames(
@@ -342,7 +344,7 @@ router.get("/account/export", async (c) => {
         locale: account.locale,
         quotaBytes: account.quotaBytes,
         // The account holder's figure, the one quota is enforced against (quota.ts).
-        usedBytes: visibleUsedBytes(account.usedBytes, held.files + held.versions, account.quotaBytes),
+        usedBytes: holderUsedBytes(account.usedBytes, held.files + held.versions, account.quotaBytes),
         termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
         termsVersion: account.termsVersion,
       },
@@ -374,7 +376,9 @@ router.get("/account/export", async (c) => {
     });
     head = `${JSON.stringify(rest).slice(0, -1)},"nodes":[`;
   } catch (error) {
+    // Nothing was handed over: the slot and the day's export are given back.
     await releaseExport(handle, user.id, admitted.token);
+    await refundExportDay(handle, user.id);
     throw error;
   }
   audit(c, "account.export", self(user.id));
@@ -387,12 +391,22 @@ router.get("/account/export", async (c) => {
     executionCtx,
     async (bg) => {
       const writer = writable.getWriter();
+      // An export ends by its own maximum runtime, inside the time its running slot is held: two
+      // exports of one account never overlap (queries/account.ts).
+      const deadline = Date.now() + EXPORT_MAX_RUNTIME_S * 1000;
+      let readFailed = false;
       try {
         await writer.write(encoder.encode(head));
         let after: string | null = null;
         let first = true;
         for (;;) {
-          const page = await exportNodePage(bg.db, user.id, after);
+          if (Date.now() > deadline) throw new Error("export: past its maximum runtime");
+          const page: ExportNodeRow[] = await exportNodePage(bg.db, user.id, after).catch(
+            (error: unknown) => {
+              readFailed = true;
+              throw error;
+            },
+          );
           if (page.length > 0) {
             const text = page.map((row) => JSON.stringify(exportNode(row))).join(",");
             await writer.write(encoder.encode((first ? "" : ",") + text));
@@ -404,8 +418,11 @@ router.get("/account/export", async (c) => {
         await writer.write(encoder.encode("]}"));
         await writer.close();
       } catch (error) {
-        // The client went away (the write is refused), or a read failed: the body ends here.
+        // The client went away (the write is refused), it read too slowly for the maximum
+        // runtime, or a read failed: the body ends here. Only OUR failure gives the day's export
+        // back — a client that walks away has had its turn.
         await writer.abort(error).catch(() => {});
+        if (readFailed) await refundExportDay(bg.db, user.id);
       } finally {
         await releaseExport(bg.db, user.id, admitted.token);
       }
