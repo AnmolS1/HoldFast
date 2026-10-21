@@ -13,6 +13,7 @@
 //   auth.passkey_added | auth.passkey_removed
 //   auth.email_changed
 //   auth.impersonation_started | auth.impersonation_stopped
+//   auth.role_changed            a role set through the admin plugin (meta.from, meta.to)
 //   auth.admin_endpoint_denied   written by auth/admin-gate.ts
 //   auth.admin_granted           written by services/signup-policy.ts (the ADMIN_EMAILS bootstrap)
 // `meta` holds short facts only: never a raw address, a password, a token, a code or an email
@@ -193,6 +194,17 @@ async function record(c: Context<AppEnv>, scope: AuthScope, info: AuthRequestInf
         );
       }
     }
+    return;
+  }
+
+  // ── a role change through the admin plugin (T25 SEAM 2) ───────────────────────────────────
+  if (path === "/admin/set-role" && ok && facts.roleChange) {
+    const changed = facts.roleChange;
+    const after = await getAccount(db(c), changed.userId);
+    auditRow(scope, c, "auth.role_changed", userTarget(changed.userId), {
+      from: changed.from,
+      to: after?.role ?? null,
+    });
     return;
   }
 

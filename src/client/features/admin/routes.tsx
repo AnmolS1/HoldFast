@@ -1,12 +1,15 @@
-// PLACEHOLDER — taken over by the admin task (T25), which replaces this module and keeps the `routes` export.
+// The admin console: `/admin/*`, behind the router's admin guard (a non-admin gets not-found).
+// The console itself is a LAZY chunk — loaded only when an admin opens it.
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
 
 export const routes: RouteObject[] = [
   {
     path: "admin/*",
-    element: <PlaceholderPage name={t("nav.admin")} />,
+    lazy: async () => {
+      const { AdminConsole } = await import("./AdminConsole");
+      return { Component: AdminConsole };
+    },
     handle: { title: t("nav.admin"), details: false },
   },
 ];

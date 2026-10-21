@@ -69,6 +69,8 @@ export type AuthFacts = {
   } | null;
   /** The admin whose impersonation this request is ending. */
   impersonatorId: string | null;
+  /** A `/admin/set-role` the gate allowed: whose role, and what it was before (the audit's `from`). */
+  roleChange: { userId: string; from: string | null } | null;
   /** The sign-in throttle turned this request away (auth/signin-throttle.ts). */
   throttled: boolean;
   /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
@@ -151,6 +153,7 @@ export function emptyFacts(): AuthFacts {
     passkeySecondFactorFor: null,
     secondFactor: null,
     impersonatorId: null,
+    roleChange: null,
     throttled: false,
     signInAttempt: null,
     signInProved: false,

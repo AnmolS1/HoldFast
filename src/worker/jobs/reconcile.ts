@@ -97,6 +97,32 @@ const START: ReconcileCursor = { user: null, area: 0, object: null };
 /** Where the generation is kept outside the database: no swept area, and no upload prefix. */
 export const GENERATION_KEY = "sys/reconcile-generation";
 
+/**
+ * The operator's PAUSE SWITCH (T25, the System screen): while this object exists, nothing that
+ * destroys runs — every guarded job stops and every request path that asks `readsRolledBack`
+ * keeps its object, exactly as on a rollback. Beside the generation, outside Postgres: a database
+ * restore cannot undo it. Present = paused; absent = not paused; unreadable = paused. Put and
+ * deleted only by the console's audited action.
+ */
+export const DESTROY_PAUSED_KEY = "sys/destroy-paused";
+
+/** The switch as read: `unreadable` counts as `on` wherever a destroyer asks. */
+export type PauseSwitch = "on" | "off" | "unreadable";
+
+/** Reads the pause switch. Never throws: a store that cannot answer is `unreadable`. */
+export async function readPauseSwitch(env: Env): Promise<PauseSwitch> {
+  try {
+    const found = await storage(env).get(DESTROY_PAUSED_KEY);
+    if (found === null) return "off";
+    // What it says does not matter — that it exists does. Its body is read to the end.
+    if (found.kind === "body") await found.object.arrayBuffer();
+    return "on";
+  } catch (error) {
+    captureError(error, { kind: "job", job: "reconcile", reason: "pause_switch" });
+    return "unreadable";
+  }
+}
+
 /** The stored cursor, or the start for anything that is not one (it is `unknown` in the table). */
 export function readCursor(stored: unknown): ReconcileCursor {
   if (!stored || typeof stored !== "object") return { ...START };
@@ -142,7 +168,10 @@ export const GENERATION_LOCK_HOLD_MS = 15 * 60_000;
  * nothing is destroyed.
  */
 export type Detection =
-  { state: "ok" | "first"; database: number; raw: string | null } | { state: "rollback" | "unknown" };
+  | { state: "ok" | "first"; database: number; raw: string | null }
+  | { state: "rollback" | "unknown" }
+  // The operator's pause switch is on (or cannot be read): nothing is destroyed or counted.
+  | { state: "paused" };
 export type GenerationState = Detection["state"];
 
 /** The object's number; null when there is no object; NaN when it holds anything but a number. */
@@ -193,6 +222,25 @@ function mailDue(last: string | null): boolean {
  *   kept in the database: when the DATABASE is what cannot be read, only the report is left.
  */
 export async function detectRollback(bg: BackgroundContext): Promise<Detection> {
+  // The pause switch FIRST. On: nothing else is read — the operator's own act, so no rollback
+  // row and no mail. Unreadable: paused too, but the generations are still read, so a store
+  // that cannot answer is still recorded and mailed as `unknown` (S14) — never silenced by it.
+  const paused = await readPauseSwitch(bg.env);
+  if (paused === "on") return pausedReading(bg);
+  const reading = await readGenerations(bg);
+  if (paused === "unreadable" && (reading.state === "ok" || reading.state === "first")) {
+    return pausedReading(bg);
+  }
+  return reading;
+}
+
+function pausedReading(bg: BackgroundContext): Detection {
+  bg.metric("job", { kind: "reconcile", outcome: "paused" });
+  return { state: "paused" };
+}
+
+/** The two generations, compared as described on `detectRollback`. */
+async function readGenerations(bg: BackgroundContext): Promise<Detection> {
   let object: number | null = null;
   let fields: Awaited<ReturnType<typeof readDetectorFields>> | null = null;
   let failure: unknown = null;
@@ -247,6 +295,8 @@ async function bookkeeping(write: () => Promise<void>): Promise<void> {
  * rollback here. Writes, counts and alerts nothing (the jobs do); one settings statement.
  */
 export async function readsRolledBack(env: Env, db: Executor): Promise<boolean> {
+  // The operator's pause switch first: on (or unreadable) answers exactly as a rollback does.
+  if ((await readPauseSwitch(env)) !== "off") return true;
   try {
     const object = await storedGeneration(env);
     const database = databaseNumber((await readDetectorFields(db)).generation);

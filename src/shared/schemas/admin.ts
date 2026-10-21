@@ -235,7 +235,8 @@ export const DmcaNoticeDto = z.object({
   lawsuitNoticeAt: Timestamp.nullable(),
   restoredAt: Timestamp.nullable(),
   restoredBy: UserId.nullable(),
-  nodes: z.array(z.object({ nodeId: NodeId, nodeName: text(), sha256: text() })),
+  /** `tookDown`: THIS notice's takedown took the node down (only such a node is its restore's to lift). */
+  nodes: z.array(z.object({ nodeId: NodeId, nodeName: text(), sha256: text(), tookDown: z.boolean() })),
 });
 export type DmcaNoticeDto = z.infer<typeof DmcaNoticeDto>;
 
@@ -428,3 +429,513 @@ export type PatchSettingsBody = z.infer<typeof PatchSettingsBody>;
 /** `POST /api/admin/jobs/:name/run`: `200` with `done: true`, `202` with `done: false`. */
 export const JobRunResponse = z.object({ done: z.boolean() });
 export type JobRunResponse = z.infer<typeof JobRunResponse>;
+
+// ── additions for the console's actions (T25, R-c: new exports only) ────────────────────────
+// Every action below that changes something takes a typed `reason` (audited). A two-step action
+// is called once without `confirm` — it changes nothing and answers the preview — and once more
+// with `confirm: true` and the same reason; the second call decides again from the rows.
+
+const Reason = z.string().trim().min(1).max(2000);
+
+/** The body of an action whose only input is the reason it is taken for. */
+export const AdminReasonBody = z.strictObject({ reason: Reason });
+export type AdminReasonBody = z.infer<typeof AdminReasonBody>;
+
+/** A two-step action's body. */
+export const TwoStepBody = z.strictObject({ reason: Reason, confirm: z.literal(true).optional() });
+export type TwoStepBody = z.infer<typeof TwoStepBody>;
+
+// ── dashboard ────────────────────────────────────────────────────────────────────────────
+
+/** Analytics Engine tiles: `{ available: false }` until the metrics queries exist (T27). */
+export const AnalyticsTilesDto = z.union([
+  z.object({ available: z.literal(false) }),
+  z.object({
+    available: z.literal(true),
+    requestsPerMinute: z.number().nonnegative(),
+    errorRate: z.number().min(0).max(1),
+    p95LatencyMs: z.number().nonnegative(),
+  }),
+]);
+export type AnalyticsTilesDto = z.infer<typeof AnalyticsTilesDto>;
+
+export const PauseReason = z.enum([
+  "ceiling",
+  "anomaly",
+  "owner",
+  "owner_deletion",
+  "owner_suspended",
+  "report",
+  "moderation",
+]);
+export type PauseReason = z.infer<typeof PauseReason>;
+
+/** The operator's pause switch as read: `unreadable` counts as on. */
+export const PauseSwitchState = z.enum(["on", "off", "unreadable"]);
+export type PauseSwitchState = z.infer<typeof PauseSwitchState>;
+
+export const AdminDashboardDto = z.object({
+  users: z.object({ total: z.number().int().nonnegative(), new7d: z.number().int().nonnegative() }),
+  storageBytes: Bytes,
+  uploads24h: z.number().int().nonnegative(),
+  downloads24h: z.object({ count: z.number().int().nonnegative(), bytes: Bytes }),
+  scans24h: z.record(z.string(), z.number().int().nonnegative()),
+  scanBacklog: z.object({ running: z.number().int().nonnegative(), oldestStartedAt: Timestamp.nullable() }),
+  nodesInError: z.number().int().nonnegative(),
+  reports: z.object({ open: z.number().int().nonnegative(), oldestOpenAt: Timestamp.nullable() }),
+  strikes7d: z.number().int().nonnegative(),
+  linksPaused: z.record(z.string(), z.number().int().nonnegative()),
+  pauseSwitch: PauseSwitchState,
+  analytics: AnalyticsTilesDto,
+});
+export type AdminDashboardDto = z.infer<typeof AdminDashboardDto>;
+
+// ── users ────────────────────────────────────────────────────────────────────────────────
+
+/** How the strike list shows a strike (an expired form offers no Lift). */
+export const StrikeState = z.enum(["active", "lifted", "lifted_expired", "lifted_by_system", "expired"]);
+export type StrikeState = z.infer<typeof StrikeState>;
+
+export const AdminStrikeDto = StrikeDto.extend({ state: StrikeState });
+export type AdminStrikeDto = z.infer<typeof AdminStrikeDto>;
+
+export const AdminUserDetailDto = z.object({
+  user: AdminUserDto,
+  /** The `link_owner` ledger today against the effective `CEIL_OWNER_LINK_BYTES_DAY` (decimal bytes). */
+  linkEgressToday: z.object({ bytes: Bytes, count: z.number().int().nonnegative(), capBytes: Bytes }),
+  /** The TRUE counter (`user.used_bytes`) and the operator's breakdown — never the holder's figure. */
+  usage: z.object({
+    usedBytes: Bytes,
+    filesBytes: Bytes,
+    trashBytes: Bytes,
+    versionsBytes: Bytes,
+    reservedBytes: Bytes,
+    /** Deleted for good by the holder but kept (held): still counted. */
+    keptDeletedBytes: Bytes,
+    keptBackstopReached: z.boolean(),
+  }),
+  strikes: z.array(AdminStrikeDto),
+  sessions: z.number().int().nonnegative(),
+  links: z.object({ live: z.number().int().nonnegative(), paused: z.number().int().nonnegative() }),
+  shares: z.number().int().nonnegative(),
+  /** The newest `admin.legal_hold_set` / `_cleared` row says set: the hold is a hand-set one. */
+  legalHoldByHand: z.boolean(),
+});
+export type AdminUserDetailDto = z.infer<typeof AdminUserDetailDto>;
+
+export const AddStrikeResponse = z.object({ strike: AdminStrikeDto, created: z.boolean() });
+export type AddStrikeResponse = z.infer<typeof AddStrikeResponse>;
+
+export const LiftStrikeResponse = z.object({ activeStrikes: z.number().int().nonnegative() });
+export type LiftStrikeResponse = z.infer<typeof LiftStrikeResponse>;
+
+export const RevokeCountResponse = z.object({ revoked: z.number().int().nonnegative() });
+export type RevokeCountResponse = z.infer<typeof RevokeCountResponse>;
+
+export const DeletionResponse = z.object({ scheduledFor: Timestamp.nullable(), changed: z.boolean() });
+export type DeletionResponse = z.infer<typeof DeletionResponse>;
+
+// ── settings ─────────────────────────────────────────────────────────────────────────────
+
+export const AdminSettingsResponse = z.object({
+  settings: SettingsDto,
+  /** Each ceiling key's default (from the vars) — the form shows default and effective value. */
+  ceilingDefaults: z.record(z.string(), z.number()),
+  /** Accounts that would be asked to accept the terms again after a version bump. */
+  termsAccounts: z.number().int().nonnegative(),
+});
+export type AdminSettingsResponse = z.infer<typeof AdminSettingsResponse>;
+
+// ── quarantine ───────────────────────────────────────────────────────────────────────────
+
+export const QuarantineQuery = z.strictObject({
+  status: z.enum(["infected", "suspected_csam", "under_review", "error", "skipped", "taken_down"]).optional(),
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type QuarantineQuery = z.infer<typeof QuarantineQuery>;
+
+/** Why a node cannot be deleted from here (or anywhere): `assertPurgeable`'s causes, by name. */
+export const HoldCause = z.enum([
+  "node_legal_hold",
+  "owner_legal_hold",
+  "suspected_csam",
+  "under_review",
+  "open_notice",
+  "inherited_legal_hold",
+  "inherited_open_notice",
+]);
+export type HoldCause = z.infer<typeof HoldCause>;
+
+export const AdminQuarantineDetailDto = z.object({
+  item: QuarantineItemDto,
+  owner: UserRef,
+  scanReason: z.string().nullable(),
+  scanDetail: z.record(z.string(), z.unknown()).nullable(),
+  /** The scanner's hash once it has one (null while `pending`). */
+  sha256: Sha256.nullable(),
+  holds: z.array(HoldCause),
+  links: z.array(AdminLinkDto),
+  /** The uploader's unlifted malware strike for this file, when one exists (offered for lifting). */
+  malwareStrikeId: RowId.nullable(),
+});
+export type AdminQuarantineDetailDto = z.infer<typeof AdminQuarantineDetailDto>;
+
+export const QuarantineActionResponse = z.object({
+  node: AdminNodeDto.nullable(),
+  /** `release`: whether the blocklist entry this node added was removed. */
+  blocklistRemoved: z.boolean().optional(),
+  /** `release`: the uploader's malware strike for this file, to offer `liftStrike`. */
+  malwareStrikeId: RowId.nullable().optional(),
+  /** `rescan`: what the rescan did. */
+  rescan: AdminRescanResponse.optional(),
+  /** `delete`: the subtree is gone. */
+  purged: z.boolean().optional(),
+});
+export type QuarantineActionResponse = z.infer<typeof QuarantineActionResponse>;
+
+// ── reports ──────────────────────────────────────────────────────────────────────────────
+
+/** `ReportListQuery` and the two filters it lacks: the source, and an age. */
+export const AdminReportListQuery = z.strictObject({
+  status: ReportStatus.optional(),
+  category: ReportCategory.optional(),
+  source: z.enum(["user", "system", "admin", "photodna"]).optional(),
+  olderThanHours: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 365)
+    .optional(),
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type AdminReportListQuery = z.infer<typeof AdminReportListQuery>;
+
+export const ReportAssignBody = z.strictObject({ assignToMe: z.boolean() });
+export type ReportAssignBody = z.infer<typeof ReportAssignBody>;
+
+/** A `scan.csam_alert_sent` row: when operators were told, how, and how many (never an address). */
+export const CsamAlertDto = z.object({
+  at: Timestamp,
+  via: z.string().nullable(),
+  recipients: z.number().int(),
+});
+export type CsamAlertDto = z.infer<typeof CsamAlertDto>;
+
+export const ReportDetailDto = z.object({
+  report: ReportDto,
+  /** Open or reviewing reports on the node, and from how many distinct reporters. */
+  openOnNode: z.number().int().nonnegative(),
+  distinctReporters: z.number().int().nonnegative(),
+  uploader: z
+    .object({
+      id: UserId,
+      displayName: z.string(),
+      createdAt: Timestamp,
+      strikes: z.array(AdminStrikeDto),
+    })
+    .nullable(),
+  links: z.object({
+    count: z.number().int().nonnegative(),
+    downloads: z.number().int().nonnegative(),
+    bytesServed: Bytes,
+    lastAccessAt: Timestamp.nullable(),
+  }),
+  /** The `scan.suspected_csam` row: when, and its real source. Null when the node was never locked. */
+  locked: z.object({ at: Timestamp, source: z.string().nullable() }).nullable(),
+  alerts: z.array(CsamAlertDto),
+  /** The node is a folder (a lock is refused for it). */
+  nodeIsFolder: z.boolean(),
+  /** For a `csam` report: the earliest release date once filed (`ncmecFiledAt` + 1 year). */
+  releasableAt: Timestamp.nullable(),
+});
+export type ReportDetailDto = z.infer<typeof ReportDetailDto>;
+
+export const ReportActionResponse = z.object({
+  report: ReportDto,
+  /** An escalation: the `csam` report the case now runs on (the same id for a `csam` report). */
+  csamReportId: RowId.nullable(),
+});
+export type ReportActionResponse = z.infer<typeof ReportActionResponse>;
+
+// ── the NCMEC procedure ──────────────────────────────────────────────────────────────────
+
+export const EvidenceAddressDto = z.object({
+  uploadIpRowId: RowId,
+  versionId: z.string(),
+  at: Timestamp,
+  /** The decrypted address; null with `error` when the row cannot be opened. */
+  ip: z.string().nullable(),
+  error: z.literal("undecryptable").optional(),
+});
+export type EvidenceAddressDto = z.infer<typeof EvidenceAddressDto>;
+
+export const EvidenceSubjectDto = z.object({
+  userId: UserId,
+  isOwner: z.boolean(),
+  uploadedVersionIds: z.array(z.string()),
+  isCurrentVersionUploader: z.boolean(),
+  held: z.boolean(),
+  account: z.object({
+    email: z.string(),
+    name: z.string(),
+    createdAt: Timestamp,
+    signInCountries: z.array(z.string()),
+  }),
+  addresses: z.array(EvidenceAddressDto),
+});
+export type EvidenceSubjectDto = z.infer<typeof EvidenceSubjectDto>;
+
+/** `POST /api/admin/reports/:id/ncmec/evidence`. Answered `Cache-Control: no-store`. */
+export const NcmecEvidenceResponse = z.object({
+  reportId: RowId,
+  node: z.object({
+    id: NodeId,
+    name: z.string(),
+    mimeSniffed: z.string().nullable(),
+    size: Bytes,
+    sha256: z.string().nullable(),
+    uploadedAt: Timestamp,
+    versions: z.array(z.object({ versionId: z.string(), at: Timestamp, current: z.boolean() })),
+  }),
+  links: z.object({
+    count: z.number().int().nonnegative(),
+    downloads: z.number().int().nonnegative(),
+    bytesServed: Bytes,
+    lastAccessAt: Timestamp.nullable(),
+    everPublic: z.boolean(),
+  }),
+  subjects: z.array(EvidenceSubjectDto),
+  /** `deleted`: the current version's uploader has no account any more (no subject is marked). */
+  currentVersionUploader: z.enum(["present", "deleted"]),
+  orphanAddresses: z.array(EvidenceAddressDto.extend({ uploaderId: z.string() })),
+});
+export type NcmecEvidenceResponse = z.infer<typeof NcmecEvidenceResponse>;
+
+export const ReleaseHoldsResponse = z.object({
+  confirmed: z.boolean(),
+  node: z.object({ released: z.boolean(), keptBecause: z.string().nullable() }),
+  releasedUserIds: z.array(UserId),
+  kept: z.array(
+    z.object({ userId: UserId, because: z.enum(["other_csam_report", "other_locked_node", "set_by_hand"]) }),
+  ),
+  uploadIpsReleased: z.number().int().nonnegative(),
+  /** True when nothing was held any more (a second confirmed call). */
+  nothingToRelease: z.boolean(),
+});
+export type ReleaseHoldsResponse = z.infer<typeof ReleaseHoldsResponse>;
+
+/** `moderation.clearSuspectedCsam`'s result, as the console shows it. */
+export const CsamClearResultDto = z.object({
+  cleared: z.boolean(),
+  refused: z.enum(["not_locked", "reported"]).nullable(),
+  blocklistRemoved: z.boolean(),
+  blocklistRestoredTo: z.enum(["malware", "csam", "dmca", "admin"]).nullable(),
+  blocklistKept: z
+    .enum(["confirmed", "not_this_locks", "other_node_locked", "reported", "edited"])
+    .nullable(),
+  reportIds: z.array(RowId),
+});
+export type CsamClearResultDto = z.infer<typeof CsamClearResultDto>;
+
+export const ClearLockResponse = z.object({
+  confirmed: z.boolean(),
+  /** The confirmed call's result; null on the preview. */
+  result: CsamClearResultDto.nullable(),
+  /** The node's status as the row has it after the call. */
+  nodeStatus: AdminScanStatus.nullable(),
+});
+export type ClearLockResponse = z.infer<typeof ClearLockResponse>;
+
+/** "Find, then lock as suspected CSAM": a node id, an R2 object key, or a files-host URL/path. */
+export const LockCsamBody = z.strictObject({
+  reference: z.string().trim().min(1).max(2048),
+  reason: Reason,
+  confirm: z.literal(true).optional(),
+});
+export type LockCsamBody = z.infer<typeof LockCsamBody>;
+
+export const LockCsamResponse = z.object({
+  confirmed: z.boolean(),
+  referenceKind: z.enum(["node_id", "object_key", "files_url"]),
+  match: z.object({
+    nodeId: NodeId,
+    name: z.string(),
+    mimeSniffed: z.string().nullable(),
+    size: Bytes,
+    sha256: z.string().nullable(),
+    owner: UserRef,
+    uploaders: z.array(z.object({ versionId: z.string(), uploader: UserRef.nullable() })),
+    scanStatus: AdminScanStatus,
+  }),
+  /** The case the lock filed or found (the confirmed call only). */
+  reportId: RowId.nullable(),
+});
+export type LockCsamResponse = z.infer<typeof LockCsamResponse>;
+
+/** An upload kept under "keep and alert": the server proved csam, the hash is no longer listed. */
+export const KeptUploadDto = z.object({
+  uploadId: RowId,
+  ownerId: UserId,
+  uploaderId: UserId.nullable(),
+  name: z.string(),
+  size: Bytes,
+  sha256: z.string().nullable(),
+  /** The hash's blocklist reason now (null: not listed — the keep-and-alert case). */
+  listedAs: z.enum(["malware", "csam", "dmca", "admin"]).nullable(),
+  owedAt: Timestamp,
+  createdAt: Timestamp,
+});
+export type KeptUploadDto = z.infer<typeof KeptUploadDto>;
+
+export const KeptUploadPage = Page(KeptUploadDto);
+export type KeptUploadPage = z.infer<typeof KeptUploadPage>;
+
+export const ResolveKeptUploadBody = z.strictObject({
+  resolution: z.enum(["relist", "false_positive"]),
+  reason: Reason,
+  confirm: z.literal(true).optional(),
+});
+export type ResolveKeptUploadBody = z.infer<typeof ResolveKeptUploadBody>;
+
+export const ResolveKeptUploadResponse = z.object({
+  confirmed: z.boolean(),
+  resolution: z.enum(["relist", "false_positive"]),
+  upload: KeptUploadDto,
+  /** `false_positive`, confirmed: the session ended and its object deleted. */
+  ended: z.boolean(),
+});
+export type ResolveKeptUploadResponse = z.infer<typeof ResolveKeptUploadResponse>;
+
+// ── copyright notices ────────────────────────────────────────────────────────────────────
+
+export const DmcaListQuery = z.strictObject({
+  status: DmcaStatus.optional(),
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type DmcaListQuery = z.infer<typeof DmcaListQuery>;
+
+/** One notice per alleged infringer: a notice naming several uploaders' files is split. */
+export const CreateDmcaNoticeResponse = z.object({ notices: z.array(DmcaNoticeDto) });
+export type CreateDmcaNoticeResponse = z.infer<typeof CreateDmcaNoticeResponse>;
+
+// ── links ────────────────────────────────────────────────────────────────────────────────
+
+export const AdminLinkListQuery = z.strictObject({
+  ownerId: UserId.optional(),
+  nodeId: NodeId.optional(),
+  paused: z.enum(["true", "false"]).optional(),
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type AdminLinkListQuery = z.infer<typeof AdminLinkListQuery>;
+
+/** Pause a link by hand with `anomaly`, or lift that reason (the only way before 00:05 UTC). */
+export const AdminLinkAnomalyBody = z.strictObject({ paused: z.boolean(), reason: Reason });
+export type AdminLinkAnomalyBody = z.infer<typeof AdminLinkAnomalyBody>;
+
+// ── invites ──────────────────────────────────────────────────────────────────────────────
+
+export const InviteListQuery = z.strictObject({
+  cursor: z.string().min(1).max(512).optional(),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+});
+export type InviteListQuery = z.infer<typeof InviteListQuery>;
+
+export const CreateInvitesResponse = z.object({ invites: z.array(InviteDto) });
+export type CreateInvitesResponse = z.infer<typeof CreateInvitesResponse>;
+
+// ── audit ────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A page of audit rows, and who each actor id is: an id with no account any more maps to null
+ * ("deleted account") — the row is never dropped for it.
+ */
+export const AdminAuditResponse = z.object({
+  items: z.array(AuditEntryDto),
+  nextCursor: z.string().nullable(),
+  actors: z.record(z.string(), UserRef.nullable()),
+});
+export type AdminAuditResponse = z.infer<typeof AdminAuditResponse>;
+
+// ── system ───────────────────────────────────────────────────────────────────────────────
+
+/** How the rollback detector reads the two copies of the generation (written nowhere by reading). */
+export const DetectorDto = z.object({
+  object: z.object({ raw: z.string().nullable(), number: z.number().int().nullable() }),
+  database: z.object({ raw: z.string().nullable(), number: z.number().int().nullable() }),
+  reading: z.enum(["level", "first", "object_ahead", "object_missing", "anomaly", "unreadable"]),
+  pauseSwitch: PauseSwitchState,
+  orphanDeleteEnabled: z.boolean(),
+});
+export type DetectorDto = z.infer<typeof DetectorDto>;
+
+export const AdminSystemDto = z.object({
+  build: z.object({ sha: z.string().nullable(), builtAt: z.string().nullable() }),
+  database: z.object({ ok: z.boolean() }),
+  storage: z.object({ ok: z.boolean() }),
+  flags: z.object({ photodnaEnabled: z.boolean(), scanStub: z.boolean() }),
+  scannerAvailable: z.boolean(),
+  jobs: z.array(
+    z.object({ name: z.string(), cron: z.string(), guarded: z.boolean(), streamed: z.boolean() }),
+  ),
+  detector: DetectorDto,
+});
+export type AdminSystemDto = z.infer<typeof AdminSystemDto>;
+
+export const ScannerCheckResponse = z.object({
+  available: z.boolean(),
+  instances: z.array(
+    z.object({
+      name: z.string(),
+      ok: z.boolean(),
+      ready: z.boolean().nullable(),
+      dbVersion: z.string().nullable(),
+      dbAgeHours: z.number().nullable(),
+      freshclam: z.string().nullable(),
+      error: z.string().nullable(),
+    }),
+  ),
+});
+export type ScannerCheckResponse = z.infer<typeof ScannerCheckResponse>;
+
+/** S11's checklist, ticked in this order before the generation is levelled. */
+export const AcceptGenerationBody = z.strictObject({
+  reason: Reason,
+  confirm: z.literal(true).optional(),
+  checklist: z
+    .strictObject({
+      pausedAndOrphansOff: z.literal(true),
+      reapplied: z.literal(true),
+      reconciled: z.literal(true),
+    })
+    .optional(),
+});
+export type AcceptGenerationBody = z.infer<typeof AcceptGenerationBody>;
+
+export const AcceptGenerationResponse = z.object({
+  confirmed: z.boolean(),
+  /** What the confirm would do / did: move the database's number, or rewrite the object. */
+  action: z.enum(["advance_database", "rewrite_object", "none"]),
+  before: z.object({ object: z.string().nullable(), database: z.string().nullable() }),
+  after: z.object({ object: z.string().nullable(), database: z.string().nullable() }).nullable(),
+  detector: DetectorDto,
+});
+export type AcceptGenerationResponse = z.infer<typeof AcceptGenerationResponse>;
+
+export const DestroyPauseBody = z.strictObject({
+  on: z.boolean(),
+  reason: Reason,
+  confirm: z.literal(true).optional(),
+});
+export type DestroyPauseBody = z.infer<typeof DestroyPauseBody>;
+
+export const DestroyPauseResponse = z.object({
+  confirmed: z.boolean(),
+  before: PauseSwitchState,
+  after: PauseSwitchState,
+  changed: z.boolean(),
+});
+export type DestroyPauseResponse = z.infer<typeof DestroyPauseResponse>;

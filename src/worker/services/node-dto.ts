@@ -31,6 +31,7 @@
 // BATCHED. A page costs one names read and one `sharingSummary` call (none when the viewer owns
 // no row of the page), whatever its length.
 
+import type { AdminNodeDto } from "../../shared/schemas/admin";
 import type { Role } from "../../shared/schemas/common";
 import type { NodeDto, NodeSharing, TrashItemDto } from "../../shared/schemas/node";
 import type { SearchResultDto } from "../../shared/schemas/search";
@@ -272,4 +273,90 @@ export async function toOwnAvatarDto(
     { viewerId: view.viewerId, role: "owner", isShareRoot: false, system: "avatar" },
     lookups,
   );
+}
+
+// ── the admin console's view (T25; ruling #24) ──────────────────────────────────────────────
+
+/** What the admin variant reads of a row: the mapper's fields, plus the two the console shows. */
+export type AdminNodeRow = NodeRow & Pick<Node, "takedownReason" | "legalHold">;
+
+/**
+ * A page of rows as the ADMIN CONSOLE sees them (`AdminNodeDto`), in the order given — the one
+ * mapper every `/api/admin/*` answer uses. Metadata only; the console never mints a content URL.
+ * It differs from the owner's view in exactly these ways:
+ *  - a HIDDEN row (taken down, `suspected_csam`) is accepted, and the three `AdminNodeDto`
+ *    fields are filled: `scanStatus` as stored (all seven), `takedown` and `legalHold`;
+ *  - a SYSTEM row (an avatar) still throws: the console lists `system IS NULL` only;
+ *  - `role` is always `viewer` — the admin acts only through `/api/admin/*`, so no owner action
+ *    may be offered on an admin row — and `parentId` is always the real one;
+ *  - `scanReason` and `pua` are always filled; `sha256` stays null while `pending` (until the
+ *    scanner has hashed the object the value is only what the client declared);
+ *  - `thumb`, `starred` are false and `lastAccessedAt` null; `deletedAt` / `purgeAfter` as the
+ *    row has them; `sharing` is the real summary (one `sharingSummary` call for the page).
+ * Written field by field like every other variant here; one names read per page.
+ */
+export async function toAdminNodeDtos<R extends AdminNodeRow>(
+  db: Executor,
+  rows: readonly R[],
+): Promise<AdminNodeDto[]> {
+  if (rows.length === 0) return [];
+  for (const row of rows) {
+    if (row.system !== null) throw new Error("node-dto: a system node was handed to the admin mapper");
+  }
+  const userIds = rows.flatMap((row) =>
+    row.createdBy === null ? [row.ownerId] : [row.ownerId, row.createdBy],
+  );
+  // One after the other: `db` may be a transaction, which has one connection.
+  const names = await displayNames(db, userIds);
+  const sharing = await sharingSummary(
+    db,
+    rows.map((row) => row.id),
+  );
+  return rows.map((row) => {
+    const ownerName = names.get(row.ownerId);
+    if (ownerName === undefined) throw new Error("node-dto: the node's owner has no user row");
+    const creatorName = row.createdBy === null ? undefined : names.get(row.createdBy);
+    const isFile = row.kind === "file";
+    return {
+      id: row.id,
+      parentId: row.parentId,
+      kind: row.kind,
+      name: row.name,
+      ext: row.ext,
+      size: row.size,
+      mimeCategory: isFile ? categoryOf(row.mimeSniffed, row.ext) : "other",
+      mimeSniffed: row.mimeSniffed,
+      etag: row.versionId ?? "",
+      sha256: row.scanStatus !== "pending" ? row.sha256 : null,
+      scanStatus: row.scanStatus,
+      scanReason: row.scanReason,
+      pua: [...(row.scanDetail?.pua ?? [])],
+      thumb: false,
+      starred: false,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+      lastAccessedAt: null,
+      deletedAt: row.deletedAt ? row.deletedAt.toISOString() : null,
+      purgeAfter: row.purgeAfter ? row.purgeAfter.toISOString() : null,
+      owner: { id: row.ownerId, displayName: ownerName },
+      createdBy:
+        row.createdBy === null || creatorName === undefined
+          ? null
+          : { id: row.createdBy, displayName: creatorName },
+      role: "viewer",
+      sharing: sharingOf(sharing.get(row.id)),
+      // A takedown always carries its reason (T05 `takedownNode` writes both); `admin` is the
+      // console's own word for one that, against that, has none.
+      takedown:
+        row.takedownAt === null
+          ? null
+          : { at: row.takedownAt.toISOString(), reason: row.takedownReason ?? "admin" },
+      legalHold: row.legalHold,
+    };
+  });
+}
+
+export async function toAdminNodeDto<R extends AdminNodeRow>(db: Executor, row: R): Promise<AdminNodeDto> {
+  const [dto] = await toAdminNodeDtos(db, [row]);
+  return dto!;
 }

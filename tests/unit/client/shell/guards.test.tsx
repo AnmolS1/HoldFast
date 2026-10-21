@@ -120,13 +120,13 @@ describe("route guards", () => {
     shellFetch({ session: sessionOf({ role: "user" }) });
     renderRoutes(buildRoutes(), ["/admin/users"]);
     expect(await screen.findByRole("heading", { name: "Page not found" })).toBeTruthy();
-    expect(document.querySelector('[data-placeholder-page="Admin"]')).toBeNull();
+    expect(document.querySelector("[data-admin-page]")).toBeNull();
   });
 
   it("/admin/* with the admin role renders the admin page", async () => {
     shellFetch({ session: sessionOf({ role: "admin" }) });
     renderRoutes(buildRoutes(), ["/admin/users"]);
-    await waitFor(() => expect(document.querySelector('[data-placeholder-page="Admin"]')).not.toBeNull());
+    await waitFor(() => expect(document.querySelector("[data-admin-page]")).not.toBeNull());
   });
 
   // Better Auth's admin plugin stores one role or a comma-separated list; the server's guard
@@ -136,7 +136,7 @@ describe("route guards", () => {
     async (role) => {
       shellFetch({ session: sessionOf({ role }) });
       renderRoutes(buildRoutes(), ["/admin/users"]);
-      await waitFor(() => expect(document.querySelector('[data-placeholder-page="Admin"]')).not.toBeNull());
+      await waitFor(() => expect(document.querySelector("[data-admin-page]")).not.toBeNull());
     },
   );
 
