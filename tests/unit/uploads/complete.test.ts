@@ -47,6 +47,7 @@ import {
   sessionRow,
   sessionsOf,
   sha,
+  sha256Of,
   TWO_PARTS,
   uploaded,
   uploader,
@@ -309,7 +310,12 @@ describe("the stub scan pipeline (how files become downloadable in this wave)", 
     ] as const) {
       const session = await uploaded(user, {}, bytes);
       const sent: unknown[] = [];
-      const answer = await complete(user, session.uploadId, {}, { sent });
+      // T21 (f.4): the bytes' REAL hash is declared for the clean file — a made-up one now ends
+      // `error`/`hash_mismatch`. The EICAR file keeps a made-up declaration: its real hash is on
+      // the blocklist once any earlier infected verdict listed it, and a listed declaration is
+      // refused at complete; the scanner's own `infected` (f.2) comes before the compare.
+      const declared = verdict === "clean" ? await sha256Of(bytes) : undefined;
+      const answer = await complete(user, session.uploadId, { sha256: declared }, { sent });
       expect(answer.status).toBe(201);
       expect(sent).toHaveLength(1);
       expect(await deliver([{ body: sent[0] }])).toEqual([{ outcome: "ack" }]);
