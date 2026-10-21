@@ -1,12 +1,11 @@
-// PLACEHOLDER — taken over by the sharing task (T24), which replaces this module and keeps the `routes` export.
 import type { RouteObject } from "react-router";
-import { PlaceholderPage } from "../../components/PlaceholderPage";
 import { t } from "../../lib/i18n";
+import { SharedWithMePage } from "./SharedWithMePage";
 
 export const routes: RouteObject[] = [
   {
     path: "shared",
-    element: <PlaceholderPage name={t("nav.sharedWithMe")} note={t("placeholder.shared.note")} />,
+    element: <SharedWithMePage />,
     handle: { title: t("nav.sharedWithMe") },
   },
 ];

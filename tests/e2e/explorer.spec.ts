@@ -407,7 +407,7 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     await expect(row(page, "notes.pdf")).toBeVisible();
   });
 
-  test("details of a file; Re-check sends it back to scanning; share is a disabled stub", async ({
+  test("details of a file; Re-check sends it back to scanning; share is offered", async ({
     page,
     origins,
   }) => {
@@ -425,13 +425,13 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     await expect(panel.locator("[data-sha256]")).toHaveText(NOTES.sha256!);
     await expect(panel).toContainText("Scanned. Nothing harmful found.");
     await expect(panel).toContainText("Not shared");
-    // Sharing arrives with the sharing task: shown, disabled — in the row's menu and under More.
+    // Sharing is on (T24): offered under More, enabled, without the "not switched on" reason.
     await page.locator("[data-selection-bar]").getByRole("button", { name: "More" }).click();
-    await expect(page.getByRole("menuitem", { name: /Share or get link/ })).toHaveAttribute(
+    await expect(page.getByRole("menuitem", { name: /Share or get link/ })).not.toHaveAttribute(
       "aria-disabled",
       "true",
     );
-    await expect(page.getByRole("menuitem", { name: /Share or get link/ })).toContainText(
+    await expect(page.getByRole("menuitem", { name: /Share or get link/ })).not.toContainText(
       "Sharing isn't switched on yet",
     );
     await page.keyboard.press("Escape");

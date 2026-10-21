@@ -593,22 +593,22 @@ describe("roles in a shared folder", () => {
   });
 });
 
-describe("sharing waits for the sharing task", () => {
-  it("the share action is shown, disabled, with the reason", async () => {
+describe("sharing is on", () => {
+  it("the share action is shown and enabled, with no 'not switched on' reason — in the row menu and under More", async () => {
     serveDrive(top());
     renderExplorer("/");
     await waitForRows(4);
     const { menu } = await openMenu(NOTES.id);
     const share = menu.querySelector<HTMLElement>('[data-action="share"]')!;
-    expect(share.getAttribute("aria-disabled")).toBe("true");
-    expect(share.textContent).toContain("Sharing isn't switched on yet");
+    expect(share.getAttribute("aria-disabled")).not.toBe("true");
+    expect(share.textContent).not.toContain("Sharing isn't switched on yet");
     fireEvent.keyDown(menu, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
     // The selection bar offers the same list under More.
     fireEvent.click(rowOf(NOTES.id)!);
     fireEvent.click(within(screen.getByRole("toolbar")).getByRole("button", { name: "More" }));
     const more = await screen.findByRole("menu");
-    expect(more.querySelector('[data-action="share"]')!.getAttribute("aria-disabled")).toBe("true");
+    expect(more.querySelector('[data-action="share"]')!.getAttribute("aria-disabled")).not.toBe("true");
   });
 });
 

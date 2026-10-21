@@ -176,9 +176,7 @@ describe("route guards", () => {
   it("/s/:token renders outside the frame with no session", async () => {
     shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/s/abc123"]);
-    await waitFor(() =>
-      expect(document.querySelector('[data-placeholder-page="Shared file"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector("[data-public-link-page]")).not.toBeNull());
     expect(document.querySelector("[data-frame]")).toBeNull();
   });
 

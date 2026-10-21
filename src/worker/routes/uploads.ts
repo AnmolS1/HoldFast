@@ -218,7 +218,8 @@ function assertOpen(c: Ctx, session: Upload): void {
 
 // ── where a file may go ─────────────────────────────────────────────────────────────────────
 
-type Place = { ownerId: string; role: Role; shareRootId: string | null };
+/** `viewRootId`: where the caller's view of the tree starts — what an answer is rooted at. */
+type Place = { ownerId: string; role: Role; shareRootId: string | null; viewRootId: string | null };
 
 /**
  * The init check on the parent, run again at complete: the caller may upload there (an editor or
@@ -238,11 +239,21 @@ async function placeFor(c: Ctx, user: SessionUser, parentId: string | null): Pro
   }
   const parent = await getNode(db(c), parentId);
   if (!parent || parent.kind !== "folder" || parent.system !== null) throw new AppError("not_found");
-  return { ownerId: parent.ownerId, role: access.role, shareRootId: access.shareRootId };
+  return {
+    ownerId: parent.ownerId,
+    role: access.role,
+    shareRootId: access.shareRootId,
+    viewRootId: access.viewRootId,
+  };
 }
 
 /** The caller's own top level — also where an avatar "is". */
-const OWN_ROOT = (user: SessionUser): Place => ({ ownerId: user.id, role: "owner", shareRootId: null });
+const OWN_ROOT = (user: SessionUser): Place => ({
+  ownerId: user.id,
+  role: "owner",
+  shareRootId: null,
+  viewRootId: null,
+});
 
 const replaceRefused = () => new AppError("conflict", REPLACE_REFUSED_MESSAGE);
 
@@ -607,6 +618,10 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
   const versionId = uuidv7();
   const r2Key = avatar ? avatarKey(user.id, nodeId) : keyFor(place.ownerId, nodeId, versionId);
   const at = now(c);
+  // The uploader's address, sealed as for `upload_ips`: kept on the session while it is unfinished,
+  // for the repair sweep that may finish it without a request (T22). Sealed here, outside the
+  // admission: its callback is database statements only.
+  const sealedIp = await sealIp(c.env, c.get("ip"));
 
   // The admission. Database statements only: a transaction Postgres ends as a deadlock victim is
   // run again (a refusal throws, and is never run twice).
@@ -645,6 +660,7 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
         purpose: body.purpose,
         fileLastModified: match.fileLastModified,
         expiresAt: expiresAtFor(at, body.size),
+        sealedIp,
       });
       return { session, created: true };
     });
@@ -1047,7 +1063,10 @@ async function sessionNode(
   c: Ctx,
   user: SessionUser,
   session: Upload,
-): Promise<{ node: Node; access: { role: Role; shareRootId: string | null } | null } | null> {
+): Promise<{
+  node: Node;
+  access: { role: Role; shareRootId: string | null; viewRootId: string | null } | null;
+} | null> {
   const node = await findByR2Key(db(c), session.r2Key);
   let access: Awaited<ReturnType<typeof requireRole>> | null = null;
   try {
@@ -1089,7 +1108,7 @@ async function completedAgain(c: Ctx, user: SessionUser, session: Upload, body: 
   const dto = await toNodeDto(db(c), found.node, {
     viewerId: user.id,
     role: found.access.role,
-    shareRootId: found.access.shareRootId,
+    shareRootId: found.access.viewRootId,
   });
   return c.json(dto, 200);
 }
@@ -1389,7 +1408,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   const dto = await toNodeDto(db(c), node, {
     viewerId: user.id,
     role: place.role,
-    shareRootId: place.shareRootId,
+    shareRootId: place.viewRootId,
   });
   return c.json(dto, replacing ? 200 : 201);
 });

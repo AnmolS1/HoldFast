@@ -57,6 +57,13 @@
       "when": 1791923079866,
       "tag": "0007_jit_off",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1792570512295,
+      "tag": "0008_session_ip",
+      "breakpoints": true
     }
   ]
 }

@@ -98,10 +98,7 @@ const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
   admin: ["routes.tsx"],
   dmca: ["routes.tsx"],
   interstitial: ["index.ts", "routes.tsx"],
-  "public-link": ["index.ts", "routes.tsx"],
   report: ["index.ts", "routes.tsx"],
-  share: ["index.ts", "routes.tsx"],
-  "shared-by-me": ["index.ts", "routes.tsx"],
 };
 
 describe("placeholder modules", () => {
