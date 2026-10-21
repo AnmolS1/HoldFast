@@ -222,7 +222,8 @@ type Action = DmcaActionBody["action"];
 const ACTIONS: Record<string, Action[]> = {
   received: ["mark_incomplete", "reject", "takedown"],
   incomplete: ["reject", "takedown"],
-  actioned: ["forward_counter", "close", "withdraw"],
+  // `forward_counter` only once a counter-notice is in (the server refuses it before: m6).
+  actioned: ["lawsuit_notice", "close", "withdraw"],
   counter_received: ["forward_counter", "lawsuit_notice", "restore", "uphold", "withdraw"],
 };
 
