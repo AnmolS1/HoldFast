@@ -5,7 +5,7 @@
 // Local queue delivery is asynchronous: the node's status is POLLED (bounded), never asserted
 // right after complete. The parent folder is seeded straight into the database, and the node is
 // read from there — the nodes API is another task's.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { APIRequestContext } from "@playwright/test";
 import { localDb, signedInUser } from "../setup/auth-fixtures";
 import { eicarBytes } from "../setup/fixture-bytes";
@@ -103,7 +103,9 @@ test.describe("uploads API", () => {
     expect(clean).toMatchObject({ name: "hello.txt", size: text.byteLength, scanStatus: "pending" });
     await expect.poll(() => scanStatusOf(clean.id), { timeout: 30_000 }).toBe("clean");
 
-    const infected = await uploadSmall(api, folderId, "eicar.com", eicarBytes());
+    // Per-run content (Common addendum 3): an infected verdict lists the hash for every spec.
+    const infectedBytes = Buffer.concat([Buffer.from(eicarBytes()), Buffer.from(`\n${randomUUID()}\n`)]);
+    const infected = await uploadSmall(api, folderId, "eicar.com", infectedBytes);
     await expect.poll(() => scanStatusOf(infected.id), { timeout: 30_000 }).toBe("infected");
 
     // The same name again fails, and says which file holds it.
@@ -162,7 +164,13 @@ test.describe("uploads API", () => {
     });
     expect(wrong.status()).toBe(400);
 
-    const done = await complete(api, session.uploadId, parts);
+    // T21 (f.4, Addendum 3 Q3): the REAL hash of the bytes sent (PART_BYTES + 1 zero bytes).
+    const done = await complete(
+      api,
+      session.uploadId,
+      parts,
+      createHash("sha256").update(Buffer.alloc(size)).digest("hex"),
+    );
     expect(done.status()).toBe(201);
     const node = (await done.json()) as { id: string; size: number };
     expect(node.size).toBe(size);
