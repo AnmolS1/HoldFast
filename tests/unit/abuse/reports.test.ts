@@ -354,6 +354,21 @@ describe("the effect of a valid report", () => {
     );
   });
 
+  it("review m2: the cap holds under a parallel burst — 8 reports at once from one address → exactly 5 filed, 3 refused 429", async () => {
+    const owner = await member();
+    const folder = await makeFolder(owner.id);
+    const files = [];
+    for (let i = 0; i < 8; i++) files.push(await makeFile(owner.id, folder.id, { scanStatus: "clean" }));
+    const link = await linkTo(owner, folder.id);
+    const ip = freshIp();
+    const answers = await Promise.all(
+      files.map((file) => publicReport({ nodeId: file.id, linkToken: link.token }, { ip })),
+    );
+    expect(answers.map((a) => a.status).sort()).toEqual([202, 202, 202, 202, 202, 429, 429, 429]);
+    const rows = (await Promise.all(files.map((file) => reportsOn(file.id)))).flat();
+    expect(rows).toHaveLength(REPORTS_PER_REPORTER_DAY);
+  });
+
   it("the state table (setUnderReview, called unconditionally): pending/clean/skipped/error → under_review with the previous status saved; a second report leaves scanStatusPrev alone; infected and suspected_csam change nothing and pause nothing", async () => {
     const reporter = await ipHashStable(testKeys(), freshIp());
     async function fileOn(status: ScanStatus) {
