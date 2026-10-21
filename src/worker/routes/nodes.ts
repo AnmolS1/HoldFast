@@ -70,6 +70,7 @@ import {
   zipManifest,
   type ZipRoot,
 } from "../db/queries/nodes-api";
+import { purgeRequestedBytes } from "../db/queries/account";
 import { usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
@@ -338,9 +339,22 @@ router.post("/nodes/download-urls", async (c) => {
 
 router.get("/account/usage", async (c) => {
   const user = requireVerified(c);
-  const usage = await usageBreakdown(db(c), user.id);
+  const [usage, held] = await Promise.all([
+    usageBreakdown(db(c), user.id),
+    purgeRequestedBytes(db(c), user.id),
+  ]);
   if (!usage) throw new AppError("not_found");
-  return c.json(usage satisfies UsageDto);
+  // What the account holder is shown never reveals a legal hold (T23 brief Addendum 2, Q3): a
+  // root deleted for good is gone to its owner, held or not — so the bytes a hold keeps of it
+  // (in the trash, and its old versions) are left out here as the purge would have given them
+  // back. Quota enforcement and the operator's figure keep the stored counter.
+  const body: UsageDto = {
+    ...usage,
+    usedBytes: Math.max(0, usage.usedBytes - held.files - held.versions),
+    trashBytes: Math.max(0, usage.trashBytes - held.files),
+    versionsBytes: Math.max(0, usage.versionsBytes - held.versions),
+  };
+  return c.json(body);
 });
 
 // ── by id: read ─────────────────────────────────────────────────────────────────────────────
