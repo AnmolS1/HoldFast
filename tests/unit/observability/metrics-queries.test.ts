@@ -32,7 +32,8 @@ const RECORDED_VERDICTS = {
 };
 
 function recorder(answer: () => Response | Promise<Response>) {
-  return vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => answer());
+  // Typed like fetch, so the calls' URL and init can be read back.
+  return vi.fn<(url: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(async () => answer());
 }
 
 describe("not configured → { available: false }, and no request", () => {
