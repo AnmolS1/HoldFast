@@ -48,4 +48,7 @@ head -c 9999969 /dev/urandom > head.bin
 { cat head.bin; hex2bin "$marker_hex"; } > marker-end.bin
 { cat head.bin; head -c 31 /dev/urandom; } > no-marker.bin
 rm head.bin
+# 1 GB of zeros deflated to ~1 MB: its extraction alone fills a small temp directory, and it is far
+# above a small MaxScanSize.
+head -c 1000000000 /dev/zero > zeros.bin && zip -q -X zeros-1g.zip zeros.bin && rm zeros.bin
 ls -l

@@ -55,11 +55,33 @@ type Server struct {
 	Engine  Engine
 	Status  func() Status
 	FreeTmp func() (int64, error) // free bytes in clamd's TemporaryDirectory
+	Sweep   func()                // empties clamd's TemporaryDirectory (nil: nothing to sweep)
 	Budget  time.Duration
 
 	large chan struct{}
 	small chan struct{}
 	once  sync.Once
+
+	mu       sync.Mutex // guards inflight; held while sweeping, so no scan starts mid-sweep
+	inflight int
+}
+
+// begin and end bracket a scan that may write to clamd's temp directory. When the last one ends —
+// whatever its outcome — the directory is emptied: clamd keeps a scan's files while it finishes a
+// scan whose client went away (Addendum 3).
+func (s *Server) begin() {
+	s.mu.Lock()
+	s.inflight++
+	s.mu.Unlock()
+}
+
+func (s *Server) end() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inflight--
+	if s.inflight == 0 && s.Sweep != nil {
+		s.Sweep()
+	}
 }
 
 func (s *Server) init() {
@@ -168,6 +190,9 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		busy()
 		return
 	}
+
+	s.begin()
+	defer s.end()
 
 	started := time.Now()
 	// The budget bounds both legs: clamd (the context) and a client that stops sending (the read

@@ -15,7 +15,11 @@
 # MaxScanTime 600000 (the 120 s default cut a clean cap-sized scan off on standard-1); the shim maps
 # Heuristics.Limits.Exceeded.MaxScanTime to { status: 'error', reason: 'timeout' }, never to
 # limits_exceeded. TemporaryDirectory /scan-tmp is on the instance disk: INSTREAM spools the whole
-# stream there (~2 GB for a cap-sized scan) — never a tmpfs.
+# stream there (~2 GB for a cap-sized scan) — never a tmpfs. Extracted archive members are written there
+# too; MaxScanSize 4900M (5,138,022,400 bytes) is sized so a cap-sized spool + a full extraction +
+# 256 MiB fit standard-1's 7,070 MiB free (numbers in clamd.conf). An archive that would need more is
+# limits_exceeded; one that still fills the disk fails closed (error), and the shim empties /scan-tmp
+# after every scan once none is running, so the instance recovers.
 #
 # Signature cache (C26): the build never fetches signatures. It COPYs main.cvd, daily.cvd and
 # bytecode.cvd from cvd/ (gitignored: containers/clamav/.gitignore). Locally, fill it once with
@@ -59,8 +63,8 @@
 #      `wrangler deploy` always builds a Dockerfile path.
 #
 # Targets: the default (last) stage is the shipped image. `--target test` adds test-only material:
-# a private signature file (test/holdfast-test.ndb), fixtures, and a clamd config with a tiny
-# MaxScanTime. The shim's Go tests run in the `shim` stage, so a red test fails every build.
+# a private signature file (test/holdfast-test.ndb), fixtures, and clamd configs with a tiny
+# MaxScanTime, a tiny MaxScanSize, and the temp directory on a mount the test makes small. The shim's Go tests run in the `shim` stage, so a red test fails every build.
 #
 # Integration run (containers enabled in a local `wrangler dev`, the only place they are):
 #   containers/clamav/test/integration.sh      (exits non-zero when Docker or containers are unavailable)
@@ -99,7 +103,11 @@ COPY --from=fixtures /fixtures /fixtures
 COPY --chown=clamav:clamav test/holdfast-test.ndb /var/lib/clamav/
 RUN install -d /etc/clamav/test \
  && sed 's/^MaxScanTime .*/MaxScanTime 1/' /etc/clamav/clamd.conf > /etc/clamav/test/clamd-scantime.conf \
- && grep -q '^MaxScanTime 1$' /etc/clamav/test/clamd-scantime.conf
+ && grep -q '^MaxScanTime 1$' /etc/clamav/test/clamd-scantime.conf \
+ && sed 's/^MaxScanSize .*/MaxScanSize 10M/' /etc/clamav/clamd.conf > /etc/clamav/test/clamd-scansize.conf \
+ && grep -q '^MaxScanSize 10M$' /etc/clamav/test/clamd-scansize.conf \
+ && sed 's|^TemporaryDirectory .*|TemporaryDirectory /scan-tmp/clamd|' /etc/clamav/clamd.conf > /etc/clamav/test/clamd-tmpfull.conf \
+ && grep -q '^TemporaryDirectory /scan-tmp/clamd$' /etc/clamav/test/clamd-tmpfull.conf
 USER clamav
 
 FROM runtime

@@ -172,6 +172,7 @@ func main() {
 			}
 			return int64(fs.Bavail) * int64(fs.Bsize), nil
 		},
+		Sweep: func() { sweepDir(cfg.TmpDir) },
 	}
 	// Listen first: the container library probes the port for ~20 s, and clamd needs longer to load.
 	httpServer := &http.Server{Addr: ":8080", Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}

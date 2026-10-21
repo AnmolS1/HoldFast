@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -352,5 +354,65 @@ func TestSmallScanRefusedWithoutExtractionSpace(t *testing.T) {
 	}
 	if ExtractAllowance != 2_097_152_000 {
 		t.Fatalf("ExtractAllowance %d is not clamd.conf's MaxFileSize 2000M", ExtractAllowance)
+	}
+}
+
+// /scan-tmp is emptied after every scan, whatever its outcome, once no other scan is running: clamd
+// keeps scanning (and keeps its spool) after a client goes (Addendum 3).
+func TestSweepAfterTheLastScanEnds(t *testing.T) {
+	e := &fakeEngine{reply: "stream: OK", entered: make(chan struct{}, 8), release: make(chan struct{})}
+	s := newServer(e)
+	var sweeps atomic.Int32
+	s.Sweep = func() { sweeps.Add(1) }
+	h := s.Handler()
+	done := make(chan *httptest.ResponseRecorder, 2)
+	go func() { done <- post(t, h, "3", strings.NewReader("abc")) }()
+	<-e.entered
+	go func() { done <- post(t, h, "3", strings.NewReader("abc")) }()
+	<-e.entered
+	e.release <- struct{}{}
+	<-done
+	if n := sweeps.Load(); n != 0 {
+		t.Fatalf("swept %d times while another scan was still running", n)
+	}
+	close(e.release)
+	<-done
+	if n := sweeps.Load(); n != 1 {
+		t.Fatalf("swept %d times after the last scan ended, want 1", n)
+	}
+	// Every outcome sweeps: an error, a short body, an overrun, a timeout.
+	for _, eng := range []Engine{errEngine{ErrBodyShort}, errEngine{ErrBodyOverrun}, errEngine{errors.New("clamd gone")}} {
+		s.Engine = eng
+		before := sweeps.Load()
+		post(t, h, "3", strings.NewReader("abc"))
+		if sweeps.Load() != before+1 {
+			t.Fatalf("%v: no sweep", eng)
+		}
+	}
+	s.Engine, s.Budget = &fakeEngine{release: make(chan struct{})}, 20*time.Millisecond
+	before := sweeps.Load()
+	post(t, h, "3", strings.NewReader("abc"))
+	if sweeps.Load() != before+1 {
+		t.Fatal("no sweep after a timeout")
+	}
+	// A refusal before admission writes nothing and sweeps nothing.
+	s.Status = func() Status { return Status{Clamd: "loading", NotReady: "clamd_loading"} }
+	before = sweeps.Load()
+	post(t, h, "3", strings.NewReader("abc"))
+	if sweeps.Load() != before {
+		t.Fatal("a not_ready refusal swept")
+	}
+}
+
+// sweepDir empties a directory and keeps it (and any mount point below it).
+func TestSweepDir(t *testing.T) {
+	dir := t.TempDir()
+	os.MkdirAll(filepath.Join(dir, "clamav-1.tmp", "deep"), 0o750)
+	os.WriteFile(filepath.Join(dir, "clamav-1.tmp", "deep", "member"), []byte("x"), 0o640)
+	os.WriteFile(filepath.Join(dir, "spool"), []byte("y"), 0o640)
+	sweepDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("left %v (%v)", entries, err)
 	}
 }

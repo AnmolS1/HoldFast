@@ -106,6 +106,11 @@ if grep -qx 'DetectPUA disabled' <<<"$(docker exec hf-clamav-fx clamconf -c /etc
 else
   bad "clamconf does not show DetectPUA disabled"
 fi
+if grep -qx 'MaxScanSize = "5138022400"' <<<"$(docker exec hf-clamav-fx clamconf -c /etc/clamav)"; then
+  ok "clamconf: MaxScanSize = 5138022400 (4900M)"
+else
+  bad "clamconf does not show MaxScanSize 5138022400"
+fi
 expect "$fx/clean.txt" clean
 expect "$fx/eicar.com" infected Eicar-Test-Signature
 expect "$fx/eicar.zip" infected Eicar-Test-Signature
@@ -174,6 +179,38 @@ else
 fi
 if curl -s "localhost:$port/health" | grep -q '"busy":false'; then ok "slot released"; else bad "slot still busy"; fi
 stop hf-clamav-fx
+
+# tmp_used <container> <dir>: KiB in use under dir (what clamd left behind).
+tmp_used() { docker exec "$1" du -sk "$2" | cut -f1; }
+
+echo "== a scan the client abandons leaves nothing in /scan-tmp (Addendum 3)"
+start hf-clamav-fx-gone
+head -c 30000000 /dev/urandom >"$work/pad.bin"
+(cd "$work" && cp "$fx/zeros-1g.zip" slow.zip && zip -q -X -0 slow.zip pad.bin)
+curl -s -o /dev/null --max-time 5 -X POST -H "X-Scan-Size: $(wc -c <"$work/slow.zip" | tr -d ' ')" \
+  -T "$work/slow.zip" "localhost:$port/scan" || true
+for _ in $(seq 1 30); do curl -s "localhost:$port/health" | grep -q '"busy":false' && break; sleep 1; done
+used="$(tmp_used hf-clamav-fx-gone /scan-tmp)"
+if [ "$used" -le 64 ]; then ok "client gone mid-scan → slot free, /scan-tmp holds $used KiB"; else bad "client gone mid-scan → /scan-tmp still holds $used KiB"; fi
+expect "$fx/eicar.com" infected Eicar-Test-Signature
+stop hf-clamav-fx-gone
+
+echo "== a bomb that fills the temp directory fails closed, and the instance recovers (Addendum 3)"
+# clamd's temp directory on a 200 MB tmpfs below /scan-tmp (the shim checks /scan-tmp, so it admits).
+start hf-clamav-fx-full2 -e CLAMD_CONF=/etc/clamav/test/clamd-tmpfull.conf \
+  --tmpfs /scan-tmp/clamd:size=200m,uid=100,gid=101,mode=0750
+expect_not_clean "$fx/zeros-1g.zip"
+used="$(tmp_used hf-clamav-fx-full2 /scan-tmp/clamd)"
+if [ "$used" -le 64 ]; then ok "after the spool-filling bomb /scan-tmp/clamd holds $used KiB"; else bad "after the bomb /scan-tmp/clamd still holds $used KiB"; fi
+expect "$fx/eicar.com" infected Eicar-Test-Signature
+expect "$fx/no-marker.bin" clean
+expect "$fx/marker-end.bin" infected Holdfast.Test.Marker
+stop hf-clamav-fx-full2
+
+echo "== an archive above MaxScanSize is limits_exceeded, not clean (MaxScanSize 10M here)"
+start hf-clamav-fx-scansize -e CLAMD_CONF=/etc/clamav/test/clamd-scansize.conf
+expect "$fx/zeros-1g.zip" limits_exceeded Heuristics.Limits.Exceeded.
+stop hf-clamav-fx-scansize
 
 echo "== MaxScanTime 1 ms: a cut-off is error/timeout, never limits_exceeded"
 start hf-clamav-fx-scantime -e CLAMD_CONF=/etc/clamav/test/clamd-scantime.conf
