@@ -43,11 +43,17 @@ const skippedMetrics = () =>
     .mock.calls.filter(([name, tags]) => name === "scan" && tags?.outcome === "photodna_skipped")
     .map(([, tags]) => tags?.reason);
 
-/** A PNG of `extra` more bytes than its pixels need (still sniffed as image/png). */
+/**
+ * A PNG with bytes of its own after its end (still sniffed as image/png), `extra` more bytes in
+ * all. UNIQUE per call: a match locks the content's hash as csam, and the bare fixture PNG is
+ * what other files' tests upload as an avatar.
+ */
 const png = (extra = 0) => {
   const base = pngBytes(32, 32);
-  const out = new Uint8Array(base.length + extra);
+  const tail = crypto.getRandomValues(new Uint8Array(16));
+  const out = new Uint8Array(base.length + tail.length + extra);
   out.set(base, 0);
+  out.set(tail, base.length);
   return out;
 };
 
