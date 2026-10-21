@@ -242,9 +242,7 @@ describe("mobile frame", () => {
     fireEvent.click(within(control).getByRole("link", { name: "By me" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/shared-by-me"));
     // The location leads the drawn page: wait for the new page before reading the nav under it.
-    await waitFor(() =>
-      expect(document.querySelector('[data-placeholder-page="Shared by me"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector('[data-shared-page="by-me"]')).not.toBeNull());
     expect(document.querySelector('[data-bottom-nav-item="shared"]')!.getAttribute("aria-current")).toBe(
       "page",
     );

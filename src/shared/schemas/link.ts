@@ -1,9 +1,16 @@
 // Public links: what the owner manages, and what the public page is told.
 
 import { z } from "zod";
-import { THUMB_SIZES, ZIP_MAX_ENTRIES } from "../constants";
+import { THUMB_SIZES, ZIP_MAX_ENTRIES, ZIP_URL_BATCH } from "../constants";
 import { Bytes, MimeCategory, NodeId, Page, PathToken, RowId, Timestamp } from "./common";
-import { DownloadUrlResponse, hasAField, NodeKind, NOTHING_TO_CHANGE, ZipEntry } from "./node";
+import {
+  BatchDownloadUrlsResponse,
+  DownloadUrlResponse,
+  hasAField,
+  NodeKind,
+  NOTHING_TO_CHANGE,
+  ZipEntry,
+} from "./node";
 
 export const LinkState = z.enum(["active", "paused", "expired", "revoked", "limit_reached", "locked"]);
 export type LinkState = z.infer<typeof LinkState>;
@@ -51,6 +58,9 @@ export function ownerCanUnpause(stored: readonly string[], lockedByAdmin: boolea
 /**
  * `url` is the full public URL, derived again from the sealed token on every owner read, so
  * "Copy link" works later. It is `null` for an impersonated session.
+ * `limitedToday`: the link's daily download count or daily bytes are used up right now — it is
+ * refused with `429` until the UTC day rolls over, and is NOT paused (`state` stays live and
+ * `pausedReasons` empty). Absent or false otherwise.
  */
 export const LinkDto = z.object({
   id: RowId,
@@ -68,6 +78,7 @@ export const LinkDto = z.object({
   allowPreview: z.boolean(),
   createdAt: Timestamp,
   lastAccessAt: Timestamp.nullable(),
+  limitedToday: z.boolean().optional(),
 });
 export type LinkDto = z.infer<typeof LinkDto>;
 
@@ -145,6 +156,8 @@ export const PublicNodeDto = z.object({
   size: Bytes,
   mimeCategory: MimeCategory,
   ext: z.string(),
+  /** The detected type — what the preview picks its viewer by (the owner's `NodeDto` carries the same). */
+  mimeSniffed: z.string().nullable(),
   thumb: z.boolean(),
 });
 export type PublicNodeDto = z.infer<typeof PublicNodeDto>;
@@ -197,6 +210,22 @@ export type PublicDownloadUrlBody = z.infer<typeof PublicDownloadUrlBody>;
 
 export const PublicDownloadUrlResponse = DownloadUrlResponse;
 export type PublicDownloadUrlResponse = z.infer<typeof PublicDownloadUrlResponse>;
+
+/**
+ * `POST /api/public/links/:token/download-urls` — the URLs of one window of a public zip, minted
+ * under its grant in ONE request (one hit of the per-address limiter). Every node passes every
+ * check of the single mint; a refused node is an item with its code and no URL. A request without
+ * a valid grant is refused as a whole. Answered with `PublicDownloadUrlsResponse`.
+ */
+export const PublicDownloadUrlsBody = z.strictObject({
+  zipGrant: z.string().min(1).max(2048),
+  nodeIds: z.array(NodeId).min(1).max(ZIP_URL_BATCH),
+  dangerousAck: z.boolean().optional(),
+});
+export type PublicDownloadUrlsBody = z.infer<typeof PublicDownloadUrlsBody>;
+
+export const PublicDownloadUrlsResponse = BatchDownloadUrlsResponse;
+export type PublicDownloadUrlsResponse = z.infer<typeof PublicDownloadUrlsResponse>;
 
 /** A public visitor is told ONE reason for every entry left out, never why. */
 export const PublicZipSkipped = z.object({

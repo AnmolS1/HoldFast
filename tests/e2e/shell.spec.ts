@@ -51,9 +51,9 @@ interface Destination {
 const DESTINATIONS: Destination[] = [
   { path: "/", title: "Files", nav: "files", placeholder: false },
   { path: "/folder/abc", title: "Files", placeholder: false },
-  { path: "/shared", title: "Shared with me", nav: "shared", placeholder: true },
+  { path: "/shared", title: "Shared with me", nav: "shared", placeholder: false },
   { path: "/uploads", title: "Uploads", placeholder: false },
-  { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: true },
+  { path: "/shared-by-me", title: "Shared by me", nav: "shared-by-me", placeholder: false },
   { path: "/recent", title: "Recent", nav: "recent", placeholder: false },
   { path: "/starred", title: "Starred", nav: "starred", placeholder: false },
   { path: "/trash", title: "Trash", nav: "trash", placeholder: false },
@@ -208,7 +208,7 @@ test.describe("shell routes", () => {
     await expect(page.locator("[data-frame]")).toHaveCount(0);
     await expect(page).toHaveURL(/\/dmca$/);
     await page.goto("/s/sometoken");
-    await expect(placeholder(page, "Shared file")).toBeVisible();
+    await expect(page.locator("[data-public-link-page]")).toBeVisible();
     await expect(page.locator("[data-frame]")).toHaveCount(0);
   });
 
@@ -248,9 +248,7 @@ test.describe("navigation", () => {
       await expect(item).toHaveAttribute("aria-current", "page");
     }
     await page.locator('[data-sidebar] [data-nav="shared"]').click();
-    await expect(placeholder(page, "Shared with me")).toContainText(
-      "Shared files appear here once sharing is switched on.",
-    );
+    await expect(page.locator('[data-shared-page="with-me"]')).toBeVisible();
   });
 
   test("mobile: three nav items; Recent, Starred and Trash through the Files switcher", async ({
@@ -284,11 +282,9 @@ test.describe("navigation", () => {
     }
 
     await page.locator('[data-bottom-nav-item="shared"]').click();
-    await expect(placeholder(page, "Shared with me")).toContainText(
-      "Shared files appear here once sharing is switched on.",
-    );
+    await expect(page.locator('[data-shared-page="with-me"]')).toBeVisible();
     await page.getByRole("group", { name: "Shared files view" }).getByRole("link", { name: "By me" }).click();
-    await expect(placeholder(page, "Shared by me")).toBeVisible();
+    await expect(page.locator('[data-shared-page="by-me"]')).toBeVisible();
 
     await page.locator('[data-bottom-nav-item="account"]').click();
     const sheet = page.getByRole("dialog", { name: "Ada Lovelace" });
@@ -486,7 +482,7 @@ test.describe("accessibility (light)", () => {
   test("the frame has no axe violations", async ({ page, origins }) => {
     await mockShell(page, origins.port);
     await gotoFrame(page, "/shared");
-    await expect(placeholder(page, "Shared with me")).toBeVisible();
+    await expect(page.locator('[data-shared-page="with-me"]')).toBeVisible();
     await expectNoA11yViolations(page);
   });
 
@@ -575,7 +571,7 @@ test.describe("session expiry", () => {
     await gotoFrame(page, "/");
     await page.evaluate(() => window.history.pushState({}, "", "/s/sometoken"));
     await page.evaluate(() => window.dispatchEvent(new PopStateEvent("popstate")));
-    await expect(placeholder(page, "Shared file")).toBeVisible();
+    await expect(page.locator("[data-public-link-page]")).toBeVisible();
     const requested = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/nodes");
     await trigger401(page);
     expect((await requested).status()).toBe(401);

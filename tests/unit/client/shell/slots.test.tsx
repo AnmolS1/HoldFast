@@ -95,7 +95,6 @@ void asContract;
 
 const target = { nodeId: "n1", linkToken: "tok" };
 const noop = () => {};
-const dialog = { open: true, nodeId: "n1", onClose: noop };
 const rendersNothing = (element: ReactElement) => () => expect(render(element).container.innerHTML).toBe("");
 
 // What each slot does while it is still the shell's stub. ONE STUB PER LINE: the task that fills a
@@ -104,7 +103,6 @@ const rendersNothing = (element: ReactElement) => () => expect(render(element).c
 const STUBS: Array<[behaviour: string, check: () => void]> = [
   ["ReportLink renders nothing", rendersNothing(<ReportLink target={target} />)],
   ["ReportDialog renders nothing", rendersNothing(<ReportDialog open onClose={noop} target={target} />)],
-  ["ShareDialog renders nothing", rendersNothing(<ShareDialog {...dialog} />)],
 ];
 
 describe("slot stubs", () => {

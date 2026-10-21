@@ -303,6 +303,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, f.owner, f.deep.id)).toEqual({
       role: "owner",
       shareRootId: null,
+      viewRootId: null,
       canUpload: true,
     });
     expect(await effectiveRole(db, f.owner, f.root.id)).toBe("owner");
@@ -349,11 +350,13 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, viewer, f.a.id)).toEqual({
       role: "viewer",
       shareRootId: f.a.id,
+      viewRootId: f.a.id,
       canUpload: false,
     });
     expect(await effectiveAccess(db, viewer, f.deep.id)).toEqual({
       role: "viewer",
       shareRootId: f.a.id,
+      viewRootId: f.a.id,
       canUpload: false,
     });
     // Nothing above or beside the shared folder.
@@ -372,6 +375,7 @@ describe("effectiveAccess", () => {
       expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
         role: "editor",
         shareRootId: f.root.id,
+        viewRootId: f.root.id,
         canUpload: false,
       });
     }
@@ -381,6 +385,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, uploader, f.deep.id)).toEqual({
       role: "editor",
       shareRootId: f.a.id,
+      viewRootId: f.a.id,
       canUpload: true,
     });
   });
@@ -394,6 +399,7 @@ describe("effectiveAccess", () => {
       expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
         role: "editor",
         shareRootId: f.b.id,
+        viewRootId: f.root.id,
         canUpload: true,
       });
     }
@@ -401,6 +407,7 @@ describe("effectiveAccess", () => {
       expect(await effectiveAccess(db, grantee, node.id), node.name).toEqual({
         role: "viewer",
         shareRootId: f.root.id,
+        viewRootId: f.root.id,
         canUpload: false,
       });
     }
@@ -415,12 +422,14 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, inner, f.deep.id)).toEqual({
       role: "editor",
       shareRootId: f.root.id,
+      viewRootId: f.root.id,
       canUpload: true,
     });
     // Outside the inner share its toggle says nothing.
     expect(await effectiveAccess(db, inner, f.zeta.id)).toEqual({
       role: "editor",
       shareRootId: f.root.id,
+      viewRootId: f.root.id,
       canUpload: false,
     });
     // The toggle on the outer share only: it holds for everything under it.
@@ -430,6 +439,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, outer, f.deep.id)).toEqual({
       role: "editor",
       shareRootId: f.root.id,
+      viewRootId: f.root.id,
       canUpload: true,
     });
     // Viewer twice: the outermost; a viewer share's toggle is never an upload right.
@@ -439,6 +449,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, viewer, f.deep.id)).toEqual({
       role: "viewer",
       shareRootId: f.a.id,
+      viewRootId: f.a.id,
       canUpload: false,
     });
     // A viewer share that carries the toggle does not lend it to an editor share that does not.
@@ -448,6 +459,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, mixed, f.deep.id)).toEqual({
       role: "editor",
       shareRootId: f.b.id,
+      viewRootId: f.root.id,
       canUpload: false,
     });
     // A share that is not activated is no share: it is neither the root nor a toggle.
@@ -464,6 +476,7 @@ describe("effectiveAccess", () => {
     expect(await effectiveAccess(db, pending, f.deep.id)).toEqual({
       role: "editor",
       shareRootId: f.b.id,
+      viewRootId: f.b.id,
       canUpload: false,
     });
     expect(await effectiveAccess(db, pending, f.zeta.id)).toBeNull();
