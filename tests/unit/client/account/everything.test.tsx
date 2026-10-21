@@ -189,4 +189,51 @@ describe("Download everything", () => {
         .filter((call) => call.path === "/api/nodes/download-urls" || call.path.startsWith("/d/")),
     ).toEqual([]);
   });
+
+  it.each([
+    ["the manifest", (call: MockCall) => call.path === "/api/nodes/zip-manifest"],
+    ["the first window of URLs", (call: MockCall) => call.path === "/api/nodes/download-urls"],
+  ])(
+    "the account changes while %s is on its way: the zip stops there and fetches nothing",
+    async (_name, isHeld) => {
+      captureBlob();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const calls = mockFetch(async (call: MockCall) => {
+        if (isHeld(call)) await gate;
+        if (call.path === "/api/nodes/zip-manifest") return json(manifest(120));
+        if (call.path === "/api/nodes/download-urls") {
+          const ids = (call.body as { nodeIds: string[] }).nodeIds;
+          return json({
+            items: ids.map((nodeId) => ({
+              nodeId,
+              url: `${CONFIG.filesOrigin}/d/${nodeId}/t`,
+              expiresAt: LATER,
+            })),
+          });
+        }
+        if (call.path.startsWith("/d/")) return new Response("x", { status: 200 });
+        return json({ error: "not_found", message: "not found" }, 404);
+      });
+      // As a browser does: a request whose signal is already aborted is never sent.
+      const routed = globalThis.fetch;
+      vi.stubGlobal("fetch", (input: RequestInfo | URL, init: RequestInit = {}) =>
+        init.signal?.aborted
+          ? Promise.reject(new DOMException("Aborted", "AbortError"))
+          : routed(input, init),
+      );
+      const running = startZip({ allOwned: true }, "holdfast-everything", { notIncluded: notIncludedText });
+      await waitFor(() => expect(calls.some(isHeld)).toBe(true));
+      const before = calls.length;
+      await purgeUserState();
+      release();
+      const result = await running;
+      expect(result.outcome).toBe("cancelled");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const later = calls
+        .slice(before)
+        .filter((call) => call.path === "/api/nodes/download-urls" || call.path.startsWith("/d/"));
+      expect(later).toEqual([]);
+    },
+  );
 });

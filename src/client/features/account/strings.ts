@@ -136,7 +136,6 @@ export const messages = {
   "twoFactor.code": "6-digit code",
   "twoFactor.code.error": "Enter the 6 digits from your app.",
   "twoFactor.code.wrong": "That code isn't right. Check the time on your phone and try again.",
-  "twoFactor.trust": "Trust this browser for 30 days",
   "twoFactor.verify": "Verify",
   "twoFactor.enabled": "Two-factor authentication is on.",
   "twoFactor.backup.title": "Backup codes",

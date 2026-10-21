@@ -121,6 +121,11 @@ test.describe("preferences and profile", () => {
     await page.getByRole("combobox", { name: "Time zone" }).selectOption("Asia/Tokyo");
     await expect(page.getByText("Saved.")).toBeVisible();
     await expect.poll(async () => (await userRow(user.id))?.timezone).toBe("Asia/Tokyo");
+    // What the shell's date formatter reads (session.user.timezone), without signing out.
+    const session = (await (await page.request.get("/api/auth/get-session")).json()) as {
+      user: { timezone: string | null };
+    };
+    expect(session.user.timezone).toBe("Asia/Tokyo");
 
     // The second device starts from its own (default) preferences; the server's copy wins.
     const other = await secondDevice(browser, origins.app, user.email, clientIp);

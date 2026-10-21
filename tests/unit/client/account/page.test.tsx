@@ -143,6 +143,25 @@ describe("profile", () => {
     expect(screen.queryByText("That password isn't right.")).toBeNull();
   });
 
+  it("a new time zone is stored, and the session is read again so every date follows it at once", async () => {
+    const calls = api((call) =>
+      call.path === "/api/account/profile" && call.method === "PATCH"
+        ? json({ ...PROFILE, timezone: (call.body as { timezone: string }).timezone })
+        : undefined,
+    );
+    renderRoutes(buildRoutes(), ["/account"]);
+    const zone = await screen.findByRole("combobox", { name: "Time zone" });
+    const reads = () => calls.filter((call) => call.path === "/api/auth/get-session").length;
+    await waitFor(() => expect(reads()).toBeGreaterThan(0));
+    const before = reads();
+    fireEvent.change(zone, { target: { value: "Asia/Tokyo" } });
+    await waitFor(() => expect(getToasts().map((toast) => toast.message)).toContain("Saved."));
+    const patch = calls.find((call) => call.path === "/api/account/profile" && call.method === "PATCH")!;
+    expect(patch.body).toEqual({ timezone: "Asia/Tokyo" });
+    expect(header(patch)).toBe(ME);
+    expect(reads()).toBe(before + 1);
+  });
+
   it("/account?email=unavailable shows its notice, and the parameter leaves the address", async () => {
     api();
     const { router } = renderRoutes(buildRoutes(), ["/account?email=unavailable"]);

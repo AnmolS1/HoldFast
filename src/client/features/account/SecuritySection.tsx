@@ -178,13 +178,19 @@ function LinkedPart({ hasPassword }: { hasPassword: boolean }) {
   };
 
   const connect = async (password?: string) => {
+    const then = accountEpoch();
     setBusy(true);
     setFailure(null);
     setPasswordError(null);
     const result = await linkGoogle(password);
+    // Another account by now: its browser is not sent to link Google to anything.
+    if (!sameAccount(then)) return;
     setBusy(false);
-    // On success the library takes the browser to Google's consent screen.
-    if (result.error) refused(result.error);
+    if (result.error) {
+      refused(result.error);
+      return;
+    }
+    if (result.data.url) window.location.assign(result.data.url);
   };
 
   const disconnect = async (accountId: string, password?: string) => {

@@ -33,7 +33,12 @@ const PREFS = {
 };
 const LATER = () => new Date(Date.now() + 3_600_000).toISOString();
 
-type Held = { path: (call: MockCall) => boolean; answer: () => Response };
+type Held = {
+  path: (call: MockCall) => boolean;
+  answer: () => Response;
+  /** Other answers of the scenario (as either account). */
+  extra?: (call: MockCall) => Response | undefined;
+};
 
 /**
  * The API as A, then as B. The request `held` matches is answered only when the test releases it —
@@ -47,6 +52,8 @@ function scripted(held: Held) {
     session: () => sessionOf({ id: who, email: profileOf(who).email, name: profileOf(who).displayName }),
     extra: (call) => {
       if (held.path(call)) return gate.then(held.answer) as unknown as Response;
+      const own = held.extra?.(call);
+      if (own) return own;
       const as = new Headers(call.headers).get(IDENTITY_HEADER) ?? who;
       if (call.path === "/api/account/profile" && call.method === "GET") return json(profileOf(as));
       if (call.path === "/api/account/prefs" && call.method === "GET") return json(PREFS);
@@ -242,5 +249,196 @@ describe("the account changes while a step waits", () => {
     api.release();
     await expectOnlyB(api.calls, before);
     expect(screen.queryByText(/Check ada@example\.com/)).toBeNull();
+  });
+});
+
+describe("the account changes while a step waits — preferences, password, passkeys, two-factor", () => {
+  const TWO_FACTOR = (enabled: boolean) => (call: MockCall) =>
+    call.path.startsWith("/api/auth/get-session?")
+      ? json({ user: { id: A, twoFactorEnabled: enabled }, session: {} })
+      : undefined;
+  const KEY = { id: "key-1", name: "Old laptop", createdAt: new Date().toISOString() };
+  const keys = (call: MockCall) =>
+    call.path.startsWith("/api/auth/passkey/list-user-passkeys") ? json([KEY]) : undefined;
+  const both =
+    (...handlers: Array<(call: MockCall) => Response | undefined>) =>
+    (call: MockCall) =>
+      handlers.reduce<Response | undefined>((found, handler) => found ?? handler(call), undefined);
+
+  /** Run one scenario: start the step as A, change to B while it waits, release, and check. */
+  async function scenario(
+    at: string,
+    held: Held,
+    start: () => Promise<void>,
+    after: (calls: MockCall[], before: number) => void | Promise<void> = () => {},
+  ) {
+    const api = scripted(held);
+    renderRoutes(buildRoutes(), [at]);
+    await start();
+    await api.waitHeld();
+    await api.switchToB();
+    const before = api.calls.length;
+    api.release();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(getToasts()).toEqual([]);
+    const forA = api.calls
+      .slice(before)
+      .filter((call) => new Headers(call.headers).get(IDENTITY_HEADER) === A);
+    expect(forA).toEqual([]);
+    await after(api.calls, before);
+  }
+
+  it("the emailShares PATCH: its answer is not written into B's preferences", async () => {
+    await scenario(
+      "/account/preferences",
+      {
+        path: (call) => call.path === "/api/account/prefs" && call.method === "PATCH",
+        answer: () => json({ ...PREFS, emailShares: false }),
+      },
+      async () => {
+        const toggle = await screen.findByRole("switch", {
+          name: "Email me when something is shared with me",
+        });
+        await waitFor(() => expect((toggle as HTMLInputElement).disabled).toBe(false));
+        fireEvent.click(toggle);
+      },
+      () => {
+        const cached = queryClient.getQueryData<{ emailShares: boolean }>(["account", "prefs"]);
+        if (cached) expect(cached.emailShares).toBe(true);
+      },
+    );
+  });
+
+  it("a password change: no 'Password changed.' for B", async () => {
+    await scenario(
+      "/account/security",
+      { path: (call) => call.path === "/api/auth/change-password", answer: () => json({ token: null }) },
+      async () => {
+        fireEvent.change(await screen.findByLabelText("Current password"), {
+          target: { value: "made-up old one 1" },
+        });
+        fireEvent.change(screen.getByLabelText("New password"), {
+          target: { value: "made-up new passphrase 2" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+      },
+    );
+  });
+
+  it("adding a passkey: the ceremony is not continued for anybody once the account changed", async () => {
+    await scenario(
+      "/account/security",
+      {
+        path: (call) => call.path.startsWith("/api/auth/passkey/generate-register-options"),
+        answer: () => json({ error: "made-up refusal" }, 400),
+        extra: (call) =>
+          call.path.startsWith("/api/auth/passkey/list-user-passkeys") ? json([]) : undefined,
+      },
+      async () => {
+        const add = await screen.findByRole("button", { name: "Add passkey" });
+        await waitFor(() => expect((add as HTMLButtonElement).disabled).toBe(false));
+        fireEvent.click(add);
+        fireEvent.change(await screen.findByLabelText("Passkey name"), { target: { value: "New key" } });
+        fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      },
+      (calls) =>
+        expect(calls.filter((call) => call.path.startsWith("/api/auth/passkey/verify-registration"))).toEqual(
+          [],
+        ),
+    );
+  });
+
+  it.each([
+    ["renaming", "/api/auth/passkey/update-passkey", "Rename: Old laptop"],
+    ["removing", "/api/auth/passkey/delete-passkey", "Remove: Old laptop"],
+  ])("%s a passkey: no toast for B", async (_name, path, button) => {
+    await scenario(
+      "/account/security",
+      { path: (call) => call.path === path, answer: () => json({ status: true }), extra: keys },
+      async () => {
+        fireEvent.click(await screen.findByRole("button", { name: button }));
+        const dialog = await screen.findByRole("dialog");
+        fireEvent.click(
+          within(dialog).getByRole("button", { name: button.startsWith("Rename") ? "Save" : "Remove" }),
+        );
+      },
+    );
+  });
+
+  it("turning two-factor on: the setup is not shown to B and nothing more is sent", async () => {
+    await scenario(
+      "/account/security",
+      {
+        path: (call) => call.path === "/api/auth/two-factor/enable",
+        answer: () =>
+          json({ totpURI: "otpauth://totp/Holdfast?secret=JBSWY3DPEHPK3PXP", backupCodes: ["a-1"] }),
+        extra: TWO_FACTOR(false),
+      },
+      async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "Turn on" }));
+        const dialog = await screen.findByRole("dialog");
+        fireEvent.change(within(dialog).getByLabelText("Your password"), {
+          target: { value: "made-up password 1" },
+        });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
+      },
+      () => expect(document.querySelector("[data-two-factor-setup]")).toBeNull(),
+    );
+  });
+
+  it("confirming the enrolment's code: no 'is on' for B", async () => {
+    await scenario(
+      "/account/security",
+      {
+        path: (call) => call.path === "/api/auth/two-factor/verify-totp",
+        answer: () => json({ token: "x" }),
+        extra: both(TWO_FACTOR(false), (call) =>
+          call.path === "/api/auth/two-factor/enable"
+            ? json({ totpURI: "otpauth://totp/Holdfast?secret=JBSWY3DPEHPK3PXP", backupCodes: ["a-1"] })
+            : undefined,
+        ),
+      },
+      async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "Turn on" }));
+        const dialog = await screen.findByRole("dialog");
+        fireEvent.change(within(dialog).getByLabelText("Your password"), {
+          target: { value: "made-up password 1" },
+        });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
+        fireEvent.change(await screen.findByLabelText("6-digit code"), { target: { value: "123456" } });
+        fireEvent.click(await screen.findByRole("button", { name: "Verify" }));
+      },
+      () => expect(document.querySelector("[data-backup-codes]")).toBeNull(),
+    );
+  });
+
+  it("the step-up's code: once the account changed, the action is NOT repeated — as A or as B", async () => {
+    await scenario(
+      "/account/security",
+      {
+        path: (call) => call.path === "/api/auth/two-factor/verify-totp",
+        answer: () => json({ token: "x" }),
+        extra: both(TWO_FACTOR(true), (call) =>
+          call.path === "/api/auth/two-factor/generate-backup-codes"
+            ? json({ code: "SECOND_FACTOR_REQUIRED", message: "made-up" }, 403)
+            : undefined,
+        ),
+      },
+      async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "New backup codes" }));
+        const dialog = await screen.findByRole("dialog", { name: "New backup codes" });
+        fireEvent.change(within(dialog).getByLabelText("Your password"), {
+          target: { value: "made-up password 1" },
+        });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
+        const prompt = await screen.findByRole("dialog", { name: "Confirm it's you" });
+        fireEvent.change(within(prompt).getByLabelText("Code"), { target: { value: "123456" } });
+        fireEvent.click(within(prompt).getByRole("button", { name: "Continue" }));
+      },
+      (calls) =>
+        expect(
+          calls.filter((call) => call.path === "/api/auth/two-factor/generate-backup-codes"),
+        ).toHaveLength(1),
+    );
   });
 });

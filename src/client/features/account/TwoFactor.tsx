@@ -4,8 +4,6 @@
 // when this session has not passed the factor (the step-up).
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
-import Checkbox from "@mui/material/Checkbox";
-import FormControlLabel from "@mui/material/FormControlLabel";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { toast } from "../../components/Toaster";
@@ -88,7 +86,6 @@ export function TwoFactorPart() {
   const [failure, setFailure] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [codeError, setCodeError] = useState<string | null>(null);
-  const [trust, setTrust] = useState(false);
 
   const enabled = state.data === true;
 
@@ -143,7 +140,7 @@ export function TwoFactorPart() {
     const then = accountEpoch();
     setCodeError(null);
     setBusy(true);
-    const result = await verifyTotp(value, trust);
+    const result = await verifyTotp(value);
     if (!sameAccount(then)) return;
     setBusy(false);
     if (result.error) {
@@ -218,10 +215,6 @@ export function TwoFactorPart() {
             onChange={(event) => setCode(event.target.value)}
             error={codeError}
             slotProps={{ htmlInput: { inputMode: "numeric", maxLength: 6 } }}
-          />
-          <FormControlLabel
-            control={<Checkbox checked={trust} onChange={(event) => setTrust(event.target.checked)} />}
-            label={t("twoFactor.trust")}
           />
           <Box sx={{ display: "flex", gap: 2 }}>
             <Button type="submit" variant="contained" disabled={busy}>

@@ -13,6 +13,7 @@ import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import { useCallback, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { accountEpoch, sameAccount } from "../../lib/query";
 import { AUTH_CODES, verifyBackupCode, verifyTotp } from "./auth-calls";
 import { failureText, holdFor, useSecondsLeft, waitText } from "./failures";
 import { STEP_UP_WAIT, StepUpContext, type Run } from "./step-up";
@@ -24,6 +25,7 @@ export function StepUpProvider({ children }: { children: ReactNode }) {
   const settle = useRef<((passed: boolean) => void) | null>(null);
 
   const run = useCallback<Run>(async (action) => {
+    const then = accountEpoch();
     const first = await action();
     if (first.error?.code !== AUTH_CODES.secondFactorRequired) return first;
     const passed = await new Promise<boolean>((resolve) => {
@@ -32,8 +34,9 @@ export function StepUpProvider({ children }: { children: ReactNode }) {
     });
     settle.current = null;
     setOpen(false);
-    // Given up: the refusal stands, nothing is sent again.
-    if (!passed) return first;
+    // Given up — or the account changed meanwhile (the code was the previous account's): the
+    // refusal stands, and nothing is sent again, least of all as the account signed in now.
+    if (!passed || !sameAccount(then)) return first;
     return action();
   }, []);
 

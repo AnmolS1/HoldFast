@@ -135,9 +135,13 @@ export const enableTwoFactor = (password: string) =>
     client.twoFactor.enable({ password, fetchOptions }),
   );
 
-/** Confirms an enrolment, or steps the session up; `trustDevice`: this browser for 30 days. */
-export const verifyTotp = (code: string, trustDevice = false) =>
-  call((fetchOptions) => client.twoFactor.verifyTotp({ code, trustDevice, fetchOptions }));
+/**
+ * Confirms an enrolment, or steps the session up. Sent BY a session, Better Auth never sets the
+ * trusted-device cookie (plugins/two-factor/verify-two-factor.mjs: `trustDevice` is read on the
+ * sign-in challenge only) — the 30-day option is on the shell's sign-in code screen.
+ */
+export const verifyTotp = (code: string) =>
+  call((fetchOptions) => client.twoFactor.verifyTotp({ code, fetchOptions }));
 
 /** The base32 secret of an otpauth:// URI, for typing in by hand. */
 export function secretOf(uri: string): string {
@@ -170,13 +174,17 @@ export interface LinkedAccount {
 export const listLinked = () =>
   call<LinkedAccount[]>((fetchOptions) => client.listAccounts({ fetchOptions }));
 
-/** Starts Google's consent screen; the library sends the browser there. */
+/**
+ * Asks for Google's consent-screen address (`url`). The browser is NOT sent there by the library
+ * (`disableRedirect`): the caller does it, once it knows the account has not changed meanwhile.
+ */
 export const linkGoogle = (password?: string) =>
-  call((fetchOptions) =>
+  call<{ url?: string }>((fetchOptions) =>
     client.linkSocial({
       provider: "google",
       callbackURL: "/account/security",
       errorCallbackURL: "/account/security",
+      disableRedirect: true,
       ...(password ? { password } : {}),
       fetchOptions,
     }),
