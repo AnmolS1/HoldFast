@@ -32,7 +32,14 @@
 #
 # Endpoints: POST /scan (body streamed to clamd with INSTREAM, SHA-256 in the same pass, header
 # X-Scan-Size required; one large scan > 8 MiB per instance and four small ones, more → 503 busy with
-# Retry-After: 15 before any body byte is read) and GET /health (always 200, never scans).
+# Retry-After: 15 before any body byte is read) and GET /health (always 200, never scans). A refusal
+# made before the body is read also states its outcome in headers (X-Scan-Status busy|not_ready,
+# X-Scan-Reason, X-Scan-Db-Age-Hours): the connection closes with the upload unread and the caller
+# can lose the JSON body.
+#
+# Environment: SIG_FRESH_HOURS (24); SCANNER_OFFLINE=1 skips freshclam entirely (local test runs only —
+# fail-closed: a stale bake then never becomes ready); CLAMD_CONF selects another clamd config (the
+# test target's tiny-MaxScanTime one).
 #
 # Workflow needs (T09c's .github/workflows/scanner-image.yml; reported to the orchestrator, not edited here):
 #   1. Scheduled rebuild for BOTH dev and prod. This file is the real scanner: the placeholder guard
