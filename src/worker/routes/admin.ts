@@ -83,7 +83,7 @@ import { todayTotals } from "../db/queries/ledger";
 import { pauseLinks, unpauseLinks } from "../db/queries/links";
 import { deletedKeptBytes, keptBackstopReached, usageBreakdown } from "../db/queries/quota";
 import { backlog } from "../db/queries/scan-jobs";
-import { setSetting, type Settings } from "../db/queries/settings";
+import { clearSettingsCache, setSetting, type Settings } from "../db/queries/settings";
 import { revokeLink } from "../db/queries/sharing";
 import { EXPIRED_NOTE } from "../db/queries/strikes";
 import type { Node, Report, Strike } from "../db/schema";
@@ -94,7 +94,7 @@ import { requireAdmin } from "../middleware/guards";
 import { SCANNER_INSTANCES, scannerHealth, type ScannerDeps } from "../scan/container";
 import { cancelDeletion, revokeSessions, scheduleDeletion, suspendUser } from "../services/account-state";
 import * as actions from "../services/admin-actions";
-import { audit } from "../services/audit";
+import { audit, auditInTx } from "../services/audit";
 import { jsonBody } from "../services/body";
 import { effectiveLimits } from "../services/ceilings";
 import { now } from "../services/clock";
@@ -468,11 +468,15 @@ router.post(`/admin/users/${USER}/revoke-links`, async (c) => {
   const userId = c.req.param("userId");
   const { reason } = AdminReasonBody.parse(await jsonBody(c));
   await knownUser(c, userId);
-  let revoked = 0;
-  for (const id of await adminQ.unrevokedLinkIds(db(c), userId)) {
-    if (await revokeLink(db(c), id)) revoked += 1;
-  }
-  audit(c, "admin.links_revoked", { type: "user", id: userId }, { reason, revoked });
+  // The revokes and their audit row commit together (m4): none of them without the record.
+  const revoked = await db(c).transaction(async (tx) => {
+    let count = 0;
+    for (const id of await adminQ.unrevokedLinkIds(tx, userId)) {
+      if (await revokeLink(tx, id)) count += 1;
+    }
+    await auditInTx(tx, c, "admin.links_revoked", { type: "user", id: userId }, { reason, revoked: count });
+    return count;
+  });
   return c.json({ revoked });
 });
 
@@ -608,12 +612,16 @@ router.patch("/admin/settings", async (c) => {
     });
   }
   const changes: Record<string, { from: unknown; to: unknown }> = {};
-  for (const [key, value] of Object.entries(body) as [keyof Settings & keyof typeof body, unknown][]) {
-    if (value === undefined) continue;
-    await setSetting(db(c), key, value as never, admin.id);
-    changes[key] = { from: before[key as keyof SettingsDto], to: value };
-  }
-  audit(c, "admin.settings_changed", { type: "settings", id: null }, { changes });
+  // Every key and the audit row in ONE transaction (m4): no change commits without its record.
+  await db(c).transaction(async (tx) => {
+    for (const [key, value] of Object.entries(body) as [keyof Settings & keyof typeof body, unknown][]) {
+      if (value === undefined) continue;
+      await setSetting(tx, key, value as never, admin.id);
+      changes[key] = { from: before[key as keyof SettingsDto], to: value };
+    }
+    await auditInTx(tx, c, "admin.settings_changed", { type: "settings", id: null }, { changes });
+  });
+  clearSettingsCache();
   return c.json(await settingsAnswer(c));
 });
 
@@ -1253,22 +1261,39 @@ function streamedRun(c: C, name: string): Response {
   const writer = stream.writable.getWriter();
   const line = (value: unknown) => writer.write(encoder.encode(`${JSON.stringify(value)}\n`));
   const store = storage(c.env);
-  const prefix = `b/db/${now(c).toISOString().slice(0, 10)}/_progress/`;
+  // The backup's date is the UTC day of its pass: the day the call started and — for a pass that
+  // crosses midnight — the day it is now. Only the CURRENT attempt's records are progress
+  // (Addendum 1, 19:05: `b/db/<date>/_attempt.json` names it; each record carries its id) — a
+  // retried pass must not echo the steps of the attempt before it.
+  const startDay = now(c).toISOString().slice(0, 10);
   const seen = new Set<string>();
+  const attemptOf = async (key: string): Promise<string | null> => {
+    const found = await store.get(key);
+    if (!found || found.kind !== "body") return null;
+    const value = JSON.parse(await found.object.text()) as { attempt?: unknown };
+    return typeof value.attempt === "string" ? value.attempt : null;
+  };
   const report = async () => {
-    try {
-      let cursor: string | undefined;
-      do {
-        const page = await store.list(prefix, cursor);
-        for (const object of page.objects) {
-          if (seen.has(object.key)) continue;
-          seen.add(object.key);
-          await line({ progress: object.key.slice(prefix.length) });
-        }
-        cursor = page.cursor ?? undefined;
-      } while (cursor);
-    } catch {
-      // A listing that fails keeps nothing from finishing: the next look tries again.
+    for (const day of new Set([startDay, new Date().toISOString().slice(0, 10)])) {
+      try {
+        const current = await attemptOf(`b/db/${day}/_attempt.json`);
+        if (current === null) continue;
+        const prefix = `b/db/${day}/_progress/`;
+        let cursor: string | undefined;
+        do {
+          const page = await store.list(prefix, cursor);
+          for (const object of page.objects) {
+            if (seen.has(object.key)) continue;
+            if ((await attemptOf(object.key)) !== current) continue;
+            seen.add(object.key);
+            await line({ progress: object.key.slice(prefix.length) });
+          }
+          cursor = page.cursor ?? undefined;
+        } while (cursor);
+      } catch {
+        // A listing (or a record) that cannot be read keeps nothing from finishing: the next look
+        // tries again.
+      }
     }
   };
   const work = (async () => {

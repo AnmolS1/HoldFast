@@ -159,12 +159,19 @@ describe("the plain pass", () => {
 });
 
 describe("the streamed pass (backup)", () => {
-  it("one progress line per new _progress/ record, the last line {name, done:true}, as application/x-ndjson", async () => {
+  it("one progress line per new _progress/ record OF THE CURRENT ATTEMPT (`_attempt.json`), the last line {name, done:true}, as application/x-ndjson", async () => {
     const who = await admin();
     const prefix = `b/db/${today()}/_progress/`;
+    const attempt = `b/db/${today()}/_attempt.json`;
+    // A record left by the attempt before this one (Addendum 1, 19:05): never shown as progress.
+    await env.FILES.put(`${prefix}old.json`, JSON.stringify({ attempt: "attempt-1" }));
     fake(STREAMED, async () => {
-      await env.FILES.put(`${prefix}users.json`, "{}");
-      await env.FILES.put(`${prefix}nodes.json`, "{}");
+      await env.FILES.put(
+        attempt,
+        JSON.stringify({ attempt: "attempt-2", startedAt: new Date().toISOString() }),
+      );
+      await env.FILES.put(`${prefix}users.json`, JSON.stringify({ attempt: "attempt-2" }));
+      await env.FILES.put(`${prefix}nodes.json`, JSON.stringify({ attempt: "attempt-2" }));
       return { done: true };
     });
     const answer = await run(who.as, STREAMED);
@@ -178,7 +185,7 @@ describe("the streamed pass (backup)", () => {
         .map((line) => line.progress)
         .sort(),
     ).toEqual(["nodes.json", "users.json"]);
-    await env.FILES.delete([`${prefix}users.json`, `${prefix}nodes.json`]);
+    await env.FILES.delete([`${prefix}users.json`, `${prefix}nodes.json`, `${prefix}old.json`, attempt]);
   });
 
   it("a pass that runs out of time ends {done:false}; a second call finishes it", async () => {

@@ -64,6 +64,8 @@ export type CallOptions = {
   raw?: string;
   /** Read the settings table as it is (the table-wide files only): no test settings over it. */
   tableSettings?: boolean;
+  /** Injected modules to replace for this request (a failing audit insert, say). */
+  core?: Partial<CoreDeps>;
 };
 
 const allow = { limit: async () => ({ success: true }) };
@@ -107,6 +109,7 @@ export async function call(
           ...BASE_SETTINGS,
           ...options.settings,
         }),
+    ...options.core,
   };
   const app = createApp(core);
   const pending: Promise<unknown>[] = [];

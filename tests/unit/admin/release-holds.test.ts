@@ -69,10 +69,14 @@ const clear = (who: Who, reportId: string) =>
     body: { reason: "The listing was added in error.", confirm: true },
     env: operators().env,
   });
-const file = (who: Who, reportId: string, filedAt: Date) =>
-  adminCall(who, "POST", `/reports/${reportId}/ncmec/filed`, {
+/** The procedure as it runs: started (the case locked and held), then filed. */
+const file = async (who: Who, reportId: string, filedAt: Date) => {
+  const started = await adminCall(who, "POST", `/reports/${reportId}/ncmec/start`, { env: operators().env });
+  if (started.status !== 200) return started;
+  return adminCall(who, "POST", `/reports/${reportId}/ncmec/filed`, {
     body: { reportId: `CT-${rand(4)}`, filedAt: filedAt.toISOString() },
   });
+};
 
 const held = async (ids: string[]) => Promise.all(ids.map(async (id) => (await userRowOf(id))!.legalHold));
 

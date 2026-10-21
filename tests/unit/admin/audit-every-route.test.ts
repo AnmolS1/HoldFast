@@ -175,6 +175,7 @@ const scenarios: Record<string, Scenario> = {
   },
   "POST /admin/reports/:id/ncmec/filed": async (who) => {
     const { reportId } = await lockedFile();
+    await adminCall(who.as, "POST", `/reports/${reportId}/ncmec/start`);
     const answer = await adminCall(who.as, "POST", `/reports/${reportId}/ncmec/filed`, {
       body: { reportId: "123456789", filedAt: new Date().toISOString() },
     });

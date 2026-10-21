@@ -145,6 +145,7 @@ describe("one test per CsamClearResult row", () => {
     const op = await admin();
     const owner = await member();
     const { file, reportId } = await lockFile(owner);
+    expect((await adminCall(op.as, "POST", `/reports/${reportId}/ncmec/start`)).status).toBe(200);
     const filed = await adminCall(op.as, "POST", `/reports/${reportId}/ncmec/filed`, {
       body: { reportId: "CT-1", filedAt: new Date(Date.now() - 86_400_000).toISOString() },
     });
@@ -248,6 +249,7 @@ describe("one test per CsamClearResult row", () => {
     const owner = await member();
     const filedNode = await lockFile(owner);
     const twin = await lockFile(owner, filedNode.sha256);
+    expect((await adminCall(op.as, "POST", `/reports/${filedNode.reportId}/ncmec/start`)).status).toBe(200);
     expect(
       (
         await adminCall(op.as, "POST", `/reports/${filedNode.reportId}/ncmec/filed`, {

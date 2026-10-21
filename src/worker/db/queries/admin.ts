@@ -734,6 +734,22 @@ export async function userIsUnreleasableSubject(db: Executor, userId: string, no
   );
 }
 
+/**
+ * Does an open CSAM case concern this user — a subject of a `csam` report that may not be released
+ * yet, or of a node that is `suspected_csam` right now (a lock whose report is still to come)?
+ */
+export async function userHeldByCsamCase(db: Executor, userId: string, nowAt: Date): Promise<boolean> {
+  if (await userIsUnreleasableSubject(db, userId, nowAt)) return true;
+  const result = await db.execute<{ found: boolean }>(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM nodes n WHERE n.scan_status = 'suspected_csam' AND (
+        n.owner_id = ${userId} OR n.created_by = ${userId}
+        OR EXISTS (SELECT 1 FROM node_versions v WHERE v.node_id = n.id AND v.created_by = ${userId})
+        OR EXISTS (SELECT 1 FROM upload_ips i WHERE i.node_id = n.id AND i.uploader_id = ${userId}))
+    ) AS found`);
+  return result.rows[0]?.found === true;
+}
+
 /** When the node was locked (the `scan.suspected_csam` rows) and each time operators were told. */
 export async function lockRecord(db: Executor, nodeId: string, reportId: string) {
   const rows = await db
@@ -854,6 +870,26 @@ export async function lockKeptSession(tx: Executor, uploadId: string): Promise<U
     .where(and(eq(uploads.id, uploadId), eq(uploads.status, "completing"), owedRowOf(sql`${uploads.id}`)))
     .for("update");
   return row ?? null;
+}
+
+/**
+ * Is this hash a reason to KEEP an upload's bytes: listed in the blocklist for ANY reason (the
+ * entry read `FOR SHARE` — after the session row, in lock order), or carried by a node that is
+ * `suspected_csam`? Null when neither.
+ */
+export async function hashKeepsBytes(tx: Executor, sha256: string): Promise<"listed" | "locked" | null> {
+  const [entry] = await tx
+    .select({ reason: hashBlocklist.reason })
+    .from(hashBlocklist)
+    .where(eq(hashBlocklist.sha256, sha256))
+    .for("share");
+  if (entry) return "listed";
+  const [locked] = await tx
+    .select({ id: nodes.id })
+    .from(nodes)
+    .where(and(eq(nodes.sha256, sha256), eq(nodes.scanStatus, "suspected_csam")))
+    .limit(1);
+  return locked ? "locked" : null;
 }
 
 // ── copyright notices ───────────────────────────────────────────────────────────────────────
@@ -985,6 +1021,27 @@ export async function updateNotice(
     .where(eq(dmcaNotices.id, noticeId))
     .returning();
   return row ?? null;
+}
+
+/**
+ * Does a notice OTHER than `noticeId` that is still in force (`actioned` or `counter_received`)
+ * name this node — or a node with this content (by its snapshot or the node's current hash)?
+ */
+export async function otherActiveNoticeNames(
+  db: Executor,
+  noticeId: string,
+  what: { nodeId: string } | { sha256: string },
+): Promise<boolean> {
+  const match =
+    "nodeId" in what
+      ? sql`dn.node_id = ${what.nodeId}`
+      : sql`(dn.sha256 = ${what.sha256} OR EXISTS (SELECT 1 FROM nodes n WHERE n.id = dn.node_id AND n.sha256 = ${what.sha256}))`;
+  const result = await db.execute<{ found: boolean }>(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM dmca_notice_nodes dn JOIN dmca_notices d ON d.id = dn.notice_id
+      WHERE d.id <> ${noticeId} AND d.status IN ('actioned', 'counter_received') AND ${match}
+    ) AS found`);
+  return result.rows[0]?.found === true;
 }
 
 export const NOTICE_OPEN: readonly DmcaNotice["status"][] = OPEN_NOTICE_STATUSES;

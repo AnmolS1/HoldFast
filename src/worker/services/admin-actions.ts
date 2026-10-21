@@ -83,6 +83,17 @@ import { addStrike, enforceStrikeThreshold, liftStrike, type StrikeKind } from "
 import { openIp } from "./tokens";
 
 type C = Context<AppEnv>;
+
+/**
+ * TEST SEAMS, null in production: awaited at the two points where a concurrent writer must be
+ * seen — after a kept upload's unlocked read (before its transaction), and after the hold toggle
+ * has locked the user's row.
+ */
+export const adminHooks: {
+  afterKeptRead: (() => Promise<void>) | null;
+  /** After the hold toggle's check, before its write (the user's row is locked). */
+  afterHoldUserLock: ((tx: Tx) => Promise<void>) | null;
+} = { afterKeptRead: null, afterHoldUserLock: null };
 export type Admin = { id: string };
 
 const conflict = (reason: string, details: Record<string, unknown> = {}, message?: string) =>
@@ -355,8 +366,24 @@ export async function assignReport(c: C, admin: Admin, reportId: string, assignT
 
 // ── the NCMEC procedure (section 6) ─────────────────────────────────────────────────────────
 
-/** `POST …/ncmec/start`: report → `reviewing`, `ncmecStartedAt`; reminders stop. Idempotent. */
+/**
+ * `POST …/ncmec/start`: report → `reviewing`, `ncmecStartedAt`; reminders stop. Idempotent.
+ * THE PROCEDURE RUNS ON A LOCKED NODE (Addendum 3, B1): a `csam` report whose file is not locked
+ * yet — a user's report, `under_review` only — is first locked through T10's one handler (the
+ * node `suspected_csam`; node, owner and every uploader held; addresses held; links paused; its
+ * record and alert), on the handle, outside any transaction here. A folder is refused.
+ */
 export async function ncmecStart(c: C, reportId: string) {
+  const seen = await adminQ.reportRow(db(c), reportId);
+  if (!seen) throw new AppError("not_found");
+  if (seen.category !== "csam") throw conflict("not_csam");
+  if (OPEN_STATES.includes(seen.status) && seen.nodeId) {
+    const node = await adminQ.nodeRow(db(c), seen.nodeId);
+    if (node && node.scanStatus !== "suspected_csam") {
+      if (node.kind !== "file" || node.system !== null) throw conflict("folder");
+      await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+    }
+  }
   const { report, changed } = await retryOnDeadlock(db(c), async (tx) => {
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     if (!locked) throw new AppError("not_found");
@@ -396,6 +423,8 @@ export async function ncmecEvidence(c: C, reportId: string): Promise<NcmecEviden
   if (!report || report.category !== "csam") throw new AppError("not_found");
   const node = report.nodeId ? await adminQ.nodeRow(db(c), report.nodeId) : null;
   if (!node) throw new AppError("not_found");
+  // A step of the procedure for a LOCKED file (m2): nothing is opened for any other.
+  if (node.scanStatus !== "suspected_csam") throw conflict("not_locked");
 
   const subjects = await csamSubjects(db(c), node.id);
   const subjectIds = subjects
@@ -474,7 +503,8 @@ export async function ncmecEvidence(c: C, reportId: string): Promise<NcmecEviden
       name: node.name,
       mimeSniffed: node.mimeSniffed,
       size: node.size,
-      sha256: node.scanStatus !== "pending" ? node.sha256 : null,
+      // Locked (checked above): the server's hash, never a declaration.
+      sha256: node.sha256,
       uploadedAt: node.createdAt.toISOString(),
       versions: versions.map((v) => ({ versionId: v.versionId, at: v.at.toISOString(), current: v.current })),
     },
@@ -502,11 +532,20 @@ export async function ncmecFiled(c: C, reportId: string, body: { reportId: strin
     const seen = await adminQ.reportRow(tx, reportId);
     if (!seen || seen.category !== "csam") throw new AppError("not_found");
     const node = seen.nodeId ? await adminQ.lockNodeRow(tx, seen.nodeId) : null;
+    const filedBefore = seen.status === "actioned" && seen.ncmecFiledAt !== null;
+    // NO FILING WITHOUT A LOCK (Addendum 3, B1): the node must be locked and held — a filing
+    // starts the preservation clock, and what it preserves is what the lock holds. (A node row
+    // that is gone — purged — has nothing left to hold; the filing then confirms no hash.)
+    if (node && !filedBefore && (node.scanStatus !== "suspected_csam" || !node.legalHold)) {
+      throw conflict("not_locked");
+    }
     const confirmed = node?.sha256 ? await blocklist.confirmCsam(tx, node.sha256) : false;
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     const report = locked!.report;
     if (report.status === "actioned" && report.ncmecFiledAt) return { report, changed: false, confirmed };
-    if (!OPEN_STATES.includes(report.status)) throw conflict("state", { status: report.status });
+    // ...and only after `ncmec/start`: the case was started (and, there, locked).
+    if (report.status === "open") throw conflict("not_started");
+    if (report.status !== "reviewing") throw conflict("state", { status: report.status });
     const updated = await adminQ.setReportStatus(tx, reportId, {
       status: "actioned",
       ncmecReportId: body.reportId,
@@ -628,6 +667,10 @@ export async function releaseHolds(c: C, reportId: string, reason: string, confi
     nothingToRelease: true,
   };
   if (!node) return empty;
+  // m3: a report that was never filed releases nothing while its own node is still locked (the
+  // lock's case is elsewhere — another report, or T22's unrecorded-lock repair). A FILED report's
+  // node stays locked for good (Clear lock refuses it): the filed row of the table applies.
+  if (!seen.ncmecFiledAt && node.scanStatus === "suspected_csam") throw conflict("node_locked");
 
   if (!confirm) {
     const decision = await decideRelease(
@@ -647,6 +690,7 @@ export async function releaseHolds(c: C, reportId: string, reason: string, confi
       await adminQ.lockUsers(tx, planned);
       const lockedNode = await adminQ.lockNodeRow(tx, node.id);
       if (!lockedNode) return null;
+      if (!seen.ncmecFiledAt && lockedNode.scanStatus === "suspected_csam") throw conflict("node_locked");
       const subjects = subjectIdsOf(await csamSubjects(tx, node.id));
       if (subjects.some((id) => !planned.includes(id))) throw new Retry();
       const report = (await adminQ.lockReportAndNode(tx, reportId))!.report;
@@ -1014,12 +1058,17 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
     });
     if (!moved) return null;
     for (const { nodeId } of notice.nodes) {
+      // A notice changes only what it changes (M1): a node already taken down — for abuse, by an
+      // admin, as csam, or by another notice — keeps its takedown and its reason as they are.
+      const before = await adminQ.nodeRow(tx, nodeId);
+      if (!before || before.takedownAt !== null) continue;
       if (!(await takedownNode(tx, nodeId, { reason: "dmca", by: admin.id }))) continue;
       await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
-      const node = await adminQ.nodeRow(tx, nodeId);
-      if (node?.sha256 && node.scanStatus !== "pending") {
+      // The hash is listed `dmca` only when it is listed for nothing yet: an entry another
+      // reason made is never rewritten (and so never removed by this notice's restore).
+      if (before.sha256 && before.scanStatus !== "pending" && !(await blocklist.lookup(tx, before.sha256))) {
         await blocklist.upsert(tx, {
-          sha256: node.sha256,
+          sha256: before.sha256,
           reason: "dmca",
           sourceNodeId: nodeId,
           addedBy: admin.id,
@@ -1106,6 +1155,7 @@ async function restoreNotice(
   admin: Admin,
   notice: adminQ.NoticeWithNodes,
   mode: "restore" | "withdraw",
+  note: string | null,
 ) {
   if (mode === "restore") {
     if (notice.lawsuitNoticeAt) throw conflict("lawsuit");
@@ -1129,21 +1179,43 @@ async function restoreNotice(
       });
       if (!row) return false;
     }
+    const ours = new Set(notice.nodes.map((n) => n.nodeId));
     for (const { nodeId } of notice.nodes) {
+      // Lifted only when no other cause remains (M1): a DMCA takedown, and no OTHER notice that
+      // names the node still in force. (Read under the tree locks this transaction holds.)
+      const node = await adminQ.nodeRow(tx, nodeId);
+      if (!node || node.takedownAt === null || node.takedownReason !== "dmca") continue;
+      if (await adminQ.otherActiveNoticeNames(tx, notice.id, { nodeId })) continue;
       await restoreTakedown(tx, nodeId);
       await unpauseLinks(tx, { subtreeOf: nodeId }, "moderation");
-      const node = await adminQ.nodeRow(tx, nodeId);
-      if (node?.sha256) await blocklist.remove(tx, node.sha256, { onlyIfReason: "dmca" });
+      // The `dmca` entry goes only if a node of THIS notice put it there and no other notice in
+      // force names the same content.
+      if (node.sha256) {
+        const entry = await blocklist.lookup(tx, node.sha256);
+        if (
+          entry?.reason === "dmca" &&
+          entry.sourceNodeId !== null &&
+          ours.has(entry.sourceNodeId) &&
+          !(await adminQ.otherActiveNoticeNames(tx, notice.id, { sha256: node.sha256 }))
+        ) {
+          await blocklist.remove(tx, node.sha256, {
+            onlyIfReason: "dmca",
+            onlyIfSourceNodeId: entry.sourceNodeId,
+          });
+        }
+      }
     }
     return true;
   });
   if (!moved) throw conflict("state", { status: notice.status });
+  // Recorded now that it has committed — before the steps that follow, which may fail (m5).
+  audit(c, `admin.dmca_${mode}`, { type: "dmca_notice", id: notice.id }, { reason: note });
   if (notice.strikeId) {
     try {
       await liftStrike(deps(c), notice.strikeId, admin.id);
     } catch (error) {
-      // Already lifted (by hand): nothing to do.
-      if (!(error instanceof AppError)) throw error;
+      // Already lifted (by hand): nothing to do. Anything else is reported: the restore stands.
+      if (!(error instanceof AppError)) captureError(error, { kind: "admin", reason: "dmca_lift_strike" });
     }
   }
   for (const { nodeId } of notice.nodes) {
@@ -1222,10 +1294,17 @@ export async function noticeAction(
       await simple(["counter_received"], { status: "upheld" }, true);
       break;
     case "restore":
-      await restoreNotice(c, admin, notice, "restore");
-      break;
+      await restoreNotice(c, admin, notice, "restore", note);
+      return (await adminQ.noticeById(db(c), noticeId))!;
     case "withdraw":
-      await restoreNotice(c, admin, notice, "withdraw");
+      if (notice.status === "received" || notice.status === "incomplete") {
+        // It took no action: closed as withdrawn, and nothing on the nodes changes (M1).
+        const closed = await retryOnDeadlock(db(c), (tx) => closeNotice(tx, noticeId, "withdrawn"));
+        if (!closed) throw conflict("state", { status: notice.status });
+      } else {
+        await restoreNotice(c, admin, notice, "withdraw", note);
+        return (await adminQ.noticeById(db(c), noticeId))!;
+      }
       break;
     case "close": {
       const closed = await retryOnDeadlock(db(c), (tx) => closeNotice(tx, noticeId, "closed"));
@@ -1347,6 +1426,9 @@ export async function acceptGeneration(
   const action = plannedLevel(first);
   const before = { object: first.rawObject, database: first.rawDatabase };
   if (!confirm) return { confirmed: false, action, before, after: null, detector: publicReading(first) };
+  // Levelling RE-ARMS every destroyer: it is done only with the pause switch ON (m7) — checked
+  // here, not trusted from the checklist the console ticks.
+  if (first.pauseSwitch !== "on") throw conflict("not_paused");
   if (action === "none") throw conflict("level");
 
   const locked = await withJobLock(db(c), GENERATION_LOCK, GENERATION_LOCK_HOLD_MS, async () => {
@@ -1447,14 +1529,23 @@ export async function resolveKeptUpload(
     audit(c, "admin.kept_upload_relisted", { type: "upload", id: uploadId }, { reason });
     return { confirmed: true, kept: (await adminQ.keptUpload(db(c), uploadId)) ?? kept, ended: false };
   }
+  // B2 (Addendum 3): bytes the server proved csam are NEVER ended while their hash is listed —
+  // for ANY reason — or a node with it is locked; nor while held, paused or rolled back.
+  if (kept.expectedSha256 && (await adminQ.hashKeepsBytes(db(c), kept.expectedSha256)))
+    throw conflict("listed");
   await refuseHeldOrPaused(c, kept);
   if (!confirm) return { confirmed: false, kept, ended: false };
+  await adminHooks.afterKeptRead?.();
 
   const ended = await retryOnDeadlock(db(c), async (tx) => {
-    // The owner's row (the reservation) and the uploader's, ascending; then the session.
+    // The owner's row (the reservation) and the uploader's, ascending; then the session; then —
+    // decided again under the locks — the hash's entry.
     await adminQ.lockUsers(tx, [kept.ownerId, kept.uploaderId]);
     const session = await adminQ.lockKeptSession(tx, uploadId);
     if (!session) return null;
+    if (session.expectedSha256 && (await adminQ.hashKeepsBytes(tx, session.expectedSha256))) {
+      throw conflict("listed");
+    }
     const owner = await adminQ.adminUser(tx, session.ownerId);
     const uploader = await adminQ.adminUser(tx, session.uploaderId);
     if (owner?.legalHold || uploader?.legalHold) throw conflict("held");
@@ -1520,10 +1611,17 @@ export async function unsuspend(c: C, admin: Admin, userId: string) {
  * the report detail. Every use is audited (`admin.legal_hold_set` / `_cleared`, `{ reason }`).
  */
 export async function setLegalHold(c: C, userId: string, held: boolean, reason: string) {
-  if (!held && (await adminQ.userIsUnreleasableSubject(db(c), userId, now(c)))) {
-    throw conflict("hold_not_releasable");
-  }
-  if (!(await setUserLegalHold(db(c), userId, held))) throw new AppError("not_found");
+  // ONE transaction in the CSAM lock path's order (M2): the user's row FIRST — a lock that wants
+  // to hold this user (it takes the user rows before the node) either committed before, and is
+  // seen by the check below, or waits for this write and then sets the hold again.
+  const found = await retryOnDeadlock(db(c), async (tx) => {
+    await adminQ.lockUsers(tx, [userId]);
+    if (!(await adminQ.adminUser(tx, userId))) return false;
+    if (!held && (await adminQ.userHeldByCsamCase(tx, userId, now(c)))) throw conflict("hold_not_releasable");
+    await adminHooks.afterHoldUserLock?.(tx as Tx);
+    return setUserLegalHold(tx, userId, held);
+  });
+  if (!found) throw new AppError("not_found");
   audit(
     c,
     held ? "admin.legal_hold_set" : "admin.legal_hold_cleared",

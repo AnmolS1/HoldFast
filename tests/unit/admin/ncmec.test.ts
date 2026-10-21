@@ -91,17 +91,15 @@ describe("ncmec/start", () => {
     expect(await listing()).toEqual(before);
   });
 
-  it("refused on a node that is not locked (409 not_locked) and on a report that is not csam", async () => {
+  // (Addendum 3, B1: start on a csam report whose node is not locked LOCKS it first — fix-pass.test.ts.)
+  it("refused on a report that is not csam", async () => {
     const who = await admin();
     const owner = await member();
     const file = await makeFile(owner.id, null, { scanStatus: "clean" });
-    const csam = await reported(file.id, owner.id, "csam");
-    const notLocked = await adminCall(who.as, "POST", `/reports/${csam}/ncmec/start`);
-    expect([notLocked.status, notLocked.body.details?.reason]).toEqual([409, "not_locked"]);
     const spam = await reported(file.id, owner.id, "spam");
     const notCsam = await adminCall(who.as, "POST", `/reports/${spam}/ncmec/start`);
     expect([notCsam.status, notCsam.body.details?.reason]).toEqual([409, "not_csam"]);
-    expect((await reportRowOf(csam))!.status).toBe("open");
+    expect((await reportRowOf(spam))!.status).toBe("open");
   });
 });
 
@@ -199,6 +197,7 @@ describe("ncmec/filed", () => {
     const who = await admin();
     const t = await lockedFile();
     const filedAt = new Date(Date.now() - 3_600_000).toISOString();
+    expect((await adminCall(who.as, "POST", `/reports/${t.reportId}/ncmec/start`)).status).toBe(200);
     const answer = await adminCall(who.as, "POST", `/reports/${t.reportId}/ncmec/filed`, {
       body: { reportId: "NCMEC-123", filedAt },
     });
