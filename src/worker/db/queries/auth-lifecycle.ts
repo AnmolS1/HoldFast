@@ -148,7 +148,10 @@ export async function reserveSignup(
  * user row was written (the request threw somewhere after the reservation) — if a user with
  * that address exists, nothing is given back and false is returned. A caller that knows its
  * insert failed (Better Auth answered "failed to create user": another sign-up took the address
- * first) passes null: the row that exists is someone else's.
+ * first) passes null: the row that exists is someone else's. So does a sign-up that creates no
+ * row at all (a Google sign-up at an account that was there before): "a user with that address
+ * exists" cannot tell a row made by this sign-up from one made before it, so it is asked only
+ * where the address had no row when the reservation was taken.
  */
 export async function releaseSignup(
   db: Executor,

@@ -108,8 +108,14 @@ export type AuthScope = {
    */
   reauthPassword?: unknown;
   facts: AuthFacts;
-  /** What the sign-up in flight has taken, until its user exists. */
-  reservation: { taken: SignupReservation; email: string } | null;
+  /**
+   * What the sign-up in flight has taken, until its user exists. `email`: the address of the user
+   * row this sign-up creates — a row found there when it is released is its own, and keeps what
+   * was taken. Null when the sign-up creates no row (a Google sign-up taking over an UNVERIFIED
+   * account that exists: hooks.ts `beforeProviderLink`): the row at the address is somebody
+   * else's, and an unspent reservation is always given back.
+   */
+  reservation: { taken: SignupReservation; email: string | null } | null;
   /** One entry per `user` update in flight that touches `banned` or the address (hooks.ts). */
   userUpdates: Array<{ banned?: boolean; address?: boolean; emailChanged?: boolean }>;
   /** Memo of the per-domain sign-up check (the MX lookup is made once per request). */
