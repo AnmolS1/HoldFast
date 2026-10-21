@@ -7,7 +7,9 @@
 #
 # (a) No Worker secret's NAME appears anywhere under the bundle directory. `SENTRY_DSN` is matched
 #     only as a whole name, so the public browser DSN's name `SENTRY_DSN_WEB` does not count.
-# (b) No VALUE of those secrets, as the vars file holds them, appears there either. Values are
+# (b) No VALUE of any key of the vars file appears there either — every key but the NON_SECRET
+#     ones below (wrangler.jsonc `vars`, public by definition, and GOOGLE_CLIENT_ID); a comma
+#     list (ADMIN_EMAILS) entry by entry, so one address alone is caught. Values are
 #     handed to grep through a file descriptor, never on a command line, and are never printed:
 #     only the key name of a value that was found. A vars file that does not exist skips (b), and
 #     says so (CI builds have none).
@@ -28,6 +30,17 @@ SECRET_NAMES=(
   CF_ANALYTICS_TOKEN
   PHOTODNA_SUBSCRIPTION_KEY
 )
+# Not secrets: every name of wrangler.jsonc `vars` (published with the Worker) and the public ids.
+NON_SECRET=(
+  APP_ORIGIN FILES_ORIGIN EMAIL_TRANSPORT SCAN_STUB SENTRY_ENVIRONMENT SENTRY_DSN_WEB TURNSTILE_SITEKEY
+  GOOGLE_CLIENT_ID SIGNUP_MODE SIGNUP_ALLOWED_DOMAINS TERMS_VERSION CF_ACCOUNT_ID PHOTODNA_ENABLED
+  QUOTA_BYTES MAX_FILE_BYTES PART_BYTES NEW_ACCOUNT_DAYS NEW_ACCOUNT_FACTOR NEW_ACCOUNT_MAX_LINKS
+  CEIL_USER_BYTES_DAY CEIL_LINK_BYTES_DAY CEIL_OWNER_LINK_BYTES_DAY CEIL_LINK_DOWNLOADS_DAY CEIL_IP_BYTES_DAY
+  CEIL_UPLOAD_BYTES_DAY CEIL_UPLOAD_COUNT_DAY CEIL_EDITOR_UPLOAD_BYTES_DAY CEIL_TRANSFORMS_DAY CEIL_SHARES_DAY
+  CEIL_LINKS_DAY
+)
+# Values that are a comma list of separate secrets.
+LIST_VALUED=(ADMIN_EMAILS)
 # Shorter values are too likely to occur by chance in minified code to mean anything.
 MIN_VALUE_LENGTH=8
 
@@ -84,19 +97,31 @@ check_values() {
     echo "bundle-secrets: no vars file at $vars — the value check (b) is skipped"
     return 0
   fi
-  for key in "${SECRET_NAMES[@]}"; do
+  local keys key entry
+  # Every KEY= of the file (names only), less the non-secret ones.
+  keys="$(grep -oE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=' "$vars" |
+    sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/[[:space:]]*=$//' | sort -u)"
+  for key in $keys; do
+    if printf '%s\n' "${NON_SECRET[@]}" | grep -qx "$key"; then continue; fi
     value="$(value_of "$vars" "$key")"
     [ -z "$value" ] && continue
-    if [ "${#value}" -lt "$MIN_VALUE_LENGTH" ]; then
-      short=$((short + 1))
-      continue
-    fi
-    checked=$((checked + 1))
-    # -F: the value is a literal; -f: it arrives through a descriptor, not argv.
-    if grep -rqF -f <(printf '%s\n' "$value") "$dir" 2>/dev/null; then
-      echo "bundle-secrets: the VALUE of $key is in the bundle (not printed)"
-      found=1
-    fi
+    local entries=("$value")
+    if printf '%s\n' "${LIST_VALUED[@]}" | grep -qx "$key"; then IFS=',' read -r -a entries <<<"$value"; fi
+    for entry in "${entries[@]}"; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      [ -z "$entry" ] && continue
+      if [ "${#entry}" -lt "$MIN_VALUE_LENGTH" ]; then
+        short=$((short + 1))
+        continue
+      fi
+      checked=$((checked + 1))
+      # -F: the value is a literal; -f: it arrives through a descriptor, not argv.
+      if grep -rqF -f <(printf '%s\n' "$entry") "$dir" 2>/dev/null; then
+        echo "bundle-secrets: the VALUE of $key is in the bundle (not printed)"
+        found=1
+      fi
+    done
   done
   echo "bundle-secrets: $checked secret value(s) checked, $short too short to check"
   return "$found"
@@ -125,7 +150,10 @@ BETTER_AUTH_SECRET="made-up-auth-secret-0123456789"
 FILES_TOKEN_SECRET=made-up-files-secret-0123456789
 SENTRY_DSN=
 TURNSTILE_SITEKEY=1x00000000000000000000AA
-ADMIN_EMAILS=x
+ADMIN_EMAILS="x,made-up-admin@admins.example"
+OTHER_LOCAL_SECRET=made-up-other-secret-0123456789
+APP_ORIGIN=http://made-up-origin.example
+GOOGLE_CLIENT_ID=made-up-client-id.example
 VARS
   printf 'const a=1;export{a};\n' >"$tmp/clean/assets/index.js"
   printf 'console.log("BETTER_AUTH_SECRET")\n' >"$tmp/name/assets/index.js"
@@ -137,6 +165,11 @@ VARS
   # Better Auth's env accessor, as the minifier writes it: allowed. The same file with one more use: not.
   printf 'Object.freeze({get BETTER_AUTH_SECRET(){return oV(`BETTER_AUTH_SECRET`)},get X(){}});\n' >"$tmp/accessor/assets/index.js"
   printf 'Object.freeze({get BETTER_AUTH_SECRET(){return oV(`BETTER_AUTH_SECRET`)}});send(BETTER_AUTH_SECRET);\n' >"$tmp/accessor-plus/assets/index.js"
+  mkdir -p "$tmp/admin/assets" "$tmp/other/assets" "$tmp/nonsecret/assets"
+  # One admin address of the list, alone; a secret under a name of no list; non-secret vars.
+  printf 'const a="made-up-admin@admins.example";\n' >"$tmp/admin/assets/index.js"
+  printf 'const o="made-up-other-secret-0123456789";\n' >"$tmp/other/assets/index.js"
+  printf 'const o="http://made-up-origin.example",g="made-up-client-id.example";\n' >"$tmp/nonsecret/assets/index.js"
 
   expect() { # <label> <expected status> <dir>
     local label="$1" want="$2" got=0
@@ -156,6 +189,9 @@ VARS
   expect "SENTRY_DSN_WEB, the site key and a short value pass" 0 public
   expect "Better Auth's env accessor alone passes" 0 accessor
   expect "the accessor plus another use of the name fails" 1 accessor-plus
+  expect "one ADMIN_EMAILS entry on its own fails" 1 admin
+  expect "the value of a key of no list fails (every key but the non-secret ones is checked)" 1 other
+  expect "a wrangler var and GOOGLE_CLIENT_ID pass" 0 nonsecret
   return "$failures"
 }
 
