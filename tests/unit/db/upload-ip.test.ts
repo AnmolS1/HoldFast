@@ -22,7 +22,7 @@ import {
   sealedIpOf,
   trimFinished,
 } from "../../../src/worker/db/queries/uploads";
-import { type Upload, uploads } from "../../../src/worker/db/schema";
+import { type Upload, uploads, user } from "../../../src/worker/db/schema";
 import { stripComments } from "./_sql-rule-scan";
 import { makeFolder, makeUpload, makeUser, openDb } from "./_helpers";
 
@@ -136,13 +136,26 @@ describe("every terminal transition clears it", () => {
     expect(await row(session.id)).toMatchObject({ status: "aborted", ...NONE });
   });
 
-  it("deleteSubtreeRows — a session a hold KEEPS is ended as aborted, and its address goes", async () => {
+  it("EXCEPTION (ruling 2026-10-21, legal-hold preservation — T29 :119): a session deleteSubtreeRows keeps BECAUSE of a hold is ended as aborted with its address KEPT; trimFinished deletes the row, address and all, once the hold is lifted", async () => {
     const owner = await makeUser(db);
     const heldEditor = await makeUser(db, { legalHold: true });
     const folder = await makeFolder(db, owner, null, "purged");
     const kept = await sealedSession(owner, heldEditor, { parentId: folder.id, size: 300 });
     await deleteSubtreeRows(db, folder.id);
-    expect(await row(kept.id)).toMatchObject({ status: "aborted", parentId: null, ...NONE });
+    expect(await row(kept.id)).toMatchObject({ status: "aborted", parentId: null });
+    expect(await ipOf(kept.id)).toEqual(KEPT);
+
+    // Past the trim age but still held: preserved as it is.
+    await db
+      .update(uploads)
+      .set({ completedAt: new Date(Date.now() - 30 * 86_400_000) })
+      .where(eq(uploads.id, kept.id));
+    await trimFinished(db, 7, 100_000);
+    expect(await ipOf(kept.id)).toEqual(KEPT);
+    // The hold lifted: the retention job's trim deletes the row — the address goes with it.
+    await db.update(user).set({ legalHold: false }).where(eq(user.id, heldEditor));
+    await trimFinished(db, 7, 100_000);
+    expect(await row(kept.id)).toBeNull();
   });
 
   it("the rows that are deleted take it with them: trimFinished, deleteForUser, deleteSubtreeRows", async () => {
@@ -216,7 +229,7 @@ describe("ended()", () => {
     }
   });
 
-  it("is the only way a session is written done or aborted: a scan of every worker source file", () => {
+  it("is the only way a session is written done or aborted — but for the one hold-preservation exception: a scan of every worker source file", () => {
     const root = fileURLToPath(new URL("../../../src/worker/", import.meta.url));
     const files: string[] = [];
     const walk = (dir: string) => {
@@ -243,6 +256,11 @@ describe("ended()", () => {
     }
     // The scan saw the updates it is about (claim, the three terminal helpers, the trash purge…).
     expect(updates).toBeGreaterThanOrEqual(6);
-    expect(offenders.map((o) => o.slice(root.length))).toEqual([]);
+    // Exactly ONE named exception (ruling 2026-10-21): deleteSubtreeRows ends the sessions a legal
+    // hold keeps without clearing the address — preservation keeps a held user's rows as they are.
+    // A second exception, or this one moved, is red.
+    expect(offenders.map((o) => o.slice(root.length))).toEqual([
+      'db/queries/trash.ts: .set({ status: "aborted", completedAt: sql`now()` })',
+    ]);
   });
 });
