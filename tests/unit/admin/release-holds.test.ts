@@ -60,12 +60,7 @@ function yearAgo(days: number): Date {
   return new Date(at.getTime() + days * DAY);
 }
 
-const release = (
-  who: Who,
-  reportId: string,
-  confirm = false,
-  reason: string | null = "Counsel agreed.",
-) =>
+const release = (who: Who, reportId: string, confirm = false, reason: string | null = "Counsel agreed.") =>
   adminCall(who, "POST", `/reports/${reportId}/release-holds`, {
     body: { ...(reason === null ? {} : { reason }), ...(confirm ? { confirm: true } : {}) },
   });
