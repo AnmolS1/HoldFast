@@ -326,6 +326,13 @@ export type Access = {
    */
   shareRootId: string | null;
   /**
+   * Where the user's VIEW of the tree starts: the OUTERMOST node on the path with an activated
+   * share to them, of any role (it may lie above `shareRootId` — an outer viewer share around an
+   * inner editor share). Null for the owner. Breadcrumbs are cut and the tree is rooted here;
+   * the refusals that protect a share root keep reading `shareRootId`.
+   */
+  viewRootId: string | null;
+  /**
    * Whether the user may add files here: always for the owner; for an editor, when ANY of their
    * editor shares on the path allows it (each share's toggle holds for everything under it).
    */
@@ -374,7 +381,8 @@ export async function effectiveAccess(db: Executor, userId: string, nodeId: stri
   // Read for every caller, used below for a grantee only (see the header).
   const ownerState = await userState(db, self ? self.owner_id : NO_SUCH_OWNER_ID);
   if (!self) return null;
-  if (self.owner_id === userId) return { role: "owner", shareRootId: null, canUpload: true };
+  if (self.owner_id === userId)
+    return { role: "owner", shareRootId: null, viewRootId: null, canUpload: true };
 
   // Nearest first (the chain is ordered by depth): the last of a list is the outermost.
   const grants = chain.filter((row) => row.role !== null);
@@ -386,6 +394,7 @@ export async function effectiveAccess(db: Executor, userId: string, nodeId: stri
   return {
     role: editors.length > 0 ? "editor" : "viewer",
     shareRootId: granting[granting.length - 1]!.id,
+    viewRootId: grants[grants.length - 1]!.id,
     canUpload: editors.some((row) => row.can_upload === true),
   };
 }

@@ -78,6 +78,11 @@ export interface Access {
    * the path — or the link's root; null for the owner. See `tree.Access`.
    */
   shareRootId: string | null;
+  /**
+   * Where the caller's view of the tree starts: the outermost node on the path with any share to
+   * them, or the link's root; null for the owner. See `tree.Access`.
+   */
+  viewRootId: string | null;
   /** Whether files may be added here: always for the owner; for an editor, when a share of theirs on the path allows it. */
   canUpload: boolean;
   via: "owner" | "share" | "link";
@@ -145,7 +150,13 @@ async function reach(c: Context<AppEnv>, link: LinkScope | null, nodeId: string)
   if (link) {
     // The link decides alone: a signed-in visitor gets no more through it than a stranger.
     return (await isDescendantOrSelf(db(c), nodeId, link.rootNodeId))
-      ? { role: "viewer", shareRootId: link.rootNodeId, canUpload: false, via: "link" }
+      ? {
+          role: "viewer",
+          shareRootId: link.rootNodeId,
+          viewRootId: link.rootNodeId,
+          canUpload: false,
+          via: "link",
+        }
       : null;
   }
   const user = c.get("user");
@@ -222,7 +233,7 @@ export async function requireRole(
 export async function requireUpload(c: Context<AppEnv>, parentId: string | null): Promise<Access> {
   if (parentId === null) {
     if (stateOf(c).link || !c.get("user")) throw new AppError("not_found");
-    return { role: "owner", shareRootId: null, canUpload: true, via: "owner" };
+    return { role: "owner", shareRootId: null, viewRootId: null, canUpload: true, via: "owner" };
   }
   const access = await requireRole(c, parentId, "editor");
   if (access.role !== "owner" && !access.canUpload) {

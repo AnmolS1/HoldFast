@@ -123,11 +123,11 @@ async function liveNode(c: Ctx, nodeId: string, min: Role): Promise<{ node: Node
 const statusesFor = (access: Access) =>
   access.role === "owner" ? OWNER_VISIBLE_STATUSES : SHARED_VISIBLE_STATUSES;
 
-/** Who the mapper answers for: the role, and the node a share partner's role comes from. */
+/** Who the mapper answers for: the role, and the node a share partner's view of the tree starts at. */
 const viewOf = (user: SessionUser, access: Access): NodeView => ({
   viewerId: user.id,
   role: access.role,
-  shareRootId: access.shareRootId,
+  shareRootId: access.viewRootId,
 });
 
 const target = (nodeId: string) => ({ type: "node", id: nodeId });
@@ -376,15 +376,15 @@ router.get(`/nodes/${ID}/children`, async (c) => {
 router.get(`/nodes/${ID}`, async (c) => {
   const user = requireVerified(c);
   const { node, access } = await liveNode(c, c.req.param("id"), "viewer");
-  // Root first, the node itself not included. Anyone but the owner sees the chain from the node
-  // that was shared with them: what lies above it is not theirs to know.
+  // Root first, the node itself not included. Anyone but the owner sees the chain from the
+  // outermost node that was shared with them: what lies above it is not theirs to know.
   const chain = await ancestors(db(c), node.id);
   const from =
-    access.shareRootId === null
+    access.viewRootId === null
       ? 0
-      : access.shareRootId === node.id
+      : access.viewRootId === node.id
         ? chain.length
-        : chain.findIndex((row) => row.id === access.shareRootId);
+        : chain.findIndex((row) => row.id === access.viewRootId);
   const breadcrumbs = (from < 0 ? [] : chain.slice(from)).map((row) => ({ id: row.id, name: row.name }));
   const dto = await toNodeDto(db(c), node, viewOf(user, access));
   return c.json({ node: dto, breadcrumbs } satisfies NodeDetailDto);

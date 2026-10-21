@@ -179,7 +179,7 @@ router.post(`/nodes/${ID}/trash`, async (c) => {
   if (!row) throw new AppError("not_found");
   // After the transaction, once: an attempt Postgres threw away leaves no row.
   audit(c, "node.trash", { type: "node", id });
-  const view = { viewerId: user.id, role: access.role, shareRootId: access.shareRootId };
+  const view = { viewerId: user.id, role: access.role, shareRootId: access.viewRootId };
   return c.json(await toTrashItemDto(db(c), row, view));
 });
 
@@ -215,7 +215,7 @@ router.post(`/nodes/${ID}/restore`, async (c) => {
   }
   if (!row) throw refused();
   audit(c, "node.restore", { type: "node", id }, { toRoot });
-  const view = { viewerId: user.id, role: access.role, shareRootId: access.shareRootId };
+  const view = { viewerId: user.id, role: access.role, shareRootId: access.viewRootId };
   return c.json(await toNodeDto(db(c), row, view));
 });
 
