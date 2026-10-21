@@ -151,6 +151,34 @@ describe("the SPA shell", () => {
     expect(html.indexOf('<meta name="csp-nonce"')).toBeLessThan(html.indexOf("</head>"));
   });
 
+  it("concurrent shell requests: each response's header nonce is its own page's (Addendum 3 F10)", async () => {
+    // Every request's asset fetch is held until all of them are in flight; then they are released
+    // together, so each response is stamped while the others are being stamped too.
+    const COUNT = 4;
+    let arrived = 0;
+    let release!: () => void;
+    const together = new Promise<void>((resolve) => (release = resolve));
+    const ASSETS = {
+      fetch: async () => {
+        arrived += 1;
+        if (arrived === COUNT) release();
+        await together;
+        return new Response(SHELL, { headers: { "content-type": "text/html; charset=utf-8" } });
+      },
+    };
+    const app = appWith(fakeCore());
+    const answers = await Promise.all(
+      Array.from({ length: COUNT }, () => call(app, "/files", { env: { ASSETS } })),
+    );
+    const seen = new Set<string>();
+    for (const { response } of answers) {
+      const nonce = nonceOfHeader(response.headers.get("content-security-policy") ?? "");
+      expect(await response.text()).toContain(`<meta name="csp-nonce" content="${nonce}">`);
+      seen.add(nonce ?? "");
+    }
+    expect(seen.size).toBe(COUNT);
+  });
+
   it("a fresh nonce per response; the shell is never stored and carries no validator", async () => {
     const seen = new Set<string>();
     for (let i = 0; i < 5; i++) {
