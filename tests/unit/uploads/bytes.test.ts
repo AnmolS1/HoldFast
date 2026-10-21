@@ -30,6 +30,7 @@ import {
   putSingle,
   sessionRow,
   sha,
+  sha256Of,
   TWO_PARTS,
   uploaded,
   uploader,
@@ -159,7 +160,13 @@ describe("the gate of a single PUT: after complete nothing a client sends change
     // … the honest one finishes, the session is completed and its object scanned …
     expect((await putSingle(user, session.uploadId, filled(4000, 0xaa))).status).toBe(200);
     const sent: unknown[] = [];
-    const done = await complete(user, session.uploadId, {}, { sent });
+    // T21 (f.4): the honest bytes' REAL hash is declared; a made-up one now ends `hash_mismatch`.
+    const done = await complete(
+      user,
+      session.uploadId,
+      { sha256: await sha256Of(filled(4000, 0xaa)) },
+      { sent },
+    );
     expect(done.status).toBe(201);
     expect(await deliver([{ body: sent[0] }])).toEqual([{ outcome: "ack" }]);
     const node = (await nodeById(String(done.body.id)))!;

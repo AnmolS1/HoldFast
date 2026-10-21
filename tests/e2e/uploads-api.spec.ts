@@ -5,6 +5,7 @@
 // Local queue delivery is asynchronous: the node's status is POLLED (bounded), never asserted
 // right after complete. The parent folder is seeded straight into the database, and the node is
 // read from there — the nodes API is another task's.
+import { createHash, randomUUID } from "node:crypto";
 import type { APIRequestContext } from "@playwright/test";
 import { localDb, signedInUser } from "../setup/auth-fixtures";
 import { eicarBytes } from "../setup/fixture-bytes";
@@ -50,16 +51,22 @@ async function init(api: Api, parentId: string, name: string, size: number) {
   return (await response.json()) as { uploadId: string; mode: string; partBytes: number; partCount: number };
 }
 
-async function complete(api: Api, uploadId: string, parts: { n: number; etag: string }[] = []) {
-  // The hash is the client's word, and advisory: the scanner computes its own.
+async function complete(
+  api: Api,
+  uploadId: string,
+  parts: { n: number; etag: string }[] = [],
+  sha256 = "0".repeat(64),
+) {
+  // The hash is the client's word: the scanner computes its own and compares (T21 f.4) — a
+  // made-up declaration for clean bytes ends `error`/`hash_mismatch`.
   const response = await api.request.post(`/api/uploads/${uploadId}/complete`, {
     headers: api.headers,
-    data: { sha256: "0".repeat(64), parts },
+    data: { sha256, parts },
   });
   return response;
 }
 
-async function uploadSmall(api: Api, parentId: string, name: string, bytes: Uint8Array) {
+async function uploadSmall(api: Api, parentId: string, name: string, bytes: Uint8Array, declared?: string) {
   const session = await init(api, parentId, name, bytes.byteLength);
   expect(session.mode).toBe("single");
   const put = await api.request.put(`/api/uploads/${session.uploadId}/single`, {
@@ -68,7 +75,7 @@ async function uploadSmall(api: Api, parentId: string, name: string, bytes: Uint
   });
   expect(put.status()).toBe(200);
   expect(await put.json()).toEqual({ etag: expect.any(String) });
-  const done = await complete(api, session.uploadId);
+  const done = await complete(api, session.uploadId, [], declared);
   expect(done.status()).toBe(201);
   return (await done.json()) as { id: string; scanStatus: string; name: string; size: number };
 }
@@ -84,11 +91,21 @@ test.describe("uploads API", () => {
     const folderId = await seedFolder(user.id);
 
     const text = new TextEncoder().encode("Hello from the uploads e2e spec.\n");
-    const clean = await uploadSmall(api, folderId, "hello.txt", text);
+    // T21 (f.4): the clean file declares its REAL hash. The EICAR file keeps the made-up one (its
+    // real hash is listed after any earlier infected verdict, and a listed declaration is refused).
+    const clean = await uploadSmall(
+      api,
+      folderId,
+      "hello.txt",
+      text,
+      createHash("sha256").update(text).digest("hex"),
+    );
     expect(clean).toMatchObject({ name: "hello.txt", size: text.byteLength, scanStatus: "pending" });
     await expect.poll(() => scanStatusOf(clean.id), { timeout: 30_000 }).toBe("clean");
 
-    const infected = await uploadSmall(api, folderId, "eicar.com", eicarBytes());
+    // Per-run content (Common addendum 3): an infected verdict lists the hash for every spec.
+    const infectedBytes = Buffer.concat([Buffer.from(eicarBytes()), Buffer.from(`\n${randomUUID()}\n`)]);
+    const infected = await uploadSmall(api, folderId, "eicar.com", infectedBytes);
     await expect.poll(() => scanStatusOf(infected.id), { timeout: 30_000 }).toBe("infected");
 
     // The same name again fails, and says which file holds it.
@@ -147,7 +164,13 @@ test.describe("uploads API", () => {
     });
     expect(wrong.status()).toBe(400);
 
-    const done = await complete(api, session.uploadId, parts);
+    // T21 (f.4, Addendum 3 Q3): the REAL hash of the bytes sent (PART_BYTES + 1 zero bytes).
+    const done = await complete(
+      api,
+      session.uploadId,
+      parts,
+      createHash("sha256").update(Buffer.alloc(size)).digest("hex"),
+    );
     expect(done.status()).toBe(201);
     const node = (await done.json()) as { id: string; size: number };
     expect(node.size).toBe(size);

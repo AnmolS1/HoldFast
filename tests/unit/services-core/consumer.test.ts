@@ -31,6 +31,24 @@ const explicit = (node: { id: string; r2Key: string | null }, force?: boolean) =
   ...(force === undefined ? {} : { force }),
 });
 
+/**
+ * The EICAR file with bytes of its own after it: infected for the stub, with a hash no other run
+ * has. A verdict lists the content's hash in the SHARED test database (T21, Addendum 3 Q6).
+ */
+function uniqueEicar(): Uint8Array {
+  const tail = new TextEncoder().encode(`\n${crypto.randomUUID()}\n`);
+  const out = new Uint8Array(eicarBytes().length + tail.length);
+  out.set(eicarBytes(), 0);
+  out.set(tail, eicarBytes().length);
+  return out;
+}
+
+async function sha256Hex(bytes: Uint8Array | string): Promise<string> {
+  const data = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** A pending file with its object in the store. */
 async function pendingFile(bytes: Uint8Array | string, name = "notes.txt") {
   const owner = await makeUser();
@@ -59,7 +77,7 @@ describe("through the real local queue (SCAN_STUB=1)", () => {
   });
 
   it("the antivirus test file becomes infected", async () => {
-    const file = await pendingFile(eicarBytes(), "eicar.com.txt");
+    const file = await pendingFile(uniqueEicar(), "eicar.com.txt");
     await env.SCAN_QUEUE.send({ v: 1, nodeId: file.id, key: file.r2Key });
     const scanned = await eventually(async () => {
       const row = await nodeById(file.id);
@@ -79,7 +97,7 @@ describe("queue() called directly", () => {
     expect(await deliver([{ body: explicit(a) }])).toEqual([{ outcome: "ack" }]);
     expect(await nodeById(a.id)).toMatchObject({ scanStatus: "clean", mimeSniffed: "text/plain" });
 
-    const b = await pendingFile(eicarBytes());
+    const b = await pendingFile(uniqueEicar());
     expect(await deliver([{ body: r2Event(b.r2Key!, "PutObject") }])).toEqual([{ outcome: "ack" }]);
     expect(await nodeById(b.id)).toMatchObject({ scanStatus: "infected" });
     // The event's eTag is recorded with the job, and nothing else is done with it.
@@ -266,18 +284,36 @@ describe("the verdict guard: only a node that is still pending and not taken dow
     ];
     // The control: a pending node, same owner, same bytes, same message shape — it IS written.
     const control = await makeFile(owner.id, null, { scanStatus: "pending" });
-    for (const node of [...locked, control]) await putObject(node.r2Key!, "harmless bytes");
+    // Per-run content (Addendum 3 Q6): a locked fixture's hash is listed once a sweep completes it.
+    const harmless = `harmless bytes ${crypto.randomUUID()}`;
+    for (const node of [...locked, control]) await putObject(node.r2Key!, harmless);
 
+    // T21 (task 2g): the record of what the scanner saw — server sha256, scanDetail, scannedAt,
+    // mimeSniffed — is written on every verdict; what opens or closes access is not. An
+    // `under_review` node keeps its status and gets the verdict as the status to restore.
+    const SERVER_SHA = await sha256Hex(harmless);
+    const access = (row: typeof control | null) => ({
+      scanStatus: row?.scanStatus,
+      scanReason: row?.scanReason,
+      takedownAt: row?.takedownAt,
+      takedownReason: row?.takedownReason,
+      legalHold: row?.legalHold,
+      deletedAt: row?.deletedAt,
+      r2Key: row?.r2Key,
+    });
     for (const before of locked) {
       const label = `${before.scanStatus}${before.takedownAt ? " (taken down)" : ""}`;
+      const prevAfter = before.scanStatus === "under_review" ? "clean" : before.scanStatusPrev;
       expect(await deliver([{ body: r2Event(before.r2Key!) }]), label).toEqual([{ outcome: "ack" }]);
-      // Every column, compared whole: status, scanStatusPrev, mimeSniffed, scannedAt, scanDetail, …
-      expect(await nodeById(before.id), label).toEqual(before);
+      const after = await nodeById(before.id);
+      expect(access(after), label).toEqual(access(before));
+      expect(after!.scanStatusPrev, label).toBe(prevAfter);
+      expect(after!.sha256, label).toBe(SERVER_SHA);
       // The job is finished all the same, so the message is not redelivered for ever.
       expect(await jobsFor(before.r2Key!), label).toMatchObject([{ status: "done" }]);
       // And a forced explicit message does not get through either.
       expect(await deliver([{ body: explicit(before, true) }]), label).toEqual([{ outcome: "ack" }]);
-      expect(await nodeById(before.id), label).toEqual(before);
+      expect(access(await nodeById(before.id)), label).toEqual(access(before));
     }
 
     expect(await deliver([{ body: r2Event(control.r2Key!) }])).toEqual([{ outcome: "ack" }]);
@@ -288,19 +324,27 @@ describe("the verdict guard: only a node that is still pending and not taken dow
 
   it("a node locked between the claim and the verdict is left alone (the guard reads the locked row)", async () => {
     // The antivirus test file: the stub would mark it infected. It is locked first.
-    const file = await pendingFile(eicarBytes());
+    const file = await pendingFile(uniqueEicar());
     await testDb()
       .update(nodes)
       .set({ scanStatus: "suspected_csam", legalHold: true })
       .where(eq(nodes.id, file.id));
     const before = await nodeById(file.id);
     expect(await deliver([{ body: explicit(file) }])).toEqual([{ outcome: "ack" }]);
-    expect(await nodeById(file.id)).toEqual(before);
+    // T21 (task 2g): the status is never downgraded; the record (server hash, detail) is written.
+    const after = await nodeById(file.id);
+    expect(after).toMatchObject({
+      scanStatus: "suspected_csam",
+      scanReason: before!.scanReason,
+      legalHold: true,
+      takedownAt: before!.takedownAt,
+    });
+    expect(after!.sha256).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
 describe("fail closed", () => {
-  it("without SCAN_STUB=1 nothing is ever marked clean: the message is retried in 5 minutes", async () => {
+  it("without SCAN_STUB=1 nothing is ever marked clean: the job fails and the message is retried with the backoff", async () => {
     const file = await pendingFile("perfectly harmless");
     const closed: Record<string, unknown>[] = [
       { SCAN_STUB: "0" },
@@ -310,14 +354,20 @@ describe("fail closed", () => {
       { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "production" },
       { SCAN_STUB: "0", SENTRY_ENVIRONMENT: "production" },
     ];
-    for (const vars of closed) {
+    // T21: with the stub off the container adapter runs. Here no SCANNER binding answers (the
+    // binding is left out: "scanner unavailable"), and once through the real binding with
+    // containers off (it throws a transport error): the job fails, the message is retried with
+    // backoff(1) = 30 s, and the node stays exactly as it was.
+    for (const vars of [...closed.map((v) => ({ ...v, SCANNER: undefined })), { SCAN_STUB: "0" }]) {
       for (const body of [explicit(file), r2Event(file.r2Key!)]) {
         expect(await deliver([{ body }], vars), JSON.stringify(vars)).toEqual([
-          { outcome: "retry", delaySeconds: 300 },
+          { outcome: "retry", delaySeconds: 30 },
         ]);
+        if ("SCANNER" in vars) continue;
+        break; // the real binding takes seconds to refuse: once is enough
       }
       expect(await nodeById(file.id), JSON.stringify(vars)).toEqual(file);
-      expect(await jobsFor(file.r2Key!), JSON.stringify(vars)).toEqual([]);
+      expect(await jobsFor(file.r2Key!), JSON.stringify(vars)).toMatchObject([{ status: "failed" }]);
     }
     // The control: the very same message with the stub on scans it.
     expect(await deliver([{ body: explicit(file) }], { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "dev" })).toEqual([
@@ -326,14 +376,20 @@ describe("fail closed", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("clean");
   });
 
-  it("dead letters are acknowledged whatever the stub flag says, and scan nothing", async () => {
+  it("dead letters are acknowledged whatever the stub flag says, and end a pending node error — never clean (T21 step 3)", async () => {
     const file = await pendingFile("harmless");
     for (const vars of [{ SCAN_STUB: "0" }, { SCAN_STUB: "1" }]) {
       expect(
         await deliver([{ body: explicit(file) }, { body: { n: 1 } }], vars, "holdfast-scan-dev-dlq"),
       ).toEqual([{ outcome: "ack" }, { outcome: "ack" }]);
+      // Nothing scanned it: no job, and the node — pending, no job — is `error`, not `clean`.
+      expect(await nodeById(file.id), JSON.stringify(vars)).toMatchObject({
+        scanStatus: "error",
+        scanReason: "engine",
+        sha256: file.sha256,
+        scannedAt: null,
+      });
     }
-    expect(await nodeById(file.id)).toEqual(file);
     expect(await jobsFor(file.r2Key!)).toEqual([]);
   });
 });
@@ -343,9 +399,8 @@ describe("failure", () => {
     const owner = await makeUser();
     const file = await makeFile(owner.id, null, { scanStatus: "pending" });
     // No object yet: reading it fails.
-    expect(await deliver([{ body: explicit(file) }])).toEqual([
-      { outcome: "retry", delaySeconds: undefined },
-    ]);
+    // T21: the retry waits backoff(attempts) — 30 s on the first delivery.
+    expect(await deliver([{ body: explicit(file) }])).toEqual([{ outcome: "retry", delaySeconds: 30 }]);
     expect(await jobsFor(file.r2Key!)).toMatchObject([
       { status: "failed", attempt: 1, lastError: "scan: the object is gone" },
     ]);
