@@ -8,12 +8,17 @@
 // and never reuses one: a reused server may be another checkout's. So a dev server and an e2e run
 // cannot be up at the same time in one checkout — stop `npm run dev` first.
 //
+// REMOTE (HOLDFAST_E2E_BASE_URL, + HOLDFAST_E2E_SESSION_FILE): no dev server, no globalSetup, no
+// local database — only the `@prod-safe` (and `@remote-session`) tests, against that deploy. See
+// tests/e2e/fixtures/remote.ts. Unset in every local run.
+//
 // HOLDFAST_E2E_REAL is not read here: it reaches the specs through the environment untouched
 // (tests/e2e/fixtures/mode.ts). HOLDFAST_E2E_WORKERS caps the parallel browsers; unset =
 // Playwright's own default (half the logical cores).
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, devices } from "@playwright/test";
+import { remoteMode, remoteProjects } from "./tests/e2e/fixtures/remote";
 import { ROUTE_COVERAGE, startHitFile } from "./tests/e2e/fixtures/route-hits";
 import { preflight } from "./tests/setup/e2e-preflight";
 import {
@@ -28,10 +33,10 @@ import { E2E_ADMIN_EMAILS } from "./tests/setup/test-vars";
 
 forbidDotEnvFallback();
 
+const remote = remoteMode();
 const root = dirname(fileURLToPath(import.meta.url));
 const port = e2ePort();
-const db = localDbName();
-const baseURL = appOrigin(port);
+const baseURL = remote?.baseURL ?? appOrigin(port);
 
 function workersCap(): { workers?: number } {
   const raw = process.env.HOLDFAST_E2E_WORKERS;
@@ -45,11 +50,55 @@ function workersCap(): { workers?: number } {
 
 // Once, in the process that will start the server. Playwright loads this file again in its
 // worker processes, by which time the port is (rightly) held by its own server.
-if (process.env.HOLDFAST_E2E_PREFLIGHT !== String(port)) {
+if (remote === null && process.env.HOLDFAST_E2E_PREFLIGHT !== String(port)) {
   preflight(root, port);
   process.env.HOLDFAST_E2E_PREFLIGHT = String(port);
   // Route coverage: this run's hits replace the last run's (tests/e2e/fixtures/route-hits.ts).
   if (ROUTE_COVERAGE) startHitFile();
+}
+
+const DEVICES = [
+  { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+  // Below the 1024 px mobile breakpoint.
+  { name: "mobile-chrome", use: { ...devices["Pixel 7"] } },
+];
+
+/** A local run: this checkout's own dev server and database. */
+function localServer() {
+  const db = localDbName();
+  return {
+    globalSetup: "./tests/setup/e2e-global-setup.ts",
+    webServer: {
+      // `--force`: Vite's dependency cache is re-optimised from a full scan at every start. A cache
+      // left by an earlier run is reused as long as the lockfile and this config are unchanged —
+      // also when the code now imports a package it did not import then (pdfjs-dist and shiki,
+      // reached only through lazy chunks). Vite then discovers the package while a TEST loads that
+      // chunk, re-optimises and RELOADS the page in the middle of it: a URL minted twice, a viewer
+      // not there within its 5 s. With a full scan at start, every such package is known before the
+      // first page loads (it costs well under a second of the warm-up).
+      command: `npm run dev -- --port ${port} --strictPort --force`,
+      // `localhost`, not 127.0.0.1: the Worker answers any other host with 421. /__meta is
+      // answered by the Worker itself, so "ready" means the Worker is up, not just Vite — and it
+      // does not depend on the database, which /api/health does (503 when the database is down).
+      url: `${baseURL}/__meta`,
+      reuseExistingServer: false,
+      // Vite's own lines (dependency optimisation, reloads) go to stdout, which Playwright drops by
+      // default: a CI log without them cannot say whether the dev server re-optimised mid-run.
+      stdout: "pipe" as const,
+      timeout: 60_000,
+      gracefulShutdown: { signal: "SIGTERM" as const, timeout: 5_000 },
+      env: {
+        HOLDFAST_PORT: String(port),
+        HOLDFAST_DEV_PORT: String(port),
+        HOLDFAST_DB: db,
+        // Read from the process environment, never from .dev.vars.
+        [HYPERDRIVE_OVERRIDE]: localDbUrl(db),
+        CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
+        // The run's admin addresses (a reserved test domain): see tests/setup/test-vars.ts.
+        HOLDFAST_E2E_ADMIN_EMAILS: E2E_ADMIN_EMAILS,
+      },
+    },
+  };
 }
 
 export default defineConfig({
@@ -59,45 +108,16 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: 0,
   ...workersCap(),
-  reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
-  globalSetup: "./tests/setup/e2e-global-setup.ts",
+  reporter: [
+    ["list"],
+    ["html", { open: "never", outputFolder: "playwright-report" }],
+    // A remote run prints every skip with its reason, and fails on one without a reason.
+    ...(remote ? [[join(root, "tests/e2e/fixtures/skip-reporter.ts")] as const] : []),
+  ],
+  ...(remote ? {} : localServer()),
   use: {
     baseURL,
     trace: "retain-on-failure",
   },
-  projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
-    // Below the 1024 px mobile breakpoint.
-    { name: "mobile-chrome", use: { ...devices["Pixel 7"] } },
-  ],
-  webServer: {
-    // `--force`: Vite's dependency cache is re-optimised from a full scan at every start. A cache
-    // left by an earlier run is reused as long as the lockfile and this config are unchanged —
-    // also when the code now imports a package it did not import then (pdfjs-dist and shiki,
-    // reached only through lazy chunks). Vite then discovers the package while a TEST loads that
-    // chunk, re-optimises and RELOADS the page in the middle of it: a URL minted twice, a viewer
-    // not there within its 5 s. With a full scan at start, every such package is known before the
-    // first page loads (it costs well under a second of the warm-up).
-    command: `npm run dev -- --port ${port} --strictPort --force`,
-    // `localhost`, not 127.0.0.1: the Worker answers any other host with 421. /__meta is
-    // answered by the Worker itself, so "ready" means the Worker is up, not just Vite — and it
-    // does not depend on the database, which /api/health does (503 when the database is down).
-    url: `${baseURL}/__meta`,
-    reuseExistingServer: false,
-    // Vite's own lines (dependency optimisation, reloads) go to stdout, which Playwright drops by
-    // default: a CI log without them cannot say whether the dev server re-optimised mid-run.
-    stdout: "pipe",
-    timeout: 60_000,
-    gracefulShutdown: { signal: "SIGTERM", timeout: 5_000 },
-    env: {
-      HOLDFAST_PORT: String(port),
-      HOLDFAST_DEV_PORT: String(port),
-      HOLDFAST_DB: db,
-      // Read from the process environment, never from .dev.vars.
-      [HYPERDRIVE_OVERRIDE]: localDbUrl(db),
-      CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-      // The run's admin addresses (a reserved test domain): see tests/setup/test-vars.ts.
-      HOLDFAST_E2E_ADMIN_EMAILS: E2E_ADMIN_EMAILS,
-    },
-  },
+  projects: remote ? remoteProjects(remote, DEVICES) : DEVICES,
 });

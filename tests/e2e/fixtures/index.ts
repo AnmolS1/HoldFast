@@ -7,6 +7,7 @@
 // SPA is `mockShell` (./mock-shell.ts); which of the two a spec uses is `REAL` (./mode.ts).
 import { test as base } from "@playwright/test";
 import { appOrigin, e2ePort, filesOrigin } from "../../setup/local-env";
+import { remoteMode, remoteOrigins } from "./remote";
 import { ROUTE_COVERAGE, watchContext, watchRequests } from "./route-hits";
 import { addVirtualAuthenticator, type VirtualAuthenticator } from "./webauthn";
 
@@ -148,6 +149,9 @@ export const test = base.extend<HarnessFixtures, HarnessWorkerFixtures>({
   ],
   // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring pattern.
   origins: async ({}, use) => {
+    // A remote run (./remote.ts): the deploy's origins.
+    const remote = remoteMode();
+    if (remote !== null) return use(await remoteOrigins(remote));
     const port = e2ePort();
     await use({ app: appOrigin(port), files: filesOrigin(port), port });
   },
