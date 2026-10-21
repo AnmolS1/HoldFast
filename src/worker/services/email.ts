@@ -365,6 +365,8 @@ const OPERATOR_CRITICAL = {
   database_rollback: "The database is older than the object store: orphan deletion is stopped",
   detector_unreadable:
     "The rollback detector cannot read the object store or the database: every destructive job is stopped",
+  backup_missing:
+    "Last night's database backup did not complete: there is no complete backup set for that day",
   unknown: "A critical event needs attention",
 } as const;
 export type OperatorCriticalEvent = Exclude<keyof typeof OPERATOR_CRITICAL, "unknown">;
