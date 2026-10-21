@@ -177,7 +177,9 @@ async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => vo
 
 /**
  * Reads a scanner answer. The status is inspected, not only caught: the platform answers a full
- * `max_instances` with a resolved 500 (S9).
+ * `max_instances` with a resolved 500 (S9). A refusal is read from the shim's headers first: when
+ * it answers before reading the upload, the status and headers arrive but the body is lost
+ * ("Network connection lost." — integration run).
  */
 async function verdictOf(response: Response): Promise<ShimVerdict> {
   if (response.status === 200) {
@@ -185,21 +187,31 @@ async function verdictOf(response: Response): Promise<ShimVerdict> {
     if (isVerdict(body)) return body;
     throw new ScannerTransportError("engine", "scanner answered 200 without a verdict");
   }
-  const text = await response.text().catch(() => "");
   if (response.status === 503) {
-    let body: Record<string, unknown> | null = null;
-    try {
-      body = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      // not the shim's answer
+    let status = response.headers.get("X-Scan-Status");
+    let reason = response.headers.get("X-Scan-Reason");
+    const ageHeader = response.headers.get("X-Scan-Db-Age-Hours");
+    let age: number | null = ageHeader === null || ageHeader === "" ? null : Number(ageHeader);
+    if (status === null) {
+      // An older shim, or another 503: the JSON body, if it can be read.
+      const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+      status = typeof body?.status === "string" ? body.status : null;
+      reason = typeof body?.reason === "string" ? body.reason : null;
+      age = typeof body?.dbAgeHours === "number" ? body.dbAgeHours : null;
+    } else {
+      await response.body?.cancel().catch(() => {});
     }
-    if (body?.status === "busy") throw new ScannerBusyError(retryAfterOf(response, BUSY_RETRY_SECONDS));
-    if (body?.status === "not_ready") {
-      const reason = body.reason === "signatures" ? "signatures" : "clamd_loading";
-      const age = typeof body.dbAgeHours === "number" ? body.dbAgeHours : null;
-      throw new ScannerNotReadyError(reason, age, retryAfterOf(response, NOT_READY_RETRY_SECONDS));
+    if (status === "busy") throw new ScannerBusyError(retryAfterOf(response, BUSY_RETRY_SECONDS));
+    if (status === "not_ready") {
+      throw new ScannerNotReadyError(
+        reason === "signatures" ? "signatures" : "clamd_loading",
+        age !== null && Number.isFinite(age) ? age : null,
+        retryAfterOf(response, NOT_READY_RETRY_SECONDS),
+      );
     }
+    throw new ScannerTransportError("engine", "scanner answered 503");
   }
+  const text = await response.text().catch(() => "");
   if (response.status === 500 && text.startsWith(MAX_INSTANCES_BODY)) {
     throw new ScannerBusyError(CAPACITY_RETRY_SECONDS, "no scanner instance could be started");
   }

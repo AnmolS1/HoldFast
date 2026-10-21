@@ -64,7 +64,20 @@ function verdict(overrides: Partial<ShimVerdict> = {}): ShimVerdict {
 
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
-const busy = () => json(503, { status: "busy" }, { "Retry-After": "15" });
+const busy = () => json(503, { status: "busy" }, { "Retry-After": "15", "X-Scan-Status": "busy" });
+/**
+ * A refusal as it really arrives when the shim answers before reading an upload (integration run):
+ * status and headers intact, the body lost — reading it throws "Network connection lost.".
+ */
+const headersOnly = (status: number, headers: Record<string, string>) =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(new Error("Network connection lost."));
+      },
+    }),
+    { status, headers },
+  );
 const MAX_INSTANCES =
   "Failed to start container: Maximum number of running container instances exceeded. Try again later, or try configuring a higher value for max_instances";
 
@@ -167,6 +180,46 @@ describe("busy", () => {
     );
     await expect(scan).rejects.toBeInstanceOf(ScannerBusyError);
     expect(calls.map((c) => c.name)).toEqual(["scanner-0"]);
+  });
+
+  it("is read from the headers when the 503's body is lost (the shim answered before reading the upload)", async () => {
+    const bytes = bytesOf(1_000_000);
+    const lost = async () => headersOnly(503, { "Retry-After": "15", "X-Scan-Status": "busy" });
+    const { calls, stub } = fakeScanner({ "scanner-0": lost, "scanner-1": readAll });
+    const result = await scanObject(
+      env,
+      { key: keyFor("scanner-0"), size: bytes.length, body: streamOf(bytes) },
+      { stub },
+    );
+    expect(calls.map((c) => c.name)).toEqual(["scanner-0", "scanner-1"]);
+    expect(result.sha256).toBe(await sha256Hex(bytes));
+
+    const notReady = fakeScanner({
+      "scanner-0": async () =>
+        headersOnly(503, {
+          "Retry-After": "30",
+          "X-Scan-Status": "not_ready",
+          "X-Scan-Reason": "signatures",
+          "X-Scan-Db-Age-Hours": "30.5",
+        }),
+    });
+    const error = await scanObject(
+      env,
+      { key: keyFor("scanner-0"), size: 3, body: streamOf(bytesOf(3)) },
+      { stub: notReady.stub },
+    ).catch((e) => e);
+    expect(error).toBeInstanceOf(ScannerNotReadyError);
+    expect(error).toMatchObject({ reason: "signatures", dbAgeHours: 30.5, retryAfter: 30 });
+
+    // A 503 that says nothing is not busy: it is an engine failure.
+    const silent = fakeScanner({ "scanner-0": async () => headersOnly(503, {}) });
+    await expect(
+      scanObject(
+        env,
+        { key: keyFor("scanner-0"), size: 3, body: streamOf(bytesOf(3)) },
+        { stub: silent.stub },
+      ),
+    ).rejects.toMatchObject({ name: "ScannerTransportError", reason: "engine" });
   });
 
   it("on both instances throws ScannerBusyError after exactly two calls", async () => {

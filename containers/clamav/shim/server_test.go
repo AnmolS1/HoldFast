@@ -178,6 +178,10 @@ func TestScanNotReadyGivesNoVerdict(t *testing.T) {
 		body := &countingBody{r: strings.NewReader("abc")}
 		rec := post(t, s.Handler(), "3", body)
 		m := decode(t, rec)
+		if rec.Header().Get("X-Scan-Status") != "not_ready" || rec.Header().Get("X-Scan-Reason") != st.NotReady ||
+			rec.Header().Get("X-Scan-Db-Age-Hours") != strconv.FormatFloat(roundHours(st.DBAgeHours), 'f', -1, 64) {
+			t.Fatalf("not_ready headers: %v", rec.Header())
+		}
 		if rec.Code != 503 || rec.Header().Get("Retry-After") != "30" || m["status"] != "not_ready" || m["reason"] != st.NotReady ||
 			m["dbAgeHours"] != roundHours(st.DBAgeHours) || e.calls.Load() != 0 || body.read.Load() != 0 {
 			t.Fatalf("%d %v %v, read %d, calls %d", rec.Code, rec.Header(), m, body.read.Load(), e.calls.Load())
@@ -200,7 +204,8 @@ func TestOneLargeScanAtATimeWhileSmallScansProceed(t *testing.T) {
 
 	second := &countingBody{r: bytes.NewReader(make([]byte, SmallScanBytes+1))}
 	rec := post(t, h, large, second)
-	if rec.Code != 503 || rec.Header().Get("Retry-After") != "15" || decode(t, rec)["status"] != "busy" || second.read.Load() != 0 {
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "15" || rec.Header().Get("X-Scan-Status") != "busy" ||
+		decode(t, rec)["status"] != "busy" || second.read.Load() != 0 {
 		t.Fatalf("second large scan: %d %v read %d", rec.Code, rec.Header(), second.read.Load())
 	}
 
@@ -235,7 +240,8 @@ func TestSmallScansAreBoundedAtFour(t *testing.T) {
 		<-e.entered
 	}
 	fifth := &countingBody{r: strings.NewReader("abc")}
-	if rec := post(t, h, "3", fifth); rec.Code != 503 || rec.Header().Get("Retry-After") != "15" || fifth.read.Load() != 0 {
+	if rec := post(t, h, "3", fifth); rec.Code != 503 || rec.Header().Get("Retry-After") != "15" ||
+		rec.Header().Get("X-Scan-Status") != "busy" || fifth.read.Load() != 0 {
 		t.Fatalf("fifth small scan: %d read %d", rec.Code, fifth.read.Load())
 	}
 	// At the boundary: exactly SmallScanBytes is small.
@@ -277,7 +283,8 @@ func TestLargeScanRefusedWithoutSpoolSpace(t *testing.T) {
 		s.FreeTmp = free
 		body := &countingBody{r: bytes.NewReader(make([]byte, size))}
 		rec := post(t, s.Handler(), strconv.FormatInt(size, 10), body)
-		if rec.Code != 503 || rec.Header().Get("Retry-After") != "15" || decode(t, rec)["status"] != "busy" || e.calls.Load() != 0 || body.read.Load() != 0 {
+		if rec.Code != 503 || rec.Header().Get("Retry-After") != "15" || rec.Header().Get("X-Scan-Status") != "busy" ||
+			decode(t, rec)["status"] != "busy" || e.calls.Load() != 0 || body.read.Load() != 0 {
 			t.Fatalf("%d %s calls %d read %d", rec.Code, rec.Body.String(), e.calls.Load(), body.read.Load())
 		}
 		if s.LargeBusy() {

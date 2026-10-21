@@ -107,6 +107,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// scan answers POST /scan. A refusal decided before the body is read carries its outcome in
+// headers too (X-Scan-Status, X-Scan-Reason, X-Scan-Db-Age-Hours): the connection is closed with the
+// upload unread, and the caller may receive the status and headers but lose the body.
 func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -130,6 +133,9 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	st := s.Status()
 	if !st.Ready {
 		w.Header().Set("Retry-After", retryNotReady)
+		w.Header().Set("X-Scan-Status", "not_ready")
+		w.Header().Set("X-Scan-Reason", st.NotReady)
+		w.Header().Set("X-Scan-Db-Age-Hours", strconv.FormatFloat(roundHours(st.DBAgeHours), 'f', -1, 64))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status": "not_ready", "reason": st.NotReady, "dbAgeHours": roundHours(st.DBAgeHours),
 		})
@@ -137,6 +143,7 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 	}
 	busy := func() {
 		w.Header().Set("Retry-After", retryBusy)
+		w.Header().Set("X-Scan-Status", "busy")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "busy"})
 	}
 	slot := s.small
