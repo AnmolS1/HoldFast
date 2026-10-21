@@ -5,6 +5,7 @@
 import { env } from "cloudflare:workers";
 import { sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { printableKey, SECRET_KEY_TABLES } from "../../../scripts/ops/restore-core";
 import { parentsFirst, schemaTableNames, tableShapes } from "../../../src/worker/db/queries/backup";
 import {
   BACKUP_PART_BYTES,
@@ -187,5 +188,19 @@ describe("the table set and the order", () => {
   it("monthOf gives the month's first day and the next month's", () => {
     expect(monthOf(new Date("2099-12-31T23:59:59Z"))).toEqual({ from: "2099-12-01", to: "2100-01-01" });
     expect(monthOf(new Date("2099-03-01T00:00:00Z"))).toEqual({ from: "2099-03-01", to: "2099-04-01" });
+  });
+});
+
+describe("the restore prints no secret key (review minor 3)", () => {
+  it("an invite code or a blocked hash is shown as sha256:<12 hex>; other keys as they are", async () => {
+    const code = "ABCDE-FGHJK-MNPQR-STUVW"; // made up
+    const shown = await printableKey("invites", code);
+    expect(shown).toMatch(/^sha256:[0-9a-f]{12}$/);
+    expect(shown).not.toContain("ABCDE");
+    expect(await printableKey("hash_blocklist", "ab".repeat(32))).toMatch(/^sha256:[0-9a-f]{12}$/);
+    expect(await printableKey("nodes", "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e")).toBe(
+      "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e",
+    );
+    expect([...SECRET_KEY_TABLES].sort()).toEqual(["hash_blocklist", "invites"]);
   });
 });

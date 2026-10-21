@@ -111,3 +111,20 @@ describe("a captured Worker event, through sentryOptions and the SDK's own wrapp
     expect(all).toContain(`notice for ${EMAIL}`);
   });
 });
+
+describe("beforeBreadcrumb on its own (review m12)", () => {
+  it("a breadcrumb is redacted by sentryOptions' own hook, not only by beforeSend's walk of the event", () => {
+    const options = sentryOptions({ SENTRY_DSN: FAKE_DSN, SENTRY_ENVIRONMENT: "test" })!;
+    const crumb = options.beforeBreadcrumb!(
+      {
+        category: "fetch",
+        message: `GET /api/public/links/${TOKEN} for ${EMAIL}`,
+        data: { url: `/s/${TOKEN}` },
+      },
+      {},
+    );
+    const text = JSON.stringify(crumb);
+    expect(text).toContain("/api/public/links/");
+    for (const needle of [TOKEN, EMAIL]) expect(text, needle).not.toContain(needle);
+  });
+});

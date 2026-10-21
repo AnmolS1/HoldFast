@@ -132,4 +132,23 @@ describe("configured", () => {
       expect(fetcher, name).toHaveBeenCalledTimes(1);
     }
   });
+
+  it("review minor 7: a row whose count is not a number reads as bad_response, never as a zero", async () => {
+    const fetcher = recorder(() => Response.json({ data: [{ outcome: "clean", kind: "stub", n: "lots" }] }));
+    expect(await verdictCounts24h(configured, fetcher)).toEqual({ available: false, reason: "bad_response" });
+  });
+
+  it("review minor 8: an environment that is neither dev nor production is not configured — no request", async () => {
+    for (const SENTRY_ENVIRONMENT of ["staging", "test", "", undefined]) {
+      const fetcher = recorder(() => Response.json(RECORDED_VERDICTS));
+      expect(
+        await verdictCounts24h({ ...configured, SENTRY_ENVIRONMENT }, fetcher),
+        String(SENTRY_ENVIRONMENT),
+      ).toEqual({
+        available: false,
+        reason: "not_configured",
+      });
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
 });

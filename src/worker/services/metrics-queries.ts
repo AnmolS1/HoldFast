@@ -63,6 +63,11 @@ export async function runSql<Row extends Record<string, unknown>>(
   const account = env.CF_ACCOUNT_ID?.trim() ?? "";
   const token = env.CF_ANALYTICS_TOKEN?.trim() ?? "";
   if (account === "" || token === "") return { available: false, reason: "not_configured" };
+  // Each environment reads its own dataset and rows: an environment that is neither is a
+  // misconfiguration, never "dev" by default (it would show one environment's numbers as another's).
+  if (env.SENTRY_ENVIRONMENT !== "dev" && env.SENTRY_ENVIRONMENT !== "production") {
+    return { available: false, reason: "not_configured" };
+  }
   let response: Response;
   try {
     response = await fetcher(SQL_API_URL(account), {
@@ -91,9 +96,18 @@ export async function runSql<Row extends Record<string, unknown>>(
 }
 
 /** A count or a total as a number: ClickHouse may quote 64-bit integers in JSON. */
+class NotANumber extends Error {}
+
+/** A count or a total as a number (ClickHouse may quote 64-bit integers); anything else is a bad row. */
 const num = (value: unknown): number => {
-  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-  return Number.isFinite(n) ? n : 0;
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : Number.NaN;
+  if (!Number.isFinite(n)) throw new NotANumber();
+  return n;
 };
 
 /** Maps an available result's rows; an unavailable one passes through unchanged. */
@@ -101,7 +115,14 @@ function mapRows<In, Out>(
   result: QueryResult<In & Record<string, unknown>>,
   map: (row: In) => Out,
 ): QueryResult<Out> {
-  return result.available ? { available: true, rows: result.rows.map(map) } : result;
+  if (!result.available) return result;
+  try {
+    return { available: true, rows: result.rows.map(map) };
+  } catch (error) {
+    // A row that is not what was asked for is not a zero: the whole answer is unreadable.
+    if (error instanceof NotANumber) return { available: false, reason: "bad_response" };
+    throw error;
+  }
 }
 
 type Window = "1 HOUR" | "1 DAY" | "7 DAY" | "35 DAY";
