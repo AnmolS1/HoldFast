@@ -582,6 +582,55 @@ describe("(b) anomaly reporting in abuse-hourly — reports, never pauses", () =
     });
   });
 
+  it("review m7: a subject already reported today does not take a place in the query's LIMIT — the next one is found (owners and busy links)", async () => {
+    const { ownersNearEgressCap, busyLinksLastHour } = await import("../../../src/worker/db/queries/abuse");
+    await rolledBack(async (db) => {
+      const day = utcDay(new Date());
+      const first = await member({ createdAt: new Date(Date.now() - 400 * DAY) });
+      const second = await member({ createdAt: new Date(Date.now() - 400 * DAY) });
+      // Larger than anything another test serves: these two are the head of the list.
+      await egress(db, first.id, 9_000_000_000_000_000);
+      await egress(db, second.id, 8_000_000_000_000_000);
+      expect((await ownersNearEgressCap(db, day, 1, 1)).map((o) => o.ownerId)).toEqual([first.id]);
+      await db.insert(downloadLedger).values({
+        day,
+        subjectType: "notice",
+        subjectId: findingMarker("download_owner", first.id),
+        bytes: 0,
+        count: 1,
+      });
+      expect((await ownersNearEgressCap(db, day, 1, 1)).map((o) => o.ownerId)).toEqual([second.id]);
+
+      const file = await makeFile(first.id, null, { scanStatus: "clean" });
+      const a = await makeLink(file.id, first.id);
+      const b = await makeLink(file.id, first.id);
+      for (const [link, n] of [
+        [a, 5000],
+        [b, 4000],
+      ] as const) {
+        await db
+          .insert(linkAccessLog)
+          .values(
+            Array.from({ length: n }, () => ({
+              linkId: link.id,
+              nodeId: file.id,
+              at: new Date(),
+              outcome: "ok" as const,
+            })),
+          );
+      }
+      expect((await busyLinksLastHour(db, day, 500, 50, 1)).map((l) => l.linkId)).toEqual([a.id]);
+      await db.insert(downloadLedger).values({
+        day,
+        subjectType: "notice",
+        subjectId: findingMarker("link_traffic", a.id),
+        bytes: 0,
+        count: 1,
+      });
+      expect((await busyLinksLastHour(db, day, 500, 50, 1)).map((l) => l.linkId)).toEqual([b.id]);
+    });
+  });
+
   it("notice markers are never read as an owner total: an owner with only marker rows (T13's download_owner:<id>, this job's digest:download_owner:<id>) huge in bytes is not reported", async () => {
     await rolledBack(async (db) => {
       const ops = operators();
