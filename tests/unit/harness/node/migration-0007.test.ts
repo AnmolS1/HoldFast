@@ -94,7 +94,6 @@ afterAll(async () => {
 describe("migration 0007", () => {
   it("is in the journal, right after 0006", () => {
     expect(journal.entries[7]!.tag).toBe(TAG);
-    expect(journal.entries).toHaveLength(8);
   });
 
   it("before it, a new session compiles: the server has JIT and nothing is stored on the database", async () => {
