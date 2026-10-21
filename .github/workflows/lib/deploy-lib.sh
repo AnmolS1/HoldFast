@@ -546,6 +546,27 @@ CVD_BUCKET="holdfast-files-dev"
 CVD_PREFIX="b/clamav"
 CVD_FILES="main.cvd daily.cvd bytecode.cvd"
 CVD_MAX_AGE_S=86400
+CVD_DAILY_MAX_AGE_S=172800
+# The files themselves, whatever the cache's stamp says (anything able to write the dev bucket can
+# write the stamp): each carries ClamAV's signature ("Verification OK." from sigtool in the pinned
+# base image), and daily.cvd's own build time is under CVD_DAILY_MAX_AGE_S old and not in the
+# future — an old but genuine set is refused. main/bytecode are rebuilt rarely by ClamAV; their
+# age is not checked.
+cvd_verified() {
+  local dir="$1" base out daily_built age
+  base="$(sed -n 's/^FROM \(clamav\/clamav:[^ ]*\) AS runtime/\1/p' "$repo_root/containers/clamav/Dockerfile")"
+  [ -n "$base" ] || { echo "cvd-cache: no runtime FROM line in the Dockerfile"; return 1; }
+  out="$(docker run --rm --platform linux/amd64 -v "$dir:/cvd:ro" --entrypoint sh "$base" -c \
+    'for f in main daily bytecode; do echo "== $f"; sigtool --info /cvd/$f.cvd; done' 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$out" | grep -c '^Verification OK\.')" = 3 ] || { echo "cvd-cache: a signature did not verify"; return 1; }
+  daily_built="$(printf '%s\n' "$out" | awk '/^== daily/{d=1} d && /^Build time:/{sub(/^Build time: */,""); print; exit}')"
+  age="$(python3 -c 'import sys,time,email.utils as e
+t=time.strptime(sys.argv[1][:17], "%d %b %Y %H:%M"); off=sys.argv[1][18:]
+import calendar; s=calendar.timegm(t)-((1 if off[0]=="+" else -1)*(int(off[1:3])*3600+int(off[3:5])*60))
+print(int(time.time()-s))' "$daily_built" 2>/dev/null)" || { echo "cvd-cache: daily.cvd build time unreadable"; return 1; }
+  [ "$age" -ge -3600 ] && [ "$age" -lt "$CVD_DAILY_MAX_AGE_S" ] || { echo "cvd-cache: daily.cvd is $((age / 3600)) h old"; return 1; }
+  echo "cvd-cache: signatures verified; daily.cvd built $((age / 3600)) h ago"
+}
 cmd_cvd_cache() {
   need npx docker
   local dir="$repo_root/containers/clamav/cvd" stamp now age f fresh=1
@@ -559,7 +580,7 @@ cmd_cvd_cache() {
   else
     age=$((now - stamp))
     echo "cvd-cache: cached copy is $((age / 3600)) h old"
-    [ "$age" -lt "$CVD_MAX_AGE_S" ] || fresh=0
+    [ "$age" -ge 0 ] && [ "$age" -lt "$CVD_MAX_AGE_S" ] || fresh=0
   fi
   if [ "$fresh" = 1 ]; then
     for f in $CVD_FILES; do
@@ -567,9 +588,14 @@ cmd_cvd_cache() {
         [ -s "$dir/$f" ] || { fresh=0; echo "cvd-cache: $f missing from the cache"; break; }
     done
   fi
+  if [ "$fresh" = 1 ] && ! cvd_verified "$dir"; then
+    fresh=0
+    echo "cvd-cache: the cached copy is refused"
+  fi
   if [ "$fresh" = 0 ]; then
     echo "cvd-cache: one freshclam run on the runner"
     bash "$repo_root/containers/clamav/fetch-cvd.sh" >/dev/null || fail "cvd-cache: freshclam on the runner failed"
+    cvd_verified "$dir" || fail "cvd-cache: freshly downloaded signatures do not verify"
     for f in $CVD_FILES; do
       [ -s "$dir/$f" ] || fail "cvd-cache: $f missing after freshclam"
       (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/$f" --file "$dir/$f" --content-type application/octet-stream --remote) >/dev/null ||
