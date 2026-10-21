@@ -84,6 +84,24 @@ describe("link-password: verification", () => {
     }
   });
 
+  it("a stored string asking for more memory or time than this code writes is refused with no hash run", async () => {
+    const stored = await hashLinkPassword(PASSWORD);
+    const [, , , , salt, key] = stored.split("$");
+    const derive = vi.spyOn(scryptInternals, "derive");
+    for (const [N, r, p] of [
+      [131072, 32, 1], // 1 GiB of maxmem
+      [32768, 16, 1], // twice the product's memory
+      [16384, 32, 1],
+      [16384, 16, 2], // twice the product's time
+    ]) {
+      expect(
+        await verifyLinkPassword(PASSWORD, ["scrypt", N, r, p, salt, key].join("$")),
+        `${N}/${r}/${p}`,
+      ).toBe(false);
+    }
+    expect(derive).not.toHaveBeenCalled();
+  });
+
   it("re-derives with the STORED parameters, with maxmem computed from them", async () => {
     const salt = new Uint8Array(16).fill(7);
     const key = scryptSync(PASSWORD, salt, 64, { N: 1024, r: 8, p: 1, maxmem: 128 * 1024 * 8 * 2 });

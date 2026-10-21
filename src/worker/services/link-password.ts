@@ -22,10 +22,13 @@ const SALT_BYTES = 16;
 const SCHEME = "scrypt";
 
 // What a stored string may name. Anything outside is not a hash this product wrote, and is
-// refused without deriving anything (a row edited to N = 2^30 must not cost a gigabyte).
-const N_RANGE = { min: 1 << 10, max: 1 << 17 };
-const R_MAX = 32;
-const P_MAX = 4;
+// refused without deriving anything (a row edited to N = 2^30 must not cost a gigabyte): never
+// more memory (128·N·r) nor more time (N·r·p) than the product's own parameters cost. A smaller,
+// older parameter set still verifies with its own values.
+const N_RANGE = { min: 1 << 10, max: LINK_PASSWORD_PARAMS.N };
+const R_MAX = LINK_PASSWORD_PARAMS.r;
+const P_MAX = LINK_PASSWORD_PARAMS.p;
+const COST_MAX = LINK_PASSWORD_PARAMS.N * LINK_PASSWORD_PARAMS.r * LINK_PASSWORD_PARAMS.p;
 const KEY_RANGE = { min: 16, max: 128 };
 
 type Params = { N: number; r: number; p: number };
@@ -82,6 +85,7 @@ function parse(stored: string): Parsed | null {
   const [N, r, p] = [int(fields[1]!), int(fields[2]!), int(fields[3]!)];
   if (N === null || r === null || p === null) return null;
   if (N < N_RANGE.min || N > N_RANGE.max || !isPowerOfTwo(N) || r > R_MAX || p > P_MAX) return null;
+  if (N * r * p > COST_MAX) return null;
   const salt = fromBase64Url(fields[4]!);
   const key = fromBase64Url(fields[5]!);
   if (!salt || salt.length < SALT_BYTES || !key || key.length < KEY_RANGE.min || key.length > KEY_RANGE.max) {
