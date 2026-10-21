@@ -61,7 +61,7 @@ const DESTINATIONS: Destination[] = [
   { path: "/storage", title: "Storage", placeholder: false },
   { path: "/account/security", title: "Account", placeholder: false },
   { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: false },
-  { path: "/admin/users", title: "Admin", placeholder: true },
+  { path: "/admin/users", title: "Admin", placeholder: false },
 ];
 
 function destination(path: string): Destination {
@@ -316,6 +316,10 @@ test.describe("navigation", () => {
       await mockShell(page, origins.port, { user: { role: "admin" } });
       await gotoFrame(page, entry.path);
       await expectDestination(page, entry);
+      // The admin console under the mock's JSON 404 for every /api/admin/* read: its error state.
+      if (entry.path === "/admin/users") {
+        await expect(page.locator("[data-admin-page] [data-admin-error]")).toBeVisible();
+      }
     });
   }
 
@@ -343,7 +347,7 @@ test.describe("navigation", () => {
     await mockShell(page, origins.port);
     await page.goto("/admin/users");
     await expect(notFound(page)).toBeVisible();
-    await expect(placeholder(page, "Admin")).toHaveCount(0);
+    await expect(page.locator("[data-admin-page]")).toHaveCount(0);
   });
 
   test("the breakpoint flips at 1024: 1023 is mobile, 1024 is desktop", async ({ page, origins }) => {
