@@ -130,6 +130,8 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
             {shown ? shown.element : <ColdBackground routes={backgroundRoutes} from={coldFrom} />}
           </Box>
           {overlay ? (
+            // No background of its own: the preview is D01's dialog OVER the page, on the scrim
+            // (D01 §2 "scrim — dialogs"; T18) — the kept list shows through, inert, behind it.
             <Box
               data-overlay
               sx={{
@@ -138,7 +140,6 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
                 zIndex: 2,
                 display: "flex",
                 flexDirection: "column",
-                backgroundColor: hf.surface,
               }}
             >
               {outlet}

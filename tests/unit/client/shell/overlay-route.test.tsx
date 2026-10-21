@@ -89,6 +89,9 @@ describe("overlay routes", () => {
     expect(kept.contains(screen.getByTestId("list"))).toBe(true);
     expect(kept.compareDocumentPosition(overlay) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(kept.hasAttribute("inert")).toBe(true);
+    // D01 §2 ("scrim — dialogs") and T18: the preview is a dialog OVER the explorer, on the scrim —
+    // the overlay box paints nothing of its own that would hide the kept list.
+    expect(getComputedStyle(overlay).backgroundColor).toMatch(/^(|transparent|rgba\(0, 0, 0, 0\))$/);
 
     // Moving between previews keeps the same background.
     act(() => screen.getByText("next").click());
