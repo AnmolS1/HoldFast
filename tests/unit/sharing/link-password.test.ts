@@ -102,6 +102,16 @@ describe("link-password: verification", () => {
     expect(derive).not.toHaveBeenCalled();
   });
 
+  it("a stored key cut short never verifies (scrypt's output prefix is the same for any length)", async () => {
+    const stored = await hashLinkPassword(PASSWORD);
+    const fields = stored.split("$");
+    const key = fromB64url(fields[5]!);
+    for (const length of [16, 48, 63]) {
+      const cut = [...fields.slice(0, 5), b64url(key.subarray(0, length))].join("$");
+      expect(await verifyLinkPassword(PASSWORD, cut), String(length)).toBe(false);
+    }
+  });
+
   it("re-derives with the STORED parameters, with maxmem computed from them", async () => {
     const salt = new Uint8Array(16).fill(7);
     const key = scryptSync(PASSWORD, salt, 64, { N: 1024, r: 8, p: 1, maxmem: 128 * 1024 * 8 * 2 });

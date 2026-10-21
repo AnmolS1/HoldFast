@@ -29,7 +29,6 @@ const N_RANGE = { min: 1 << 10, max: LINK_PASSWORD_PARAMS.N };
 const R_MAX = LINK_PASSWORD_PARAMS.r;
 const P_MAX = LINK_PASSWORD_PARAMS.p;
 const COST_MAX = LINK_PASSWORD_PARAMS.N * LINK_PASSWORD_PARAMS.r * LINK_PASSWORD_PARAMS.p;
-const KEY_RANGE = { min: 16, max: 128 };
 
 type Params = { N: number; r: number; p: number };
 
@@ -88,7 +87,9 @@ function parse(stored: string): Parsed | null {
   if (N * r * p > COST_MAX) return null;
   const salt = fromBase64Url(fields[4]!);
   const key = fromBase64Url(fields[5]!);
-  if (!salt || salt.length < SALT_BYTES || !key || key.length < KEY_RANGE.min || key.length > KEY_RANGE.max) {
+  // Exactly the product's key length: a shorter stored key would verify against the PREFIX of
+  // the right one (scrypt's output prefix does not depend on the length asked for).
+  if (!salt || salt.length < SALT_BYTES || !key || key.length !== LINK_PASSWORD_PARAMS.keylen) {
     return null;
   }
   return { N, r, p, salt, key };
