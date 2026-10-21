@@ -19,6 +19,7 @@ import {
   softDeadlineOf,
   type Job,
 } from "../../../src/worker/jobs/index";
+import { parts as abuseParts } from "../../../src/worker/jobs/abuse-hourly";
 import { job as operatorDigests } from "../../../src/worker/jobs/operator-digests";
 import { detectRollback } from "../../../src/worker/jobs/reconcile";
 import { job as verificationSweep } from "../../../src/worker/jobs/verification-sweep";
@@ -266,6 +267,9 @@ describe("the four cron expressions, with the real jobs", () => {
         });
         for (const [cron, names] of Object.entries(SLOTS)) {
           const ran = watch(false);
+          // T21 (R4, Addendum 3 Q5): abuse-hourly runs for real here, but its pending-scan part
+          // would send real scan messages for whatever pending nodes other runs left behind.
+          vi.spyOn(abuseParts, "sweepPendingScans").mockResolvedValue({ checked: 0, requeued: 0 });
           const job = jobContext();
           await expect(entry(cronEvent(cron), env, ctx, job.bg)).resolves.toBeUndefined();
           await job.settle();

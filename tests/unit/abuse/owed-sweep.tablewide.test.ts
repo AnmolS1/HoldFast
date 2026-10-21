@@ -8,7 +8,7 @@
 // a made-up address of the test's own. The client addresses are documentation ranges (made up).
 import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import {
@@ -27,7 +27,13 @@ import {
   uploads,
   user as userTable,
 } from "../../../src/worker/db/schema";
-import { job, owedHooks, settleOwedSession, sweepOwedNodes } from "../../../src/worker/jobs/abuse-hourly";
+import {
+  job,
+  owedHooks,
+  parts,
+  settleOwedSession,
+  sweepOwedNodes,
+} from "../../../src/worker/jobs/abuse-hourly";
 import { GENERATION_KEY } from "../../../src/worker/jobs/reconcile";
 import { extOf, nameKeyOf } from "../../../src/worker/services/filename";
 import { keyFor } from "../../../src/worker/services/storage";
@@ -674,6 +680,16 @@ describe("decided again under the row's lock (standing check a)", () => {
 });
 
 describe("abuse-hourly runs the sweep (part 0c)", () => {
+  // T21 (R4, Addendum 3 Q5): the pending-scan part is a no-op here — the real one would re-send
+  // whatever pending nodes other runs left in the shared database to this file's queue.
+  const realPendingSweep = parts.sweepPendingScans;
+  beforeEach(() => {
+    parts.sweepPendingScans = async () => ({ checked: 0, requeued: 0 });
+  });
+  afterEach(() => {
+    parts.sweepPendingScans = realPendingSweep;
+  });
+
   it("one run of the job: the owed session becomes one locked, held node of the uploader's; nothing deleted; a second run changes nothing", async () => {
     await rolledBack(async (db) => {
       const ops = operators();
