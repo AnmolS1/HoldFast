@@ -148,8 +148,9 @@ export const test = base.extend<HarnessFixtures, HarnessWorkerFixtures>({
     await use(roles);
     await roles.close();
   },
-  apiRequests: async ({ page }, use) => {
-    await use(countApiRequests(page, appOrigin(e2ePort())));
+  // The run's own app origin — a deploy's in a remote run (review m7), this checkout's otherwise.
+  apiRequests: async ({ page, origins }, use) => {
+    await use(countApiRequests(page, origins.app));
   },
   // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring pattern.
   origins: async ({}, use) => {

@@ -122,11 +122,11 @@ describe("a remote run's skips", () => {
   });
 
   it("every skip is printed with its reason; one without a reason fails the run", () => {
-    expect(verdict([{ title: "dmca agent", reason: "agent details unset" }], false)).toEqual({
+    expect(verdict([{ title: "dmca agent", reason: "agent details unset" }], false, 2)).toEqual({
       failed: false,
       lines: ["skipped: dmca agent — agent details unset"],
     });
-    const unexplained = verdict([{ title: "x", reason: "" }], false);
+    const unexplained = verdict([{ title: "x", reason: "" }], false, 1);
     expect(unexplained.failed).toBe(true);
     expect(unexplained.lines).toEqual([
       "skipped: x — (NO REASON GIVEN)",
@@ -134,8 +134,14 @@ describe("a remote run's skips", () => {
     ]);
   });
 
+  it("nothing passed — every test skipped, each with its reason, no flag — fails all the same (review m1)", () => {
+    const allSkipped = verdict([{ title: "dmca agent", reason: "agent details unset" }], false, 0);
+    expect(allSkipped.failed).toBe(true);
+    expect(allSkipped.lines).toContain("no test passed: a remote run that checked nothing fails");
+  });
+
   it("HOLDFAST_E2E_FAIL_ON_SKIP: any skip fails the run (a gate is never carried by a skip)", () => {
-    expect(verdict([{ title: "dmca agent", reason: "agent details unset" }], true).failed).toBe(true);
-    expect(verdict([], true).failed).toBe(false);
+    expect(verdict([{ title: "dmca agent", reason: "agent details unset" }], true, 3).failed).toBe(true);
+    expect(verdict([], true, 3).failed).toBe(false);
   });
 });

@@ -11,6 +11,7 @@
 // SQL `now()` is not moved: a test moves time only around its own rows (PLAN §6 rule 16).
 import type { Page } from "@playwright/test";
 import { appOrigin, e2ePort, filesOrigin } from "../../setup/local-env";
+import { remoteMode } from "./remote";
 
 /** src/worker/services/clock.ts `TEST_NOW_HEADER`. */
 export const TEST_NOW_HEADER = "x-holdfast-test-now";
@@ -27,6 +28,9 @@ export interface TestClock {
 }
 
 export async function testClock(page: Page, start: Date): Promise<TestClock> {
+  // A deploy ignores the header (not test mode), so a moved clock there would move only the
+  // browser's — a test would compare a moved page with an unmoved Worker (review m7).
+  if (remoteMode() !== null) throw new Error("testClock: a remote run cannot move the Worker's clock");
   let current = new Date(start.getTime());
   await page.clock.install({ time: current });
   const port = e2ePort();
