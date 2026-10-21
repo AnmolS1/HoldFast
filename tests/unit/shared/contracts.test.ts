@@ -198,7 +198,7 @@ const dmcaNotice = {
   lawsuitNoticeAt: null,
   restoredAt: null,
   restoredBy: null,
-  nodes: [{ nodeId: NODE, nodeName: "report.pdf", sha256: SHA }],
+  nodes: [{ nodeId: NODE, nodeName: "report.pdf", sha256: SHA, tookDown: true }],
 };
 const page = <T>(item: T) => ({ items: [item], nextCursor: null });
 

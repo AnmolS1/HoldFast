@@ -235,7 +235,8 @@ export const DmcaNoticeDto = z.object({
   lawsuitNoticeAt: Timestamp.nullable(),
   restoredAt: Timestamp.nullable(),
   restoredBy: UserId.nullable(),
-  nodes: z.array(z.object({ nodeId: NodeId, nodeName: text(), sha256: text() })),
+  /** `tookDown`: THIS notice's takedown took the node down (only such a node is its restore's to lift). */
+  nodes: z.array(z.object({ nodeId: NodeId, nodeName: text(), sha256: text(), tookDown: z.boolean() })),
 });
 export type DmcaNoticeDto = z.infer<typeof DmcaNoticeDto>;
 

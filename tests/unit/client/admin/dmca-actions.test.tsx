@@ -47,7 +47,7 @@ function notice(status: string) {
     lawsuitNoticeAt: null,
     restoredAt: null,
     restoredBy: null,
-    nodes: [{ nodeId: NODE, nodeName: "file.bin", sha256: null }],
+    nodes: [{ nodeId: NODE, nodeName: "file.bin", sha256: null, tookDown: true }],
   };
 }
 

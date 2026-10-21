@@ -305,7 +305,12 @@ function noticeDto(row: adminQ.NoticeWithNodes): DmcaNoticeDto {
     lawsuitNoticeAt: iso(row.lawsuitNoticeAt),
     restoredAt: iso(row.restoredAt),
     restoredBy: row.restoredBy,
-    nodes: row.nodes.map((node) => ({ nodeId: node.nodeId, nodeName: node.nodeName, sha256: node.sha256 })),
+    nodes: row.nodes.map((node) => ({
+      nodeId: node.nodeId,
+      nodeName: node.nodeName,
+      sha256: node.sha256,
+      tookDown: node.tookDown,
+    })),
   };
 }
 
