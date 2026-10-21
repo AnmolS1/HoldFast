@@ -79,7 +79,7 @@ import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
-import { fitName, nameKeyOf, sanitizeName, zipPath } from "../services/filename";
+import { fitName, nameKeyOf, sanitizeName, uniqueZipPaths, zipPath } from "../services/filename";
 import { metric } from "../services/metrics";
 import { inlineKindAllowed, thumbEligible } from "../services/mime";
 import { toNodeDto, toNodeDtos, type NodeView } from "../services/node-dto";
@@ -267,6 +267,11 @@ async function mintUrl(
   return { answer, owner: access.role === "owner" };
 }
 
+/** Each entry with its path from `paths` (same order). */
+function withPaths<T extends { path: string }>(entries: T[], paths: string[]): T[] {
+  return entries.map((entry, index) => ({ ...entry, path: paths[index]! }));
+}
+
 // ── zip ─────────────────────────────────────────────────────────────────────────────────────
 
 /** "name", then "name (2)", "name (3)" …: two selected nodes of one name must not share a path. */
@@ -313,7 +318,7 @@ router.post("/nodes/zip-manifest", async (c) => {
   // Every segment as it is saved: a reserved Windows name gets its `_` (services/filename.ts).
   return c.json({
     ...manifest,
-    entries: manifest.entries.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
+    entries: withPaths(manifest.entries, uniqueZipPaths(manifest.entries.map((entry) => entry.path))),
     skipped: manifest.skipped.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
   });
 });

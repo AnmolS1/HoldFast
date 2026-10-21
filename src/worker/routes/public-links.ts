@@ -81,7 +81,7 @@ import {
   verifyZipGrant,
 } from "../services/tokens";
 import { parse } from "./links";
-import { zipPath } from "../services/filename";
+import { uniqueZipPaths } from "../services/filename";
 
 export const router = new Hono<AppEnv>();
 
@@ -537,6 +537,8 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   const manifest = await zipManifest(db(c), [{ id: root.id, label: root.name, owner: false }], {
     maxFiles: ZIP_MAX_ENTRIES,
   });
+  // Saved paths: reserved names renamed, then unique again (the rename can make two one).
+  const paths = uniqueZipPaths(manifest.entries.map((entry) => entry.path));
   // One zip is one download: both counters, once, here.
   await countDownload(c, link, owner, root.id);
   const grant = await mintZipGrant(keys(c), {
@@ -555,7 +557,7 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   metric("download", { kind: "zip", outcome: "ok", reason: "link" });
   return c.json({
     // Every segment as it is saved: a reserved Windows name gets its `_` (services/filename.ts).
-    entries: manifest.entries.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
+    entries: manifest.entries.map((entry, index) => ({ ...entry, path: paths[index]! })),
     totalBytes: manifest.totalBytes,
     // Empty by construction: nothing that is not clean was walked.
     skipped: [],
