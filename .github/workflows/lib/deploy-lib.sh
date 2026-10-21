@@ -10,6 +10,7 @@
 #   deploy-lib.sh branch-head <branch> <sha>         sha is still the head of origin/<branch>
 #   deploy-lib.sh containers-plan <base-url> <sha>   build the scanner image, or leave containers alone?
 #   deploy-lib.sh worker-ready <worker>              the Worker exists, has a deployment and its secrets
+#   deploy-lib.sh cvd-cache                          fill containers/clamav/cvd/ (R2 cache, else one freshclam)
 #   deploy-lib.sh secrets <worker>                   the Worker has the nine secret names
 #   deploy-lib.sh utc-zone                           the database in DATABASE_URL_DIRECT keeps UTC time
 #   deploy-lib.sh migrate <apply|none-pending> <local|remote>   utc-zone, then drizzle migrations, counted
@@ -532,6 +533,55 @@ cmd_worker_ready() {
   if eval_deployments "$tmp"; then rm -f "$tmp"; else rm -f "$tmp" && fail "worker-ready: Worker '$worker' has never been deployed; CI does not do a first deploy"; fi
   cmd_secrets "$worker"
   echo "worker-ready: OK ($worker)"
+}
+
+# ── cvd-cache ────────────────────────────────────────────────────────────────────────────────────
+# The scanner image COPYs ClamAV's signatures from containers/clamav/cvd/ and never fetches them
+# (PLAN C26: the mirror rate-limits frequent downloaders, and shared cloud runners most of all).
+# This fills the directory before any image build: from the dev bucket's b/clamav/ copy while
+# that copy is under CVD_MAX_AGE_S old (its age is the epoch in b/clamav/fetched-at); otherwise
+# ONE freshclam run on the runner (containers/clamav/fetch-cvd.sh, Docker), whose files are then
+# written back for the next build. Needs CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID.
+CVD_BUCKET="holdfast-files-dev"
+CVD_PREFIX="b/clamav"
+CVD_FILES="main.cvd daily.cvd bytecode.cvd"
+CVD_MAX_AGE_S=86400
+cmd_cvd_cache() {
+  need npx docker
+  local dir="$repo_root/containers/clamav/cvd" stamp now age f fresh=1
+  mkdir -p "$dir"
+  now="$(date +%s)"
+  # No cached copy yet is a normal first run, not a failure (set -e / pipefail would end the script).
+  stamp="$( { (cd "$repo_root" && npx wrangler r2 object get "$CVD_BUCKET/$CVD_PREFIX/fetched-at" --pipe --remote) 2>/dev/null || true; } | tr -cd '0-9')"
+  if [ -z "$stamp" ]; then
+    fresh=0
+    echo "cvd-cache: no cached copy"
+  else
+    age=$((now - stamp))
+    echo "cvd-cache: cached copy is $((age / 3600)) h old"
+    [ "$age" -lt "$CVD_MAX_AGE_S" ] || fresh=0
+  fi
+  if [ "$fresh" = 1 ]; then
+    for f in $CVD_FILES; do
+      (cd "$repo_root" && npx wrangler r2 object get "$CVD_BUCKET/$CVD_PREFIX/$f" --file "$dir/$f" --remote) >/dev/null 2>&1 &&
+        [ -s "$dir/$f" ] || { fresh=0; echo "cvd-cache: $f missing from the cache"; break; }
+    done
+  fi
+  if [ "$fresh" = 0 ]; then
+    echo "cvd-cache: one freshclam run on the runner"
+    bash "$repo_root/containers/clamav/fetch-cvd.sh" >/dev/null || fail "cvd-cache: freshclam on the runner failed"
+    for f in $CVD_FILES; do
+      [ -s "$dir/$f" ] || fail "cvd-cache: $f missing after freshclam"
+      (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/$f" --file "$dir/$f" --content-type application/octet-stream --remote) >/dev/null ||
+        fail "cvd-cache: could not write $f back to the cache"
+    done
+    printf '%s' "$now" >"$dir/.fetched-at"
+    (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/fetched-at" --file "$dir/.fetched-at" --content-type text/plain --remote) >/dev/null ||
+      fail "cvd-cache: could not write the cache's timestamp"
+    rm -f "$dir/.fetched-at"
+  fi
+  for f in $CVD_FILES; do [ -s "$dir/$f" ] || fail "cvd-cache: $f is empty"; done
+  echo "cvd-cache: OK ($(du -sh "$dir" | cut -f1) in containers/clamav/cvd)"
 }
 
 # ── migrate ──────────────────────────────────────────────────────────────────────────────────────
@@ -1091,6 +1141,7 @@ case "$command" in
   files-host) cmd_files_host "$@" ;;
   branch-head) cmd_branch_head "$@" ;;
   containers-plan) cmd_containers_plan "$@" ;;
+  cvd-cache) cmd_cvd_cache "$@" ;;
   live-migration-rule) cmd_live_migration_rule "$@" ;;
   worker-ready) cmd_worker_ready "$@" ;;
   secrets) cmd_secrets "$@" ;;

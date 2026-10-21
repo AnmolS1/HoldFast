@@ -115,6 +115,13 @@ jobs:
           DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_DEV }}
         run: bash .github/workflows/lib/deploy-lib.sh migrate apply remote
 
+      # The scanner image COPYs ClamAV signatures; they come from the R2 cache (or one freshclam run).
+      - name: Scanner signatures
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh cvd-cache
+
       # = the deploy half of `npm run deploy:dev` (the build half ran above so that the name check
       # sits between them). The log prints every `vars` value — public ones; no secret is a var.
       - name: Deploy
