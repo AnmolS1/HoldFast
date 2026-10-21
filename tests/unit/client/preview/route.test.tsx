@@ -8,7 +8,7 @@ import { routes as previewRoutes } from "../../../../src/client/features/preview
 import { adoptIdentity } from "../../../../src/client/lib/query";
 import { Frame } from "../../../../src/client/routes/frame/Frame";
 import { renderRoutes, seedConfig, seedSession, sessionOf } from "../shell/helpers";
-import { ID, NODES, nodeOf } from "./fixtures";
+import { detailOf, ID, NODES, nodeOf } from "./fixtures";
 import {
   dialog,
   envelope,
@@ -253,5 +253,135 @@ describe("the account stamp on the route's history state", () => {
     // Still usable: Next moves on.
     fireEvent.click(screen.getByRole("button", { name: "Next file" }));
     await screen.findByText("sample.html");
+  });
+
+  // The frame's loader takes longer than the file's own load: on a cold link the stamp's replace
+  // is still loading when the file arrives (review M1).
+  const slower: RouteObject[] = [
+    {
+      path: "/",
+      loader: () => new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+      element: <Frame backgroundRoutes={background} />,
+      children,
+    },
+  ];
+
+  it("a cold link whose file arrives while the stamp is still loading: Close goes to the file's folder, and the entry records it", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slower, [`/preview/${ID.svg}`]);
+    await screen.findByText("sample.svg");
+    // The file is known while the route's own replace (the stamp) has not landed yet.
+    expect(router.state.navigation.state).toBe("loading");
+    fireEvent.keyDown(dialog()!, { key: "Escape" });
+    await waitFor(() => expect(router.state.location.pathname).not.toBe(`/preview/${ID.svg}`));
+    expect(router.state.location.pathname).toBe(`/folder/${ID.folder}`);
+  });
+
+  it("a cold link: once everything has settled the entry records the folder, the cold mark and the account", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slower, [`/preview/${ID.svg}`]);
+    await screen.findByText("sample.svg");
+    await waitFor(() =>
+      expect(router.state.location.state).toMatchObject({
+        from: `/folder/${ID.folder}`,
+        cold: true,
+        account: sessionOf().user.id,
+      }),
+    );
+    expect(router.state.navigation.state).toBe("idle");
+  });
+
+  // R-a (EXECUTION 2026-10-21 12:10): Back taken before the preview's own stamp was issued — the
+  // router is already on its way to the page behind (its loader runs), the preview is still drawn.
+  // The stamp must not be written then: the router would apply it to the entry it is going to.
+  it("Back taken while the preview's stamp is still to be issued: the page behind is reached and stays", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slow, [`/folder/${ID.folder}?q=list`]);
+    await screen.findByTestId("list");
+    let backed = false;
+    const stop = router.subscribe((next) => {
+      // The moment the router lands on the preview (before React has drawn it): Back.
+      if (!backed && next.location.pathname === `/preview/${ID.svg}` && next.navigation.state === "idle") {
+        backed = true;
+        void router.navigate(-1);
+      }
+    });
+    act(() => screen.getByText("open sample.svg").click());
+    await waitFor(() => expect(backed).toBe(true));
+    await waitFor(() => expect(router.state.navigation.state).toBe("idle"));
+    await settle(200);
+    stop();
+    expect(router.state.location.pathname + router.state.location.search).toBe(`/folder/${ID.folder}?q=list`);
+    await waitFor(() => expect(dialog()).toBeNull());
+  });
+
+  // The other side of the same guard (review M1, the effect's hunk): a stamp held back while the
+  // router was on its way elsewhere is written once it settles on this entry again — Back, then
+  // Forward to the very same entry before Back has landed.
+  it("a navigation away that comes back to the same entry before it lands: the stamp is still written", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slower, [`/folder/${ID.folder}?q=list`]);
+    await screen.findByTestId("list");
+    let turned = false;
+    let previewKey = "";
+    const stop = router.subscribe((next) => {
+      if (!turned && next.location.pathname === `/preview/${ID.svg}` && next.navigation.state === "idle") {
+        turned = true;
+        previewKey = next.location.key;
+        void router.navigate(-1);
+        // Forward again while Back's loader (150 ms) still runs — the preview has been drawn by then.
+        setTimeout(() => void router.navigate(1), 60);
+      }
+    });
+    act(() => screen.getByText("open sample.svg").click());
+    await waitFor(() => expect(turned).toBe(true));
+    await waitFor(() =>
+      expect(router.state.location.state).toMatchObject({
+        from: `/folder/${ID.folder}`,
+        account: sessionOf().user.id,
+      }),
+    );
+    stop();
+    expect(router.state.location.pathname).toBe(`/preview/${ID.svg}`);
+    expect(router.state.navigation.state).toBe("idle");
+    expect(previewKey).not.toBe("");
+  });
+
+  // The cold folder's own write held back the same way: the file is known while Back's loader runs;
+  // Forward to the same entry before Back lands — the entry still records its folder.
+  it("a cold link whose file arrives while the router is on its way elsewhere: written once it is back on the entry", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { network } = arrange((call) =>
+      call.url.pathname === `/api/nodes/${ID.svg}` && call.method === "GET"
+        ? gate.then(() => json(detailOf(NODES.svg)))
+        : undefined,
+    );
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slower, [`/folder/${ID.folder}?q=list`, `/preview/${ID.svg}`]);
+    await waitFor(() => expect(dialog()).not.toBeNull());
+    await waitFor(() => expect(router.state.navigation.state).toBe("idle"));
+    await waitFor(() =>
+      expect(network.api().some((call) => call.url.pathname === `/api/nodes/${ID.svg}`)).toBe(true),
+    );
+    // Back: its loader (150 ms) runs; the file answers meanwhile; Forward before Back has landed.
+    void router.navigate(-1);
+    expect(router.state.navigation.state).toBe("loading");
+    await act(async () => {
+      release();
+      await gate;
+    });
+    await screen.findByText("sample.svg");
+    void router.navigate(1);
+    await waitFor(() =>
+      expect(router.state.location.state).toMatchObject({ from: `/folder/${ID.folder}`, cold: true }),
+    );
+    expect(router.state.location.pathname).toBe(`/preview/${ID.svg}`);
+    fireEvent.keyDown(dialog()!, { key: "Escape" });
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/folder/${ID.folder}`));
   });
 });

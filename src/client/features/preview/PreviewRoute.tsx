@@ -1,6 +1,6 @@
 // `/preview/:nodeId` as a page: the dialog over whatever was open, with the signed-in source.
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useLocation, useNavigate, useParams } from "react-router";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
+import { UNSAFE_DataRouterContext, useLocation, useNavigate, useParams } from "react-router";
 import { isStamped, ownHistoryState, stamped } from "../../lib/history-state";
 import { getKnownUserId } from "../../lib/query";
 import { PreviewDialogView } from "./PreviewDialog";
@@ -40,6 +40,23 @@ export function PreviewRoute() {
   const { nodeId = null } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
+  // The router's LIVE state (React's copy lags behind it). A write held back below is tried again on
+  // the next render: a navigation that ends commits a location (a new one, or this entry's again),
+  // which renders this route if it is still here — the router never ends one without that.
+  const router = useContext(UNSAFE_DataRouterContext)?.router;
+  // A replace written later — by the effect below, or when the file arrives — goes to whatever entry
+  // is CURRENT when it is applied. After a Back or a link that the router took before React drew it,
+  // that is another page's entry, and the replace would put the preview back in its place
+  // (EXECUTION 2026-10-21 12:10). So it is written only while the router is on THIS entry and is not
+  // on its way to another address; a navigation to this same address (our own replace re-running
+  // the frame's loader) is ours and does not hold it back.
+  const here = location.pathname + location.search;
+  const onEntry = useCallback(() => {
+    if (router === undefined) return true;
+    if (router.state.location.key !== location.key) return false;
+    const pending = router.state.navigation.location;
+    return pending === undefined || pending.pathname + pending.search === here;
+  }, [router, location.key, here]);
   const account = getKnownUserId() ?? undefined;
   // Written for another account, or for nobody (no account was known then): none of it is ours to
   // use, and it is never stamped as this account's (lib/history-state.ts).
@@ -59,7 +76,7 @@ export function PreviewRoute() {
   const unstamped = account !== undefined && (stale || written.account === undefined);
   const stampedKey = useRef<string | null>(null);
   useEffect(() => {
-    if (!unstamped || stampedKey.current === location.key) return;
+    if (!unstamped || stampedKey.current === location.key || !onEntry()) return;
     stampedKey.current = location.key;
     void navigate(location.pathname + location.search, { replace: true, state: stamped({ ...state }) });
   });
@@ -81,19 +98,36 @@ export function PreviewRoute() {
   // records it in the entry has landed (that replace re-runs the frame's loader, which can take a
   // while): Close pressed in between still goes to the folder.
   const coldParent = useRef<string | null>(null);
-  const onItem = useCallback(
-    (item: LoadedItem) => {
-      // A cold link has no page underneath: once the file is known, its folder becomes that page.
-      if (from !== undefined || !item.node) return;
-      const parent = item.node.parentId === null ? "/" : `/folder/${item.node.parentId}`;
-      coldParent.current = parent;
+  // The cold folder's write, when the file was known at a moment it could not be written (above).
+  // `onItem` is called once per file, so a write held back is kept here and written by the effect
+  // below as soon as the router is on this entry again.
+  const coldWrite = useRef<{ key: string; parent: string } | null>(null);
+  const writeCold = useCallback(
+    (parent: string) => {
+      coldWrite.current = null;
       void navigate(location.pathname + location.search, {
         replace: true,
         state: stamped({ siblingIds, from: parent, cold: true }),
       });
     },
-    [from, siblingIds, navigate, location.pathname, location.search],
+    [siblingIds, navigate, location.pathname, location.search],
   );
+  const onItem = useCallback(
+    (item: LoadedItem) => {
+      // A cold link has no page underneath: once the file is known, its folder becomes that page.
+      if (from !== undefined || !item.node) return;
+      const parent = item.node.parentId === null ? "/" : `/folder/${item.node.parentId}`;
+      // Close goes there from now on, whether or not the entry can record it yet.
+      coldParent.current = parent;
+      if (onEntry()) writeCold(parent);
+      else coldWrite.current = { key: location.key, parent };
+    },
+    [from, onEntry, writeCold, location.key],
+  );
+  useEffect(() => {
+    const held = coldWrite.current;
+    if (held && held.key === location.key && from === undefined && onEntry()) writeCold(held.parent);
+  });
 
   const onNavigate = (id: string) =>
     void navigate(`/preview/${encodeURIComponent(id)}`, { replace: true, state: stamped({ ...state }) });
