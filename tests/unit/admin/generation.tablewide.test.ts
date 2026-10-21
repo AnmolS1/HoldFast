@@ -10,7 +10,7 @@ import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { clearSettingsCache, setSetting } from "../../../src/worker/db/queries/settings";
 import { withJobLock } from "../../../src/worker/db/queries/trash-jobs";
-import { GENERATION_KEY, GENERATION_LOCK } from "../../../src/worker/jobs/reconcile";
+import { DESTROY_PAUSED_KEY, GENERATION_KEY, GENERATION_LOCK } from "../../../src/worker/jobs/reconcile";
 import { gate } from "../services-core/helpers";
 import { adminCall, admin, auditOf, baId, member, rand, testDb, type Who } from "./helpers";
 
@@ -63,8 +63,14 @@ const accept = (who: Who, body: Record<string, unknown>, env?: Record<string, un
   adminCall(who, "POST", "/system/generation", { body, ...(env ? { env } : {}) });
 
 let reason = "";
-beforeEach(() => {
+// Levelling is done only with the pause switch ON (review m7, server-side): this file's bucket
+// has it on for every case (fix-pass.test.ts proves the refusal with it off).
+beforeEach(async () => {
   reason = `restored ${rand()}`;
+  await env.FILES.put(DESTROY_PAUSED_KEY, "paused for the generation tests");
+});
+afterAll(async () => {
+  await env.FILES.delete(DESTROY_PAUSED_KEY);
 });
 
 describe("object ahead → the database's generation FIELD moves, nothing else", () => {
