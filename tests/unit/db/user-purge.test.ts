@@ -388,7 +388,7 @@ describe("hard delete of a user", () => {
   // H2 review M1: a completing session whose declared hash is listed for a reason OTHER than csam
   // owes nothing. The purge keeps it while its request may be alive, the stale job ends it once it
   // is stale, and the purge then goes on — a csam-listed one stays the repair sweep's.
-  it("a stale completing session with a non-csam listed hash: kept by the purge, ended by the stale job, then the user goes", async () => {
+  it("a stale completing session with a non-csam listed hash: kept by the purge, NOT the stale job's (Addendum 3 m5) — the repair sweep ends it, then the user goes", async () => {
     const leaving = await makeUser(db);
     const stale = new Date(Date.now() - (COMPLETING_STALE_MINUTES + 5) * 60_000);
     const malware = randomBytes(32).toString("hex");
@@ -410,11 +410,11 @@ describe("hard delete of a user", () => {
 
     expect(await deleteForUser(db, leaving)).toEqual([]);
     expect(await remainingForUser(db, leaving)).toBe(2);
-    // The stale job's list: the non-csam one is there, the owed one is not.
+    // Not the stale job's (m5): the repair sweep hashes it first.
     const due = (await expired(db, 100_000)).map((u) => u.id);
-    expect(due).toContain(other.id);
+    expect(due).not.toContain(other.id);
     expect(due).not.toContain(owed.id);
-    // The stale job ends it (what its settle does to the row).
+    // The repair sweep ends it (refuseBlocked: what that does to the row).
     expect(await markAborted(db, other.id)).toBe(true);
     // The next purge run takes it; only the owed session still holds the user row.
     expect(await deleteForUser(db, leaving)).toEqual([]);
