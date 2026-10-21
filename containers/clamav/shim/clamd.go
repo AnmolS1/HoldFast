@@ -39,12 +39,14 @@ func (c Clamd) dial(ctx context.Context) (net.Conn, error) {
 	return conn, nil
 }
 
+// readReply reads one NUL-terminated reply. A reply cut off before its NUL is an error: a
+// truncated answer is never classified (review m6).
 func readReply(r io.Reader) (string, error) {
 	reply, err := bufio.NewReader(r).ReadString(0)
-	if err != nil && reply == "" {
-		return "", err
+	if err != nil {
+		return "", fmt.Errorf("reply without its terminator (%q): %w", reply, err)
 	}
-	return strings.TrimSpace(strings.TrimRight(reply, "\x00")), nil
+	return strings.TrimSpace(strings.TrimSuffix(reply, "\x00")), nil
 }
 
 // Command sends one short command (PING, VERSION, RELOAD) and returns the reply.

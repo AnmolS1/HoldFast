@@ -24,15 +24,22 @@
 #
 # Freshness gate (R2.30): the disk is ephemeral, so every wake starts from the baked signatures. POST
 # /scan answers 503 { status: 'not_ready', reason: 'signatures' | 'clamd_loading', dbAgeHours } with
-# Retry-After: 30 until clamd answers PING and either (a) the first freshclam run since boot succeeded
-# and clamd has reloaded what it fetched, or (b) the loaded daily database is younger than
-# SIG_FRESH_HOURS (below; its age comes from the build time clamd reports for the loaded daily). One
-# freshclam run per wake; daemon mode (Checks 12) starts 2 h after boot. No keep-warm: nothing pings
-# the container on a schedule.
+# Retry-After: 30 unless clamd answers PING and either (a) a freshclam run succeeded less than
+# SIG_FRESH_HOURS ago and clamd has loaded what it fetched (an update's freshness expires — ruling on
+# review M1), or (b) the loaded daily database is younger than SIG_FRESH_HOURS (below; its age comes
+# from the build time clamd reports for the loaded daily). The shim runs freshclam at boot (one run per
+# wake) and every 2 h while the container lives (= Checks 12), records each success, and RELOADs clamd.
+# No keep-warm: nothing pings the container on a schedule.
+#
+# DetectPUA no (review B1): clamd reports ONE name per scan, and a PUA.* match can replace an
+# encrypted or over-limit alert; a PUA.* name that still arrives (a private signature) is an error,
+# never clean. `pua` in the verdict stays [].
 #
 # Endpoints: POST /scan (body streamed to clamd with INSTREAM, SHA-256 in the same pass, header
 # X-Scan-Size required; one large scan > 8 MiB per instance and four small ones, more → 503 busy with
-# Retry-After: 15 before any body byte is read) and GET /health (always 200, never scans). A refusal
+# Retry-After: 15 before any body byte is read; also busy when /scan-tmp has less free space than the
+# declared size + one extracted archive member (MaxFileSize, 2,097,152,000) + 256 MiB — clamd writes
+# extracted members there too) and GET /health (always 200, never scans). A refusal
 # made before the body is read also states its outcome in headers (X-Scan-Status busy|not_ready,
 # X-Scan-Reason, X-Scan-Db-Age-Hours): the connection closes with the upload unread and the caller
 # can lose the JSON body.
@@ -58,8 +65,6 @@
 # Integration run (containers enabled in a local `wrangler dev`, the only place they are):
 #   containers/clamav/test/integration.sh      (exits non-zero when Docker or containers are unavailable)
 
-ARG CLAMAV_BASE=clamav/clamav:stable_base@sha256:751df8dc649cc977696f107c80db4960b6317a7cb511aebc8066f3b91db6b631
-
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS shim
 ARG TARGETOS
 ARG TARGETARCH
@@ -75,10 +80,11 @@ RUN apk add --no-cache zip
 COPY test/make-fixtures.sh test/holdfast-test.ndb /build/
 RUN /build/make-fixtures.sh /fixtures /build/holdfast-test.ndb
 
-FROM ${CLAMAV_BASE} AS runtime
+# A literal FROM (not an ARG) so a digest-bump bot can update it; fetch-cvd.sh reads this line.
+FROM clamav/clamav:stable_base@sha256:751df8dc649cc977696f107c80db4960b6317a7cb511aebc8066f3b91db6b631 AS runtime
 ENV TZ=Etc/UTC \
     SIG_FRESH_HOURS=24
-COPY clamd.conf freshclam.conf freshclam-boot.conf /etc/clamav/
+COPY clamd.conf freshclam.conf /etc/clamav/
 COPY --from=shim /out/hf-scanner /usr/local/bin/hf-scanner
 COPY --chown=clamav:clamav cvd/main.cvd cvd/daily.cvd cvd/bytecode.cvd /var/lib/clamav/
 RUN install -d -o clamav -g clamav -m 750 /scan-tmp \

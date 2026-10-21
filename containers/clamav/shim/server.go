@@ -25,8 +25,11 @@ const (
 	SmallScanSlots = 4
 	// ScanBudget is the outer bound of one /scan (under the queue consumer's 15-minute wall, C10).
 	ScanBudget = 12 * time.Minute
-	// SpoolMargin is kept free on /scan-tmp beyond a large scan's declared size.
+	// SpoolMargin is kept free on /scan-tmp beyond what a scan may write there.
 	SpoolMargin int64 = 256 << 20
+	// ExtractAllowance: clamd also writes extracted archive members to /scan-tmp (measured: a 1.8 MB
+	// zip of zeros used 1.86 GB there). One member is at most MaxFileSize (2000M = 2,097,152,000).
+	ExtractAllowance int64 = 2_097_152_000
 
 	retryNotReady = "30"
 	retryBusy     = "15"
@@ -157,13 +160,13 @@ func (s *Server) scan(w http.ResponseWriter, r *http.Request) {
 		busy()
 		return
 	}
-	if size > SmallScanBytes {
-		free, err := s.FreeTmp()
-		if err != nil || free < size+SpoolMargin {
-			log.Printf("scan refused: spool space free=%d need=%d err=%v", free, size+SpoolMargin, err)
-			busy()
-			return
-		}
+	// Room for the spooled stream and one extracted archive member, for every scan: never a
+	// half-written spool or extraction.
+	need := size + ExtractAllowance + SpoolMargin
+	if free, err := s.FreeTmp(); err != nil || free < need {
+		log.Printf("scan refused: spool space free=%d need=%d err=%v", free, need, err)
+		busy()
+		return
 	}
 
 	started := time.Now()

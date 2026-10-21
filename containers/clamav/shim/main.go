@@ -17,15 +17,14 @@ import (
 )
 
 type config struct {
-	ClamdConf       string
-	FreshclamBoot   string // freshclam config for the boot run (no NotifyClamd: the shim reloads)
-	FreshclamDaemon string // freshclam config for daemon mode (NotifyClamd)
-	Socket          string
-	DBDir           string
-	TmpDir          string
-	FreshHours      float64
-	Offline         bool // never contact the signature mirror (local tests only)
-	DaemonDelay     time.Duration
+	ClamdConf     string
+	FreshclamConf string // no NotifyClamd: the shim reloads clamd itself
+	Socket        string
+	DBDir         string
+	TmpDir        string
+	FreshHours    float64
+	Offline       bool // never contact the signature mirror (local tests only)
+	UpdateEvery   time.Duration
 }
 
 func env(key, fallback string) string {
@@ -41,15 +40,14 @@ func loadConfig() config {
 		log.Fatalf("SIG_FRESH_HOURS must be a number of hours")
 	}
 	return config{
-		ClamdConf:       env("CLAMD_CONF", "/etc/clamav/clamd.conf"),
-		FreshclamBoot:   "/etc/clamav/freshclam-boot.conf",
-		FreshclamDaemon: "/etc/clamav/freshclam.conf",
-		Socket:          "/run/clamav/clamd.sock",
-		DBDir:           "/var/lib/clamav",
-		TmpDir:          "/scan-tmp",
-		FreshHours:      hours,
-		Offline:         os.Getenv("SCANNER_OFFLINE") == "1",
-		DaemonDelay:     2 * time.Hour,
+		ClamdConf:     env("CLAMD_CONF", "/etc/clamav/clamd.conf"),
+		FreshclamConf: "/etc/clamav/freshclam.conf",
+		Socket:        "/run/clamav/clamd.sock",
+		DBDir:         "/var/lib/clamav",
+		TmpDir:        "/scan-tmp",
+		FreshHours:    hours,
+		Offline:       os.Getenv("SCANNER_OFFLINE") == "1",
+		UpdateEvery:   2 * time.Hour,
 	}
 }
 
@@ -62,7 +60,8 @@ type gate struct {
 	loaded      string    // daily version clamd has loaded (VERSION)
 	loadedBuilt time.Time // its build time
 	freshclam   string    // pending | ok | failed
-	updated     string    // daily version on disk after the boot freshclam run succeeded
+	updated     string    // daily version on disk after the last successful freshclam run
+	updatedAt   time.Time // when that run succeeded
 	freshHours  float64
 	now         func() time.Time
 }
@@ -86,9 +85,11 @@ func (g *gate) Status() Status {
 		st.NotReady = "clamd_loading"
 		return st
 	}
-	// (a) the first freshclam run since boot succeeded and clamd has loaded what it fetched, or
+	// (a) a freshclam run succeeded less than SIG_FRESH_HOURS ago and clamd has loaded what it
+	// fetched (an update keeps the gate open only that long — ruling on review M1), or
 	// (b) the loaded daily database is younger than SIG_FRESH_HOURS (R2.30).
-	updatedAndLoaded := g.freshclam == "ok" && g.updated != "" && g.loaded == g.updated
+	updatedAndLoaded := !g.updatedAt.IsZero() && g.now().Sub(g.updatedAt).Hours() < g.freshHours &&
+		g.updated != "" && g.loaded == g.updated
 	young := !g.loadedBuilt.IsZero() && st.DBAgeHours < g.freshHours
 	if updatedAndLoaded || young {
 		st.Ready = true
@@ -96,6 +97,31 @@ func (g *gate) Status() Status {
 		st.NotReady = "signatures"
 	}
 	return st
+}
+
+// updater runs freshclam once and records the outcome in the gate; after a success it has clamd
+// load what was fetched. main runs it at boot and then every UpdateEvery.
+type updater struct {
+	g         *gate
+	run       func() error         // one freshclam run; nil = exit 0 (up to date or updated)
+	diskDaily func() string        // the daily version on disk
+	reload    func(version string) // make clamd load `version` (waits for clamd; RELOAD if needed)
+}
+
+func (u *updater) once() {
+	if err := u.run(); err != nil {
+		log.Printf("freshclam: failed (%v)", err)
+		u.g.mu.Lock()
+		u.g.freshclam = "failed"
+		u.g.mu.Unlock()
+		return
+	}
+	version := u.diskDaily()
+	log.Printf("freshclam: ok, daily on disk %s", version)
+	u.g.mu.Lock()
+	u.g.freshclam, u.g.updated, u.g.updatedAt = "ok", version, u.g.now()
+	u.g.mu.Unlock()
+	u.reload(version)
 }
 
 // diskDaily is the version of the newest daily database on disk (daily.cld after an update,
@@ -185,8 +211,10 @@ func main() {
 		}
 	}()
 
-	// One freshclam run per wake, then daemon mode (Checks 12) once the boot run is DaemonDelay old:
-	// the daemon checks as soon as it starts, so starting it at boot would fetch twice per wake (C26).
+	// freshclam at boot and then every UpdateEvery (the 12 checks a day of `Checks 12`), run by the
+	// shim rather than `freshclam -d` so that every success is recorded: the gate's path (a) lasts
+	// SIG_FRESH_HOURS from the last success. One run per wake; nothing runs on a schedule while the
+	// container sleeps.
 	go func() {
 		if cfg.Offline {
 			log.Printf("freshclam: SCANNER_OFFLINE=1, the signature mirror is not contacted")
@@ -195,39 +223,38 @@ func main() {
 			g.mu.Unlock()
 			return
 		}
-		run := exec.Command("freshclam", "--stdout", "--foreground", "--config-file="+cfg.FreshclamBoot)
-		run.Stdout, run.Stderr = os.Stdout, os.Stderr
-		err := run.Run()
-		status, updated := "failed", ""
-		if err == nil { // freshclam: 0 = up to date or updated; every other code is a failure
-			status, updated = "ok", diskDaily(cfg.DBDir)
-		}
-		log.Printf("freshclam boot run: %s (exit %v), daily on disk %s", status, err, updated)
-		g.mu.Lock()
-		g.freshclam, g.updated = status, updated
-		g.mu.Unlock()
-		if status == "ok" {
-			// The boot run does not notify clamd (it may still be loading): reload here once clamd is up.
-			for {
-				st := g.Status()
-				if st.Clamd == "down" {
-					break
-				}
-				if st.Clamd == "up" {
-					if st.DBVersion != updated {
-						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-						reply, err := clamd.Command(ctx, "RELOAD")
-						cancel()
-						log.Printf("clamd RELOAD after freshclam: %q %v", reply, err)
+		u := &updater{
+			g: g,
+			run: func() error {
+				cmd := exec.Command("freshclam", "--stdout", "--foreground", "--config-file="+cfg.FreshclamConf)
+				cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+				return cmd.Run() // exit 0 = up to date or updated; every other code is a failure
+			},
+			diskDaily: func() string { return diskDaily(cfg.DBDir) },
+			reload: func(version string) {
+				// Wait for clamd, then RELOAD if it has not loaded `version`.
+				for {
+					st := g.Status()
+					if st.Clamd == "down" {
+						return
 					}
-					break
+					if st.Clamd == "up" {
+						if st.DBVersion != version {
+							ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+							reply, err := clamd.Command(ctx, "RELOAD")
+							cancel()
+							log.Printf("clamd RELOAD after freshclam: %q %v", reply, err)
+						}
+						return
+					}
+					time.Sleep(time.Second)
 				}
-				time.Sleep(time.Second)
-			}
+			},
 		}
-		time.Sleep(cfg.DaemonDelay)
-		daemon := start("freshclam", "--stdout", "--foreground", "--daemon", "--checks=12", "--config-file="+cfg.FreshclamDaemon)
-		go func() { _ = daemon.Wait() }()
+		for {
+			u.once()
+			time.Sleep(cfg.UpdateEvery)
+		}
 	}()
 
 	sig := make(chan os.Signal, 1)

@@ -106,3 +106,32 @@ func TestInstreamEmptyBody(t *testing.T) {
 		t.Fatalf("reply %q err %v", reply, err)
 	}
 }
+
+// A reply cut off before its NUL terminator is an error, never a reply (review m6).
+func TestReplyWithoutTerminatorIsAnError(t *testing.T) {
+	for _, sent := range []string{"stream: OK", "PONG", ""} {
+		sock := filepath.Join(t.TempDir(), "clamd.sock")
+		ln, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			io.ReadFull(conn, make([]byte, len("zPING\x00")))
+			conn.Write([]byte(sent))
+			conn.Close()
+		}()
+		reply, err := Clamd{Socket: sock}.Command(context.Background(), "PING")
+		ln.Close()
+		if err == nil {
+			t.Errorf("reply %q without NUL accepted as %q", sent, reply)
+		}
+	}
+	// With the NUL it is a reply.
+	if reply, err := readReply(strings.NewReader("stream: OK\x00")); err != nil || reply != "stream: OK" {
+		t.Fatalf("%q %v", reply, err)
+	}
+}

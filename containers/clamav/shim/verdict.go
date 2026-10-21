@@ -23,7 +23,8 @@ const (
 	sigPUA       = "PUA."
 )
 
-// Classify maps one INSTREAM reply to status, reason and names. A MaxScanTime cut-off is a slow scan,
+// Classify maps one INSTREAM reply to status, reason and names. Only exactly "stream: OK" is
+// clean; any name it does not recognise is infected. A MaxScanTime cut-off is a slow scan,
 // not a property of the file: it is a retryable timeout, never limits_exceeded (spike S2).
 func Classify(reply string) (status, reason string, signatures, pua []string) {
 	signatures, pua = []string{}, []string{}
@@ -42,7 +43,10 @@ func Classify(reply string) (status, reason string, signatures, pua []string) {
 		case strings.HasPrefix(name, sigEncrypted):
 			return "encrypted", "encrypted", []string{name}, pua
 		case strings.HasPrefix(name, sigPUA):
-			return "clean", "", signatures, []string{name}
+			// clamd reports ONE name, the last alert: a PUA match can stand in for an encrypted or
+			// over-limit member it could not inspect (review B1). DetectPUA is off; a PUA name that
+			// still arrives (a private signature) fails closed, and pua stays empty.
+			return "error", "engine", signatures, pua
 		default:
 			return "infected", "", []string{name}, pua
 		}

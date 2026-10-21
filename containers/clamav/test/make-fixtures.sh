@@ -31,6 +31,18 @@ zip -q -X eicar-then-pua.zip eicar.com pua.bin
 { head -c 4096 /dev/urandom; hex2bin "$marker_hex"; head -c 4096 /dev/urandom; } > marker.bin
 zip -q -X marker-then-eicar.zip marker.bin eicar.com
 zip -q -X eicar-then-marker.zip eicar.com marker.bin
+# A PUA match next to an alert that does not stop the scan (encrypted, limits): clamd reports one
+# name, the last alert — the PUA name must never turn these into clean (review B1). Both member orders.
+zip -q -X -P not-a-real-password enceicar.zip eicar.com
+mkdir nest; cp eicar.com nest/n0; name=n0; i=1
+while [ "$i" -le 17 ]; do
+  (cd nest && zip -q -X "n$i.zip" "$name"); name="n$i.zip"; i=$((i + 1))
+done
+cp nest/n17.zip nest17-eicar.zip; rm -rf nest
+for other in password enceicar bomb-20 nest17-eicar; do
+  zip -q -X "$other-then-pua.zip" "$other.zip" pua.bin
+  zip -q -X "pua-then-$other.zip" pua.bin "$other.zip"
+done
 # 10 MB with the private marker in its last 31 bytes, and the same without it.
 head -c 9999969 /dev/urandom > head.bin
 { cat head.bin; hex2bin "$marker_hex"; } > marker-end.bin

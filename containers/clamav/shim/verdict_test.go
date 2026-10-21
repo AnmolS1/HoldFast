@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -21,7 +22,10 @@ func TestClassify(t *testing.T) {
 		{"stream: Heuristics.Limits.Exceeded.MaxScanTime FOUND", "error", "timeout", []string{}, []string{}},
 		{"stream: Heuristics.Encrypted.Zip FOUND", "encrypted", "encrypted", []string{"Heuristics.Encrypted.Zip"}, []string{}},
 		{"stream: Heuristics.Encrypted.PDF FOUND", "encrypted", "encrypted", []string{"Heuristics.Encrypted.PDF"}, []string{}},
-		{"stream: PUA.Win.Packer.Upx-1 FOUND", "clean", "", []string{}, []string{"PUA.Win.Packer.Upx-1"}},
+		// A PUA name may be the one name clamd reports for an object whose other members it could not
+		// inspect (encrypted, past a limit): never clean (review B1).
+		{"stream: PUA.Win.Packer.Upx-1 FOUND", "error", "engine", []string{}, []string{}},
+		{"stream: PUA.Holdfast.TestSample.UNOFFICIAL FOUND", "error", "engine", []string{}, []string{}},
 		{"INSTREAM size limit exceeded. ERROR", "error", "engine", []string{}, []string{}},
 		{"Error writing to temporary file ERROR", "error", "engine", []string{}, []string{}},
 		{"stream:  FOUND", "error", "engine", []string{}, []string{}},
@@ -84,8 +88,11 @@ func TestGate(t *testing.T) {
 		{"stale, update pending", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "pending"}, false, "up", "signatures"},
 		{"stale, update failed", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "failed"}, false, "up", "signatures"},
 		{"stale, updated, not reloaded", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "ok", updated: "2"}, false, "up", "signatures"},
-		{"stale, updated and reloaded", &gate{clamdUp: true, loaded: "2", loadedBuilt: stale, freshclam: "ok", updated: "2"}, true, "up", ""},
-		{"stale, up to date (no new version)", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "ok", updated: "1"}, true, "up", ""},
+		{"stale, updated and reloaded", &gate{clamdUp: true, loaded: "2", loadedBuilt: stale, freshclam: "ok", updated: "2", updatedAt: now.Add(-time.Hour)}, true, "up", ""},
+		{"stale, up to date (no new version)", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "ok", updated: "1", updatedAt: now.Add(-time.Hour)}, true, "up", ""},
+		// The ruling on M1: an update keeps the gate open only SIG_FRESH_HOURS after it succeeded.
+		{"stale, last update 25 h ago", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "failed", updated: "1", updatedAt: now.Add(-25 * time.Hour)}, false, "up", "signatures"},
+		{"stale, last update exactly 24 h ago", &gate{clamdUp: true, loaded: "1", loadedBuilt: stale, freshclam: "ok", updated: "1", updatedAt: now.Add(-24 * time.Hour)}, false, "up", "signatures"},
 		{"exactly at the threshold", &gate{clamdUp: true, loaded: "1", loadedBuilt: now.Add(-24 * time.Hour), freshclam: "failed"}, false, "up", "signatures"},
 	}
 	for _, c := range cases {
@@ -100,5 +107,50 @@ func TestGate(t *testing.T) {
 	g := gate{clamdUp: true, loaded: "1", loadedBuilt: now, freshclam: "pending", freshHours: 0, now: func() time.Time { return now }}
 	if g.Status().Ready {
 		t.Error("SIG_FRESH_HOURS=0 let a database through without an update")
+	}
+}
+
+// A long-lived instance whose updates keep failing after one success goes not_ready once that
+// success is SIG_FRESH_HOURS old (review M1), and a later success opens the gate again.
+func TestUpdatesExpire(t *testing.T) {
+	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	g := &gate{clamdUp: true, loaded: "100", loadedBuilt: now.Add(-30 * time.Hour), freshclam: "pending", freshHours: 24,
+		now: func() time.Time { return now }}
+	results := []error{nil}
+	reloads := 0
+	u := &updater{
+		g:         g,
+		run:       func() error { r := results[0]; results = results[1:]; return r },
+		diskDaily: func() string { return "100" },
+		reload:    func(string) { reloads++ },
+	}
+	if g.Status().Ready {
+		t.Fatal("a 30 h old bake was ready before any update")
+	}
+	u.once()
+	if !g.Status().Ready || g.Status().Freshclam != "ok" {
+		t.Fatalf("not ready after a successful update: %+v", g.Status())
+	}
+	for h := 2; h < 24; h += 2 {
+		now = now.Add(2 * time.Hour)
+		results = append(results, errors.New("rate limited"))
+		u.once()
+		if st := g.Status(); !st.Ready || st.Freshclam != "failed" {
+			t.Fatalf("%d h after the update: %+v", h, st)
+		}
+	}
+	now = now.Add(2 * time.Hour) // 24 h after the last success
+	results = append(results, errors.New("rate limited"))
+	u.once()
+	if st := g.Status(); st.Ready || st.NotReady != "signatures" {
+		t.Fatalf("24 h after the last success, updates failing: %+v", st)
+	}
+	results = append(results, nil)
+	u.once()
+	if !g.Status().Ready {
+		t.Fatal("a new successful update did not open the gate")
+	}
+	if reloads != 2 {
+		t.Fatalf("reload called %d times, want once per successful update", reloads)
 	}
 }

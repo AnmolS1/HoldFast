@@ -76,6 +76,20 @@ expect() {
   ok "$name → $status $(jq -c '[.reason, .signatures, .pua]' <<<"$body") sha256 = shasum"
 }
 
+# expect_not_clean <file>: any verdict but clean (and the right sha256) — for objects whose content
+# clamd could not fully inspect.
+expect_not_clean() {
+  local file="$1" body want name
+  name="$(basename "$file")"
+  body="$(scan "$file")"
+  want="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+  if [ "$(cat "$work/code")" != 200 ] || [ "$(jq -r .status <<<"$body")" = clean ] || [ "$(jq -r .sha256 <<<"$body")" != "$want" ]; then
+    bad "$name → $(cat "$work/code") $body (want anything but clean)"
+  else
+    ok "$name → $(jq -c '[.status, .reason, .signatures, .pua]' <<<"$body") (not clean)"
+  fi
+}
+
 # The fixtures are built in the image (make-fixtures.sh); copy them out to send them from here.
 names+=(hf-clamav-fx-copy)
 docker create --platform linux/amd64 --name hf-clamav-fx-copy "$image" >/dev/null
@@ -86,6 +100,12 @@ head -c 100000000 /dev/urandom >"$work/random-100mb.bin"
 
 echo "== shipped config (+ the private test signatures)"
 start hf-clamav-fx
+# clamd logs nothing about PUA at start-up; clamconf reads the effective config.
+if grep -qx 'DetectPUA disabled' <<<"$(docker exec hf-clamav-fx clamconf -c /etc/clamav)"; then
+  ok "clamconf: DetectPUA disabled"
+else
+  bad "clamconf does not show DetectPUA disabled"
+fi
 expect "$fx/clean.txt" clean
 expect "$fx/eicar.com" infected Eicar-Test-Signature
 expect "$fx/eicar.zip" infected Eicar-Test-Signature
@@ -95,8 +115,14 @@ expect "$fx/password.zip" encrypted Heuristics.Encrypted.
 expect "$fx/marker-end.bin" infected Holdfast.Test.Marker
 expect "$fx/no-marker.bin" clean
 expect "$work/random-100mb.bin" clean
-# PUA: informational alone, and never masking real malware in the same object (either member order).
-expect "$fx/pua-only.zip" clean "" PUA.Holdfast.TestSample
+# PUA (review B1): DetectPUA is off, and a PUA.* name that still comes back (a private signature
+# fires under DetectPUA no) is never clean — it may be the one name hiding an unscanned member.
+expect "$fx/nest17-eicar.zip" limits_exceeded Heuristics.Limits.Exceeded.
+expect_not_clean "$fx/pua-only.zip"
+for other in password enceicar bomb-20 nest17-eicar; do
+  expect_not_clean "$fx/$other-then-pua.zip"
+  expect_not_clean "$fx/pua-then-$other.zip"
+done
 expect "$fx/pua-then-eicar.zip" infected Eicar-Test-Signature
 expect "$fx/eicar-then-pua.zip" infected Eicar-Test-Signature
 # Control: with an ordinary signature the first member's match is the answer, so the two PUA cases

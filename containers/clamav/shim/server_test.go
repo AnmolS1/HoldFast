@@ -275,7 +275,7 @@ func TestSmallBoundaryUsesTheSmallSlots(t *testing.T) {
 func TestLargeScanRefusedWithoutSpoolSpace(t *testing.T) {
 	size := SmallScanBytes + 1
 	for _, free := range []func() (int64, error){
-		func() (int64, error) { return size + SpoolMargin - 1, nil },
+		func() (int64, error) { return size + ExtractAllowance + SpoolMargin - 1, nil },
 		func() (int64, error) { return 0, errors.New("statfs failed") },
 	} {
 		e := &fakeEngine{reply: "stream: OK"}
@@ -293,7 +293,7 @@ func TestLargeScanRefusedWithoutSpoolSpace(t *testing.T) {
 	}
 	// Exactly enough space: accepted.
 	s := newServer(&fakeEngine{reply: "stream: OK"})
-	s.FreeTmp = func() (int64, error) { return size + SpoolMargin, nil }
+	s.FreeTmp = func() (int64, error) { return size + ExtractAllowance + SpoolMargin, nil }
 	if rec := post(t, s.Handler(), strconv.FormatInt(size, 10), bytes.NewReader(make([]byte, size))); rec.Code != 200 {
 		t.Fatalf("enough space: %d", rec.Code)
 	}
@@ -331,5 +331,26 @@ func TestScanIsPostOnly(t *testing.T) {
 	newServer(&fakeEngine{}).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/scan", nil))
 	if rec.Code != 405 {
 		t.Fatalf("GET /scan: %d", rec.Code)
+	}
+}
+
+// clamd extracts archive members into /scan-tmp too (measured: a 1.8 MB zip of zeros used 1.86 GB
+// there), so every scan — small ones included — needs room for one extracted member of up to
+// MaxFileSize beyond its own spool (review m8).
+func TestSmallScanRefusedWithoutExtractionSpace(t *testing.T) {
+	need := int64(3) + ExtractAllowance + SpoolMargin
+	e := &fakeEngine{reply: "stream: OK"}
+	s := newServer(e)
+	s.FreeTmp = func() (int64, error) { return need - 1, nil }
+	body := &countingBody{r: strings.NewReader("abc")}
+	if rec := post(t, s.Handler(), "3", body); rec.Code != 503 || rec.Header().Get("X-Scan-Status") != "busy" || e.calls.Load() != 0 || body.read.Load() != 0 {
+		t.Fatalf("small scan without extraction space: %d calls %d read %d", rec.Code, e.calls.Load(), body.read.Load())
+	}
+	s.FreeTmp = func() (int64, error) { return need, nil }
+	if rec := post(t, s.Handler(), "3", strings.NewReader("abc")); rec.Code != 200 {
+		t.Fatalf("small scan with exactly enough space: %d", rec.Code)
+	}
+	if ExtractAllowance != 2_097_152_000 {
+		t.Fatalf("ExtractAllowance %d is not clamd.conf's MaxFileSize 2000M", ExtractAllowance)
 	}
 }

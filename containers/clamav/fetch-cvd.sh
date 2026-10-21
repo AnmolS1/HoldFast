@@ -6,8 +6,8 @@
 #   containers/clamav/fetch-cvd.sh            (Docker must be running; on a Mac export DOCKER_CONTEXT first)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-base="$(sed -n 's/^ARG CLAMAV_BASE=//p' "$here/Dockerfile")"
-[ -n "$base" ] || { echo "fetch-cvd: no ARG CLAMAV_BASE in $here/Dockerfile" >&2; exit 1; }
+base="$(sed -n 's/^FROM \(clamav\/clamav:[^ ]*\) AS runtime$/\1/p' "$here/Dockerfile")"
+[ -n "$base" ] || { echo "fetch-cvd: no 'FROM clamav/clamav:… AS runtime' line in $here/Dockerfile" >&2; exit 1; }
 mkdir -p "$here/cvd"
 docker run --rm --platform linux/amd64 -v "$here/cvd:/var/lib/clamav" --entrypoint sh "$base" -c \
   'chown clamav:clamav /var/lib/clamav && freshclam --stdout --foreground --config-file=/etc/clamav/freshclam.conf'
