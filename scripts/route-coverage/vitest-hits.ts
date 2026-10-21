@@ -10,6 +10,7 @@
 // orchestrator's seam edit). It wraps `Hono`, a library — this file imports no application code
 // (a setup module that did would bind the app's modules before a test's own `vi.mock`).
 import { afterAll, afterEach, expect, vi } from "vitest";
+import type { RouteHandler } from "./handler-hit";
 import type { Hit } from "./routes";
 
 declare module "vitest" {
@@ -25,31 +26,14 @@ const bucket = ((globalThis as unknown as Record<string, Bucket>)[KEY] ??= { hit
 vi.mock("hono", async (importOriginal) => {
   const hono = await importOriginal<typeof import("hono")>();
   const shared = (globalThis as unknown as Record<string, Bucket>)["__holdfastRouteHits"]!;
-  type Handler = (c: import("hono").Context, next: () => Promise<void>) => unknown;
+  const { wrapRouteHandler } = await import("./handler-hit");
+  const testFile = () =>
+    String(expect.getState().testPath ?? "").replace(/^.*\/tests\/unit\//, "tests/unit/");
   /** The route's own handler (the LAST one given), wrapped: a hit is recorded when it runs. */
   const wrapLast = (args: unknown[]): unknown[] => {
     const index = args.findLastIndex((arg) => typeof arg === "function");
     if (index === -1) return args;
-    const handler = args[index] as Handler;
-    const wrapped: Handler = async (c, next) => {
-      const url = new URL(c.req.url);
-      const hit: Hit = {
-        source: "vitest",
-        // The test origins (tests/setup/test-vars.ts): files.localhost is the files host.
-        host: url.hostname.startsWith("files.") ? "files" : url.pathname.startsWith("/api/") ? "app" : null,
-        method: c.req.method.toUpperCase(),
-        path: url.pathname,
-        status: 0,
-        handler: true,
-        file: String(expect.getState().testPath ?? "").replace(/^.*\/tests\/unit\//, "tests/unit/"),
-      };
-      shared.hits.push(hit);
-      try {
-        return await handler(c, next);
-      } finally {
-        hit.status = c.res?.status ?? 0;
-      }
-    };
+    const wrapped = wrapRouteHandler(args[index] as RouteHandler, (hit) => shared.hits.push(hit), testFile);
     return [...args.slice(0, index), wrapped, ...args.slice(index + 1)];
   };
   /**

@@ -49,7 +49,9 @@ export function PreviewRoute() {
   // that is another page's entry, and the replace would put the preview back in its place
   // (EXECUTION 2026-10-21 12:10). So it is written only while the router is on THIS entry and is not
   // on its way to another address; a navigation to this same address (our own replace re-running
-  // the frame's loader) is ours and does not hold it back.
+  // the frame's loader) is ours and does not hold it back. Accepted (review D4): a POP to ANOTHER
+  // history entry with the same URL would pass as well — our own replace gets a fresh key, so the
+  // pending key cannot tell the two apart; such a POP is rare and only lets a write land there.
   const here = location.pathname + location.search;
   const onEntry = useCallback(() => {
     if (router === undefined) return true;
