@@ -16,6 +16,7 @@ import { accountEpoch, deletionStatusQuery, refreshSession, sameAccount, useSess
 import { startZip } from "../explorer";
 import { cancelDeletion, fetchExport } from "./api";
 import { requestDeletion } from "./auth-calls";
+import { notIncludedText } from "./not-included";
 import { saveBlob } from "./download";
 import { t } from "./strings";
 import { failureText } from "./failures";
@@ -60,7 +61,7 @@ function ZipPart() {
   const onZip = async () => {
     setBusy(true);
     // The engine says how it ended (the toast, the ribbon); the truncation is said there and here.
-    await startZip({ allOwned: true }, "holdfast-everything");
+    await startZip({ allOwned: true }, "holdfast-everything", { notIncluded: notIncludedText });
     setBusy(false);
   };
   return (

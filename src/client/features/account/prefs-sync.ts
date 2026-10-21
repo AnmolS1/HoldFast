@@ -1,7 +1,8 @@
 // The preferences sync (lib/prefs.ts `registerPrefsSync`), registered for the account that is
 // signed in — once per account, from this feature's entry module.
 //
-// It follows the session query: when a session names an account the sync is not registered for,
+// It follows the session query: when the server's session answer names an account the sync is not
+// registered for,
 // the server copy is loaded and wins, and from then on each change is saved to the server
 // debounced (lib/prefs.ts). An account change purges first (lib/query.ts `adoptIdentity`): the
 // purge drops the sync and any save still waiting (lib/prefs.ts's own purger, and this file's),
@@ -10,7 +11,7 @@
 import type { PrefsDto } from "../../../shared/schemas/account";
 import { registerUserStatePurger, type SessionShape } from "../../lib/contracts";
 import { registerPrefsSync, type Prefs, type PrefsSync } from "../../lib/prefs";
-import { getCachedSession, getKnownUserId, queryClient, sessionQuery } from "../../lib/query";
+import { getKnownUserId, queryClient, sessionQuery } from "../../lib/query";
 import { patchPrefs, prefsQuery } from "./api";
 
 const toPrefs = (dto: PrefsDto): Prefs => ({
@@ -59,9 +60,11 @@ export function startPrefsSync(): void {
   started = true;
   queryClient.getQueryCache().subscribe((event) => {
     if (event.type !== "updated" || event.query.queryKey[0] !== sessionQuery.queryKey[0]) return;
-    follow(event.query.state.data as SessionShape | undefined);
+    // A session the SERVER answered (lib/query.ts `fetchSession`, which adopts the identity
+    // first) — not a value written into the cache by hand (a sign-out's null, a test's seed).
+    if (event.action.type !== "success" || event.action.manual) return;
+    follow(event.action.data as SessionShape | undefined);
   });
-  follow(getCachedSession());
 }
 
 /** Forget the account: the next session answer registers the sync again. */

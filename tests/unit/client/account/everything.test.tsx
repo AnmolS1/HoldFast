@@ -6,6 +6,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { startZip } from "../../../../src/client/features/explorer";
 import { resetZipForTests } from "../../../../src/client/features/explorer/zip";
+import { notIncludedText } from "../../../../src/client/features/account/not-included";
 import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { purgeUserState } from "../../../../src/client/lib/query";
 import { buildRoutes } from "../../../../src/client/router";
@@ -78,9 +79,17 @@ function serve(
   return { calls, order };
 }
 
-function captureBlob(): void {
-  vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: () => "blob:zip", revokeObjectURL: () => {} }));
+function captureBlob(): { saved: Blob[] } {
+  const saved: Blob[] = [];
+  vi.stubGlobal(
+    "URL",
+    Object.assign(URL, {
+      createObjectURL: (blob: Blob) => (saved.push(blob), "blob:zip"),
+      revokeObjectURL: () => {},
+    }),
+  );
   vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+  return { saved };
 }
 
 describe("Download everything", () => {
@@ -113,6 +122,24 @@ describe("Download everything", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Download everything" }));
     await waitFor(() => expect(calls.filter((call) => call.path.startsWith("/d/"))).toHaveLength(3));
     expect(zips.map((call) => call.body)).toEqual([{ allOwned: true }]);
+  });
+
+  it("the zip carries _not_included.txt: every file left out and why, and that it holds the first 10,000 only", async () => {
+    const { saved } = captureBlob();
+    serve(3, { truncated: true });
+    const result = await startZip({ allOwned: true }, "holdfast-everything", {
+      notIncluded: notIncludedText,
+    });
+    expect(result.outcome).toBe("saved");
+    // client-zip stores without compression: the archive's bytes hold each name and text as is.
+    const archive = await saved[0]!.text();
+    expect(archive).toContain("_not_included.txt");
+    expect(archive).toContain("Not included in this zip\n\nfolder/pending.txt — still being scanned\n");
+    expect(archive).toContain("This zip holds the first 10,000 files of your account, not all of them.");
+    // The explorer's own zips stay as they were: no such file unless asked for.
+    const plain = await startZip({ allOwned: true }, "plain");
+    expect(plain.outcome).toBe("saved");
+    expect(await saved[1]!.text()).not.toContain("_not_included.txt");
   });
 
   it(`a ${ZIP_MAX_ENTRIES}-file manifest with a slow consumer: ${ZIP_MAX_ENTRIES / ZIP_URL_BATCH} windows of ${ZIP_URL_BATCH}, each minted only when the stream reaches it`, async () => {

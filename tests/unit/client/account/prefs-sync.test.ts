@@ -5,7 +5,7 @@ import { waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetPrefsSync, startPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { getPrefs, setPrefs, SYNC_DEBOUNCE_MS } from "../../../../src/client/lib/prefs";
-import { adoptIdentity, purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
+import { purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
 import { json, mockFetch, sessionOf, setupShell, type MockCall } from "../shell/helpers";
 
@@ -28,6 +28,12 @@ const prefsOf = (patch: Record<string, unknown>) => ({
 function server(start: Record<string, Record<string, unknown>>) {
   const stored = new Map(Object.entries(start).map(([id, patch]) => [id, prefsOf(patch)]));
   const calls = mockFetch((call: MockCall) => {
+    if (call.path === "/api/auth/get-session")
+      return json(
+        browserSession
+          ? sessionOf({ id: browserSession, email: `${browserSession.slice(0, 4)}@example.com` })
+          : null,
+      );
     const who = new Headers(call.headers).get(IDENTITY_HEADER) ?? "";
     if (call.path === "/api/account/prefs" && call.method === "GET") return json(stored.get(who));
     if (call.path === "/api/account/prefs" && call.method === "PATCH") {
@@ -40,16 +46,18 @@ function server(start: Record<string, Record<string, unknown>>) {
   return { calls, stored };
 }
 
-/** What the session query would hold after the session was read as `id`. */
+let browserSession: string | null = null;
+
+/** The browser is signed in as `id` now, and the shell reads its session (lib/query.ts). */
 async function signedInAs(id: string) {
-  const session = sessionOf({ id, email: `${id.slice(0, 4)}@example.com` });
-  await adoptIdentity(session);
-  queryClient.setQueryData(sessionQuery.queryKey, session);
+  browserSession = id;
+  await queryClient.fetchQuery({ ...sessionQuery, staleTime: 0 });
 }
 
 const patches = (calls: MockCall[]) => calls.filter((call) => call.method === "PATCH");
 
 beforeEach(() => {
+  browserSession = null;
   resetPrefsSync();
   startPrefsSync();
 });
@@ -115,7 +123,9 @@ describe("the preferences sync", () => {
     const { calls } = server({ [A]: {} });
     await signedInAs(A);
     await waitFor(() => expect(calls.filter((call) => call.path === "/api/account/prefs")).toHaveLength(1));
-    queryClient.setQueryData(sessionQuery.queryKey, null);
+    // The session read as nobody (it ended; no purge yet), then the same account again.
+    browserSession = null;
+    await queryClient.fetchQuery({ ...sessionQuery, staleTime: 0 });
     await signedInAs(A);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(calls.filter((call) => call.path === "/api/account/prefs")).toHaveLength(1);
@@ -137,5 +147,14 @@ describe("the preferences sync", () => {
     );
     setPrefs({ viewMode: "grid" });
     await waitFor(() => expect(patches(calls)).toHaveLength(1), { timeout: SYNC_DEBOUNCE_MS * 4 });
+  });
+});
+
+describe("what the sync follows", () => {
+  it("a session written into the cache by hand (a seed, a sign-out's null) registers nothing", async () => {
+    const { calls } = server({ [A]: {} });
+    queryClient.setQueryData(sessionQuery.queryKey, sessionOf({ id: A }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).toEqual([]);
   });
 });
