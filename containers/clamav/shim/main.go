@@ -41,7 +41,7 @@ func loadConfig() config {
 	return config{
 		ClamdConf:     env("CLAMD_CONF", "/etc/clamav/clamd.conf"),
 		FreshclamConf: "/etc/clamav/freshclam.conf",
-		Socket:        "/run/clamav/clamd.sock",
+		Socket:        "/scanner-run/clamd.sock", // clamd.conf LocalSocket: not under /run (a fresh mount at boot)
 		DBDir:         "/var/lib/clamav",
 		TmpDir:        "/scan-tmp",
 		FreshHours:    hours,

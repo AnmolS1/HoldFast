@@ -93,7 +93,7 @@ COPY clamd.conf freshclam.conf /etc/clamav/
 COPY --from=shim /out/hf-scanner /usr/local/bin/hf-scanner
 COPY --chown=clamav:clamav cvd/main.cvd cvd/daily.cvd cvd/bytecode.cvd /var/lib/clamav/
 RUN install -d -o clamav -g clamav -m 750 /scan-tmp \
- && install -d -o clamav -g clamav -m 755 /run/clamav
+ && install -d -o clamav -g clamav -m 750 /scanner-run
 USER clamav
 EXPOSE 8080
 ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/hf-scanner"]
