@@ -53,7 +53,8 @@ const policy = (files: string, sentry: string | null, https: boolean) =>
     ...(https ? ["upgrade-insecure-requests"] : []),
   ].join("; ");
 
-const hostsIn = (csp: string) => [...new Set([...csp.matchAll(/https?:\/\/[^\s;]+/g)].map((m) => m[0]))].sort();
+const hostsIn = (csp: string) =>
+  [...new Set([...csp.matchAll(/https?:\/\/[^\s;]+/g)].map((m) => m[0]))].sort();
 
 describe("buildCsp", () => {
   it("is the task's policy, for each of the three environment shapes", () => {
@@ -76,13 +77,20 @@ describe("buildCsp", () => {
       expect(hostsIn(csp), name).toEqual([...origins(shape), "https://challenges.cloudflare.com"].sort());
       for (const [other, otherShape] of Object.entries(SHAPES)) {
         if (other === name) continue;
-        for (const origin of origins(otherShape)) expect(csp, `${name} names ${other}'s ${origin}`).not.toContain(origin);
+        for (const origin of origins(otherShape))
+          expect(csp, `${name} names ${other}'s ${origin}`).not.toContain(origin);
       }
     }
   });
 
   it("an unset or unparseable SENTRY_DSN_WEB leaves the Sentry source out — never a wider one", () => {
-    for (const dsn of ["", "not a url", "o123.ingest.sentry.io", "javascript:alert(1)", "data:text/plain,x"]) {
+    for (const dsn of [
+      "",
+      "not a url",
+      "o123.ingest.sentry.io",
+      "javascript:alert(1)",
+      "data:text/plain,x",
+    ]) {
       const csp = buildCsp({ ...DEV, SENTRY_DSN_WEB: dsn }, NONCE);
       const connect = csp.split("; ").find((directive) => directive.startsWith("connect-src"));
       expect(connect, dsn).toBe(`connect-src 'self' ${DEV.FILES_ORIGIN} https://challenges.cloudflare.com`);
@@ -129,7 +137,9 @@ describe("the SPA shell", () => {
     expect(csp).toContain(`style-src 'self' 'nonce-${nonce}' 'report-sample'`);
     const html = await response.text();
 
-    const tags = [...html.matchAll(/<(?:script|style|link rel="modulepreload")[\s>][^>]*>?/g)].map((m) => m[0]);
+    const tags = [...html.matchAll(/<(?:script|style|link rel="modulepreload")[\s>][^>]*>?/g)].map(
+      (m) => m[0],
+    );
     expect(tags).toHaveLength(6);
     for (const tag of tags) expect(tag).toContain(`nonce="${nonce}"`);
     // A nonce that came with the content is replaced, never kept.
@@ -159,7 +169,11 @@ describe("the SPA shell", () => {
     const { response } = await appCall("/", { env: { ASSETS: shellAssets() } });
     const nonce = nonceOfHeader(response.headers.get("content-security-policy") ?? "");
     const planted = new HTMLRewriter()
-      .on("body", { element: (body) => body.append("<script>planted()</script>", { html: true }) })
+      .on("body", {
+        element: (body) => {
+          body.append("<script>planted()</script>", { html: true });
+        },
+      })
       .transform(response);
     const html = await planted.text();
     const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
@@ -183,10 +197,14 @@ describe("the SPA shell", () => {
     const etag = direct.headers.get("etag");
     await direct.text();
     expect(etag).toBeTruthy();
-    const revalidated = await env.ASSETS.fetch(`${TEST_APP_ORIGIN}/files`, { headers: { "if-none-match": etag! } });
+    const revalidated = await env.ASSETS.fetch(`${TEST_APP_ORIGIN}/files`, {
+      headers: { "if-none-match": etag! },
+    });
     expect(revalidated.status, "the binding itself answers 304").toBe(304);
     await revalidated.text();
-    const conditional = await exports.default.fetch(`${TEST_APP_ORIGIN}/files`, { headers: { "if-none-match": etag! } });
+    const conditional = await exports.default.fetch(`${TEST_APP_ORIGIN}/files`, {
+      headers: { "if-none-match": etag! },
+    });
     expect(conditional.status).toBe(200);
     const nonce = nonceOfHeader(conditional.headers.get("content-security-policy") ?? "");
     expect(await conditional.text()).toContain(`<meta name="csp-nonce" content="${nonce}">`);
@@ -195,7 +213,9 @@ describe("the SPA shell", () => {
 
 const script = (contentType = "text/javascript") => ({
   fetch: async () =>
-    new Response("export {}", { headers: { "content-type": contentType, "cache-control": "public, max-age=0" } }),
+    new Response("export {}", {
+      headers: { "content-type": contentType, "cache-control": "public, max-age=0" },
+    }),
 });
 
 describe("/assets/ scripts carry the policy too (a worker runs under its own script's header)", () => {
@@ -207,8 +227,12 @@ describe("/assets/ scripts carry the policy too (a worker runs under its own scr
     ] as const) {
       const { response } = await appCall(path, { env: { ASSETS: script(type) } });
       const csp = response.headers.get("content-security-policy") ?? "";
-      expect(csp, path).toMatch(/^default-src 'self'; script-src 'nonce-[A-Za-z0-9+/]{22}==' 'strict-dynamic' 'wasm-unsafe-eval'/);
-      expect(csp, path).toContain("connect-src 'self' http://files.localhost https://challenges.cloudflare.com");
+      expect(csp, path).toMatch(
+        /^default-src 'self'; script-src 'nonce-[A-Za-z0-9+/]{22}==' 'strict-dynamic' 'wasm-unsafe-eval'/,
+      );
+      expect(csp, path).toContain(
+        "connect-src 'self' http://files.localhost https://challenges.cloudflare.com",
+      );
       expect(response.headers.get("reporting-endpoints"), path).toBe('csp="/api/public/csp-report"');
       expect(response.headers.get("cache-control"), path).toBe("public, max-age=31536000, immutable");
       expect(await response.text(), path).toBe("export {}");
