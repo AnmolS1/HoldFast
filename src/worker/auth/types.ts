@@ -29,7 +29,8 @@ export type SessionUser = {
 
   // Additional fields.
   quotaBytes: number;
-  usedBytes: number;
+  /** Not in a session answer (`returned: false`, auth/fields.ts): read the counter from the database. */
+  usedBytes?: number;
   ageVerifiedAt?: Date | null;
   termsAcceptedAt?: Date | null;
   termsVersion?: string | null;

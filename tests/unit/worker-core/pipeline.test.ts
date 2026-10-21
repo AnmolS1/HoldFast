@@ -631,18 +631,19 @@ describe("impersonation is read-only", () => {
   it("fills route parameters with values their patterns accept", async () => {
     const router = new Hono<AppEnv>();
     router.post(`/nodes/:id{${UUID_PARAM}}/copy`, (c) => c.json({ reached: "copy" }));
-    router.delete(`/account/sessions/:id{${BA_ID_PARAM}}`, (c) => c.json({ reached: "session" }));
+    router.delete(`/account/sessions-probe/:id{${BA_ID_PARAM}}`, (c) => c.json({ reached: "session" }));
     const fake = fakeCore();
     fake.state.settings = { termsVersion: "2026-10-01" };
     const app = appWith(fake, { extraRouters: [router] });
     // The two routes this test adds (the real routers have parameterised routes of their own).
     const routes = app.routes.filter(
       (route) =>
-        route.path.includes(":") && /^\/api\/(nodes\/[^/]+\/copy$|account\/sessions\/)/.test(route.path),
+        route.path.includes(":") &&
+        /^\/api\/(nodes\/[^/]+\/copy$|account\/sessions-probe\/)/.test(route.path),
     );
     expect(routes.map((route) => `${route.method} ${concrete(route.path)}`)).toEqual([
       "POST /api/nodes/0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e/copy",
-      "DELETE /api/account/sessions/aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL",
+      "DELETE /api/account/sessions-probe/aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL",
     ]);
     // Signed in normally they are reached; impersonated they are refused.
     for (const [who, expected] of [

@@ -95,7 +95,6 @@ describe("tokens with restricted use", () => {
 // deliberate — folders of different Wave-2 tasks are never on neighbouring lines, so two tasks
 // deleting their lines do not meet in a merge. Keep it when adding a line.
 const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
-  account: ["routes.tsx"],
   admin: ["routes.tsx"],
   dmca: ["routes.tsx"],
   interstitial: ["index.ts", "routes.tsx"],

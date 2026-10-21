@@ -575,6 +575,14 @@ export function buildHooks(scope: AuthScope) {
     if (ctx.request) scope.facts.endpointPath = path ?? null;
     if (typeof path !== "string") return;
     if (path.startsWith("/admin/")) await adminGate(scope, ctx);
+    // Better Auth's own session list hands the browser every session's token and IP address. The
+    // account page lists them through GET /api/account/sessions (no token, no address), so a
+    // signed-in caller gets a 404 here; without a session Better Auth answers its own 401
+    // (T23 review m4). Matched on the path as Better Auth's router read it: no spelling slips by.
+    if (path === "/list-sessions" && ctx.request) {
+      const session = await getSessionFromCtx(ctx, { disableCookieCache: true }).catch(() => null);
+      if (session) throw new APIError("NOT_FOUND", { code: "NOT_FOUND", message: "Not found" });
+    }
     if (OWN_MAIL_PATHS.has(path) && ctx.request) scope.facts.ownAddress = await ownAddressOf(scope, ctx);
     if (path === "/verify-email" && ctx.request) await beforeVerifyEmail(scope, ctx);
     if (TWO_FACTOR_MANAGE_PATHS.has(path)) await beforeTwoFactorManage(scope, ctx);

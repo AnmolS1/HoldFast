@@ -87,7 +87,7 @@ describe("deletion banner", () => {
     await waitFor(() => expect(banner()).not.toBeNull());
     await waitFor(() => expect(router.state.location.search).toBe("?tab=x"));
     expect(router.state.location.pathname).toBe("/account");
-    expect(document.querySelector('[data-placeholder-page="Account"]')).not.toBeNull();
+    expect(document.querySelector("[data-account-page]")).not.toBeNull();
     expect(
       calls.filter((call) => call.path === "/api/account/deletion-status").length,
     ).toBeGreaterThanOrEqual(1);

@@ -59,7 +59,7 @@ const DESTINATIONS: Destination[] = [
   { path: "/trash", title: "Trash", nav: "trash", placeholder: false },
   { path: "/search?q=tax", title: "Search", placeholder: false },
   { path: "/storage", title: "Storage", placeholder: false },
-  { path: "/account/security", title: "Account", placeholder: true },
+  { path: "/account/security", title: "Account", placeholder: false },
   { path: "/preview/node-1", title: "Preview", overlay: true, placeholder: false },
   { path: "/admin/users", title: "Admin", placeholder: true },
 ];
@@ -299,7 +299,9 @@ test.describe("navigation", () => {
       "Sign out",
     ]);
     await sheet.getByText("Account settings").click();
-    await expect(placeholder(page, "Account")).toBeVisible();
+    await expect(
+      page.locator("[data-account-page]").getByRole("navigation", { name: "Account sections" }),
+    ).toBeVisible();
     await expect(page.locator('[data-bottom-nav-item="account"]')).toHaveAttribute("aria-current", "page");
   });
 

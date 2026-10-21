@@ -70,7 +70,7 @@ import {
   zipManifest,
   type ZipRoot,
 } from "../db/queries/nodes-api";
-import { usageBreakdown } from "../db/queries/quota";
+import { deletedKeptBytes, holderUsage, usageBreakdown } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node, ScanStatus } from "../db/schema";
@@ -338,9 +338,13 @@ router.post("/nodes/download-urls", async (c) => {
 
 router.get("/account/usage", async (c) => {
   const user = requireVerified(c);
-  const usage = await usageBreakdown(db(c), user.id);
+  const [usage, kept] = await Promise.all([usageBreakdown(db(c), user.id), deletedKeptBytes(db(c), user.id)]);
   if (!usage) throw new AppError("not_found");
-  return c.json(usage satisfies UsageDto);
+  // What the account holder is shown never reveals a hold (T23 brief Addenda 2-5): a root they
+  // deleted for good is gone to them, whatever still keeps it — so it is left out here, and the
+  // figure is the one quota is enforced against (quota.ts `holderUsage`: past the backstop, full).
+  // The operator's figure keeps the stored counter.
+  return c.json(holderUsage(usage, kept) satisfies UsageDto);
 });
 
 // ── by id: read ─────────────────────────────────────────────────────────────────────────────

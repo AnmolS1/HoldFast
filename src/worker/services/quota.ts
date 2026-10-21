@@ -8,6 +8,7 @@
 import type { Executor } from "../db/client";
 import * as quota from "../db/queries/quota";
 import { AppError } from "./errors";
+import { metric } from "./metrics";
 
 /** What an editor is told when the tree they upload into is full: it is not their own storage. */
 export const OWNER_FULL_MESSAGE = "The owner's storage is full.";
@@ -20,6 +21,9 @@ export async function reserve(
   opts: { forEditor: boolean },
 ): Promise<void> {
   if (await quota.reserve(tx, ownerId, bytes)) return;
+  // Refused past the kept-bytes backstop (db/queries/quota.ts): the answer is a full account's, nothing
+  // else; the operator learns it from the metric (T23 brief Addendum 4).
+  if (await quota.keptBackstopReached(tx, ownerId)) metric("upload", { outcome: "hold_backstop" });
   throw new AppError("quota_exceeded", opts.forEditor ? OWNER_FULL_MESSAGE : undefined);
 }
 

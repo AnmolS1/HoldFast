@@ -4,7 +4,7 @@
 import { downloadZip } from "client-zip";
 import { useSyncExternalStore } from "react";
 import { ZIP_MAX_ENTRIES, ZIP_URL_BATCH } from "../../../shared/constants";
-import type { ZipEntry, ZipManifest } from "../../../shared/schemas/node";
+import type { ZipEntry, ZipManifest, ZipManifestBody } from "../../../shared/schemas/node";
 import { toast } from "../../components/Toaster";
 import { publish } from "../../components/TransferRibbon";
 import { ApiError } from "../../lib/api";
@@ -233,8 +233,22 @@ export function limitedSentence(missing: string[]): string {
     : t("explorer.zip.limitedShort.many", { count: missing.length, list: named(missing) });
 }
 
-/** Every manifest of a selection, asked for ZIP_MANIFEST_ROOTS roots at a time and merged. */
-async function readManifest(nodeIds: readonly string[], signal: AbortSignal): Promise<ZipManifest> {
+/**
+ * Every manifest of a selection, asked for ZIP_MANIFEST_ROOTS roots at a time and merged — or, for
+ * `{ allOwned: true }` ("Download everything", the account page), the one manifest of the caller's
+ * whole tree.
+ */
+async function readManifest(
+  source: readonly string[] | ZipManifestBody,
+  signal: AbortSignal,
+): Promise<ZipManifest> {
+  if (!Array.isArray(source)) {
+    const body = source as ZipManifestBody;
+    return body.allOwned === true
+      ? zipManifest({ allOwned: true }, signal)
+      : readManifest(body.nodeIds, signal);
+  }
+  const nodeIds = source as readonly string[];
   const merged: ZipManifest = { entries: [], totalBytes: 0, skipped: [], truncated: false };
   const seen = new Set<string>();
   for (let start = 0; start < nodeIds.length; start += ZIP_MANIFEST_ROOTS) {
@@ -257,12 +271,29 @@ async function readManifest(nodeIds: readonly string[], signal: AbortSignal): Pr
   return merged;
 }
 
+/** The text file a zip may carry about what it does not hold. */
+export const NOT_INCLUDED_FILE = "_not_included.txt";
+
+export interface ZipOptions {
+  /**
+   * The text of NOT_INCLUDED_FILE, written as the archive's last entry — or null for none. Called
+   * once the files are in, with what the manifest left out and whether it was cut at
+   * ZIP_MAX_ENTRIES. Without it (the explorer's own zips) the archive holds the files only.
+   */
+  notIncluded?(what: Pick<ZipResult, "leftOut" | "truncated">): string | null;
+}
+
 /**
- * Zip the given files and folders into one download. `suggestedName` is the archive's name
- * without the extension. Never throws: every way it can end is a `ZipOutcome` and at most one
- * toast — none at all once the account that started it is no longer the one signed in.
+ * Zip the given files and folders — or, given `{ allOwned: true }`, everything the caller owns —
+ * into one download. `suggestedName` is the archive's name without the extension. Never throws:
+ * every way it can end is a `ZipOutcome` and at most one toast — none at all once the account
+ * that started it is no longer the one signed in.
  */
-export async function startZip(nodeIds: readonly string[], suggestedName: string): Promise<ZipResult> {
+export async function startZip(
+  nodeIds: readonly string[] | ZipManifestBody,
+  suggestedName: string,
+  options: ZipOptions = {},
+): Promise<ZipResult> {
   const then = accountEpoch();
   const mine = () => sameAccount(then);
   const result: ZipResult = { outcome: "failed", leftOut: [], missing: [], truncated: false };
@@ -494,6 +525,17 @@ export async function startZip(nodeIds: readonly string[], suggestedName: string
           }),
         );
         yield { name, lastModified: new Date(entry.modifiedAt), input: counted };
+      }
+      // What the manifest left out, as a file in the archive itself (when the caller asks).
+      const notIncluded = options.notIncluded?.({ leftOut: result.leftOut, truncated: result.truncated });
+      if (notIncluded) {
+        signal.throwIfAborted();
+        yield {
+          name: uniqueZipPath(NOT_INCLUDED_FILE, names),
+          lastModified: new Date(),
+          // Bytes, not a string: client-zip reads a string through Blob.stream().
+          input: new TextEncoder().encode(notIncluded),
+        };
       }
     }
 

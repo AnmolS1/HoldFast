@@ -223,7 +223,8 @@ describe("a suspended account cannot start a session", () => {
     );
     expect((await send(client, "/api/account/deletion-status")).status).toBe(200);
     expect((await send(client, "/api/auth/update-user", { json: { name: "Renamed" } })).status).toBe(200);
-    expect((await send(client, "/api/auth/list-sessions")).status).toBe(200);
+    // An auth read in good standing (/list-sessions answers a session 404 since T23 review m4).
+    expect((await send(client, "/api/auth/list-accounts")).status).toBe(200);
     expect((await userById(row.id))!.name).toBe("Renamed");
   });
 
