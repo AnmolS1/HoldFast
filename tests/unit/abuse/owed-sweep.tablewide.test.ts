@@ -11,7 +11,11 @@ import { and, eq } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
-import { CSAM_NODE_OWED_ACTION, owedSessions } from "../../../src/worker/db/queries/abuse";
+import {
+  CSAM_NODE_OWED_ACTION,
+  OWED_ATTEMPTS_PER_DAY,
+  owedSessions,
+} from "../../../src/worker/db/queries/abuse";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { deleteForUser, sealedIpOf } from "../../../src/worker/db/queries/uploads";
 import {
@@ -23,7 +27,7 @@ import {
   uploads,
   user as userTable,
 } from "../../../src/worker/db/schema";
-import { job, settleOwedSession, sweepOwedNodes } from "../../../src/worker/jobs/abuse-hourly";
+import { job, owedHooks, settleOwedSession, sweepOwedNodes } from "../../../src/worker/jobs/abuse-hourly";
 import { GENERATION_KEY } from "../../../src/worker/jobs/reconcile";
 import { extOf, nameKeyOf } from "../../../src/worker/services/filename";
 import { keyFor } from "../../../src/worker/services/storage";
@@ -47,6 +51,7 @@ const ROLLBACK = Symbol("rollback");
 /** Before every other row: what a limit of one reaches first. */
 const LONG_AGO = new Date(Date.UTC(1971, 0, 1));
 const MINUTE = 60_000;
+const TODAY = () => new Date().toISOString().slice(0, 10);
 
 afterEach(async () => {
   // In step again for the next case (a case may have put the store "ahead" of the database).
@@ -186,7 +191,7 @@ async function sweepOnce(db: Db, envOverride: Record<string, unknown> = {}) {
 }
 
 describe("the listing", () => {
-  it("lists a completing session older than 60 minutes with an owed audit row OR a csam-listed declared hash; not a young one, nor one whose declared hash is listed for another reason", async () => {
+  it("lists a completing session older than 60 minutes with an owed audit row OR a declared hash listed with ANY reason (Addendum 3 m5); not a young one, nor one whose declared hash is not listed", async () => {
     await rolledBack(async (db) => {
       const withRow = await owed(db, { stored: "csam", owedRow: true });
       const declaredOnly = await owed(db, { stored: null, declared: "other-csam" });
@@ -196,12 +201,14 @@ describe("the listing", () => {
         completingAt: new Date(Date.now() - 30 * MINUTE),
       });
       const malware = await owed(db, { stored: "malware" });
-      const listed = await owedSessions(db, 1_000_000);
+      const unlisted = await owed(db, { stored: null });
+      const listed = await owedSessions(db, 1_000_000, TODAY());
       const ids = listed.map((entry) => entry.session.id);
       expect(ids).toContain(withRow.session.id);
       expect(ids).toContain(declaredOnly.session.id);
+      expect(ids).toContain(malware.session.id);
       expect(ids).not.toContain(young.session.id);
-      expect(ids).not.toContain(malware.session.id);
+      expect(ids).not.toContain(unlisted.session.id);
       expect(listed.find((e) => e.session.id === withRow.session.id)!.owedRow).toBe(true);
       expect(listed.find((e) => e.session.id === declaredOnly.session.id)!.owedRow).toBe(false);
     });
@@ -467,16 +474,119 @@ describe("the declared hash is never acted on: the server's decides", () => {
     }
   });
 
-  it("an owed ROW whose bytes are no longer listed as csam: reported (owed_not_csam), then the server hash decides (here: stale)", async () => {
+  it("Addendum 3 m1: an owed ROW (the server proved csam) whose bytes are no longer listed as csam — or whose object is gone — is left UNTOUCHED: nothing deleted, nobody struck, the session completing; ONE critical operator alert per session, not one per run", async () => {
     await rolledBack(async (db) => {
-      const made = await owed(db, { stored: null, declared: "other-csam", owedRow: true });
-      const { result, ctx } = await sweepOnce(db);
-      expect(result).toMatchObject({ stale: 1 });
+      const ops = operators();
+      const unlisted = await owed(db, { stored: "malware", declared: "other-csam", owedRow: true });
+      const { result, ctx } = await sweepOnce(db, ops.env);
+      expect(result).toMatchObject({ held: 1, refused: 0, stale: 0 });
       expect(ctx.metric.mock.calls).toContainEqual([
         "job",
         { kind: "abuse-hourly", outcome: "error", reason: "owed_not_csam" },
       ]);
+      expect(await read.session(db, unlisted.session.id)).toMatchObject({ status: "completing" });
+      expect(await exists(unlisted.session.r2Key)).toBe(true);
+      expect(await db.select().from(strikes).where(eq(strikes.userId, unlisted.uploader.id))).toEqual([]);
+      expect((await read.user(db, unlisted.owner.id)).usedBytes).toBe(unlisted.bytes.byteLength);
+      expect(criticalMails(ops.address)).toHaveLength(1);
+      expect(JSON.stringify(criticalMails(ops.address)[0])).toContain(unlisted.session.id);
+      // Again: still untouched, and nobody is told twice.
+      expect((await sweepOnce(db, ops.env)).result).toMatchObject({ held: 1 });
+      expect(criticalMails(ops.address)).toHaveLength(1);
+      expect(await exists(unlisted.session.r2Key)).toBe(true);
+    });
+    await rolledBack(async (db) => {
+      const ops = operators();
+      const gone = await owed(db, { stored: "csam", owedRow: true, noObject: true });
+      expect((await sweepOnce(db, ops.env)).result).toMatchObject({ held: 1 });
+      expect(await read.session(db, gone.session.id)).toMatchObject({ status: "completing" });
+      expect(criticalMails(ops.address)).toHaveLength(1);
+    });
+  });
+
+  it("Addendum 3 m5: a DECLARED hash listed as malware over stored bytes listed as malware (no owed row) → the route's refusal (aborted, struck, object deleted)", async () => {
+    await rolledBack(async (db) => {
+      const made = await owed(db, { stored: "malware" });
+      expect((await sweepOnce(db)).result).toMatchObject({ refused: 1 });
       expect(await read.session(db, made.session.id)).toMatchObject({ status: "aborted" });
+      expect(await db.select().from(strikes).where(eq(strikes.userId, made.uploader.id))).toHaveLength(1);
+      expect(await exists(made.session.r2Key)).toBe(false);
+    });
+  });
+});
+
+describe("an entry listed between the sweep's lookup and its act (review M1, m3)", () => {
+  afterEach(() => {
+    owedHooks.afterLookup = null;
+  });
+
+  it("M1: path (3) — the bytes were not listed at the lookup and are listed as csam before the act: the re-check under the row lock leaves the session and its object (skipped), and the next run locks it", async () => {
+    await rolledBack(async (db) => {
+      const made = await owed(db, { stored: null, declared: "other-csam", multipart: true });
+      owedHooks.afterLookup = async (session, sha256) => {
+        if (session.id === made.session.id && sha256) await blocklist.upsert(db, { sha256, reason: "csam" });
+      };
+      expect((await sweepOnce(db)).result).toMatchObject({ skipped: 1, stale: 0 });
+      expect(await read.session(db, made.session.id)).toMatchObject({ status: "completing" });
+      expect(await exists(made.session.r2Key)).toBe(true);
+      owedHooks.afterLookup = null;
+      expect((await sweepOnce(db)).result).toMatchObject({ locked: 1 });
+      expect(await read.nodesOnKey(db, made.session.r2Key)).toHaveLength(1);
+      expect(await exists(made.session.r2Key)).toBe(true);
+    });
+  });
+
+  it("m3: path (2) — the bytes were listed as malware at the lookup and raised to csam before the refusal: nothing deleted, nobody struck, and the SAME run locks the node", async () => {
+    await rolledBack(async (db) => {
+      const made = await owed(db, { stored: "malware", declared: "other-csam" });
+      owedHooks.afterLookup = async (session, sha256) => {
+        if (session.id === made.session.id && sha256) await blocklist.upsert(db, { sha256, reason: "csam" });
+      };
+      expect((await sweepOnce(db)).result).toMatchObject({ locked: 1, refused: 0 });
+      expect(await exists(made.session.r2Key)).toBe(true);
+      expect(await db.select().from(strikes).where(eq(strikes.userId, made.uploader.id))).toEqual([]);
+      const [node] = await read.nodesOnKey(db, made.session.r2Key);
+      expect(node).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    });
+  });
+});
+
+describe("a session that never resolves cannot hold the head of the list (review m6)", () => {
+  afterEach(() => {
+    owedHooks.afterLookup = null;
+  });
+
+  it(`after ${OWED_ATTEMPTS_PER_DAY} attempts in a day it is off the list until the next day, and the operators are told ONCE that it is stuck`, async () => {
+    await rolledBack(async (db) => {
+      const ops = operators();
+      const stuck = await owed(db, { stored: "csam", owedRow: true });
+      const stuckMails = () =>
+        criticalMails(ops.address).filter((m) => JSON.stringify(m).includes(stuck.session.id));
+      owedHooks.afterLookup = async (session) => {
+        if (session.id === stuck.session.id) throw new Error("test: this session fails every time");
+      };
+      for (let i = 0; i < OWED_ATTEMPTS_PER_DAY; i++) {
+        expect((await sweepOnce(db, ops.env)).result).toMatchObject({ failed: 1 });
+      }
+      const ids = (await owedSessions(db, 1_000_000, TODAY())).map((entry) => entry.session.id);
+      expect(ids).not.toContain(stuck.session.id);
+      expect(stuckMails()).toHaveLength(1);
+      // Another session behind it is reached now.
+      owedHooks.afterLookup = null;
+      const next = await owed(db, {
+        stored: "csam",
+        owedRow: true,
+        completingAt: new Date(Date.UTC(1972, 0, 1)),
+      });
+      expect((await sweepOnce(db, ops.env)).result).toMatchObject({ locked: 1 });
+      expect(await read.nodesOnKey(db, next.session.r2Key)).toHaveLength(1);
+      // The next day it is listed again.
+      expect(
+        (await owedSessions(db, 1_000_000, new Date(Date.now() + 86_400_000).toISOString().slice(0, 10))).map(
+          (e) => e.session.id,
+        ),
+      ).toContain(stuck.session.id);
+      expect(stuckMails()).toHaveLength(1);
     });
   });
 });
@@ -485,7 +595,9 @@ describe("decided again under the row's lock (standing check a)", () => {
   it("a session that moved on between the listing and the act (finished meanwhile) is skipped and not written to", async () => {
     await rolledBack(async (db) => {
       const made = await owed(db, { stored: "csam", owedRow: true });
-      const [listed] = (await owedSessions(db, 1_000_000)).filter((e) => e.session.id === made.session.id);
+      const [listed] = (await owedSessions(db, 1_000_000, TODAY())).filter(
+        (e) => e.session.id === made.session.id,
+      );
       await db.update(uploads).set({ status: "done" }).where(eq(uploads.id, made.session.id));
       const ctx = jobContext({ db });
       expect(await settleOwedSession(ctx.bg, listed!, async () => true)).toBe("skipped");
@@ -497,7 +609,7 @@ describe("decided again under the row's lock (standing check a)", () => {
     await rolledBack(async (db) => {
       const refused = await owed(db, { stored: "malware", declared: "other-csam" });
       const stale = await owed(db, { stored: null, declared: "other-csam", multipart: true });
-      const listed = (await owedSessions(db, 1_000_000)).filter((e) =>
+      const listed = (await owedSessions(db, 1_000_000, TODAY())).filter((e) =>
         [refused.session.id, stale.session.id].includes(e.session.id),
       );
       expect(listed).toHaveLength(2);

@@ -40,6 +40,11 @@
 import { getNode, keyReference } from "../db/queries/nodes";
 import * as blocklist from "../db/queries/blocklist";
 import {
+  OWED_ALERTED_ACTION,
+  OWED_ATTEMPTS_PER_DAY,
+  owedAlerted,
+  owedAttemptMarker,
+  findingMarker,
   busyLinksLastHour,
   busyNewUploadersLastHour,
   guessedLinksLastHour,
@@ -49,7 +54,7 @@ import {
   ownersNearEgressCap,
   suspendedForStrikesSince,
 } from "../db/queries/abuse";
-import { addUsageIfUnder, utcDay } from "../db/queries/ledger";
+import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import { insertReport, type ReportInput } from "../db/queries/moderation";
 import { release } from "../db/queries/quota";
 import { markAborted, markDone, sealedIpOf } from "../db/queries/uploads";
@@ -66,7 +71,7 @@ import {
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { effectiveLimits } from "../services/ceilings";
-import { sendAdminDigest } from "../services/email";
+import { sendAdminDigest, sendOperatorCritical } from "../services/email";
 import type { BackgroundContext } from "../services/request-context";
 import { lockSuspectedCsam, sweepCsamAlerts, sweepUnrecordedCsamLocks } from "../services/scanning";
 import { adminListOf } from "../services/signup-policy";
@@ -123,8 +128,13 @@ export type OwedResult = {
   refused: number;
   /** Not listed, or no object: ended as a stale session. */
   stale: number;
-  /** Moved on meanwhile, or left for the next run (a delete not allowed now). */
+  /** Moved on meanwhile, or listed since the lookup: left for the next run. */
   skipped: number;
+  /**
+   * Proved csam by the route (its owed row) but no longer listed as csam, or its object gone:
+   * left untouched for an operator — never deleted or struck automatically (Addendum 3, m1).
+   */
+  held: number;
   failed: number;
 };
 
@@ -269,6 +279,41 @@ async function endStale(
 }
 
 /**
+ * TEST SEAM: awaited between the server hash's lookup and the act on it — where an entry listed
+ * by someone else meanwhile has to be noticed again under the row's lock. Null in production.
+ */
+export const owedHooks: { afterLookup: ((session: Upload, sha256: string | null) => Promise<void>) | null } =
+  {
+    afterLookup: null,
+  };
+
+/**
+ * The critical operator alert about one owed session, ONCE per session and reason: sent first,
+ * then recorded (`upload.owed_alerted`) only when it reached someone — so a mail that reached
+ * nobody is tried again the next time. (The record goes with the audit retention: a session
+ * still stuck after it is announced again — on purpose.)
+ */
+async function alertOnce(
+  bg: BackgroundContext,
+  uploadId: string,
+  kind: "owed_not_csam" | "stuck",
+): Promise<void> {
+  if (await owedAlerted(bg.db, uploadId, kind)) return;
+  let reached = 0;
+  for (const to of adminListOf(bg.env).addresses) {
+    const outcome = await sendOperatorCritical(bg, { to, event: "csam_lock", id: uploadId }).catch(
+      () => "failed" as const,
+    );
+    if (outcome === "sent") reached += 1;
+  }
+  if (reached === 0) {
+    bg.metric("job", { kind: KIND, outcome: "error", reason: `owed_alert_${kind}` });
+    return;
+  }
+  audit(bg, OWED_ALERTED_ACTION, { type: "upload", id: uploadId }, { kind, recipients: reached });
+}
+
+/**
  * One listed session: hashed from the stored bytes, then the server hash decides. Exported for the
  * tests that change the row between the listing and this call.
  */
@@ -287,14 +332,19 @@ export async function settleOwedSession(
     return "failed";
   }
   const hit = sha256 === null ? null : await blocklist.lookup(bg.db, sha256);
-  if (listed.owedRow && hit?.reason !== "csam") {
-    // The route found these bytes listed as csam; the list (or the object) says otherwise now.
+  if (owedHooks.afterLookup) await owedHooks.afterLookup(session, sha256);
+  if (listed.owedRow && (sha256 === null || hit?.reason !== "csam")) {
+    // The SERVER proved these bytes csam when the route owed the node; the list (or the object)
+    // says otherwise now. Nothing is deleted or struck on that: the session is left as it is and
+    // the operators are told, once — a person decides (Addendum 3, m1).
     captureError(new Error("owed session: the stored bytes are not listed as csam"), {
       kind: "job",
       job: KIND,
       reason: "owed_not_csam",
     });
     bg.metric("job", { kind: KIND, outcome: "error", reason: "owed_not_csam" });
+    await alertOnce(bg, session.id, "owed_not_csam");
+    return "held";
   }
   if (sha256 !== null && hit?.reason === "csam") return preserveOwed(bg, session, sha256);
   if (sha256 !== null && hit)
@@ -308,18 +358,40 @@ export async function sweepOwedNodes(
   opts: { limit?: number; stopAt?: number } = {},
 ): Promise<OwedResult> {
   const limit = Math.max(1, Math.min(opts.limit ?? ABUSE_HOURLY_LIMITS.owedNodes, 1_000));
-  const listed = await owedSessions(bg.db, limit);
-  const result: OwedResult = { checked: 0, locked: 0, refused: 0, stale: 0, skipped: 0, failed: 0 };
+  const day = utcDay(new Date());
+  const listed = await owedSessions(bg.db, limit, day);
+  const result: OwedResult = { checked: 0, locked: 0, refused: 0, stale: 0, skipped: 0, held: 0, failed: 0 };
   const mayDelete = destroyGate(bg);
   for (const entry of listed) {
     if (opts.stopAt !== undefined && Date.now() >= opts.stopAt) break;
     result.checked += 1;
+    const marker = owedAttemptMarker(entry.session.id);
+    // Counted BEFORE the attempt: a session that kills the attempt is counted all the same.
+    await addUsageIfUnder(
+      bg.db,
+      day,
+      "notice",
+      marker,
+      { bytes: 0, count: 1 },
+      { count: OWED_ATTEMPTS_PER_DAY },
+    );
+    let outcome: Outcome;
     try {
-      result[await settleOwedSession(bg, entry, mayDelete)] += 1;
+      outcome = await settleOwedSession(bg, entry, mayDelete);
     } catch (error) {
       // One session must not stop the ones behind it; it is found again next run.
-      result.failed += 1;
       captureError(error, { kind: "job", job: KIND, reason: "owed_node" });
+      outcome = "failed";
+    }
+    result[outcome] += 1;
+    // Its last try of the day and still not settled: off the list until tomorrow, and the
+    // operators are told once that it is stuck.
+    if (outcome === "skipped" || outcome === "failed") {
+      if ((await totalsOn(bg.db, day, "notice", marker)).count >= OWED_ATTEMPTS_PER_DAY) {
+        await alertOnce(bg, entry.session.id, "stuck").catch((error: unknown) =>
+          captureError(error, { kind: "job", job: KIND, reason: "owed_alert" }),
+        );
+      }
     }
   }
   return result;
@@ -327,8 +399,7 @@ export async function sweepOwedNodes(
 
 // ── (b) anomaly reporting ───────────────────────────────────────────────────────────────────
 
-/** A day's "already reported" marker of one finding (ledger subject `notice`). */
-export const findingMarker = (kind: string, id: string) => `digest:${kind}:${id}`;
+export { findingMarker };
 
 /**
  * Files one finding — once per subject per UTC day: the day's marker is claimed and the report
@@ -399,6 +470,7 @@ export async function reportAnomalies(bg: BackgroundContext, at: Date = new Date
 
   for (const link of await busyLinksLastHour(
     bg.db,
+    day,
     ANOMALY.linkDownloadsPerHour,
     ANOMALY.linkAddressesPerHour,
     limit,
@@ -428,6 +500,7 @@ export async function reportAnomalies(bg: BackgroundContext, at: Date = new Date
   const days = newAccountDays(bg.env, stored.ceilings as Record<string, number> | undefined);
   for (const uploader of await busyNewUploadersLastHour(
     bg.db,
+    day,
     days,
     ANOMALY.newAccountUploadsPerHour,
     limit,
@@ -442,7 +515,7 @@ export async function reportAnomalies(bg: BackgroundContext, at: Date = new Date
     }
   }
 
-  for (const link of await guessedLinksLastHour(bg.db, ANOMALY.passwordAddressesPerHour, limit)) {
+  for (const link of await guessedLinksLastHour(bg.db, day, ANOMALY.passwordAddressesPerHour, limit)) {
     if (
       await fileFinding(bg, day, findingMarker("link_password", link.linkId), {
         ownerId: link.ownerId,

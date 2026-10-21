@@ -6,7 +6,7 @@
 // NOTHING HERE ENDS A SESSION, writes a report or pauses a link: those writes are T05's helpers,
 // called by the route and the job. This module reads, and takes locks.
 
-import { and, asc, eq, gt, gte, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, gt, gte, inArray, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { downloadLedger, nodes, reports, type Upload, uploads, user } from "../schema";
@@ -79,23 +79,54 @@ const STALE = sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) < now(
 const HAS_OWED_ROW = sql`EXISTS (SELECT 1 FROM audit_log a
   WHERE a.action = ${CSAM_NODE_OWED_ACTION} AND a.target_type = 'upload' AND a.target_id = ${uploads.id}::text)`;
 
+/** Attempts the repair sweep makes on one session in one UTC day before it stops listing it. */
+export const OWED_ATTEMPTS_PER_DAY = 3;
+
+/** The day's attempt counter of one owed session (ledger subject `notice`). */
+export const owedAttemptMarker = (uploadId: string) => `owed_attempt:${uploadId}`;
+
 /**
  * The sessions the repair sweep owns: `completing`, older than `COMPLETING_STALE_MINUTES` on the
- * clock `uploads.expired` uses (a request still hashing is never raced), and EITHER carrying an
- * `upload.csam_node_owed` audit row OR owing a locked node by their declared hash
- * (`owesLockedNode()`). Oldest first, at most `limit`. `owedRow`: the audit row exists.
+ * clock `uploads.expired` uses (a request still hashing is never raced), and `owesLockedNode()` —
+ * a hash on the session listed with any reason, or the route's `upload.csam_node_owed` row.
+ * Oldest first, at most `limit` — leaving out a session the sweep has already tried
+ * OWED_ATTEMPTS_PER_DAY times on `day` (one that never resolves must not hold the head of the
+ * list against the ones behind it; it is tried again the next day). `owedRow`: the audit row exists.
  */
 export async function owedSessions(
   db: Executor,
   limit: number,
+  day: string,
 ): Promise<Array<{ session: Upload; owedRow: boolean }>> {
   const rows = await db
     .select({ session: uploads, owedRow: sql<boolean>`${HAS_OWED_ROW}` })
     .from(uploads)
-    .where(and(eq(uploads.status, "completing"), STALE, sql`(${owesLockedNode()} OR ${HAS_OWED_ROW})`))
+    .where(
+      and(
+        eq(uploads.status, "completing"),
+        STALE,
+        owesLockedNode(),
+        sql`NOT EXISTS (SELECT 1 FROM download_ledger t
+          WHERE t.day = ${day}::date AND t.subject_type = 'notice'
+            AND t.subject_id = 'owed_attempt:' || ${uploads.id}::text
+            AND t.count >= ${OWED_ATTEMPTS_PER_DAY})`,
+      ),
+    )
     .orderBy(asc(sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt})`), asc(uploads.id))
     .limit(limit);
   return rows.map((row) => ({ session: row.session, owedRow: row.owedRow === true }));
+}
+
+/** The action of the once-per-session operator alert the repair sweep writes when it sends one. */
+export const OWED_ALERTED_ACTION = "upload.owed_alerted";
+
+/** Has the sweep already told the operators about this session, for this reason? */
+export async function owedAlerted(db: Executor, uploadId: string, kind: string): Promise<boolean> {
+  const result = await db.execute<{ found: boolean }>(sql`
+    SELECT EXISTS (SELECT 1 FROM audit_log a
+      WHERE a.action = ${OWED_ALERTED_ACTION} AND a.target_type = 'upload'
+        AND a.target_id = ${uploadId} AND a.meta ->> 'kind' = ${kind}) AS found`);
+  return result.rows[0]?.found === true;
 }
 
 /**
@@ -115,6 +146,19 @@ export async function lockOwedSession(tx: Executor, uploadId: string): Promise<U
 }
 
 // ── anomaly findings (the hourly job's part (b)) ────────────────────────────────────────────
+
+/** The day's "already reported" marker of one finding: `digest:<kind>:<id>` (ledger subject `notice`). */
+export const findingMarker = (kind: string, id: string) => `digest:${kind}:${id}`;
+
+/**
+ * Not yet reported on `day` — asked IN the query, before its LIMIT, so that subjects reported
+ * earlier in the day do not fill the window and keep a new one from being found.
+ */
+function notReported(kind: string, id: SQL, day: string): SQL {
+  return sql`NOT EXISTS (SELECT 1 FROM download_ledger m
+    WHERE m.day = ${day}::date AND m.subject_type = 'notice'
+      AND m.subject_id = ${"digest:" + kind + ":"} || ${id})`;
+}
 
 /**
  * Owners whose `link_owner` ledger row of `day` is at least half of the smaller of the two caps
@@ -143,6 +187,7 @@ export async function ownersNearEgressCap(
         eq(downloadLedger.subjectType, "link_owner"),
         gt(downloadLedger.bytes, 0),
         sql`${downloadLedger.bytes} * 2 >= ${minCapBytes}::bigint`,
+        notReported("download_owner", sql`${downloadLedger.subjectId}`, day),
       ),
     )
     .orderBy(sql`${downloadLedger.bytes} DESC`, asc(downloadLedger.subjectId))
@@ -156,6 +201,7 @@ export async function ownersNearEgressCap(
  */
 export async function busyLinksLastHour(
   db: Executor,
+  day: string,
   maxDownloads: number,
   maxAddresses: number,
   limit: number,
@@ -178,6 +224,7 @@ export async function busyLinksLastHour(
           OR count(DISTINCT ip_hash_daily) > ${maxAddresses}
     ) l
     JOIN share_links s ON s.id = l.link_id
+    WHERE ${notReported("link_traffic", sql`l.link_id::text`, day)}
     ORDER BY l.downloads DESC, l.link_id
     LIMIT ${limit}`);
   return result.rows.map((r) => ({
@@ -203,6 +250,7 @@ export async function linkCreatorsOn(
         eq(downloadLedger.day, day),
         eq(downloadLedger.subjectType, "link_user"),
         gt(downloadLedger.count, max),
+        notReported("link_creation", sql`${downloadLedger.subjectId}`, day),
       ),
     )
     .orderBy(sql`${downloadLedger.count} DESC`, asc(downloadLedger.subjectId))
@@ -216,6 +264,7 @@ export async function linkCreatorsOn(
  */
 export async function busyNewUploadersLastHour(
   db: Executor,
+  day: string,
   newAccountDays: number,
   max: number,
   limit: number,
@@ -226,6 +275,7 @@ export async function busyNewUploadersLastHour(
     JOIN "user" a ON a.id = u.uploader_id
     WHERE u.created_at > now() - interval '1 hour'
       AND a.created_at > now() - make_interval(days => ${newAccountDays})
+      AND ${notReported("new_account_uploads", sql`u.uploader_id`, day)}
     GROUP BY u.uploader_id
     HAVING count(*) > ${max}
     ORDER BY uploads DESC, user_id
@@ -240,6 +290,7 @@ export async function busyNewUploadersLastHour(
  */
 export async function guessedLinksLastHour(
   db: Executor,
+  day: string,
   maxAddresses: number,
   limit: number,
 ): Promise<Array<{ linkId: string; ownerId: string; addresses: number }>> {
@@ -253,6 +304,7 @@ export async function guessedLinksLastHour(
       HAVING count(DISTINCT ip_hash_stable) > ${maxAddresses}
     ) p
     JOIN share_links s ON s.id = p.link_id
+    WHERE ${notReported("link_password", sql`p.link_id::text`, day)}
     ORDER BY p.addresses DESC, p.link_id
     LIMIT ${limit}`);
   return result.rows.map((r) => ({ linkId: r.link_id, ownerId: r.owner_id, addresses: Number(r.addresses) }));
@@ -282,7 +334,8 @@ export async function suspendedForStrikesSince(
 /**
  * For each owner, their address and name and the name of ONE of the given nodes (the first in
  * `nodeIds` order that still exists) — what the "link available again" mail needs. Owners with
- * no such node, or no row, are left out.
+ * no such node, or no row, are left out. The link's creator is matched to the node's OWNER: v1's
+ * links are always made by the owner, so a link whose creator is not (none exist) mails nobody.
  */
 export async function availableAgainRecipients(
   db: Executor,
