@@ -6,10 +6,10 @@
 // NOTHING HERE ENDS A SESSION, writes a report or pauses a link: those writes are T05's helpers,
 // called by the route and the job. This module reads, and takes locks.
 
-import { and, asc, eq, gt, gte, sql } from "drizzle-orm";
+import { and, asc, eq, gt, gte, inArray, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import { downloadLedger, reports, type Upload, uploads, user } from "../schema";
+import { downloadLedger, nodes, reports, type Upload, uploads, user } from "../schema";
 import { COMPLETING_STALE_MINUTES, owesLockedNode } from "./uploads";
 
 /** The audit action the upload route writes when a preserved node could not be written. */
@@ -275,4 +275,30 @@ export async function suspendedForStrikesSince(
     .orderBy(asc(user.id))
     .limit(limit);
   return rows.map((row) => row.id);
+}
+
+// ── the midnight job ────────────────────────────────────────────────────────────────────────
+
+/**
+ * For each owner, their address and name and the name of ONE of the given nodes (the first in
+ * `nodeIds` order that still exists) — what the "link available again" mail needs. Owners with
+ * no such node, or no row, are left out.
+ */
+export async function availableAgainRecipients(
+  db: Executor,
+  byOwner: Array<{ ownerId: string; nodeIds: string[] }>,
+): Promise<Array<{ ownerId: string; email: string; name: string | null; itemName: string }>> {
+  const out: Array<{ ownerId: string; email: string; name: string | null; itemName: string }> = [];
+  for (const { ownerId, nodeIds } of byOwner) {
+    const ids = nodeIds.filter(isUuid);
+    if (ids.length === 0) continue;
+    const rows = await db
+      .select({ email: user.email, name: user.name, nodeId: nodes.id, itemName: nodes.name })
+      .from(user)
+      .innerJoin(nodes, eq(nodes.ownerId, user.id))
+      .where(and(eq(user.id, ownerId), inArray(nodes.id, ids)));
+    const first = ids.map((id) => rows.find((row) => row.nodeId === id)).find((row) => row !== undefined);
+    if (first) out.push({ ownerId, email: first.email, name: first.name, itemName: first.itemName });
+  }
+  return out;
 }
