@@ -17,7 +17,7 @@ import {
   owedSessions,
 } from "../../../src/worker/db/queries/abuse";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
-import { deleteForUser, sealedIpOf } from "../../../src/worker/db/queries/uploads";
+import { deleteForUser, remainingForUser, sealedIpOf } from "../../../src/worker/db/queries/uploads";
 import {
   auditLog,
   nodes,
@@ -511,6 +511,20 @@ describe("the declared hash is never acted on: the server's decides", () => {
       expect(await read.session(db, made.session.id)).toMatchObject({ status: "aborted" });
       expect(await db.select().from(strikes).where(eq(strikes.userId, made.uploader.id))).toHaveLength(1);
       expect(await exists(made.session.r2Key)).toBe(false);
+    });
+  });
+});
+
+describe("m5 and the account purge (Addendum 3, 14:15)", () => {
+  it("a leaving user's malware-declared completing session: the purge keeps it (it is not the stale job's), the sweep refuses it, and then the purge takes it — the user row can go", async () => {
+    await rolledBack(async (db) => {
+      const made = await owed(db, { stored: "malware" });
+      await deleteForUser(db, made.uploader.id);
+      expect(await read.session(db, made.session.id)).toMatchObject({ status: "completing" });
+      expect(await remainingForUser(db, made.uploader.id)).toBe(1);
+      expect((await sweepOnce(db)).result).toMatchObject({ refused: 1 });
+      await deleteForUser(db, made.uploader.id);
+      expect(await remainingForUser(db, made.uploader.id)).toBe(0);
     });
   });
 });
