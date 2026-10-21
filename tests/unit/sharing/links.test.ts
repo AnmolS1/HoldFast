@@ -318,6 +318,12 @@ describe("DELETE /links/:id — decided by who created the link (Addendum 6)", (
     expect(await testDb().select().from(linkAccessLog).where(eq(linkAccessLog.linkId, made.id))).toHaveLength(
       1,
     );
+    // And access ended: a hold keeps rows, it does not keep the link serving.
+    const visit = await api(null, `/public/links/${made.url!.slice(made.url!.lastIndexOf("/") + 1)}`);
+    expect([visit.status, (visit.body as { details?: { reason?: string } }).details?.reason]).toEqual([
+      410,
+      "revoked",
+    ]);
   });
 
   it("anyone but the creator gets 404, like an unknown id — the link untouched", async () => {
