@@ -2,8 +2,8 @@
 // bytes are ABOVE `KEPT_MAX_QUOTAS` × their quota — the same expression `keptBackstopReached` and
 // `reserve` use. The database is shared: the listing is read with a large limit and only this
 // file's own accounts are looked at.
-import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { eq, inArray } from "drizzle-orm";
+import { afterAll, describe, expect, it } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import {
   KEPT_MAX_QUOTAS,
@@ -16,6 +16,16 @@ import { makeFile, makeFolder, makeUser, testDb } from "../services-core/helpers
 const QUOTA = 1_000;
 
 /** An account with a deleted-for-good folder holding `fileBytes`, plus a kept old version. */
+const requestedFolders: string[] = [];
+
+// Out of the backstop again: every account left past it is one more the backup's alarm (and
+// every later run of this listing) has to walk.
+afterAll(async () => {
+  if (requestedFolders.length) {
+    await testDb().update(nodes).set({ purgeRequestedAt: null }).where(inArray(nodes.id, requestedFolders));
+  }
+});
+
 async function accountKeeping(fileBytes: number, versionBytes: number, requested = true) {
   const owner = await makeUser({ quotaBytes: QUOTA });
   const folder = await makeFolder(owner.id);
@@ -36,6 +46,7 @@ async function accountKeeping(fileBytes: number, versionBytes: number, requested
       .update(nodes)
       .set({ deletedAt: new Date(), purgeRequestedAt: new Date() })
       .where(eq(nodes.id, folder.id));
+    requestedFolders.push(folder.id);
   }
   return owner.id;
 }
