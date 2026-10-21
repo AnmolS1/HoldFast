@@ -18,6 +18,9 @@
 //             session read the shell makes in every route guard and on every window focus:
 //             people behind one address would otherwise spend each other's sign-in attempts.
 //   RL_API    by user (`u:<id>`) when signed in, else by client address, on every /api/* path
+//             but the CSP report endpoint, which spends a bucket of its own (`csp:<address>`, in
+//             routes/csp-report.ts): a page with a repeating violation must not use up its
+//             address's budget for the rest of the API (a public link page behind one NAT)
 //
 // THE PATH AND THE METHOD are the canonical ones (middleware/canonical.ts): that step has already
 // answered 404 to anything that is not, byte for byte, a path in canonical form, and to anything
@@ -63,6 +66,9 @@ export function ipKey(ip: string): string {
   return `ip:${normalise(ip)}`;
 }
 
+/** Limited by its own bucket in its route (see the header). */
+const CSP_REPORT_PATH = "/api/public/csp-report";
+
 export const rateLimit: MiddlewareHandler<AppEnv> = async (c, next) => {
   const path = requestPath(c);
   const method = requestMethod(c);
@@ -70,6 +76,7 @@ export const rateLimit: MiddlewareHandler<AppEnv> = async (c, next) => {
   const budget = authBudgetOf(method, path);
   if (budget)
     await enforceRateLimit(c.env, "RL_AUTH", budget === "ip" ? key : `${budget}:${normalise(c.get("ip"))}`);
+  if (path === CSP_REPORT_PATH) return next();
   const user = c.get("user");
   await enforceRateLimit(c.env, "RL_API", user ? `u:${user.id}` : key);
   return next();
