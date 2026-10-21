@@ -12,6 +12,7 @@ import { accountEpoch, sameAccount } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
 import { accountKeys, linkedQuery } from "./api";
 import { AUTH_CODES, changePassword, linkGoogle, unlinkAccount, type AuthFailure } from "./auth-calls";
+import { browserNavigation } from "./navigation";
 import { PasskeysPart } from "./Passkeys";
 import { useSignInAgain } from "./session";
 import { StepUpProvider } from "./StepUp";
@@ -55,7 +56,9 @@ function PasswordPart({ hasPassword }: { hasPassword: boolean }) {
   const queryClient = useQueryClient();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
-  const [revoke, setRevoke] = useState(false);
+  // Checked unless the person unticks it: a password is changed most often because a session is
+  // suspected — that one must not stay signed in (T23 review m1). This browser stays signed in.
+  const [revoke, setRevoke] = useState(true);
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [nextError, setNextError] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
@@ -190,7 +193,7 @@ function LinkedPart({ hasPassword }: { hasPassword: boolean }) {
       refused(result.error);
       return;
     }
-    if (result.data.url) window.location.assign(result.data.url);
+    if (result.data.url) browserNavigation.assign(result.data.url);
   };
 
   const disconnect = async (accountId: string, password?: string) => {

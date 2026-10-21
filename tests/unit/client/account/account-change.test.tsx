@@ -4,6 +4,7 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
+import { browserNavigation } from "../../../../src/client/features/account/navigation";
 import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
 import { adoptIdentity, queryClient, sessionQuery } from "../../../../src/client/lib/query";
@@ -440,5 +441,45 @@ describe("the account changes while a step waits — preferences, password, pass
           calls.filter((call) => call.path === "/api/auth/two-factor/generate-backup-codes"),
         ).toHaveLength(1),
     );
+  });
+
+  it("connecting Google: a consent address that arrives after the account changed is not followed", async () => {
+    const assign = vi.spyOn(browserNavigation, "assign").mockImplementation(() => {});
+    await scenario(
+      "/account/security",
+      {
+        path: (call) => call.path === "/api/auth/link-social",
+        answer: () => json({ url: "https://accounts.google.com/o/oauth2/made-up", redirect: false }),
+      },
+      async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
+        const dialog = await screen.findByRole("dialog");
+        fireEvent.change(within(dialog).getByLabelText("Your password"), {
+          target: { value: "made-up password 1" },
+        });
+        fireEvent.click(within(dialog).getByRole("button", { name: "Connect" }));
+      },
+    );
+    expect(assign).not.toHaveBeenCalled();
+  });
+
+  it("connecting Google for the same account does follow the consent address (the control)", async () => {
+    const assign = vi.spyOn(browserNavigation, "assign").mockImplementation(() => {});
+    scripted({
+      path: () => false,
+      answer: () => json({}),
+      extra: (call) =>
+        call.path === "/api/auth/link-social"
+          ? json({ url: "https://accounts.google.com/o/oauth2/made-up", redirect: false })
+          : undefined,
+    });
+    renderRoutes(buildRoutes(), ["/account/security"]);
+    fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Your password"), {
+      target: { value: "made-up password 1" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith("https://accounts.google.com/o/oauth2/made-up"));
   });
 });

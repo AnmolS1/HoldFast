@@ -214,6 +214,28 @@ describe("profile", () => {
   });
 });
 
+describe("security: password", () => {
+  it("a password change signs out every OTHER device unless the person unticks it", async () => {
+    const calls = api((call) =>
+      call.path === "/api/auth/change-password" ? json({ token: null }) : undefined,
+    );
+    renderRoutes(buildRoutes(), ["/account/security"]);
+    const box = (await screen.findByRole("checkbox", {
+      name: "Sign out of all other devices",
+    })) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "made-up old one 1" } });
+    fireEvent.change(screen.getByLabelText("New password"), {
+      target: { value: "made-up new passphrase 2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    await waitFor(() => expect(calls.some((call) => call.path === "/api/auth/change-password")).toBe(true));
+    expect(calls.find((call) => call.path === "/api/auth/change-password")!.body).toMatchObject({
+      revokeOtherSessions: true,
+    });
+  });
+});
+
 describe("security: step-up", () => {
   const TWO_FACTOR_ON = { user: { id: ME, twoFactorEnabled: true }, session: {} };
 

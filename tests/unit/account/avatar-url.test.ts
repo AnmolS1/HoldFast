@@ -142,4 +142,70 @@ describe("who sees an avatar", () => {
     expect(text(zip)).not.toContain(me.node.id);
     expect(text(zip)).toContain(plain.id);
   });
+
+  it("only an ACTIVE share relationship counts: not one on a trashed, taken-down or deleted-for-good node, nor one of an owner who is suspended or in the deletion window", async () => {
+    const cases: Array<[string, (owner: { id: string }, folderId: string) => Promise<void>]> = [
+      [
+        "trashed",
+        async (_owner, folderId) => {
+          await testDb()
+            .update(nodes)
+            .set({ deletedAt: new Date(), trashedRoot: true })
+            .where(eq(nodes.id, folderId));
+        },
+      ],
+      [
+        "taken down",
+        async (_owner, folderId) => {
+          await takedownNode(testDb(), folderId, { reason: "abuse", by: null });
+        },
+      ],
+      [
+        "deleted for good (held)",
+        async (_owner, folderId) => {
+          await testDb()
+            .update(nodes)
+            .set({ deletedAt: new Date(), trashedRoot: true, purgeRequestedAt: new Date() })
+            .where(eq(nodes.id, folderId));
+        },
+      ],
+      [
+        "owner suspended",
+        async (owner) => {
+          await testDb().update(user).set({ suspendedAt: new Date() }).where(eq(user.id, owner.id));
+        },
+      ],
+      [
+        "owner in the deletion window",
+        async (owner) => {
+          await testDb()
+            .update(user)
+            .set({ deleteScheduledAt: new Date(Date.now() + 86_400_000) })
+            .where(eq(user.id, owner.id));
+        },
+      ],
+    ];
+    for (const [name, spoil] of cases) {
+      const owner = await withAvatar();
+      const grantee = await withAvatar();
+      const folder = await makeFolder(owner.id);
+      await makeShare(folder.id, owner.id, grantee.id);
+      expect((await api(grantee.as, "GET", urlOf(owner.id))).status, `${name}: before`).toBe(200);
+      await spoil(owner, folder.id);
+      expect((await api(grantee.as, "GET", urlOf(owner.id))).status, `${name}: grantee sees owner`).toBe(404);
+      // A suspended owner is refused everything (403) before this route's own rule.
+      if (name !== "owner suspended")
+        expect((await api(owner.as, "GET", urlOf(grantee.id))).status, `${name}: owner sees grantee`).toBe(
+          404,
+        );
+    }
+    // A legal hold changes nothing (it must not be observable).
+    const owner = await withAvatar();
+    const grantee = await withAvatar();
+    const folder = await makeFolder(owner.id);
+    await makeShare(folder.id, owner.id, grantee.id);
+    await testDb().update(user).set({ legalHold: true }).where(eq(user.id, owner.id));
+    await testDb().update(nodes).set({ legalHold: true }).where(eq(nodes.id, folder.id));
+    expect((await api(grantee.as, "GET", urlOf(owner.id))).status).toBe(200);
+  });
 });

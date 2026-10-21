@@ -30,7 +30,8 @@ import {
   type UserPrefs,
 } from "../schema";
 import { notPurgeRequested } from "./trash";
-import { notHiddenRow } from "./tree";
+import { notEffectivelyTrashedOrHidden, notHiddenRow } from "./tree";
+import { ownerIsActive } from "./users";
 
 export type SessionRow = typeof session.$inferSelect;
 
@@ -98,6 +99,31 @@ export async function currentAvatar(
     )
     .limit(1);
   return row ?? null;
+}
+
+/**
+ * True when the two accounts have an ACTIVE share relationship, in either direction: an activated
+ * share from one to the other on a node that is still there for its grantee — not a system node,
+ * not in the trash or taken down (itself or by a folder above), not locked, not deleted for good —
+ * of an owner whose shares still work (not banned, suspended or in the deletion window). A legal
+ * hold changes nothing here: it must not be observable. (Avatar visibility; T05's
+ * `hasShareBetween` counts any activated row — T23 review m3.)
+ */
+export async function activeShareBetween(db: Executor, userA: string, userB: string): Promise<boolean> {
+  if (userA === userB) return true;
+  const result = await db.execute<{ found: boolean }>(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM shares s JOIN nodes ON nodes.id = s.node_id
+      WHERE s.activated_at IS NOT NULL
+        AND ((nodes.owner_id = ${userA} AND s.grantee_user_id = ${userB})
+          OR (nodes.owner_id = ${userB} AND s.grantee_user_id = ${userA}))
+        AND nodes.system IS NULL
+        AND ${notEffectivelyTrashedOrHidden("nodes")}
+        AND nodes.scan_status <> 'suspected_csam'
+        AND ${notPurgeRequested("nodes")}
+        AND ${ownerIsActive(sql`nodes.owner_id`)}
+    ) AS found`);
+  return result.rows[0]?.found === true;
 }
 
 /** The id of the user's current avatar node, or null (no avatar, or no such user). */
@@ -289,35 +315,6 @@ export async function exportUser(db: Executor, userId: string): Promise<ExportUs
   return row ?? null;
 }
 
-/**
- * The bytes `used_bytes` still counts for roots whose permanent deletion was asked for and that a
- * hold kept: the files of those subtrees and their kept old versions — exactly what the purge
- * would have given back (trash.ts `DeletedRows.freedBytes`; an unheld root is purged at once by
- * the request, so for it both are 0). What the ACCOUNT HOLDER is shown — the export's
- * `usedBytes`, `GET /api/account/usage` — leaves them out: to its owner such a root is deleted,
- * and a figure that still counted it would tell a held account apart. The operator's figure and
- * quota enforcement keep the stored counter.
- * (Read by routes/account.ts and by routes/nodes.ts's usage route — T23 brief Addendum 2, Q3.)
- */
-export async function purgeRequestedBytes(
-  db: Executor,
-  userId: string,
-): Promise<{ files: number; versions: number }> {
-  const result = await db.execute<{ files: string; versions: string }>(sql`
-    WITH RECURSIVE asked(id) AS (
-      SELECT n.id FROM nodes n
-      WHERE n.owner_id = ${userId} AND n.purge_requested_at IS NOT NULL
-      UNION
-      SELECT c.id FROM nodes c JOIN asked ON c.parent_id = asked.id
-    )
-    SELECT
-      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
-       WHERE n.kind = 'file' AND n.system IS NULL)::bigint AS files,
-      (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)::bigint AS versions`);
-  const row = result.rows[0];
-  return { files: Number(row?.files ?? 0), versions: Number(row?.versions ?? 0) };
-}
-
 /** The export's node set, as a predicate over `nodes` (see the header). */
 function exportable(userId: string) {
   return and(eq(nodes.ownerId, userId), isNull(nodes.system), notHiddenRow(), notPurgeRequested());
@@ -342,34 +339,105 @@ export type ExportNodeRow = Pick<
 /** Read in pages of this many rows (keyset on the id). */
 export const EXPORT_PAGE = 2_000;
 
-/** Every node of the export, in id order, read a page at a time. */
-export async function exportNodes(db: Executor, userId: string): Promise<ExportNodeRow[]> {
-  const all: ExportNodeRow[] = [];
-  let after: string | null = null;
-  for (;;) {
-    const page: ExportNodeRow[] = await db
-      .select({
-        id: nodes.id,
-        parentId: nodes.parentId,
-        kind: nodes.kind,
-        name: nodes.name,
-        size: nodes.size,
-        mimeSniffed: nodes.mimeSniffed,
-        sha256: nodes.sha256,
-        scanStatus: nodes.scanStatus,
-        starred: nodes.starred,
-        createdAt: nodes.createdAt,
-        updatedAt: nodes.updatedAt,
-        deletedAt: nodes.deletedAt,
-      })
-      .from(nodes)
-      .where(and(exportable(userId), after === null ? undefined : sql`${nodes.id} > ${after}::uuid`))
-      .orderBy(nodes.id)
-      .limit(EXPORT_PAGE);
-    all.push(...page);
-    if (page.length < EXPORT_PAGE) return all;
-    after = page[page.length - 1]!.id;
-  }
+/**
+ * One page of the export's nodes, in id order, after `after` (null: the first page). The export
+ * reads them one page at a time as its body is read (T23 review M3): never the whole tree.
+ */
+export async function exportNodePage(
+  db: Executor,
+  userId: string,
+  after: string | null,
+  limit: number = EXPORT_PAGE,
+): Promise<ExportNodeRow[]> {
+  return db
+    .select({
+      id: nodes.id,
+      parentId: nodes.parentId,
+      kind: nodes.kind,
+      name: nodes.name,
+      size: nodes.size,
+      mimeSniffed: nodes.mimeSniffed,
+      sha256: nodes.sha256,
+      scanStatus: nodes.scanStatus,
+      starred: nodes.starred,
+      createdAt: nodes.createdAt,
+      updatedAt: nodes.updatedAt,
+      deletedAt: nodes.deletedAt,
+    })
+    .from(nodes)
+    .where(and(exportable(userId), after === null ? undefined : sql`${nodes.id} > ${after}::uuid`))
+    .orderBy(nodes.id)
+    .limit(limit);
+}
+
+// ── the export limiter ──────────────────────────────────────────────────────────────────────
+// An export reads the whole account, so an account runs ONE at a time and at most
+// EXPORT_DAILY_LIMIT a day (T23 review M3). Both budgets are rows of `rate_limit` (Better Auth's
+// table, the second-factor budget's too): `last_request` is when a window began, by the
+// database's clock. The running slot is given back when the stream ends; one a crashed stream
+// never gave back frees itself after EXPORT_RUNNING_MAX_S.
+
+/** Exports per account in a day. */
+export const EXPORT_DAILY_LIMIT = 10;
+const EXPORT_DAY_S = 86_400;
+/** How long a running slot is held at most (a stream that never ended frees it then). */
+export const EXPORT_RUNNING_MAX_S = 30 * 60;
+
+export const exportSlotKeys = (userId: string) => ({
+  running: `account-export-running:${userId}`,
+  day: `account-export-day:${userId}`,
+});
+
+/** Counts one use of `key` in its window unless `cap` is reached; refused: seconds until it ends. */
+async function admitWindow(
+  db: Executor,
+  key: string,
+  cap: number,
+  windowSeconds: number,
+): Promise<{ ok: true } | { ok: false; retryAfterSeconds: number }> {
+  const windowMs = windowSeconds * 1000;
+  const result = await db.execute<{ admitted: number | null; wait_ms: string | number | null }>(sql`
+    WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
+    held AS (
+      SELECT r.last_request + ${windowMs} - clock.ms AS wait_ms FROM rate_limit r, clock WHERE r.key = ${key}
+    ),
+    admitted AS (
+      INSERT INTO rate_limit AS r (id, key, count, last_request)
+      SELECT gen_random_uuid()::text, ${key}, 1, clock.ms FROM clock
+      ON CONFLICT (key) DO UPDATE SET
+        count = CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN 1 ELSE r.count + 1 END,
+        last_request =
+          CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN (SELECT ms FROM clock)
+               ELSE r.last_request END
+      WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs} OR r.count < ${cap}
+      RETURNING r.count
+    )
+    SELECT (SELECT count FROM admitted) AS admitted, (SELECT wait_ms FROM held) AS wait_ms`);
+  const row = result.rows[0];
+  if (row && row.admitted !== null) return { ok: true };
+  const waitMs = row?.wait_ms != null ? Number(row.wait_ms) : windowMs;
+  return { ok: false, retryAfterSeconds: Math.min(windowSeconds, Math.max(1, Math.ceil(waitMs / 1000))) };
+}
+
+/**
+ * Takes the account's running slot, then counts the export on its day. Refused (the other export
+ * is still running, or the day's budget is spent): seconds to wait, and nothing is held.
+ */
+export async function admitExport(
+  db: Executor,
+  userId: string,
+): Promise<{ ok: true } | { ok: false; retryAfterSeconds: number }> {
+  const keys = exportSlotKeys(userId);
+  const running = await admitWindow(db, keys.running, 1, EXPORT_RUNNING_MAX_S);
+  if (!running.ok) return running;
+  const day = await admitWindow(db, keys.day, EXPORT_DAILY_LIMIT, EXPORT_DAY_S);
+  if (!day.ok) await releaseExport(db, userId);
+  return day;
+}
+
+/** Gives the running slot back (the stream ended, however it ended). */
+export async function releaseExport(db: Executor, userId: string): Promise<void> {
+  await db.execute(sql`DELETE FROM rate_limit WHERE key = ${exportSlotKeys(userId).running}`);
 }
 
 /** The shares the user gave, pending ones included, on nodes of the export's set. */

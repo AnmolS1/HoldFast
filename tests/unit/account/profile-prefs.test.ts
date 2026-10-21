@@ -126,7 +126,8 @@ describe("preferences", () => {
       emailShares: false,
       emailSecurity: true,
     });
-    expect(await auditRows({ action: "account.prefs_updated", targetId: me.id })).toHaveLength(1);
+    // A preference is no security fact: no audit row (review m2; the profile keeps its rows).
+    expect(await auditRows({ action: "account.prefs_updated", targetId: me.id })).toHaveLength(0);
     // A second write changes only what it names.
     await api(me.as, "PATCH", "/account/prefs", { body: { theme: "light" } });
     expect(await prefsRow(me.id)).toMatchObject({ theme: "light", density: "comfortable", viewMode: "grid" });

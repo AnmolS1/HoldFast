@@ -40,30 +40,36 @@ import {
 import type { LinkState } from "../../shared/schemas/link";
 import type { ThumbUrlResponse } from "../../shared/schemas/node";
 import { hasSecondFactor } from "../auth/second-factor";
+import { heldPurgeBytes } from "../db/queries/quota";
+import { captureError } from "../sentry";
 import {
   ACTIVITY_LIMIT,
   avatarNodeIdOf,
   currentAvatar,
   deleteOtherSessions,
   deleteOwnSession,
+  activeShareBetween,
+  admitExport,
+  EXPORT_PAGE,
   exportLinks,
-  exportNodes,
+  exportNodePage,
   exportSharesGiven,
   exportUser,
   FAILED_ACTIVITY_ACTIONS,
   getPrefs,
   getProfile,
   ownSessions,
-  purgeRequestedBytes,
   recentActivity,
+  releaseExport,
   updatePrefs,
   updateProfile,
   type ActivityRow,
+  type ExportNodeRow,
   type ProfileRow,
 } from "../db/queries/account";
 import { displayNames } from "../db/queries/node-dto";
 import { SHARED_VISIBLE_STATUSES } from "../db/queries/nodes";
-import { hasShareBetween, sharedWithMe } from "../db/queries/shares";
+import { sharedWithMe } from "../db/queries/shares";
 import type { UserPrefs } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
@@ -71,7 +77,7 @@ import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { assertContentAccess } from "../services/permissions";
-import { db, keys, type AppEnv } from "../services/request-context";
+import { coreOf, db, keys, runBackground, type AppEnv } from "../services/request-context";
 import { mintDownloadToken } from "../services/tokens";
 
 export const router = new Hono<AppEnv>();
@@ -174,8 +180,9 @@ router.patch("/account/prefs", async (c) => {
   const user = requireVerified(c);
   // Strict, and at least one field: `emailSecurity` is not a field of it.
   const body = PatchPrefsBody.parse(await jsonBody(c));
+  // No audit row: a theme or a notification switch is no security fact, and the debounced sync
+  // would write one per burst of clicks (T23 review m2). Profile, sessions and export keep theirs.
   const row = await updatePrefs(db(c), user.id, body);
-  audit(c, "account.prefs_updated", self(user.id), { fields: Object.keys(body).sort() });
   return c.json(toPrefsDto(row) satisfies PrefsDto);
 });
 
@@ -244,10 +251,21 @@ router.delete(`/account/sessions/:id${BA_ID}`, async (c) => {
 });
 
 // ── the data export ─────────────────────────────────────────────────────────────────────────
+// THE TREE IS NEVER HELD WHOLE (T23 review M3). The small parts — the profile, prefs, shares,
+// links, the activity — are read before the answer; the nodes are read a keyset page at a time
+// AS THE BODY IS READ: the producer writes into a stream whose reader is the client, so it waits
+// (backpressure) and at most one page and one encoded chunk are alive. It runs on a pool of its
+// own (`runBackground`), held by ONE `waitUntil` registered before the handler returns — the
+// request's own pool closes after its deferred drain (20 s), long before a big export ends
+// (wave3-common §7; files-host `settleLater`). An account exports one at a time and at most
+// EXPORT_DAILY_LIMIT a day (queries/account.ts); the running slot is given back however the
+// stream ends.
 
 const EXPORT_ACTIVITY_LIMIT = 1_000;
-/** Nodes written per chunk of the streamed body. */
-const NODES_PER_CHUNK = 500;
+/** One node of the file, as the contract says it — parsed per node, never the whole list. */
+const ExportNode = ExportManifest.shape.nodes.element;
+/** The file without its nodes, parsed through the contract: nothing beyond its fields is written. */
+const ExportHead = ExportManifest.omit({ nodes: true });
 
 /** What the owner is shown a link as. Most decisive first: an ended link is not "paused". */
 function linkState(
@@ -269,115 +287,139 @@ function linkState(
   return "active";
 }
 
+const exportNode = (row: ExportNodeRow) =>
+  ExportNode.parse({
+    id: row.id,
+    parentId: row.parentId,
+    kind: row.kind,
+    name: row.name,
+    size: row.size,
+    mimeSniffed: row.mimeSniffed,
+    sha256: row.sha256,
+    scanStatus: row.scanStatus,
+    starred: row.starred,
+    createdAt: iso(row.createdAt),
+    updatedAt: iso(row.updatedAt),
+    deletedAt: row.deletedAt ? iso(row.deletedAt) : null,
+  });
+
 router.get("/account/export", async (c) => {
   const user = requireVerified(c);
   assertContentAccess(c);
   const handle = db(c);
   const at = now(c);
-  // EVERY read happens here, before the answer: the pool closes once the request's deferred work
-  // is drained, which a long download could outlast.
-  const [account, prefs, nodeRows, given, received, links, activity, asked] = await Promise.all([
-    exportUser(handle, user.id),
-    getPrefs(handle, user.id),
-    exportNodes(handle, user.id),
-    exportSharesGiven(handle, user.id),
-    sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
-    exportLinks(handle, user.id),
-    recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
-    purgeRequestedBytes(handle, user.id),
-  ]);
-  if (!account) throw new AppError("not_found");
-  const owners = await displayNames(
-    handle,
-    received.map((item) => item.node.ownerId),
-  );
+  const admitted = await admitExport(handle, user.id);
+  if (!admitted.ok) {
+    throw new AppError("rate_limited", undefined, undefined, {
+      "Retry-After": String(admitted.retryAfterSeconds),
+    });
+  }
+  let head: string;
+  try {
+    const [account, prefs, given, received, links, activity, held] = await Promise.all([
+      exportUser(handle, user.id),
+      getPrefs(handle, user.id),
+      exportSharesGiven(handle, user.id),
+      sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
+      exportLinks(handle, user.id),
+      recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
+      heldPurgeBytes(handle, user.id),
+    ]);
+    if (!account) throw new AppError("not_found");
+    const owners = await displayNames(
+      handle,
+      received.map((item) => item.node.ownerId),
+    );
+    const rest = ExportHead.parse({
+      version: 1,
+      exportedAt: iso(at),
+      user: {
+        id: account.id,
+        email: account.email,
+        displayName: account.name,
+        createdAt: iso(account.createdAt),
+        timezone: account.timezone,
+        locale: account.locale,
+        quotaBytes: account.quotaBytes,
+        // The account holder's figure: without what a hold keeps (quota.ts `heldPurgeBytes`).
+        usedBytes: Math.max(0, account.usedBytes - held.files - held.versions),
+        termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
+        termsVersion: account.termsVersion,
+      },
+      prefs: toPrefsDto(prefs),
+      shares: given.map((row) => ({
+        nodeId: row.nodeId,
+        email: row.granteeEmail,
+        role: row.role,
+        canUpload: row.canUpload,
+        createdAt: iso(row.createdAt),
+      })),
+      sharedWithMe: received.map(({ share, node }) => ({
+        nodeId: node.id,
+        name: node.name,
+        role: share.role,
+        ownerDisplayName: owners.get(node.ownerId) ?? "",
+      })),
+      links: links.map((row) => ({
+        id: row.id,
+        nodeId: row.nodeId,
+        state: linkState(row, at),
+        expiresAt: row.expiresAt ? iso(row.expiresAt) : null,
+        hasPassword: row.hasPassword,
+        maxDownloads: row.maxDownloads,
+        downloadCount: row.downloadCount,
+        createdAt: iso(row.createdAt),
+      })),
+      activity: activity.map(toActivityDto),
+    });
+    head = `${JSON.stringify(rest).slice(0, -1)},"nodes":[`;
+  } catch (error) {
+    await releaseExport(handle, user.id);
+    throw error;
+  }
+  audit(c, "account.export", self(user.id));
 
-  // Parsed through the contract: what is written is exactly its fields — a column added to a
-  // query later can never reach the file.
-  const manifest = ExportManifest.parse({
-    version: 1,
-    exportedAt: iso(at),
-    user: {
-      id: account.id,
-      email: account.email,
-      displayName: account.name,
-      createdAt: iso(account.createdAt),
-      timezone: account.timezone,
-      locale: account.locale,
-      quotaBytes: account.quotaBytes,
-      // Without what a hold keeps of roots deleted for good (see `purgeRequestedBytes`).
-      usedBytes: Math.max(0, account.usedBytes - asked.files - asked.versions),
-      termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
-      termsVersion: account.termsVersion,
-    },
-    prefs: toPrefsDto(prefs),
-    nodes: nodeRows.map((row) => ({
-      id: row.id,
-      parentId: row.parentId,
-      kind: row.kind,
-      name: row.name,
-      size: row.size,
-      mimeSniffed: row.mimeSniffed,
-      sha256: row.sha256,
-      scanStatus: row.scanStatus,
-      starred: row.starred,
-      createdAt: iso(row.createdAt),
-      updatedAt: iso(row.updatedAt),
-      deletedAt: row.deletedAt ? iso(row.deletedAt) : null,
-    })),
-    shares: given.map((row) => ({
-      nodeId: row.nodeId,
-      email: row.granteeEmail,
-      role: row.role,
-      canUpload: row.canUpload,
-      createdAt: iso(row.createdAt),
-    })),
-    sharedWithMe: received.map(({ share, node }) => ({
-      nodeId: node.id,
-      name: node.name,
-      role: share.role,
-      ownerDisplayName: owners.get(node.ownerId) ?? "",
-    })),
-    links: links.map((row) => ({
-      id: row.id,
-      nodeId: row.nodeId,
-      state: linkState(row, at),
-      expiresAt: row.expiresAt ? iso(row.expiresAt) : null,
-      hasPassword: row.hasPassword,
-      maxDownloads: row.maxDownloads,
-      downloadCount: row.downloadCount,
-      createdAt: iso(row.createdAt),
-    })),
-    activity: activity.map(toActivityDto),
-  });
-  audit(c, "account.export", self(user.id), { nodes: manifest.nodes.length });
-
-  // The body is written in parts — the nodes, which can be many, a chunk at a time — from what
-  // was read above; nothing is read from the database after this returns.
-  const { nodes: list, ...rest } = manifest;
-  const head = JSON.stringify(rest).slice(0, -1);
   const encoder = new TextEncoder();
-  let index = 0;
-  let started = false;
-  const body = new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (!started) {
-        started = true;
-        controller.enqueue(encoder.encode(`${head},"nodes":[`));
-        return;
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const { env, executionCtx } = c;
+  const produce = runBackground(
+    env,
+    executionCtx,
+    async (bg) => {
+      const writer = writable.getWriter();
+      try {
+        await writer.write(encoder.encode(head));
+        let after: string | null = null;
+        let first = true;
+        for (;;) {
+          const page = await exportNodePage(bg.db, user.id, after);
+          if (page.length > 0) {
+            const text = page.map((row) => JSON.stringify(exportNode(row))).join(",");
+            await writer.write(encoder.encode((first ? "" : ",") + text));
+            first = false;
+            after = page[page.length - 1]!.id;
+          }
+          if (page.length < EXPORT_PAGE) break;
+        }
+        await writer.write(encoder.encode("]}"));
+        await writer.close();
+      } catch (error) {
+        // The client went away (the write is refused), or a read failed: the body ends here.
+        await writer.abort(error).catch(() => {});
+      } finally {
+        await releaseExport(bg.db, user.id);
       }
-      if (index < list.length) {
-        const part = list.slice(index, index + NODES_PER_CHUNK).map((item) => JSON.stringify(item));
-        controller.enqueue(encoder.encode((index === 0 ? "" : ",") + part.join(",")));
-        index += NODES_PER_CHUNK;
-        return;
-      }
-      controller.enqueue(encoder.encode("]}"));
-      controller.close();
     },
+    coreOf(c),
+  ).catch((error) => {
+    captureError(error, { kind: "account_export" });
   });
+  // The request's own drain ends long before a long export does: this promise holds nothing of
+  // the request's — the producer opens, drains and closes a pool of its own.
+  // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
+  executionCtx.waitUntil(produce);
   const day = iso(at).slice(0, 10);
-  return c.body(body, 200, {
+  return c.body(readable, 200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="holdfast-export-${day}.json"`,
     "cache-control": "no-store",
@@ -387,7 +429,8 @@ router.get("/account/export", async (c) => {
 // ── an avatar's URL ─────────────────────────────────────────────────────────────────────────
 // WHO MAY SEE AN AVATAR is decided here and nowhere else (the files host's gate 4d does not ask
 // for an avatar thumbnail): the user themself, someone with an ACTIVE share relationship with
-// them in either direction (a pending share is none), and an admin as the admin routes see one.
+// them in either direction (a pending share is none; nor one on a node the trash, a takedown or a
+// delete-forever has taken away, nor one of an owner whose shares have stopped working), and an admin as the admin routes see one.
 // Anyone else, no avatar, and an avatar that is not clean or is hidden are the one `404`, after
 // the same reads.
 
@@ -418,7 +461,7 @@ router.get(`/account/avatar-url/:userId${BA_ID}`, async (c) => {
   const handle = db(c);
   // Both reads, whatever the first answers.
   const [related, nodeId] = await Promise.all([
-    hasShareBetween(handle, viewer.id, targetId),
+    activeShareBetween(handle, viewer.id, targetId),
     avatarNodeIdOf(handle, targetId),
   ]);
   const node = await currentAvatar(handle, targetId, nodeId);

@@ -27,6 +27,17 @@ async function secondBrowser(email: string, headers: Record<string, string> = {}
 
 type Listed = Array<{ id: string; current: boolean; uaLabel: string; country: string | null }>;
 
+describe("Better Auth's own session list", () => {
+  it("is switched off: GET /api/auth/list-sessions answers 404 and hands out no token and no address", async () => {
+    const { client, user } = await verifiedUser();
+    const answer = await send(client, "/api/auth/list-sessions");
+    expect(answer.status).toBe(404);
+    for (const row of await sessionsOf(user.id)) expect(answer.text).not.toContain(row.token);
+    // The account's own list is ours.
+    expect((await send(client, "/api/account/sessions")).status).toBe(200);
+  });
+});
+
 describe("the session list", () => {
   it("lists the caller's own sessions, marks the current one, and carries no token and no address", async () => {
     const { client, email, user } = await verifiedUser();
