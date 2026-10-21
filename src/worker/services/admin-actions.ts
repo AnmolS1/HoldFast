@@ -1182,7 +1182,8 @@ async function restoreNotice(
     const ours = new Set(notice.nodes.map((n) => n.nodeId));
     for (const { nodeId } of notice.nodes) {
       // Lifted only when no other cause remains (M1): a DMCA takedown, and no OTHER notice that
-      // names the node still in force. (Read under the tree locks this transaction holds.)
+      // still holds a takedown on the node — by its recorded effect, whatever its status
+      // (upheld and closed-after-takedown count). Read under the tree locks this transaction holds.
       const node = await adminQ.nodeRow(tx, nodeId);
       if (!node || node.takedownAt === null || node.takedownReason !== "dmca") continue;
       if (await adminQ.otherActiveNoticeNames(tx, notice.id, { nodeId })) continue;

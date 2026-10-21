@@ -333,6 +333,38 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
     expect(await blocklistRow(sha)).toBeNull();
   });
 
+  it("a notice that still keeps the content down in a TERMINAL status counts: B upheld (lawsuit) or B closed after its takedown → withdrawing A leaves the node down and the dmca entry; control: B withdrawn → A's withdraw restores", async () => {
+    const who = await admin();
+    for (const ending of ["lawsuit_notice", "close"] as const) {
+      const owner = await member();
+      const sha = madeUpSha();
+      const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: sha });
+      const a = await noticeOn(who, file.id);
+      const b = await noticeOn(who, file.id);
+      expect((await act(who, a, "takedown")).status).toBe(200);
+      expect((await act(who, b, "takedown")).status).toBe(200);
+      const ended = await act(who, b, ending);
+      expect(ended.status, ended.text).toBe(200);
+      expect(ended.body.status).toBe(ending === "close" ? "closed" : "upheld");
+      expect((await act(who, a, "withdraw")).status).toBe(200);
+      expect((await nodeRowOf(file.id))!.takedownAt, ending).not.toBeNull();
+      expect((await blocklistRow(sha))?.reason, ending).toBe("dmca");
+    }
+    // Control: B ended by a withdraw of its own (its takedown lifted) — A's withdraw restores.
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const a = await noticeOn(who, file.id);
+    const b = await noticeOn(who, file.id);
+    await act(who, a, "takedown");
+    await act(who, b, "takedown");
+    await act(who, b, "withdraw");
+    // A notice that never took anything down (still `received`) holds nothing.
+    await noticeOn(who, file.id);
+    expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
+    await act(who, a, "withdraw");
+    expect((await nodeRowOf(file.id))!.takedownAt).toBeNull();
+  });
+
   it("an entry listed before the notice (malware) is neither rewritten to dmca nor removed by its restore", async () => {
     const who = await admin();
     const owner = await member();

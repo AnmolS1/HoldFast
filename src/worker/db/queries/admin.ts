@@ -1024,8 +1024,13 @@ export async function updateNotice(
 }
 
 /**
- * Does a notice OTHER than `noticeId` that is still in force (`actioned` or `counter_received`)
- * name this node — or a node with this content (by its snapshot or the node's current hash)?
+ * Does a notice OTHER than `noticeId` still HOLD a takedown on this node — or on a node with this
+ * content (by its snapshot or the node's current hash)? Decided from the notice's own recorded
+ * effect, not from a list of statuses: it took down (`takedown_at` is set, written only by its
+ * takedown) and has not given that up (`restored` and `withdrawn` are the two endings that lift
+ * it). So `actioned`, `counter_received`, `upheld` (a lawsuit: the material stays down) and
+ * `closed` after a takedown (down for good) all count; a notice that never took anything down —
+ * `received`, `incomplete`, `rejected`, or one closed before acting — does not.
  */
 export async function otherActiveNoticeNames(
   db: Executor,
@@ -1039,7 +1044,8 @@ export async function otherActiveNoticeNames(
   const result = await db.execute<{ found: boolean }>(sql`
     SELECT EXISTS (
       SELECT 1 FROM dmca_notice_nodes dn JOIN dmca_notices d ON d.id = dn.notice_id
-      WHERE d.id <> ${noticeId} AND d.status IN ('actioned', 'counter_received') AND ${match}
+      WHERE d.id <> ${noticeId} AND d.takedown_at IS NOT NULL
+        AND d.status NOT IN ('restored', 'withdrawn') AND ${match}
     ) AS found`);
   return result.rows[0]?.found === true;
 }
