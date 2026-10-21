@@ -433,6 +433,27 @@ describe("scope, inherited takedown, refusals", () => {
     expect(envelope(await visit(link.token, `/children/${parent.id}`))).toEqual(reference);
   });
 
+  it("a folder listing names clean files only: pending, infected, skipped, error, under review, suspected CSAM and taken-down children are never listed", async () => {
+    const owner = await member();
+    const root = await makeFolder(owner.id);
+    const clean = await makeFile(owner.id, root.id, { scanStatus: "clean", name: "clean.txt" });
+    for (const state of [
+      "pending",
+      "infected",
+      "skipped",
+      "error",
+      "under_review",
+      "suspected_csam",
+    ] as const) {
+      await makeFile(owner.id, root.id, { scanStatus: state, name: `${state}.bin` });
+    }
+    await makeFile(owner.id, root.id, { scanStatus: "clean", name: "down.txt", takedownAt: new Date() });
+    const link = await linkTo(owner, root.id);
+    const listing = (await visit(link.token, "/children")).body as { items: { id: string; name: string }[] };
+    expect(listing.items.map((item) => item.name)).toEqual(["clean.txt"]);
+    expect(listing.items[0]!.id).toBe(clean.id);
+  });
+
   it("a link above a taken-down folder: the folder is not listed, its listing, a file two levels inside it and its zip entries are 404 / absent", async () => {
     const owner = await member();
     const root = await makeFolder(owner.id);

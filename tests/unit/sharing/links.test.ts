@@ -16,6 +16,7 @@ import {
   makeFile,
   makeFolder,
   makeLink,
+  makeShare,
   member,
   settingsWith,
   testDb,
@@ -159,6 +160,26 @@ describe("POST /nodes/:id/links", () => {
     expect([past.status, errorOf(past).error]).toEqual([400, "validation"]);
     for (const node of [pending, infected, down, inside, csam, folder])
       expect(await linksOn(node.id)).toHaveLength(0);
+  });
+
+  it("an editor or a viewer of the folder may not link it: 403 forbidden, no row", async () => {
+    const owner = await member();
+    const editor = await member();
+    const viewer = await member();
+    const folder = await makeFolder(owner.id);
+    const inner = await makeFolder(owner.id, folder.id);
+    await makeShare(folder.id, owner.id, editor.id, { role: "editor" });
+    await makeShare(folder.id, owner.id, viewer.id, { role: "viewer" });
+    for (const [who, nodeId] of [
+      [editor, folder.id],
+      [editor, inner.id],
+      [viewer, folder.id],
+    ] as const) {
+      const answer = await createLink(who, nodeId);
+      expect([answer.status, errorOf(answer).error]).toEqual([403, "forbidden"]);
+    }
+    expect(await linksOn(folder.id)).toHaveLength(0);
+    expect(await linksOn(inner.id)).toHaveLength(0);
   });
 
   it("link_user: CEIL_LINKS_DAY reached → the thrown 429, rolled back: no row, no ledger unit", async () => {
