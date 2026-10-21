@@ -420,6 +420,16 @@ export async function queue(
 ): Promise<void> {
   void ctx;
   const deadLetters = batch.queue.endsWith("-dlq");
+  // A batch with no scan message in it at all is acknowledged whole (and asks the database nothing).
+  if (batch.messages.every((message) => normalizeScanMessage(message.body) === null)) {
+    for (const message of batch.messages) {
+      console.warn(
+        `scan: message ignored (not a scan message, or a key outside u/): ${loggable(keyOf(message.body))}`,
+      );
+    }
+    batch.ackAll();
+    return;
+  }
   for (const message of batch.messages) {
     try {
       if (deadLetters) await handleDeadLetter(message, bg);
