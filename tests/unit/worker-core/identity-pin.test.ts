@@ -6,7 +6,6 @@ import { describe, expect, it, vi } from "vitest";
 import { buildPipeline } from "../../../src/worker/app";
 import { IDENTITY_HEADER } from "../../../src/worker/middleware/identity-pin";
 import type { AppEnv } from "../../../src/worker/services/request-context";
-import clientApiSource from "../../../src/client/lib/api.ts?raw";
 import { appWith, call, fakeCore, sameOrigin, signIn, type CallOptions } from "./helpers";
 
 // As in pipeline.test.ts: the real auth router is replaced by a stand-in that lets probes through.
@@ -95,9 +94,5 @@ describe("identity pin", () => {
   it("sits directly after session in the pipeline", () => {
     const names = buildPipeline(fakeCore().core).map((step) => step.name);
     expect(names.indexOf("identityPin")).toBe(names.indexOf("session") + 1);
-  });
-
-  it("the SPA's client sends the same header name", () => {
-    expect(clientApiSource).toContain(`IDENTITY_HEADER = "${IDENTITY_HEADER}"`);
   });
 });

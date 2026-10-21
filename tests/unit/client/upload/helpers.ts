@@ -46,6 +46,8 @@ export interface PutCall {
   /** Milliseconds on the (possibly fake) clock when the request started. */
   at: number;
   signal?: AbortSignal;
+  /** The account the body names (the identity pin): the one the upload was started for. */
+  account?: string | null;
   progress(loaded: number): void;
   resolve(): void;
   reject(error: unknown): void;
@@ -196,6 +198,7 @@ export function installServer(): Server {
           size: body.size,
           at: Date.now(),
           signal,
+          account: options.account,
           progress: (loaded) => options.onProgress?.(loaded),
           resolve: () =>
             finish(() => resolve(schema.parse(n === "single" ? singleResponse() : partResponse(n)))),

@@ -5,6 +5,7 @@
 // This module imports neither the router nor the query client: both register what the client
 // needs through `configureApi`, which keeps the import graph acyclic.
 import type { ZodType } from "zod";
+import { HEADER_USER } from "../../shared/constants";
 import { toast } from "../components/Toaster/store";
 import { INTERNAL_ERROR, isErrorCode, type ErrorCode } from "./contracts";
 import { t } from "./i18n";
@@ -250,8 +251,8 @@ export function cancelTermsGate(): void {
 // (403 forbidden, `identity_mismatch`, src/worker/middleware/identity-pin.ts), and the client then
 // adopts the account the browser is signed in as — the request is never replayed.
 
-/** The header name; the Worker's middleware reads the same (a test pins the two together). */
-export const IDENTITY_HEADER = "x-holdfast-user";
+/** The header name (src/shared/constants.ts), as `Headers` spells it. */
+export const IDENTITY_HEADER = HEADER_USER.toLowerCase();
 
 /** Paths that never act for an account's data: the pin is not sent there. */
 function pinned(path: string): boolean {
@@ -261,10 +262,14 @@ function pinned(path: string): boolean {
   );
 }
 
-/** For a request made outside `api()` (the upload bodies, through XMLHttpRequest). */
-export function identityHeaders(): Record<string, string> {
-  const userId = environment.userId();
-  return userId === null ? {} : { [IDENTITY_HEADER]: userId };
+/** The account this client's state belongs to now (what `api()` captures when a call starts). */
+export function currentAccount(): string | null {
+  return environment.userId();
+}
+
+/** For a request made outside `api()` (the upload bodies): the header for `account`. */
+export function identityHeaders(account: string | null = environment.userId()): Record<string, string> {
+  return account === null ? {} : { [IDENTITY_HEADER]: account };
 }
 
 export function isIdentityMismatch(error: unknown): boolean {
@@ -293,11 +298,14 @@ function adoptBrowserIdentity(): void {
 }
 
 /**
- * For a request made outside `api()` (the upload bodies): when its failure says the browser is
- * signed in to another account, adopt it, as `api()` does. Returns whether it did.
+ * A refusal as another account's, for the account the request was SENT for. Adopted only when this
+ * tab still holds that account: a request made for the previous account whose refusal arrives
+ * after the tab has already moved on (a session re-read adopted the new one) is dropped quietly —
+ * adopting again would purge the account the tab holds now. Returns whether it adopted.
  */
-export function noteIdentityMismatch(error: unknown): boolean {
+export function noteIdentityMismatch(error: unknown, sentFor: string | null): boolean {
   if (!isIdentityMismatch(error)) return false;
+  if (sentFor === null || sentFor !== environment.userId()) return false;
   adoptBrowserIdentity();
   return true;
 }
@@ -491,10 +499,10 @@ function waitWords(seconds: number): string {
 }
 
 /** Side effects of a failure that is not replayed. `silent`: codes whose toast the caller shows. */
-function react(error: ApiError, silent: readonly ApiErrorCode[] = []): void {
+function react(error: ApiError, silent: readonly ApiErrorCode[], sentFor: string | null): void {
   const quiet = silent.includes(error.code);
   if (isIdentityMismatch(error)) {
-    adoptBrowserIdentity();
+    noteIdentityMismatch(error, sentFor);
     return;
   }
   const reason = typeof error.details?.reason === "string" ? error.details.reason : undefined;
@@ -591,7 +599,7 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
         continue;
       }
     }
-    react(error, options.silent);
+    react(error, options.silent ?? [], userId);
     throw error;
   }
 }

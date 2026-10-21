@@ -102,6 +102,11 @@ export const SCAN_CLAIM_STALE_MINUTES = 20;
 
 export const HEADER_WARNING = "X-Holdfast-Warning";
 export const HEADER_LINK_SESSION = "X-Holdfast-Link-Session";
+/**
+ * The identity pin (W2S4): the account the SPA's state belongs to, on every pinned API request.
+ * The app host refuses a request whose session is another account (src/worker/middleware/identity-pin.ts).
+ */
+export const HEADER_USER = "X-Holdfast-User";
 
 // ── file categories ─────────────────────────────────────────────────────────────────────────
 

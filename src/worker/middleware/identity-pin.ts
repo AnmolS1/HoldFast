@@ -14,11 +14,12 @@
 
 import { requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
+import { HEADER_USER } from "../../shared/constants";
 import { AppError } from "../services/errors";
 import type { AppEnv } from "../services/request-context";
 
-/** Lower case, as Hono reads it. The client's lib/api.ts names the same header (a test pins it). */
-export const IDENTITY_HEADER = "x-holdfast-user";
+/** src/shared/constants.ts — the client's lib/api.ts sends the same header. */
+export const IDENTITY_HEADER = HEADER_USER.toLowerCase();
 
 const EXEMPT_PREFIXES = ["/api/auth/", "/api/public/", "/api/_test/"];
 

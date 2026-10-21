@@ -113,6 +113,35 @@ describe("refused as another account", () => {
     expect(calls.filter((call) => call.path.startsWith("/api/nodes"))).toHaveLength(1);
   });
 
+  // Review M1: a request sent for A whose refusal arrives after the tab has ALREADY moved to B
+  // (the focus re-read of the session adopted B) must not purge B or send B to `/`.
+  it("a late refusal of a request made for the previous account: dropped quietly — B is not purged, nothing navigates", async () => {
+    let release: (answer: Response) => void = () => {};
+    const held = new Promise<Response>((resolve) => (release = resolve));
+    server((call) => (call.path === "/api/nodes/slow" ? held : undefined));
+    const request = api("/api/nodes/slow", { method: "POST" }).catch((error: unknown) => error);
+    // The tab adopts B on its own (a session re-read), before the old answer comes.
+    browser = BOB;
+    const { refreshSession } = await import("../../../../src/client/lib/query");
+    await refreshSession();
+    expect(getKnownUserId()).toBe(BOB.user.id);
+    let bPurged = false;
+    const { registerUserStatePurger } = await import("../../../../src/client/lib/contracts");
+    registerUserStatePurger(() => {
+      bPurged = true;
+    });
+    const epoch = accountEpoch();
+    release(MISMATCH());
+    expect(await request).toMatchObject({ details: { reason: "identity_mismatch" } });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect({ navigated, bPurgedAgain: bPurged || !sameAccount(epoch) }).toEqual({
+      navigated: [],
+      bPurgedAgain: false,
+    });
+    expect(getKnownUserId()).toBe(BOB.user.id);
+    expect(getToasts()).toEqual([]);
+  });
+
   it("control: another 403 forbidden (no reason) adopts nothing and keeps its toast path", async () => {
     browser = BOB;
     server(() => envelope("forbidden", 403));

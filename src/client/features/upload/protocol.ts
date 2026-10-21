@@ -14,7 +14,14 @@ import {
   type CompleteUploadBody,
   type InitUploadBody,
 } from "../../../shared/schemas/upload";
-import { api, ApiError, apiErrorOf, identityHeaders, noteIdentityMismatch } from "../../lib/api";
+import {
+  api,
+  ApiError,
+  apiErrorOf,
+  currentAccount,
+  identityHeaders,
+  noteIdentityMismatch,
+} from "../../lib/api";
 import { t } from "./strings";
 
 export function initUpload(body: InitUploadBody, signal?: AbortSignal): Promise<InitUploadResponse> {
@@ -70,6 +77,11 @@ export interface PutOptions {
   /** Bytes of this body the browser has sent so far. */
   onProgress?(loaded: number): void;
   signal?: AbortSignal;
+  /**
+   * The account the upload was started for (the identity pin). Every body names it, whoever the
+   * tab knows when the body leaves. Absent: the account known now.
+   */
+  account?: string | null;
 }
 
 export type PutBody = <T>(path: string, body: Blob, schema: ZodType<T>, options?: PutOptions) => Promise<T>;
@@ -87,13 +99,13 @@ function parseJson(text: string): unknown {
 }
 
 /** The failure of a body request: the ApiError the API client throws for the same answer. */
-function errorOf(xhr: XMLHttpRequest): ApiError {
+function errorOf(xhr: XMLHttpRequest, sentFor: string | null): ApiError {
   const error = apiErrorOf(
     { status: xhr.status, body: xhr.responseText, retryAfter: xhr.getResponseHeader("retry-after") },
     t("row.failed"),
   );
   // Refused as another account's (another tab signed in since): the client adopts that account.
-  noteIdentityMismatch(error);
+  noteIdentityMismatch(error, sentFor);
   return error;
 }
 
@@ -104,6 +116,7 @@ function errorOf(xhr: XMLHttpRequest): ApiError {
 export const putBody: PutBody = (path, body, schema, options = {}) =>
   new Promise((resolve, reject) => {
     const { signal, onProgress } = options;
+    const sentFor = options.account !== undefined ? options.account : currentAccount();
     if (signal?.aborted) {
       reject(abortError());
       return;
@@ -117,12 +130,12 @@ export const putBody: PutBody = (path, body, schema, options = {}) =>
     xhr.setRequestHeader("content-type", "application/octet-stream");
     // The account this upload is for: a body sent after another tab signed in as someone else is
     // refused (identity_mismatch), not stored in that account.
-    for (const [name, value] of Object.entries(identityHeaders())) xhr.setRequestHeader(name, value);
+    for (const [name, value] of Object.entries(identityHeaders(sentFor))) xhr.setRequestHeader(name, value);
     xhr.upload.onprogress = (event) => onProgress?.(event.loaded);
     xhr.onload = () => {
       settle();
       if (xhr.status < 200 || xhr.status >= 300) {
-        reject(errorOf(xhr));
+        reject(errorOf(xhr, sentFor));
         return;
       }
       const parsed = schema.safeParse(parseJson(xhr.responseText));
