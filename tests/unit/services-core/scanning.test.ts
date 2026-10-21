@@ -625,7 +625,12 @@ describe("enqueueRescan", () => {
     it("a second rescan that got through while the first one's send failed: its verdict IS written", async () => {
       const owner = await makeUser();
       const file = await makeFile(owner.id, null, { name: "eicar.com.txt", scanStatus: "clean", ...VERDICT });
-      await putObject(file.r2Key!, eicarBytes());
+      // Per-run content (Common addendum 3): the infected verdict lists the hash for every file.
+      const tail = new TextEncoder().encode(`\n${crypto.randomUUID()}\n`);
+      const infected = new Uint8Array(eicarBytes().length + tail.length);
+      infected.set(eicarBytes(), 0);
+      infected.set(tail, eicarBytes().length);
+      await putObject(file.r2Key!, infected);
       const second = recordingDeps();
       const first = failingDeps(async () => {
         expect(await enqueueRescan(second.deps, file.id, { by: "admin" })).toEqual({ queued: true });
@@ -662,18 +667,19 @@ describe("enqueueRescan", () => {
       const scanned = (await nodeById(file.id))!;
       expect(scanned).toMatchObject({ scanStatus: "clean", scanDetail: { engine: "stub" } });
       // The second message: the same job row is claimed again (forced), the bytes are read again,
-      // and the node — no longer pending — is left exactly as the first verdict made it.
+      // and the node — no longer pending — keeps its status. T21 (task 2g, Addendum 3 Q2): the
+      // record of what the scanner saw (detail, scan time) is written on every verdict.
       await testDb()
         .update(nodes)
         .set({ scanDetail: { engine: "marker" } })
         .where(eq(nodes.id, file.id));
       expect(await deliver([{ body: two.sent[0] }])).toEqual([{ outcome: "ack" }]);
-      expect(await nodeById(file.id)).toMatchObject({
-        scanStatus: "clean",
-        scanDetail: { engine: "marker" },
-        scannedAt: scanned.scannedAt,
-      });
+      const again = (await nodeById(file.id))!;
+      expect(again).toMatchObject({ scanStatus: "clean", scanReason: null, scanDetail: { engine: "stub" } });
+      expect(again.scannedAt!.getTime()).toBeGreaterThanOrEqual(scanned.scannedAt!.getTime());
       expect(await jobsFor(file.r2Key!)).toMatchObject([{ status: "done", attempt: 2 }]);
+      // No second effect: the ledger is unchanged and empty for a clean file.
+      expect((await jobsFor(file.r2Key!))[0]!.verdict).toMatchObject({ effects: {} });
     });
   });
 

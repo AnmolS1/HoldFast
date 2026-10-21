@@ -306,7 +306,11 @@ describe("the stub scan pipeline (how files become downloadable in this wave)", 
     const user = await uploader();
     for (const [bytes, verdict] of [
       [new TextEncoder().encode("just some text\n"), "clean"],
-      [eicarBytes(), "infected"],
+      // Per-run content (Common addendum 3): an infected verdict lists the hash for every file.
+      [
+        new Uint8Array([...eicarBytes(), ...new TextEncoder().encode(`\n${crypto.randomUUID()}\n`)]),
+        "infected",
+      ],
     ] as const) {
       const session = await uploaded(user, {}, bytes);
       const sent: unknown[] = [];

@@ -31,6 +31,24 @@ const explicit = (node: { id: string; r2Key: string | null }, force?: boolean) =
   ...(force === undefined ? {} : { force }),
 });
 
+/**
+ * The EICAR file with bytes of its own after it: infected for the stub, with a hash no other run
+ * has. A verdict lists the content's hash in the SHARED test database (T21, Addendum 3 Q6).
+ */
+function uniqueEicar(): Uint8Array {
+  const tail = new TextEncoder().encode(`\n${crypto.randomUUID()}\n`);
+  const out = new Uint8Array(eicarBytes().length + tail.length);
+  out.set(eicarBytes(), 0);
+  out.set(tail, eicarBytes().length);
+  return out;
+}
+
+async function sha256Hex(bytes: Uint8Array | string): Promise<string> {
+  const data = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** A pending file with its object in the store. */
 async function pendingFile(bytes: Uint8Array | string, name = "notes.txt") {
   const owner = await makeUser();
@@ -59,7 +77,7 @@ describe("through the real local queue (SCAN_STUB=1)", () => {
   });
 
   it("the antivirus test file becomes infected", async () => {
-    const file = await pendingFile(eicarBytes(), "eicar.com.txt");
+    const file = await pendingFile(uniqueEicar(), "eicar.com.txt");
     await env.SCAN_QUEUE.send({ v: 1, nodeId: file.id, key: file.r2Key });
     const scanned = await eventually(async () => {
       const row = await nodeById(file.id);
@@ -79,7 +97,7 @@ describe("queue() called directly", () => {
     expect(await deliver([{ body: explicit(a) }])).toEqual([{ outcome: "ack" }]);
     expect(await nodeById(a.id)).toMatchObject({ scanStatus: "clean", mimeSniffed: "text/plain" });
 
-    const b = await pendingFile(eicarBytes());
+    const b = await pendingFile(uniqueEicar());
     expect(await deliver([{ body: r2Event(b.r2Key!, "PutObject") }])).toEqual([{ outcome: "ack" }]);
     expect(await nodeById(b.id)).toMatchObject({ scanStatus: "infected" });
     // The event's eTag is recorded with the job, and nothing else is done with it.
@@ -266,12 +284,14 @@ describe("the verdict guard: only a node that is still pending and not taken dow
     ];
     // The control: a pending node, same owner, same bytes, same message shape — it IS written.
     const control = await makeFile(owner.id, null, { scanStatus: "pending" });
-    for (const node of [...locked, control]) await putObject(node.r2Key!, "harmless bytes");
+    // Per-run content (Addendum 3 Q6): a locked fixture's hash is listed once a sweep completes it.
+    const harmless = `harmless bytes ${crypto.randomUUID()}`;
+    for (const node of [...locked, control]) await putObject(node.r2Key!, harmless);
 
     // T21 (task 2g): the record of what the scanner saw — server sha256, scanDetail, scannedAt,
     // mimeSniffed — is written on every verdict; what opens or closes access is not. An
     // `under_review` node keeps its status and gets the verdict as the status to restore.
-    const SERVER_SHA = "0e9a93f09abe34a03dc3c32d0ab6edd02c2298466a8b774825aa69d1b693bbc7"; // sha256("harmless bytes")
+    const SERVER_SHA = await sha256Hex(harmless);
     const access = (row: typeof control | null) => ({
       scanStatus: row?.scanStatus,
       scanReason: row?.scanReason,
@@ -304,7 +324,7 @@ describe("the verdict guard: only a node that is still pending and not taken dow
 
   it("a node locked between the claim and the verdict is left alone (the guard reads the locked row)", async () => {
     // The antivirus test file: the stub would mark it infected. It is locked first.
-    const file = await pendingFile(eicarBytes());
+    const file = await pendingFile(uniqueEicar());
     await testDb()
       .update(nodes)
       .set({ scanStatus: "suspected_csam", legalHold: true })
