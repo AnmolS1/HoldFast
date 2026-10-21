@@ -413,6 +413,110 @@ describe("zip grants", () => {
   });
 });
 
+describe("the batch mint of a public zip (Addendum 8)", () => {
+  const batch = (token: string, body: Record<string, unknown>, options: Parameters<typeof visit>[2] = {}) =>
+    visit(token, "/download-urls", { ...options, json: body });
+  type Items = {
+    items: ({ nodeId: string; url: string; expiresAt: string } | { nodeId: string; error: string })[];
+  };
+
+  it("one request mints the window under the grant: no count, no maxDownloads unit, no audit row, one limiter hit", async () => {
+    const owner = await member();
+    const root = await makeFolder(owner.id);
+    const files = [];
+    for (let i = 0; i < 50; i++)
+      files.push(await makeFile(owner.id, root.id, { scanStatus: "clean", name: `f${i}.txt` }));
+    const link = await linkTo(owner, root.id, { maxDownloads: 5 });
+    const manifest = await visit(link.token, "/zip-manifest", { method: "POST", ip: X });
+    const grant = (manifest.body as { zipGrant: string }).zipGrant;
+    let hits = 0;
+    const counting = { limit: async () => ((hits += 1), { success: true }) };
+    const answer = await batch(
+      link.token,
+      { zipGrant: grant, nodeIds: files.map((f) => f.id) },
+      { ip: X, env: { RL_LINKS: counting } },
+    );
+    expect(answer.status).toBe(200);
+    const items = (answer.body as Items).items;
+    expect(items).toHaveLength(50);
+    for (const item of items) {
+      expect("url" in item).toBe(true);
+      if ("url" in item)
+        expect(claimsOf(item.url)).toMatchObject({
+          k: "download",
+          st: "l",
+          sub: link.id,
+          pwv: NO_PASSWORD_PWV,
+        });
+    }
+    expect(hits).toBe(1);
+    expect((await ledgerOf("link", link.id, today())).count).toBe(1);
+    expect((await linkById(link.id)).downloadCount).toBe(1);
+    expect(await auditRows({ action: "file.download", targetId: files[0]!.id })).toHaveLength(0);
+    // More than a window is refused as a whole.
+    const tooMany = await batch(
+      link.token,
+      { zipGrant: grant, nodeIds: [...files.map((f) => f.id), root.id] },
+      { ip: X },
+    );
+    expect([tooMany.status, errorOf(tooMany).error]).toEqual([400, "validation"]);
+  });
+
+  it("a node outside the link, a non-clean or hidden node in the batch: none minted for it, the rest are", async () => {
+    const owner = await member();
+    const root = await makeFolder(owner.id);
+    const good = await makeFile(owner.id, root.id, { scanStatus: "clean" });
+    const pending = await makeFile(owner.id, root.id, { scanStatus: "pending" });
+    const infected = await makeFile(owner.id, root.id, { scanStatus: "infected" });
+    const down = await makeFile(owner.id, root.id, { scanStatus: "clean", takedownAt: new Date() });
+    const outside = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const link = await linkTo(owner, root.id);
+    const grant = (
+      (await visit(link.token, "/zip-manifest", { method: "POST", ip: X })).body as { zipGrant: string }
+    ).zipGrant;
+    const answer = await batch(
+      link.token,
+      { zipGrant: grant, nodeIds: [good.id, pending.id, infected.id, down.id, outside.id] },
+      { ip: X },
+    );
+    expect(answer.status).toBe(200);
+    const items = (answer.body as Items).items;
+    expect(items.filter((item) => "url" in item).map((item) => item.nodeId)).toEqual([good.id]);
+    for (const id of [pending.id, infected.id, down.id, outside.id]) {
+      expect(items.find((item) => item.nodeId === id)).toEqual({ nodeId: id, error: "not_found" });
+    }
+  });
+
+  it("no valid grant — none, another address's, another link's — is 403 and mints nothing; a dangerous type needs the ack", async () => {
+    const owner = await member();
+    const root = await makeFolder(owner.id);
+    const file = await makeFile(owner.id, root.id, { scanStatus: "clean" });
+    const exe = await makeFile(owner.id, root.id, { scanStatus: "clean", name: "setup.exe" });
+    const link = await linkTo(owner, root.id);
+    const other = await linkTo(owner, root.id);
+    const grant = (
+      (await visit(link.token, "/zip-manifest", { method: "POST", ip: X })).body as { zipGrant: string }
+    ).zipGrant;
+    for (const [token, ip] of [
+      [link.token, Y],
+      [other.token, X],
+    ] as const) {
+      const refused = await batch(token, { zipGrant: grant, nodeIds: [file.id] }, { ip });
+      expect([refused.status, errorOf(refused).error, errorOf(refused).details?.reason]).toEqual([
+        403,
+        "forbidden",
+        "zip_grant",
+      ]);
+    }
+    const noAck = (await batch(link.token, { zipGrant: grant, nodeIds: [exe.id] }, { ip: X })).body as Items;
+    expect(noAck.items).toEqual([{ nodeId: exe.id, error: "forbidden" }]);
+    const acked = (
+      await batch(link.token, { zipGrant: grant, nodeIds: [exe.id], dangerousAck: true }, { ip: X })
+    ).body as Items;
+    expect("url" in acked.items[0]!).toBe(true);
+  });
+});
+
 describe("scope, inherited takedown, refusals", () => {
   it("a folder link reaches its subtree only: a sibling, the parent and their listings are 404", async () => {
     const owner = await member();

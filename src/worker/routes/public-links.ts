@@ -34,15 +34,17 @@ import { HEADER_LINK_SESSION, TOKEN_TTL, ZIP_MAX_ENTRIES } from "../../shared/co
 import { TOKEN_PARAM, UUID_PARAM } from "../../shared/ids";
 import {
   PublicDownloadUrlBody,
+  PublicDownloadUrlsBody,
   UnlockBody,
   type PublicChildrenResponse,
   type PublicDownloadUrlResponse,
+  type PublicDownloadUrlsResponse,
   type PublicLinkInfo,
   type PublicNodeDto,
   type PublicZipManifest,
   type UnlockResponse,
 } from "../../shared/schemas/link";
-import { ListChildrenQuery } from "../../shared/schemas/node";
+import { ListChildrenQuery, type BatchDownloadUrlItem } from "../../shared/schemas/node";
 import { QueryError } from "../db/errors";
 import {
   clearPasswordFailures,
@@ -114,6 +116,32 @@ function logVisit(c: Ctx, linkId: string, nodeId: string | null, outcome: Outcom
       country,
       uaHash: null,
     });
+  defer(
+    c,
+    write().catch(() => {
+      metric("link", { outcome: "error", reason: "access_log" });
+    }),
+  );
+}
+
+/** Several access-log rows, written one after the other by ONE deferred task. */
+function logVisits(c: Ctx, linkId: string, rows: { nodeId: string; outcome: Outcome }[]): void {
+  if (rows.length === 0) return;
+  const cf = c.req.raw.cf as { country?: unknown } | undefined;
+  const country = typeof cf?.country === "string" ? cf.country : null;
+  const write = async () => {
+    const ipHash = await ipHashDaily(keys(c), c.get("ip"), dayUTC(now(c)));
+    for (const row of rows) {
+      await logAccess(db(c), {
+        linkId,
+        nodeId: row.nodeId,
+        outcome: row.outcome,
+        ipHashDaily: ipHash,
+        country,
+        uaHash: null,
+      });
+    }
+  };
   defer(
     c,
     write().catch(() => {
@@ -415,6 +443,53 @@ router.post(`${BASE}/download-url`, limited, async (c) => {
     url: `${c.env.FILES_ORIGIN}/${path}/${token}`,
     expiresAt: isoOf(expiresAt),
   } satisfies PublicDownloadUrlResponse);
+});
+
+/**
+ * The URLs of one window of a public zip, in ONE request — one hit of `RL_LINKS` for up to
+ * `ZIP_URL_BATCH` files, never an exemption from it. Only under a VALID grant (this link, its
+ * folder, the current password version, this address): without one the request is refused as a
+ * whole and nothing is minted. Every node passes every check of the single mint — under the link,
+ * not trashed or hidden, a clean file with a version, the ack for a dangerous type — and one that
+ * does not is an item with its code and no URL. Nothing is counted: the zip was, at its manifest.
+ */
+router.post(`${BASE}/download-urls`, limited, async (c) => {
+  const body = parse(PublicDownloadUrlsBody, await jsonBody(c));
+  const resolved = await resolveLink(c, c.req.param("token"), { zipGrant: body.zipGrant });
+  const { link, pwv } = resolved;
+  if (!resolved.granted) {
+    refuse(c, link, null, "denied_scan", new AppError("forbidden", undefined, { reason: "zip_grant" }));
+  }
+  const owner = await ownerSubject(c, link);
+  await previewOwnerCap(c, link, owner, link.nodeId);
+  const items: BatchDownloadUrlItem[] = [];
+  const outcomes: { nodeId: string; outcome: Outcome }[] = [];
+  // One after the other, in the order asked.
+  for (const nodeId of [...new Set(body.nodeIds)]) {
+    const access = await getAccess(c, nodeId, { notTrashed: true });
+    const node = access ? await getNode(db(c), nodeId) : null;
+    if (!node || node.system !== null || node.kind !== "file" || node.versionId === null) {
+      items.push({ nodeId, error: "not_found" });
+      outcomes.push({ nodeId, outcome: "denied_scan" });
+      continue;
+    }
+    if (!body.dangerousAck && dangerousForPublicLink(node.name, node.mimeSniffed)) {
+      items.push({ nodeId, error: "forbidden" });
+      outcomes.push({ nodeId, outcome: "denied_scan" });
+      continue;
+    }
+    const { token, expiresAt } = await mintDownloadToken(
+      keys(c),
+      { k: "download", n: node.id, ver: node.versionId, st: "l", sub: link.id, pwv },
+      { ttlSec: TOKEN_TTL.zip },
+    );
+    items.push({ nodeId, url: `${c.env.FILES_ORIGIN}/d/${node.id}/${token}`, expiresAt: isoOf(expiresAt) });
+    outcomes.push({ nodeId, outcome: "ok" });
+  }
+  // One access-log row per mint and per refusal, written by one deferred task.
+  logVisits(c, link.id, outcomes);
+  metric("download", { kind: "zip_batch", outcome: "ok", reason: "link" });
+  return c.json({ items } satisfies PublicDownloadUrlsResponse);
 });
 
 async function children(c: Ctx, nodeId: string | undefined) {

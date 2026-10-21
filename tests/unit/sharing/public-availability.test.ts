@@ -228,14 +228,29 @@ describe("every public route", () => {
     }
   });
 
-  it("RL_LINKS: a refusing limiter answers 429 rate_limited with Retry-After", async () => {
-    const { link } = await folderLink();
-    const keys: string[] = [];
-    const refuse = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: false }) };
-    const answer = await visit(link.token, "", { env: { RL_LINKS: refuse }, ip: "198.51.100.23" });
-    expect([answer.status, errorOf(answer).error]).toEqual([429, "rate_limited"]);
-    expect(answer.headers["retry-after"]).toBe("60");
-    expect(keys).toEqual(["ip:198.51.100.23"]);
+  it("RL_LINKS on EVERY public route: a refusing limiter answers 429 rate_limited with Retry-After, keyed by address", async () => {
+    const { folder, file, link } = await folderLink();
+    const routes: [string, Parameters<typeof visit>[2]][] = [
+      ["", {}],
+      ["/children", {}],
+      [`/children/${folder.id}`, {}],
+      ["/unlock", { json: { password: PASSWORD } }],
+      ["/download-url", { json: { kind: "download", nodeId: file.id } }],
+      ["/download-urls", { json: { zipGrant: "made-up-grant", nodeIds: [file.id] } }],
+      ["/zip-manifest", { method: "POST" }],
+    ];
+    for (const [rest, options] of routes) {
+      const keys: string[] = [];
+      const refuse = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: false }) };
+      const answer = await visit(link.token, rest, {
+        ...options,
+        env: { RL_LINKS: refuse },
+        ip: "198.51.100.23",
+      });
+      expect([answer.status, errorOf(answer).error], rest || "/").toEqual([429, "rate_limited"]);
+      expect(answer.headers["retry-after"], rest || "/").toBe("60");
+      expect(keys, rest || "/").toEqual(["ip:198.51.100.23"]);
+    }
     // The control: an allowing limiter lets the same request through.
     expect((await visit(link.token)).status).toBe(200);
   });

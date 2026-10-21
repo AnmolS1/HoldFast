@@ -306,6 +306,13 @@ const EXAMPLES: Record<string, unknown> = {
   "link.LinkOutcome": "refused",
   "link.LinkPauseReason": "review",
   "link.LinkDto": linkDto,
+  "link.PublicDownloadUrlsBody": { zipGrant: "made-up-grant", nodeIds: [NODE], dangerousAck: true },
+  "link.PublicDownloadUrlsResponse": {
+    items: [
+      { nodeId: NODE, url: "https://files.example/d/x/y", expiresAt: AT },
+      { nodeId: NODE, error: "not_found" },
+    ],
+  },
   "link.CreateLinkBody": {
     expiresAt: AT,
     password: "a made-up password",
