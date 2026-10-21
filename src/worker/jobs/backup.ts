@@ -381,6 +381,10 @@ export async function backupPass(bg: BackgroundContext, options: PassOptions = {
   if (await bucket.head(manifestKey(date))) return { done: true, written: [], outcome: "already_complete" };
 
   const locked = await withJobLock(bg.db, "backup", softDeadlineMs + LOCK_MARGIN_MS, async () => {
+    // Again under the lock: a pass that finished between the look above and this lock must not
+    // have its complete set overwritten (delta review d-m1).
+    if (await bucket.head(manifestKey(date)))
+      return { done: true, written: [], outcome: "already_complete" } as const;
     // A new attempt: whatever an earlier pass of this date left is overwritten, never reused.
     const attempt = `${new Date(startedAt).toISOString()}-${crypto.randomUUID().slice(0, 8)}`;
     await bucket.put(

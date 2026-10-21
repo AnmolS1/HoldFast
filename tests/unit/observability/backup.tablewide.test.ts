@@ -519,6 +519,27 @@ describe("passes: the deadline, a death, the lock, the read-back, one snapshot",
     expect(await listAll(`b/db/${date}/`)).toEqual(new Map());
   }, 120_000);
 
+  it("d-m1: a set completed between the first look and the lock is not overwritten", async () => {
+    const date = "2099-05-04";
+    await copySet(today, date);
+    const before = await listAll(`b/db/${date}/`);
+    // The first head() of the manifest misses, as if the other pass finished just after it.
+    let looks = 0;
+    const late = new Proxy(env.FILES, {
+      get(target, property) {
+        if (property === "head") {
+          return async (key: string) =>
+            key === manifestKey(date) && looks++ === 0 ? null : target.head(key);
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as R2Bucket;
+    const result = await backupPass(ctx().bg, { date, bucket: late, softDeadlineMs: 600_000 });
+    expect(result).toMatchObject({ done: true, outcome: "already_complete", written: [] });
+    expect(await listAll(`b/db/${date}/`)).toEqual(before);
+  }, 120_000);
+
   it("standing check (a): an account purged after a dead pass — the next pass starts over, the set restores with no dangling row", async () => {
     const date = "2099-03-01";
     const victim = await seedAccount();
@@ -611,6 +632,12 @@ describe("passes: the deadline, a death, the lock, the read-back, one snapshot",
     const heldRows = forced.dangling.filter((row) => row.held).map((row) => row.key);
     // The held folder, and everything under it (held by inheritance).
     expect(heldRows).toEqual(expect.arrayContaining([held.folder, held.child, held.file]));
+    // A row ABOUT a held node (its kept version, dropped with it) is held through its node_id.
+    expect(
+      forced.dangling.find((row) => row.table === "node_versions" && row.key.includes(held.versionId)),
+    ).toMatchObject({
+      held: true,
+    });
     expect(forced.warnings.some((warning) => /legal hold/.test(warning))).toBe(true);
   }, 600_000);
 });
