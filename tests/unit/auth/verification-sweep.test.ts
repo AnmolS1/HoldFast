@@ -6,7 +6,8 @@ import { inArray, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import { sweepExpiredVerifications } from "../../../src/worker/db/queries/auth-lifecycle";
 import { verification } from "../../../src/worker/db/schema";
-import { NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
+import { job } from "../../../src/worker/jobs/verification-sweep";
+import { NIGHTLY_CRON } from "../../../src/worker/scheduled";
 import type { BackgroundContext } from "../../../src/worker/services/request-context";
 import { testDb } from "./helpers";
 
@@ -94,18 +95,18 @@ describe("the sweep of expired verification rows", () => {
 
   it("the nightly cron runs it; the other crons do not", async () => {
     const old = await plant(-40 * HOUR);
-    const run = (cron: string) =>
-      scheduled(
-        { cron, scheduledTime: Date.now(), noRetry() {} } as ScheduledController,
-        env,
-        { waitUntil() {}, passThroughOnException() {}, props: {} } as unknown as ExecutionContext,
-        { db: testDb(), env, defer: () => {} } as unknown as BackgroundContext,
-      );
+    // The job itself, not the cron entry: the entry would run every job of the slot, table-wide,
+    // beside the other test files. Which jobs an expression runs is the registry's own test.
+    const run = () =>
+      job.run({ db: testDb(), env, defer: () => {} } as unknown as BackgroundContext, env, {
+        cron: NIGHTLY_CRON,
+        scheduledTime: Date.now(),
+        noRetry() {},
+      } as ScheduledController);
     const sweep = vi.mocked(sweepExpiredVerifications);
     sweep.mockClear();
-    await run("3 * * * *");
-    expect(sweep).not.toHaveBeenCalled();
-    await run(NIGHTLY_CRON);
+    expect(job.cron).toBe(NIGHTLY_CRON);
+    await run();
     expect(sweep).toHaveBeenCalledTimes(1);
     expect(await left([old])).toEqual([]);
   });

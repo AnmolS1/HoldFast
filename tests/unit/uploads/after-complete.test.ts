@@ -1042,9 +1042,13 @@ describe("fail safe — bytes are destroyed only on a definitive answer, never o
       const row = (await sessionRow(uploadId))!;
       await kind.before?.(folder.id);
       const fault = { armed: false, error: kind.faultInRecheck };
+      // Armed by the FIRST read only — the server's hash of the object — so that the fault lands
+      // on the re-check's first statement (a later read, e.g. the restore detector's, does not
+      // move it).
+      let reads = 0;
       const watched = watchedBucket(kind.fail ?? [], {
         get: async () => {
-          if (kind.faultInRecheck) fault.armed = true;
+          if (kind.faultInRecheck && reads++ === 0) fault.armed = true;
         },
       });
       const answer = await complete(

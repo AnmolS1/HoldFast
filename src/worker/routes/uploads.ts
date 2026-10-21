@@ -79,6 +79,7 @@ import { retryOnDeadlock } from "../db/retry";
 import type { Node, Upload } from "../db/schema";
 import { requireVerified } from "../middleware/guards";
 import { requireSwitch } from "../middleware/kill-switch";
+import { readsRolledBack } from "../jobs/reconcile";
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
@@ -326,8 +327,11 @@ async function releaseAndAbort(
 /**
  * Removes what a given-up session left in the store: the unfinished multipart upload, or the
  * object. Best effort — the database is already right, and what stays behind is unreferenced.
+ * While the database reads as rolled back (a restore — jobs/reconcile.ts, the detector) nothing
+ * is removed: it stays unreferenced, for the orphan sweep once the rollback is cleared.
  */
 async function discardStored(c: Ctx, session: Upload, assembled: boolean): Promise<void> {
+  if (await readsRolledBack(c.env, db(c))) return;
   const store = storage(c.env);
   try {
     if (session.r2UploadId && !assembled) {
@@ -509,7 +513,10 @@ async function withMultipart(c: Ctx, session: Upload): Promise<Upload> {
     return { ...session, r2UploadId: mpu.uploadId };
   }
   // Not recorded: the session was aborted meanwhile, or another init recorded its own first.
-  await store.abort(mpu).catch((error: unknown) => captureError(error, { kind: "upload_discard" }));
+  // (Not while the database reads as rolled back: the store ends an unfinished upload at 7 days.)
+  if (!(await readsRolledBack(c.env, db(c)))) {
+    await store.abort(mpu).catch((error: unknown) => captureError(error, { kind: "upload_discard" }));
+  }
   const current = await sessions.get(db(c), session.id);
   if (current?.status !== "open" || current.r2UploadId === null) {
     throw new AppError("conflict", "This upload is no longer open.");
@@ -985,7 +992,9 @@ export async function refuseBlocked(
   // Asked again right before the delete: a lock elsewhere may have raised this entry to CSAM
   // since the request read it, and such bytes are never deleted.
   if ((await blocklist.lookup(db(c), sha256))?.reason === "csam") throw new RaisedToCsam();
-  await storage(c.env).delete([session.r2Key]);
+  // While the database reads as rolled back the object is kept (unreferenced: the orphan sweep's
+  // once the rollback is cleared); everything else — and the answer — is as usual.
+  if (!(await readsRolledBack(c.env, db(c)))) await storage(c.env).delete([session.r2Key]);
   if (await releaseAndAbort(db(c), session, "claimed")) {
     audit(c, "upload.blocked", { type: "upload", id: session.id }, { reason, nodeId: session.nodeId });
     metric("upload", { outcome: "blocked", kind: modeOf(session), reason });
@@ -1005,8 +1014,12 @@ export async function refuseBlocked(
   throw blocked();
 }
 
-/** After the commit: what the removed avatar nodes left in the store. Best effort. */
-async function discardRemoved(store: Storage, removed: DeletedRows[]): Promise<void> {
+/**
+ * After the commit: what the removed avatar nodes left in the store. Best effort. Nothing while
+ * the database reads as rolled back (the orphan sweep's once it is cleared).
+ */
+async function discardRemoved(c: Ctx, store: Storage, removed: DeletedRows[]): Promise<void> {
+  if (await readsRolledBack(c.env, db(c))) return;
   try {
     await store.delete(removed.flatMap((rows) => rows.r2Keys));
     for (const prefix of removed.flatMap((rows) => rows.thumbPrefixes)) await store.deletePrefix(prefix);
@@ -1355,7 +1368,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       );
     }
     if (finished.keptHeld > 0) metric("upload", { outcome: "avatar_kept_held" }, finished.keptHeld);
-    await discardRemoved(store, finished.removed);
+    await discardRemoved(c, store, finished.removed);
     return c.json(await toOwnAvatarDto(db(c), node, { viewerId: user.id }), 201);
   }
   try {
@@ -1365,7 +1378,8 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
     captureError(error, { kind: "upload_enqueue" });
     metric("error", { kind: "upload_enqueue" });
   }
-  if (replacing && previousVersionId !== null) {
+  // The replaced version's thumbnails — not while the database reads as rolled back.
+  if (replacing && previousVersionId !== null && !(await readsRolledBack(c.env, db(c)))) {
     try {
       await store.delete(THUMB_SIZES.map((size) => thumbKey(node.id, previousVersionId, size)));
     } catch (error) {
