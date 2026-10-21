@@ -2,9 +2,17 @@
 // that pauses and hides — reversibly — and nothing more.
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { HEADER_LINK_SESSION } from "../../../src/shared/constants";
 import { TURNSTILE_TEST_SECRET_FAIL } from "../../../src/worker/auth/test-outbound";
 import { dismissReview } from "../../../src/worker/db/queries/moderation";
-import { hashBlocklist, nodes, shareLinks, strikes, type ScanStatus } from "../../../src/worker/db/schema";
+import {
+  hashBlocklist,
+  nodes,
+  shareLinks,
+  strikes,
+  user,
+  type ScanStatus,
+} from "../../../src/worker/db/schema";
 import { ipHashStable } from "../../../src/worker/services/ip-hash";
 import {
   fileReport,
@@ -24,10 +32,11 @@ import {
   member,
   nodeById,
   rand,
+  settingsWith,
   testDb,
   testKeys,
 } from "../sharing/helpers";
-import { linkTo, visit } from "../sharing/public-helpers";
+import { linkTo, unlock, visit } from "../sharing/public-helpers";
 import {
   alertsAbout,
   backdateReport,
@@ -42,6 +51,9 @@ import {
 } from "./helpers";
 
 const UNKNOWN_TOKEN = "AAAAAAAAAAAAAAAAAAAAAA";
+// Made up.
+const PASSWORD = "made-up link password 1";
+const OTHER_PASSWORD = "made-up link password 2";
 
 async function setNodeRow(id: string, values: Partial<typeof nodes.$inferInsert>) {
   await testDb().update(nodes).set(values).where(eq(nodes.id, id));
@@ -84,16 +96,79 @@ describe("the public route: proof of access, in order", () => {
     }
   });
 
-  it("a PAUSED link still takes reports (another visitor may hold the same URL); so does a password-protected one, on the URL alone", async () => {
-    const paused = await deepLink();
-    await setLinkRow(paused.link.id, { pauseReasons: ["anomaly"], pausedAt: new Date() });
-    expect((await publicReport({ nodeId: paused.file.id, linkToken: paused.link.token })).status).toBe(202);
-
+  it("a password link: no link session, another link's, one from another address, one of an old password → 404 identical to an unknown token; this link's session from this address → 202", async () => {
     const owner = await member();
     const folder = await makeFolder(owner.id);
     const file = await makeFile(owner.id, folder.id, { scanStatus: "clean" });
-    const locked = await linkTo(owner, folder.id, { password: "made-up link password 1" });
-    expect((await publicReport({ nodeId: file.id, linkToken: locked.token })).status).toBe(202);
+    const locked = await linkTo(owner, folder.id, { password: PASSWORD });
+    const ip = freshIp();
+    const as = (session: string | undefined, from = ip) =>
+      publicReport(
+        { nodeId: file.id, linkToken: locked.token },
+        { ip: from, headers: session ? { [HEADER_LINK_SESSION]: session } : {} },
+      );
+    const unknown = envelope(await publicReport({ nodeId: file.id, linkToken: UNKNOWN_TOKEN }));
+
+    const other = await linkTo(owner, folder.id, { password: PASSWORD });
+    const { session: otherSession } = await unlock(other.token, PASSWORD, { ip });
+    const { session: oldSession } = await unlock(locked.token, PASSWORD, { ip });
+    expect(otherSession).toBeTruthy();
+    expect(oldSession).toBeTruthy();
+    const refused = [await as(undefined), await as(otherSession), await as(oldSession, freshIp())];
+    await api(asCaller(owner), `/links/${locked.id}`, {
+      method: "PATCH",
+      json: { password: OTHER_PASSWORD },
+    });
+    refused.push(await as(oldSession));
+    for (const answer of refused) expect(envelope(answer)).toEqual(unknown);
+    expect(await reportsOn(file.id)).toEqual([]);
+    expect((await nodeById(file.id))!.scanStatus).toBe("clean");
+
+    const { session } = await unlock(locked.token, OTHER_PASSWORD, { ip });
+    expect((await as(session)).status).toBe(202);
+    expect(await reportsOn(file.id)).toHaveLength(1);
+  });
+
+  it("every other row of the availability table — an admin lock, any pause (a report's, the owner's, anomaly), links off, the owner suspended or banned, the download cap — → 404 identical to an unknown token, nothing filed", async () => {
+    const unknown = envelope(await publicReport({ nodeId: crypto.randomUUID(), linkToken: UNKNOWN_TOKEN }));
+    const cases: [string, (subject: Awaited<ReturnType<typeof deepLink>>) => Promise<unknown>, object?][] = [
+      ["lockedByAdmin", (s) => setLinkRow(s.link.id, { lockedByAdmin: true })],
+      ["report", (s) => setLinkRow(s.link.id, { pauseReasons: ["report"], pausedAt: new Date() })],
+      ["owner", (s) => setLinkRow(s.link.id, { pauseReasons: ["owner"], pausedAt: new Date() })],
+      ["anomaly", (s) => setLinkRow(s.link.id, { pauseReasons: ["anomaly"], pausedAt: new Date() })],
+      ["linksEnabled off", async () => {}, { settings: settingsWith({ linksEnabled: false }) }],
+      [
+        "suspended",
+        (s) => testDb().update(user).set({ suspendedAt: new Date() }).where(eq(user.id, s.owner.id)),
+      ],
+      ["banned", (s) => testDb().update(user).set({ banned: true }).where(eq(user.id, s.owner.id))],
+      ["cap", (s) => setLinkRow(s.link.id, { maxDownloads: 2, downloadCount: 2 })],
+    ];
+    for (const [name, arrange, options] of cases) {
+      const subject = await deepLink();
+      await arrange(subject);
+      const answer = await publicReport({ nodeId: subject.file.id, linkToken: subject.link.token }, options);
+      // Soft: a red names every row that is still let through, not only the first.
+      expect.soft(envelope(answer), name).toEqual(unknown);
+      expect.soft(await reportsOn(subject.file.id), name).toEqual([]);
+      expect.soft((await nodeById(subject.file.id))!.scanStatus, name).toBe("clean");
+    }
+  });
+
+  it("a refused link says nothing about the node: its file, its folder and an unknown id answer the same 404 in the same number of statements", async () => {
+    const { owner, outer, inner, file } = await deepLink();
+    const locked = await linkTo(owner, outer.id, { password: PASSWORD });
+    const ip = freshIp();
+    const answers = [];
+    for (const nodeId of [file.id, inner.id, crypto.randomUUID()]) {
+      answers.push(await publicReport({ nodeId, linkToken: locked.token }, { ip }));
+    }
+    const [first, ...rest] = answers;
+    expect(envelope(first!)).toMatchObject({ status: 404, error: "not_found" });
+    for (const answer of rest) {
+      expect(envelope(answer)).toEqual(envelope(first!));
+      expect(answer.statements).toBe(first!.statements);
+    }
   });
 
   it("a folder target → 400 validation, 'Choose the file you want to report' (after the token is proven)", async () => {
