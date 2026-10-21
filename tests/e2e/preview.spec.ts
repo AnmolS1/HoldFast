@@ -176,6 +176,39 @@ async function arrange(
   return arranged;
 }
 
+/**
+ * A one-page PDF whose fonts are NOT embedded: Japanese text in a CID font through a predefined
+ * Adobe CMap (UniJIS-UCS2-H), and a line in Helvetica. pdf.js can read neither without its own
+ * data files (the binary CMaps, the standard fonts) — served by this app under /pdfjs/.
+ */
+function nonEmbeddedFontsPdf(): Buffer {
+  const content = [
+    "BT /F1 24 Tf 72 700 Td <65E5672C8A9E> Tj ET",
+    "BT /F2 18 Tf 72 640 Td (Helvetica, not embedded) Tj ET",
+  ].join("\n");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>",
+    `<< /Length ${Buffer.byteLength(content, "latin1")} >>\nstream\n${content}\nendstream`,
+    "<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiMin-W3 /Encoding /UniJIS-UCS2-H /DescendantFonts [6 0 R] >>",
+    "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /HeiseiMin-W3 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> /FontDescriptor 8 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Type /FontDescriptor /FontName /HeiseiMin-W3 /Flags 6 /FontBBox [0 -141 1000 859] /ItalicAngle 0 /Ascent 859 /Descent -141 /CapHeight 709 /StemV 69 >>",
+  ];
+  let body = "%PDF-1.7\n";
+  const offsets: number[] = [];
+  objects.forEach((object, index) => {
+    offsets.push(Buffer.byteLength(body, "latin1"));
+    body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(body, "latin1");
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) body += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(body, "latin1");
+}
+
 const dialog = (page: Page) => page.getByRole("dialog");
 const renderer = (page: Page, kind: string) => page.locator(`[data-preview-renderer="${kind}"]`);
 
@@ -284,6 +317,82 @@ test.describe("previews (mocked API and files host)", () => {
     // The page underneath is still there, and inert.
     await expect(page.locator('[data-background="kept"]')).toHaveAttribute("inert", "");
     expectClean(arranged);
+  });
+
+  // T18 review m5: without pdf.js's data files a CJK document drew no text and a non-embedded
+  // font was guessed at. They are this app's own files under /pdfjs/ (vite.config.ts), in dev and
+  // in the build, read from the app's origin only.
+  test("a PDF with non-embedded fonts: the CMap is fetched from this app and the Japanese text is read", async ({
+    page,
+    origins,
+  }) => {
+    const pdf = nonEmbeddedFontsPdf();
+    const arranged = await arrange(page, origins, [NODES.pdf], {
+      files: async (route, path) => {
+        if (!path.startsWith(`/i/${ID.pdf}/`)) return false;
+        await route.fulfill({
+          status: 200,
+          body: pdf,
+          headers: { "access-control-allow-origin": origins.app, "content-type": "application/pdf" },
+        });
+        return true;
+      },
+    });
+    const data: Array<{ path: string; status: number; type: string }> = [];
+    const warnings: string[] = [];
+    page.on("response", (response) => {
+      const url = new URL(response.url());
+      if (!url.pathname.startsWith("/pdfjs/")) return;
+      data.push({
+        path: url.pathname,
+        status: response.status(),
+        type: response.headers()["content-type"] ?? "",
+      });
+    });
+    page.on("console", (message) => {
+      if (/cmap|standard font|wasm|fetchStandardFontData|translateFont/i.test(message.text()))
+        warnings.push(message.text());
+    });
+    await open(page, ID.pdf);
+    await expect(renderer(page, "pdf")).toBeVisible();
+    const first = page.locator('[data-pdf-page="1"]');
+    await expect(first.locator(".textLayer")).toContainText("日本語");
+    await expect(first.locator(".textLayer")).toContainText("Helvetica, not embedded");
+
+    const cmap = data.find((entry) => entry.path === "/pdfjs/cmaps/UniJIS-UCS2-H.bcmap");
+    expect(cmap, "the predefined CMap was asked for").toBeDefined();
+    expect(cmap!.status).toBe(200);
+    expect(cmap!.type).not.toMatch(/text\/html/);
+    for (const entry of data) expect(entry.status, entry.path).toBe(200);
+    expect(warnings).toEqual([]);
+    expectClean(arranged);
+  });
+
+  test("pdf.js's data files are this app's own (fonts, decoders); its scripting engine is not served", async ({
+    page,
+  }) => {
+    for (const [path, type] of [
+      ["/pdfjs/cmaps/Adobe-Japan1-UCS2.bcmap", "application/octet-stream"],
+      ["/pdfjs/standard_fonts/LiberationSans-Regular.ttf", "font/ttf"],
+      ["/pdfjs/standard_fonts/FoxitSerif.pfb", "application/octet-stream"],
+      ["/pdfjs/wasm/openjpeg.wasm", "application/wasm"],
+      ["/pdfjs/wasm/jbig2.wasm", "application/wasm"],
+      ["/pdfjs/iccs/CGATS001Compat-v2-micro.icc", "application/vnd.iccprofile"],
+    ] as const) {
+      const response = await page.request.get(path);
+      expect(response.status(), path).toBe(200);
+      expect(response.headers()["content-type"], path).toBe(type);
+      expect((await response.body()).length, path).toBeGreaterThan(0);
+    }
+    for (const path of [
+      "/pdfjs/wasm/quickjs-eval.wasm",
+      "/pdfjs/wasm/quickjs-eval.js",
+      "/pdfjs/cmaps/..%2F..%2Fpackage.json",
+    ]) {
+      const response = await page.request.get(path);
+      // Not the file: a 404 in dev; the SPA's page (HTML) from the built assets.
+      expect(response.headers()["content-type"] ?? "", path).not.toMatch(/wasm|javascript|json/);
+    }
   });
 
   test("a PDF: page 1 is drawn with selectable text; page 3 is reached; a link out asks first", async ({

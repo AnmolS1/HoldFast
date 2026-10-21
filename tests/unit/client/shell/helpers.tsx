@@ -15,6 +15,7 @@ import type { PublicConfig, SessionShape, SessionUserShape } from "../../../../s
 import { resetPrefsForTests } from "../../../../src/client/lib/prefs";
 import {
   publicConfigQuery,
+  QUERY_DEFAULTS,
   queryClient,
   resetIdentityForTests,
   sessionQuery,
@@ -326,7 +327,11 @@ export function setupShell(): void {
     localStorage.clear();
     sessionStorage.clear();
     queryClient.clear();
-    queryClient.setDefaultOptions({ queries: { retry: false, staleTime: 15_000 } });
+    // The shell's own defaults (the Retry-After holds among them), without the retry.
+    queryClient.setDefaultOptions({
+      ...QUERY_DEFAULTS,
+      queries: { ...QUERY_DEFAULTS.queries, retry: false, staleTime: 15_000 },
+    });
     resetApiForTests();
     resetIdentityForTests();
     resetPrefsForTests();

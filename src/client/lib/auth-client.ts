@@ -18,6 +18,7 @@
 import { passkeyClient } from "@better-auth/passkey/client";
 import { createAuthClient } from "better-auth/client";
 import { adminClient, inferAdditionalFields, twoFactorClient } from "better-auth/client/plugins";
+import { IDENTITY_HEADER, identityHeaders, noteIdentityMismatch, toApiError } from "./api";
 import type { AuthClientContract, AuthError, AuthResult } from "./auth-contract";
 import { registerUserStatePurger } from "./contracts";
 import { OPTIONS_PATH, passkeyCeremonies } from "./passkey-ceremony";
@@ -36,10 +37,25 @@ export const betterAuthClient = createAuthClient({
   // the HttpOnly cookie itself.
   basePath: "/api/auth",
   fetchOptions: {
-    // Tells the ceremony queue that a passkey sign-in has its options (lib/passkey-ceremony.ts).
-    onResponse(context) {
+    // The page's `fetch` when the request is made (the library would keep the one it saw when
+    // this module loaded).
+    customFetchImpl: (...args: Parameters<typeof fetch>) => fetch(...args),
+    // The identity pin (W2S4): every request names the account this client's state belongs to.
+    // The Worker refuses one whose session is another account — except the endpoints that sign
+    // the browser in or out, or read its session (middleware/identity-pin.ts).
+    onRequest(context) {
+      for (const [name, value] of Object.entries(identityHeaders())) context.headers.set(name, value);
+    },
+    async onResponse(context) {
+      // Tells the ceremony queue that a passkey sign-in has its options (lib/passkey-ceremony.ts).
       if (new URL(context.response.url, window.location.origin).pathname.endsWith(OPTIONS_PATH)) {
         passkeyCeremonies.optionsArrived();
+      }
+      // Refused as another account's: the same adoption as the API client's, for the account the
+      // request was sent for.
+      if (context.response.status === 403) {
+        const sentFor = context.request.headers.get(IDENTITY_HEADER);
+        noteIdentityMismatch(await toApiError(context.response), sentFor);
       }
     },
   },
@@ -108,15 +124,18 @@ export const authClient: AuthClientContract = {
 
 // The library keeps a session store of its own (unused by the shell). If anything ever fills it,
 // it is user-scoped state like any other: emptied on sign-out and on every change of identity.
+// Read through `.value`, never `.get()`: `get()` MOUNTS a store nobody listens to, and the session
+// store's mount asks `GET /api/auth/get-session`, listens for focus, and unmounts a second later
+// from a timer that touches `document`.
 registerUserStatePurger(() => {
   try {
     const store = (
       betterAuthClient as unknown as {
-        $store?: { atoms?: Record<string, { get(): unknown; set(value: unknown): void } | undefined> };
+        $store?: { atoms?: Record<string, { value: unknown; set(value: unknown): void } | undefined> };
       }
     ).$store;
     const session = store?.atoms?.session;
-    if (session) session.set({ ...(session.get() as object), data: null, error: null, isPending: false });
+    if (session) session.set({ ...(session.value as object), data: null, error: null, isPending: false });
   } catch {
     // Nothing to empty.
   }

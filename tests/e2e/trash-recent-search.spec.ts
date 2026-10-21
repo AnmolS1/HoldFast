@@ -755,9 +755,10 @@ test.describe("a page never throws on an API error", () => {
         await expect(viewError(page, name).getByRole("button", { name: "Try again" })).toBeVisible();
         await expect(page.getByText("Something broke on this page")).toHaveCount(0);
         await expect(page.locator("[data-placeholder-page]")).toHaveCount(0);
-        // The sidebar's bar is on every page of the desktop frame: a skeleton, not a crash.
+        // The sidebar's bar is on every page of the desktop frame: it says the usage could not be
+        // read (no skeleton for ever), not a crash.
         if (!isMobile(page)) {
-          await expect(page.locator("[data-sidebar]").getByLabel("Loading storage use")).toBeVisible();
+          await expect(page.locator("[data-sidebar]").getByText("Storage use unavailable")).toBeVisible();
         }
       }
       expect(pageErrors).toEqual([]);

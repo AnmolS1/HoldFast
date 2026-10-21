@@ -5,6 +5,7 @@
 // This module imports neither the router nor the query client: both register what the client
 // needs through `configureApi`, which keeps the import graph acyclic.
 import type { ZodType } from "zod";
+import { HEADER_USER } from "../../shared/constants";
 import { toast } from "../components/Toaster/store";
 import { INTERNAL_ERROR, isErrorCode, type ErrorCode } from "./contracts";
 import { t } from "./i18n";
@@ -62,6 +63,16 @@ export interface ApiEnvironment {
   clearSession(): void;
   /** Reflect a kill switch learned from a 503 into the cached public config. */
   patchConfig(patch: { readOnly?: boolean; uploadsEnabled?: boolean; linksEnabled?: boolean }): void;
+  /** The account the client's state belongs to (sent as `X-Holdfast-User`), or null. */
+  userId(): string | null;
+  /**
+   * The browser is signed in to another account than the one this client's state belongs to
+   * (the API refused a request with `identity_mismatch`): purge, and adopt the account the
+   * session now names. The API client then starts again at `/`.
+   */
+  identityChanged(): Promise<void>;
+  /** Load the app again from `to` (a full page load): what is left when the session cannot be read. */
+  reload(to: string): void;
 }
 
 const defaultEnvironment: ApiEnvironment = {
@@ -72,6 +83,11 @@ const defaultEnvironment: ApiEnvironment = {
     typeof location === "undefined" ? "/" : location.pathname + location.search + location.hash,
   clearSession: () => {},
   patchConfig: () => {},
+  userId: () => null,
+  identityChanged: async () => {},
+  reload: (to) => {
+    if (typeof window !== "undefined") window.location.assign(to);
+  },
 };
 
 let environment: ApiEnvironment = { ...defaultEnvironment };
@@ -85,6 +101,7 @@ export function resetApiForTests(): void {
   environment = { ...defaultEnvironment };
   reauth = null;
   terms = null;
+  adopting = null;
   emitGates();
 }
 
@@ -228,6 +245,73 @@ export function cancelTermsGate(): void {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The identity pin (W2S4). The session cookie is the browser's, shared by every tab: another tab
+// signing in as someone else changes who THIS tab's next request runs as. Each request names the
+// account this client's state belongs to; the API refuses one whose session is another account
+// (403 forbidden, `identity_mismatch`, src/worker/middleware/identity-pin.ts), and the client then
+// adopts the account the browser is signed in as — the request is never replayed.
+
+/** The header name (src/shared/constants.ts), as `Headers` spells it. */
+export const IDENTITY_HEADER = HEADER_USER.toLowerCase();
+
+/**
+ * Where the pin is sent: every `/api/*` path but `/api/public/*` (nothing there acts for an
+ * account). Under `/api/auth/*` the Worker itself leaves the identity endpoints unpinned.
+ */
+function pinned(path: string): boolean {
+  const pathname = pathnameOf(path);
+  return pathname.startsWith("/api/") && !pathname.startsWith("/api/public/");
+}
+
+/** The account this client's state belongs to now (what `api()` captures when a call starts). */
+export function currentAccount(): string | null {
+  return environment.userId();
+}
+
+/** For a request made outside `api()` (the upload bodies): the header for `account`. */
+export function identityHeaders(account: string | null = environment.userId()): Record<string, string> {
+  return account === null ? {} : { [IDENTITY_HEADER]: account };
+}
+
+export function isIdentityMismatch(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && error.details?.reason === "identity_mismatch";
+}
+
+let adopting: Promise<void> | null = null;
+
+/**
+ * Once, however many requests were refused at the same time: purge, adopt, start again at `/`.
+ * When the session cannot be read, the app is loaded again from `/` instead: the account it
+ * remembers would still be the old one, and every request made for it would be refused again —
+ * and adopted again — without end.
+ */
+function adoptBrowserIdentity(): void {
+  if (adopting) return;
+  adopting = environment
+    .identityChanged()
+    .then(
+      () => environment.navigate("/", { replace: true }),
+      () => environment.reload("/"),
+    )
+    .finally(() => {
+      adopting = null;
+    });
+}
+
+/**
+ * A refusal as another account's, for the account the request was SENT for. Adopted only when this
+ * tab still holds that account: a request made for the previous account whose refusal arrives
+ * after the tab has already moved on (a session re-read adopted the new one) is dropped quietly —
+ * adopting again would purge the account the tab holds now. Returns whether it adopted.
+ */
+export function noteIdentityMismatch(error: unknown, sentFor: string | null): boolean {
+  if (!isIdentityMismatch(error)) return false;
+  if (sentFor === null || sentFor !== environment.userId()) return false;
+  adoptBrowserIdentity();
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
 
 export interface ApiOptions<T> {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -237,6 +321,17 @@ export interface ApiOptions<T> {
   signal?: AbortSignal;
   /** Parses and types the response. Without it the parsed JSON is returned unchecked. */
   schema?: ZodType<T>;
+  /**
+   * The caller wants no body: any 2xx resolves to `undefined` without reading it (a `202` that
+   * may or may not carry one). A failure is read and thrown as usual.
+   */
+  empty?: boolean;
+  /**
+   * Codes this caller announces itself: no toast is shown for them (their other side effects
+   * still happen, and the error is thrown as usual). E.g. the uploader says "Daily upload limit
+   * reached" in its ribbon, so its init passes `["ceiling_exceeded"]`.
+   */
+  silent?: readonly ApiErrorCode[];
 }
 
 function isBodyInit(body: unknown): body is BodyInit {
@@ -271,27 +366,39 @@ function isEnvelope(value: unknown): value is RawEnvelope {
   return isRecord(value) && typeof value.error === "string" && typeof value.message === "string";
 }
 
-async function toApiError(response: Response): Promise<ApiError> {
-  const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
-  let body: unknown;
+/** A failed answer as its parts: what `apiErrorOf` reads (an XMLHttpRequest has no `Response`). */
+export interface FailedAnswer {
+  status: number;
+  /** The body as text; `undefined`/`null` when there was none. */
+  body?: string | null;
+  /** The raw `Retry-After` header, when there was one. */
+  retryAfter?: string | null;
+}
+
+function parseJsonText(text: string | null | undefined): unknown {
+  if (!text) return undefined;
   try {
-    body = await response.clone().json();
+    return JSON.parse(text) as unknown;
   } catch {
-    body = undefined;
+    return undefined;
   }
+}
+
+/** The error envelope (or its absence) as a typed ApiError; `fallback` is the client's own words. */
+function errorFrom(
+  status: number,
+  body: unknown,
+  retryAfter: number | undefined,
+  fallback: string,
+): ApiError {
   if (!isEnvelope(body)) {
-    return new ApiError({
-      status: response.status,
-      code: "http_error",
-      message: t("toast.generic"),
-      retryAfter,
-    });
+    return new ApiError({ status, code: "http_error", message: fallback, retryAfter });
   }
   // The request id is kept in every case: it is what support uses to find the call.
   const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
   if (isErrorCode(body.error)) {
     return new ApiError({
-      status: response.status,
+      status,
       code: body.error,
       message: body.message,
       requestId,
@@ -302,16 +409,47 @@ async function toApiError(response: Response): Promise<ApiError> {
   // An unexpected failure (`500 internal`), or a code newer than this build: a generic failure
   // in the client's own words — the server's text for these says nothing a user can act on.
   return new ApiError({
-    status: response.status,
+    status,
     code: body.error === INTERNAL_ERROR ? INTERNAL_ERROR : "http_error",
-    message: t("toast.generic"),
+    message: fallback,
     requestId,
     retryAfter,
   });
 }
 
-async function send(path: string, options: ApiOptions<unknown>): Promise<Response> {
+/**
+ * A failed answer read some other way than `fetch` (the upload bodies go through
+ * XMLHttpRequest): the same ApiError `api()` would have thrown. `fallback` is the message when
+ * the server's own text is not shown (no envelope, `internal`, a code this build does not know).
+ */
+export function apiErrorOf(answer: FailedAnswer, fallback: string = t("toast.generic")): ApiError {
+  return errorFrom(
+    answer.status,
+    parseJsonText(answer.body),
+    parseRetryAfter(answer.retryAfter ?? null),
+    fallback,
+  );
+}
+
+/** A failed `Response` as the ApiError `api()` throws for it. The response's body is not consumed. */
+export async function toApiError(response: Response): Promise<ApiError> {
+  let body: unknown;
+  try {
+    body = await response.clone().json();
+  } catch {
+    body = undefined;
+  }
+  return errorFrom(
+    response.status,
+    body,
+    parseRetryAfter(response.headers.get("retry-after")),
+    t("toast.generic"),
+  );
+}
+
+async function send(path: string, options: ApiOptions<unknown>, userId: string | null): Promise<Response> {
   const headers: Record<string, string> = { accept: "application/json", ...options.headers };
+  if (userId !== null && pinned(path)) headers[IDENTITY_HEADER] = userId;
   let body: BodyInit | undefined;
   if (options.body !== undefined && options.body !== null) {
     if (isBodyInit(options.body)) {
@@ -351,8 +489,23 @@ async function readBody<T>(response: Response, schema: ZodType<T> | undefined): 
   return parsed.data;
 }
 
-/** Side effects of a failure that is not replayed. */
-function react(error: ApiError): void {
+/** "45 min", "1 h 30 min", "30 s": how long until a limit resets. */
+function waitWords(seconds: number): string {
+  if (seconds < 60) return t("time.seconds", { count: Math.max(1, seconds) });
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return t("time.minutes", { count: minutes });
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? t("time.hours", { count: hours }) : t("time.hoursMinutes", { hours, minutes: rest });
+}
+
+/** Side effects of a failure that is not replayed. `silent`: codes whose toast the caller shows. */
+function react(error: ApiError, silent: readonly ApiErrorCode[], sentFor: string | null): void {
+  const quiet = silent.includes(error.code);
+  if (isIdentityMismatch(error)) {
+    noteIdentityMismatch(error, sentFor);
+    return;
+  }
   const reason = typeof error.details?.reason === "string" ? error.details.reason : undefined;
   if (error.status === 403 && reason === "account_suspended") {
     environment.clearSession();
@@ -360,10 +513,24 @@ function react(error: ApiError): void {
     return;
   }
   if (error.status === 403 && reason === "impersonation_read_only") {
-    toast({ message: t("toast.impersonationReadOnly"), key: "impersonation" });
+    if (!quiet) toast({ message: t("toast.impersonationReadOnly"), key: "impersonation" });
+    return;
+  }
+  // A daily limit, not "too many requests": it resets at 00:00 UTC (the Retry-After says when).
+  if (error.status === 429 && error.code === "ceiling_exceeded") {
+    if (quiet) return;
+    toast({
+      message:
+        error.retryAfter === undefined
+          ? t("toast.ceilingReached")
+          : t("toast.ceilingReachedIn", { wait: waitWords(error.retryAfter) }),
+      requestId: error.requestId,
+      key: "rate",
+    });
     return;
   }
   if (error.status === 429) {
+    if (quiet) return;
     toast({
       message:
         error.retryAfter === undefined
@@ -376,17 +543,17 @@ function react(error: ApiError): void {
   }
   if (error.status === 503 && error.code === "read_only") {
     environment.patchConfig({ readOnly: true });
-    toast({ message: t("toast.readOnly"), key: "read-only" });
+    if (!quiet) toast({ message: t("toast.readOnly"), key: "read-only" });
     return;
   }
   if (error.status === 503 && error.code === "feature_disabled") {
     if (reason === "uploads_disabled") {
       environment.patchConfig({ uploadsEnabled: false });
-      toast({ message: t("toast.uploadsPaused"), key: "feature" });
+      if (!quiet) toast({ message: t("toast.uploadsPaused"), key: "feature" });
     } else if (reason === "links_disabled") {
       environment.patchConfig({ linksEnabled: false });
-      toast({ message: t("toast.linksPaused"), key: "feature" });
-    } else {
+      if (!quiet) toast({ message: t("toast.linksPaused"), key: "feature" });
+    } else if (!quiet) {
       toast({ message: t("toast.featurePaused"), key: "feature" });
     }
   }
@@ -399,10 +566,19 @@ function react(error: ApiError): void {
 export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}): Promise<T> {
   // Captured before the request leaves: a session that ends while it is in flight still counts.
   const hadSession = environment.hadSession();
+  // The account this request is made for — the same on a replay after re-auth.
+  const userId = environment.userId();
   let replayed = false;
   for (;;) {
-    const response = await send(path, options);
-    if (response.ok) return readBody(response, options.schema);
+    const response = await send(path, options, userId);
+    if (response.ok) {
+      if (options.empty) {
+        // Not read: release the connection's body without parsing it.
+        void response.body?.cancel().catch(() => {});
+        return undefined as T;
+      }
+      return readBody(response, options.schema);
+    }
     const error = await toApiError(response);
     if (!replayed) {
       if (
@@ -424,7 +600,7 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
         continue;
       }
     }
-    react(error);
+    react(error, options.silent ?? [], userId);
     throw error;
   }
 }
@@ -432,8 +608,9 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
 /** The standard error toast: the message, and the request id so support can find the call. */
 export function toastApiError(error: unknown): void {
   if (error instanceof ApiError) {
-    // These were already announced by `react`.
-    if (error.status === 429 || error.status === 503) return;
+    // These were already announced by `react`; an identity change says nothing (the page starts
+    // again as the account the browser is signed in as).
+    if (error.status === 429 || error.status === 503 || isIdentityMismatch(error)) return;
     toast({ message: error.message, requestId: error.requestId });
     return;
   }

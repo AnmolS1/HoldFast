@@ -328,6 +328,10 @@ test.describe("navigation", () => {
     await gotoFrame(page, preview.path);
     const overlay = page.locator("[data-overlay]");
     await expect(overlay).toBeAttached();
+    // The dialog sits over the page on the scrim (D01): the overlay box itself paints nothing.
+    expect(await overlay.evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
+      "rgba(0, 0, 0, 0)",
+    );
     if (preview.placeholder) await expect(placeholder(overlay, preview.title)).toBeVisible();
     else await expect(placeholder(page, preview.title)).toHaveCount(0);
     // Cold link: the root page is the background.

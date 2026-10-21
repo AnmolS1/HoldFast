@@ -279,7 +279,7 @@ describe("A2: a failed next page is not asked for again by a refresh of the list
     await waitFor(() => expect(notice("trash")).not.toBeNull());
     const reads = requests(calls, "GET", "/api/trash").length;
     fireEvent.click(screen.getByRole("button", { name: "More actions for report.pdf" }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(rowNames()).not.toContain(report.id));
     // The patch made the query "successful" again; the failed page and its wait are still remembered.
     expect(queryClient.getQueryState(viewKeys.trash)?.status).toBe("success");
@@ -343,7 +343,7 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
 
   it("Restore, 20 selected, every answer 429 with Retry-After: 30 → ONE request, one notice, all 20 still selected, the actions off for the wait", async () => {
     const { calls } = await openTwenty(everyNode(() => limited("30")));
-    fireEvent.click(bar().getByRole("button", { name: "Restore" }));
+    fireEvent.click(bar().getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(stopped()).not.toBeNull());
     expect(nodeCalls(calls, "POST").length).toBe(1);
     expect(nodeCalls(calls, "POST").length).toBeLessThanOrEqual(4);
@@ -353,7 +353,7 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
       "Restoring stopped: 0 restored, 20 left. Too many requests just now. You can try again shortly. req req-1234",
     );
     expect(document.querySelectorAll('[aria-selected="true"]')).toHaveLength(20);
-    expect((bar().getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((bar().getByRole("button", { name: /^Restore/ }) as HTMLButtonElement).disabled).toBe(true);
     expect((bar().getByRole("button", { name: /Delete forever/ }) as HTMLButtonElement).disabled).toBe(true);
     // Only the API client's own word about the limit — no toast per item.
     expect(getToasts()).toHaveLength(1);
@@ -374,7 +374,7 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
 
   it("every answer a 500 → ONE request and no stack of toasts", async () => {
     const { calls } = await openTwenty(everyNode(() => envelope("internal", 500)));
-    fireEvent.click(bar().getByRole("button", { name: "Restore" }));
+    fireEvent.click(bar().getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(stopped()).not.toBeNull());
     expect(nodeCalls(calls, "POST")).toHaveLength(1);
     expect(stopped()!.textContent).toBe("Restoring stopped: 0 restored, 20 left. req req-1234");
@@ -382,7 +382,7 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
     // Nobody else said it: the notice is the one announcement.
     expect(stopped()!.getAttribute("role")).toBe("alert");
     // No wait was named: the action is offered again at once.
-    expect((bar().getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((bar().getByRole("button", { name: /^Restore/ }) as HTMLButtonElement).disabled).toBe(false);
   });
 
   it("three restored, then a 429 with Retry-After: 1 → '3 restored, 17 left', 17 still selected; after the wait the batch can go on", async () => {
@@ -417,12 +417,12 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
       }
       return original(input, init);
     });
-    fireEvent.click(bar().getByRole("button", { name: "Restore" }));
+    fireEvent.click(bar().getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(stopped()).not.toBeNull());
     expect(stopped()!.textContent).toContain("Restoring stopped: 3 restored, 17 left.");
     expect(nodeCalls(calls, "POST")).toHaveLength(4);
     await waitFor(() => expect(document.querySelectorAll('[aria-selected="true"]')).toHaveLength(17));
-    const restore = () => bar().getByRole("button", { name: "Restore" }) as HTMLButtonElement;
+    const restore = () => bar().getByRole("button", { name: /^Restore/ }) as HTMLButtonElement;
     expect(restore().disabled).toBe(true);
     // The API's own second, awaited as the action coming back.
     await waitFor(() => expect(restore().disabled).toBe(false), { timeout: 4000 });
@@ -435,7 +435,7 @@ describe("A1: a batch stops at the first answer that is about the API", () => {
 
   it("failures about single items (404) do not stop the batch, and are said in ONE toast", async () => {
     const { calls } = await openTwenty(everyNode(() => envelope("not_found", 404)));
-    fireEvent.click(bar().getByRole("button", { name: "Restore" }));
+    fireEvent.click(bar().getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(nodeCalls(calls, "POST")).toHaveLength(20));
     await waitFor(() => expect(getToasts()).toHaveLength(1));
     expect(stopped()).toBeNull();
@@ -464,7 +464,7 @@ describe("A3: 'Empty the trash?' opens only as the continuation of its own click
     expect(emptyButton().getAttribute("aria-busy")).toBe("true");
     expect(emptyButton().disabled).toBe(true);
     const bar = within(document.querySelector<HTMLElement>("[data-selection-bar]")!);
-    expect((bar.getByRole("button", { name: "Restore" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((bar.getByRole("button", { name: /^Restore/ }) as HTMLButtonElement).disabled).toBe(true);
     expect((bar.getByRole("button", { name: /Delete forever/ }) as HTMLButtonElement).disabled).toBe(true);
     // Left alone, the answer opens the dialog that was asked for.
     read.resolve(json(TRASH));

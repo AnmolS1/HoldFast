@@ -187,6 +187,7 @@ describe("shortcuts", () => {
       "previous",
       "quickLook",
       "rename",
+      "restore",
       "search",
       "selectAll",
       "theme",

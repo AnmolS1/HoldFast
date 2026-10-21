@@ -4,11 +4,11 @@ import type { ReactNode } from "react";
 import { formatBytes } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { hf } from "../../theme/tokens";
-import type { UsageSummary } from "../slots";
+import type { UsageSlotValue } from "../slots";
 
 export interface StorageBarProps {
-  /** `null` while unknown: the bar shows its skeleton. */
-  usage: UsageSummary | null;
+  /** `null` while unknown: the bar shows its skeleton. `"unavailable"`: it says so. */
+  usage: UsageSlotValue;
   /** e.g. the "Manage storage" link. */
   footer?: ReactNode;
 }
@@ -17,6 +17,16 @@ export const ALMOST_FULL = 0.9;
 
 /** Storage use as a sentence and a 3 px bar. The bar is graphite; only the warning is coloured. */
 export function StorageBar({ usage, footer }: StorageBarProps) {
+  if (usage === "unavailable") {
+    return (
+      <Box sx={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+        <Box component="span" data-storage-unavailable sx={{ color: hf.textSecondary, fontSize: 12 }}>
+          {t("storage.unavailable")}
+        </Box>
+        {footer}
+      </Box>
+    );
+  }
   if (!usage) {
     return (
       <Box

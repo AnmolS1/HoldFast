@@ -1,7 +1,9 @@
 // pdf.js behind a small interface: open bytes, draw a page to a canvas with a text layer, list a
 // page's links. Safe-rendering rules live here:
 //   - the worker is this app's own file (same origin, no CDN);
-//   - the bytes are handed over whole — pdf.js makes no request of its own;
+//   - the bytes are handed over whole — pdf.js asks for nothing but its own data files (CMaps,
+//     standard fonts, image decoders), which are this app's static files under /pdfjs/
+//     (vite.config.ts) — never the document's server, never another origin;
 //   - no scripting anywhere: nothing here builds pdf.js's annotation or scripting layers, so a
 //     document's JavaScript actions and form scripts have nothing to run in. Links are read as
 //     DATA (a rectangle and an address) and drawn by the viewer itself.
@@ -20,6 +22,12 @@ import { PAGE_MAX_LINKS, PDF_MAX_IMAGE_PIXELS, TEXT_LAYER_MAX_ITEMS } from "./pd
 import { safeExternalUrl } from "./pdf-links";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
+
+/** Where vite.config.ts serves pdf.js's data files (dev) and puts them in the build. */
+const PDFJS_DATA = "/pdfjs/";
+const dataUrl = (dir: string) =>
+  new URL(`${PDFJS_DATA}${dir}/`, typeof location === "undefined" ? "http://localhost" : location.origin)
+    .href;
 
 /** Thrown by `openPdf` for a document that needs a password. */
 export class PdfLockedError extends Error {}
@@ -185,9 +193,16 @@ export async function openPdf(data: Uint8Array, signal?: AbortSignal): Promise<P
     disableRange: true,
     disableStream: true,
     disableAutoFetch: true,
-    // No forms engine, and nothing fetched by pdf.js: no CMap, font or decoder URL is configured.
+    // No forms engine. pdf.js's own data: the binary CMaps (CJK text), the standard fonts (a
+    // document that does not embed them), the WebAssembly image decoders and colour profiles —
+    // read on the main thread from this app's origin (connect-src 'self').
     enableXfa: false,
     useWorkerFetch: false,
+    cMapUrl: dataUrl("cmaps"),
+    cMapPacked: true,
+    standardFontDataUrl: dataUrl("standard_fonts"),
+    wasmUrl: dataUrl("wasm"),
+    iccUrl: dataUrl("iccs"),
     maxImageSize: PDF_MAX_IMAGE_PIXELS,
   });
   const destroy = () => void task.destroy();

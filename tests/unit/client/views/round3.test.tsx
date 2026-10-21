@@ -89,7 +89,7 @@ describe("n1: a batch's Retry-After outlives the visit to /trash", () => {
     const posts = () =>
       calls.filter((call) => call.method === "POST" && pathOf(call).startsWith("/api/nodes/"));
     await selectAll();
-    fireEvent.click(bar().getByRole("button", { name: "Restore" }));
+    fireEvent.click(bar().getByRole("button", { name: /^Restore/ }));
     await waitFor(() => expect(document.querySelector("[data-trash-stopped]")).not.toBeNull());
     expect(posts()).toHaveLength(1);
 
@@ -97,7 +97,7 @@ describe("n1: a batch's Retry-After outlives the visit to /trash", () => {
     await waitFor(() => expect(document.querySelector('[data-view-page="starred"]')).not.toBeNull());
     await act(() => router.navigate("/trash"));
     await selectAll();
-    const restore = bar().getByRole("button", { name: "Restore" }) as HTMLButtonElement;
+    const restore = bar().getByRole("button", { name: /^Restore/ }) as HTMLButtonElement;
     expect(restore.disabled).toBe(true);
     expect((bar().getByRole("button", { name: /Delete forever/ }) as HTMLButtonElement).disabled).toBe(true);
     expect(document.querySelector("[data-trash-stopped]")!.textContent).toContain(
@@ -118,7 +118,7 @@ describe("n1: a batch's Retry-After outlives the visit to /trash", () => {
     });
     await waitFor(() => expect(rowNames()).toHaveLength(2));
     fireEvent.click(screen.getByRole("button", { name: `More actions for ${twenty[0]!.name}` }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Restore" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /^Restore/ }));
     await waitFor(() => expect(document.querySelector("[data-trash-stopped]")).not.toBeNull());
     await act(() => purgeUserState({ keepSession: true }));
     await waitFor(() => expect(document.querySelector("[data-trash-stopped]")).toBeNull());

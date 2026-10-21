@@ -2,6 +2,7 @@
 // no answer is ever asked for again without bound.
 import { act, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getToasts } from "../../../../src/client/components/Toaster";
 import { getRibbonSnapshot } from "../../../../src/client/components/TransferRibbon";
 import { UploadDropOverlay } from "../../../../src/client/features/upload";
 import {
@@ -13,7 +14,7 @@ import {
 } from "../../../../src/client/features/upload/manager";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
-import { ApiError } from "../../../../src/client/lib/api";
+import { ApiError, configureApi } from "../../../../src/client/lib/api";
 import { renderShell, setupShell } from "../shell/helpers";
 import { EXISTING_ID } from "./fixtures";
 import {
@@ -138,6 +139,35 @@ describe("429 ceiling_exceeded", () => {
     await act(async () => screen.getByRole("button", { name: "Resume f0.txt" }).click());
     await act(() => settle(0));
     expect(server.completes.length).toBe(2);
+  });
+});
+
+describe("the identity pin (review m4)", () => {
+  it("every body names the account the upload was started for — captured once, when it started", async () => {
+    configureApi({ userId: () => "a".repeat(32) });
+    renderShell(<UploadPanel />);
+    await act(() => addFiles(many(1), null));
+    await act(() => settle(0));
+    expect(server.puts.length).toBeGreaterThan(0);
+    expect(server.puts.map((put) => put.account)).toEqual(server.puts.map(() => "a".repeat(32)));
+  });
+});
+
+describe("429 ceiling_exceeded: the daily limit is said once", () => {
+  it("the ribbon's sentence, and no shell toast beside it (init passes silent)", async () => {
+    server.onInit = () =>
+      envelope(
+        "ceiling_exceeded",
+        429,
+        { kind: "upload_user", dimension: "bytes" },
+        { "retry-after": "3600" },
+      );
+    renderShell(<UploadPanel />);
+    await act(() => addFiles(many(1), null));
+    await act(() => settle(0));
+    expect(items().map((item) => item.pauseReason)).toEqual(["ceiling"]);
+    expect(sentence()).toBe("Daily upload limit reached — resumes after midnight UTC");
+    expect(getToasts()).toEqual([]);
   });
 });
 

@@ -1,5 +1,6 @@
 // A page never throws on an API error: with its request answered 404 or 500 each view shows its
-// OWN error state (not the frame's error boundary), and the sidebar's bar stays a skeleton.
+// OWN error state (not the frame's error boundary), and the sidebar's bar says storage use is
+// unavailable (a skeleton only while it loads).
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { viewKeys } from "../../../../src/client/features/starred/view-queries";
@@ -89,7 +90,7 @@ describe("the storage slot", () => {
   }
 
   it.each(FAILURES)(
-    "useUsageSummary() is null when the request is answered %s — it never throws",
+    'useUsageSummary() is null while loading and "unavailable" once the request is answered %s — it never throws',
     async (_s, failure) => {
       const calls = shellFetch({
         extra: (call) => (call.path === "/api/account/usage" ? failure() : undefined),
@@ -99,8 +100,9 @@ describe("the storage slot", () => {
       // Until the query has settled as failed — then every value it ever gave is on the list.
       await waitFor(() => expect(queryClient.getQueryState(viewKeys.usage)?.status).toBe("error"));
       expect(requests(calls, "GET", "/api/account/usage")).toHaveLength(1);
-      expect(values.length).toBeGreaterThan(0);
-      expect(values.every((value) => value === null)).toBe(true);
+      await waitFor(() => expect(values.at(-1)).toBe("unavailable"));
+      expect(values[0]).toBeNull();
+      expect(values.every((value) => value === null || value === "unavailable")).toBe(true);
     },
   );
 
@@ -114,12 +116,17 @@ describe("the storage slot", () => {
     );
   });
 
-  it("on every page of the frame the sidebar's bar is a skeleton when usage is unavailable", async () => {
+  // A failed usage read used to leave the bar a skeleton for ever (EXECUTION 708): a third state.
+  it("on every page of the frame the sidebar's bar says so when usage is unavailable — no skeleton left", async () => {
     await openView("/recent", {
       "GET /api/account/usage": () => envelope("not_found", 404),
       "GET /api/recent": RECENT,
     });
     await waitFor(() => expect(rowNames().length).toBe(4));
-    expect(screen.getByLabelText("Loading storage use").getAttribute("aria-busy")).toBe("true");
+    await waitFor(() => expect(screen.getByText("Storage use unavailable")).toBeTruthy());
+    expect(screen.queryByLabelText("Loading storage use")).toBeNull();
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+    // The way to the Storage page stays.
+    expect(screen.getByRole("link", { name: "Manage storage" })).toBeTruthy();
   });
 });

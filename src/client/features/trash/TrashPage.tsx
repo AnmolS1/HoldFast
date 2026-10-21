@@ -220,6 +220,12 @@ export function TrashPage() {
     () => askDelete(selected),
     selected.length > 0 && deleting === null && menu === null && !blocked,
   );
+  // Shift+R restores the selection, under the same conditions.
+  useShortcut(
+    "restore",
+    () => void restore(selected),
+    selected.length > 0 && deleting === null && menu === null && !blocked,
+  );
   const paging = usePagedView(trash, viewKeys.trash, items.length);
 
   const onOpen = useCallback(() => {
@@ -262,7 +268,10 @@ export function TrashPage() {
   const menuActions = menu ? (
     <>
       <MenuItem onClick={() => void restore([menu.item])} disabled={blocked} data-trash-action="restore">
-        {t("trash.restore")}
+        <Box component="span" sx={{ flex: "1 1 auto" }}>
+          {t("trash.restore")}
+        </Box>
+        {desktop ? <Kbd>{shortcutLabel("restore")}</Kbd> : null}
       </MenuItem>
       <MenuItem onClick={() => askDelete([menu.item])} disabled={blocked} data-trash-action="delete">
         <Box component="span" sx={{ flex: "1 1 auto" }}>
@@ -360,6 +369,7 @@ export function TrashPage() {
             <SelectionBarAction
               label={t("trash.restore")}
               onClick={() => void restore(selected)}
+              shortcut={desktop ? "restore" : undefined}
               disabled={blocked}
             />
             <SelectionBarAction

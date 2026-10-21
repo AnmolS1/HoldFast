@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PartResponse } from "../../../../src/shared/schemas/upload";
 import { putBody } from "../../../../src/client/features/upload/protocol";
-import { ApiError } from "../../../../src/client/lib/api";
+import { ApiError, configureApi, IDENTITY_HEADER, resetApiForTests } from "../../../../src/client/lib/api";
 import { errorBody } from "./fixtures";
 
 class FakeXhr {
@@ -65,6 +65,83 @@ const caught = (promise: Promise<unknown>) =>
   );
 
 describe("putBody", () => {
+  it("a body refused as another account's (identity_mismatch) starts the adoption, once", async () => {
+    const identityChanged = vi.fn(async () => {});
+    const navigated: string[] = [];
+    // Sent for A, and the tab still holds A: the browser's session is another account — adopt it.
+    configureApi({
+      userId: () => "a".repeat(32),
+      identityChanged,
+      navigate: (to) => void navigated.push(to),
+    });
+    try {
+      const promise = caught(putBody(path, blob, PartResponse));
+      FakeXhr.made[0]!.answer(403, {
+        error: "forbidden",
+        message: "x",
+        requestId: "r",
+        details: { reason: "identity_mismatch" },
+      });
+      expect(await promise).toMatchObject({ status: 403, details: { reason: "identity_mismatch" } });
+      await vi.waitFor(() => expect(navigated).toEqual(["/"]));
+      expect(identityChanged).toHaveBeenCalledTimes(1);
+    } finally {
+      resetApiForTests();
+    }
+  });
+
+  // Review m4: the account is the one the upload was started for, not whoever is known when a
+  // body leaves.
+  it("an upload started for A names A on every body, whoever the tab knows by then", async () => {
+    configureApi({ userId: () => "b".repeat(32) });
+    try {
+      const promise = putBody(path, blob, PartResponse, { account: "a".repeat(32) });
+      expect(FakeXhr.made[0]!.headers[IDENTITY_HEADER]).toBe("a".repeat(32));
+      FakeXhr.made[0]!.answer(200, { n: 2, etag: "abc" });
+      await promise;
+    } finally {
+      resetApiForTests();
+    }
+  });
+
+  // Review M1 on the XHR path: a body sent for A and refused after the tab moved to B adopts nothing.
+  it("a body refused after the tab moved to another account: no adoption", async () => {
+    const identityChanged = vi.fn(async () => {});
+    const navigated: string[] = [];
+    configureApi({
+      userId: () => "b".repeat(32),
+      identityChanged,
+      navigate: (to) => void navigated.push(to),
+    });
+    try {
+      const promise = caught(putBody(path, blob, PartResponse, { account: "a".repeat(32) }));
+      FakeXhr.made[0]!.answer(403, {
+        error: "forbidden",
+        message: "x",
+        requestId: "r",
+        details: { reason: "identity_mismatch" },
+      });
+      expect(await promise).toMatchObject({ status: 403 });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(identityChanged).not.toHaveBeenCalled();
+      expect(navigated).toEqual([]);
+    } finally {
+      resetApiForTests();
+    }
+  });
+
+  it("names the account the upload is for (the identity pin), when one is known", async () => {
+    configureApi({ userId: () => "a".repeat(32) });
+    try {
+      const promise = putBody(path, blob, PartResponse);
+      expect(FakeXhr.made[0]!.headers[IDENTITY_HEADER]).toBe("a".repeat(32));
+      FakeXhr.made[0]!.answer(200, { n: 2, etag: "abc" });
+      await promise;
+    } finally {
+      resetApiForTests();
+    }
+  });
+
   it("sends the blob itself with PUT — a body of known length, never a stream", async () => {
     const promise = putBody(path, blob, PartResponse);
     const [xhr] = FakeXhr.made;

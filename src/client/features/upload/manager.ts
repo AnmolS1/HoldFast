@@ -24,7 +24,7 @@ import type {
   UploadedPart,
 } from "../../../shared/schemas/upload";
 import { toast } from "../../components/Toaster";
-import { ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT } from "../../lib/api";
+import { ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT, currentAccount } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { formatBytes } from "../../lib/format";
 import { accountEpoch, getCachedSession, publicConfigQuery, queryClient, sameAccount } from "../../lib/query";
@@ -159,6 +159,8 @@ interface Work {
   row: ResumeRow | null;
   /** An init that is still on its way, with the body it was sent with: never asked twice at once. */
   init: { body: string; asked: Promise<InitUploadResponse> } | null;
+  /** The account this upload was started for: every body names it (the identity pin). */
+  account: string | null;
 }
 
 interface FolderFlight {
@@ -232,6 +234,7 @@ function workOf(id: string): Work {
       started: false,
       row: null,
       init: null,
+      account: currentAccount(),
     };
     works.set(id, work);
   }
@@ -658,6 +661,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
           () =>
             putSingle(runtime.put, sending, file, {
               signal,
+              account: work.account,
               onProgress: (loaded) => {
                 if (!current()) return;
                 work.inFlight.set(0, loaded);
@@ -808,6 +812,7 @@ async function sendParts(
           () =>
             putPart(runtime.put, uploadId, n, file.slice(from, to), {
               signal: group.signal,
+              account: work.account,
               onProgress: (loaded) => {
                 if (!current()) return;
                 work.inFlight.set(n, Math.min(loaded, to - from));

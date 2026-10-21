@@ -358,7 +358,7 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     expect(refused).toBe(3);
   });
 
-  test("a preview opened from a row with a stale session and a slow session read: it shows, the entry is stamped once, Escape returns", async ({
+  test("a preview opened from a row with a stale session and a slow session read: it shows, the entry arrives stamped (no replace), Escape returns", async ({
     page,
     origins,
   }) => {
@@ -392,11 +392,15 @@ test.describe("files: download, zip, details, re-check; sharing waits", () => {
     const preview = page.getByRole("dialog", { name: "notes.pdf" });
     await expect(preview).toBeVisible();
     await expect(page).toHaveURL(new RegExp(`/preview/${NOTES.id}$`));
-    // Long enough for a loop to repeat many times; then exactly one replace (the stamp).
+    // Long enough for a loop to repeat many times. The explorer writes the entry already stamped
+    // with the account (lib/history-state.ts), so the preview has nothing to replace.
     await page.clock.runFor(3_000);
     await page.waitForTimeout(1_500);
     const after = await page.evaluate(() => (window as unknown as { __replaces: number }).__replaces);
-    expect(after - before).toBe(1);
+    expect(after - before).toBe(0);
+    expect(
+      await page.evaluate(() => (history.state as { usr?: { account?: unknown } } | null)?.usr?.account),
+    ).toBe(MOCK_USER.id);
     await page.keyboard.press("Escape");
     await expect(preview).toHaveCount(0);
     await expect(page).toHaveURL(/\/$/);

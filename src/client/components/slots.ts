@@ -68,11 +68,17 @@ export interface SearchSuggestionsProps {
   onPick(nodeId: string): void;
 }
 
-/** `useUsageSummary()` returns this, or `null` while unknown (the bar shows its skeleton). */
+/** What `useUsageSummary()` returns once the usage is known. */
 export interface UsageSummary {
   usedBytes: number;
   quotaBytes: number;
 }
+
+/**
+ * `useUsageSummary()`: the usage; `null` while it is loading (the bar shows its skeleton);
+ * `"unavailable"` when it could not be read (the bar says so — never a skeleton for ever).
+ */
+export type UsageSlotValue = UsageSummary | "unavailable" | null;
 
 export interface RequestUploadOptions {
   files?: File[];

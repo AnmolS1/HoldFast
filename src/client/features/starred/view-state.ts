@@ -3,10 +3,17 @@
 // pages in hand clears the query's error), and until when the API asked not to be called.
 import { hashKey, type QueryKey } from "@tanstack/react-query";
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
-import { ApiError } from "../../lib/api";
 import { registerUserStatePurger } from "../../lib/contracts";
-import { accountEpoch, queryClient, sameAccount } from "../../lib/query";
-import { holdUntil, useWaitUntil, waitUntil } from "./waits";
+import {
+  accountEpoch,
+  isHeld,
+  queryClient,
+  retryNotBefore,
+  sameAccount,
+  unlessHeld,
+  useWaitUntil,
+  waitUntil,
+} from "../../lib/query";
 
 /** The parts of a query's state these helpers read (a plain or an infinite query has them). */
 export interface QueryLike {
@@ -40,14 +47,9 @@ export function hasFailed(query: QueryLike): boolean {
 /** `setTimeout` takes 31 bits of milliseconds; a longer wait is taken in steps. */
 const LONGEST_TIMER_MS = 2_147_483_647;
 
-/**
- * Until when the API asked not to be called again: a failure that came with `Retry-After` (a
- * `429`) names a number of seconds. 0 = no wait. "Try again" is the user's own request, and it
- * honours that wait like any other.
- */
-export function retryNotBefore(error: unknown, since: number): number {
-  return error instanceof ApiError && error.retryAfter !== undefined ? since + error.retryAfter * 1000 : 0;
-}
+// Until when the API asked not to be called again (lib/query.ts). "Try again" is the user's own
+// request, and it honours that wait like any other.
+export { isHeld, retryNotBefore };
 
 /** True until the clock passes `until` (ms); false at once for 0 or a time already past. */
 export function useBlockedUntil(until: number): boolean {
@@ -112,11 +114,7 @@ function endsTheList(data: unknown): boolean {
 
 queryClient.getQueryCache().subscribe((event) => {
   const hash = event.query.queryHash;
-  // Every failure of a query — its first page, a refresh, a next page — that names a wait puts it
-  // in the one registry (waits.ts), where no later write to the cache can lift it.
-  if (event.type === "updated" && event.action.type === "error") {
-    holdUntil(hash, retryNotBefore(event.action.error, Date.now()));
-  }
+  // (A failure that names a wait is recorded by the shell's own subscription, lib/query.ts.)
   // A remembered failure lives exactly as long as it can be true: it goes when its query leaves
   // the cache (a later visit loads the list afresh), and when the list turns out to end before
   // the page that failed — written (an emptied trash) or read again (a list that shrank to one
@@ -150,26 +148,12 @@ export function pageFailureOf(key: QueryKey): PageFailure | null {
   return failures.get(hashKey(key)) ?? null;
 }
 
-/** What `refetchOn…` options and an invalidation's predicate are handed: a query of the cache. */
-export interface CachedQuery {
-  queryHash: string;
-}
+export type { CachedQuery } from "../../lib/query";
 
 /**
- * Is this query inside a wait the API named (waits.ts)? While it is, NOTHING refreshes it by
- * itself: not an event, not the tab coming back, not a reconnect, not a remount, not a write to
- * the cache. (After the wait, the next such trigger does.)
- */
-export function isHeld(query: CachedQuery): boolean {
-  return waitUntil(query.queryHash) > 0;
-}
-
-const unlessHeld = (query: CachedQuery): boolean => !isHeld(query);
-
-/**
- * Spread into every query of the views: the automatic refetches respect `isHeld`. A query whose
- * read failed and that has no data is loaded on mount without asking `refetchOnMount` — that is
- * what `retryOnMount` decides, so it asks too.
+ * Spread into every query of the views: the automatic refetches respect `isHeld`. These are the
+ * QueryClient's own defaults now (lib/query.ts, `QUERY_DEFAULTS`); kept spelled out here so a view
+ * keeps them whatever defaults a test installs.
  */
 export const AUTO_REFETCH = {
   refetchOnWindowFocus: unlessHeld,

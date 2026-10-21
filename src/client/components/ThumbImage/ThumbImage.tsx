@@ -62,15 +62,27 @@ function Thumb(props: ThumbImageProps) {
   }, [eligible, visible, failed, url, nodeId, versionKey, size]);
 
   // One re-request when the image itself fails to load (an expired or refused URL), then the fallback.
+  // A re-request can hand back the very URL that failed (a thumbnail token is the same string for
+  // the same node, version and size within the API's bucket): the same `src` reloads nothing and no
+  // second error comes, so that answer IS the second failure.
   const onError = () => {
     if (retried.current) {
       setFailed(true);
       return;
     }
     retried.current = true;
-    thumbCache.delete(keyOf(nodeId, versionKey, size));
+    const failedUrl = url;
+    const key = keyOf(nodeId, versionKey, size);
+    thumbCache.delete(key);
     resolveUrl({ nodeId, versionKey, size, getUrl: (id, s) => latestGetUrl.current(id, s) }, true).then(
-      (entry) => setUrl(entry.url),
+      (entry) => {
+        if (entry.url !== failedUrl) {
+          setUrl(entry.url);
+          return;
+        }
+        if (thumbCache.get(key) === entry) thumbCache.delete(key);
+        setFailed(true);
+      },
       () => setFailed(true),
     );
   };

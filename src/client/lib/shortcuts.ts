@@ -16,6 +16,7 @@ export type ShortcutId =
   | "help"
   | "newFolder"
   | "rename"
+  | "restore"
   | "upload"
   | "theme";
 
@@ -55,6 +56,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "help", combos: [{ key: "?", shift: true }], description: "shortcuts.help" },
   { id: "newFolder", combos: [{ key: "N", shift: true }], description: "shortcuts.newFolder" },
   { id: "rename", combos: [{ key: "F2" }], description: "shortcuts.rename" },
+  { id: "restore", combos: [{ key: "r", shift: true }], description: "shortcuts.restore" },
   { id: "upload", combos: [{ key: "u", mod: true }], description: "shortcuts.upload", global: true },
   {
     id: "theme",

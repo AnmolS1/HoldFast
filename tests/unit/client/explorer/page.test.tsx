@@ -619,7 +619,12 @@ describe("opening", () => {
     await waitForRows(4);
     fireEvent.keyDown(rowOf(NOTES.id)!, { key: "Enter" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/preview/${NOTES.id}`));
-    expect(router.state.location.state).toEqual({ siblingIds: [NOTES.id, PHOTO.id], from: "/" });
+    // Stamped with the account it was written for — nobody's here: this harness knows no account.
+    expect(router.state.location.state).toEqual({
+      siblingIds: [NOTES.id, PHOTO.id],
+      from: "/",
+      account: null,
+    });
   });
 
   it("a folder goes to its own route (double-click and Enter)", async () => {

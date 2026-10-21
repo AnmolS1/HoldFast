@@ -76,6 +76,7 @@ export const en = {
   "storage.of": "{used} of {quota}",
   "storage.aria": "{used} of {quota} used",
   "storage.loading": "Loading storage use",
+  "storage.unavailable": "Storage use unavailable",
   "storage.almostFull": "Almost full",
   "storage.full": "Storage is full",
 
@@ -94,6 +95,12 @@ export const en = {
 
   "toast.rateLimited": "Too many requests. Try again in {seconds} s.",
   "toast.rateLimitedSoon": "Too many requests. Try again shortly.",
+  "toast.ceilingReachedIn": "Daily limit reached. It resets in {wait}.",
+  "toast.ceilingReached": "Daily limit reached. It resets at midnight UTC.",
+  "time.seconds": "{count} s",
+  "time.minutes": "{count} min",
+  "time.hours": "{count} h",
+  "time.hoursMinutes": "{hours} h {minutes} min",
   "toast.impersonationReadOnly": "Read-only while impersonating",
   "toast.uploadsPaused": "Uploads are paused right now.",
   "toast.linksPaused": "Link sharing is paused right now.",
@@ -177,6 +184,7 @@ export const en = {
   "shortcuts.help": "Show this list",
   "shortcuts.newFolder": "New folder",
   "shortcuts.rename": "Rename",
+  "shortcuts.restore": "Restore from trash",
   "shortcuts.upload": "Upload files",
   "shortcuts.theme": "Switch theme",
 

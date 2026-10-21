@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 import { useLocation, useNavigate } from "react-router";
 import type { FileListItem } from "../../components/types";
+import { stamped } from "../../lib/history-state";
 
 /**
  * Open a row of a view: a folder in the explorer, a file in the preview — with the view's other
@@ -17,7 +18,7 @@ export function useOpenNode<T extends Pick<FileListItem, "id" | "kind">>(items: 
         return;
       }
       const siblingIds = items.filter((entry) => entry.kind === "file").map((entry) => entry.id);
-      void navigate(`/preview/${encodeURIComponent(item.id)}`, { state: { siblingIds, from } });
+      void navigate(`/preview/${encodeURIComponent(item.id)}`, { state: stamped({ siblingIds, from }) });
     },
     [navigate, items, from],
   );

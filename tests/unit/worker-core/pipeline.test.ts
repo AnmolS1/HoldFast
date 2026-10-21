@@ -350,6 +350,7 @@ describe("middleware order", () => {
       "csrf",
       "cookieGuard",
       "session",
+      "identityPin",
       "impersonationReadOnly",
       "termsGate",
       "killSwitch",

@@ -132,8 +132,11 @@ describe("the PDF engine", () => {
     expect(GlobalWorkerOptions.workerSrc).not.toMatch(/^https?:|^\/\//);
   });
 
-  it("pdf.js gets the bytes whole and may fetch nothing, run no forms engine, and decode no giant image", async () => {
+  // T18 review m5 (shell item 6): pdf.js's data files — CMaps, standard fonts, decoders, colour
+  // profiles — are this app's own static files under /pdfjs/; nothing else is fetched by pdf.js.
+  it("pdf.js gets the bytes whole and fetches only its data files from this app, runs no forms engine, and decodes no giant image", async () => {
     await openPdf(bytes);
+    const data = (dir: string) => `${location.origin}/pdfjs/${dir}/`;
     expect(pdfjs.state.options).toEqual([
       {
         data: bytes,
@@ -142,13 +145,22 @@ describe("the PDF engine", () => {
         disableAutoFetch: true,
         enableXfa: false,
         useWorkerFetch: false,
+        cMapUrl: data("cmaps"),
+        cMapPacked: true,
+        standardFontDataUrl: data("standard_fonts"),
+        wasmUrl: data("wasm"),
+        iccUrl: data("iccs"),
         maxImageSize: PDF_MAX_IMAGE_PIXELS,
       },
     ]);
     const options = pdfjs.state.options[0]!;
-    // No address pdf.js could fetch from, and nothing that switches scripting on.
-    for (const key of ["url", "cMapUrl", "standardFontDataUrl", "wasmUrl", "iccUrl", "enableScripting"]) {
+    // No address of the document's own, and nothing that switches scripting on.
+    for (const key of ["url", "docBaseUrl", "enableScripting"]) {
       expect(key in options, key).toBe(false);
+    }
+    // Every data URL is on the app's origin.
+    for (const key of ["cMapUrl", "standardFontDataUrl", "wasmUrl", "iccUrl"]) {
+      expect(new URL(String(options[key])).origin, key).toBe(location.origin);
     }
   });
 

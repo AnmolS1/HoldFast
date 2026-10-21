@@ -46,6 +46,8 @@ export interface PutCall {
   /** Milliseconds on the (possibly fake) clock when the request started. */
   at: number;
   signal?: AbortSignal;
+  /** The account the body names (the identity pin): the one the upload was started for. */
+  account?: string | null;
   progress(loaded: number): void;
   resolve(): void;
   reject(error: unknown): void;
@@ -196,6 +198,7 @@ export function installServer(): Server {
           size: body.size,
           at: Date.now(),
           signal,
+          account: options.account,
           progress: (loaded) => options.onProgress?.(loaded),
           resolve: () =>
             finish(() => resolve(schema.parse(n === "single" ? singleResponse() : partResponse(n)))),
@@ -281,9 +284,9 @@ const librarySessionStore = (): LibraryStore =>
   (betterAuthClient as unknown as { $store: { atoms: { session: LibraryStore } } }).$store.atoms.session;
 
 /**
- * Whether the auth library's own session store is mounted. Every purge mounts it (the shell's
- * purger reads it, `lib/auth-client.ts`), and it unmounts itself a second later from a timer that
- * touches `document`.
+ * Whether the auth library's own session store is mounted. A mounted store unmounts itself a
+ * second later from a timer that touches `document`; the shell's purger (`lib/auth-client.ts`)
+ * reads it without mounting it.
  */
 export function authSessionStoreMounted(): boolean {
   return librarySessionStore().active === true;

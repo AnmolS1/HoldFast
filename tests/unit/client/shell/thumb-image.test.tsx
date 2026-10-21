@@ -106,6 +106,23 @@ describe("ThumbImage", () => {
     expect(p.getUrl).toHaveBeenCalledTimes(2);
   });
 
+  // T18 review M2: a thumb token is the same string for the same node, version and size within the
+  // API's 600 s bucket, so the forced re-mint after an image error hands back the URL that failed.
+  // The same `src` does not reload the <img>, no second error comes, and the box stayed "pending".
+  it("a re-mint that returns the URL that just failed is the second failure: the fallback shows", async () => {
+    const same = { url: "https://files.test/t/n1/320/same-token", expiresAt: inFuture(300_000) };
+    const p = props({ getUrl: vi.fn(async () => same) });
+    const { container, queryByTestId } = renderShell(<ThumbImage {...p} />);
+    act(() => intersect());
+    await waitFor(() => expect(img(container)?.getAttribute("src")).toBe(same.url));
+    fireEvent.error(img(container)!);
+    await waitFor(() => expect(queryByTestId("fallback")).not.toBeNull());
+    expect(img(container)).toBeNull();
+    expect(container.querySelector("[data-thumb]")?.getAttribute("data-thumb")).toBe("fallback");
+    // One forced re-mint, no more.
+    expect(p.getUrl).toHaveBeenCalledTimes(2);
+  });
+
   it("a refused URL request (a normal 404) shows the fallback, not an error", async () => {
     const p = props({ getUrl: vi.fn(async () => Promise.reject(new Error("404"))) });
     const { queryByTestId } = renderShell(<ThumbImage {...p} />);

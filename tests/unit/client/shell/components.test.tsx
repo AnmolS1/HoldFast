@@ -112,6 +112,18 @@ describe("StorageBar", () => {
     renderShell(<StorageBar usage={null} />);
     expect(screen.getByLabelText("Loading storage use").getAttribute("aria-busy")).toBe("true");
   });
+
+  it('"unavailable" usage says so in secondary text — no skeleton, no bar; the footer stays', () => {
+    const { container } = renderShell(
+      <StorageBar usage="unavailable" footer={<a href="/storage">Manage storage</a>} />,
+    );
+    const said = screen.getByText("Storage use unavailable");
+    expect(resolveVar(getComputedStyle(said).color)).toBe(lightTokens.textSecondary);
+    expect(screen.queryByLabelText("Loading storage use")).toBeNull();
+    expect(container.querySelector('[aria-busy="true"]')).toBeNull();
+    expect(container.querySelector("[data-storage-fill]")).toBeNull();
+    expect(screen.getByRole("link", { name: "Manage storage" })).toBeTruthy();
+  });
 });
 
 describe("SelectionBar", () => {
