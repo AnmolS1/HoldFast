@@ -791,7 +791,7 @@ describe("review fixes on the trash page", () => {
 
   it("a run stopped by a 429 cannot be started again before the time the API named", async () => {
     const { calls } = await openTrash({
-      "DELETE /api/trash": () => envelope("rate_limited", 429, undefined, { "retry-after": "1" }),
+      "DELETE /api/trash": () => envelope("rate_limited", 429, undefined, { "retry-after": "3" }),
     });
     const button = () => screen.getByRole("button", { name: "Empty trash" }) as HTMLButtonElement;
     fireEvent.click(button());
@@ -803,13 +803,14 @@ describe("review fixes on the trash page", () => {
     expect(button().disabled).toBe(true);
     expect(requests(calls, "DELETE", "/api/trash")).toHaveLength(1);
     // a4: one announcement — the API client's own for a 429; no second toast, no alert.
-    expect(getToasts().map((toast) => toast.message)).toEqual(["Too many requests. Try again in 1 s."]);
+    expect(getToasts().map((toast) => toast.message)).toEqual(["Too many requests. Try again in 3 s."]);
     expect(document.querySelector("[data-empty-trash-stopped]")!.getAttribute("role")).toBeNull();
     // Closing the line does not lift the wait.
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(button().disabled).toBe(true);
-    // Enabled again when that second has passed — the wait is the API's, awaited as an event.
-    await waitFor(() => expect(button().disabled).toBe(false), { timeout: 4000 });
+    // Enabled again when those seconds have passed — the wait is the API's, awaited as an event.
+    // (3 s, not 1: on a slow CI runner one second could pass before the disabled checks above ran.)
+    await waitFor(() => expect(button().disabled).toBe(false), { timeout: 6000 });
   });
 
   it("m4: Delete does not open a second dialog over 'Empty the trash?', nor over the row menu", async () => {
