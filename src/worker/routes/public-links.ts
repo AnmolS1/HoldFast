@@ -81,6 +81,7 @@ import {
   verifyZipGrant,
 } from "../services/tokens";
 import { parse } from "./links";
+import { zipPath } from "../services/filename";
 
 export const router = new Hono<AppEnv>();
 
@@ -553,7 +554,8 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   logVisit(c, link.id, root.id, "ok");
   metric("download", { kind: "zip", outcome: "ok", reason: "link" });
   return c.json({
-    entries: manifest.entries,
+    // Every segment as it is saved: a reserved Windows name gets its `_` (services/filename.ts).
+    entries: manifest.entries.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
     totalBytes: manifest.totalBytes,
     // Empty by construction: nothing that is not clean was walked.
     skipped: [],

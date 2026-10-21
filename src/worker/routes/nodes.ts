@@ -79,7 +79,7 @@ import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
-import { nameKeyOf, sanitizeName } from "../services/filename";
+import { fitName, nameKeyOf, sanitizeName, zipPath } from "../services/filename";
 import { metric } from "../services/metrics";
 import { inlineKindAllowed, thumbEligible } from "../services/mime";
 import { toNodeDto, toNodeDtos, type NodeView } from "../services/node-dto";
@@ -276,7 +276,8 @@ function uniqueLabels(names: string[]): string[] {
     const dot = name.lastIndexOf(".");
     const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
     let label = name;
-    for (let n = 2; taken.has(nameKeyOf(label)); n++) label = `${stem} (${n})${ext}`;
+    // Cut to the name limit before the suffix (a 255-byte name and its " (2)").
+    for (let n = 2; taken.has(nameKeyOf(label)); n++) label = fitName(stem, ` (${n})${ext}`);
     taken.add(nameKeyOf(label));
     return label;
   });
@@ -305,12 +306,16 @@ router.post("/nodes/zip-manifest", async (c) => {
     const owned = await ownedRoots(db(c), user.id);
     roots = owned.map((node) => ({ id: node.id, label: node.name, owner: true }));
   }
-  return c.json(
-    await zipManifest(db(c), roots, {
-      maxFiles: ZIP_MAX_ENTRIES,
-      partner: { viewerId: user.id, uploaderSees: UPLOADER_VISIBLE_STATUSES },
-    }),
-  );
+  const manifest = await zipManifest(db(c), roots, {
+    maxFiles: ZIP_MAX_ENTRIES,
+    partner: { viewerId: user.id, uploaderSees: UPLOADER_VISIBLE_STATUSES },
+  });
+  // Every segment as it is saved: a reserved Windows name gets its `_` (services/filename.ts).
+  return c.json({
+    ...manifest,
+    entries: manifest.entries.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
+    skipped: manifest.skipped.map((entry) => ({ ...entry, path: zipPath(entry.path) })),
+  });
 });
 
 router.post("/nodes/download-urls", async (c) => {

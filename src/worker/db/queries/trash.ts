@@ -10,7 +10,7 @@
 // missing objects.
 
 import { and, desc, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { extOf, nameKeyOf } from "../../services/filename";
+import { extOf, fitName, nameKeyOf } from "../../services/filename";
 import type { Executor } from "../client";
 import { decodeCursor, encodeCursor, isCursorTimestamp } from "../cursor";
 import { type HoldCause, isUniqueViolation, LegalHoldError, QueryError } from "../errors";
@@ -72,13 +72,15 @@ export async function trash(
   return row ?? null;
 }
 
-/** "report.pdf" → "report (restored).pdf", then "report (restored 2).pdf", … */
+/**
+ * "report.pdf" → "report (restored).pdf", then "report (restored 2).pdf", … — the base cut so that
+ * the whole stays within the name limit (255 bytes of UTF-8), the suffix and the extension kept.
+ */
 function restoredName(name: string, attempt: number): string {
   const suffix = attempt === 1 ? " (restored)" : ` (restored ${attempt})`;
   const ext = extOf(name);
-  return ext === ""
-    ? name + suffix
-    : name.slice(0, name.length - ext.length - 1) + suffix + name.slice(-ext.length - 1);
+  const tail = ext === "" ? "" : name.slice(-ext.length - 1);
+  return fitName(name.slice(0, name.length - tail.length), suffix + tail);
 }
 
 /**
