@@ -1,7 +1,7 @@
 // `/preview/:nodeId` as a page: the dialog over whatever was open, with the signed-in source.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
-import { stamped } from "../../lib/history-state";
+import { isStamped, ownHistoryState, stamped } from "../../lib/history-state";
 import { getKnownUserId } from "../../lib/query";
 import { PreviewDialogView } from "./PreviewDialog";
 import type { LoadedItem } from "./source";
@@ -41,9 +41,11 @@ export function PreviewRoute() {
   const location = useLocation();
   const navigate = useNavigate();
   const account = getKnownUserId() ?? undefined;
-  const written = readState(location.state);
-  // Written for another account: none of it is ours to use.
-  const stale = written.account !== undefined && written.account !== account;
+  // Written for another account, or for nobody (no account was known then): none of it is ours to
+  // use, and it is never stamped as this account's (lib/history-state.ts).
+  const own = ownHistoryState(location.state);
+  const written = readState(own);
+  const stale = isStamped(location.state) && own === null;
   const state: PreviewRouteState = stale ? {} : written;
   const { siblingIds, from, cold } = state;
 
@@ -52,7 +54,9 @@ export function PreviewRoute() {
   // ONCE per history entry: the replace re-runs the frame's loader, and until it lands every
   // render still sees the unstamped entry — asking again would cancel the replace under way and
   // start it over, for ever.
-  const unstamped = stale || (written.account === undefined && account !== undefined);
+  // With no account known there is nothing to stamp it as: the entry is left as it is (a stamp of
+  // nobody's would read as stale again on the next entry, and replace for ever).
+  const unstamped = account !== undefined && (stale || written.account === undefined);
   const stampedKey = useRef<string | null>(null);
   useEffect(() => {
     if (!unstamped || stampedKey.current === location.key) return;

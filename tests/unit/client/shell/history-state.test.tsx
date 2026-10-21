@@ -90,6 +90,25 @@ describe("lib/history-state", () => {
     expect(drawn.slice(before)).toEqual([]);
   });
 
+  // Review m3: state written while NO account is known (a late write after a sign-out purge) is
+  // stamped as nobody's, and is never read as the account signed in later.
+  it("state written with no account known is stamped as nobody's, and refused once B is signed in", async () => {
+    const { resetIdentityForTests } = await import("../../../../src/client/lib/query");
+    resetIdentityForTests();
+    const written = stamped({ from: "/folder/alices-folder" });
+    expect(written).toEqual({ from: "/folder/alices-folder", account: null });
+    drawn = [];
+    const current = { session: BOB as SessionShape };
+    shellFetch({ session: () => current.session });
+    seedConfig();
+    await signedInAs(BOB, current);
+    expect(ownHistoryState(written)).toBeNull();
+    renderRoutes(routes, [{ pathname: "/preview/node-3", state: written }]);
+    await screen.findByTestId("preview");
+    expect(screen.getByTestId("root-page")).toBeTruthy();
+    expect(drawn).toEqual([]);
+  });
+
   it("control: an unstamped entry (nobody's) is read as it is", async () => {
     drawn = [];
     const current = { session: BOB as SessionShape };

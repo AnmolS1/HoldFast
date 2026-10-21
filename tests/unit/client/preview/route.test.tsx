@@ -102,7 +102,12 @@ describe("the preview route", () => {
     expect(router.state.location.pathname).toBe(`/preview/${ID.other}`);
     fireEvent.keyDown(dialog()!, { key: "ArrowLeft" });
     await screen.findByText("sample.html");
-    expect(router.state.location.state).toEqual({ siblingIds: SIBLINGS, from: `/folder/${ID.folder}` });
+    // No account is known in this harness: what the route writes is stamped as nobody's.
+    expect(router.state.location.state).toEqual({
+      siblingIds: SIBLINGS,
+      from: `/folder/${ID.folder}`,
+      account: null,
+    });
 
     // Escape: back to the list — the same instance — and focus is on what opened the preview.
     fireEvent.keyDown(dialog()!, { key: "Escape" });
@@ -200,6 +205,26 @@ describe("the account stamp on the route's history state", () => {
       children,
     },
   ];
+
+  // Review m3: an entry written while no account was known (`account: null`) is nobody's: its ids
+  // are not offered, and the route does not stamp it as the account signed in now.
+  it("opened with state stamped as nobody's: no prev/next, and it is not adopted as this account's", async () => {
+    arrange();
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(routes, [
+      {
+        pathname: `/preview/${ID.svg}`,
+        state: { siblingIds: SIBLINGS, from: `/folder/${ID.folder}`, account: null },
+      },
+    ]);
+    await screen.findByText("sample.svg");
+    await settle(30);
+    expect(screen.queryByRole("button", { name: "Next file" })).toBeNull();
+    expect(JSON.stringify(router.state.location.state)).not.toContain(ID.html);
+    // Treated as a cold link: this account's stamp, the file's own folder underneath, no ids.
+    expect(router.state.location.state).toMatchObject({ account: sessionOf().user.id });
+    expect((router.state.location.state as { siblingIds?: unknown }).siblingIds).toBeUndefined();
+  });
 
   it("opened with an opener's unstamped state: stamped once, and the navigation settles", async () => {
     arrange();
