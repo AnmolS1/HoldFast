@@ -5,8 +5,10 @@
 // and lets the request through when it is current, so an accept made a moment ago by a request
 // still in flight beside this one takes effect at once.
 //
-// Exempt: /api/auth/*, /api/public/*, the accept route itself, and the deletion routes (a user
-// must always be able to leave).
+// Exempt: /api/auth/*, /api/public/*, the accept route itself, the deletion routes (a user
+// must always be able to leave), and /api/admin/* — an operator must be able to act in an
+// emergency (a CSAM takedown) before accepting a new version (T25, brief Addendum 2); the admin
+// still accepts through their own account's flows.
 
 import { requestMethod, requestPath } from "./canonical";
 import type { MiddlewareHandler } from "hono";
@@ -18,6 +20,7 @@ function exempt(path: string): boolean {
   return (
     path.startsWith("/api/auth/") ||
     path.startsWith("/api/public/") ||
+    path.startsWith("/api/admin/") ||
     path === "/api/account/accept-terms" ||
     path === "/api/account/deletion" ||
     path.startsWith("/api/account/deletion/")

@@ -155,7 +155,17 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
       needsSecondFactor = isAdmin && !passed;
     }
   }
-  if (allowed) return;
+  if (allowed) {
+    if (path === "/admin/set-role") {
+      // The role as it is before the plugin writes the new one: `auth.role_changed`'s `from`.
+      const userId = (ctx as { body?: { userId?: unknown } }).body?.userId;
+      if (typeof userId === "string" && userId !== "") {
+        const target = await getAccount(scope.db, userId);
+        scope.facts.roleChange = { userId, from: target?.role ?? null };
+      }
+    }
+    return;
+  }
 
   await recordAdminDenial(scope, sessionUserId, path, method);
   if (needsSecondFactor) {
