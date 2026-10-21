@@ -49,8 +49,7 @@ import {
   consumeDownload,
   findByTokenHash,
   logAccess,
-  passwordLock,
-  recordPasswordFailure,
+  reservePasswordAttempt,
 } from "../db/queries/links";
 import { getNode, listChildren, SHARED_VISIBLE_STATUSES } from "../db/queries/nodes";
 import { zipManifest } from "../db/queries/nodes-api";
@@ -316,27 +315,30 @@ router.post(`${BASE}/unlock`, limited, async (c) => {
     ipHashStable: stable,
   } = await resolveLink(c, c.req.param("token"), { password: "skip" });
   if (link.passwordHash !== null) {
-    // The throttle BEFORE the hash: a caller who is locked out buys no scrypt.
-    const lock = await passwordLock(db(c), link.id, stable);
-    if (lock) {
+    // The attempt is RESERVED before the hash, in one statement that refuses while locked: a
+    // caller who is locked out buys no scrypt, and a burst cannot slip past a lock being set.
+    const attempt = await reservePasswordAttempt(db(c), link.id, stable);
+    if (!attempt || !attempt.reserved) {
+      const retryAfterSec = attempt ? attempt.retryAfterSec : 60;
       refuse(
         c,
         link,
         null,
         "denied_password",
-        new AppError("rate_limited", undefined, undefined, { "Retry-After": String(lock.retryAfterSec) }),
+        new AppError("rate_limited", undefined, undefined, { "Retry-After": String(retryAfterSec) }),
       );
     }
     if (!(await verifyLinkPassword(body.password, link.passwordHash))) {
-      const failure = await recordPasswordFailure(db(c), link.id, stable);
-      const until = failure?.lockedUntil?.getTime() ?? 0;
-      const retryAfterSec = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+      // Already counted by the reservation; its wait is the database's clock's.
       refuse(
         c,
         link,
         null,
         "denied_password",
-        new AppError("password_required", undefined, { wrongPassword: true, retryAfterSec }),
+        new AppError("password_required", undefined, {
+          wrongPassword: true,
+          retryAfterSec: attempt.retryAfterSec,
+        }),
       );
     }
     await clearPasswordFailures(db(c), link.id, stable);

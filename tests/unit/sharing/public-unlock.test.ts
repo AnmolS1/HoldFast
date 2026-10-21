@@ -2,6 +2,7 @@
 // a wrong password records a failure, a right one clears it, and the link itself is never paused.
 // The schedule itself (2^(n-3) s, at most 900 s) is T05's and T22's suite. Every password is made up.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PASSWORD_FREE_ATTEMPTS } from "../../../src/worker/db/queries/links";
 import { scryptInternals } from "../../../src/worker/services/link-password";
 import { api, asCaller, errorOf, linkById, makeFile, member } from "./helpers";
 import { linkTo, mint, unlock, visit } from "./public-helpers";
@@ -59,6 +60,34 @@ describe("POST /public/links/:token/unlock", () => {
     expect((await unlock(link.token, PASSWORD, { ip: OTHER_IP })).answer.status).toBe(200);
     const row = await linkById(link.id);
     expect([row.pauseReasons, row.pausedAt]).toEqual([[], null]);
+  });
+
+  it("a parallel burst of wrong guesses from one address: at most free attempts + 1 hash checks, the rest 429 without a hash", async () => {
+    const { link } = await passwordLink();
+    const derive = vi.spyOn(scryptInternals, "derive");
+    const K = 10;
+    const answers = await Promise.all(
+      Array.from({ length: K }, (_, i) =>
+        unlock(link.token, `made-up wrong ${i}`, { ip: IP }).then((r) => r.answer),
+      ),
+    );
+    const evaluated = answers.filter((answer) => answer.status === 403);
+    const locked = answers.filter((answer) => answer.status === 429);
+    expect(evaluated.length + locked.length).toBe(K);
+    expect(evaluated.length).toBeLessThanOrEqual(PASSWORD_FREE_ATTEMPTS + 1);
+    expect(derive.mock.calls.length).toBe(evaluated.length);
+    for (const answer of evaluated) expect(errorOf(answer).details?.wrongPassword).toBe(true);
+    for (const answer of locked) expect(errorOf(answer).error).toBe("rate_limited");
+  });
+
+  it("a moved request clock does not move the advertised wait: retryAfterSec comes from the database's clock", async () => {
+    const { link } = await passwordLink();
+    const skewed = { "x-holdfast-test-now": new Date(Date.now() + 3_600_000).toISOString() };
+    for (let i = 1; i <= 3; i++) await unlock(link.token, `made-up wrong ${i}`, { ip: IP, headers: skewed });
+    const fourth = (await unlock(link.token, "made-up wrong 4", { ip: IP, headers: skewed })).answer;
+    // Failure 4 locks for 2^(4-3) = 2 s.
+    expect(Number(errorOf(fourth).details?.retryAfterSec)).toBeGreaterThanOrEqual(1);
+    expect(Number(errorOf(fourth).details?.retryAfterSec)).toBeLessThanOrEqual(2);
   });
 
   it("the right password clears the failures of that address", async () => {

@@ -278,6 +278,65 @@ export async function recordPasswordFailure(
 }
 
 /**
+ * RESERVES one password attempt for (link, IP) BEFORE the password is evaluated — in ONE
+ * conditional upsert, so attempts that arrive together are counted one after the other on the
+ * row's lock and none of them can slip past a lock another one is setting:
+ *   - not locked → the attempt is counted as a failure now (failure n > 3 locks the pair for
+ *     min(2^(n-3), 900) s, exactly as `recordPasswordFailure` would after a wrong guess) and
+ *     `{ reserved: true }` is answered: the caller may evaluate the password. A right password
+ *     then calls `clearPasswordFailures`, which removes the count again;
+ *   - locked → nothing is written, and the wait is answered: the caller refuses without a hash.
+ * So a burst of K wrong guesses from one address costs at most PASSWORD_FREE_ATTEMPTS + 1 hash
+ * checks. Every time is the DATABASE's clock (`retryAfterSec` included). A row idle for 24 hours
+ * starts again at one. Null — and nothing is recorded — when there is no such link.
+ */
+export async function reservePasswordAttempt(
+  db: Executor,
+  linkId: string,
+  ipHashStable: string,
+): Promise<
+  | { reserved: true; failures: number; retryAfterSec: number }
+  | { reserved: false; retryAfterSec: number }
+  | null
+> {
+  if (!isUuid(linkId)) return null;
+  try {
+    // In a savepoint: a link that does not exist fails the foreign key, and that must not abort
+    // the caller's transaction.
+    return await db.transaction(async (sp) => {
+      const result = await sp.execute<{ failures: number; retry_after: number | null }>(sql`
+        INSERT INTO link_password_attempts AS a (link_id, ip_hash_stable, failures, last_failure_at, locked_until)
+        VALUES (${linkId}, ${ipHashStable}, 1, now(), NULL)
+        ON CONFLICT (link_id, ip_hash_stable) DO UPDATE SET
+          failures = (CASE WHEN a.last_failure_at < now() - interval '24 hours' THEN 1 ELSE a.failures + 1 END),
+          last_failure_at = now(),
+          locked_until = CASE
+            WHEN (CASE WHEN a.last_failure_at < now() - interval '24 hours' THEN 1 ELSE a.failures + 1 END) > ${PASSWORD_FREE_ATTEMPTS}
+            THEN now() + make_interval(secs => LEAST(power(2, LEAST((CASE WHEN a.last_failure_at < now() - interval '24 hours' THEN 1 ELSE a.failures + 1 END) - ${PASSWORD_FREE_ATTEMPTS}, 30)), ${PASSWORD_LOCK_MAX_SEC}))
+            ELSE NULL END
+        WHERE a.locked_until IS NULL OR a.locked_until <= now()
+        RETURNING a.failures,
+          CASE WHEN a.locked_until IS NULL THEN 0 ELSE CEIL(EXTRACT(EPOCH FROM a.locked_until - now())) END AS retry_after`);
+      const row = result.rows[0];
+      if (row)
+        return {
+          reserved: true as const,
+          failures: Number(row.failures),
+          retryAfterSec: Number(row.retry_after ?? 0),
+        };
+      // Locked: the wait, from the same clock.
+      const lock = await sp.execute<{ retry_after: number }>(sql`
+        SELECT GREATEST(1, CEIL(EXTRACT(EPOCH FROM locked_until - now()))) AS retry_after
+        FROM link_password_attempts WHERE link_id = ${linkId} AND ip_hash_stable = ${ipHashStable}`);
+      return { reserved: false as const, retryAfterSec: Number(lock.rows[0]?.retry_after ?? 1) };
+    });
+  } catch (error) {
+    if (pgError(error)?.code === "23503") return null;
+    throw error;
+  }
+}
+
+/**
  * The active lock for (link, IP), or null. Checked BEFORE the password is evaluated, so a
  * locked-out caller costs no hash.
  */
