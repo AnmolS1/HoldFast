@@ -299,31 +299,82 @@ describe("a folder", () => {
     zipGrant: "made-up-grant",
   };
 
-  it("lists its files; Download all mints each file under the grant, one at a time, and saves one zip", async () => {
+  /** `POST …/download-urls`: a URL for every node asked, under the grant. */
+  const batchOk = (call: MockCall) => {
+    const body = call.body as { nodeIds: string[]; zipGrant: string };
+    expect(body.zipGrant).toBe("made-up-grant");
+    return json({ items: body.nodeIds.map((nodeId) => ({ nodeId, ...minted("d", nodeId) })) });
+  };
+  const cleanManifest = { ...manifest, skipped: [] };
+
+  it("lists its files; Download all mints the window in ONE request under the grant, and saves one zip", async () => {
     const { calls } = await openPublic({
       [`GET ${publicPath()}`]: info(publicFolder()),
       [`GET ${publicPath("/children")}`]: children(files),
-      [`POST ${publicPath("/zip-manifest")}`]: manifest,
-      [`POST ${publicPath("/download-url")}`]: (call) =>
-        json(minted("d", (call.body as { nodeId: string }).nodeId)),
+      [`POST ${publicPath("/zip-manifest")}`]: cleanManifest,
+      [`POST ${publicPath("/download-urls")}`]: batchOk,
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => new Response("aaa"),
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
     });
     const list = await screen.findByRole("list", { name: "Files in Holiday" });
     expect(await within(list).findByText("a.txt")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
-    expect(await screen.findByText("Zip saved. 1 file is not available and is left out.")).toBeTruthy();
+    expect(await screen.findByText("Zip saved.")).toBeTruthy();
     expect(saved).toHaveLength(1);
     expect(publicCalls(calls)).toEqual([
       "GET /",
       "GET /children",
       "POST /zip-manifest",
-      "POST /download-url",
-      "POST /download-url",
+      "POST /download-urls",
     ]);
-    const mints = calls.filter((call) => call.path === publicPath("/download-url"));
-    for (const mint of mints)
-      expect(mint.body).toMatchObject({ kind: "download", zipGrant: "made-up-grant" });
+    const batch = calls.find((call) => call.path === publicPath("/download-urls"))!;
+    expect(batch.body).toEqual({ zipGrant: "made-up-grant", nodeIds: files.map((file) => file.id) });
+  });
+
+  it("a 120-file folder zips without meeting the per-address limit: 1 manifest + 3 batches, no single mint", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const many = Array.from({ length: 120 }, (_, i) =>
+      publicFile({ id: `0199d3c2-7a10-7000-8001-${String(i).padStart(12, "0")}`, name: `f${i}.txt` }),
+    );
+    // RL_LINKS as the Worker applies it: 30 public requests a minute from this address, then 429.
+    let used = 0;
+    const limited = (answer: (call: MockCall) => Response) => (call: MockCall) =>
+      ++used > 30 ? envelope("rate_limited", 429, undefined, { "Retry-After": "60" }) : answer(call);
+    const files: Record<string, (call: MockCall) => Response> = {};
+    for (const file of many) files[`GET /d/${file.id}/made-up-token`] = () => new Response("abc");
+    const { calls } = await openPublic({
+      [`GET ${publicPath()}`]: limited(() => json(info(publicFolder()))),
+      [`GET ${publicPath("/children")}`]: limited(() => json(children(many.slice(0, 2)))),
+      [`POST ${publicPath("/zip-manifest")}`]: limited(() =>
+        json({
+          ...cleanManifest,
+          entries: many.map((file) => ({
+            nodeId: file.id,
+            path: `Holiday/${file.name}`,
+            size: 3,
+            etag: "e",
+            modifiedAt: "2099-01-01T00:00:00.000Z",
+          })),
+          totalBytes: 360,
+        }),
+      ),
+      [`POST ${publicPath("/download-urls")}`]: limited(batchOk),
+      [`POST ${publicPath("/download-url")}`]: limited((call) =>
+        json(minted("d", (call.body as { nodeId: string }).nodeId)),
+      ),
+      ...files,
+    });
+    await screen.findByRole("button", { name: "Download all as zip" });
+    fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
+    // Well inside a minute: no limiter wait at all.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(screen.getByText("Zip saved.")).toBeTruthy();
+    const seen = publicCalls(calls);
+    expect(seen.filter((call) => call === "POST /download-urls")).toHaveLength(3);
+    expect(seen.filter((call) => call === "POST /download-url")).toHaveLength(0);
+    expect(used).toBeLessThanOrEqual(30);
   });
 
   it("progress re-renders while the files arrive do not cancel the zip", async () => {
@@ -331,9 +382,8 @@ describe("a folder", () => {
     await openPublic({
       [`GET ${publicPath()}`]: info(publicFolder()),
       [`GET ${publicPath("/children")}`]: children(files),
-      [`POST ${publicPath("/zip-manifest")}`]: manifest,
-      [`POST ${publicPath("/download-url")}`]: (call) =>
-        json(minted("d", (call.body as { nodeId: string }).nodeId)),
+      [`POST ${publicPath("/zip-manifest")}`]: cleanManifest,
+      [`POST ${publicPath("/download-urls")}`]: batchOk,
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => first.promise,
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
     });
@@ -346,19 +396,18 @@ describe("a folder", () => {
     expect(saved).toHaveLength(1);
   });
 
-  it("the per-address limit (429 rate_limited) on a mint under the grant: the zip waits as told and saves complete", async () => {
+  it("the per-address limit (429 rate_limited) on a batch: the zip waits as told and saves complete", async () => {
     let refused = 0;
     const { calls } = await openPublic({
       [`GET ${publicPath()}`]: info(publicFolder()),
       [`GET ${publicPath("/children")}`]: children(files),
-      [`POST ${publicPath("/zip-manifest")}`]: { ...manifest, skipped: [] },
-      [`POST ${publicPath("/download-url")}`]: (call) => {
-        const nodeId = (call.body as { nodeId: string }).nodeId;
-        if (nodeId === files[1]!.id && refused === 0) {
+      [`POST ${publicPath("/zip-manifest")}`]: cleanManifest,
+      [`POST ${publicPath("/download-urls")}`]: (call) => {
+        if (refused === 0) {
           refused += 1;
           return envelope("rate_limited", 429, undefined, { "Retry-After": "1" });
         }
-        return json(minted("d", nodeId));
+        return batchOk(call);
       },
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => new Response("aaa"),
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
@@ -367,27 +416,56 @@ describe("a folder", () => {
     fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
     expect(await screen.findByText("Zip saved.", undefined, { timeout: 5_000 })).toBeTruthy();
     expect(refused).toBe(1);
-    expect(calls.filter((call) => call.path === publicPath("/download-url"))).toHaveLength(3);
+    expect(calls.filter((call) => call.path === publicPath("/download-urls"))).toHaveLength(2);
   });
 
-  it("a password change while the zip runs: it stops at the next mint, saves NOTHING, and the form shows", async () => {
-    let mints = 0;
-    await openPublic({
-      [`GET ${publicPath()}`]: () =>
-        json(mints > 1 ? info(null, { requiresPassword: true }) : info(publicFolder())),
+  it("a dangerous file in the window: the interstitial first, then its URL is asked again with the ack", async () => {
+    const { calls } = await openPublic({
+      [`GET ${publicPath()}`]: info(publicFolder()),
       [`GET ${publicPath("/children")}`]: children(files),
-      [`POST ${publicPath("/zip-manifest")}`]: manifest,
-      [`POST ${publicPath("/download-url")}`]: (call) => {
-        mints += 1;
-        return mints === 1 ? json(minted("d", (call.body as { nodeId: string }).nodeId)) : passwordRequired();
+      [`POST ${publicPath("/zip-manifest")}`]: cleanManifest,
+      [`POST ${publicPath("/download-urls")}`]: (call) => {
+        const body = call.body as { nodeIds: string[]; dangerousAck?: boolean };
+        return json({
+          items: body.nodeIds.map((nodeId) =>
+            nodeId === files[1]!.id && !body.dangerousAck
+              ? { nodeId, error: "forbidden" }
+              : { nodeId, ...minted("d", nodeId) },
+          ),
+        });
       },
       "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => new Response("aaa"),
+      "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
+    });
+    await screen.findByRole("button", { name: "Download a.txt" });
+    fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
+    expect(await screen.findByText("Zip saved.")).toBeTruthy();
+    const batches = calls
+      .filter((call) => call.path === publicPath("/download-urls"))
+      .map((call) => call.body);
+    expect(batches).toEqual([
+      { zipGrant: "made-up-grant", nodeIds: files.map((file) => file.id) },
+      { zipGrant: "made-up-grant", nodeIds: [files[1]!.id], dangerousAck: true },
+    ]);
+  });
+
+  it("a password change while the zip runs: it stops at the next batch, saves NOTHING, and the form shows", async () => {
+    let batches = 0;
+    await openPublic({
+      [`GET ${publicPath()}`]: () =>
+        json(batches > 0 ? info(null, { requiresPassword: true }) : info(publicFolder())),
+      [`GET ${publicPath("/children")}`]: children(files),
+      [`POST ${publicPath("/zip-manifest")}`]: cleanManifest,
+      [`POST ${publicPath("/download-urls")}`]: () => {
+        batches += 1;
+        return passwordRequired();
+      },
     });
     await screen.findByRole("button", { name: "Download a.txt" });
     fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
     expect(await screen.findByRole("heading", { name: "This link is protected" })).toBeTruthy();
     expect(saved).toHaveLength(0);
-    expect(mints).toBe(2);
+    expect(batches).toBe(1);
   });
 
   it("five simulated minutes with a preview open and a zip in progress: no polling, one window of mints, no retry storm", async () => {
@@ -417,8 +495,9 @@ describe("a folder", () => {
         })),
         skipped: [],
       },
+      [`POST ${publicPath("/download-urls")}`]: batchOk,
       [`POST ${publicPath("/download-url")}`]: (call) =>
-        json(minted("d", (call.body as { nodeId: string }).nodeId)),
+        json(minted("i", (call.body as { nodeId: string }).nodeId)),
       // The files host never answers the first file: the zip is in progress for the whole time.
       [`GET /d/${many[0]!.id}/made-up-token`]: () => new Promise<Response>(() => {}),
     });
@@ -433,17 +512,17 @@ describe("a folder", () => {
     expect(seen.filter((call) => call === "GET /")).toHaveLength(1);
     expect(seen.filter((call) => call === "GET /children")).toHaveLength(1);
     expect(seen.filter((call) => call === "POST /zip-manifest")).toHaveLength(1);
-    const mints = calls.filter((call) => call.path === publicPath("/download-url"));
-    const zipMints = mints.filter((call) => (call.body as { kind: string }).kind === "download");
-    const previewMints = mints.filter((call) => (call.body as { kind: string }).kind !== "download");
-    // One window (ZIP_URL_BATCH = 50) minted, the next not before the first file arrived.
-    expect(zipMints).toHaveLength(50);
+    const previewMints = calls.filter((call) => call.path === publicPath("/download-url"));
+    const zipBatches = calls.filter((call) => call.path === publicPath("/download-urls"));
+    // One window (ZIP_URL_BATCH = 50) minted in one request, the next not before the first file arrived.
+    expect(zipBatches).toHaveLength(1);
+    expect((zipBatches[0]!.body as { nodeIds: string[] }).nodeIds).toHaveLength(50);
     // The preview's URL is minted once and not refreshed within five minutes (80 % of 15 min).
     // The one URL of the open preview: its proactive refresh is due only at 80 % of 15 min.
     expect(previewMints.map((call) => call.body)).toEqual([
       { nodeId: "0199d3c2-7a10-7000-8000-0000000000b1", kind: "inline" },
     ]);
-    expect(seen.length).toBeLessThanOrEqual(3 + 50 + 2);
+    expect(seen.length).toBeLessThanOrEqual(3 + 1 + 1);
     void FOLDER_ID;
   });
 });

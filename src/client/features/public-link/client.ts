@@ -11,10 +11,12 @@
 import {
   PublicChildrenResponse,
   PublicDownloadUrlResponse,
+  PublicDownloadUrlsResponse,
   PublicLinkInfo,
   PublicZipManifest,
   UnlockResponse,
   type PublicDownloadUrlBody,
+  type PublicDownloadUrlsBody,
   type PublicNodeDto,
 } from "../../../shared/schemas/link";
 import { HEADER_LINK_SESSION } from "../../../shared/constants";
@@ -166,6 +168,16 @@ export class LinkClient {
             ...(options.zipGrant ? { zipGrant: options.zipGrant } : {}),
           };
     return this.#unlockedCall("/download-url", { method: "POST", body, schema: PublicDownloadUrlResponse });
+  }
+
+  /** One window of a zip's URLs in ONE request, under its grant (one hit of the limiter). */
+  mintBatch(nodeIds: string[], zipGrant: string, dangerousAck = false): Promise<PublicDownloadUrlsResponse> {
+    const body: PublicDownloadUrlsBody = {
+      zipGrant,
+      nodeIds,
+      ...(dangerousAck ? { dangerousAck: true } : {}),
+    };
+    return this.#unlockedCall("/download-urls", { method: "POST", body, schema: PublicDownloadUrlsResponse });
   }
 
   zipManifest(): Promise<PublicZipManifest> {

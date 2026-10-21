@@ -1,7 +1,7 @@
 // "Download all as zip" on a folder link, built in the browser with client-zip. The manifest call
 // is the zip's ONE download (it hands out a grant); the per-file URLs are then minted lazily, one
-// window of `ZIP_URL_BATCH` at a time just ahead of the archive, each mint carrying the grant (so
-// none of them counts again) — one request in flight, one window at a time.
+// window of `ZIP_URL_BATCH` at a time just ahead of the archive, in ONE batch request under the
+// grant (so none of them counts again, and a window is one hit of the per-address limiter).
 //
 // It never ends half done: when the link locks while a zip runs (the owner changed the password),
 // the zip stops at its next mint and NOTHING is saved; the page shows the password form.
@@ -13,7 +13,7 @@ import { isPasswordRequired, type LinkClient } from "./client";
 
 /** What the browser holds in memory for one archive: 1 GB, decimal. */
 export const ZIP_MAX_BYTES = 1_000_000_000;
-/** Waits for a minute's per-address limit (`429 rate_limited`) before a mint gives up. */
+/** Waits for a minute's per-address limit (`429 rate_limited`) before a window gives up. */
 export const ZIP_RATE_WAITS = 3;
 const MAX_WAIT_MS = 60_000;
 
@@ -75,43 +75,60 @@ export async function zipFolder(client: LinkClient, name: string, hooks: ZipHook
   const grant = manifest.zipGrant;
   const entries = manifest.entries;
 
-  /** The URL of one entry under the grant, or null to leave it out. Throws `Locked`. */
-  const mintOne = async (entry: ZipEntry): Promise<string | null> => {
-    let acknowledged = false;
-    for (let waits = 0; ;) {
-      try {
-        const minted = await client.mint(entry.nodeId, "download", {
-          zipGrant: grant,
-          dangerousAck: acknowledged,
-        });
-        return minted.url;
-      } catch (error) {
-        if (isPasswordRequired(error)) throw new Locked();
-        if (!(error instanceof ApiError)) throw error;
-        if (error.code === "forbidden" && error.details?.reason === "dangerous_ack" && !acknowledged) {
-          if (!(await hooks.confirmDangerous(entry.path.slice(entry.path.lastIndexOf("/") + 1)))) return null;
-          acknowledged = true;
-          continue;
+  /**
+   * The URLs of one window, minted in ONE request under the grant; null for an entry that is
+   * left out. A dangerous type is confirmed first and asked for again with the ack. Throws `Locked`.
+   */
+  const mintWindow = async (window: ZipEntry[]): Promise<Map<string, string>> => {
+    const urls = new Map<string, string>();
+    const ask = async (ids: string[], ack: boolean) => {
+      for (let waits = 0; ;) {
+        try {
+          return await client.mintBatch(ids, grant, ack);
+        } catch (error) {
+          if (isPasswordRequired(error)) throw new Locked();
+          if (error instanceof ApiError && error.code === "rate_limited" && waits < ZIP_RATE_WAITS) {
+            waits += 1;
+            await sleep(Math.min(MAX_WAIT_MS, (error.retryAfter ?? 60) * 1000), hooks.signal);
+            continue;
+          }
+          return null;
         }
-        if (error.code === "rate_limited" && waits < ZIP_RATE_WAITS) {
-          waits += 1;
-          await sleep(Math.min(MAX_WAIT_MS, (error.retryAfter ?? 60) * 1000), hooks.signal);
-          continue;
-        }
-        return null;
+      }
+    };
+    const first = await ask(
+      window.map((entry) => entry.nodeId),
+      false,
+    );
+    const dangerous: ZipEntry[] = [];
+    for (const item of first?.items ?? []) {
+      if ("url" in item) urls.set(item.nodeId, item.url);
+      else if (item.error === "forbidden") {
+        const entry = window.find((candidate) => candidate.nodeId === item.nodeId);
+        if (entry) dangerous.push(entry);
       }
     }
+    const confirmed: string[] = [];
+    for (const entry of dangerous) {
+      if (await hooks.confirmDangerous(entry.path.slice(entry.path.lastIndexOf("/") + 1)))
+        confirmed.push(entry.nodeId);
+    }
+    if (confirmed.length > 0) {
+      for (const item of (await ask(confirmed, true))?.items ?? []) {
+        if ("url" in item) urls.set(item.nodeId, item.url);
+      }
+    }
+    return urls;
   };
 
   let done = 0;
   async function* files() {
     for (let start = 0; start < entries.length; start += ZIP_URL_BATCH) {
       const window = entries.slice(start, start + ZIP_URL_BATCH);
-      const urls: (string | null)[] = [];
-      // One mint at a time: a window is never a burst.
-      for (const entry of window) urls.push(await mintOne(entry));
-      for (const [index, entry] of window.entries()) {
-        const url = urls[index];
+      // One request for the window: never a burst of single mints.
+      const urls = await mintWindow(window);
+      for (const entry of window) {
+        const url = urls.get(entry.nodeId);
         done += 1;
         hooks.progress(done, entries.length);
         if (!url) {
