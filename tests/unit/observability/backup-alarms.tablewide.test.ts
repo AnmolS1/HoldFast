@@ -3,6 +3,11 @@
 // past it now). Each is called with its own instant — a far-future month drawn per run, so other
 // files' ledger rows and earlier runs' markers are never in it — and mails an operator address
 // of its own (no other test's hourly mail count is shared with it).
+//
+// TABLE-WIDE (PLAN §6 rule 16): both alarms read a whole table's state — the month's ledger rows,
+// every account past the backstop — and the kept alarm writes a daily marker for EVERY such
+// account, other files' included. So this runs in the serial step (`HOLDFAST_TABLEWIDE=1`), and
+// still asserts only on this file's own rows and mails.
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
 import { downloadLedger, nodes } from "../../../src/worker/db/schema";
