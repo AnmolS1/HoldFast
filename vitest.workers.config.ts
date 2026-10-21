@@ -93,6 +93,8 @@ export default defineConfig({
     // it is provided here. `capTests`: the 2,000,000,000-byte tests run only when asked for
     // (HOLDFAST_CAP_TESTS=1) — a file gates itself with `describe.skipIf(!inject("capTests"))`.
     provide: { holdfastDb: db, capTests: process.env.HOLDFAST_CAP_TESTS === "1" },
+    // Each file starts with its own bucket's rollback detector in step (see the file).
+    setupFiles: ["./tests/setup/workers-generation.ts"],
     // Closing a database client (`client.end()` in pg, `sql.end()` in postgres.js) makes the
     // driver's pending socket read reject with exactly this message, after the test has passed.
     // Vitest would fail the whole run on it. Only this one message is let through.
