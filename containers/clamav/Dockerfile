@@ -32,7 +32,8 @@
 # SIG_FRESH_HOURS ago and clamd has loaded what it fetched (an update's freshness expires — ruling on
 # review M1), or (b) the loaded daily database is younger than SIG_FRESH_HOURS (below; its age comes
 # from the build time clamd reports for the loaded daily). The shim runs freshclam at boot (one run per
-# wake) and every 2 h while the container lives (= Checks 12), records each success, and RELOADs clamd.
+# wake) and every 2 h while the container lives (= Checks 12) — after a failure at 15 min, doubling up
+# to 2 h; each run killed after 10 min — records each success, and RELOADs clamd.
 # No keep-warm: nothing pings the container on a schedule.
 #
 # DetectPUA no (review B1): clamd reports ONE name per scan, and a PUA.* match can replace an

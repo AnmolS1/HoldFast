@@ -1,7 +1,7 @@
 // The scanner helpers (T20) against a fake container: every call goes through `new Request(…)`, so a
 // body is locked by the first call exactly as the real Durable Object stub locks it. The SCANNER
 // binding itself is never called here (containers are off in tests).
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   BUDGET_HEADER,
   CAPACITY_RETRY_SECONDS,
@@ -15,6 +15,7 @@ import {
   ScannerRefusedError,
   ScannerTransportError,
   scanObject,
+  ScannerContainer,
   scannerHealth,
   scanSmall,
   SMALL_SCAN_BYTES,
@@ -571,5 +572,43 @@ describe("scannerHealth", () => {
     await expect(scannerHealth(env, "scanner-0", { stub: broken.stub })).rejects.toMatchObject({
       reason: "engine",
     });
+  });
+});
+
+describe("ScannerContainer.fetch", () => {
+  it("cuts its container request off at the caller's budget, never past 12 minutes (review d3)", async () => {
+    // The real class method with a stand-in `this`: the library's fetch forwards to containerFetch.
+    const timeouts: number[] = [];
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => {
+      timeouts.push(ms);
+      return new AbortController().signal;
+    });
+    const forwarded: Request[] = [];
+    const self = {
+      defaultPort: 8080,
+      containerFetch: async (request: Request) => {
+        forwarded.push(request);
+        return new Response("ok");
+      },
+    } as unknown as ScannerContainer;
+    const send = (budget?: string) =>
+      ScannerContainer.prototype.fetch.call(
+        self,
+        new Request(
+          "http://scanner/scan",
+          budget === undefined ? {} : { headers: { [BUDGET_HEADER]: budget } },
+        ),
+      );
+    try {
+      await send("30000");
+      await send(String(10 * SCAN_TIMEOUT_MS)); // a caller cannot extend the cap
+      await send(String(SCAN_TIMEOUT_MS + 1));
+      for (const none of [undefined, "", "abc", "-5", "0"]) await send(none);
+    } finally {
+      timeout.mockRestore();
+    }
+    expect(timeouts).toEqual([30_000, SCAN_TIMEOUT_MS, SCAN_TIMEOUT_MS]);
+    expect(forwarded).toHaveLength(8);
+    expect(forwarded.every((request) => request.url === "http://scanner/scan")).toBe(true);
   });
 });

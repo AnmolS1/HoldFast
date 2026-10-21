@@ -416,3 +416,35 @@ func TestSweepDir(t *testing.T) {
 		t.Fatalf("left %v (%v)", entries, err)
 	}
 }
+
+// d4: a scan that starts while a sweep runs waits for it — the sweep cannot remove a new scan's
+// spool. (If the sweep ran outside the lock, the new scan would reach the engine mid-sweep.)
+func TestScanWaitsForARunningSweep(t *testing.T) {
+	e := &fakeEngine{reply: "stream: OK", entered: make(chan struct{}, 8)}
+	s := newServer(e)
+	sweeping, finish := make(chan struct{}), make(chan struct{})
+	first := true
+	s.Sweep = func() {
+		if first {
+			first = false
+			close(sweeping)
+			<-finish
+		}
+	}
+	h := s.Handler()
+	done := make(chan *httptest.ResponseRecorder, 2)
+	go func() { done <- post(t, h, "3", strings.NewReader("abc")) }()
+	<-e.entered // scan A in the engine
+	<-sweeping  // A ended; its sweep is running and held open
+	go func() { done <- post(t, h, "3", strings.NewReader("abc")) }()
+	select {
+	case <-e.entered:
+		t.Fatal("scan B reached the engine while the sweep was running")
+	case <-time.After(300 * time.Millisecond):
+		// B is held at begin(); nothing to await for an absence.
+	}
+	close(finish)
+	<-e.entered // B proceeds once the sweep is done
+	<-done
+	<-done
+}

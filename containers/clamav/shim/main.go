@@ -24,7 +24,6 @@ type config struct {
 	TmpDir        string
 	FreshHours    float64
 	Offline       bool // never contact the signature mirror (local tests only)
-	UpdateEvery   time.Duration
 }
 
 func env(key, fallback string) string {
@@ -47,7 +46,6 @@ func loadConfig() config {
 		TmpDir:        "/scan-tmp",
 		FreshHours:    hours,
 		Offline:       os.Getenv("SCANNER_OFFLINE") == "1",
-		UpdateEvery:   2 * time.Hour,
 	}
 }
 
@@ -100,7 +98,7 @@ func (g *gate) Status() Status {
 }
 
 // updater runs freshclam once and records the outcome in the gate; after a success it has clamd
-// load what was fetched. main runs it at boot and then every UpdateEvery.
+// load what was fetched. main runs it at boot, then every UpdateEvery (sooner after a failure).
 type updater struct {
 	g         *gate
 	run       func() error         // one freshclam run; nil = exit 0 (up to date or updated)
@@ -108,13 +106,14 @@ type updater struct {
 	reload    func(version string) // make clamd load `version` (waits for clamd; RELOAD if needed)
 }
 
-func (u *updater) once() {
+// once runs freshclam and reports whether it succeeded.
+func (u *updater) once() bool {
 	if err := u.run(); err != nil {
 		log.Printf("freshclam: failed (%v)", err)
 		u.g.mu.Lock()
 		u.g.freshclam = "failed"
 		u.g.mu.Unlock()
-		return
+		return false
 	}
 	version := u.diskDaily()
 	log.Printf("freshclam: ok, daily on disk %s", version)
@@ -122,6 +121,7 @@ func (u *updater) once() {
 	u.g.freshclam, u.g.updated, u.g.updatedAt = "ok", version, u.g.now()
 	u.g.mu.Unlock()
 	u.reload(version)
+	return true
 }
 
 // diskDaily is the version of the newest daily database on disk (daily.cld after an update,
@@ -212,7 +212,8 @@ func main() {
 		}
 	}()
 
-	// freshclam at boot and then every UpdateEvery (the 12 checks a day of `Checks 12`), run by the
+	// freshclam at boot, then every UpdateEvery (the 12 checks a day of `Checks 12`) — after a failure
+	// at 15 min doubling up to that (review d1), each run limited to FreshclamTimeout — run by the
 	// shim rather than `freshclam -d` so that every success is recorded: the gate's path (a) lasts
 	// SIG_FRESH_HOURS from the last success. One run per wake; nothing runs on a schedule while the
 	// container sleeps.
@@ -227,9 +228,8 @@ func main() {
 		u := &updater{
 			g: g,
 			run: func() error {
-				cmd := exec.Command("freshclam", "--stdout", "--foreground", "--config-file="+cfg.FreshclamConf)
-				cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-				return cmd.Run() // exit 0 = up to date or updated; every other code is a failure
+				// exit 0 = up to date or updated; every other code, and a run past the limit, is a failure
+				return runLimited(FreshclamTimeout, "freshclam", "--stdout", "--foreground", "--config-file="+cfg.FreshclamConf)
 			},
 			diskDaily: func() string { return diskDaily(cfg.DBDir) },
 			reload: func(version string) {
@@ -252,10 +252,7 @@ func main() {
 				}
 			},
 		}
-		for {
-			u.once()
-			time.Sleep(cfg.UpdateEvery)
-		}
+		runUpdates(u, 0, time.Sleep)
 	}()
 
 	sig := make(chan os.Signal, 1)
