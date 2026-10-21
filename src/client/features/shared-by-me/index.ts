@@ -1,2 +1,2 @@
-// PLACEHOLDER — taken over by the sharing task (T24), which replaces this module and keeps the `routes` export.
+// The Shared by me destination.
 export { routes } from "./routes";
