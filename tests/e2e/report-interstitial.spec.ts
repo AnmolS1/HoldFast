@@ -7,6 +7,7 @@
 //     download-url call without `dangerousAck` is refused.
 import { randomUUID } from "node:crypto";
 import type { Page } from "@playwright/test";
+import { HEADER_LINK_SESSION } from "../../src/shared/constants";
 import { localDb, signedInUser } from "../setup/auth-fixtures";
 import { appOrigin, e2ePort } from "../setup/local-env";
 import { expect, stubTurnstile, test } from "./fixtures";
@@ -44,10 +45,15 @@ async function seedFolder(ownerId: string, name: string): Promise<string> {
   return id;
 }
 
-async function linkTo(page: Page, clientIp: string, nodeId: string): Promise<string> {
+async function linkTo(
+  page: Page,
+  clientIp: string,
+  nodeId: string,
+  extra: Record<string, unknown> = {},
+): Promise<string> {
   const made = await page.request.post(`/api/nodes/${nodeId}/links`, {
     headers: { origin: appOrigin(e2ePort()), "cf-connecting-ip": clientIp },
-    data: { allowPreview: true },
+    data: { allowPreview: true, ...extra },
   });
   expect(made.status()).toBe(201);
   const { url } = (await made.json()) as { url: string };
@@ -154,5 +160,53 @@ test("a folder link: a stranger reports a FILE inside it from its preview — th
   const answer = await sent;
   expect(answer.status()).toBe(202);
   expect(answer.request().postDataJSON()).toMatchObject({ nodeId: fileId, linkToken: token });
+  await expect(dialog.getByText("Thanks. The file is hidden while we review it.")).toBeVisible();
+});
+
+test("a PASSWORD folder link: once unlocked, the previewed file's report carries the link session and is taken; without it the same report is the 404 of an unknown token", async ({
+  page,
+  clientIp,
+}) => {
+  const owner = await signedInUser(page, { clientIp });
+  const tag = randomUUID().slice(0, 8);
+  const folderId = await seedFolder(owner.id, `e2e-locked-${tag}`);
+  const name = `e2e-locked-inside-${tag}.txt`;
+  const fileId = await seedFile(owner.id, name, "text/plain", folderId);
+  const password = `made-up e2e password ${tag}`; // made up
+  const token = await linkTo(page, clientIp, folderId, { password });
+  await stubTurnstile(page);
+
+  // The URL alone proves nothing: refused before Turnstile, exactly like a token that matches no link.
+  const report = { nodeId: fileId, category: "spam", details: "", turnstileToken: "XXXX.DUMMY.TOKEN.XXXX" };
+  const headers = { origin: appOrigin(e2ePort()), "cf-connecting-ip": clientIp };
+  const bare = await page.request.post("/api/public/report", {
+    headers,
+    data: { ...report, linkToken: token },
+  });
+  const unknown = await page.request.post("/api/public/report", {
+    headers,
+    data: { ...report, linkToken: "AAAAAAAAAAAAAAAAAAAAAA" },
+  });
+  expect(bare.status()).toBe(404);
+  const withoutRequestId = async (answer: typeof bare) => {
+    const body = (await answer.json()) as Record<string, unknown>;
+    delete body.requestId;
+    return body;
+  };
+  expect(await withoutRequestId(bare)).toEqual(await withoutRequestId(unknown));
+
+  await page.goto(`/s/${token}`);
+  await page.getByLabel("Password").fill(password);
+  await page.getByRole("button", { name: "Open" }).click();
+  await page.getByRole("button", { name: `Preview ${name}` }).click();
+  await page.locator("[data-report-link]").click();
+  const dialog = page.getByRole("dialog", { name: "Report this file" });
+  await dialog.getByLabel("Spam").check();
+  await expect(dialog.locator("[data-turnstile='ready']")).toBeAttached();
+  const sent = page.waitForResponse((response) => response.url().endsWith("/api/public/report"));
+  await dialog.getByRole("button", { name: "Send report" }).click();
+  const answer = await sent;
+  expect(answer.status()).toBe(202);
+  expect(await answer.request().headerValue(HEADER_LINK_SESSION)).toBeTruthy();
   await expect(dialog.getByText("Thanks. The file is hidden while we review it.")).toBeVisible();
 });
