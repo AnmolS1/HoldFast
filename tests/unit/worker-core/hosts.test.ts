@@ -330,6 +330,19 @@ describe("app host headers", () => {
     }
   });
 
+  it("Referrer-Policy: no-referrer on /s/* (a link's token is in the path); the rest of the app keeps strict-origin-when-cross-origin", async () => {
+    for (const [path, expected] of [
+      ["/s/abcdefghijklmnop", "no-referrer"],
+      ["/s/abcdefghijklmnop/sub", "no-referrer"],
+      ["/files", "strict-origin-when-cross-origin"],
+      ["/shared", "strict-origin-when-cross-origin"],
+    ] as const) {
+      const { response } = await appCall(path);
+      expect(response.headers.get("referrer-policy"), path).toBe(expected);
+      await response.text();
+    }
+  });
+
   it("static assets: nosniff; hashed files immutable, everything else no-cache; no CSP", async () => {
     const hashed = await appCall("/assets/index-abc123.js", { env: { ASSETS: script } });
     expect(headersOf(hashed.response)).toEqual({

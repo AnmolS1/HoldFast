@@ -83,6 +83,8 @@ export function htmlHeaders(
   if (path.startsWith("/s/") || path === "/admin" || path.startsWith("/admin/")) {
     headers["X-Robots-Tag"] = "noindex, nofollow";
   }
+  // A public-link page carries the link's token in its path: no Referer leaves it, not even an origin.
+  if (path.startsWith("/s/")) headers["Referrer-Policy"] = "no-referrer";
   return headers;
 }
 
