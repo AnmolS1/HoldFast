@@ -23,7 +23,7 @@
 import { readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { parseArgs } from "node:util";
-import pg from "pg";
+import { localSession } from "./local-session";
 
 type Klass = {
   name: string;
@@ -126,66 +126,8 @@ function filesGet(path: string, extra: Record<string, string>): Promise<Response
 }
 
 // ── a session (local throwaway, or the file) ───────────────────────────────────────────────────
-// A made-up password for the throwaway local account; it never leaves this machine.
-const LOCAL_PASSWORD = "correct horse battery staple 9!";
-const TURNSTILE_TEST_TOKEN = "XXXX.DUMMY.TOKEN.XXXX";
-
-async function localSession(ip: string): Promise<string> {
-  const url = process.env.DATABASE_URL_DIRECT;
-  if (!url)
-    throw new Error("--local with no --session needs DATABASE_URL_DIRECT (eval scripts/dev-worktree.sh)");
-  const db = new pg.Client({ connectionString: url });
-  await db.connect();
-  const code = `PROBE-${rand(10).toUpperCase()}`;
-  try {
-    await db.query("INSERT INTO invites (code, max_uses, note) VALUES ($1, 1, 'ratelimit-probe')", [code]);
-  } finally {
-    await db.end();
-  }
-  const email = `probe-${rand(10)}@ratelimit-probe.example`;
-  const signUp = await fetch(`${base}/api/auth/sign-up/email`, {
-    method: "POST",
-    headers: headers(ip, {
-      "content-type": "application/json",
-      origin: base,
-      "sec-fetch-site": "same-origin",
-      "x-captcha-response": TURNSTILE_TEST_TOKEN,
-    }),
-    body: JSON.stringify({
-      email,
-      password: LOCAL_PASSWORD,
-      name: "Probe",
-      inviteCode: code,
-      birthYear: 1990,
-      birthMonth: 5,
-      acceptTerms: true,
-      callbackURL: "/login?reason=verified",
-    }),
-  });
-  if (!signUp.ok) throw new Error(`local sign-up: ${signUp.status}`);
-  // The browser that signed up holds the mailbox proof; the link signs in only with it.
-  const pending = signUp.headers
-    .getSetCookie()
-    .map((c) => c.split(";")[0]!)
-    .join("; ");
-  let link: string | undefined;
-  for (let attempt = 0; attempt < 50 && !link; attempt++) {
-    const outbox = await fetch(`${base}/api/_test/outbox?to=${encodeURIComponent(email)}`, {
-      headers: headers(ip),
-    });
-    const text = await outbox.text();
-    link = /https?:\/\/[^\s"'<>\\]+\/api\/auth\/verify-email[^\s"'<>\\]+/.exec(text)?.[0];
-    if (!link) await sleep(100);
-  }
-  if (!link) throw new Error("local sign-up: no verification mail in the test outbox");
-  const verified = await fetch(link.replace(/&amp;/g, "&"), {
-    headers: headers(ip, { cookie: pending }),
-    redirect: "manual",
-  });
-  const cookie = verified.headers.getSetCookie().find((c) => /^(__Host-)?hf\.session_token=/.test(c));
-  if (!cookie)
-    throw new Error(`local sign-up: the verification answered ${verified.status} without a session`);
-  return cookie.split(";")[0]!;
+async function localCookie(ip: string): Promise<string> {
+  return (await localSession(base, headers(ip))).header;
 }
 
 function sessionFromFile(path: string): string {
@@ -349,14 +291,14 @@ async function main() {
   let cookie: string | null = null;
   if (values.session) cookie = sessionFromFile(values.session);
   else if (local && (!only || ["api-user", "search", "link-password"].some((name) => only.has(name)))) {
-    cookie = await localSession(addressFor());
+    cookie = await localCookie(addressFor());
   }
   const wanted = (name: string) => !only || only.has(name);
   // Search spends the same `u:<id>` budget as every other request of its user: it needs an
   // account of its own, or it would find the budget api-user has just used up.
   let searchCookie: string | null = null;
   if (values["search-session"]) searchCookie = sessionFromFile(values["search-session"]);
-  else if (local && wanted("search")) searchCookie = await localSession(addressFor());
+  else if (local && wanted("search")) searchCookie = await localCookie(addressFor());
   const passwordLink = cookie && wanted("link-password") ? await makePasswordLink(cookie) : null;
   const results: Outcome[] = [];
   for (const klass of classes(cookie, searchCookie, passwordLink)) {
