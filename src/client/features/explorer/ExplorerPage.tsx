@@ -55,6 +55,7 @@ import { StatusDot, statusSentence } from "../../components/StatusDot";
 import { ThumbImage } from "../../components/ThumbImage";
 import { toast } from "../../components/Toaster";
 import { ApiError } from "../../lib/api";
+import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
 import { queryClient } from "../../lib/query";
@@ -284,7 +285,10 @@ function Explorer({ folderId }: { folderId: string | null }) {
         return;
       }
       void navigate(`/preview/${encodeURIComponent(node.id)}`, {
-        state: { siblingIds: siblingWindow(nodes, node.id), from: location.pathname + location.search },
+        state: stamped({
+          siblingIds: siblingWindow(nodes, node.id),
+          from: location.pathname + location.search,
+        }),
       });
     },
     [navigate, nodes, location.pathname, location.search],

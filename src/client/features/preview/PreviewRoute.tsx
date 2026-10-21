@@ -1,6 +1,7 @@
 // `/preview/:nodeId` as a page: the dialog over whatever was open, with the signed-in source.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router";
+import { stamped } from "../../lib/history-state";
 import { getKnownUserId } from "../../lib/query";
 import { PreviewDialogView } from "./PreviewDialog";
 import type { LoadedItem } from "./source";
@@ -56,7 +57,7 @@ export function PreviewRoute() {
   useEffect(() => {
     if (!unstamped || stampedKey.current === location.key) return;
     stampedKey.current = location.key;
-    void navigate(location.pathname + location.search, { replace: true, state: { ...state, account } });
+    void navigate(location.pathname + location.search, { replace: true, state: stamped({ ...state }) });
   });
 
   // Focus goes back to whatever opened the preview (a row of the list underneath).
@@ -84,14 +85,14 @@ export function PreviewRoute() {
       coldParent.current = parent;
       void navigate(location.pathname + location.search, {
         replace: true,
-        state: { siblingIds, from: parent, cold: true, account },
+        state: stamped({ siblingIds, from: parent, cold: true }),
       });
     },
-    [from, siblingIds, account, navigate, location.pathname, location.search],
+    [from, siblingIds, navigate, location.pathname, location.search],
   );
 
   const onNavigate = (id: string) =>
-    void navigate(`/preview/${encodeURIComponent(id)}`, { replace: true, state: { ...state, account } });
+    void navigate(`/preview/${encodeURIComponent(id)}`, { replace: true, state: stamped({ ...state }) });
 
   const onClose = () => {
     // Opened from a page of the app: that page is the entry behind this one.

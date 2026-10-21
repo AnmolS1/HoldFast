@@ -13,6 +13,7 @@ import { openPalette } from "../../components/CommandPalette";
 import { Kbd } from "../../components/Kbd";
 import { SearchSuggestions } from "../../features/search";
 import { t } from "../../lib/i18n";
+import { stamped } from "../../lib/history-state";
 import { usePrefs } from "../../lib/prefs";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
@@ -105,7 +106,7 @@ export function SearchBox({ compact = false }: { compact?: boolean }) {
             query={query.trim()}
             onPick={(nodeId) =>
               navigate(`/preview/${encodeURIComponent(nodeId)}`, {
-                state: { from: location.pathname + location.search },
+                state: stamped({ from: location.pathname + location.search }),
               })
             }
           />

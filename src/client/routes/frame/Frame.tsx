@@ -11,6 +11,7 @@ import type { RouteHandle } from "../../components/slots";
 import { TransferRibbon } from "../../components/TransferRibbon";
 import { UploadDropOverlay } from "../../features/upload";
 import { t } from "../../lib/i18n";
+import { ownHistoryState } from "../../lib/history-state";
 import { getKnownUserId, useSession } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
@@ -83,7 +84,8 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
   const [background, setBackground] = useState<Background | null>(null);
   if (!overlay && background?.key !== location.key)
     setBackground({ key: location.key, element: outlet, handle });
-  const from = (location.state as { from?: unknown } | null)?.from;
+  // Another account's history state is not read, not for one render (lib/history-state.ts).
+  const from = ownHistoryState(location.state)?.from;
   const coldFrom = typeof from === "string" && from.startsWith("/") && !from.startsWith("//") ? from : "/";
   const shown = overlay ? background : { element: outlet, handle };
   const pageHandle = shown?.handle ?? {};

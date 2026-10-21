@@ -8,6 +8,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react"
 import { useLocation, useNavigationType, useSearchParams } from "react-router";
 import { BottomSheet } from "../../components/BottomSheet";
 import { EmptyState } from "../../components/EmptyState";
+import { ownHistoryState, stamped } from "../../lib/history-state";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
 import { ListNotice, NodeList, ViewError, ViewPage } from "../starred/view-kit";
@@ -47,8 +48,7 @@ const ANY = "";
 
 /** Marks an address this page wrote from its own box (see the note on `typed` below). */
 const OWN_WRITE = { searchBox: true } as const;
-const isOwnWrite = (state: unknown): boolean =>
-  typeof state === "object" && state !== null && (state as { searchBox?: unknown }).searchBox === true;
+const isOwnWrite = (state: unknown): boolean => ownHistoryState(state)?.searchBox === true;
 
 interface FiltersProps {
   state: SearchState;
@@ -130,7 +130,7 @@ export function SearchPage() {
     const q = typed.trim().slice(0, Q_MAX);
     if (q === state.q) return;
     const timer = setTimeout(
-      () => setParams(searchParamsOf({ ...state, q }), { replace: true, state: OWN_WRITE }),
+      () => setParams(searchParamsOf({ ...state, q }), { replace: true, state: stamped(OWN_WRITE) }),
       DEBOUNCE_MS,
     );
     return () => clearTimeout(timer);
