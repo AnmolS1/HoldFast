@@ -556,9 +556,17 @@ cvd_verified() {
   local dir="$1" base out daily_built age
   base="$(sed -n 's/^FROM \(clamav\/clamav:[^ ]*\) AS runtime/\1/p' "$repo_root/containers/clamav/Dockerfile")"
   [ -n "$base" ] || { echo "cvd-cache: no runtime FROM line in the Dockerfile"; return 1; }
+  # sigtool's EXIT STATUS decides (0 only when the RSA signature verifies — a changed byte gives 1);
+  # the first failing file ends the run. Then each file's own section must hold exactly one
+  # "Verification OK." line — a count over all three could be met by text a file prints itself.
   out="$(docker run --rm --platform linux/amd64 -v "$dir:/cvd:ro" --entrypoint sh "$base" -c \
-    'for f in main daily bytecode; do echo "== $f"; sigtool --info /cvd/$f.cvd; done' 2>/dev/null)" || return 1
-  [ "$(printf '%s\n' "$out" | grep -c '^Verification OK\.')" = 3 ] || { echo "cvd-cache: a signature did not verify"; return 1; }
+    'for f in main daily bytecode; do echo "== $f"; sigtool --info "/cvd/$f.cvd" || exit 1; done' 2>/dev/null)" ||
+    { echo "cvd-cache: a signature did not verify"; return 1; }
+  local f
+  for f in main daily bytecode; do
+    [ "$(printf '%s\n' "$out" | awk -v f="$f" '/^== /{s=($2==f)} s && /^Verification OK\.$/{n++} END{print n+0}')" = 1 ] ||
+      { echo "cvd-cache: $f.cvd did not verify on its own"; return 1; }
+  done
   daily_built="$(printf '%s\n' "$out" | awk '/^== daily/{d=1} d && /^Build time:/{sub(/^Build time: */,""); print; exit}')"
   age="$(python3 -c 'import sys,time,email.utils as e
 t=time.strptime(sys.argv[1][:17], "%d %b %Y %H:%M"); off=sys.argv[1][18:]
