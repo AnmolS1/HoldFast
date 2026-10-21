@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { createKeys } from "../../../src/worker/services/keys";
 import { verifyDownloadToken } from "../../../src/worker/services/tokens";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
-import { user, type ScanStatus } from "../../../src/worker/db/schema";
+import { nodes, user, type ScanStatus } from "../../../src/worker/db/schema";
 import { makePendingShare } from "../auth/helpers";
 import {
   api,
@@ -117,5 +117,29 @@ describe("who sees an avatar", () => {
     expect((await api(me.as, "GET", urlOf(me.id, 1280))).status).toBe(400);
     expect((await api(me.as, "GET", `/account/avatar-url/${me.id}`)).status).toBe(400);
     expect((await api(me.as, "GET", "/account/avatar-url/not-an-id?size=160")).status).toBe(404);
+  });
+
+  it("an avatar is in no listing, no search, no recent, no starred and no zip manifest of its owner", async () => {
+    const me = await withAvatar();
+    await testDb()
+      .update(nodes)
+      .set({ starred: true, lastAccessedAt: new Date() })
+      .where(eq(nodes.id, me.node.id));
+    const plain = await makeFile(me.id, null, {
+      name: `avatar-plain-${rand()}.png`,
+      scanStatus: "clean",
+      starred: true,
+    });
+    const text = (answer: { body: unknown }) => JSON.stringify(answer.body);
+    for (const path of ["/nodes/root", "/recent", "/starred", `/search?q=${encodeURIComponent("avatar")}`]) {
+      const answer = await api(me.as, "GET", path);
+      expect(answer.status, path).toBe(200);
+      expect(text(answer), path).not.toContain(me.node.id);
+    }
+    expect(text(await api(me.as, "GET", "/nodes/root"))).toContain(plain.id);
+    const zip = await api(me.as, "POST", "/nodes/zip-manifest", { body: { allOwned: true } });
+    expect(zip.status).toBe(200);
+    expect(text(zip)).not.toContain(me.node.id);
+    expect(text(zip)).toContain(plain.id);
   });
 });

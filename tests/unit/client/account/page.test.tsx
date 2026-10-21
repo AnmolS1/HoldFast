@@ -1,7 +1,7 @@
 // The account page (features/account): what each section sends and how it answers the server's
 // refusals — against a scripted API.
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
@@ -251,6 +251,55 @@ describe("security: step-up", () => {
     expect(calls.filter((call) => call.path === "/api/auth/two-factor/generate-backup-codes")).toHaveLength(
       1,
     );
+  });
+});
+
+describe("data: export", () => {
+  it("Download export saves the file the API answered, checked against the contract", async () => {
+    let saved: Blob | null = null;
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, {
+        createObjectURL: (blob: Blob) => ((saved = blob), "blob:export"),
+        revokeObjectURL: () => {},
+      }),
+    );
+    const names: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      names.push(this.download);
+    });
+    const at = new Date().toISOString();
+    const calls = api((call) =>
+      call.path === "/api/account/export"
+        ? json({
+            version: 1,
+            exportedAt: at,
+            user: {
+              id: ME,
+              email: "ada@example.com",
+              displayName: "Ada Lovelace",
+              createdAt: at,
+              timezone: null,
+              locale: "en",
+              quotaBytes: 1,
+              usedBytes: 0,
+              termsAcceptedAt: null,
+              termsVersion: null,
+            },
+            prefs: PREFS,
+            nodes: [],
+            shares: [],
+            sharedWithMe: [],
+            links: [],
+            activity: [],
+          })
+        : undefined,
+    );
+    renderRoutes(buildRoutes(), ["/account/data"]);
+    fireEvent.click(await screen.findByRole("button", { name: "Download export" }));
+    await waitFor(() => expect(names).toEqual([`holdfast-export-${at.slice(0, 10)}.json`]));
+    expect(JSON.parse(await saved!.text())).toMatchObject({ version: 1, user: { id: ME } });
+    expect(header(calls.find((call) => call.path === "/api/account/export"))).toBe(ME);
   });
 });
 
