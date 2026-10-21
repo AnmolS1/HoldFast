@@ -5,7 +5,7 @@
 #   - 2,000,000,000 random bytes → clean, bytes 2000000000, sha256 = shasum, inside 12 minutes;
 #   - the same size with the private marker in its last 31 bytes → infected with the marker (read to the end);
 #   - X-Scan-Size 2,000,000,001 → 413 before the body is read;
-#   - clamd load time on the shape, and how long a RELOAD blocks clamd (idle, and during a cap scan);
+#   - clamd load time on the shape, and how long a RELOAD blocks scans (idle, and during a cap scan);
 #   - peaks: clamd RSS (VmHWM), container memory (cgroup memory.peak), /scan-tmp use.
 # Heavy (two 2 GB files, a 4 GiB container): run it through holdfast-plan/scripts/heavy.sh cap.
 # On an Apple-silicon Mac the image is EMULATED: durations are not representative, memory and disk are.
@@ -66,7 +66,7 @@ sampler=$!
 post() {
   local t0=$(date +%s)
   curl -s -o "$work/body" -w '%{http_code} %{size_upload}' -X POST -H "X-Scan-Size: $2" -T "$1" \
-    "localhost:$port/scan" >"$work/code"
+    "localhost:$port/scan" >"$work/code" || true # a refusal before the body ends curl's upload with an error
   echo $(($(date +%s) - t0)) >"$work/secs"
 }
 
@@ -93,7 +93,7 @@ fi
 echo "== X-Scan-Size 2,000,000,001"
 head -c $((cap + 1)) /dev/zero >"$work/over.bin"
 post "$work/over.bin" $((cap + 1))
-read -r code uploaded <"$work/code"
+read -r code uploaded <"$work/code" || true # curl -w writes no newline
 echo "$code, uploaded $uploaded bytes, $(cat "$work/secs") s: $(cat "$work/body")"
 if [ "$code" = 413 ] && [ "$uploaded" -lt 100000000 ]; then
   ok "one byte over the cap → 413 before the body was read ($uploaded bytes left curl)"
@@ -102,20 +102,37 @@ else
 fi
 rm -f "$work/over.bin"
 
+now() { perl -MTime::HiRes=time -e 'printf "%.1f", time'; }
+since() { perl -e 'printf "%.1f", $ARGV[1] - $ARGV[0]' "$1" "$(now)"; }
+printf '%s%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR' '-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' >"$work/eicar.com"
+# small_after_reload <label>: RELOAD, then EICAR scans once a second until one is answered with a
+# verdict. While clamd reloads (ConcurrentDatabaseReload no) it answers no PING, so the shim answers
+# 503 not_ready (clamd_loading) instead of letting a scan hang: the time to the first verdict is how
+# long scans are held up.
+small_after_reload() {
+  local t0 refused=0 code
+  t0=$(now)
+  docker exec "$name" clamdscan --config-file=/etc/clamav/clamd.conf --reload
+  while :; do
+    code="$(curl -s --max-time 900 -o "$work/small" -w '%{http_code}' -X POST -H 'X-Scan-Size: 68' \
+      --data-binary @"$work/eicar.com" "localhost:$port/scan" || true)"
+    [ "$code" = 200 ] && break
+    refused=$((refused + 1))
+    [ "$(perl -e 'print int($ARGV[1] - $ARGV[0])' "$t0" "$(now)")" -lt 900 ] || break
+    sleep 1
+  done
+  echo "$1: first verdict after RELOAD $(since "$t0") s later ($refused answers 503 before it): $(jq -c '[.status, .signatures]' "$work/small" 2>/dev/null)"
+  jq -e '.status == "infected"' "$work/small" >/dev/null || bad "$1: EICAR after RELOAD → $(cat "$work/small")"
+}
+
 echo "== RELOAD while idle (ConcurrentDatabaseReload no)"
-t0=$(date +%s)
-docker exec "$name" clamdscan --config-file=/etc/clamav/clamd.conf --reload
-docker exec "$name" clamdscan --config-file=/etc/clamav/clamd.conf --ping 600:1 >/dev/null
-echo "clamd answered PING again $(($(date +%s) - t0)) s after RELOAD (idle, emulated)"
+small_after_reload "idle (emulated)"
 
 echo "== RELOAD during a cap-sized scan"
 post "$work/clean.bin" "$cap" &
 scan=$!
 until docker exec "$name" du -sk /scan-tmp 2>/dev/null | awk '{exit !($1 > 500000)}'; do sleep 1; done
-t0=$(date +%s)
-docker exec "$name" clamdscan --config-file=/etc/clamav/clamd.conf --reload
-docker exec "$name" clamdscan --config-file=/etc/clamav/clamd.conf --ping 900:1 >/dev/null
-echo "clamd answered PING again $(($(date +%s) - t0)) s after a RELOAD sent 500 MB into the spool (emulated)"
+small_after_reload "500 MB into a cap-sized scan's spool (emulated)"
 wait "$scan"
 echo "$(cat "$work/code") $(cat "$work/secs") s: $(cat "$work/body")"
 if jq -e --arg s "$clean_sha" '.status == "clean" and .sha256 == $s' "$work/body" >/dev/null; then
@@ -128,7 +145,7 @@ kill "$sampler"; sampler=""
 echo "== peaks"
 docker exec "$name" sh -c 'grep VmHWM /proc/$(pidof clamd)/status; echo "cgroup memory.peak: $(( $(cat /sys/fs/cgroup/memory.peak) / 1048576 )) MiB of $(( $(cat /sys/fs/cgroup/memory.max) / 1048576 )) MiB"'
 awk 'BEGIN{r=0;m=0;d=0} {if($2>r)r=$2; if($3>m)m=$3; if($4>d)d=$4} END{printf "sampled peaks: clamd RSS %d MiB, container memory %d MiB, /scan-tmp %d MiB (%d samples)\n", r/1024, m/1048576, d/1024, NR}' "$work/samples"
-docker logs "$name" 2>&1 | grep -E 'scan bytes=|RELOAD|reload|Database' | tail -12
+docker logs "$name" 2>&1 | grep -E 'scan bytes=|reload|Reading databases|Database' | tail -14 || true
 
 echo "cap: $failures failure(s)"
 [ "$failures" = 0 ]
