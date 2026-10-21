@@ -403,8 +403,20 @@ export function spyBucket(
           },
         });
       }
+      // The original body is locked by now: its readers read the watched stream instead.
+      const readers: Record<string, () => Promise<unknown>> = {
+        text: () => new Response(watched).text(),
+        arrayBuffer: () => new Response(watched).arrayBuffer(),
+        json: () => new Response(watched).json(),
+        blob: () => new Response(watched).blob(),
+      };
       return new Proxy(found, {
-        get: (target, name) => (name === "body" ? watched : Reflect.get(target, name, target)),
+        get: (target, name) =>
+          name === "body"
+            ? watched
+            : typeof name === "string" && name in readers
+              ? readers[name]
+              : Reflect.get(target, name, target),
       });
     },
     put: (key: string, ...rest: unknown[]) => {

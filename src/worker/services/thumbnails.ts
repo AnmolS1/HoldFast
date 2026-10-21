@@ -71,6 +71,7 @@ import { addUsageIfUnder, totalsOn, utcDay } from "../db/queries/ledger";
 import { releaseHold, takeOverStaleHold } from "../db/queries/files-host";
 import { getNode } from "../db/queries/nodes";
 import { effectiveHidden } from "../db/queries/tree";
+import { readsRolledBack } from "../jobs/reconcile";
 import { tryConsumeCeiling } from "./ceilings";
 import { now } from "./clock";
 import { db, defer, type AppEnv } from "./request-context";
@@ -298,9 +299,10 @@ async function attempt(
   } catch {
     stored = null;
   }
-  // Written first, checked after: see the header.
+  // Written first, checked after: see the header. While the database reads as rolled back its
+  // "gone" may be wrong, so the object is kept (the orphan sweep's once the rollback is cleared).
   if (!(await stillCurrent(c, node))) {
-    if (stored) await store.delete([key]).catch(() => {});
+    if (stored && !(await readsRolledBack(c.env, db(c)))) await store.delete([key]).catch(() => {});
     return none("superseded");
   }
   return { ok: true, buffer, stored };

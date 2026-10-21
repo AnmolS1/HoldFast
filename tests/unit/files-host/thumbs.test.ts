@@ -4,12 +4,14 @@
 // this file proves is what the code ASKS for and what it does when the service fails.
 import { eq, sql } from "drizzle-orm";
 import type { Context } from "hono";
-import { describe, expect, it } from "vitest";
+import { env } from "cloudflare:workers";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { THUMB_INPUT_MAX_BYTES } from "../../../src/shared/constants";
 import type { AppEnv } from "../../../src/worker/services/request-context";
 import { addUsageIfUnder, subtractUsage } from "../../../src/worker/db/queries/ledger";
 import { releaseHold, takeOverStaleHold } from "../../../src/worker/db/queries/files-host";
 import { nodes } from "../../../src/worker/db/schema";
+import { GENERATION_KEY } from "../../../src/worker/jobs/reconcile";
 import { dayUTC } from "../../../src/worker/services/ip-hash";
 import { keyFor, thumbKey } from "../../../src/worker/services/storage";
 import {
@@ -23,6 +25,7 @@ import {
 } from "../../../src/worker/services/thumbnails";
 import { backendPid, untilBlockedBy } from "../services-core/helpers";
 import { invoke } from "../services-core/request";
+import { generationInStep } from "../trash/helpers";
 import {
   ask,
   FAKE_WEBP,
@@ -1038,6 +1041,15 @@ describe("the asker's room is asked for the largest thumbnail, not one byte", ()
 });
 
 describe("a transform in flight across a Replace, a purge or a takedown leaves nothing behind", () => {
+  // The restore detector in step (S16): this file's own bucket holds the database's generation.
+  let database = 0;
+  beforeAll(async () => {
+    database = await generationInStep();
+  });
+  afterEach(async () => {
+    await env.FILES.put(GENERATION_KEY, String(database));
+  });
+
   /** Replaces the file: a new version, a new object, the node pointing at it. */
   const replace = async (node: { id: string; ownerId: string }) => {
     const versionId = crypto.randomUUID();
@@ -1094,6 +1106,33 @@ describe("a transform in flight across a Replace, a purge or a takedown leaves n
       expect(answer.status).toBe(404);
       expect(await real.bucket.head(key)).toBeNull();
     }
+  });
+
+  it("S16: while the database reads as rolled back, the object just written is kept — the answer is the same icon", async () => {
+    await env.FILES.put(GENERATION_KEY, String(database + 2));
+    const owner = await makeAccount();
+    const node = await picture(owner.id);
+    const key = thumbKey(node.id, node.versionId, 320);
+    const real = spyBucket();
+    const spy = spyBucket({
+      put: (async (k: string, value: ArrayBuffer, options?: R2PutOptions) => {
+        const written = await real.bucket.put(k, value, options);
+        await updateNode(node.id, { takedownAt: new Date(), takedownReason: "admin" });
+        return written;
+      }) as unknown as R2Bucket["put"],
+    });
+    const answer = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      env: { IMAGES: imagesMock().binding, FILES: spy.bucket },
+    });
+    expect(answer.status).toBe(404);
+    expect(spy.deletes).toEqual([]);
+    // Unreferenced once its node is gone: the orphan sweep's, after the rollback is cleared.
+    expect(await real.bucket.head(key)).not.toBeNull();
+    // Kept is not served: the taken-down node's thumbnail is still the icon.
+    const again = await ask(await urlFor("thumb", node, { user: owner.id }), {
+      env: { IMAGES: imagesMock().binding },
+    });
+    expect(again.status).toBe(404);
   });
 
   it("the control: nothing changed meanwhile → the object stays and is served", async () => {
