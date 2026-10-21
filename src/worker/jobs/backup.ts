@@ -284,8 +284,6 @@ export type PassOptions = {
   tables?: string[];
   pageRows?: number;
   partBytes?: number;
-  /** When the alarms look at the day and month (now by default). */
-  at?: Date;
 };
 
 export type PassResult = JobResult & {
