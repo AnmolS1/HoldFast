@@ -490,6 +490,29 @@ describe("decided again under the row's lock (standing check a)", () => {
     });
   });
 
+  it("paths (2) and (3) too: a session that moved on between the listing and the act — refused bytes are NOT deleted and nobody is struck; a would-be stale one is not ended again", async () => {
+    await rolledBack(async (db) => {
+      const refused = await owed(db, { stored: "malware", declared: "other-csam" });
+      const stale = await owed(db, { stored: null, declared: "other-csam", multipart: true });
+      const listed = (await owedSessions(db, 1_000_000)).filter((e) =>
+        [refused.session.id, stale.session.id].includes(e.session.id),
+      );
+      expect(listed).toHaveLength(2);
+      for (const id of [refused.session.id, stale.session.id]) {
+        await db.update(uploads).set({ status: "done" }).where(eq(uploads.id, id));
+      }
+      const ctx = jobContext({ db });
+      for (const entry of listed)
+        expect(await settleOwedSession(ctx.bg, entry, async () => true)).toBe("skipped");
+      await ctx.settle();
+      expect(await exists(refused.session.r2Key)).toBe(true);
+      expect(await db.select().from(strikes).where(eq(strikes.userId, refused.uploader.id))).toEqual([]);
+      expect(await read.audits(db, "upload.blocked", refused.session.id)).toEqual([]);
+      expect(await exists(stale.session.r2Key)).toBe(true);
+      expect((await read.user(db, stale.owner.id)).usedBytes).toBe(stale.bytes.byteLength);
+    });
+  });
+
   it("the uploader's account purge before the sweep: deleteForUser keeps the completing session (the purge waits); the sweep's node then holds the account", async () => {
     await rolledBack(async (db) => {
       const made = await owed(db, { stored: "csam", owedRow: true });

@@ -196,8 +196,12 @@ async function refuseOwed(
   sha256: string,
   mayDelete: () => Promise<boolean>,
 ): Promise<Outcome> {
+  // Decided again before anything is deleted: a session that moved on since it was listed is
+  // not this sweep's any more. (No transaction is held across the store's delete.)
+  const current = await retryOnDeadlock(bg.db, (tx) => lockOwedSession(tx, session.id));
+  if (!current) return "skipped";
   try {
-    await refuseBlockedSession(bg, session, reason, sha256, {
+    await refuseBlockedSession(bg, current, reason, sha256, {
       mayDelete,
       onEnded: () => {
         audit(
