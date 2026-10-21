@@ -328,7 +328,8 @@ describe("typed confirmation for emptying the trash", () => {
     expect((within(dialog).getByRole("button", { name: "Empty trash" }) as HTMLButtonElement).disabled).toBe(
       false,
     );
-  });
+    // Renders 100 rows (1.5 s locally, ~3x on a CI runner): the budget is for that work, not a wait.
+  }, 15000);
 
   it("101 items: the word must be typed first", async () => {
     const { calls } = await openTrash({ "GET /api/trash": trashPage(trashItems(101)) });
@@ -344,7 +345,8 @@ describe("typed confirmation for emptying the trash", () => {
     expect(calls.filter((call) => call.method === "DELETE")).toEqual([]);
     fireEvent.change(input, { target: { value: CONFIRM_WORD } });
     expect(confirm.disabled).toBe(false);
-  });
+    // Renders 101 rows (1.7 s locally, ~3x on a CI runner): the budget is for that work, not a wait.
+  }, 15000);
 
   it("more pages than were loaded: 'More than', and typing", async () => {
     await openTrash({ "GET /api/trash": trashPage(TRASH.items, "next") });
@@ -811,7 +813,8 @@ describe("review fixes on the trash page", () => {
     // Enabled again when those seconds have passed — the wait is the API's, awaited as an event.
     // (3 s, not 1: on a slow CI runner one second could pass before the disabled checks above ran.)
     await waitFor(() => expect(button().disabled).toBe(false), { timeout: 6000 });
-  });
+    // It waits the API's 3 s on purpose, plus a slow runner's rendering.
+  }, 15000);
 
   it("m4: Delete does not open a second dialog over 'Empty the trash?', nor over the row menu", async () => {
     await openTrash();
