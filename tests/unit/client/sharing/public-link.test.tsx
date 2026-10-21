@@ -344,6 +344,30 @@ describe("a folder", () => {
     expect(saved).toHaveLength(1);
   });
 
+  it("the per-address limit (429 rate_limited) on a mint under the grant: the zip waits as told and saves complete", async () => {
+    let refused = 0;
+    const { calls } = await openPublic({
+      [`GET ${publicPath()}`]: info(publicFolder()),
+      [`GET ${publicPath("/children")}`]: children(files),
+      [`POST ${publicPath("/zip-manifest")}`]: { ...manifest, skipped: [] },
+      [`POST ${publicPath("/download-url")}`]: (call) => {
+        const nodeId = (call.body as { nodeId: string }).nodeId;
+        if (nodeId === files[1]!.id && refused === 0) {
+          refused += 1;
+          return envelope("rate_limited", 429, undefined, { "Retry-After": "1" });
+        }
+        return json(minted("d", nodeId));
+      },
+      "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => new Response("aaa"),
+      "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
+    });
+    await screen.findByRole("button", { name: "Download a.txt" });
+    fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
+    expect(await screen.findByText("Zip saved.", undefined, { timeout: 5_000 })).toBeTruthy();
+    expect(refused).toBe(1);
+    expect(calls.filter((call) => call.path === publicPath("/download-url"))).toHaveLength(3);
+  });
+
   it("a password change while the zip runs: it stops at the next mint, saves NOTHING, and the form shows", async () => {
     let mints = 0;
     await openPublic({

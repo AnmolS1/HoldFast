@@ -143,6 +143,58 @@ describe("Shared by me — people", () => {
   });
 });
 
+describe("Shared by me — an account change while a change to a person is in flight", () => {
+  const share = {
+    id: "0199d3c2-7a10-7000-8000-0000000003b1",
+    nodeId: FOLDER_ID,
+    email: "friend@example.test",
+    role: "viewer" as const,
+    canUpload: true,
+    createdAt: AT,
+  };
+  it.each([
+    [
+      "change the role",
+      "PATCH",
+      async () => {
+        fireEvent.mouseDown(document.querySelector("[data-by-me-share] [role='combobox']")!);
+        fireEvent.click(await screen.findByRole("option", { name: "Can edit" }));
+      },
+    ],
+    [
+      "remove the person",
+      "DELETE",
+      async () => fireEvent.click(screen.getByRole("button", { name: "Remove friend@example.test" })),
+    ],
+  ] as const)("%s: the late answer says nothing and reads nothing again", async (_name, method, start) => {
+    const answer = deferred<Response>();
+    const { calls } = await openView("/shared-by-me", {
+      "GET /api/shares/mine": [{ node: { id: FOLDER_ID, name: "Holiday", kind: "folder" }, shares: [share] }],
+      [`${method} /api/shares/${share.id}`]: () => answer.promise,
+    });
+    await screen.findByRole("heading", { name: "Holiday" });
+    const readsBefore = requests(calls, "GET", "/api/shares/mine").length;
+    await act(async () => {
+      await start();
+    });
+    await waitFor(() => expect(calls.some((call) => call.method === method)).toBe(true));
+    await act(() => purgeUserState({ keepSession: true }));
+    const toastsBefore = getToasts().length;
+    await act(async () =>
+      answer.resolve(
+        method === "DELETE" ? new Response(null, { status: 204 }) : json({ ...share, role: "editor" }),
+      ),
+    );
+    expect(getToasts().length).toBe(toastsBefore);
+    // The purge itself may make the page read its list again for the account now signed in;
+    // the late answer adds no read of its own.
+    const readsAfter = requests(calls, "GET", "/api/shares/mine").length;
+    await act(async () => {});
+    expect(requests(calls, "GET", "/api/shares/mine").length).toBe(readsAfter);
+    expect(readsAfter).toBeGreaterThanOrEqual(readsBefore);
+  });
+});
+
 describe("Shared with me", () => {
   it("lists what is shared with the caller, with the owner's name; a folder opens in the explorer", async () => {
     const node = {

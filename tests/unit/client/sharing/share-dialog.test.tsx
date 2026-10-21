@@ -216,7 +216,10 @@ describe("ShareDialog", () => {
 
 describe("ShareDialog — an account change while a change is in flight", () => {
   type Start = (dialog: HTMLElement) => void | Promise<void>;
-  const cases: Array<[string, string, Start]> = [
+  const pausedOwn = sharing({
+    links: [link({ state: "paused", pausedReasons: ["owner"], canUnpause: true })],
+  });
+  const cases: Array<[string, string, Start, NodeSharingDto?]> = [
     [
       "share with a person",
       "POST",
@@ -228,6 +231,19 @@ describe("ShareDialog — an account change while a change is in flight", () => 
       },
     ],
     [
+      "change a person's role",
+      "PATCH",
+      async (dialog) => {
+        fireEvent.mouseDown(dialog.querySelector("[data-share-person] [role='combobox']")!);
+        fireEvent.click(await screen.findByRole("option", { name: "Can view" }));
+      },
+    ],
+    [
+      "turn a person's uploads off",
+      "PATCH",
+      (dialog) => fireEvent.click(within(dialog).getByLabelText("Can add files")),
+    ],
+    [
       "remove a person",
       "DELETE",
       (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Remove friend@example.test" })),
@@ -236,6 +252,22 @@ describe("ShareDialog — an account change while a change is in flight", () => 
       "pause a link",
       "PATCH",
       (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Pause" })),
+    ],
+    [
+      "resume a link",
+      "PATCH",
+      (dialog) => fireEvent.click(within(dialog).getByRole("button", { name: "Resume" })),
+      pausedOwn,
+    ],
+    [
+      "save a link setting",
+      "PATCH",
+      async (dialog) => {
+        fireEvent.click(dialog.querySelector("[data-link-segment='password']")!);
+        const editor = await screen.findByRole("presentation");
+        fireEvent.change(within(editor).getByLabelText("Password"), { target: { value: "made-up new one" } });
+        fireEvent.click(within(editor).getByRole("button", { name: "Save" }));
+      },
     ],
     [
       "create a link",
@@ -255,13 +287,16 @@ describe("ShareDialog — an account change while a change is in flight", () => 
 
   it.each(cases)(
     "%s: the dialog closes with the account, and the late answer writes nothing",
-    async (_name, method, start) => {
+    async (_name, method, start, data) => {
       const answer = deferred<Response>();
       const writeText = vi.fn(async () => {});
       Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-      const { dialog, calls, onClose } = await open((call) =>
-        call.method === method ? answer.promise : undefined,
-      );
+      let sentTo = "";
+      const { dialog, calls, onClose } = await open((call) => {
+        if (call.method !== method) return undefined;
+        sentTo = call.path;
+        return answer.promise;
+      }, data ?? sharing());
       const readsBefore = sharingReads(calls);
       await act(async () => {
         await start(dialog);
@@ -270,18 +305,13 @@ describe("ShareDialog — an account change while a change is in flight", () => 
       await act(() => purgeUserState({ keepSession: true }));
       expect(onClose).toHaveBeenCalled();
       const toastsBefore = getToasts().length;
+      // The answer the API would have given, for the path that was asked.
+      const body = sentTo.startsWith("/api/shares/") || sentTo.endsWith("/shares") ? SHARE : link();
       await act(async () => {
         answer.resolve(
           method === "DELETE"
             ? new Response(null, { status: 204 })
-            : json(
-                method === "PATCH"
-                  ? link({ state: "paused", pausedReasons: ["owner"], canUnpause: true })
-                  : method === "POST" && _name === "create a link"
-                    ? link()
-                    : SHARE,
-                method === "POST" ? 201 : 200,
-              ),
+            : json(body, method === "POST" ? 201 : 200),
         );
       });
       // Nothing for the previous account: no toast, no list read again on its behalf.
