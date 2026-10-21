@@ -54,6 +54,7 @@ import {
   getPrefs,
   getProfile,
   ownSessions,
+  purgeRequestedBytes,
   recentActivity,
   updatePrefs,
   updateProfile,
@@ -275,7 +276,7 @@ router.get("/account/export", async (c) => {
   const at = now(c);
   // EVERY read happens here, before the answer: the pool closes once the request's deferred work
   // is drained, which a long download could outlast.
-  const [account, prefs, nodeRows, given, received, links, activity] = await Promise.all([
+  const [account, prefs, nodeRows, given, received, links, activity, asked] = await Promise.all([
     exportUser(handle, user.id),
     getPrefs(handle, user.id),
     exportNodes(handle, user.id),
@@ -283,6 +284,7 @@ router.get("/account/export", async (c) => {
     sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
     exportLinks(handle, user.id),
     recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
+    purgeRequestedBytes(handle, user.id),
   ]);
   if (!account) throw new AppError("not_found");
   const owners = await displayNames(
@@ -303,7 +305,8 @@ router.get("/account/export", async (c) => {
       timezone: account.timezone,
       locale: account.locale,
       quotaBytes: account.quotaBytes,
-      usedBytes: account.usedBytes,
+      // Without what a hold keeps of roots deleted for good (see `purgeRequestedBytes`).
+      usedBytes: Math.max(0, account.usedBytes - asked),
       termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
       termsVersion: account.termsVersion,
     },

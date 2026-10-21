@@ -215,7 +215,9 @@ describe("a held account", () => {
     const kept = await makeFile(who.id, null, { name: "kept.txt", scanStatus: "clean", size: 100 });
     const doomed = await makeFile(who.id, null, { name: "doomed.txt", scanStatus: "clean", size: 100 });
     const folder = await makeFolder(who.id, null, { name: "folder" });
-    await makeFile(who.id, folder.id, { name: "in-folder.txt", scanStatus: "clean" });
+    await makeFile(who.id, folder.id, { name: "in-folder.txt", scanStatus: "clean", size: 100 });
+    // The counter as uploads would have left it: the three files.
+    await testDb().update(user).set({ usedBytes: 300 }).where(eq(user.id, who.id));
     expect((await api(who.as, "POST", `/nodes/${doomed.id}/trash`)).status).toBe(200);
     expect((await api(who.as, "POST", `/nodes/${folder.id}/trash`)).status).toBe(200);
     expect((await api(who.as, "DELETE", `/nodes/${doomed.id}`)).status).toBe(204);
@@ -226,7 +228,7 @@ describe("a held account", () => {
   /** Everything but what differs by construction: ids, the address, the instants — and usedBytes (see below). */
   function shape(manifest: Manifest) {
     return {
-      user: { ...manifest.user, id: "", email: "", createdAt: "", usedBytes: 0 },
+      user: { ...manifest.user, id: "", email: "", createdAt: "" },
       prefs: manifest.prefs,
       nodes: manifest.nodes
         .map((node) => [node.name, node.kind, node.deletedAt !== null, node.scanStatus])
@@ -249,7 +251,9 @@ describe("a held account", () => {
     const b = ExportManifest.parse((await exportOf(free.who)).body);
     expect(a.nodes.map((node) => node.name)).toEqual(["kept.txt"]);
     expect(shape(a)).toEqual(shape(b));
-    // `usedBytes` is the stored counter, as GET /api/account/usage answers it: held bytes keep
-    // counting there (T14: "the meter moved by the un-held file only"). Not this route's to mask.
+    // `usedBytes` included: the stored counter still holds the held root's bytes (T14: "the meter
+    // moved by the un-held file only"); the export answers it without them.
+    expect(a.user.usedBytes).toBe(b.user.usedBytes);
+    expect(a.user.usedBytes).toBe(100);
   });
 });

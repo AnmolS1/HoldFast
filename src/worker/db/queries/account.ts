@@ -289,6 +289,29 @@ export async function exportUser(db: Executor, userId: string): Promise<ExportUs
   return row ?? null;
 }
 
+/**
+ * The bytes `used_bytes` still counts for roots whose permanent deletion was asked for and that a
+ * hold kept: the files of those subtrees and their kept old versions — exactly what the purge
+ * would have given back (trash.ts `DeletedRows.freedBytes`; an unheld root is purged at once by
+ * the request, so for it this is 0). The export answers `usedBytes` without them: to its owner
+ * such a root is deleted, and a figure that still counted it would tell a held account apart.
+ */
+export async function purgeRequestedBytes(db: Executor, userId: string): Promise<number> {
+  const result = await db.execute<{ bytes: string }>(sql`
+    WITH RECURSIVE asked(id) AS (
+      SELECT n.id FROM nodes n
+      WHERE n.owner_id = ${userId} AND n.purge_requested_at IS NOT NULL
+      UNION
+      SELECT c.id FROM nodes c JOIN asked ON c.parent_id = asked.id
+    )
+    SELECT (
+      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
+       WHERE n.kind = 'file' AND n.system IS NULL)
+      + (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)
+    )::bigint AS bytes`);
+  return Number(result.rows[0]?.bytes ?? 0);
+}
+
 /** The export's node set, as a predicate over `nodes` (see the header). */
 function exportable(userId: string) {
   return and(eq(nodes.ownerId, userId), isNull(nodes.system), notHiddenRow(), notPurgeRequested());
