@@ -236,14 +236,15 @@ describe("the registry", () => {
     const job = jobContext();
     await expect(runJob("no-such-job", job.bg)).rejects.toThrow("unknown job");
     await expect(runJob("purge; drop", job.bg)).rejects.toThrow("unknown job");
-    // A placeholder returns nothing: that is done.
-    expect(await runJob("abuse-hourly", job.bg)).toEqual({ done: true });
     // A job stopped at its deadline says that more is left.
     expect(await runJob("retention", job.bg, { softDeadlineMs: 0 })).toEqual({ done: false });
     const ran = watch(true);
+    // A job that returns nothing is done. (Stubbed: abuse-hourly was a placeholder when this was
+    // written and is a real, table-wide job since T22 — run for real it outlived the test on CI.)
+    expect(await runJob("abuse-hourly", job.bg)).toEqual({ done: true });
     await runJob("reconcile", job.bg);
     await runJob("purge", job.bg, { softDeadlineMs: 5 });
-    expect(ran).toEqual(["reconcile", "purge"]);
+    expect(ran).toEqual(["abuse-hourly", "reconcile", "purge"]);
     const reconcile = vi.mocked(jobs.find((entry) => entry.name === "reconcile")!.run).mock.calls[0]!;
     expect(reconcile[2].cron).toBe("0 2 * * *");
     expect(reconcile[3]).toEqual({ softDeadlineMs: 120_000 });

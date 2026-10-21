@@ -3,10 +3,11 @@
 // file and keeps the props. Cross-feature imports go only through `features/<name>/index.ts`.
 import type { MimeCategory, ScanStatus } from "./types";
 
-/** `linkToken` is the proof of access on public pages. */
+/** `linkToken` is the proof of access on public pages; `linkSession`, a password link's unlock. */
 export interface ReportTarget {
   nodeId: string;
   linkToken?: string;
+  linkSession?: string;
 }
 
 export interface ReportLinkProps {

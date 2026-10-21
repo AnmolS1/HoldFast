@@ -631,7 +631,7 @@ export function PublicLinkPage() {
       <Box component="footer" sx={{ display: "grid", justifyItems: "center", gap: 1, py: 2 }}>
         {/* A report is about a FILE: a folder link's files are reported from their preview. */}
         {node && !locked && node.kind === "file" ? (
-          <ReportLink target={{ nodeId: node.id, linkToken: token }} />
+          <ReportLink target={client.reportTarget(node.id)} />
         ) : null}
         <LegalFooter />
       </Box>
