@@ -96,6 +96,7 @@ const publicNode = {
   size: 10,
   mimeCategory: "image",
   ext: "png",
+  mimeSniffed: "image/png",
   thumb: true,
 };
 const prefs = {

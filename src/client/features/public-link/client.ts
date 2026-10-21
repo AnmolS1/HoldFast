@@ -197,6 +197,7 @@ export class LinkClient {
           size: node.size,
           mimeCategory: node.mimeCategory,
           ext: node.ext,
+          mimeSniffed: node.mimeSniffed,
           thumb: node.thumb,
         };
       },

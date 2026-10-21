@@ -239,6 +239,7 @@ function publicNode(node: Node, link: ShareLink): PublicNodeDto {
     size: node.size,
     mimeCategory: file ? categoryOf(node.mimeSniffed, node.ext) : "other",
     ext: node.ext,
+    mimeSniffed: node.mimeSniffed,
     thumb: file && link.allowPreview && thumbEligible(node),
   };
 }

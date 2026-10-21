@@ -222,6 +222,24 @@ describe("the preview's source while locked", () => {
   });
 });
 
+describe("the preview", () => {
+  it("a public PNG previews in the image viewer (the detected type travels with the node)", async () => {
+    await preloadRenderers();
+    const png = publicFile({ name: "p.png", mimeCategory: "image", ext: "png", mimeSniffed: "image/png" });
+    await openPublic({
+      [`GET ${publicPath()}`]: info(png),
+      [`POST ${publicPath("/download-url")}`]: json(minted("i")),
+    });
+    await screen.findByRole("heading", { name: "p.png" });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() =>
+      expect(document.querySelector("[data-preview-renderer]")?.getAttribute("data-preview-renderer")).toBe(
+        "image",
+      ),
+    );
+  });
+});
+
 describe("downloads", () => {
   it("a dangerous type: the interstitial first (T22's stub passes through), and the one mint carries dangerousAck", async () => {
     const { calls } = await openPublic({
@@ -328,12 +346,12 @@ describe("a folder", () => {
   it("five simulated minutes with a preview open and a zip in progress: no polling, one window of mints, no retry storm", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     await preloadRenderers();
-    // A code file: the text viewer needs no detected type (PublicNodeDto carries none — see the report).
     const image = publicFile({
       id: "0199d3c2-7a10-7000-8000-0000000000b1",
-      name: "main.ts",
-      mimeCategory: "code",
-      ext: "ts",
+      name: "p.png",
+      mimeCategory: "image",
+      ext: "png",
+      mimeSniffed: "image/png",
     });
     const many = Array.from({ length: 70 }, (_, i) =>
       publicFile({ id: `0199d3c2-7a10-7000-8000-${String(i).padStart(12, "0")}`, name: `f${i}.txt` }),
@@ -354,14 +372,13 @@ describe("a folder", () => {
       },
       [`POST ${publicPath("/download-url")}`]: (call) =>
         json(minted("d", (call.body as { nodeId: string }).nodeId)),
-      "GET /i/0199d3c2-7a10-7000-8000-0000000000b1/made-up-token": () => new Response("const a = 1;\n"),
       // The files host never answers the first file: the zip is in progress for the whole time.
       [`GET /d/${many[0]!.id}/made-up-token`]: () => new Promise<Response>(() => {}),
     });
-    await screen.findByRole("button", { name: "Preview main.ts" });
+    await screen.findByRole("button", { name: "Preview p.png" });
     // The zip first: the preview is a modal dialog, and the page under it is hidden from then on.
     fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
-    fireEvent.click(screen.getByRole("button", { name: "Preview main.ts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview p.png" }));
     await act(async () => {
       await vi.advanceTimersByTimeAsync(300_000);
     });
@@ -375,9 +392,10 @@ describe("a folder", () => {
     // One window (ZIP_URL_BATCH = 50) minted, the next not before the first file arrived.
     expect(zipMints).toHaveLength(50);
     // The preview's URL is minted once and not refreshed within five minutes (80 % of 15 min).
-    // At most the one URL of the open preview: its proactive refresh is due only at 80 % of 15 min.
-    // (Until PublicNodeDto carries the detected type, the viewer picks no renderer and mints none.)
-    expect(previewMints.length).toBeLessThanOrEqual(1);
+    // The one URL of the open preview: its proactive refresh is due only at 80 % of 15 min.
+    expect(previewMints.map((call) => call.body)).toEqual([
+      { nodeId: "0199d3c2-7a10-7000-8000-0000000000b1", kind: "inline" },
+    ]);
     expect(seen.length).toBeLessThanOrEqual(3 + 50 + 2);
     void FOLDER_ID;
   });

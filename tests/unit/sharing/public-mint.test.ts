@@ -91,6 +91,29 @@ describe("pwv on everything minted", () => {
   });
 });
 
+describe("the public node", () => {
+  it("carries the detected type the owner's NodeDto carries — the preview picks its viewer by it", async () => {
+    const owner = await member();
+    const file = await imageFile(owner);
+    const folder = await makeFolder(owner.id);
+    await makeFile(owner.id, folder.id, {
+      scanStatus: "clean",
+      name: "notes.txt",
+      mimeSniffed: "text/plain",
+    });
+    const onFile = await linkTo(owner, file.id);
+    const onFolder = await linkTo(owner, folder.id);
+    const node = ((await visit(onFile.token)).body as { node: Record<string, unknown> }).node;
+    const asOwner = (
+      (await api(asCaller(owner), `/nodes/${file.id}`)).body as { node: Record<string, unknown> }
+    ).node;
+    expect(node.mimeSniffed).toBe("image/png");
+    expect(node.mimeSniffed).toBe(asOwner.mimeSniffed);
+    const listing = (await visit(onFolder.token, "/children")).body as { items: Record<string, unknown>[] };
+    expect(listing.items.map((item) => item.mimeSniffed)).toEqual(["text/plain"]);
+  });
+});
+
 describe("counting at mint", () => {
   it("download mints count; inline and thumb do not; at CEIL_LINK_DOWNLOADS_DAY the mint is 429, nothing paused, one mail; 429 again (never 423); the next day mints with nothing lifted", async () => {
     const owner = await member();

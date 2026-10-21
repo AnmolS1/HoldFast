@@ -23,6 +23,7 @@ export function publicFile(overrides: Partial<PublicNodeDto> = {}): PublicNodeDt
     size: 1234,
     mimeCategory: "document",
     ext: "txt",
+    mimeSniffed: "text/plain",
     thumb: false,
     ...overrides,
   };

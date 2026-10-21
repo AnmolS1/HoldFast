@@ -149,6 +149,8 @@ export const PublicNodeDto = z.object({
   size: Bytes,
   mimeCategory: MimeCategory,
   ext: z.string(),
+  /** The detected type — what the preview picks its viewer by (the owner's `NodeDto` carries the same). */
+  mimeSniffed: z.string().nullable(),
   thumb: z.boolean(),
 });
 export type PublicNodeDto = z.infer<typeof PublicNodeDto>;
