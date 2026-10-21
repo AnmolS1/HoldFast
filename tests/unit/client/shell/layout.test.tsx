@@ -126,7 +126,7 @@ describe("desktop frame", () => {
     expect(JSON.parse(localStorage.getItem("hf.prefs.v1")!).viewMode).toBe("grid");
   });
 
-  it("New: 'New folder' is disabled until the explorer registers it; menu items show their shortcuts", async () => {
+  it("New: 'New folder' is disabled where the folder did not load (the explorer registers it disabled); menu items show their shortcuts", async () => {
     await openAt(1280);
     fireEvent.click(screen.getByRole("button", { name: "New" }));
     const menu = await screen.findByRole("menu");
