@@ -837,7 +837,12 @@ test.describe("uploads (mocked API)", () => {
       await filesInput(page).setInputFiles(files.png);
       await expect.poll(() => api.completes.length).toBe(1);
     } finally {
-      await new Promise((resolve) => server.close(resolve));
+      // close() alone waits for every connection with a request still arriving, and the browser
+      // may hold one open for as long as it likes (run 38559838447: all five parts answered, then
+      // 26 s in close() until the test timed out). Everything this test asserts on is in `seen`.
+      const closed = new Promise((resolve) => server.close(resolve));
+      server.closeAllConnections();
+      await closed;
     }
     const size = statSync(files.png).size;
     const partCount = Math.ceil(size / (512 * 1024));
