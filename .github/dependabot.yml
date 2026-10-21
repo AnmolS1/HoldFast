@@ -12,3 +12,17 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "scanner image"
+  # The app's dependencies (T26). Weekly; a PR per update, reviewed like any other change.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"
+  # Every workflow action is pinned by commit SHA: this keeps the pins moving.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
