@@ -18,7 +18,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run -c vitest.config.ts && vitest run -c vitest.workers.config.ts && HOLDFAST_TABLEWIDE=1 vitest run -c vitest.workers.config.ts --passWithNoTests",
+    "test": "bash scripts/run-unit.sh",
     "e2e": "playwright test",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",

@@ -121,6 +121,23 @@ jobs:
       - name: Unit tests
         run: npm test
 
+      # The 2,000,000,000-byte tests skip themselves unless HOLDFAST_CAP_TESTS=1, so `npm test` never
+      # runs them. Here they run, and the step fails unless all five RAN and passed: a skip that
+      # comes back (the gate, the file selection) would otherwise read green for ever.
+      - name: Cap tests (2 GB) ran and passed
+        env:
+          HOLDFAST_CAP_TESTS: "1"
+        run: |
+          npx vitest run -c vitest.workers.config.ts \
+            tests/unit/uploads/cap.cap.test.ts tests/unit/files-host/cap.cap.test.ts \
+            --reporter=default --reporter=json --outputFile.json=cap-results.json
+          node -e '
+            const r = require("./cap-results.json");
+            const expected = 5;
+            console.log(`cap tests: ${r.numPassedTests} passed, ${r.numPendingTests} skipped, ${r.numFailedTests} failed of ${r.numTotalTests}`);
+            if (r.numTotalTests !== expected || r.numPassedTests !== expected) process.exit(1);
+          '
+
       - name: Build
         run: npm run build
 
