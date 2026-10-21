@@ -3,7 +3,10 @@
 //
 // A literal snapshot taken locally can never equal production's: the CSP nonce changes on every
 // response, and the origins come from the environment. So, in every value:
-//   'nonce-…'         → 'nonce-<NONCE>'
+//   'nonce-…'         → 'nonce-<NONCE>', only for a WELL-FORMED nonce (16 bytes of base64: 22
+//                       characters and "=="; not a constant such as sixteen zero bytes), and only
+//                       when every nonce of that value is the same one. Anything else stays
+//                       literal, so a broken nonce in production fails the comparison (T30).
 //   the files origin  → <FILES_ORIGIN>
 //   the Sentry origin → <SENTRY_ORIGIN>
 //   the app origin    → <APP_ORIGIN>   (the files host's Access-Control-Allow-Origin)
@@ -15,6 +18,22 @@ const PER_RESPONSE = new Set(["date", "cf-ray", "cf-cache-status", "x-mf-additio
 const VALIDATORS = new Set(["etag", "last-modified"]);
 
 const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const WELL_FORMED = /^[A-Za-z0-9+/]{22}==$/;
+/** Fewer different characters than this in 22 is not a random value (sixteen equal bytes, …). */
+const MIN_DISTINCT = 8;
+
+/** The value with its nonce as the token — or as it is, when the nonce is not a sound one. */
+function normaliseNonces(value) {
+  const nonces = [...value.matchAll(/'nonce-([^']*)'/g)].map((match) => match[1]);
+  if (nonces.length === 0) return value;
+  const [first] = nonces;
+  const sound =
+    nonces.every((nonce) => nonce === first) &&
+    WELL_FORMED.test(first) &&
+    new Set(first.slice(0, 22)).size >= MIN_DISTINCT;
+  return sound ? value.replaceAll(`'nonce-${first}'`, "'nonce-<NONCE>'") : value;
+}
 
 /**
  * @param {Headers | Record<string, string> | Iterable<[string, string]>} headers
@@ -46,7 +65,7 @@ export function normaliseHeaders(headers, origins = {}) {
       out[name] = "<validator>";
       continue;
     }
-    let value = String(rawValue).replace(/'nonce-[^']*'/g, "'nonce-<NONCE>'");
+    let value = normaliseNonces(String(rawValue));
     for (const [pattern, token] of tokens) value = value.replace(pattern, token);
     out[name] = value;
   }

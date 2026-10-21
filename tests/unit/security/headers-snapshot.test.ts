@@ -108,11 +108,12 @@ describe("the header snapshot of both hosts", () => {
     expect(app["GET /assets/index-x.js"].headers).not.toHaveProperty("reporting-endpoints");
   });
 
-  it("the normaliser replaces whole origins only, and every nonce", () => {
+  it("the normaliser replaces whole origins only, and a well-formed nonce used throughout the header", () => {
+    const N = "q7Lm2Xc9Rt4Bv8Np1Kd6Wg==";
     expect(
       normaliseHeaders(
         {
-          "Content-Security-Policy": "script-src 'nonce-abc+/=' x; style-src 'nonce-def'",
+          "Content-Security-Policy": `script-src 'nonce-${N}' x; style-src 'nonce-${N}'`,
           "Access-Control-Allow-Origin": "http://localhost",
           Link: "http://localhost:5190/x http://files.localhost/y",
           ETag: '"1"',
@@ -126,5 +127,21 @@ describe("the header snapshot of both hosts", () => {
       etag: "<validator>",
       link: "http://localhost:5190/x <FILES_ORIGIN>/y",
     });
+  });
+
+  it("a broken nonce stays LITERAL, so a comparison against the baseline fails (Addendum 3 F7)", () => {
+    const policy = (script: string, style: string) =>
+      `script-src 'nonce-${script}'; style-src 'nonce-${style}'`;
+    const csp = (value: string) =>
+      normaliseHeaders({ "content-security-policy": value })["content-security-policy"];
+    for (const value of [
+      policy("", ""), // empty
+      policy("abc", "abc"), // too short
+      policy("q7Lm2Xc9Rt4Bv8Np1Kd6Wg", "q7Lm2Xc9Rt4Bv8Np1Kd6Wg"), // 22 characters but no padding: not 16 bytes
+      policy("AAAAAAAAAAAAAAAAAAAAAA==", "AAAAAAAAAAAAAAAAAAAAAA=="), // a constant: sixteen zero bytes
+      policy("q7Lm2Xc9Rt4Bv8Np1Kd6Wg==", "z3Hn8Yb2Pq5Fs1Jm7Tc4Vk=="), // two nonces in one header
+    ]) {
+      expect(csp(value), value).toBe(value);
+    }
   });
 });
