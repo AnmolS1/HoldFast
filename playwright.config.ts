@@ -14,6 +14,7 @@
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, devices } from "@playwright/test";
+import { ROUTE_COVERAGE, startHitFile } from "./tests/e2e/fixtures/route-hits";
 import { preflight } from "./tests/setup/e2e-preflight";
 import {
   appOrigin,
@@ -47,6 +48,8 @@ function workersCap(): { workers?: number } {
 if (process.env.HOLDFAST_E2E_PREFLIGHT !== String(port)) {
   preflight(root, port);
   process.env.HOLDFAST_E2E_PREFLIGHT = String(port);
+  // Route coverage: this run's hits replace the last run's (tests/e2e/fixtures/route-hits.ts).
+  if (ROUTE_COVERAGE) startHitFile();
 }
 
 export default defineConfig({

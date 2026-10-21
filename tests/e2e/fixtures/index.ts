@@ -7,6 +7,7 @@
 // SPA is `mockShell` (./mock-shell.ts); which of the two a spec uses is `REAL` (./mode.ts).
 import { test as base } from "@playwright/test";
 import { appOrigin, e2ePort, filesOrigin } from "../../setup/local-env";
+import { ROUTE_COVERAGE, watchContext, watchRequests } from "./route-hits";
 import { addVirtualAuthenticator, type VirtualAuthenticator } from "./webauthn";
 
 export interface HarnessFixtures {
@@ -27,8 +28,21 @@ export interface HarnessFixtures {
   clientIp: string;
 }
 
+export interface HarnessWorkerFixtures {
+  /**
+   * Route coverage (./route-hits.ts): with HOLDFAST_ROUTE_COVERAGE=1, every answer the Worker gives
+   * a test of this worker is recorded. Automatic; unset, it does nothing at all.
+   */
+  routeHits: void;
+}
+
 /** See the `page` fixture below. */
 export const MAX_APP_LOADS_PER_TEST = 4;
+
+function coverageOrigins(): { app: string; files: string } {
+  const port = e2ePort();
+  return { app: appOrigin(port), files: filesOrigin(port) };
+}
 
 /** A stable private address per test and attempt: 10.x.y.z from a hash of the test's id. */
 function addressFor(seed: string): string {
@@ -41,7 +55,7 @@ function addressFor(seed: string): string {
   return `10.${(bytes >>> 16) & 255}.${(bytes >>> 8) & 255}.${bytes & 255}`;
 }
 
-export const test = base.extend<HarnessFixtures>({
+export const test = base.extend<HarnessFixtures, HarnessWorkerFixtures>({
   // Every test is held to a few loads of the app document: each is cold (see ./navigate.ts) and
   // costs 2.3–3.3 s on a CI runner, so more than this many put a test near its 30 s on a slow
   // machine. Plain-text answers (a 404 of the files host) are not counted.
@@ -87,6 +101,50 @@ export const test = base.extend<HarnessFixtures>({
       await use(ip);
     },
     { auto: false },
+  ],
+  // Route coverage (./route-hits.ts). Each only watches, and only with HOLDFAST_ROUTE_COVERAGE=1.
+  context: async ({ context }, use) => {
+    if (ROUTE_COVERAGE) {
+      watchContext(context, coverageOrigins());
+      watchRequests(context.request, coverageOrigins());
+    }
+    await use(context);
+  },
+  request: async ({ request }, use) => {
+    if (ROUTE_COVERAGE) watchRequests(request, coverageOrigins());
+    await use(request);
+  },
+  browser: [
+    async ({ browser }, use) => {
+      if (ROUTE_COVERAGE) {
+        // Contexts a test makes for itself (a second user, a signed-out visitor).
+        const newContext = browser.newContext.bind(browser);
+        browser.newContext = async (...args) => {
+          const context = await newContext(...args);
+          watchContext(context, coverageOrigins());
+          watchRequests(context.request, coverageOrigins());
+          return context;
+        };
+      }
+      await use(browser);
+    },
+    { scope: "worker" },
+  ],
+  routeHits: [
+    async ({ playwright }, use) => {
+      if (ROUTE_COVERAGE) {
+        // API contexts a test makes for itself (`playwright.request.newContext()`).
+        const factory = playwright.request;
+        const newContext = factory.newContext.bind(factory);
+        factory.newContext = async (...args) => {
+          const api = await newContext(...args);
+          watchRequests(api, coverageOrigins());
+          return api;
+        };
+      }
+      await use();
+    },
+    { scope: "worker", auto: true },
   ],
   // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring pattern.
   origins: async ({}, use) => {
