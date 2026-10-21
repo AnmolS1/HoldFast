@@ -112,11 +112,12 @@ router.get("/shared-with-me", async (c) => {
 router.get(`/nodes/${ID}/sharing`, async (c) => {
   requireVerified(c);
   const id = c.req.param("id");
-  const node = await sharedNode(c, id, "editor");
+  const { node, access } = await sharedNode(c, id, "editor");
   const [shares, links, inheritedFrom] = [
     await sharesOnNode(db(c), node.id),
     await linksOnNode(db(c), node.id),
-    await nearestSharedAncestor(db(c), node.id),
+    // Never above where the caller's view of the tree starts (the owner: the whole chain).
+    await nearestSharedAncestor(db(c), node.id, access.viewRootId),
   ];
   return c.json({
     shares: shares.map(shareDto),
@@ -129,7 +130,7 @@ router.post(`/nodes/${ID}/shares`, async (c) => {
   const user = requireVerified(c);
   const id = c.req.param("id");
   const body = parse(CreateShareBody, await jsonBody(c));
-  const node = await sharedNode(c, id, "owner");
+  const { node } = await sharedNode(c, id, "owner");
   scanGate(node);
   if (body.email.toLowerCase() === user.email.toLowerCase()) {
     throw new AppError("validation", "You cannot share with yourself.", { reason: "self_share" });

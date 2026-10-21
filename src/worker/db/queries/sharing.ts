@@ -134,17 +134,25 @@ export async function deleteShare(db: Executor, shareId: string): Promise<boolea
 /**
  * The nearest folder ABOVE the node (the node itself not included) that has a share to anyone,
  * pending or active: whose shares also reach this node. Null when none has.
+ *
+ * `within`: the outermost node the caller may see (`Access.viewRootId`) — the walk goes up to it
+ * and NO FURTHER, so a folder above a share partner's view is never named to them. Null: the
+ * owner, who sees the whole chain.
  */
 export async function nearestSharedAncestor(
   db: Executor,
   nodeId: string,
+  within: string | null,
 ): Promise<{ nodeId: string; name: string } | null> {
-  if (!isUuid(nodeId)) return null;
+  if (!isUuid(nodeId) || (within !== null && !isUuid(within))) return null;
+  // The walk does not climb from the boundary row: nothing above it is read.
+  const stop = within === null ? sql`true` : sql`up.id <> ${within}`;
   const result = await db.execute<{ id: string; name: string }>(sql`
     WITH RECURSIVE up(id, parent_id, name, depth) AS (
       SELECT n.id, n.parent_id, n.name, 0 FROM nodes n WHERE n.id = ${nodeId}
       UNION ALL
       SELECT p.id, p.parent_id, p.name, up.depth + 1 FROM nodes p JOIN up ON p.id = up.parent_id
+      WHERE ${stop}
     ) CYCLE id SET is_cycle USING path
     SELECT up.id, up.name FROM up
     WHERE up.depth > 0 AND NOT up.is_cycle AND EXISTS (SELECT 1 FROM shares s WHERE s.node_id = up.id)

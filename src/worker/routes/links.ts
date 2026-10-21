@@ -59,7 +59,7 @@ import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { hashLinkPassword } from "../services/link-password";
 import { metric } from "../services/metrics";
-import { requireRole } from "../services/permissions";
+import { requireRole, type Access } from "../services/permissions";
 import { db, deps, keys, settings, type AppEnv } from "../services/request-context";
 import {
   hashLinkToken,
@@ -97,11 +97,15 @@ export function parse<T>(schema: z.ZodType<T>, input: unknown): T {
  * node is no node of this API. Whether it is there for them is `requireRole`'s answer alone —
  * hidden, unknown and not theirs are one `404`.
  */
-export async function sharedNode(c: Ctx, nodeId: string, min: "editor" | "owner"): Promise<Node> {
-  await requireRole(c, nodeId, min, { notTrashed: true });
+export async function sharedNode(
+  c: Ctx,
+  nodeId: string,
+  min: "editor" | "owner",
+): Promise<{ node: Node; access: Access }> {
+  const access = await requireRole(c, nodeId, min, { notTrashed: true });
   const node = await getNode(db(c), nodeId);
   if (!node || node.system !== null) throw new AppError("not_found");
-  return node;
+  return { node, access };
 }
 
 /** A file is shared, or linked, only once the scanner has passed it (the matrix's session codes). */
@@ -219,7 +223,7 @@ router.get("/links/mine", async (c) => {
 router.post(`/nodes/${ID}/links`, requireSwitch("linksEnabled"), async (c) => {
   const user = requireVerified(c);
   const body = parse(CreateLinkBody, await jsonBody(c));
-  const node = await sharedNode(c, c.req.param("id"), "owner");
+  const { node } = await sharedNode(c, c.req.param("id"), "owner");
   scanGate(node);
   const expiresAt = futureExpiry(c, body.expiresAt) ?? null;
 

@@ -329,6 +329,36 @@ describe("GET /nodes/:id/sharing", () => {
   });
 });
 
+describe("GET /nodes/:id/sharing — what an editor is told about the folders above", () => {
+  it("a shared folder ABOVE the editor's view is never named; one inside the view is", async () => {
+    const owner = await member();
+    const editor = await member();
+    const other = await member();
+    const outer = await makeFolder(owner.id, null, { name: "Outer, not theirs" });
+    const view = await makeFolder(owner.id, outer.id, { name: "Their view" });
+    const leaf = await makeFolder(owner.id, view.id);
+    // Someone else's share on the folder above the editor's share root.
+    await makeShare(outer.id, owner.id, other.id, { role: "viewer" });
+    await makeShare(view.id, owner.id, editor.id, { role: "editor" });
+
+    const atRoot = await api(asCaller(editor), `/nodes/${view.id}/sharing`);
+    expect(atRoot.status).toBe(200);
+    expect((atRoot.body as { inheritedFrom: unknown }).inheritedFrom).toBeNull();
+    expect(JSON.stringify(atRoot.body)).not.toContain(outer.id);
+    const below = await api(asCaller(editor), `/nodes/${leaf.id}/sharing`);
+    expect((below.body as { inheritedFrom: unknown }).inheritedFrom).toEqual({
+      nodeId: view.id,
+      name: "Their view",
+    });
+    // The owner is told about the outer folder.
+    const asOwner = await api(asCaller(owner), `/nodes/${view.id}/sharing`);
+    expect((asOwner.body as { inheritedFrom: unknown }).inheritedFrom).toEqual({
+      nodeId: outer.id,
+      name: "Outer, not theirs",
+    });
+  });
+});
+
 describe("GET /shared-with-me", () => {
   type Item = {
     node: { id: string; parentId: string | null };
