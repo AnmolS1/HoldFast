@@ -104,14 +104,14 @@ describe("an owed node behind a malware-listed declaration", () => {
     });
   });
 
-  it("(a) alone — a session owed before (b), its hash still the malware-listed declaration (multipart): the owed row keeps it from the stale job; the object and its upload are kept; the sweep locks it", async () => {
+  it("(a) alone — a session owed before (b), its hash still the client's UNLISTED declaration (multipart): the owed row keeps it from the stale job; the object and its upload are kept; the sweep locks it", async () => {
     await rolledBack(async (db) => {
       const owner = await member();
       const bytes = uniqueBytes(500);
       const storedSha = await sha256Of(bytes);
       await blocklist.upsert(db, { sha256: storedSha, reason: "csam" });
+      // Not listed at all (an avatar's shape, or an entry removed since): only the owed row says so.
       const declaredSha = rand(32);
-      await blocklist.upsert(db, { sha256: declaredSha, reason: "malware" });
       const nodeId = uuidv7();
       const versionId = uuidv7();
       const name = `owed-${rand()}.bin`;

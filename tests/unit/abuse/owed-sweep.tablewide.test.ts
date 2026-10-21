@@ -515,6 +515,26 @@ describe("the declared hash is never acted on: the server's decides", () => {
   });
 });
 
+describe("the stuck alert's severity (Addendum 4)", () => {
+  afterEach(() => {
+    owedHooks.afterLookup = null;
+  });
+
+  it("a stuck session with no csam in play (malware-declared, no owed row) gets ONE ROUTINE operator alert, no critical one", async () => {
+    await rolledBack(async (db) => {
+      const ops = operators();
+      const stuck = await owed(db, { stored: "malware" });
+      owedHooks.afterLookup = async (session) => {
+        if (session.id === stuck.session.id) throw new Error("test: this session fails every time");
+      };
+      for (let i = 0; i < OWED_ATTEMPTS_PER_DAY; i++) await sweepOnce(db, ops.env);
+      const about = mailTo(ops.address).filter((m) => JSON.stringify(m).includes(stuck.session.id));
+      expect(about.filter((m) => /CRITICAL/.test(m.subject))).toEqual([]);
+      expect(about.filter((m) => m.template === "adminAlert")).toHaveLength(1);
+    });
+  });
+});
+
 describe("m5 and the account purge (Addendum 3, 14:15)", () => {
   it("a leaving user's malware-declared completing session: the purge keeps it (it is not the stale job's), the sweep refuses it, and then the purge takes it — the user row can go", async () => {
     await rolledBack(async (db) => {

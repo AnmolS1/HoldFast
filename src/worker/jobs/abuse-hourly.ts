@@ -71,7 +71,7 @@ import {
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { effectiveLimits } from "../services/ceilings";
-import { sendAdminDigest, sendOperatorCritical } from "../services/email";
+import { sendAdminAlert, sendAdminDigest, sendOperatorCritical } from "../services/email";
 import type { BackgroundContext } from "../services/request-context";
 import { lockSuspectedCsam, sweepCsamAlerts, sweepUnrecordedCsamLocks } from "../services/scanning";
 import { adminListOf } from "../services/signup-policy";
@@ -297,14 +297,19 @@ async function alertOnce(
   bg: BackgroundContext,
   uploadId: string,
   kind: "owed_not_csam" | "stuck",
+  severity: "critical" | "routine" = "critical",
 ): Promise<void> {
   if (await owedAlerted(bg.db, uploadId, kind)) return;
   let reached = 0;
   for (const to of adminListOf(bg.env).addresses) {
-    const outcome = await sendOperatorCritical(bg, { to, event: "csam_lock", id: uploadId }).catch(
-      () => "failed" as const,
-    );
-    if (outcome === "sent") reached += 1;
+    const outcome =
+      severity === "critical"
+        ? await sendOperatorCritical(bg, { to, event: "csam_lock", id: uploadId }).catch(
+            () => "failed" as const,
+          )
+        : // Routine: counted, and held for the hourly digest past the mailbox's count — handed over all the same.
+          await sendAdminAlert(bg, { to, kind: "quarantine", id: uploadId }).catch(() => "failed" as const);
+    if (outcome === "sent" || (severity === "routine" && outcome === "coalesced")) reached += 1;
   }
   if (reached === 0) {
     bg.metric("job", { kind: KIND, outcome: "error", reason: `owed_alert_${kind}` });
@@ -388,8 +393,14 @@ export async function sweepOwedNodes(
     // operators are told once that it is stuck.
     if (outcome === "skipped" || outcome === "failed") {
       if ((await totalsOn(bg.db, day, "notice", marker)).count >= OWED_ATTEMPTS_PER_DAY) {
-        await alertOnce(bg, entry.session.id, "stuck").catch((error: unknown) =>
-          captureError(error, { kind: "job", job: KIND, reason: "owed_alert" }),
+        // CRITICAL only when csam is in play — the route proved it (the owed row) or the session's
+        // declared hash is listed as csam; any other stuck session is a ROUTINE alert (Addendum 4).
+        const declared = entry.session.expectedSha256;
+        const csam =
+          entry.owedRow ||
+          (declared !== null && (await blocklist.lookup(bg.db, declared))?.reason === "csam");
+        await alertOnce(bg, entry.session.id, "stuck", csam ? "critical" : "routine").catch(
+          (error: unknown) => captureError(error, { kind: "job", job: KIND, reason: "owed_alert" }),
         );
       }
     }
