@@ -4,6 +4,14 @@
 // old version, and every `open` / `completing` upload session of purpose 'file' (a reservation).
 // Avatars (`system = 'avatar'`) never count. Hidden and held bytes count on purpose: the number
 // does not move when a file is hidden, so the meter reveals nothing.
+//
+// TWO FIGURES (T23 review M2, brief Addendum 3). `used_bytes` is the operator's: it keeps what a
+// legal hold keeps of a root its owner deleted for good (the purge-requested subtrees: their
+// files and old versions — what the purge would have given back). The ACCOUNT HOLDER's figure
+// leaves those bytes out, everywhere: the room `reserve` gives (enforcement), GET
+// /api/account/usage and the data export. It is DERIVED from the held rows (`heldPurgeBytes`),
+// never kept in a counter of its own — so releasing, purging and the reconcile formula are
+// untouched, and the purge that runs once the hold is lifted gives the bytes back exactly once.
 
 import { eq, sql } from "drizzle-orm";
 import type { Executor } from "../client";
@@ -23,12 +31,55 @@ function assertBytes(bytes: number): void {
  */
 export async function reserve(tx: Executor, ownerId: string, bytes: number): Promise<boolean> {
   assertBytes(bytes);
+  // The fit is judged on the account holder's figure: the held bytes of what they deleted for
+  // good are not theirs to be refused for (see the header).
   const rows = await tx
     .update(user)
     .set({ usedBytes: sql`${user.usedBytes} + ${bytes}` })
-    .where(sql`${user.id} = ${ownerId} AND ${user.usedBytes} + ${bytes} <= ${user.quotaBytes}`)
+    .where(
+      sql`${user.id} = ${ownerId} AND ${user.usedBytes} - ${heldPurgeBytesSql(ownerId)} + ${bytes} <= ${user.quotaBytes}`,
+    )
     .returning({ id: user.id });
   return rows.length > 0;
+}
+
+/** The roots a purge was requested for and everything under them (the rows a hold kept). */
+const heldPurgeTree = (ownerId: string) => sql`
+  WITH RECURSIVE asked(id) AS (
+    SELECT n.id FROM nodes n
+    WHERE n.owner_id = ${ownerId} AND n.purge_requested_at IS NOT NULL
+    UNION
+    SELECT c.id FROM nodes c JOIN asked ON c.parent_id = asked.id
+  )`;
+
+/** `heldPurgeBytes` as one SQL expression (bigint), for a statement of its own. */
+function heldPurgeBytesSql(ownerId: string) {
+  return sql`(
+    ${heldPurgeTree(ownerId)}
+    SELECT
+      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
+       WHERE n.kind = 'file' AND n.system IS NULL)
+      + (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)
+  )::bigint`;
+}
+
+/**
+ * The bytes `used_bytes` keeps for purge-requested subtrees — the files and the kept old versions
+ * — apart. 0 and 0 for an account with none (an unheld root is purged at once by the request).
+ * What the account holder is shown and given leaves them out (see the header).
+ */
+export async function heldPurgeBytes(
+  db: Executor,
+  ownerId: string,
+): Promise<{ files: number; versions: number }> {
+  const result = await db.execute<{ files: string; versions: string }>(sql`
+    ${heldPurgeTree(ownerId)}
+    SELECT
+      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
+       WHERE n.kind = 'file' AND n.system IS NULL)::bigint AS files,
+      (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)::bigint AS versions`);
+  const row = result.rows[0];
+  return { files: Number(row?.files ?? 0), versions: Number(row?.versions ?? 0) };
 }
 
 /** Gives bytes back (an aborted session, purged rows). Never goes below zero. */
