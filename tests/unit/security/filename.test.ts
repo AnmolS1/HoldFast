@@ -69,6 +69,19 @@ describe("sanitizeName", () => {
     expect(refused(raw)).toBe("validation");
   });
 
+  it("NFC after stripping: an invisible character between a letter and its accent does not leave the name decomposed", () => {
+    // e, ZERO WIDTH SPACE, COMBINING ACUTE ACCENT: stripped first, then composed.
+    const stored = sanitizeName("e​́.txt");
+    expect(stored).toBe("é.txt");
+    expect(stored).toBe(stored.normalize("NFC"));
+  });
+
+  it("a lone surrogate is refused (a high or a low one, anywhere); a whole pair is kept", () => {
+    for (const raw of ["a\ud800b", "\udfff.txt", "name\ud83d"])
+      expect(refused(raw), JSON.stringify(raw)).toBe("validation");
+    expect(sanitizeName("😀.txt")).toBe("\u{1f600}.txt");
+  });
+
   it("255 bytes of UTF-8 is the limit, counted in bytes, not characters", () => {
     expect(sanitizeName("x".repeat(255))).toHaveLength(255);
     expect(refused("x".repeat(256))).toBe("validation");

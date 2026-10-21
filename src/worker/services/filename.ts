@@ -1,17 +1,22 @@
 // File and folder names: the stored form, the uniqueness key and the extension.
 //
-// `sanitizeName` — the stored form (every writer of a name goes through it):
-//   - NFC;
+// `sanitizeName` — the stored form of a name a client sends (the routes that create or rename go
+// through it; names the server derives — a restore into a taken place, zip labels — are cut to
+// the limit with `fitName`):
 //   - removed: Unicode Cc and Cf — C0/C1 controls, bidi embeddings / overrides / isolates
 //     (U+202A–E, U+2066–9), zero-width characters (U+200B–D) and the BOM (U+FEFF);
+//   - then NFC (after the stripping: an invisible character between a letter and its accent would
+//     otherwise leave the pair uncomposed);
 //   - every run of white space becomes one space, and the ends are trimmed;
-//   - refused (`validation`): empty, `.`, `..`, a `/` or `\` anywhere, more than 255 bytes of UTF-8;
+//   - refused (`validation`): empty, `.`, `..`, a `/` or `\` anywhere, a lone surrogate (half of a
+//     UTF-16 pair: it cannot be stored as itself), more than 255 bytes of UTF-8;
 //   - the case of the extension, like the rest of the name, is kept.
 // A reserved Windows device name (CON, NUL, COM1, …) may be stored as it is; only the name a
 // download is saved under changes (`downloadName`).
 //
-// `nameKeyOf` and `extOf` keep their meaning for every value already stored: both clean a name
-// exactly as before (NFC, Cc/Cf removed, trimmed) — the white-space rule is applied by
+// `nameKeyOf` and `extOf` keep their meaning for every value already stored: both clean a name as
+// before (Cc/Cf removed, NFC, trimmed — for a stored value, which holds no Cc/Cf, the order of the
+// first two changes nothing) — the white-space rule is applied by
 // `sanitizeName` only, so the key of a stored "a  b" is still "a  b".
 
 import { QueryError } from "../db/errors";
@@ -23,6 +28,8 @@ const STRIP = /[\p{Cc}\p{Cf}]/gu;
 // White space that survives STRIP: the space separators (Zs: U+0020, U+00A0, U+2000-200A, U+3000 ...)
 // and the line / paragraph separators (U+2028, U+2029).
 const SPACES = /[\p{Zs}\u2028\u2029]+/gu;
+// Half of a UTF-16 surrogate pair on its own (a whole pair is one astral code point, not Cs).
+const LONE_SURROGATE = /\p{Cs}/u;
 
 export const MAX_NAME_BYTES = 255;
 
@@ -31,11 +38,12 @@ const utf8 = new TextEncoder();
 export const byteLength = (name: string): number => utf8.encode(name).length;
 
 function clean(raw: string): string {
-  return raw.normalize("NFC").replace(STRIP, "").trim();
+  return raw.replace(STRIP, "").normalize("NFC").trim();
 }
 
 /** The name as stored. Throws `validation` for a name that cannot be used. */
 export function sanitizeName(raw: string): string {
+  if (LONE_SURROGATE.test(raw)) throw new QueryError("validation", "invalid name");
   const name = clean(raw).replace(SPACES, " ");
   if (name === "" || name === "." || name === "..") throw new QueryError("validation", "invalid name");
   if (name.includes("/") || name.includes("\\")) throw new QueryError("validation", "invalid name");
@@ -86,4 +94,9 @@ export function downloadName(name: string): string {
   const stem = dot === -1 ? name : name.slice(0, dot);
   if (!RESERVED.test(stem.trimEnd())) return name;
   return `${stem}_${dot === -1 ? "" : name.slice(dot)}`;
+}
+
+/** A zip entry's path as it is saved: `downloadName` applied to every segment. */
+export function zipPath(path: string): string {
+  return path.split("/").map(downloadName).join("/");
 }
