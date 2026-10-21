@@ -33,9 +33,7 @@ describe("401 and the route that is showing", () => {
     seedSession(sessionOf());
     seedConfig();
     renderRoutes(buildRoutes(), ["/s/sometoken"]);
-    await waitFor(() =>
-      expect(document.querySelector('[data-placeholder-page="Shared file"]')).not.toBeNull(),
-    );
+    await waitFor(() => expect(document.querySelector("[data-public-link-page]")).not.toBeNull());
     await expect(api("/api/nodes")).rejects.toMatchObject({ status: 401 });
     expect(isReauthPending()).toBe(false);
   });
