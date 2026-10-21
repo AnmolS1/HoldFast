@@ -608,16 +608,14 @@ describe("(b) anomaly reporting in abuse-hourly — reports, never pauses", () =
         [a, 5000],
         [b, 4000],
       ] as const) {
-        await db
-          .insert(linkAccessLog)
-          .values(
-            Array.from({ length: n }, () => ({
-              linkId: link.id,
-              nodeId: file.id,
-              at: new Date(),
-              outcome: "ok" as const,
-            })),
-          );
+        await db.insert(linkAccessLog).values(
+          Array.from({ length: n }, () => ({
+            linkId: link.id,
+            nodeId: file.id,
+            at: new Date(),
+            outcome: "ok" as const,
+          })),
+        );
       }
       expect((await busyLinksLastHour(db, day, 500, 50, 1)).map((l) => l.linkId)).toEqual([a.id]);
       await db.insert(downloadLedger).values({
