@@ -1,12 +1,14 @@
-// Route coverage, the Vitest half, INSIDE the test (a setup file of the Workers config): every
-// request a test hands to a Hono app — `app.request(…)`, `app.fetch(…)`, the Worker entry — is
-// recorded with its answer, and the list is put on the test's `meta`, which Vitest carries to the
+// Route coverage, the Vitest half, INSIDE the test (a setup file of the Workers config): a hit is
+// recorded when a ROUTE'S HANDLER runs — the last handler of every route any Hono app registers
+// (`get`/`post`/…/`all`/`on`) is wrapped as it is registered. A request a middleware answers
+// first (the pipeline's 401/403/429, a CSRF refusal, the impersonation guard) runs no handler and
+// covers nothing (review M2). The list is put on the test's `meta`, which Vitest carries to the
 // reporter in the main process (./vitest-reporter.ts writes the hit file).
 //
 // Registered by scripts/route-coverage/vitest.workers.config.ts (the main config gets it by the
 // orchestrator's seam edit). It wraps `Hono`, a library — this file imports no application code
 // (a setup module that did would bind the app's modules before a test's own `vi.mock`).
-import { afterAll, afterEach, vi } from "vitest";
+import { afterAll, afterEach, expect, vi } from "vitest";
 import type { Hit } from "./routes";
 
 declare module "vitest" {
@@ -22,25 +24,45 @@ const bucket = ((globalThis as unknown as Record<string, Bucket>)[KEY] ??= { hit
 vi.mock("hono", async (importOriginal) => {
   const hono = await importOriginal<typeof import("hono")>();
   const shared = (globalThis as unknown as Record<string, Bucket>)["__holdfastRouteHits"]!;
-  // Only TOP-LEVEL apps are asked through `fetch`: a router mounted with `app.route()` is copied
-  // into its parent, so a request is recorded once.
+  type Handler = (c: import("hono").Context, next: () => Promise<void>) => unknown;
+  /** The route's own handler (the LAST one given), wrapped: a hit is recorded when it runs. */
+  const wrapLast = (args: unknown[]): unknown[] => {
+    const index = args.findLastIndex((arg) => typeof arg === "function");
+    if (index === -1) return args;
+    const handler = args[index] as Handler;
+    const wrapped: Handler = async (c, next) => {
+      const url = new URL(c.req.url);
+      const hit: Hit = {
+        source: "vitest",
+        // The test origins (tests/setup/test-vars.ts): files.localhost is the files host.
+        host: url.hostname.startsWith("files.") ? "files" : url.pathname.startsWith("/api/") ? "app" : null,
+        method: c.req.method.toUpperCase(),
+        path: url.pathname,
+        status: 0,
+        handler: true,
+        file: String(expect.getState().testPath ?? "").replace(/^.*\/tests\/unit\//, "tests/unit/"),
+      };
+      shared.hits.push(hit);
+      try {
+        return await handler(c, next);
+      } finally {
+        hit.status = c.res?.status ?? 0;
+      }
+    };
+    return [...args.slice(0, index), wrapped, ...args.slice(index + 1)];
+  };
   class Hono<E extends import("hono").Env = import("hono").Env> extends hono.Hono<E> {
     constructor(...args: ConstructorParameters<typeof hono.Hono<E>>) {
       super(...args);
-      const fetch = this.fetch;
-      this.fetch = async (request, ...rest) => {
-        const response = await fetch(request, ...rest);
-        const url = new URL(request.url);
-        shared.hits.push({
-          source: "vitest",
-          // The test origins (tests/setup/test-vars.ts): files.localhost is the files host.
-          host: url.hostname.startsWith("files.") ? "files" : url.pathname.startsWith("/api/") ? "app" : null,
-          method: request.method.toUpperCase(),
-          path: url.pathname,
-          status: response.status,
-        });
-        return response;
-      };
+      // Class fields of the base (hono-base.js): replaced on the instance, `use` left alone.
+      const self = this as unknown as Record<string, (...given: unknown[]) => unknown>;
+      for (const method of ["get", "post", "put", "delete", "options", "patch", "all"]) {
+        const register = self[method]!;
+        self[method] = (...given: unknown[]) => register(...wrapLast(given));
+      }
+      const on = self.on!;
+      self.on = (method: unknown, path: unknown, ...handlers: unknown[]) =>
+        on(method, path, ...wrapLast(handlers));
     }
   }
   return { ...hono, Hono };

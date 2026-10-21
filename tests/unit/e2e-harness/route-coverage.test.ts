@@ -40,6 +40,7 @@ const hit = (host: Hit["host"], method: string, path: string, status = 200): Hit
   method,
   path,
   status,
+  handler: true,
 });
 
 /** One hit for every route of ROUTES except the allowlisted one. */
@@ -110,6 +111,13 @@ describe("uncovered: the routes no hit reaches", () => {
     expect(uncovered(routes, [hit("app", "GET", "/t/a/b")])).toEqual(routes);
   });
 
+  it("a request no route handler answered covers nothing (a middleware's refusal; review M2)", () => {
+    const refusals = ALL_HITS.map((one) => ({ ...one, status: 403, handler: false }));
+    expect(uncovered(ROUTES, refusals)).toHaveLength(ROUTES.length - 1);
+    const unmarked: Hit[] = ALL_HITS.map((one) => ({ ...one, handler: undefined }));
+    expect(uncovered(ROUTES, unmarked)).toHaveLength(ROUTES.length - 1);
+  });
+
   it("the allowlist is explicit: the test outbox and nothing else", () => {
     expect(ALLOWLIST.map((entry) => `${entry.host} ${entry.method} ${entry.path}`)).toEqual([
       "app GET /api/_test/outbox",
@@ -149,6 +157,18 @@ describe("diffReport: what diff.ts prints and fails on", () => {
       'no hits from "workers" (coverage/routes-hit.workers.jsonl is empty)',
       'no hits from "tablewide" (coverage/routes-hit.tablewide.jsonl is missing)',
     ]);
+  });
+
+  it("a hit file older than this run's routes.json is not counted, and says so (review m2)", () => {
+    const started = new Date();
+    const old = { ...file("workers", ALL_HITS), modified: new Date(started.getTime() - 60_000) };
+    const report = diffReport(ROUTES, [old], [], ALLOWLIST, started);
+    expect(report.problems[0]).toBe(
+      "coverage/routes-hit.workers.jsonl is older than coverage/routes.json: not from this run",
+    );
+    expect(report.problems).toContain("uncovered: app GET /api/nodes/root");
+    const fresh = { ...file("workers", ALL_HITS), modified: new Date(started.getTime() + 1) };
+    expect(diffReport(ROUTES, [fresh], [], ALLOWLIST, started).problems).toEqual([]);
   });
 
   it("an uncovered route and a stale allowlist entry are both named", () => {

@@ -21,13 +21,20 @@ export interface Route {
   path: string;
 }
 
-/** One request a test made that the Worker answered. `host` is null when the collector cannot tell. */
+/**
+ * One request a test made. `host` is null when the collector cannot tell. Only a hit whose ROUTE
+ * HANDLER ran counts (`handler: true`; review M2): a middleware's refusal covers nothing.
+ */
 export interface Hit {
   source: string;
   host: Host | null;
   method: string;
   path: string;
   status: number;
+  /** The route's own handler ran (the Vitest hook; the e2e collector once the Worker stamps it). */
+  handler?: boolean;
+  /** The test file that made it (Vitest). */
+  file?: string;
 }
 
 /**
@@ -148,6 +155,7 @@ export function uncovered(routes: readonly Route[], hits: readonly Hit[], allowl
   const compiled = routes.map((route) => ({ route, test: matcher(route.path) }));
   const reached = new Set<string>();
   for (const hit of hits) {
+    if (hit.handler !== true) continue;
     for (const host of hit.host === null ? (["app", "files"] as const) : [hit.host]) {
       const first = compiled.find(
         ({ route, test }) =>
@@ -188,6 +196,7 @@ export function parseHits(text: string, file: string): Hit[] {
         typeof hit.method !== "string" ||
         typeof hit.path !== "string" ||
         typeof hit.status !== "number" ||
+        !(hit.handler === undefined || typeof hit.handler === "boolean") ||
         !(hit.host === null || hit.host === "app" || hit.host === "files")
       ) {
         throw new Error(`${file}:${index + 1}: not a hit: ${line}`);
@@ -228,9 +237,14 @@ export function diffReport(
   files: readonly HitFile[],
   required: readonly string[] = [],
   allowlist = ALLOWLIST,
+  /** When routes.json was written (the start of this coverage run); an older hit file is stale. */
+  runStarted: Date | null = null,
 ): { lines: string[]; problems: string[] } {
   const lines: string[] = [];
   const problems: string[] = [];
+  const stale = runStarted === null ? [] : files.filter(({ modified }) => modified < runStarted);
+  for (const { file } of stale) problems.push(`${file} is older than ${ROUTES_FILE}: not from this run`);
+  files = files.filter((file) => !stale.includes(file));
   if (files.length === 0)
     problems.push(`no hit file (${COVERAGE_DIR}/${HITS_PREFIX}*.jsonl): nothing was collected`);
   for (const { file, hits, modified } of files) {

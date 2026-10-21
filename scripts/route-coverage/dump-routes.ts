@@ -1,7 +1,9 @@
 // Writes coverage/routes.json: method + path of every route of both Hono apps, read from the apps
 // as they are mounted (never a hand list), so a new route is in the table without an edit here.
+// It also STARTS a coverage run: every hit file is removed, and diff.ts refuses a hit file older
+// than routes.json — a source that did not run this time can never count (review m2).
 //
-//   npx tsx scripts/route-coverage/dump-routes.ts
+//   npx tsx scripts/route-coverage/dump-routes.ts        then the test runs, then diff.ts
 //
 // What is NOT a route here, by rule:
 //   - the app host's middleware pipeline: the first `buildPipeline(core).length` entries of the
@@ -14,9 +16,10 @@
 //     the installed packages).
 // The Worker's modules import `cloudflare:workers`, which plain Node cannot load: a resolve hook
 // hands them an empty stand-in. Nothing here runs a request.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { register } from "node:module";
-import { COVERAGE_DIR, ROUTES_FILE, routesOf, type Host, type HonoEntry } from "./routes";
+import { COVERAGE_DIR, HITS_PREFIX, ROUTES_FILE, routesOf, type Host, type HonoEntry } from "./routes";
 
 const hooks = `export async function resolve(specifier, context, next) {
   if (specifier.startsWith("cloudflare:")) {
@@ -54,6 +57,10 @@ const routes = [
 ];
 
 mkdirSync(COVERAGE_DIR, { recursive: true });
+const stale = readdirSync(COVERAGE_DIR).filter(
+  (name) => name.startsWith(HITS_PREFIX) && name.endsWith(".jsonl"),
+);
+for (const name of stale) rmSync(join(COVERAGE_DIR, name));
 writeFileSync(ROUTES_FILE, `${JSON.stringify(routes, null, 2)}\n`);
 const count = (host: Host) => routes.filter((route) => route.host === host).length;
 console.log(

@@ -13,6 +13,8 @@ import { answeredByWorker, COVERAGE_DIR, hitLine, type Host } from "../../../scr
 
 export const ROUTE_COVERAGE = process.env.HOLDFAST_ROUTE_COVERAGE === "1";
 export const E2E_HITS_FILE = `${COVERAGE_DIR}/routes-hit.e2e.jsonl`;
+/** Set by the Worker, in test mode only, from inside a route's handler (SEAM): `<METHOD> <route path>`. */
+export const ROUTE_HANDLED_HEADER = "x-holdfast-test-route";
 
 /** Once per run, in the process that starts the run: an empty hit file. */
 export function startHitFile(): void {
@@ -42,7 +44,16 @@ export function recordHit(
   if (host === null || !answeredByWorker(answer.headers)) return;
   appendFileSync(
     E2E_HITS_FILE,
-    hitLine({ source: "e2e", host, method: method.toUpperCase(), path: url.pathname, status: answer.status }),
+    hitLine({
+      source: "e2e",
+      host,
+      method: method.toUpperCase(),
+      path: url.pathname,
+      status: answer.status,
+      // The route's own handler ran: the Worker says so on the answer, in test mode only (the SEAM
+      // in reports/T28-report.md). Until it does, no e2e answer counts (review M2).
+      handler: answer.headers[ROUTE_HANDLED_HEADER] !== undefined,
+    }),
   );
 }
 
