@@ -260,7 +260,8 @@ describe("app host headers", () => {
   };
 
   // The nonce is per response: compared as the token <NONCE> (normalised by `withNonceToken`).
-  const withNonceToken = (csp: string | undefined) => csp?.replace(/'nonce-[A-Za-z0-9+/]{22}=='/g, "'nonce-<NONCE>'");
+  const withNonceToken = (csp: string | undefined) =>
+    csp?.replace(/'nonce-[A-Za-z0-9+/]{22}=='/g, "'nonce-<NONCE>'");
   const CSP_HTTP =
     "default-src 'self'; script-src 'nonce-<NONCE>' 'strict-dynamic' 'wasm-unsafe-eval' 'report-sample' https://challenges.cloudflare.com; " +
     "style-src 'self' 'nonce-<NONCE>' 'report-sample'; img-src 'self' data: blob: http://files.localhost; " +
@@ -313,7 +314,10 @@ describe("app host headers", () => {
   });
 
   it("names no host that did not come from the environment", () => {
-    const csp = buildCsp({ APP_ORIGIN: "https://a.test", FILES_ORIGIN: "https://f.test", SENTRY_DSN_WEB: "" }, "n");
+    const csp = buildCsp(
+      { APP_ORIGIN: "https://a.test", FILES_ORIGIN: "https://f.test", SENTRY_DSN_WEB: "" },
+      "n",
+    );
     const hosts = [...csp.matchAll(/https?:\/\/[^\s;]+/g)].map((match) => match[0]);
     // Turnstile is the one third party the policy names by design.
     expect([...new Set(hosts)].sort()).toEqual(["https://challenges.cloudflare.com", "https://f.test"]);
