@@ -180,6 +180,27 @@ describe("the public route: proof of access, in order", () => {
     expect(await reportsOn(inner.id)).toEqual([]);
   });
 
+  it("a file the public link routes do not show (pending, infected, error, skipped) → 404 identical to a random id, in the same statements, nothing filed; under_review (another visitor's report) → 202", async () => {
+    const reference = await publicReport({
+      nodeId: crypto.randomUUID(),
+      linkToken: (await deepLink()).link.token,
+    });
+    for (const status of ["pending", "infected", "error", "skipped"] as const) {
+      const { file, link } = await deepLink(status);
+      const answer = await publicReport({ nodeId: file.id, linkToken: link.token });
+      const random = await publicReport({ nodeId: crypto.randomUUID(), linkToken: link.token });
+      // Soft: a red names every state that is still reportable, not only the first.
+      expect.soft(envelope(answer), status).toEqual(envelope(reference));
+      expect.soft(answer.statements, status).toBe(random.statements);
+      expect.soft(await reportsOn(file.id), status).toEqual([]);
+      expect.soft((await nodeById(file.id))!.scanStatus, status).toBe(status);
+    }
+    const reviewed = await deepLink("under_review");
+    const again = await publicReport({ nodeId: reviewed.file.id, linkToken: reviewed.link.token });
+    expect(again.status).toBe(202);
+    expect(await reportsOn(reviewed.file.id)).toHaveLength(1);
+  });
+
   it("a file hidden by inheritance two levels down (its outer folder taken down) or in the trash above → 404; control: the same file before → 202", async () => {
     const control = await deepLink();
     expect((await publicReport({ nodeId: control.file.id, linkToken: control.link.token })).status).toBe(202);
@@ -534,9 +555,19 @@ describe("the effect of a valid report", () => {
     const { makeLink } = await import("../auth/helpers");
     const onlyReport = await makeLink(file.id, owner.id);
     const alsoOwner = await makeLink(file.id, owner.id, ["owner"]);
-    // Reported through a link on the folder: a skipped file cannot have a link of its own made.
-    const viaLink = await linkTo(owner, folder.id);
-    expect((await publicReport({ nodeId: file.id, linkToken: viaLink.token })).status).toBe(202);
+    // Filed through the effect itself: no route lets a reporter reach a skipped file (a link
+    // visitor sees clean files only — RPTFIX follow-up), and a skipped file cannot have a link
+    // of its own made.
+    const filed = await fileReport(
+      testDb(),
+      { nodeId: file.id, ownerId: owner.id, linkId: null, reporterUserId: null, reporterEmail: null },
+      {
+        category: "spam",
+        details: "",
+        reporterIpHashStable: await ipHashStable(testKeys(), freshIp()),
+      },
+    );
+    expect(filed).toMatchObject({ changed: true });
     expect(await linkRow(onlyReport.id)).toMatchObject({ pauseReasons: ["report"] });
     expect((await linkRow(alsoOwner.id)).pauseReasons.sort()).toEqual(["owner", "report"]);
 
