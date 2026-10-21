@@ -265,6 +265,10 @@ export const nodes = pgTable(
     index("nodes_purge_requested_idx")
       .on(t.purgeRequestedAt)
       .where(sql`purge_requested_at IS NOT NULL`),
+    // One owner's deleted-for-good roots: where the kept-bytes walk (`quota.ts`, every `reserve`) starts.
+    index("nodes_owner_purge_requested_idx")
+      .on(t.ownerId)
+      .where(sql`purge_requested_at IS NOT NULL`),
     index("nodes_sha256_idx").on(t.sha256),
     uniqueIndex("nodes_r2_key_uq")
       .on(t.r2Key)
