@@ -70,7 +70,7 @@ import {
   zipManifest,
   type ZipRoot,
 } from "../db/queries/nodes-api";
-import { heldPurgeBytes, usageBreakdown } from "../db/queries/quota";
+import { legalHoldKeptBytes, usageBreakdown, visibleUsedBytes } from "../db/queries/quota";
 import { ancestors, ownedRoots } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node, ScanStatus } from "../db/schema";
@@ -338,15 +338,20 @@ router.post("/nodes/download-urls", async (c) => {
 
 router.get("/account/usage", async (c) => {
   const user = requireVerified(c);
-  const [usage, held] = await Promise.all([usageBreakdown(db(c), user.id), heldPurgeBytes(db(c), user.id)]);
+  const [usage, held] = await Promise.all([
+    usageBreakdown(db(c), user.id),
+    legalHoldKeptBytes(db(c), user.id),
+  ]);
   if (!usage) throw new AppError("not_found");
-  // What the account holder is shown never reveals a legal hold (T23 brief Addendum 2, Q3): a
-  // root deleted for good is gone to its owner, held or not — so the bytes a hold keeps of it
-  // (in the trash, and its old versions) are left out here as the purge would have given them
-  // back. Quota enforcement and the operator's figure keep the stored counter.
+  // What the account holder is shown never reveals a legal hold (T23 brief Addenda 2-4): a root
+  // deleted for good is gone to its owner, held or not — so what a legal hold keeps of it (in the
+  // trash, and its old versions) is left out here as the purge would have given it back, and the
+  // used figure is the one quota is enforced against (quota.ts: past the backstop, full). The
+  // operator's figure keeps the stored counter.
+  const kept = held.files + held.versions;
   const body: UsageDto = {
     ...usage,
-    usedBytes: Math.max(0, usage.usedBytes - held.files - held.versions),
+    usedBytes: visibleUsedBytes(usage.usedBytes, kept, usage.quotaBytes),
     trashBytes: Math.max(0, usage.trashBytes - held.files),
     versionsBytes: Math.max(0, usage.versionsBytes - held.versions),
   };
