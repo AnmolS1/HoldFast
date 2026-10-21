@@ -7,8 +7,8 @@
 // `completing` an hour ago, the server's hash on `expected_sha256`, the route's
 // `upload.csam_node_owed` audit row, its object stored and its reservation on the owner.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, inArray } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { KeptUploadPage, ResolveKeptUploadResponse } from "../../../src/shared/schemas/admin";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { auditLog, uploads, user } from "../../../src/worker/db/schema";
@@ -33,6 +33,18 @@ const LONG_AGO = new Date(Date.now() - 3 * 3_600_000);
 beforeAll(async () => {
   await generationInStep();
 });
+// The sessions this file made are ended when it is done: a `completing` owed session left in the
+// shared table is the hourly repair sweep's — it would alert (or lock) for it in another file's
+// table-wide run, under that file's operator address.
+const made: string[] = [];
+afterAll(async () => {
+  if (made.length === 0) return;
+  await testDb()
+    .update(uploads)
+    .set({ status: "aborted", completedAt: new Date() })
+    .where(and(inArray(uploads.id, made), eq(uploads.status, "completing")));
+});
+
 afterEach(async () => {
   await env.FILES.delete(DESTROY_PAUSED_KEY);
 });
@@ -71,6 +83,7 @@ async function kept(opts: { ownerHeld?: boolean; uploaderHeld?: boolean } = {}) 
     targetId: session!.id,
     meta: { nodeId },
   });
+  made.push(session!.id);
   return { owner, uploader, session: session!, sha256 };
 }
 

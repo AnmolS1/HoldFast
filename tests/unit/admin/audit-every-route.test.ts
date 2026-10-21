@@ -8,7 +8,7 @@
 // and POST /admin/system/generation (generation.tablewide.test.ts, `admin.generation_accepted`).
 import { env } from "cloudflare:workers";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { auditLog, strikes, uploads } from "../../../src/worker/db/schema";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { jobs } from "../../../src/worker/jobs/index";
@@ -133,6 +133,7 @@ const scenarios: Record<string, Scenario> = {
         expectedSha256: madeUpSha(),
       })
       .returning();
+    keptSessions.push(session!.id);
     await testDb().insert(auditLog).values({
       actorType: "system",
       action: "upload.csam_node_owed",
@@ -325,8 +326,16 @@ beforeAll(async () => {
   await generationInStep();
   backup.run = async () => ({ done: true });
 });
-afterAll(() => {
+/** Owed sessions made here, ended in `afterAll` (left `completing`, the repair sweep would act on them). */
+const keptSessions: string[] = [];
+afterAll(async () => {
   backup.run = realRun;
+  if (keptSessions.length > 0) {
+    await testDb()
+      .update(uploads)
+      .set({ status: "aborted", completedAt: new Date() })
+      .where(inArray(uploads.id, keptSessions));
+  }
 });
 
 describe("every mutating admin route writes an audit row with the admin as actor and a target", () => {

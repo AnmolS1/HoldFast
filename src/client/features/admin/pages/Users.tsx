@@ -86,13 +86,13 @@ export function UsersPage() {
         <ErrorState error={query.error} onRetry={() => void query.refetch()} />
       ) : (
         <AdminDataGrid
-          rows={query.data.items.map((user) => ({
-            id: user.id,
-            email: user.email,
-            displayName: user.displayName,
-            status: userStatus(user),
-            used: bytes(user.usedBytes),
-            strikes: user.activeStrikes,
+          rows={query.data.items.map((account) => ({
+            id: account.id,
+            email: account.email,
+            displayName: account.displayName,
+            status: userStatus(account),
+            used: bytes(account.usedBytes),
+            strikes: account.activeStrikes,
           }))}
           columns={columns}
           onRowClick={(params) => void navigate(`/admin/users/${String(params.id)}`)}

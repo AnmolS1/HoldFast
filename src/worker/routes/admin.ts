@@ -146,25 +146,26 @@ export async function loadAnalyticsTiles(c: C): Promise<AnalyticsTilesDto> {
 
 // ── row → contract ──────────────────────────────────────────────────────────────────────────
 
-function userDto(row: adminQ.AdminUserRow): AdminUserDto {
+function userDto(account: adminQ.AdminUserRow): AdminUserDto {
   return {
-    id: row.id,
-    email: row.email,
-    displayName: row.name,
-    role: (row.role ?? "").split(",").includes("admin") ? "admin" : "user",
-    emailVerified: row.emailVerified,
-    twoFactorEnabled: row.twoFactorEnabled === true,
-    createdAt: row.createdAt.toISOString(),
-    quotaBytes: row.quotaBytes,
-    usedBytes: row.usedBytes,
-    banned: row.banned === true,
-    banReason: row.banReason,
-    suspendedAt: iso(row.suspendedAt),
-    suspendedReason: row.suspendedReason,
-    deleteScheduledAt: iso(row.deleteScheduledAt),
-    legalHold: row.legalHold,
-    activeStrikes: row.activeStrikes,
-    lastActiveAt: iso(row.lastActiveAt),
+    id: account.id,
+    email: account.email,
+    displayName: account.name,
+    role: (account.role ?? "").split(",").includes("admin") ? "admin" : "user",
+    emailVerified: account.emailVerified,
+    twoFactorEnabled: account.twoFactorEnabled === true,
+    createdAt: account.createdAt.toISOString(),
+    quotaBytes: account.quotaBytes,
+    // The TRUE counter, from the account row (never a session user's: it carries none).
+    usedBytes: account.usedBytes,
+    banned: account.banned === true,
+    banReason: account.banReason,
+    suspendedAt: iso(account.suspendedAt),
+    suspendedReason: account.suspendedReason,
+    deleteScheduledAt: iso(account.deleteScheduledAt),
+    legalHold: account.legalHold,
+    activeStrikes: account.activeStrikes,
+    lastActiveAt: iso(account.lastActiveAt),
   };
 }
 
@@ -386,15 +387,15 @@ router.get("/admin/users", async (c) => {
 
 /** The user detail: the TRUE counter and the operator's breakdown, never the holder's figure. */
 async function userDetail(c: C, userId: string): Promise<AdminUserDetailDto> {
-  const row = await adminQ.adminUser(db(c), userId);
-  if (!row) throw new AppError("not_found");
+  const account = await adminQ.adminUser(db(c), userId);
+  if (!account) throw new AppError("not_found");
   const egress = await todayTotals(db(c), "link_owner", userId);
   const stored = resolveSettings(c.env, await coreOf(c).getSettings(db(c), { fresh: true }));
   const cap = effectiveLimits(
     c.env,
     stored,
     "download_owner",
-    { quotaBytes: row.quotaBytes, createdAt: row.createdAt },
+    { quotaBytes: account.quotaBytes, createdAt: account.createdAt },
     now(c),
   );
   const usage = await usageBreakdown(db(c), userId);
@@ -403,10 +404,10 @@ async function userDetail(c: C, userId: string): Promise<AdminUserDetailDto> {
   const strikes = await adminQ.strikesOf(db(c), userId);
   const at = now(c);
   return {
-    user: userDto(row),
+    user: userDto(account),
     linkEgressToday: { bytes: egress.bytes, count: egress.count, capBytes: cap.bytes ?? 0 },
     usage: {
-      usedBytes: row.usedBytes,
+      usedBytes: account.usedBytes,
       filesBytes: usage?.filesBytes ?? 0,
       trashBytes: usage?.trashBytes ?? 0,
       versionsBytes: usage?.versionsBytes ?? 0,

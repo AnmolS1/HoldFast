@@ -79,7 +79,12 @@ beforeEach(() => {
 const pauseOn = () => env.FILES.put(DESTROY_PAUSED_KEY, "paused by a test");
 const pauseOff = () => env.FILES.delete(DESTROY_PAUSED_KEY);
 const objectGeneration = async () => (await (await env.FILES.get(GENERATION_KEY))?.text()) ?? null;
-const mails = () => vi.mocked(sendOperatorCritical).mock.calls.map(([, d]) => d.event);
+/** The detector's own critical mails (the hourly slot also runs other jobs, which mail other events). */
+const mails = () =>
+  vi
+    .mocked(sendOperatorCritical)
+    .mock.calls.map(([, d]) => d.event)
+    .filter((event) => event === "database_rollback" || event === "detector_unreadable");
 
 /** This file's bucket, whose `get` of `key` fails (every other key and method works). */
 const failingGet = (keys: string[]) =>
