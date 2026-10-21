@@ -73,7 +73,12 @@ import { audit } from "../services/audit";
 import { effectiveLimits } from "../services/ceilings";
 import { sendAdminAlert, sendAdminDigest, sendOperatorCritical } from "../services/email";
 import type { BackgroundContext } from "../services/request-context";
-import { lockSuspectedCsam, sweepCsamAlerts, sweepUnrecordedCsamLocks } from "../services/scanning";
+import {
+  lockSuspectedCsam,
+  sweepCsamAlerts,
+  sweepPendingScans,
+  sweepUnrecordedCsamLocks,
+} from "../services/scanning";
 import { adminListOf } from "../services/signup-policy";
 import { storage } from "../services/storage";
 import { STRIKE_SUSPENSION_REASON, sweepStrikeThresholds } from "../services/strikes";
@@ -89,6 +94,7 @@ export const ABUSE_HOURLY_LIMITS = {
   unrecordedLocks: 50,
   owedNodes: 50,
   strikes: 200,
+  pendingScans: 100,
   /** Findings per anomaly kind. */
   findings: 100,
 } as const;
@@ -115,6 +121,7 @@ export const parts = {
   sweepUnrecordedCsamLocks,
   sweepOwedNodes,
   sweepStrikeThresholds,
+  sweepPendingScans,
   reportAnomalies,
 };
 
@@ -596,6 +603,11 @@ export const job: Job = {
         ABUSE_HOURLY_LIMITS.strikes,
       );
       for (const id of ids) digest.push({ label: "Suspended for three strikes", value: id });
+    });
+
+    await part(bg, "pending_scan_sweep", async () => {
+      const swept = await parts.sweepPendingScans(bg, { limit: ABUSE_HOURLY_LIMITS.pendingScans });
+      ok("pending_scan_sweep", swept.requeued);
     });
 
     await part(bg, "anomaly_report", async () => {
