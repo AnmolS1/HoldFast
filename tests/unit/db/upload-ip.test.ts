@@ -24,7 +24,7 @@ import {
 } from "../../../src/worker/db/queries/uploads";
 import { type Upload, uploads, user } from "../../../src/worker/db/schema";
 import { stripComments } from "./_sql-rule-scan";
-import { makeFolder, makeUpload, makeUser, openDb } from "./_helpers";
+import { makeFolder, makeUpload, makeUser, openDb, withTrimLock } from "./_helpers";
 
 let db: Db;
 let close: () => Promise<void>;
@@ -136,49 +136,51 @@ describe("every terminal transition clears it", () => {
     expect(await row(session.id)).toMatchObject({ status: "aborted", ...NONE });
   });
 
-  it("EXCEPTION (ruling 2026-10-21, legal-hold preservation — T29 :119): a session deleteSubtreeRows keeps BECAUSE of a hold is ended as aborted with its address KEPT; trimFinished deletes the row, address and all, once the hold is lifted", async () => {
-    const owner = await makeUser(db);
-    const heldEditor = await makeUser(db, { legalHold: true });
-    const folder = await makeFolder(db, owner, null, "purged");
-    const kept = await sealedSession(owner, heldEditor, { parentId: folder.id, size: 300 });
-    await deleteSubtreeRows(db, folder.id);
-    expect(await row(kept.id)).toMatchObject({ status: "aborted", parentId: null });
-    expect(await ipOf(kept.id)).toEqual(KEPT);
+  it("EXCEPTION (ruling 2026-10-21, legal-hold preservation — T29 :119): a session deleteSubtreeRows keeps BECAUSE of a hold is ended as aborted with its address KEPT; trimFinished deletes the row, address and all, once the hold is lifted", () =>
+    withTrimLock(async () => {
+      const owner = await makeUser(db);
+      const heldEditor = await makeUser(db, { legalHold: true });
+      const folder = await makeFolder(db, owner, null, "purged");
+      const kept = await sealedSession(owner, heldEditor, { parentId: folder.id, size: 300 });
+      await deleteSubtreeRows(db, folder.id);
+      expect(await row(kept.id)).toMatchObject({ status: "aborted", parentId: null });
+      expect(await ipOf(kept.id)).toEqual(KEPT);
 
-    // Past the trim age but still held: preserved as it is.
-    await db
-      .update(uploads)
-      .set({ completedAt: new Date(Date.now() - 30 * 86_400_000) })
-      .where(eq(uploads.id, kept.id));
-    await trimFinished(db, 7, 100_000);
-    expect(await ipOf(kept.id)).toEqual(KEPT);
-    // The hold lifted: the retention job's trim deletes the row — the address goes with it.
-    await db.update(user).set({ legalHold: false }).where(eq(user.id, heldEditor));
-    await trimFinished(db, 7, 100_000);
-    expect(await row(kept.id)).toBeNull();
-  });
+      // Past the trim age but still held: preserved as it is.
+      await db
+        .update(uploads)
+        .set({ completedAt: new Date(Date.now() - 30 * 86_400_000) })
+        .where(eq(uploads.id, kept.id));
+      await trimFinished(db, 7, 100_000);
+      expect(await ipOf(kept.id)).toEqual(KEPT);
+      // The hold lifted: the retention job's trim deletes the row — the address goes with it.
+      await db.update(user).set({ legalHold: false }).where(eq(user.id, heldEditor));
+      await trimFinished(db, 7, 100_000);
+      expect(await row(kept.id)).toBeNull();
+    }));
 
-  it("the rows that are deleted take it with them: trimFinished, deleteForUser, deleteSubtreeRows", async () => {
-    const owner = await makeUser(db);
-    // trimFinished — a finished session past the trim age. (Cleared at its end already; this is
-    // a row written before that rule, which the trim still removes whole.)
-    const old = await sealedSession(owner, owner, {
-      status: "aborted",
-      completedAt: new Date(Date.now() - 30 * 86_400_000),
-    });
-    await trimFinished(db, 7, 100_000);
-    expect(await row(old.id)).toBeNull();
+  it("the rows that are deleted take it with them: trimFinished, deleteForUser, deleteSubtreeRows", () =>
+    withTrimLock(async () => {
+      const owner = await makeUser(db);
+      // trimFinished — a finished session past the trim age. (Cleared at its end already; this is
+      // a row written before that rule, which the trim still removes whole.)
+      const old = await sealedSession(owner, owner, {
+        status: "aborted",
+        completedAt: new Date(Date.now() - 30 * 86_400_000),
+      });
+      await trimFinished(db, 7, 100_000);
+      expect(await row(old.id)).toBeNull();
 
-    const leaving = await makeUser(db);
-    const open = await sealedSession(leaving, leaving);
-    await deleteForUser(db, leaving);
-    expect(await row(open.id)).toBeNull();
+      const leaving = await makeUser(db);
+      const open = await sealedSession(leaving, leaving);
+      await deleteForUser(db, leaving);
+      expect(await row(open.id)).toBeNull();
 
-    const folder = await makeFolder(db, owner, null, "gone");
-    const free = await sealedSession(owner, owner, { parentId: folder.id });
-    await deleteSubtreeRows(db, folder.id);
-    expect(await row(free.id)).toBeNull();
-  });
+      const folder = await makeFolder(db, owner, null, "gone");
+      const free = await sealedSession(owner, owner, { parentId: folder.id });
+      await deleteSubtreeRows(db, folder.id);
+      expect(await row(free.id)).toBeNull();
+    }));
 });
 
 describe("an unfinished session keeps it — the repair sweep reads it from there", () => {
