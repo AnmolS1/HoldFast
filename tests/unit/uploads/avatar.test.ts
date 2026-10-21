@@ -87,7 +87,9 @@ describe("avatar", () => {
     for (const bytes of [
       new Uint8Array(5000),
       new TextEncoder().encode("<svg onload=alert(1)>"),
-      eicarBytes(),
+      // Per-run random bytes that are no picture (T21, Addendum 3 Q4): the case is the format
+      // check — fixed content may be on the shared blocklist once any verdict listed it.
+      crypto.getRandomValues(new Uint8Array(5000)),
     ]) {
       const { session, answer } = await sendAvatar(user, bytes);
       expect(answer.status).toBe(400);

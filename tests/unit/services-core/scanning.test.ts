@@ -71,7 +71,7 @@ const KEY = `u/${OWNER}/${NODE}/0199d3c2-7a10-7000-8000-0000000000c3`;
 const RECORDED_R2_BODY =
   '{"account":"9668af964b3bf13cc286ae6b73097a35","bucket":"holdfast-files-dev","eventTime":"2026-10-12T23:12:27.740Z","action":"CompleteMultipartUpload","object":{"key":"u/spike-s8/mpu-2.bin","size":11534336,"eTag":"dce1c18393acbef2580b54a3b321765d-3"}}';
 
-const STUB_ON = { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "test" };
+const STUB_ON = { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "test", SCANNER: env.SCANNER };
 
 function streamOf(bytes: Uint8Array, chunk = 65_536): ReadableStream<Uint8Array> {
   let at = 0;
@@ -242,7 +242,12 @@ describe("the stub scanner", () => {
       { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "production" },
     ]) {
       expect(stubEnabled(off), JSON.stringify(off)).toBe(false);
-      expect(() => getScanner(off), JSON.stringify(off)).toThrow("scanner unavailable");
+      // T21: with the stub off the scanner is the container (scan/adapter.ts) — never the stub —
+      // and where there is no SCANNER binding at all there is none.
+      expect(getScanner({ ...off, SCANNER: env.SCANNER }), JSON.stringify(off)).not.toBe(getScanner(STUB_ON));
+      expect(() => getScanner({ ...off, SCANNER: undefined as never }), JSON.stringify(off)).toThrow(
+        "scanner unavailable",
+      );
     }
     expect(typeof getScanner(STUB_ON).scanBytes).toBe("function");
   });
@@ -275,33 +280,37 @@ describe("the stub scanner", () => {
     );
   });
 
-  it("reads at most 1 MiB of an object", async () => {
+  it("looks for the test string in the first 1 MiB and hashes EVERY byte (T21)", async () => {
     expect(STUB_SCAN_MAX_BYTES).toBe(1_048_576);
     const scanner = getScanner(STUB_ON);
     const late = new Uint8Array(STUB_SCAN_MAX_BYTES + 4096);
     late.set(eicarBytes(), STUB_SCAN_MAX_BYTES + 100);
     expect((await scanner.scanBytes(late)).status).toBe("clean");
-    let pulled = 0;
-    const counting = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        pulled += 1;
-        controller.enqueue(new Uint8Array(262_144));
-      },
-    });
-    const verdict = await scanner.scanStream(counting, { key: KEY, size: 50_000_000 });
-    expect(verdict).toMatchObject({ status: "clean", bytes: 50_000_000 });
-    expect(pulled).toBeLessThanOrEqual(6);
+    // A bounded stream of exactly `size` bytes, read to its end: the hash is of all of them.
+    const size = 5_000_000;
+    const bytes = new Uint8Array(size);
+    for (let i = 0; i < size; i += 4096) bytes[i] = i % 251;
+    const hex = (buffer: ArrayBuffer) =>
+      Array.from(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, "0")).join("");
+    const expected = hex(await crypto.subtle.digest("SHA-256", bytes));
+    const verdict = await scanner.scanStream(streamOf(bytes), { key: KEY, size });
+    expect(verdict).toMatchObject({ status: "clean", bytes: size, sha256: expected });
+    expect((await scanner.scanBytes(bytes)).sha256).toBe(expected);
   });
 
-  it("scanSmallObject scans bytes with it, and fails where there is no scanner", async () => {
+  it("scanSmallObject scans bytes with it, and answers error/engine where there is no scanner (T21)", async () => {
     expect((await scanSmallObject(STUB_ON, eicarBytes())).status).toBe("infected");
     expect((await scanSmallObject(STUB_ON, new Uint8Array(10))).status).toBe("clean");
-    await expect(
-      scanSmallObject({ SCAN_STUB: "0", SENTRY_ENVIRONMENT: "dev" }, new Uint8Array(10)),
-    ).rejects.toThrow("scanner unavailable");
-    await expect(
-      scanSmallObject({ SCAN_STUB: "1", SENTRY_ENVIRONMENT: "production" }, new Uint8Array(10)),
-    ).rejects.toThrow("scanner unavailable");
+    for (const off of [
+      { SCAN_STUB: "0", SENTRY_ENVIRONMENT: "dev", SCANNER: undefined as never },
+      { SCAN_STUB: "1", SENTRY_ENVIRONMENT: "production", SCANNER: undefined as never },
+    ]) {
+      // Never a throw (fold #15): the avatar is stored `error` and never shown.
+      expect(await scanSmallObject(off, new Uint8Array(10)), JSON.stringify(off)).toMatchObject({
+        status: "error",
+        reason: "engine",
+      });
+    }
   });
 });
 
@@ -616,7 +625,12 @@ describe("enqueueRescan", () => {
     it("a second rescan that got through while the first one's send failed: its verdict IS written", async () => {
       const owner = await makeUser();
       const file = await makeFile(owner.id, null, { name: "eicar.com.txt", scanStatus: "clean", ...VERDICT });
-      await putObject(file.r2Key!, eicarBytes());
+      // Per-run content (Common addendum 3): the infected verdict lists the hash for every file.
+      const tail = new TextEncoder().encode(`\n${crypto.randomUUID()}\n`);
+      const infected = new Uint8Array(eicarBytes().length + tail.length);
+      infected.set(eicarBytes(), 0);
+      infected.set(tail, eicarBytes().length);
+      await putObject(file.r2Key!, infected);
       const second = recordingDeps();
       const first = failingDeps(async () => {
         expect(await enqueueRescan(second.deps, file.id, { by: "admin" })).toEqual({ queued: true });
@@ -653,18 +667,19 @@ describe("enqueueRescan", () => {
       const scanned = (await nodeById(file.id))!;
       expect(scanned).toMatchObject({ scanStatus: "clean", scanDetail: { engine: "stub" } });
       // The second message: the same job row is claimed again (forced), the bytes are read again,
-      // and the node — no longer pending — is left exactly as the first verdict made it.
+      // and the node — no longer pending — keeps its status. T21 (task 2g, Addendum 3 Q2): the
+      // record of what the scanner saw (detail, scan time) is written on every verdict.
       await testDb()
         .update(nodes)
         .set({ scanDetail: { engine: "marker" } })
         .where(eq(nodes.id, file.id));
       expect(await deliver([{ body: two.sent[0] }])).toEqual([{ outcome: "ack" }]);
-      expect(await nodeById(file.id)).toMatchObject({
-        scanStatus: "clean",
-        scanDetail: { engine: "marker" },
-        scannedAt: scanned.scannedAt,
-      });
+      const again = (await nodeById(file.id))!;
+      expect(again).toMatchObject({ scanStatus: "clean", scanReason: null, scanDetail: { engine: "stub" } });
+      expect(again.scannedAt!.getTime()).toBeGreaterThanOrEqual(scanned.scannedAt!.getTime());
       expect(await jobsFor(file.r2Key!)).toMatchObject([{ status: "done", attempt: 2 }]);
+      // No second effect: the ledger is unchanged and empty for a clean file.
+      expect((await jobsFor(file.r2Key!))[0]!.verdict).toMatchObject({ effects: {} });
     });
   });
 

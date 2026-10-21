@@ -5,6 +5,8 @@
 
 import { randomBytes } from "node:crypto";
 import { eq } from "drizzle-orm";
+import pg from "pg";
+import { afterEach, beforeEach } from "vitest";
 import { type Db, createDb } from "../../../src/worker/db/client";
 import type { HoldCause } from "../../../src/worker/db/errors";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -32,6 +34,34 @@ export function testEnv(): Env {
 
 export function openDb(): { db: Db; close: () => Promise<void> } {
   return createDb(testEnv());
+}
+
+/**
+ * `trimFinished` deletes EVERY finished session past an age, whoever's — so two files that call it
+ * (uploads.test.ts, upload-ip.test.ts) delete each other's rows when the node project runs them side
+ * by side, and no choice of ages keeps them apart (a row old enough for its own file's trim is old
+ * enough for the other file's). A test that makes such rows and calls the trim runs whole under
+ * this lock: one session-level advisory lock on a connection of its own, so the tests that touch
+ * the table this way take turns across files.
+ *
+ * Call it inside a `describe` around those tests: the lock is taken in `beforeEach` and given back
+ * in `afterEach`, so the WAIT for it counts against the hook's budget, never the test's (review m6).
+ */
+export const TRIM_LOCK = 81_500_301;
+export function useTrimLock(): void {
+  let client: pg.Client | null = null;
+  beforeEach(async () => {
+    client = new pg.Client({ connectionString: localDbUrl() });
+    await client.connect();
+    await client.query("SELECT pg_advisory_lock($1)", [TRIM_LOCK]);
+  });
+  afterEach(async () => {
+    const held = client;
+    client = null;
+    if (!held) return;
+    await held.query("SELECT pg_advisory_unlock($1)", [TRIM_LOCK]).catch(() => undefined);
+    await held.end();
+  });
 }
 
 const ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";

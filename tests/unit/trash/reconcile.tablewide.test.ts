@@ -102,7 +102,13 @@ beforeAll(async () => {
   hadCursor = "reconcileCursor" in stored;
   found = stored.reconcileCursor;
 });
-afterEach(() => registerCoreDeps(realCore));
+afterEach(() => {
+  registerCoreDeps(realCore);
+  // A queued answer a test did not use (it failed before its walk read it) is not the next test's:
+  // back to the real queries.
+  vi.mocked(userIdsAfter).mockReset();
+  vi.mocked(reconcileUsedBytes).mockReset();
+});
 afterAll(async () => {
   if (hadCursor) await setSetting(testDb(), "reconcileCursor", found, null);
   else await testDb().delete(settingsTable).where(eq(settingsTable.key, "reconcileCursor"));
@@ -142,6 +148,21 @@ async function generations(database: number, object: number | string | null, at:
   else await env.FILES.put(GENERATION_KEY, String(object));
 }
 const objectGeneration = async () => (await (await env.FILES.get(GENERATION_KEY))?.text()) ?? null;
+
+/**
+ * The next run's quota walk is exactly `ids` (none by default), then the end — not every account
+ * the shared database has collected. Ids are random, so a walk from anywhere covers a share of the
+ * whole table until its half of the budget is spent, and leaves the sweep only the other half: what
+ * the sweep reaches would then depend on the runner's speed. Bounded by its inputs, a run can be
+ * given a budget it never reaches. Queues exactly the reads the walk makes (a leftover would be the
+ * next test's).
+ */
+function walkOnly(ids: string[] = []) {
+  if (ids.length > 0) vi.mocked(userIdsAfter).mockImplementationOnce(async () => ids);
+  vi.mocked(userIdsAfter).mockImplementationOnce(async () => []);
+}
+/** A budget no bounded run reaches: what such a run does never depends on the clock. */
+const UNREACHED = 120_000;
 
 /** The walk, for exactly one account: the first after `after`, with the deadline already past. */
 const one = (ctx: ReturnType<typeof jobContext>, id: string) =>
@@ -444,7 +465,11 @@ describe("reconcile: the orphan sweep", () => {
       vi.mocked(captureError).mockClear();
       vi.mocked(sendOperatorCritical).mockClear();
     });
-    const run = (ctx = jobContext()) => runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+    /** One run whose walk is `accounts` (none unless a test needs one) — never the shared table. */
+    const run = (ctx = jobContext(), accounts: string[] = []) => {
+      walkOnly(accounts);
+      return runReconcile(ctx.bg, { softDeadlineMs: UNREACHED, now: inHours(72) });
+    };
     /** One hourly heartbeat, on its own. */
     const beat = async (ctx = jobContext()) => {
       await heartbeat.run(ctx.bg, env, cronEvent(heartbeat.cron));
@@ -458,7 +483,7 @@ describe("reconcile: the orphan sweep", () => {
       // The object store saw run 7 complete; the restored database remembers run 5.
       await generations(5, 7, { user: justBefore(owner.id) });
       const ctx = jobContext();
-      const first = await run(ctx);
+      const first = await run(ctx, [owner.id]);
       expect(first).toMatchObject({ generation: "rollback", sweep: null, done: false });
       expect(await present(p.orphans)).toEqual(p.orphans);
       expect(ctx.outcomes("reconcile")).toContain("rollback_detected");
@@ -1103,25 +1128,38 @@ describe("reconcile: a failure in the quota half (m3)", () => {
     const p = await planted();
     const bad = await consistent();
     await setUsedBytes(bad.id, 5);
+    // The account after it, off by 200: the walk has to go on to correct it.
+    const next = await consistent();
+    await setUsedBytes(next.id, 1000);
     await generations(2, 2, { user: justBefore(bad.id) });
+    walkOnly([bad.id, next.id]);
     vi.mocked(reconcileUsedBytes).mockImplementationOnce(async () => {
       throw new Error("canceling statement due to statement timeout");
     });
     const ctx = jobContext();
     const since = new Date(Date.now() - 1000);
-    const result = await runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
-    expect(result.generation).toBe("ok");
-    // Skipped, not corrected; counted and reported.
+    const reads = vi.mocked(userIdsAfter).mock.calls.length;
+    const result = await runReconcile(ctx.bg, { softDeadlineMs: UNREACHED, now: inHours(72) });
+    expect(result).toMatchObject({ generation: "ok", done: true });
+    // The walk started at its place, and went on past the bad account to the end.
+    expect(
+      vi
+        .mocked(userIdsAfter)
+        .mock.calls.slice(reads)
+        .map((call) => call[1]),
+    ).toEqual([justBefore(bad.id), next.id]);
+    // Skipped, not corrected; counted and reported. The next one corrected.
     expect(await usedBytes(bad.id)).toBe(5);
+    expect(await usedBytes(next.id)).toBe(1200);
     expect(ctx.outcomes("reconcile")).toContain("error");
-    // Its place moved on past it.
+    // Its place was saved: the walk reached the end, so the next pass starts over.
     const cursor = readCursor((await getSettings(testDb(), { fresh: true })).reconcileCursor);
-    expect(cursor.user).not.toBe(justBefore(bad.id));
+    expect(cursor.user).toBeNull();
     // The record says so.
     const rows = (await audits("system.reconcile", "reconcile"))
       .filter((row) => row.at >= since)
       .sort((a, b) => a.at.getTime() - b.at.getTime());
-    expect((rows.at(-1)!.meta as { failed: number }).failed).toBe(1);
+    expect(rows.at(-1)!.meta).toEqual({ accounts: 2, drifted: 1, delta: 200, failed: 1 });
     // The sweep ran, and the run was counted.
     expect(await present(p.orphans)).toEqual([]);
     expect([await databaseGeneration(), await objectGeneration()]).toEqual([3, "3"]);
@@ -1135,7 +1173,8 @@ describe("reconcile: a failure in the quota half (m3)", () => {
       throw new Error("connection terminated");
     });
     const ctx = jobContext();
-    const result = await runReconcile(ctx.bg, { softDeadlineMs: 400, now: inHours(72) });
+    // The walk's first read fails, so it is bounded: the sweep has the whole budget, never reached.
+    const result = await runReconcile(ctx.bg, { softDeadlineMs: UNREACHED, now: inHours(72) });
     expect(result.generation).toBe("ok");
     expect(ctx.outcomes("reconcile")).toContain("error");
     expect(await present(p.orphans)).toEqual([]);

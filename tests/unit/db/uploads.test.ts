@@ -1,4 +1,4 @@
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../../src/worker/db/client";
 import { uuidv7 } from "../../../src/worker/db/ids";
@@ -16,7 +16,16 @@ import {
 } from "../../../src/worker/db/queries/uploads";
 import { setUserLegalHold } from "../../../src/worker/db/queries/moderation";
 import { hashBlocklist, uploadParts, uploads } from "../../../src/worker/db/schema";
-import { makeFile, makeFolder, makeUpload, makeUser, openDb, protectedFiles, rand } from "./_helpers";
+import {
+  makeFile,
+  makeFolder,
+  makeUpload,
+  makeUser,
+  openDb,
+  protectedFiles,
+  rand,
+  useTrimLock,
+} from "./_helpers";
 
 let db: Db;
 let close: () => Promise<void>;
@@ -256,72 +265,100 @@ describe("expired and trimFinished", () => {
     expect(ids).not.toContain(owed.id);
   });
 
-  it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", async () => {
-    const owner = await makeUser(db);
-    const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
-    const oldDone = await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(8) });
-    const oldAborted = await makeUpload(db, owner, owner, { status: "aborted", completedAt: daysAgo(30) });
-    const recentDone = await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(6) });
-    const oldOpen = await makeUpload(db, owner, owner, { status: "open", createdAt: daysAgo(30) });
-    const ids = [oldDone.id, oldAborted.id, recentDone.id, oldOpen.id];
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("trimFinished deletes done and aborted sessions older than the limit, and nothing unfinished", async () => {
+      const owner = await makeUser(db);
+      const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000);
+      const oldDone = await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(8) });
+      const oldAborted = await makeUpload(db, owner, owner, { status: "aborted", completedAt: daysAgo(30) });
+      const recentDone = await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(6) });
+      const oldOpen = await makeUpload(db, owner, owner, { status: "open", createdAt: daysAgo(30) });
+      const ids = [oldDone.id, oldAborted.id, recentDone.id, oldOpen.id];
 
-    // The default is the exported trim age (T12 imports it): seven days.
-    expect(FINISHED_TRIM_DAYS).toBe(7);
-    expect(await trimFinished(db)).toBeGreaterThanOrEqual(2);
-    const left = await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids));
-    expect(left.map((u) => u.id).sort()).toEqual([recentDone.id, oldOpen.id].sort());
-    expect(await trimFinished(db, 5)).toBeGreaterThanOrEqual(1);
-    expect(
-      (await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids))).map((u) => u.id),
-    ).toEqual([oldOpen.id]);
+      // The default is the exported trim age (T12 imports it): seven days.
+      expect(FINISHED_TRIM_DAYS).toBe(7);
+      expect(await trimFinished(db)).toBeGreaterThanOrEqual(2);
+      const left = await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids));
+      expect(left.map((u) => u.id).sort()).toEqual([recentDone.id, oldOpen.id].sort());
+      expect(await trimFinished(db, 5)).toBeGreaterThanOrEqual(1);
+      expect(
+        (await db.select({ id: uploads.id }).from(uploads).where(inArray(uploads.id, ids))).map((u) => u.id),
+      ).toEqual([oldOpen.id]);
 
-    const batch = [];
-    for (let i = 0; i < 3; i++)
-      batch.push((await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(9) })).id);
-    expect(await trimFinished(db, 7, 2)).toBe(2);
-    expect(await db.select().from(uploads).where(inArray(uploads.id, batch))).toHaveLength(1);
+      // The limit, on rows older than every other row in the (shared) database — finished sessions
+      // other runs left (a week later they are past 7 days too) are not candidates, only these are.
+      const oldest = await db.execute<{ days: number | null }>(
+        sql`SELECT max(extract(epoch FROM now() - COALESCE(completed_at, created_at)) / 86400)::float AS days FROM uploads`,
+      );
+      const age = Math.ceil(Number(oldest.rows[0]?.days ?? 0)) + 1;
+      const batch: string[] = [];
+      try {
+        for (let i = 0; i < 3; i++)
+          batch.push(
+            (await makeUpload(db, owner, owner, { status: "done", completedAt: daysAgo(age + 0.5) })).id,
+          );
+        expect(await trimFinished(db, age, 2)).toBe(2);
+        expect(await db.select().from(uploads).where(inArray(uploads.id, batch))).toHaveLength(1);
+      } finally {
+        // Nothing of this test is left behind, older than everything, for the next run's trims.
+        await db.delete(uploads).where(inArray(uploads.id, [...ids, ...batch]));
+      }
+    });
   });
 
-  it("trimFinished keeps a finished session while its owner or uploader is held or its node is one the purge gate protects; the count is of rows actually deleted", async () => {
-    // An age no other row in the (shared) database has, so the counts below are exact.
-    const days = 10_000 + Math.floor(Math.random() * 100_000);
-    const ended = new Date(Date.now() - days * 86_400_000 - 43_200_000);
-    const held = await makeUser(db, { legalHold: true });
-    const free = await makeUser(db);
-    const other = await makeUser(db);
-    const { files } = await protectedFiles(db);
-    const done = async (ownerId: string, uploaderId: string, nodeId?: string) =>
-      (
-        await makeUpload(db, ownerId, uploaderId, {
-          status: "done",
-          completedAt: ended,
-          ...(nodeId ? { nodeId } : {}),
-        })
-      ).id;
-    // Per cause of the gate: a session of un-held people that wrote the protected file.
-    const kept: Record<string, string> = {};
-    for (const [cause, { node }] of Object.entries(files)) kept[cause] = await done(free, other, node.id);
-    kept.owner_held = await done(held, other);
-    kept.uploader_held = await done(free, held);
-    // The control: the same row with nobody and nothing held.
-    const control = await done(free, other);
-    const present = async (id: string) =>
-      (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+  describe("(under the trim lock)", () => {
+    useTrimLock();
+    it("trimFinished keeps a finished session while its owner or uploader is held or its node is one the purge gate protects; the count is of rows actually deleted", async () => {
+      // An age above every row in the (shared) database — a row an earlier, failed run of this test
+      // left is younger than it — so the counts below are of this test's rows only (review m5).
+      const oldest = await db.execute<{ days: number | null }>(
+        sql`SELECT max(extract(epoch FROM now() - COALESCE(completed_at, created_at)) / 86400)::float AS days FROM uploads`,
+      );
+      const days = Math.ceil(Number(oldest.rows[0]?.days ?? 0)) + 1;
+      const ended = new Date(Date.now() - days * 86_400_000 - 43_200_000);
+      const held = await makeUser(db, { legalHold: true });
+      const free = await makeUser(db);
+      const other = await makeUser(db);
+      const { files } = await protectedFiles(db);
+      const done = async (ownerId: string, uploaderId: string, nodeId?: string) =>
+        (
+          await makeUpload(db, ownerId, uploaderId, {
+            status: "done",
+            completedAt: ended,
+            ...(nodeId ? { nodeId } : {}),
+          })
+        ).id;
+      // Per cause of the gate: a session of un-held people that wrote the protected file.
+      const kept: Record<string, string> = {};
+      for (const [cause, { node }] of Object.entries(files)) kept[cause] = await done(free, other, node.id);
+      kept.owner_held = await done(held, other);
+      kept.uploader_held = await done(free, held);
+      // The control: the same row with nobody and nothing held.
+      const control = await done(free, other);
+      const present = async (id: string) =>
+        (await db.select({ id: uploads.id }).from(uploads).where(eq(uploads.id, id))).length === 1;
+      const own = [control, ...Object.values(kept)];
+      try {
+        expect(await trimFinished(db, days)).toBe(1);
+        expect(await present(control)).toBe(false);
+        for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
+        expect(await trimFinished(db, days)).toBe(0);
 
-    expect(await trimFinished(db, days)).toBe(1);
-    expect(await present(control)).toBe(false);
-    for (const [why, id] of Object.entries(kept)) expect(await present(id), `kept: ${why}`).toBe(true);
-    expect(await trimFinished(db, days)).toBe(0);
-
-    // Each cause lifted, exactly its session goes on the next call.
-    for (const [cause, { release }] of Object.entries(files)) {
-      await release();
-      expect(await trimFinished(db, days), cause).toBe(1);
-      expect(await present(kept[cause]!), cause).toBe(false);
-    }
-    await setUserLegalHold(db, held, false);
-    expect(await trimFinished(db, days)).toBe(2);
-    expect(await present(kept.owner_held!)).toBe(false);
-    expect(await present(kept.uploader_held!)).toBe(false);
+        // Each cause lifted, exactly its session goes on the next call.
+        for (const [cause, { release }] of Object.entries(files)) {
+          await release();
+          expect(await trimFinished(db, days), cause).toBe(1);
+          expect(await present(kept[cause]!), cause).toBe(false);
+        }
+        await setUserLegalHold(db, held, false);
+        expect(await trimFinished(db, days)).toBe(2);
+        expect(await present(kept.owner_held!)).toBe(false);
+        expect(await present(kept.uploader_held!)).toBe(false);
+      } finally {
+        // Nothing of this test is left behind (older than everything) for the next run's trims.
+        await db.delete(uploads).where(inArray(uploads.id, own));
+      }
+    });
   });
 });

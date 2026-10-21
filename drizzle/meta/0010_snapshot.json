@@ -1,5 +1,5 @@
 {
-  "id": "8aed3767-bf4d-449d-b509-3ad091656053",
+  "id": "f09209b2-7f3c-4602-843f-b76f7f91ec7c",
   "prevId": "6e4301d2-f22e-41f6-864e-5af3284042c1",
   "version": "7",
   "dialect": "postgresql",
@@ -182,13 +182,6 @@
           "type": "text",
           "primaryKey": false,
           "notNull": false
-        },
-        "took_down": {
-          "name": "took_down",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
         }
       },
       "indexes": {
@@ -1693,6 +1686,22 @@
           "columns": [
             {
               "expression": "purge_requested_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "purge_requested_at IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "nodes_owner_purge_requested_idx": {
+          "name": "nodes_owner_purge_requested_idx",
+          "columns": [
+            {
+              "expression": "owner_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

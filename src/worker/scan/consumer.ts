@@ -1,54 +1,101 @@
-// The scan queue's consumer — the STUB one. It exists so that files can leave `pending` before
-// the real scan pipeline lands; that pipeline replaces this file's body and keeps its behaviour
-// for everything below except the verdict itself.
+// The scan queue's consumer (T21; it took over T10's stub). `queue(batch, env, ctx, bg)`: the
+// Worker entry calls it inside `runBackground`; `bg` is the run's context (`bg.db`, `bg.defer`,
+// `bg.metric`) — this file opens no client of its own, and `runBackground` drains everything
+// deferred (the CSAM handler's record and alert) before the invocation ends.
 //
-// `queue(batch, env, ctx, bg)`: the Worker entry calls it inside `runBackground`. `bg` is the
-// run's context — `bg.db`, `bg.defer`, `bg.metric` — and this file opens no client of its own.
-//
-// PER MESSAGE
-//  1. `normalizeScanMessage`. Not a scan message, or a key outside `u/`: acknowledged and logged.
-//  2. FAIL CLOSED. Unless the stub is enabled (`SCAN_STUB=1` and not production) the message is
-//     retried in five minutes and nothing else happens: a deploy without a scanner leaves files
-//     `pending`. This rule is the only thing between a misconfigured deploy and unscanned files
-//     being served.
-//  3. Resolve the key to a node. NO NODE IS THE NORMAL CASE, not an error: the object store sends
-//     its own event before the upload's request has inserted the node.
+// THE MAIN QUEUE, per message (`max_batch_size` 1, `max_concurrency` 2, `max_retries` 5):
+//  a. `normalizeScanMessage`; not a scan message → ack. Then the node by key; with none:
 //        an upload session with this key is open or completing   → retry in 10 s
-//        the key is a superseded version                         → acknowledge
-//        nothing references the key                              → retry in 10 s twice, then acknowledge
+//        the key is a superseded version, or its upload aborted   → ack (metric `orphan`)
+//        nothing references the key: attempts 1–2 → retry in 10 s, then ack (metric `orphan`)
 //     Nothing is ever deleted here; unreferenced objects are the orphan sweep's.
-//  4. Claim the scan job (keyed on the object key). Finished already → acknowledge; another
-//     delivery is running it → retry.
-//  5. Read the object: detect its type from the first 8,192 bytes, scan the body.
-//  6. In one transaction, with the node's row locked: write the verdict ONLY IF THE NODE IS STILL
-//     `pending` AND NOT TAKEN DOWN; in every case finish the job. Then acknowledge.
-//     A node in any other state is left exactly as it is — every column. The store notifies for
-//     every completed object, including one the upload route has just locked as suspected CSAM,
-//     and this consumer must never turn that node `clean`. (The verdict writer itself is not a
-//     passive guard: handed an `under_review` node it would store the verdict as the status to
-//     restore. So for such a node it is simply not called.)
-//  A failure anywhere after the claim marks the job failed — claimable again — and retries.
+//  b. Claim the job (one row per key). `done` → ack — after re-establishing the strike threshold
+//     for an `infected` node's uploader (the first delivery may have died before it); `running`
+//     → retry with the backoff, never ack: if that delivery dies, this message takes it over.
+//  c. Above `SCAN_MAX_BYTES` → `skipped`/`size`, no scanner (unreachable in v1: the file cap is
+//     the scan cap, D4 — a test pins it).
+//  d. Sniff the first 8,192 bytes (`mime.sniff`).
+//  e. Scan: the R2 body itself streamed to the scanner. A typed scanner error fails the job and
+//     retries the message (below); `ScannerRefusedError` ends the scan `error`/`engine` at once.
+//  f–g. PhotoDNA (flag off in v1), image dimensions, then the verdict (scan/verdict.ts).
+//  h. Ack only after the verdict's transaction has committed and its after-commit work is done.
 //
-// No side effects beyond the status: no email, strike, blocklist entry or link change, and no
-// hash check. Those belong to the real pipeline.
+// FAILURES — the job is finished `failed` first, so the redelivery reclaims at once:
+//   ScannerNotReadyError                     not_ready   retry(max(backoff, Retry-After))
+//   ScannerBusyError                         busy        retry(max(backoff, Retry-After))
+//   ScannerTransportError, cause "Durable    reset       retry(backoff) — a deploy; never why a file
+//     Object reset because its code was                   ends `error` (the DLQ re-sends it once)
+//     updated."
+//   ScannerTransportError / verdict `error`  timeout | engine   retry(backoff)
+//   PhotoDnaTransientError                   photodna    retry(backoff)
+//   anything else (the database, the store)  its message retry(backoff)
+// The backoff by `message.attempts` is 30 s, 2 min, 5 min, 10 min, 15 min — about 32 minutes in
+// all, deliberately longer than the 20-minute claim takeover (`SCAN_CLAIM_STALE_MINUTES`): a
+// message is still being retried when a dead claim becomes claimable. A unit test holds the
+// inequality.
+//
+// THE DEAD-LETTER QUEUE (same Worker, per message):
+//   no node for the key                      ack SILENTLY: metric dlq/no_node, nothing else
+//   job `done`                               ack
+//   job `running`, younger than 20 min       retry in 21 min (let the claim resolve first)
+//   job `failed` with `reset` or `busy`,     re-send once (`enqueueScan`, forced), mark the job
+//     node still `pending`, not re-sent yet    `requeuedFromDlq`; ack — no `error`, no Sentry error
+//   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
+//                                            not taken down → `error`/`timeout`|`engine`; Sentry
+//                                            error tagged with the key; ack
+//
+// LOGS carry keys and node ids only — never a file name or an address.
 
-import { findByR2Key, keyReference, setScanResult } from "../db/queries/nodes";
-import { claim, finish, type ClaimResult } from "../db/queries/scan-jobs";
+import { findByR2Key, keyReference } from "../db/queries/nodes";
+import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
+import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
+import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
+import type { Node } from "../db/schema";
 import { captureError } from "../sentry";
 import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
 import type { BackgroundContext } from "../services/request-context";
-import { getScanner, normalizeScanMessage, stubEnabled, type ScanMessage } from "../services/scanning";
+import {
+  enqueueScan,
+  getScanner,
+  normalizeScanMessage,
+  type ScanMessage,
+  type ScanVerdict,
+} from "../services/scanning";
 import { storage } from "../services/storage";
+import { enforceStrikeThreshold } from "../services/strikes";
+import {
+  SCAN_MAX_BYTES,
+  ScannerBusyError,
+  ScannerNotReadyError,
+  ScannerRefusedError,
+  ScannerTransportError,
+} from "./container";
+import { checkPhotoDna, PhotoDnaTransientError } from "./photodna";
+import { applyVerdict, imageDimensions } from "./verdict";
 
-/** A deploy without a scanner looks again this often. */
-export const FAIL_CLOSED_RETRY_SEC = 300;
-/** How long to wait for the upload's request to insert the node, or for another delivery to finish. */
+/** How long to wait for the upload's request to insert the node. */
 export const NO_NODE_RETRY_SEC = 10;
-export const RUNNING_RETRY_SEC = 30;
 /** A key nothing references is given up on at this delivery attempt. */
 export const UNKNOWN_KEY_MAX_ATTEMPTS = 3;
+/** The main queue's `max_retries` (wrangler.jsonc); the backoff below has one delay per retry. */
+export const SCAN_MAX_RETRIES = 5;
+/** The retry delay by attempt: 30 s, 2 min, 5 min, 10 min, 15 min. */
+export const SCAN_BACKOFF_SEC = [30, 120, 300, 600, 900] as const;
+/** The dead-letter consumer's wait for a `running` claim younger than the takeover time. */
+export const DLQ_RUNNING_RETRY_SEC = (SCAN_CLAIM_STALE_MINUTES + 1) * 60;
+/** The message `scanObject` wraps a deploy's reset in (spike S9) — matched on the CAUSE. */
+export const DEPLOY_RESET_MESSAGE = "Durable Object reset because its code was updated.";
+
+/** The retry delay for a message on its `attempts`-th delivery. */
+export function backoff(attempts: number): number {
+  const index = Math.min(Math.max(Math.trunc(attempts), 1), SCAN_BACKOFF_SEC.length) - 1;
+  return SCAN_BACKOFF_SEC[index]!;
+}
 
 type Claimed = Extract<ClaimResult, { claimed: true }>;
+
+/** The `lastError` codes of step e; anything else is a message, reported as `failed`. */
+const RETRY_REASONS = new Set(["not_ready", "busy", "reset", "timeout", "engine", "photodna"]);
 
 /** A key (ids only, never a secret) made safe for one log line. */
 function loggable(value: unknown): string {
@@ -62,6 +109,34 @@ function keyOf(body: unknown): unknown {
   return record.key ?? record.object?.key;
 }
 
+/** Why a scan could not finish: the job's `lastError`, and the least the message must wait. */
+type Failure = { error: string; minDelay: number };
+
+/** A deploy's reset, recognised on the wrapped CAUSE — never on the wrapper's own message. */
+export function isDeployReset(error: unknown): boolean {
+  if (!(error instanceof ScannerTransportError)) return false;
+  const cause = error.cause as { message?: unknown } | undefined;
+  return typeof cause?.message === "string" && cause.message.startsWith(DEPLOY_RESET_MESSAGE);
+}
+
+/** The table of step e (and its neighbours): what a thrown error is. */
+export function classify(error: unknown): Failure {
+  if (error instanceof ScannerNotReadyError) return { error: "not_ready", minDelay: error.retryAfter };
+  if (error instanceof ScannerBusyError) return { error: "busy", minDelay: error.retryAfter };
+  if (isDeployReset(error)) return { error: "reset", minDelay: 0 };
+  if (error instanceof ScannerTransportError) return { error: error.reason, minDelay: 0 };
+  if (error instanceof PhotoDnaTransientError) return { error: "photodna", minDelay: 0 };
+  if (error instanceof RangeError) return { error: "engine", minDelay: 0 };
+  return { error: error instanceof Error ? error.message.slice(0, 200) : "failed", minDelay: 0 };
+}
+
+/** A verdict the scanner returned but that is no verdict: retried like a transport failure. */
+class VerdictError extends Error {
+  constructor(readonly reason: "timeout" | "engine") {
+    super(reason);
+  }
+}
+
 async function readPrefix(env: Env, key: string, size: number): Promise<Uint8Array> {
   if (size === 0) return new Uint8Array(0);
   const head = await storage(env).get(key, {
@@ -71,43 +146,112 @@ async function readPrefix(env: Env, key: string, size: number): Promise<Uint8Arr
   return new Uint8Array(await head.object.arrayBuffer());
 }
 
-/** Steps 5 and 6 for a claimed job. */
+/** Steps c–h for a claimed job. Resolves with the message's fate. */
 async function scanClaimed(
   env: Env,
   bg: BackgroundContext,
   scan: ScanMessage,
-  name: string,
+  node: Node,
   claimed: Claimed,
-): Promise<string> {
+  message: Message<unknown>,
+): Promise<void> {
   const store = storage(env);
   const head = await store.head(scan.key);
   if (!head) throw new Error("scan: the object is gone");
+  const prefix = await readPrefix(env, scan.key, head.size);
   // Awaited: the detector is asynchronous, and a Promise must never be stored as a type.
-  const mimeSniffed = await sniff(await readPrefix(env, scan.key, head.size), name);
-  const read = await store.get(scan.key);
-  if (read?.kind !== "body") throw new Error("scan: the object is gone");
-  const { object } = read;
-  const verdict = await getScanner(env).scanStream(object.body, { key: scan.key, size: object.size });
+  const mimeSniffed = await sniff(prefix, node.name);
 
-  return bg.db.transaction(async (tx) => {
-    const node = await findByR2Key(tx, scan.key, { forUpdate: true });
-    let outcome = "left";
-    // The guard. `setScanResult` writes what it is given, so it is not called for any other node.
-    if (node && node.scanStatus === "pending" && node.takedownAt === null) {
-      await setScanResult(tx, node.id, scan.key, {
-        scanStatus: verdict.status,
-        scanReason: verdict.reason ?? null,
-        scanDetail: {
-          engine: verdict.engine,
-          ...(verdict.signatures.length > 0 ? { signatures: verdict.signatures } : {}),
-        },
-        mimeSniffed,
-        scannedAt: new Date(),
-      });
-      outcome = verdict.status;
+  let verdict: ScanVerdict;
+  if (head.size > SCAN_MAX_BYTES) {
+    // The declared hash stays: a Worker-side hash of an object this large does not fit the limits.
+    // NOTE: `setScanResult` then sets `scannedAt` over a client hash — the one place the "scannedAt
+    // means a server hash" promise (queries/scan.ts) is not kept. Unreachable in v1 (R2 pins
+    // MAX_FILE_BYTES ≤ SCAN_MAX_BYTES); a cap raise must revisit f.4's "verified before" here.
+    verdict = {
+      status: "skipped",
+      reason: "size",
+      signatures: [],
+      pua: [],
+      bytes: head.size,
+      engine: "none",
+    };
+  } else {
+    const read = await store.get(scan.key);
+    if (read?.kind !== "body") throw new Error("scan: the object is gone");
+    // The R2 body itself — the runtime sets its length from it (spike S9); never re-wrapped.
+    verdict = await getScanner(env).scanStream(read.object.body, { key: scan.key, size: read.object.size });
+    if (verdict.status === "error")
+      throw new VerdictError(verdict.reason === "timeout" ? "timeout" : "engine");
+    // A verdict without the server's hash is not one this pipeline can stand on.
+    if (!verdict.sha256) throw new VerdictError("engine");
+  }
+
+  const photodna = await checkPhotoDna(bg, {
+    key: scan.key,
+    size: head.size,
+    mimeSniffed,
+    ownerId: node.ownerId,
+  });
+  const image = await imageDimensions(env, { key: scan.key, size: head.size, mimeSniffed, prefix });
+
+  const applied = await applyVerdict(bg, {
+    key: scan.key,
+    nodeId: node.id,
+    ownerId: node.ownerId,
+    claimed,
+    verdict,
+    mimeSniffed,
+    image,
+    photodna,
+  });
+  const kind = verdict.engine === "stub" ? "stub" : "clamav";
+  if (applied.kind === "gone") {
+    bg.metric("scan", { outcome: "replaced", kind });
+  } else {
+    if (photodna && "skipped" in photodna)
+      bg.metric("scan", { outcome: "photodna_skipped", reason: photodna.skipped });
+    bg.metric(
+      "scan",
+      {
+        outcome: applied.stale ? "stale" : applied.outcome.status,
+        reason: applied.outcome.reason ?? undefined,
+        kind,
+      },
+      verdict.durationMs ?? 0,
+    );
+    if (applied.retry) {
+      message.retry({ delaySeconds: backoff(message.attempts) });
+      return;
     }
-    await finish(tx, claimed, "done", { ...verdict });
-    return outcome;
+  }
+  message.ack();
+}
+
+/**
+ * R8: the scanner refused the body for what it is (`ScannerRefusedError` — the same body gets the
+ * same answer). The job is finished `failed`/`refused`, the node — if still `pending` on this key
+ * and not taken down — `error`/`engine` (no server hash: `scannedAt` is left), and the message
+ * acknowledged.
+ */
+async function refused(
+  bg: BackgroundContext,
+  scan: ScanMessage,
+  node: Node,
+  claimed: Claimed,
+): Promise<void> {
+  await bg.db.transaction(async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const locked = await findByR2Key(tx, scan.key, { forUpdate: true });
+    if (
+      locked?.id === node.id &&
+      locked.scanStatus === "pending" &&
+      locked.takedownAt === null &&
+      !(await effectiveHidden(tx, locked.id))
+    ) {
+      await markScanError(tx, locked.id, scan.key, "engine");
+    }
+    await finish(tx, claimed, "failed", null, "refused");
   });
 }
 
@@ -121,23 +265,23 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
     return;
   }
 
-  if (!stubEnabled(env)) {
-    message.retry({ delaySeconds: FAIL_CLOSED_RETRY_SEC });
-    return;
-  }
-
   const node = await findByR2Key(bg.db, scan.key);
   if (!node) {
     const reference = await keyReference(bg.db, scan.key);
-    if (reference?.kind === "version") {
-      message.ack();
-    } else if (reference !== null || message.attempts < UNKNOWN_KEY_MAX_ATTEMPTS) {
-      // An upload session that is still open or completing — or the first sightings of a key
-      // nothing references yet.
+    if (reference?.kind === "upload") {
+      // The event beat the upload's commit (S8: every time), or a single PUT whose complete has
+      // not come yet.
       message.retry({ delaySeconds: NO_NODE_RETRY_SEC });
-    } else {
-      console.warn(`scan: nothing references the key, given up: ${loggable(scan.key)}`);
+    } else if (
+      reference?.kind === "version" ||
+      (await abortedUploadOf(bg.db, scan.key)) ||
+      message.attempts >= UNKNOWN_KEY_MAX_ATTEMPTS
+    ) {
+      bg.metric("scan", { outcome: "orphan" });
       message.ack();
+    } else {
+      // A first miss is never final.
+      message.retry({ delaySeconds: NO_NODE_RETRY_SEC });
     }
     return;
   }
@@ -154,27 +298,123 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
     force: scan.force,
   });
   if (!claimed.claimed) {
-    if (claimed.status === "done") message.ack();
-    else message.retry({ delaySeconds: RUNNING_RETRY_SEC });
+    if (claimed.status === "done") {
+      // The repair (ruling 2026-10-12): the first delivery may have committed `infected` and died
+      // before the suspension step. No strike, no mail — the threshold only.
+      if (node.scanStatus === "infected" && node.createdBy) {
+        try {
+          await enforceStrikeThreshold(bg, node.createdBy);
+        } catch (error) {
+          captureError(error, { kind: "scan", reason: "strike_repair" });
+          message.retry({ delaySeconds: backoff(message.attempts) });
+          return;
+        }
+      }
+      message.ack();
+    } else {
+      message.retry({ delaySeconds: backoff(message.attempts) });
+    }
     return;
   }
 
   try {
-    const outcome = await scanClaimed(env, bg, scan, node.name, claimed);
-    bg.metric("scan", { outcome, kind: "stub" });
-    message.ack();
+    await scanClaimed(env, bg, scan, node, claimed, message);
   } catch (error) {
-    captureError(error, { kind: "scan" });
-    bg.metric("scan", { outcome: "failed", kind: "stub" });
-    await finish(
-      bg.db,
-      claimed,
-      "failed",
-      null,
-      error instanceof Error ? error.message.slice(0, 200) : "failed",
+    if (error instanceof ScannerRefusedError) {
+      captureError(error, { kind: "scan", reason: "refused", key: loggable(scan.key) });
+      bg.metric("scan", { outcome: "error", reason: "refused" });
+      try {
+        await refused(bg, scan, node, claimed);
+        message.ack();
+      } catch (inner) {
+        captureError(inner, { kind: "scan" });
+        message.retry({ delaySeconds: backoff(message.attempts) });
+      }
+      return;
+    }
+    const failure = error instanceof VerdictError ? { error: error.reason, minDelay: 0 } : classify(error);
+    bg.metric("scan", {
+      outcome: "retry",
+      reason: RETRY_REASONS.has(failure.error) ? failure.error : "failed",
+    });
+    // An unexpected failure is reported; the scanner's own states are the normal weather.
+    if (!(
+      error instanceof ScannerNotReadyError ||
+      error instanceof ScannerBusyError ||
+      isDeployReset(error)
+    )) {
+      captureError(error, { kind: "scan" });
+    }
+    // Best effort: a failed row is claimable at once by the redelivery.
+    await finish(bg.db, claimed, "failed", null, failure.error).catch((inner: unknown) =>
+      captureError(inner, { kind: "scan" }),
     );
-    message.retry();
+    message.retry({ delaySeconds: Math.max(backoff(message.attempts), failure.minDelay) });
   }
+}
+
+// ── the dead-letter queue ───────────────────────────────────────────────────────────────────
+
+/** The last errors that are a deploy or a capacity wall: re-sent once, never `error`. */
+const REQUEUED_ERRORS = new Set(["reset", "busy"]);
+
+async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext): Promise<void> {
+  const scan = normalizeScanMessage(message.body);
+  if (!scan) {
+    message.ack();
+    return;
+  }
+  const node = await findByR2Key(bg.db, scan.key);
+  if (!node) {
+    // An abandoned single PUT, a superseded or deleted key: not a fault (ruling S8-a).
+    bg.metric("scan", { outcome: "dlq", reason: "no_node" });
+    message.ack();
+    return;
+  }
+  const job = await jobOf(bg.db, scan.key);
+  if (job?.status === "done") {
+    message.ack();
+    return;
+  }
+  const staleAt = Date.now() - SCAN_CLAIM_STALE_MINUTES * 60_000;
+  if (job?.status === "running" && job.startedAt.getTime() >= staleAt) {
+    message.retry({ delaySeconds: DLQ_RUNNING_RETRY_SEC });
+    return;
+  }
+  const requeuedBefore = (job?.verdict as Record<string, unknown> | null)?.requeuedFromDlq === true;
+  if (
+    job?.status === "failed" &&
+    REQUEUED_ERRORS.has(job.lastError ?? "") &&
+    node.scanStatus === "pending" &&
+    !requeuedBefore
+  ) {
+    // Marked FIRST, then sent: the once-guard holds however fast the re-sent message is claimed
+    // (review m2). A send that throws after the mark leaves a `pending` node with no live job —
+    // the dead letter is retried, and in the end the pending-scan sweep sends it.
+    await markRequeuedFromDlq(bg.db, job.id);
+    await enqueueScan(bg, { nodeId: node.id, key: scan.key, force: true });
+    bg.metric("scan", { outcome: "dlq", reason: "requeued" });
+    message.ack();
+    return;
+  }
+
+  const reason = job?.lastError === "timeout" ? "timeout" : "engine";
+  await bg.db.transaction(async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const locked = await findByR2Key(tx, scan.key, { forUpdate: true });
+    if (job) await failJob(tx, job.id, job.lastError ?? "dead_letter");
+    if (
+      locked?.id === node.id &&
+      locked.scanStatus === "pending" &&
+      locked.takedownAt === null &&
+      !(await effectiveHidden(tx, locked.id))
+    ) {
+      await markScanError(tx, locked.id, scan.key, reason);
+    }
+  });
+  captureError(new Error(`scan: dead-lettered (${reason})`), { kind: "scan", key: loggable(scan.key) });
+  bg.metric("scan", { outcome: "dlq", reason });
+  message.ack();
 }
 
 export async function queue(
@@ -184,15 +424,8 @@ export async function queue(
   bg: BackgroundContext,
 ): Promise<void> {
   void ctx;
-  // Dead letters: nothing more can be done with them here.
-  if (batch.queue.endsWith("-dlq")) {
-    for (const message of batch.messages) {
-      console.warn(`scan: dead-lettered message acknowledged: ${loggable(keyOf(message.body))}`);
-      message.ack();
-    }
-    return;
-  }
-  // A batch with no scan message in it at all is acknowledged whole.
+  const deadLetters = batch.queue.endsWith("-dlq");
+  // A batch with no scan message in it at all is acknowledged whole (and asks the database nothing).
   if (batch.messages.every((message) => normalizeScanMessage(message.body) === null)) {
     for (const message of batch.messages) {
       console.warn(
@@ -204,11 +437,12 @@ export async function queue(
   }
   for (const message of batch.messages) {
     try {
-      await handle(message, env, bg);
+      if (deadLetters) await handleDeadLetter(message, bg);
+      else await handle(message, env, bg);
     } catch (error) {
       // Before the claim (a database error, say): nothing to mark, try again.
       captureError(error, { kind: "scan" });
-      message.retry();
+      message.retry({ delaySeconds: deadLetters ? DLQ_RUNNING_RETRY_SEC : backoff(message.attempts) });
     }
   }
 }

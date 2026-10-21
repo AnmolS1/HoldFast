@@ -53,10 +53,10 @@
     "TURNSTILE_SITEKEY": "0x4AAAAAAFQ7GuCPvHcRBd_q",
     "PHOTODNA_ENABLED": "false",
     "EMAIL_TRANSPORT": "resend",
-    // "1" = files are marked clean by a stub instead of a real scan. Dev only: on while the dev
-    // deploy has no real scanner (it goes back to "0" when the scan pipeline lands). Production is
-    // never "1" — the deploy check refuses such a build, and the stub ignores the flag there.
-    "SCAN_STUB": "1",
+    // "1" = files are marked clean by a stub instead of a real scan. The deployed dev scans for real
+    // since the scan pipeline (T21) landed; a local checkout still gets "1" from its .dev.vars.
+    // Production is never "1" — the deploy check refuses such a build, and the stub ignores it there.
+    "SCAN_STUB": "0",
     "SENTRY_ENVIRONMENT": "dev",
     // Public value (it ships in the browser bundle). Blank until it is set.
     "SENTRY_DSN_WEB": "https://4fbb40d035e576361455d0c0598fcc2a@o4511527807811584.ingest.us.sentry.io/4512218438172672",
@@ -83,7 +83,7 @@
         "dead_letter_queue": "holdfast-scan-dev-dlq",
         "max_concurrency": 2,
       },
-      { "queue": "holdfast-scan-dev-dlq", "max_batch_size": 10 },
+      { "queue": "holdfast-scan-dev-dlq", "max_batch_size": 10, "max_retries": 3 },
     ],
   },
   "images": { "binding": "IMAGES" },
@@ -170,7 +170,7 @@
             "dead_letter_queue": "holdfast-scan-dlq",
             "max_concurrency": 2,
           },
-          { "queue": "holdfast-scan-dlq", "max_batch_size": 10 },
+          { "queue": "holdfast-scan-dlq", "max_batch_size": 10, "max_retries": 3 },
         ],
       },
       "images": { "binding": "IMAGES" },

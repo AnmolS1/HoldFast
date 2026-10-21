@@ -1,0 +1,1 @@
+CREATE INDEX "nodes_owner_purge_requested_idx" ON "nodes" USING btree ("owner_id") WHERE purge_requested_at IS NOT NULL;

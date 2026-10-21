@@ -81,6 +81,7 @@ import {
   verifyZipGrant,
 } from "../services/tokens";
 import { parse } from "./links";
+import { uniqueZipPaths } from "../services/filename";
 
 export const router = new Hono<AppEnv>();
 
@@ -187,7 +188,7 @@ type ResolveOptions = {
  * order: link state, then the password. (Rows 10–11, the file, are `nodeFor`'s.) The link scope
  * is set on success, so every access question after it is about the link alone.
  */
-async function resolveLink(c: Ctx, token: string, opts: ResolveOptions = {}): Promise<Resolved> {
+export async function resolveLink(c: Ctx, token: string, opts: ResolveOptions = {}): Promise<Resolved> {
   // 1
   const link = await findByTokenHash(db(c), await hashLinkToken(token));
   if (!link) throw new AppError("not_found");
@@ -536,6 +537,8 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   const manifest = await zipManifest(db(c), [{ id: root.id, label: root.name, owner: false }], {
     maxFiles: ZIP_MAX_ENTRIES,
   });
+  // Saved paths: reserved names renamed, then unique again (the rename can make two one).
+  const paths = uniqueZipPaths(manifest.entries.map((entry) => entry.path));
   // One zip is one download: both counters, once, here.
   await countDownload(c, link, owner, root.id);
   const grant = await mintZipGrant(keys(c), {
@@ -553,7 +556,8 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   logVisit(c, link.id, root.id, "ok");
   metric("download", { kind: "zip", outcome: "ok", reason: "link" });
   return c.json({
-    entries: manifest.entries,
+    // Every segment as it is saved: a reserved Windows name gets its `_` (services/filename.ts).
+    entries: manifest.entries.map((entry, index) => ({ ...entry, path: paths[index]! })),
     totalBytes: manifest.totalBytes,
     // Empty by construction: nothing that is not clean was walked.
     skipped: [],

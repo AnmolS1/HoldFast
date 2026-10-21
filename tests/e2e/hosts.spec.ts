@@ -29,8 +29,8 @@ test.describe("app origin", () => {
     const csp = headers["content-security-policy"] ?? "";
     for (const directive of [
       "default-src 'self'",
-      "script-src 'self' 'wasm-unsafe-eval' https://challenges.cloudflare.com",
-      "style-src 'self' 'unsafe-inline'",
+      "'strict-dynamic' 'wasm-unsafe-eval' 'report-sample' https://challenges.cloudflare.com;",
+      "style-src 'self' 'nonce-",
       `img-src 'self' data: blob: ${origins.files}`,
       `media-src ${origins.files} blob:`,
       `connect-src 'self' ${origins.files} https://challenges.cloudflare.com`,
@@ -46,7 +46,11 @@ test.describe("app origin", () => {
     }
     // http://localhost: no HSTS, no upgrade-insecure-requests, and never a blanket inline allowance.
     expect(csp).not.toContain("upgrade-insecure-requests");
-    expect(csp).not.toMatch(/script-src[^;]*'unsafe-inline'/);
+    // Scripts and styles run by the response's nonce only: never an inline allowance, anywhere.
+    expect(csp).toMatch(
+      /script-src 'nonce-([A-Za-z0-9+/]{22}==)' 'strict-dynamic'[^;]*; style-src 'self' 'nonce-\1' /,
+    );
+    expect(csp).not.toContain("'unsafe-inline'");
     expect(csp).not.toMatch(/script-src[^;]*'unsafe-eval'/);
     expect(headers["strict-transport-security"]).toBeUndefined();
     expect(headers["x-content-type-options"]).toBe("nosniff");
@@ -56,7 +60,7 @@ test.describe("app origin", () => {
     expect(headers["cross-origin-resource-policy"]).toBe("same-origin");
     expect(headers["reporting-endpoints"]).toBe('csp="/api/public/csp-report"');
     expect(headers["permissions-policy"]).toContain("publickey-credentials-get=(self)");
-    expect(headers["cache-control"]).toBe("no-cache");
+    expect(headers["cache-control"]).toBe("no-store");
 
     // The shell must actually run under the policy: React renders.
     await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();

@@ -17,7 +17,15 @@ import { fileURLToPath } from "node:url";
 import type { Page, Request, Route } from "@playwright/test";
 import type { NodeDto } from "../../src/shared/schemas/node";
 import { detailOf, ID, NODES, nodeOf, pageOf } from "../unit/client/preview/fixtures";
-import { expect, expectNoA11yViolations, mockedOnly, mockEnvelope, mockShell, test } from "./fixtures";
+import {
+  expect,
+  expectNoA11yViolations,
+  mockedOnly,
+  mockEnvelope,
+  mockShell,
+  navigateInApp,
+  test,
+} from "./fixtures";
 
 const FILES_DIR = join(dirname(fileURLToPath(import.meta.url)), "../unit/client/preview/fixtures/files");
 const file = (name: string) => readFileSync(join(FILES_DIR, name));
@@ -218,7 +226,7 @@ async function open(page: Page, nodeId: string): Promise<void> {
   const csp = response?.headers()["content-security-policy"] ?? "";
   expect(csp, "the page's Content-Security-Policy").toContain("default-src 'self'");
   expect(csp).toContain("worker-src 'self' blob:");
-  expect(csp).toMatch(/script-src 'self' 'wasm-unsafe-eval'/);
+  expect(csp).toMatch(/script-src 'nonce-[A-Za-z0-9+/]{22}==' 'strict-dynamic' 'wasm-unsafe-eval'/);
   expect(csp).not.toMatch(/script-src[^;]*'unsafe-(inline|eval)'/);
   await expect(dialog(page)).toBeVisible();
 }
@@ -287,6 +295,30 @@ test.describe("previews (mocked API and files host)", () => {
     await page.keyboard.press("Escape");
     await expect(dialog(page)).toHaveCount(0);
     await expect(page).toHaveURL(/\/$/);
+    expectClean(arranged);
+  });
+
+  test("Back taken before the preview has settled is not undone: the page behind is drawn and stays", async ({
+    page,
+    origins,
+  }) => {
+    const arranged = await arrange(page, origins, [NODES.png]);
+    await page.goto("/");
+    await expect(page.locator("#main")).toBeVisible();
+    // A page whose loader runs on the way back to it (its search differs from the preview's).
+    await navigateInApp(page, "/search?q=sample");
+    await expect(page.locator("[data-search-input]")).toHaveValue("sample");
+    // The opener's entry (no account stamp yet), then Back at once — before the preview's own
+    // replace of its entry (the stamp) has been issued.
+    await navigateInApp(page, `/preview/${ID.png}`);
+    await page.goBack();
+    // The search page is drawn again; a replace from the preview would have put it back instead.
+    await expect(page.locator("[data-search-input]")).toHaveValue("sample");
+    await expect(dialog(page)).toHaveCount(0);
+    expect(new URL(page.url()).pathname + new URL(page.url()).search).toBe("/search?q=sample");
+    // And Forward still finds the preview's own entry.
+    await page.goForward();
+    await expect(dialog(page)).toHaveAccessibleName("sample.png");
     expectClean(arranged);
   });
 

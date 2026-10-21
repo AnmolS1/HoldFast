@@ -20,7 +20,7 @@ import {
   type PublicNodeDto,
 } from "../../../shared/schemas/link";
 import { HEADER_LINK_SESSION } from "../../../shared/constants";
-import type { PreviewItem, PublicPreviewSource } from "../../components/slots";
+import type { PreviewItem, PublicPreviewSource, ReportTarget } from "../../components/slots";
 import { api, ApiError, type ApiErrorCode } from "../../lib/api";
 import { t } from "./strings";
 
@@ -184,6 +184,14 @@ export class LinkClient {
     return this.#unlockedCall("/zip-manifest", { method: "POST", body: {}, schema: PublicZipManifest });
   }
 
+  /**
+   * A report of `nodeId` as this page proves access: the link's token, and the link session as it
+   * is NOW — read at each call, so an unlock after the page was built counts; none while locked.
+   */
+  reportTarget(nodeId: string): ReportTarget {
+    return { nodeId, linkToken: this.token, ...(this.#session ? { linkSession: this.#session } : {}) };
+  }
+
   /** Whether this link has a password at all (the info said so). */
   get needsPassword(): boolean {
     return this.#needsPassword;
@@ -218,7 +226,7 @@ export class LinkClient {
         return { url: minted.url, expiresAt: minted.expiresAt };
       },
       // The previewed file is reported with the link's token: what the visitor was shown.
-      reportTarget: (nodeId: string) => ({ nodeId, linkToken: this.token }),
+      reportTarget: (nodeId: string) => this.reportTarget(nodeId),
     };
   }
 }

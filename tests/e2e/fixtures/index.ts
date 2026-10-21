@@ -7,6 +7,11 @@
 // SPA is `mockShell` (./mock-shell.ts); which of the two a spec uses is `REAL` (./mode.ts).
 import { test as base } from "@playwright/test";
 import { appOrigin, e2ePort, filesOrigin } from "../../setup/local-env";
+import { remoteMode, remoteOrigins } from "./remote";
+import { rolesFor, type Roles } from "./roles";
+import { ROUTE_COVERAGE, watchContext, watchRequests } from "./route-hits";
+import { addressFor } from "./address";
+import { countApiRequests, type ApiRequests } from "./api-requests";
 import { addVirtualAuthenticator, type VirtualAuthenticator } from "./webauthn";
 
 export interface HarnessFixtures {
@@ -25,23 +30,29 @@ export interface HarnessFixtures {
    * (20 auth writes a minute per address) or that exhausts a limit deliberately.
    */
   clientIp: string;
+  /** Signed-in pages per role — owner, editor, viewer, admin with 2FA — made when asked for (./roles.ts). */
+  roles: Roles;
+  /** The `page`'s requests to the app's /api, counted from the start of the test (./api-requests.ts). */
+  apiRequests: ApiRequests;
+}
+
+export interface HarnessWorkerFixtures {
+  /**
+   * Route coverage (./route-hits.ts): with HOLDFAST_ROUTE_COVERAGE=1, every answer the Worker gives
+   * a test of this worker is recorded. Automatic; unset, it does nothing at all.
+   */
+  routeHits: void;
 }
 
 /** See the `page` fixture below. */
 export const MAX_APP_LOADS_PER_TEST = 4;
 
-/** A stable private address per test and attempt: 10.x.y.z from a hash of the test's id. */
-function addressFor(seed: string): string {
-  let hash = 2166136261;
-  for (let index = 0; index < seed.length; index++) {
-    hash ^= seed.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  const bytes = hash >>> 0;
-  return `10.${(bytes >>> 16) & 255}.${(bytes >>> 8) & 255}.${bytes & 255}`;
+function coverageOrigins(): { app: string; files: string } {
+  const port = e2ePort();
+  return { app: appOrigin(port), files: filesOrigin(port) };
 }
 
-export const test = base.extend<HarnessFixtures>({
+export const test = base.extend<HarnessFixtures, HarnessWorkerFixtures>({
   // Every test is held to a few loads of the app document: each is cold (see ./navigate.ts) and
   // costs 2.3–3.3 s on a CI runner, so more than this many put a test near its 30 s on a slow
   // machine. Plain-text answers (a 404 of the files host) are not counted.
@@ -88,8 +99,64 @@ export const test = base.extend<HarnessFixtures>({
     },
     { auto: false },
   ],
+  // Route coverage (./route-hits.ts). Each only watches, and only with HOLDFAST_ROUTE_COVERAGE=1.
+  context: async ({ context }, use) => {
+    if (ROUTE_COVERAGE) {
+      watchContext(context, coverageOrigins());
+      watchRequests(context.request, coverageOrigins());
+    }
+    await use(context);
+  },
+  request: async ({ request }, use) => {
+    if (ROUTE_COVERAGE) watchRequests(request, coverageOrigins());
+    await use(request);
+  },
+  browser: [
+    async ({ browser }, use) => {
+      if (ROUTE_COVERAGE) {
+        // Contexts a test makes for itself (a second user, a signed-out visitor).
+        const newContext = browser.newContext.bind(browser);
+        browser.newContext = async (...args) => {
+          const context = await newContext(...args);
+          watchContext(context, coverageOrigins());
+          watchRequests(context.request, coverageOrigins());
+          return context;
+        };
+      }
+      await use(browser);
+    },
+    { scope: "worker" },
+  ],
+  routeHits: [
+    async ({ playwright }, use) => {
+      if (ROUTE_COVERAGE) {
+        // API contexts a test makes for itself (`playwright.request.newContext()`).
+        const factory = playwright.request;
+        const newContext = factory.newContext.bind(factory);
+        factory.newContext = async (...args) => {
+          const api = await newContext(...args);
+          watchRequests(api, coverageOrigins());
+          return api;
+        };
+      }
+      await use();
+    },
+    { scope: "worker", auto: true },
+  ],
+  roles: async ({ page, browser }, use, testInfo) => {
+    const roles = rolesFor({ page, browser, testInfo, maxLoads: MAX_APP_LOADS_PER_TEST });
+    await use(roles);
+    await roles.close();
+  },
+  // The run's own app origin — a deploy's in a remote run (review m7), this checkout's otherwise.
+  apiRequests: async ({ page, origins }, use) => {
+    await use(countApiRequests(page, origins.app));
+  },
   // eslint-disable-next-line no-empty-pattern -- Playwright requires the destructuring pattern.
   origins: async ({}, use) => {
+    // A remote run (./remote.ts): the deploy's origins.
+    const remote = remoteMode();
+    if (remote !== null) return use(await remoteOrigins(remote));
     const port = e2ePort();
     await use({ app: appOrigin(port), files: filesOrigin(port), port });
   },
@@ -97,6 +164,9 @@ export const test = base.extend<HarnessFixtures>({
 
 export { expect } from "@playwright/test";
 export { expectNoA11yViolations } from "./axe";
+export type { ApiRequest, ApiRequests } from "./api-requests";
+export { testClock, TEST_NOW_HEADER, type TestClock } from "./clock";
+export type { AdminPage, OwnerPage, RolePage, Roles, ShareRole } from "./roles";
 export { navigateInApp } from "./navigate";
 export {
   E2E_DIST,

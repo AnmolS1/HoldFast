@@ -1,10 +1,13 @@
 // The scanning interface: what a scan message is, how one is sent, what a scanner answers, and
 // the one handler for suspected CSAM.
 //
-// The exported signatures are fixed. The scanner behind `getScanner` is a STUB until the real
-// scan pipeline replaces this file's body: with `SCAN_STUB=1` outside production it finds the
-// EICAR test string and calls everything else clean; anywhere else there is no scanner at all,
-// and code that needs one fails ("scanner unavailable") instead of calling a file clean.
+// The exported signatures are fixed. The scanner behind `getScanner` is the REAL one (the
+// container, through scan/adapter.ts) unless `SCAN_STUB=1` outside production, where a stub
+// finds the EICAR test string and calls everything else clean. Either way the verdict carries
+// the SERVER's SHA-256 of every byte read (the stub hashes the whole stream in the Worker), and
+// the stub raises `ScannerNotReadyError` for an object holding `HF-STUB-NOT-READY`, so the hash
+// and retry paths run without Docker. The rest of the pipeline — claim, sniff, hash check,
+// blocklist, verdict, side effects — is the same with either scanner.
 //
 // NO HONO CONTEXT in anything that runs from the queue or a job: those functions take a
 // `ServiceDeps` — routes pass `deps(c)`, the consumer and jobs pass `bg`.
@@ -32,8 +35,11 @@ import {
   lockSuspectedCsam as lockRows,
 } from "../db/queries/moderation";
 import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
+import { clearRequeuedFromDlq, pendingScanCandidates } from "../db/queries/scan";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
+import { scannerOver } from "../scan/adapter";
+import { ScannerNotReadyError } from "../scan/container";
 import { captureError } from "../sentry";
 import { audit } from "./audit";
 import { sendOperatorCritical } from "./email";
@@ -66,7 +72,7 @@ export interface Scanner {
 
 export type ScanMessage = { v: 1; nodeId?: string; key: string; etag?: string; force?: boolean };
 
-/** The stub reads at most this much of an object. */
+/** The stub looks for its test strings in this much of an object; it HASHES all of it. */
 export const STUB_SCAN_MAX_BYTES = 1_048_576;
 export const STUB_ENGINE = "stub";
 export const STUB_SIGNATURE = "Stub.EICAR";
@@ -122,25 +128,36 @@ const EICAR = new TextEncoder().encode(
   "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR" + "-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
 );
 
-function containsEicar(bytes: Uint8Array): boolean {
-  const last = bytes.length - EICAR.length;
+function contains(bytes: Uint8Array, needle: Uint8Array): boolean {
+  const last = bytes.length - needle.length;
   outer: for (
-    let at = bytes.indexOf(EICAR[0]!);
+    let at = bytes.indexOf(needle[0]!);
     at !== -1 && at <= last;
-    at = bytes.indexOf(EICAR[0]!, at + 1)
+    at = bytes.indexOf(needle[0]!, at + 1)
   ) {
-    for (let i = 1; i < EICAR.length; i++) if (bytes[at + i] !== EICAR[i]) continue outer;
+    for (let i = 1; i < needle.length; i++) if (bytes[at + i] !== needle[i]) continue outer;
     return true;
   }
   return false;
 }
 
-function stubVerdict(bytes: Uint8Array, total: number, startedAt: number): ScanVerdict {
-  const infected = containsEicar(bytes);
+/** In an object's first `STUB_SCAN_MAX_BYTES`: the stub answers "not ready" (T20's error). */
+const NOT_READY_MARKER = new TextEncoder().encode("HF-STUB-NOT-READY");
+const STUB_NOT_READY_RETRY_SECONDS = 30;
+
+const hex = (digest: ArrayBuffer) =>
+  Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+
+function stubVerdict(head: Uint8Array, total: number, sha256: string, startedAt: number): ScanVerdict {
+  if (contains(head, NOT_READY_MARKER)) {
+    throw new ScannerNotReadyError("clamd_loading", null, STUB_NOT_READY_RETRY_SECONDS);
+  }
+  const infected = contains(head, EICAR);
   return {
     status: infected ? "infected" : "clean",
     signatures: infected ? [STUB_SIGNATURE] : [],
     pua: [],
+    sha256,
     bytes: total,
     engine: STUB_ENGINE,
     durationMs: Date.now() - startedAt,
@@ -150,25 +167,36 @@ function stubVerdict(bytes: Uint8Array, total: number, startedAt: number): ScanV
 const stubScanner: Scanner = {
   async scanStream(body, meta) {
     const startedAt = Date.now();
+    // The test strings are looked for in the first STUB_SCAN_MAX_BYTES; every byte is hashed.
     const head = new Uint8Array(Math.min(Math.max(meta.size, 0), STUB_SCAN_MAX_BYTES));
     let filled = 0;
+    let total = 0;
+    const digest = new crypto.DigestStream("SHA-256");
+    const writer = digest.getWriter();
     const reader = body.getReader();
     try {
-      while (filled < head.length) {
+      for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        total += value.byteLength;
         const take = Math.min(value.length, head.length - filled);
-        head.set(value.subarray(0, take), filled);
-        filled += take;
+        if (take > 0) {
+          head.set(value.subarray(0, take), filled);
+          filled += take;
+        }
+        await writer.write(value);
       }
-    } finally {
-      // The rest of the object is not read.
+      await writer.close();
+    } catch (error) {
       await reader.cancel().catch(() => {});
+      await writer.abort(error).catch(() => {});
+      throw error;
     }
-    return stubVerdict(head.subarray(0, filled), meta.size, startedAt);
+    return stubVerdict(head.subarray(0, filled), total, hex(await digest.digest), startedAt);
   },
   async scanBytes(bytes) {
-    return stubVerdict(bytes.subarray(0, STUB_SCAN_MAX_BYTES), bytes.length, Date.now());
+    const sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
+    return stubVerdict(bytes.subarray(0, STUB_SCAN_MAX_BYTES), bytes.length, sha256, Date.now());
   },
 };
 
@@ -181,18 +209,47 @@ export function stubEnabled(env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT">):
   return env.SCAN_STUB === "1" && env.SENTRY_ENVIRONMENT !== "production";
 }
 
-/** The scanner of this environment. Throws `scanner unavailable` where there is none. */
-export function getScanner(env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT">): Scanner {
+/**
+ * The scanner of this environment: the stub where `stubEnabled`, otherwise the container
+ * (scan/adapter.ts), whose typed errors pass through. Throws `scanner unavailable` only where
+ * there is no `SCANNER` binding at all.
+ */
+export function getScanner(env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT" | "SCANNER">): Scanner {
   if (stubEnabled(env)) return stubScanner;
-  throw new Error(SCANNER_UNAVAILABLE);
+  if (!env.SCANNER) throw new Error(SCANNER_UNAVAILABLE);
+  return scannerOver(env);
 }
 
-/** The synchronous path for small objects (avatars, at most 5 MB): scanned before they are stored. */
+/**
+ * The synchronous path for small objects (avatars, at most 5 MB): scanned before they are stored.
+ * IT NEVER THROWS for want of a scanner: unavailable, not ready, busy, a transport failure or a
+ * refusal all RETURN `{ status: 'error', reason: 'engine' }` — the caller stores such an avatar as
+ * `error` and never shows it; the user uploads again. (A small scan needs room for one extracted
+ * member, so an avatar sent while a large archive is being extracted is answered `busy` and ends
+ * `error`: accepted, T20 d6.) The verdict always carries the SERVER's `sha256`: the scanner's, or
+ * — when it gave none — this Worker's own.
+ */
 export async function scanSmallObject(
-  env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT">,
+  env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT" | "SCANNER">,
   bytes: Uint8Array,
 ): Promise<ScanVerdict> {
-  return getScanner(env).scanBytes(bytes);
+  try {
+    const verdict = await getScanner(env).scanBytes(bytes);
+    return verdict.sha256
+      ? verdict
+      : { ...verdict, sha256: hex(await crypto.subtle.digest("SHA-256", bytes)) };
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "small" });
+    return {
+      status: "error",
+      reason: "engine",
+      signatures: [],
+      pua: [],
+      sha256: hex(await crypto.subtle.digest("SHA-256", bytes)),
+      bytes: bytes.length,
+      engine: SCANNER_UNAVAILABLE,
+    };
+  }
 }
 
 // ── sending ─────────────────────────────────────────────────────────────────────────────────
@@ -293,14 +350,20 @@ export async function enqueueRescan(
         if (locked.scanStatus === "suspected_csam") return { reason: "locked" };
         // Neither of the two above: what is left of "hidden" is a taken-down folder above it.
         if (await effectiveHidden(tx, nodeId)) return { reason: "taken_down" };
-        if (locked.scanStatus === "under_review") return { key: r2Key };
+        // Every rescan that sends starts a new scan CYCLE: its own one dead-letter re-send.
+        if (locked.scanStatus === "under_review") {
+          await clearRequeuedFromDlq(tx, r2Key);
+          return { key: r2Key };
+        }
         // Already `pending`: with a scan under way an owner has nothing to ask for; without one
         // the message never arrived (or was lost), and what follows sends it (again).
         if (locked.scanStatus === "pending" && opts.by === "owner" && (await hasLiveScanJob(tx, r2Key))) {
           return { busy: true };
         }
         // The statement has the same guard: it changes nothing for the two locked statuses.
-        return (await resetToPending(tx, nodeId)) ? { key: r2Key } : { reason: "locked" };
+        if (!(await resetToPending(tx, nodeId))) return { reason: "locked" };
+        await clearRequeuedFromDlq(tx, r2Key);
+        return { key: r2Key };
       }
       r2Key = (await getNode(tx, nodeId))?.r2Key ?? null;
     }
@@ -320,6 +383,55 @@ export async function enqueueRescan(
   await enqueueScan(deps, { nodeId, key: decision.key, force: true });
   audit(deps, "scan.rescan_requested", { type: "node", id: nodeId }, { by: opts.by });
   return { queued: true };
+}
+
+/** The pending-scan sweep: nodes quiet for longer than this are re-sent (above the first deliveries' backoff). */
+export const PENDING_SCAN_SWEEP_MINUTES = 30;
+export const PENDING_SCAN_SWEEP_DEFAULT_LIMIT = 100;
+
+/**
+ * Re-sends the scan of every `pending` file nothing is scanning: a `pending` current version
+ * with NO live job (`nodes.hasLiveScanJob` — the one definition), quiet for longer than
+ * `PENDING_SCAN_SWEEP_MINUTES` (queries/scan.ts `pendingScanCandidates` says from when), and not
+ * taken down — itself or by a folder above it. What it repairs: a rescan whose send failed after
+ * its reset committed, an R2 event and an explicit message both lost, a message dead-lettered
+ * past every retry.
+ *
+ * Each candidate is decided again under the owner's TREE LOCK and its LOCKED row (the lock order
+ * of `enqueueRescan`); the message — forced, the key taken from the locked row — is sent after
+ * that commit. Oldest first, at most `limit`; a node whose decision or send fails is counted in
+ * `checked` and does not stop the rest. Idempotent: the claim is keyed on the object key, so a
+ * node sent twice gets one verdict, and a job that went live meanwhile makes the message a
+ * duplicate delivery. Nothing is deleted. Called by the hourly abuse job, as its own part.
+ */
+export async function sweepPendingScans(
+  deps: ServiceDeps,
+  opts: { limit?: number } = {},
+): Promise<{ checked: number; requeued: number }> {
+  const limit = Math.max(1, Math.min(opts.limit ?? PENDING_SCAN_SWEEP_DEFAULT_LIMIT, 1_000));
+  const due = await pendingScanCandidates(deps.db, PENDING_SCAN_SWEEP_MINUTES, limit);
+  let requeued = 0;
+  for (const candidate of due) {
+    try {
+      const key = await deps.db.transaction(async (tx) => {
+        await lockOwnerTree(tx, candidate.ownerId);
+        const locked = await findByR2Key(tx, candidate.r2Key, { forUpdate: true });
+        if (!locked || locked.id !== candidate.nodeId || locked.kind !== "file") return null;
+        if (locked.scanStatus !== "pending" || locked.takedownAt !== null) return null;
+        if (await effectiveHidden(tx, locked.id)) return null;
+        if (await hasLiveScanJob(tx, candidate.r2Key)) return null;
+        return candidate.r2Key;
+      });
+      if (key === null) continue;
+      await enqueueScan(deps, { nodeId: candidate.nodeId, key, force: true });
+      requeued += 1;
+    } catch (error) {
+      captureError(error, { kind: "scan", reason: "pending_sweep" });
+      writeMetric(deps.env, "error", { kind: "scan", reason: "pending_sweep" });
+    }
+  }
+  if (requeued > 0) writeMetric(deps.env, "scan", { outcome: "requeued", kind: "sweep" }, requeued);
+  return { checked: due.length, requeued };
 }
 
 // ── suspected CSAM ──────────────────────────────────────────────────────────────────────────

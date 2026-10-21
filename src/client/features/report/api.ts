@@ -1,6 +1,8 @@
 // The one call of the report dialog: the public route when it has a link token (the proof of
-// access on a public page), the signed-in route otherwise. One request per submit — never
-// retried here; a `429` names its wait (`Retry-After`), which the dialog honours.
+// access on a public page — and a password link's session in its header, as the link's own routes
+// take it), the signed-in route otherwise. One request per submit — never retried here; a `429`
+// names its wait (`Retry-After`), which the dialog honours.
+import { HEADER_LINK_SESSION } from "../../../shared/constants";
 import type { ReportBody } from "../../../shared/schemas/report";
 import { ReportResponse } from "../../../shared/schemas/report";
 import type { ReportTarget } from "../../components/slots";
@@ -25,6 +27,7 @@ export function sendReport(target: ReportTarget, input: ReportInput) {
   return api(publicRoute ? "/api/public/report" : "/api/reports", {
     method: "POST",
     body,
+    ...(publicRoute && target.linkSession ? { headers: { [HEADER_LINK_SESSION]: target.linkSession } } : {}),
     schema: ReportResponse,
     // Announced by the dialog itself, in its own words.
     silent: [

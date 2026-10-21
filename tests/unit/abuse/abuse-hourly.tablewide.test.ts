@@ -70,6 +70,7 @@ function only(...keep: Array<keyof typeof parts>) {
     sweepUnrecordedCsamLocks: async () => ({ checked: 0, completed: 0, repeated: 0, skipped: 0, failed: 0 }),
     sweepOwedNodes: async () => ({ checked: 0, locked: 0, refused: 0, stale: 0, skipped: 0, failed: 0 }),
     sweepStrikeThresholds: async () => ({ checked: 0, suspended: 0, failed: 0 }),
+    sweepPendingScans: async () => ({ checked: 0, requeued: 0 }),
     reportAnomalies: async () => [],
   };
   for (const name of Object.keys(noop) as Array<keyof typeof parts>) {
