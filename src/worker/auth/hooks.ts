@@ -200,7 +200,9 @@ const FAILED_TO_CREATE_USER = "FAILED_TO_CREATE_USER";
 /**
  * Gives back what a sign-up took when its account was not created. Never throws.
  * `insertFailed`: Better Auth said the user row could not be written — then a row with that
- * address is another sign-up's, and this one's reservation is given back whatever exists.
+ * address is another sign-up's, and this one's reservation is given back whatever exists. So is
+ * a reservation that creates no row at all (`email` null: a Google sign-up at an account that
+ * was there before — the row at the address is never its own).
  * Otherwise (the request failed somewhere unknown) it is given back only if no such user exists.
  */
 export async function releaseUnusedReservation(scope: AuthScope, insertFailed = false): Promise<void> {
@@ -301,6 +303,10 @@ export function buildHooks(scope: AuthScope) {
       };
       // Invite, velocity and the intent's single use: taken as for any new sign-up.
       const grant = await takeSignup(scope, owner.email, statement, clientOf(scope, ctx), intent.nonce);
+      // This sign-up creates no user: the row at the address is the one that was there before.
+      // Until the cleanup below has made it this sign-up's, an unspent reservation always comes
+      // back — here if the account turns out proven, or from the handler if the cleanup throws.
+      if (scope.reservation) scope.reservation.email = null;
       const removed = await clearUnprovenAccount(scope.db, owner.id, {
         ...grant,
         // The name the row's creator typed is theirs, not the owner's.
