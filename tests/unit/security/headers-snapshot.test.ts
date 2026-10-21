@@ -95,7 +95,7 @@ describe("the header snapshot of both hosts", () => {
     expect(await snapshotNow()).toEqual(baseline);
   });
 
-  it("no cookie on any of them; the policy of the shell is the policy of its scripts", () => {
+  it("no cookie on any of them; the policy of the scripts is the shell's, less report-to", () => {
     for (const host of Object.values(baseline)) {
       for (const [label, answer] of Object.entries(host)) {
         expect(answer.headers, label).not.toHaveProperty("set-cookie");
@@ -103,8 +103,9 @@ describe("the header snapshot of both hosts", () => {
     }
     const app = baseline["app host, https (a deploy)"];
     expect(app["GET /assets/index-x.js"].headers["content-security-policy"]).toBe(
-      app["GET /"].headers["content-security-policy"],
+      app["GET /"].headers["content-security-policy"]!.replace("; report-to csp", ""),
     );
+    expect(app["GET /assets/index-x.js"].headers).not.toHaveProperty("reporting-endpoints");
   });
 
   it("the normaliser replaces whole origins only, and every nonce", () => {

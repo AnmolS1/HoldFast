@@ -4,7 +4,7 @@
 //
 // App host, by kind of response:
 //   HTML (the SPA shell)   the full policy below, with a nonce of its own; never stored.
-//   /assets/ JavaScript    the SAME policy (a fresh nonce nothing uses): a Web Worker runs under
+//   /assets/ JavaScript    the same policy less `report-to` (a fresh nonce nothing uses): a Web Worker runs under
 //                          the policy of its own script response, not the page's — without it a
 //                          worker could eval, compile wasm and fetch anywhere. Still immutable.
 //   other static assets    nosniff; hashed files under /assets/ are immutable, the rest no-cache.
@@ -49,8 +49,12 @@ export function newNonce(): string {
   return btoa(String.fromCharCode(...bytes));
 }
 
-/** The Content-Security-Policy of the app host's HTML and of its /assets/ scripts. */
-export function buildCsp(env: HeaderEnv, nonce: string): string {
+/**
+ * The Content-Security-Policy of the app host's HTML and of its /assets/ scripts. `reportTo: false`
+ * (the scripts) leaves `report-to` out: with it Chromium ignores `report-uri`, and that a dedicated
+ * worker's Reporting-API reports arrive is shown nowhere; `report-uri` is (the e2e).
+ */
+export function buildCsp(env: HeaderEnv, nonce: string, options: { reportTo?: boolean } = {}): string {
   const files = env.FILES_ORIGIN;
   const sentry = sentryOrigin(env);
   const directives = [
@@ -69,7 +73,7 @@ export function buildCsp(env: HeaderEnv, nonce: string): string {
     "form-action 'self'",
     "frame-ancestors 'none'",
     `report-uri ${CSP_REPORT_PATH}`,
-    "report-to csp",
+    ...(options.reportTo === false ? [] : ["report-to csp"]),
     // Only on https: locally it would rewrite the http://files.localhost origin.
     ...(isHttps(env) ? ["upgrade-insecure-requests"] : []),
   ];
@@ -128,12 +132,14 @@ export function assetHeaders(path: string, status: number): Record<string, strin
   };
 }
 
-/** An /assets/ script: the asset set plus the page's policy, so a worker started from it is bound too. */
+/**
+ * An /assets/ script: the asset set plus the page's policy, so a worker started from it is bound
+ * too — without `report-to` (and so without Reporting-Endpoints): its reports go by `report-uri`.
+ */
 export function assetScriptHeaders(env: HeaderEnv, path: string, status: number): Record<string, string> {
   return {
     ...assetHeaders(path, status),
-    "Content-Security-Policy": buildCsp(env, newNonce()),
-    "Reporting-Endpoints": REPORTING_ENDPOINTS,
+    "Content-Security-Policy": buildCsp(env, newNonce(), { reportTo: false }),
   };
 }
 

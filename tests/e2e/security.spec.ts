@@ -94,6 +94,8 @@ function documentPolicy(page: Page): () => string {
  * `report-to`: with it Chromium ignores `report-uri`, and on http it sends no report at all (see
  * the burst test), so a worker's violation would be invisible and "no report" would prove nothing.
  * With `report-uri` alone a worker's violation reaches the report endpoint, where `watch` sees it.
+ * This is exactly what the built app sends on its /assets/ scripts (security-headers.ts
+ * `assetScriptHeaders`, Addendum 3 F2).
  */
 async function policyOnScripts(page: Page, pattern: RegExp, policyOf: () => string): Promise<string[]> {
   const served: string[] = [];

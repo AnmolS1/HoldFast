@@ -233,7 +233,11 @@ describe("/assets/ scripts carry the policy too (a worker runs under its own scr
       expect(csp, path).toContain(
         "connect-src 'self' http://files.localhost https://challenges.cloudflare.com",
       );
-      expect(response.headers.get("reporting-endpoints"), path).toBe('csp="/api/public/csp-report"');
+      // report-uri only (Addendum 3 F2): with report-to in a policy Chromium ignores report-uri, and a
+      // worker's Reporting-API delivery is proven nowhere; report-uri is (tests/e2e/security.spec.ts).
+      expect(csp, path).toMatch(/; report-uri \/api\/public\/csp-report$/);
+      expect(csp, path).not.toContain("report-to");
+      expect(response.headers.get("reporting-endpoints"), path).toBeNull();
       expect(response.headers.get("cache-control"), path).toBe("public, max-age=31536000, immutable");
       expect(await response.text(), path).toBe("export {}");
     }
