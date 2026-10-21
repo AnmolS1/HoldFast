@@ -9,8 +9,7 @@ import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import { isUuid } from "../ids";
-import type { Sealed } from "../../services/tokens";
-import { ended, FINISHED_TRIM_DAYS } from "./uploads";
+import { ended, FINISHED_TRIM_DAYS, type SealedIp } from "./uploads";
 import { type Node, nodes, type Upload, uploadParts, uploads, user } from "../schema";
 
 const LIVE_NAME_INDEXES = ["nodes_live_name_root_uq", "nodes_live_name_child_uq"] as const;
@@ -62,7 +61,7 @@ export async function create(
     purpose: "file" | "avatar";
     fileLastModified: Date;
     expiresAt: Date;
-    sealedIp: Sealed;
+    sealedIp: SealedIp;
   },
 ): Promise<Upload> {
   const { sealedIp, ...values } = session;

@@ -237,7 +237,8 @@ describe("ended()", () => {
       for (const m of source.matchAll(/\.update\(uploads\)\s*\.set\(([\s\S]*?)\)\s*\.(where|returning)\(/g)) {
         updates += 1;
         const set = m[1]!.trim();
-        if (/["'](done|aborted)["']/.test(set) && !/^ended\(["'](done|aborted)["']\)$/.test(set)) offenders.push(`${file}: .set(${set})`);
+        if (/["'](done|aborted)["']/.test(set) && !/^ended\(["'](done|aborted)["']\)$/.test(set))
+          offenders.push(`${file}: .set(${set})`);
       }
     }
     // The scan saw the updates it is about (claim, the three terminal helpers, the trash purge…).

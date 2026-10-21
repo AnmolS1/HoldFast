@@ -61,7 +61,8 @@ async function secretsOf(uploadId: string): Promise<string[]> {
 const NAMES = /ip_?enc|ipEncrypted|ip_?iv|keyVersion|key_version|sealed/i;
 function assertClean(text: string, secrets: string[], what: string) {
   expect(NAMES.test(text), `${what} names the sealed address`).toBe(false);
-  for (const ip of [AT_INIT, AT_RESUME, AT_COMPLETE]) expect(text.includes(ip), `${what} carries an address`).toBe(false);
+  for (const ip of [AT_INIT, AT_RESUME, AT_COMPLETE])
+    expect(text.includes(ip), `${what} carries an address`).toBe(false);
   for (const s of secrets) expect(text.includes(s), `${what} carries the sealed bytes`).toBe(false);
 }
 
@@ -99,7 +100,11 @@ describe("init seals the uploader's address on the session", () => {
 
   it("an avatar session too, and a multipart one", async () => {
     const user = await uploader({ quotaBytes: 20 * GB });
-    const avatar = await init(user, { purpose: "avatar", mimeDeclared: "image/png", size: 100 }, from(AT_INIT));
+    const avatar = await init(
+      user,
+      { purpose: "avatar", mimeDeclared: "image/png", size: 100 },
+      from(AT_INIT),
+    );
     expect(await holds(avatar.uploadId, AT_INIT)).toBe(true);
     const big = await init(user, { size: SINGLE_PUT_MAX + 1 }, from(AT_INIT));
     expect(big.mode).toBe("multipart");
@@ -109,10 +114,16 @@ describe("init seals the uploader's address on the session", () => {
   it("DECISION: a resume keeps the address of the init that created the session — nothing is written on that path", async () => {
     const user = await uploader();
     const body = initBody();
-    const first = await call<{ uploadId: string }>(user, "POST", "/uploads", { json: body, ...from(AT_INIT) });
+    const first = await call<{ uploadId: string }>(user, "POST", "/uploads", {
+      json: body,
+      ...from(AT_INIT),
+    });
     expect(first.status).toBe(201);
     const before = (await sessionRow(first.body.uploadId))!;
-    const again = await call<{ uploadId: string }>(user, "POST", "/uploads", { json: body, ...from(AT_RESUME) });
+    const again = await call<{ uploadId: string }>(user, "POST", "/uploads", {
+      json: body,
+      ...from(AT_RESUME),
+    });
     expect(again.status).toBe(200);
     expect(again.body.uploadId).toBe(first.body.uploadId);
     const after = (await sessionRow(first.body.uploadId))!;
@@ -203,7 +214,10 @@ describe("never exposed", () => {
   it("not in init's answer, a resume's, GET /uploads/open, a part or single PUT, complete's — nor in any audit row of the session", async () => {
     const user: UserRow = await uploader();
     const body = initBody();
-    const created = await call<{ uploadId: string }>(user, "POST", "/uploads", { json: body, ...from(AT_INIT) });
+    const created = await call<{ uploadId: string }>(user, "POST", "/uploads", {
+      json: body,
+      ...from(AT_INIT),
+    });
     const id = created.body.uploadId;
     const secrets = await secretsOf(id);
     expect(secrets.length).toBe(4); // the scan below is looking for something
@@ -231,6 +245,7 @@ describe("never exposed", () => {
       .from(auditLog)
       .where(inArray(auditLog.targetId, [id, node, blocked.uploadId]));
     expect(rows.length).toBeGreaterThan(0);
-    for (const row of rows) assertClean(JSON.stringify(row), [...secrets, ...blockedSecrets], `audit ${row.action}`);
+    for (const row of rows)
+      assertClean(JSON.stringify(row), [...secrets, ...blockedSecrets], `audit ${row.action}`);
   });
 });

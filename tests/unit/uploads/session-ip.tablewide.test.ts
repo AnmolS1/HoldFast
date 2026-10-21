@@ -23,13 +23,20 @@ beforeAll(generationInStep);
 
 const HOUR = 3_600_000;
 const ago = (ms: number) => new Date(Date.now() - ms);
-const SEALED = { ipEncrypted: new Uint8Array([1, 2, 3, 4, 5]), ipIv: new Uint8Array(12).fill(3), ipKeyVersion: 1 };
+const SEALED = {
+  ipEncrypted: new Uint8Array([1, 2, 3, 4, 5]),
+  ipIv: new Uint8Array(12).fill(3),
+  ipKeyVersion: 1,
+};
 const CLEARED = { ipEncrypted: null, ipIv: null, ipKeyVersion: null };
 
-const hex = () => [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const hex = () =>
+  [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 async function run() {
-  return staleUploadsJob.run(jobContext().bg, env, cronEvent(staleUploadsJob.cron), { softDeadlineMs: 120_000 });
+  return staleUploadsJob.run(jobContext().bg, env, cronEvent(staleUploadsJob.cron), {
+    softDeadlineMs: 120_000,
+  });
 }
 
 describe("the stale-upload job clears the sealed address of every session it ends", () => {
@@ -39,7 +46,11 @@ describe("the stale-upload job clears the sealed address of every session it end
 
     const stuck = { status: "completing" as const, completingAt: ago(2 * HOUR) };
     const committed = await makeUpload(owner.id, owner.id, { ...SEALED, ...stuck, size: 100 });
-    await makeFile(owner.id, null, { id: committed.nodeId, versionId: committed.versionId, r2Key: committed.r2Key });
+    await makeFile(owner.id, null, {
+      id: committed.nodeId,
+      versionId: committed.versionId,
+      r2Key: committed.r2Key,
+    });
     await putObject(committed.r2Key, "committed");
 
     const lost = await makeUpload(owner.id, owner.id, { ...SEALED, ...stuck, size: 70 });
@@ -47,7 +58,12 @@ describe("the stale-upload job clears the sealed address of every session it end
     // Owes a locked node: its declared hash is csam-listed — the repair sweep's, not the job's.
     const sha256 = hex();
     await blocklist.upsert(testDb(), { sha256, reason: "csam" });
-    const owed = await makeUpload(owner.id, owner.id, { ...SEALED, ...stuck, size: 300, expectedSha256: sha256 });
+    const owed = await makeUpload(owner.id, owner.id, {
+      ...SEALED,
+      ...stuck,
+      size: 300,
+      expectedSha256: sha256,
+    });
     await putObject(owed.r2Key, "verified bytes, owed a node");
 
     expect(await run()).toEqual({ done: true });

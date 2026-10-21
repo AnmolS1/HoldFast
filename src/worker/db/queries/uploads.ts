@@ -9,7 +9,6 @@
 import { and, eq, gt, inArray, isNull, lt, lte, ne, not, or, sql, type SQL } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
-import type { Sealed } from "../../services/tokens";
 import { type Upload, uploadParts, uploads, user } from "../schema";
 import { nodeProtected, userHeld } from "./holds";
 
@@ -122,13 +121,18 @@ export function ended(status: "done" | "aborted") {
 }
 
 /**
+ * A sealed address in its three parts — the shape of `Sealed` in services/tokens.ts (`sealIp`
+ * returns it, `openIp` takes it). Not imported from there: a query module stays free of the
+ * Workers runtime types that module needs (the db tests type-check without them).
+ */
+export type SealedIp = { ciphertext: Uint8Array; iv: Uint8Array; keyVersion: number };
+
+/**
  * The uploader's address as init sealed it on the session — the three parts `openIp` and
  * `uploadIps.record` take — or null: a session from before the column, a finished one (cleared),
  * or a partial triple, which is never handed on.
  */
-export function sealedIpOf(
-  session: Pick<Upload, "ipEncrypted" | "ipIv" | "ipKeyVersion">,
-): Sealed | null {
+export function sealedIpOf(session: Pick<Upload, "ipEncrypted" | "ipIv" | "ipKeyVersion">): SealedIp | null {
   const { ipEncrypted, ipIv, ipKeyVersion } = session;
   if (ipEncrypted === null || ipIv === null || ipKeyVersion === null) return null;
   return { ciphertext: ipEncrypted, iv: ipIv, keyVersion: ipKeyVersion };
