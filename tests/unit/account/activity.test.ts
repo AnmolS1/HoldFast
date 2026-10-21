@@ -1,10 +1,15 @@
 // GET /api/account/activity: the account's own sign-in history — an allow-list of auth events
 // ABOUT the account, the newest 20, and never a node event (a held "delete forever" writes no
 // `node.purge`, an unheld one does).
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { generationInStep } from "../trash/helpers";
 import { insertAudit, type AuditRow } from "../../../src/worker/db/queries/audit";
 import { CAPTCHA, newClient, send, verifiedUser } from "../auth/helpers";
 import { api, impersonated, makeFile, person, testDb } from "../nodes/helpers";
+
+// "Delete forever" asks the rollback detector first (PLAN §6 rule 17): this file's own bucket gets
+// the database's generation, so an unheld purge really purges whatever other files counted.
+beforeAll(generationInStep);
 
 type Activity = Array<{
   id: string;

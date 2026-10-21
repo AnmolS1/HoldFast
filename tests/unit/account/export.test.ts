@@ -1,7 +1,8 @@
 // GET /api/account/export: what the file holds, what it never holds, and that a held account's
 // export is the same as an unheld one's.
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { generationInStep } from "../trash/helpers";
 import { ExportManifest } from "../../../src/shared/schemas/account";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
@@ -18,6 +19,10 @@ import {
   rand,
   testDb,
 } from "../nodes/helpers";
+
+// "Delete forever" asks the rollback detector first (PLAN §6 rule 17): this file's own bucket gets
+// the database's generation, so an unheld purge really purges whatever other files counted.
+beforeAll(generationInStep);
 
 type Manifest = ExportManifest;
 
