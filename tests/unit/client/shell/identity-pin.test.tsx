@@ -32,9 +32,9 @@ beforeEach(async () => {
   await adoptIdentity(ALICE);
 });
 
-const pinOf = (call: MockCall) => call.headers[IDENTITY_HEADER];
+const pinOf = (call: MockCall) => new Headers(call.headers as HeadersInit).get(IDENTITY_HEADER) ?? undefined;
 
-function server(answer: (call: MockCall) => Response | undefined) {
+function server(answer: (call: MockCall) => Response | Promise<Response> | undefined) {
   return mockFetch((call) => {
     if (call.path === "/api/auth/get-session") return json(browser);
     return answer(call);
@@ -42,7 +42,8 @@ function server(answer: (call: MockCall) => Response | undefined) {
 }
 
 describe("the request names the account", () => {
-  it("every /api/* request carries the known account's id — not /api/auth/*, not /api/public/*", async () => {
+  // Review M2: /api/auth/* is pinned too (the Worker exempts only the identity endpoints).
+  it("every /api/* request carries the known account's id, /api/auth/* included — not /api/public/*", async () => {
     const calls = server(() => json({ ok: true }));
     await api("/api/nodes");
     await api("/api/nodes/n1", { method: "PATCH", body: { name: "x" } });
@@ -52,7 +53,7 @@ describe("the request names the account", () => {
       ["/api/nodes", ALICE.user.id],
       ["/api/nodes/n1", ALICE.user.id],
       ["/api/public/config", null],
-      ["/api/auth/list-sessions", null],
+      ["/api/auth/list-sessions", ALICE.user.id],
     ]);
   });
 
@@ -62,6 +63,29 @@ describe("the request names the account", () => {
     const calls = server(() => json({ ok: true }));
     await api("/api/nodes");
     expect(pinOf(calls[0]!)).toBeUndefined();
+  });
+});
+
+describe("the auth client (Better Auth) names the account too", () => {
+  it("its requests carry the known account's id", async () => {
+    const calls = server(() => json({ success: true }));
+    const { betterAuthClient } = await import("../../../../src/client/lib/auth-client");
+    await betterAuthClient.listSessions();
+    await betterAuthClient.changePassword({ currentPassword: "x", newPassword: "y" });
+    const sent = calls.filter((call) => call.path.startsWith("/api/auth/"));
+    expect(sent.map((call) => [call.path, pinOf(call) ?? null])).toEqual([
+      ["/api/auth/list-sessions", ALICE.user.id],
+      ["/api/auth/change-password", ALICE.user.id],
+    ]);
+  });
+
+  it("its refusal as another account starts the same adoption", async () => {
+    browser = BOB;
+    server((call) => (call.path === "/api/auth/change-password" ? MISMATCH() : undefined));
+    const { betterAuthClient } = await import("../../../../src/client/lib/auth-client");
+    await betterAuthClient.changePassword({ currentPassword: "x", newPassword: "y" });
+    await expect.poll(() => getKnownUserId()).toBe(BOB.user.id);
+    await expect.poll(() => navigated).toEqual(["/"]);
   });
 });
 

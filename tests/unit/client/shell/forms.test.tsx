@@ -365,7 +365,14 @@ describe("sign-in screen", () => {
   });
 
   it("when the auth endpoint cannot be reached the screen says so, generically", async () => {
-    shellFetch({ session: null });
+    // The network itself fails (the auth client now fetches through the page's own `fetch`).
+    shellFetch({
+      session: null,
+      extra: (call) => {
+        if (call.path === "/api/auth/sign-in/email") throw new TypeError("Failed to fetch");
+        return undefined;
+      },
+    });
     renderRoutes(buildRoutes(), ["/login"]);
     await screen.findByRole("heading", { name: "Sign in" });
     fill({ email: "ada@example.com", password: "anything" });

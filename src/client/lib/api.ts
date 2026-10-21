@@ -254,12 +254,13 @@ export function cancelTermsGate(): void {
 /** The header name (src/shared/constants.ts), as `Headers` spells it. */
 export const IDENTITY_HEADER = HEADER_USER.toLowerCase();
 
-/** Paths that never act for an account's data: the pin is not sent there. */
+/**
+ * Where the pin is sent: every `/api/*` path but `/api/public/*` (nothing there acts for an
+ * account). Under `/api/auth/*` the Worker itself leaves the identity endpoints unpinned.
+ */
 function pinned(path: string): boolean {
   const pathname = pathnameOf(path);
-  return (
-    pathname.startsWith("/api/") && !pathname.startsWith("/api/auth/") && !pathname.startsWith("/api/public/")
-  );
+  return pathname.startsWith("/api/") && !pathname.startsWith("/api/public/");
 }
 
 /** The account this client's state belongs to now (what `api()` captures when a call starts). */

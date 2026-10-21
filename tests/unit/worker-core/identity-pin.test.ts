@@ -73,10 +73,10 @@ describe("identity pin", () => {
     expect((await send("/api/nodes", { headers: claiming("") })).status).toBe(403);
   });
 
-  it("not on /api/auth/*, /api/public/*, /api/health: they answer whoever asks", async () => {
+  it("not on /api/public/*, /api/health, nor the identity endpoints of /api/auth (get-session…): they answer whoever asks", async () => {
     const { fake, send } = setup();
     signIn(fake, { id: OTHER });
-    for (const path of ["/api/auth/ok", "/api/public/config-probe", "/api/health"]) {
+    for (const path of ["/api/auth/get-session", "/api/public/config-probe", "/api/health"]) {
       const answer = await send(path, { headers: claiming(ME) });
       expect(answer.status, path).not.toBe(403);
     }
@@ -88,6 +88,16 @@ describe("identity pin", () => {
     // if the pin came later.
     signIn(fake, { id: OTHER, termsVersion: "old" }, { impersonatedBy: "a".repeat(32) });
     const answer = await send("/api/nodes/abc", { method: "POST", headers: claiming(ME, sameOrigin) });
+    expect(answer.body).toMatchObject({ details: { reason: "identity_mismatch" } });
+  });
+
+  it("an /api/auth endpoint that changes the account is pinned (the full list: identity-pin-auth.test.ts)", async () => {
+    const { fake, send } = setup();
+    signIn(fake, { id: OTHER });
+    const answer = await send("/api/auth/change-password", {
+      method: "POST",
+      headers: claiming(ME, sameOrigin),
+    });
     expect(answer.body).toMatchObject({ details: { reason: "identity_mismatch" } });
   });
 
