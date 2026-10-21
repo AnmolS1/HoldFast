@@ -79,6 +79,7 @@ const linkDto = {
   allowPreview: true,
   createdAt: AT,
   lastAccessAt: null,
+  limitedToday: false,
 };
 const shareDto = {
   id: ROW,

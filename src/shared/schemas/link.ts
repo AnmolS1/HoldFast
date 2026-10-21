@@ -51,6 +51,9 @@ export function ownerCanUnpause(stored: readonly string[], lockedByAdmin: boolea
 /**
  * `url` is the full public URL, derived again from the sealed token on every owner read, so
  * "Copy link" works later. It is `null` for an impersonated session.
+ * `limitedToday`: the link's daily download count or daily bytes are used up right now — it is
+ * refused with `429` until the UTC day rolls over, and is NOT paused (`state` stays live and
+ * `pausedReasons` empty). Absent or false otherwise.
  */
 export const LinkDto = z.object({
   id: RowId,
@@ -68,6 +71,7 @@ export const LinkDto = z.object({
   allowPreview: z.boolean(),
   createdAt: Timestamp,
   lastAccessAt: Timestamp.nullable(),
+  limitedToday: z.boolean().optional(),
 });
 export type LinkDto = z.infer<typeof LinkDto>;
 
