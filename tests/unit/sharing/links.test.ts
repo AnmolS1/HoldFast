@@ -285,6 +285,55 @@ describe("DELETE /links/:id", () => {
   });
 });
 
+describe("DELETE /links/:id — decided by who created the link (Addendum 6)", () => {
+  it("a link on a node inside a taken-down folder: listed, and revoked by its creator — access ends", async () => {
+    const owner = await member();
+    const down = await makeFolder(owner.id);
+    const file = await makeFile(owner.id, (await makeFolder(owner.id, down.id)).id, { scanStatus: "clean" });
+    const made = (await createLink(owner, file.id)).body as LinkDto;
+    await testDb().update(nodes).set({ takedownAt: new Date() }).where(eq(nodes.id, down.id));
+    await pauseLinks(testDb(), { subtreeOf: down.id }, "moderation");
+    expect((await mine(owner)).some((link) => link.id === made.id)).toBe(true);
+    expect((await api(asCaller(owner), `/links/${made.id}`, { method: "DELETE" })).status).toBe(204);
+    expect((await linkById(made.id)).revokedAt).not.toBeNull();
+    const visit = await api(null, `/public/links/${made.url!.slice(made.url!.lastIndexOf("/") + 1)}`);
+    expect([visit.status, (visit.body as { details?: { reason?: string } }).details?.reason]).toEqual([
+      410,
+      "revoked",
+    ]);
+    // PATCH still asks for the node: a hidden node's link is not changed.
+    expect((await patch(owner, made.id, { allowPreview: false })).status).toBe(404);
+  });
+
+  it("a link on a legally held node of a held owner: revoked, its row and its access log kept", async () => {
+    const owner = await member({ legalHold: true });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", legalHold: true });
+    const made = (await createLink(owner, file.id)).body as LinkDto;
+    await testDb()
+      .insert(linkAccessLog)
+      .values({ linkId: made.id, nodeId: file.id, outcome: "ok", ipHashDaily: "made-up-hash" });
+    expect((await api(asCaller(owner), `/links/${made.id}`, { method: "DELETE" })).status).toBe(204);
+    const row = await linkById(made.id);
+    expect(row.revokedAt).not.toBeNull();
+    expect(await testDb().select().from(linkAccessLog).where(eq(linkAccessLog.linkId, made.id))).toHaveLength(
+      1,
+    );
+  });
+
+  it("anyone but the creator gets 404, like an unknown id — the link untouched", async () => {
+    const owner = await member();
+    const stranger = await member();
+    const made = (await createLink(owner, (await makeFolder(owner.id)).id)).body as LinkDto;
+    const foreign = await api(asCaller(stranger), `/links/${made.id}`, { method: "DELETE" });
+    const unknown = await api(asCaller(stranger), "/links/0199d3c2-7a10-7000-8000-00000000cccc", {
+      method: "DELETE",
+    });
+    expect(envelope(foreign)).toEqual(envelope(unknown));
+    expect(foreign.status).toBe(404);
+    expect((await linkById(made.id)).revokedAt).toBeNull();
+  });
+});
+
 describe("GET /links/mine", () => {
   it("every link with its state; a link inside a taken-down folder reads paused ['review'] once the subtree pause is applied", async () => {
     const owner = await member();

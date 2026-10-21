@@ -313,7 +313,12 @@ router.patch(`/links/${ID}`, async (c) => {
 
 router.delete(`/links/${ID}`, async (c) => {
   const user = requireVerified(c);
-  const link = await ownLink(c, c.req.param("id"), user.id);
+  // Decided by who created the link, not by the node (Addendum 6, as ruling #23 for the
+  // activity): a link the owner is shown — paused on a node that is hidden now — is theirs to end.
+  // Revoking only narrows access, and tells them nothing the list has not. The row is kept: a
+  // revoked link is a stamped row, never a deleted one (a legal hold keeps its log with it).
+  const link = await linkWithNodeById(db(c), c.req.param("id"));
+  if (!link || link.createdBy !== user.id) throw new AppError("not_found");
   if (await revokeLink(db(c), link.id)) {
     audit(c, "link.revoke", target(link.nodeId), { linkId: link.id });
     metric("link", { kind: "revoke", outcome: "ok" });
