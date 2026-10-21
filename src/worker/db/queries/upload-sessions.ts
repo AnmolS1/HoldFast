@@ -9,7 +9,8 @@ import { and, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import { isUuid } from "../ids";
-import { FINISHED_TRIM_DAYS } from "./uploads";
+import type { Sealed } from "../../services/tokens";
+import { ended, FINISHED_TRIM_DAYS } from "./uploads";
 import { type Node, nodes, type Upload, uploadParts, uploads, user } from "../schema";
 
 const LIVE_NAME_INDEXES = ["nodes_live_name_root_uq", "nodes_live_name_child_uq"] as const;
@@ -39,6 +40,7 @@ export async function get(db: Executor, uploadId: string): Promise<Upload | null
 /**
  * Inserts an `open` session. For purpose 'file' the caller has reserved `size` bytes on the
  * owner in the same transaction (the row is what holds the reservation from here on).
+ * `sealedIp`: the uploader's address as `sealIp` sealed it — kept on the session until it ends.
  */
 export async function create(
   tx: Executor,
@@ -60,11 +62,19 @@ export async function create(
     purpose: "file" | "avatar";
     fileLastModified: Date;
     expiresAt: Date;
+    sealedIp: Sealed;
   },
 ): Promise<Upload> {
+  const { sealedIp, ...values } = session;
   const [row] = await tx
     .insert(uploads)
-    .values({ ...session, status: "open" })
+    .values({
+      ...values,
+      status: "open",
+      ipEncrypted: sealedIp.ciphertext,
+      ipIv: sealedIp.iv,
+      ipKeyVersion: sealedIp.keyVersion,
+    })
     .returning();
   return row!;
 }
@@ -239,7 +249,7 @@ export async function abortOpen(tx: Executor, uploadId: string, uploaderId: stri
   return tx.transaction(async (sp) => {
     const rows = await sp
       .update(uploads)
-      .set({ status: "aborted", completedAt: sql`now()` })
+      .set(ended("aborted"))
       .where(and(eq(uploads.id, uploadId), eq(uploads.uploaderId, uploaderId), eq(uploads.status, "open")))
       .returning({ id: uploads.id });
     if (rows.length === 0) return false;
