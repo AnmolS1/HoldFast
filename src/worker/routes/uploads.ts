@@ -86,7 +86,7 @@ import { jsonBody } from "../services/body";
 import { enforceUploadCeilings, recordUsage } from "../services/ceilings";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
-import { extOf, nameKeyOf, sanitizeName } from "../services/filename";
+import { byteLength, extOf, fitName, MAX_NAME_BYTES, nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
 import { sendOperatorCritical } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES, thumbEligible } from "../services/mime";
@@ -117,7 +117,6 @@ const EXPIRY_MAX_DAYS = 6;
 const NAME_ATTEMPTS = 6;
 /** How many "name (n)" candidates one query asks about. */
 const NAME_BATCH = 50;
-const MAX_NAME_LENGTH = 255;
 
 export const REPLACE_REFUSED_MESSAGE = "This file can't be replaced right now.";
 export const BLOCKED_MESSAGE = "This file can't be stored here.";
@@ -173,7 +172,10 @@ function suffixed(name: string, n: number): string {
   const tail = ext === "" ? "" : name.slice(-ext.length - 1);
   const suffix = ` (${n})`;
   const stem = name.slice(0, name.length - tail.length).replace(/ \(\d{1,4}\)$/, "");
-  return stem.slice(0, Math.max(1, MAX_NAME_LENGTH - suffix.length - tail.length)).trimEnd() + suffix + tail;
+  // Cut in BYTES of UTF-8, never inside a character (services/filename.ts `fitName`); at least the
+  // first character stays.
+  const fitted = fitName(stem, "", MAX_NAME_BYTES - byteLength(suffix + tail)).trimEnd();
+  return (fitted || [...stem][0] || "") + suffix + tail;
 }
 
 /** The first "name (n)" nothing live in the folder holds, counting from `from`. */
