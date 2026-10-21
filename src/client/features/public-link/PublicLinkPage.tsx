@@ -21,6 +21,7 @@ import {
   useEffect,
   useId,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type FormEvent,
@@ -292,12 +293,15 @@ function FolderView({
   const { busy, problem, download } = useDownload(client, askDanger);
   const [zip, setZip] = useState<{ done: number; total: number; controller: AbortController } | null>(null);
   const [zipNotice, setZipNotice] = useState<string | null>(null);
-  // The zip stops with the page.
-  useEffect(() => () => zip?.controller.abort(), [zip]);
+  // The zip stops with the page — on unmount only (a progress update is a new state object, and
+  // must not end the zip it reports on).
+  const running = useRef<AbortController | null>(null);
+  useEffect(() => () => running.current?.abort(), []);
 
   const files = items.filter((item) => item.kind === "file");
   const runZip = async () => {
     const controller = new AbortController();
+    running.current = controller;
     setZipNotice(null);
     setZip({ done: 0, total: 0, controller });
     const run: ZipRun = await zipFolder(client, root.name, {
@@ -307,6 +311,7 @@ function FolderView({
       save: saveBlob,
     });
     setZip(null);
+    running.current = null;
     const unavailable =
       run.unavailable === 0
         ? ""

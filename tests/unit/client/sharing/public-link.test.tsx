@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HEADER_LINK_SESSION } from "../../../../src/shared/constants";
 import { LinkClient } from "../../../../src/client/features/public-link/client";
 import { preloadRenderers } from "../preview/helpers";
+import { deferred } from "../views/helpers";
 import {
   envelope,
   FILE_ID,
@@ -321,6 +322,26 @@ describe("a folder", () => {
     const mints = calls.filter((call) => call.path === publicPath("/download-url"));
     for (const mint of mints)
       expect(mint.body).toMatchObject({ kind: "download", zipGrant: "made-up-grant" });
+  });
+
+  it("progress re-renders while the files arrive do not cancel the zip", async () => {
+    const first = deferred<Response>();
+    await openPublic({
+      [`GET ${publicPath()}`]: info(publicFolder()),
+      [`GET ${publicPath("/children")}`]: children(files),
+      [`POST ${publicPath("/zip-manifest")}`]: manifest,
+      [`POST ${publicPath("/download-url")}`]: (call) =>
+        json(minted("d", (call.body as { nodeId: string }).nodeId)),
+      "GET /d/0199d3c2-7a10-7000-8000-0000000000a1/made-up-token": () => first.promise,
+      "GET /d/0199d3c2-7a10-7000-8000-0000000000a2/made-up-token": () => new Response("bbb"),
+    });
+    await screen.findByRole("button", { name: "Download a.txt" });
+    fireEvent.click(screen.getByRole("button", { name: "Download all as zip" }));
+    // The page draws its progress while the first file is still on its way.
+    expect(await screen.findByText(/Making the zip… [0-9]+ of 2/)).toBeTruthy();
+    await act(async () => first.resolve(new Response("aaa")));
+    expect(await screen.findByText(/^Zip saved\./)).toBeTruthy();
+    expect(saved).toHaveLength(1);
   });
 
   it("a password change while the zip runs: it stops at the next mint, saves NOTHING, and the form shows", async () => {
