@@ -271,6 +271,18 @@ async function readManifest(
   return merged;
 }
 
+/** The text file a zip may carry about what it does not hold. */
+export const NOT_INCLUDED_FILE = "_not_included.txt";
+
+export interface ZipOptions {
+  /**
+   * The text of NOT_INCLUDED_FILE, written as the archive's last entry — or null for none. Called
+   * once the files are in, with what the manifest left out and whether it was cut at
+   * ZIP_MAX_ENTRIES. Without it (the explorer's own zips) the archive holds the files only.
+   */
+  notIncluded?(what: Pick<ZipResult, "leftOut" | "truncated">): string | null;
+}
+
 /**
  * Zip the given files and folders — or, given `{ allOwned: true }`, everything the caller owns —
  * into one download. `suggestedName` is the archive's name without the extension. Never throws:
@@ -280,6 +292,7 @@ async function readManifest(
 export async function startZip(
   nodeIds: readonly string[] | ZipManifestBody,
   suggestedName: string,
+  options: ZipOptions = {},
 ): Promise<ZipResult> {
   const then = accountEpoch();
   const mine = () => sameAccount(then);
@@ -512,6 +525,17 @@ export async function startZip(
           }),
         );
         yield { name, lastModified: new Date(entry.modifiedAt), input: counted };
+      }
+      // What the manifest left out, as a file in the archive itself (when the caller asks).
+      const notIncluded = options.notIncluded?.({ leftOut: result.leftOut, truncated: result.truncated });
+      if (notIncluded) {
+        signal.throwIfAborted();
+        yield {
+          name: uniqueZipPath(NOT_INCLUDED_FILE, names),
+          lastModified: new Date(),
+          // Bytes, not a string: client-zip reads a string through Blob.stream().
+          input: new TextEncoder().encode(notIncluded),
+        };
       }
     }
 
