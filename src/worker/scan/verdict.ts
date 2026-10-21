@@ -18,7 +18,8 @@
 //   pending, not taken down              the status (and reason); the side effects below
 //   taken down (itself or a folder       status untouched; the outcome is kept in the detail and
 //     above it — `effectiveHidden`)        the job's verdict only
-//   under_review                         `scanStatusPrev` (what dismissing the report restores)
+//   under_review                         `scanStatusPrev` (what dismissing the report restores), and
+//                                          the infected / takedown effects all the same (Addendum 2)
 //   suspected_csam, or already settled   untouched (a late or duplicate message: metric `stale`)
 // In every row the server hash, the sniffed type, the detail and the scan time are written (the
 // record of what the scanner saw; none of them opens or closes access) — except when the key is no
@@ -388,7 +389,12 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);
-    } else if (node.scanStatus === "pending") {
+    } else if (node.scanStatus === "pending" || node.scanStatus === "under_review") {
+      // `pending`: the status. `under_review`: `setScanResult` stores the outcome as the status a
+      // dismissal restores — and the effects below still apply (Addendum 2): a blocklisted hash
+      // is taken down NOW, so dismissing the report can never restore an accessible file, and an
+      // infected verdict strikes and notifies as it would on a pending node.
+      const reviewed = node.scanStatus === "under_review";
       await setScanResult(tx, node.id, key, {
         scanStatus: outcome.status,
         scanReason: outcome.reason,
@@ -397,7 +403,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
         ...(sha256 ? { sha256 } : {}),
         scannedAt,
       });
-      wrote = "status";
+      wrote = reviewed ? "prev" : "status";
       const uploader = node.createdBy;
       if (outcome.status === "infected") {
         // A hit that came from the list needs no row; an unlisted infected hash is listed now.
@@ -421,7 +427,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
             meta: { signatures: verdict.signatures, blocklist: outcome.blocklist },
           };
         }
-      } else if (outcome.status === "error" && outcome.reason === "hash_mismatch") {
+      } else if (outcome.status === "error" && outcome.reason === "hash_mismatch" && !reviewed) {
         if (!effects.notIntactNotice) {
           effects.notIntactNotice = true;
           after.mail = "not_intact";
@@ -441,17 +447,6 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
         });
         effects.takedown = true;
       }
-    } else if (node.scanStatus === "under_review") {
-      // `setScanResult` stores the outcome as the status a dismissal restores.
-      await setScanResult(tx, node.id, key, {
-        scanStatus: outcome.status,
-        scanReason: outcome.reason,
-        scanDetail,
-        mimeSniffed: input.mimeSniffed,
-        ...(sha256 ? { sha256 } : {}),
-        scannedAt,
-      });
-      wrote = "prev";
     } else {
       // `suspected_csam`, or settled already: a duplicate or late message.
       await recordScan(tx, node.id, key, seen);

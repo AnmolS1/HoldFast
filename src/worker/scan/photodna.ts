@@ -12,9 +12,13 @@
 //   - anything thrown by `env.IMAGES` → PhotoDNA is SKIPPED for this object (`skipped:images`,
 //     `skipped:images_9422` for the quota error) — the scan goes on, nothing is retried;
 //   - an object above `THUMB_INPUT_MAX_BYTES` never reaches the binding (`skipped:size`);
-//   - a network error, `429` or `5xx` from the PhotoDNA request itself → `PhotoDnaTransientError`:
-//     the consumer fails the job and retries the message;
-//   - any other answer from PhotoDNA (a 4xx, a status code that is not success) → skipped.
+//   - a network error or ANY answer from the PhotoDNA request but a 200 with a success status —
+//     401/403 (an auth or config failure), 429, 5xx, any other 4xx, a status code that is not
+//     success → `PhotoDnaTransientError`: the consumer fails the job and retries the message, and
+//     a failure that persists ends `error` through the dead-letter queue (ruling, Addendum 2);
+//   - "cannot be checked" for a SIZE or IMAGES limit (`size`, `images`, `images_9422`) — and a
+//     format the service does not take (`format`, task step 4) — is recorded in
+//     `scanDetail.photodna` and does not hold back the engine's verdict.
 // Each downscale is an Images transformation: one `transform_user` unit is added to the ledger for
 // the owner, the subject T13's thumbnails use, so the Images alarm counts it (T27).
 //
@@ -112,20 +116,21 @@ export async function checkPhotoDna(
   } catch (error) {
     throw new PhotoDnaTransientError("photodna: the request failed", { cause: error });
   }
-  if (response.status === 429 || response.status >= 500) {
-    await response.body?.cancel().catch(() => {});
-    throw new PhotoDnaTransientError(`photodna: answered ${response.status}`);
-  }
+  // Every answer but a 200 — 401/403 (the key), 429, 5xx, any other — is a failure to CHECK:
+  // retried, and in the end `error` — never "skipped" (Addendum 2).
   if (response.status !== 200) {
     await response.body?.cancel().catch(() => {});
-    return { skipped: `http_${response.status}` };
+    throw new PhotoDnaTransientError(`photodna: answered ${response.status}`);
   }
   const body = (await response.json().catch(() => null)) as {
     Status?: { Code?: unknown };
     IsMatch?: unknown;
   } | null;
   if (body?.Status?.Code !== PHOTODNA_OK || typeof body.IsMatch !== "boolean") {
-    return { skipped: `status_${typeof body?.Status?.Code === "number" ? body.Status.Code : "unknown"}` };
+    // Not an answer to "does it match": the same as no answer.
+    throw new PhotoDnaTransientError(
+      `photodna: status ${typeof body?.Status?.Code === "number" ? body.Status.Code : "unknown"}`,
+    );
   }
   return { match: body.IsMatch };
 }

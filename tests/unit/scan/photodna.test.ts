@@ -124,11 +124,17 @@ describe("PhotoDNA", () => {
     expect((await nodeById(file.id))!.scanStatus).toBe("suspected_csam");
   });
 
-  it("transient — a network error, 429, 5xx from the PhotoDNA request: job failed, message retried, node pending", async () => {
+  it("transient — a network error and EVERY non-200 (401/403 auth, 400/404, 429, 5xx) and a non-success status: job failed, message retried, node pending — never skipped (Addendum 2)", async () => {
     for (const [label, next] of [
       ["network", async () => Promise.reject(new TypeError("fetch failed"))],
+      ["401", async () => new Response("no key", { status: 401 })],
+      ["403", async () => new Response("forbidden", { status: 403 })],
+      ["400", async () => new Response("bad", { status: 400 })],
+      ["404", async () => new Response("gone", { status: 404 })],
       ["429", async () => new Response("slow down", { status: 429 })],
       ["503", async () => new Response("down", { status: 503 })],
+      ["200, status 3004", async () => Response.json({ Status: { Code: 3004 }, IsMatch: false })],
+      ["200, not JSON", async () => new Response("<html>")],
     ] as [string, Answer][]) {
       answer = next;
       const { file } = await uploadedFile(png(), { name: "p.png" });

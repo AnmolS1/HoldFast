@@ -4,7 +4,8 @@ import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
 import { STRIKES_TO_SUSPEND } from "../../../src/shared/constants";
-import { setUnderReview } from "../../../src/worker/db/queries/moderation";
+import { dismissReview, setUnderReview } from "../../../src/worker/db/queries/moderation";
+import { effectiveHidden } from "../../../src/worker/db/queries/tree";
 import { finish } from "../../../src/worker/db/queries/scan-jobs";
 import { nodes, shareLinks, strikes, uploads, user } from "../../../src/worker/db/schema";
 import { toNodeDto } from "../../../src/worker/services/node-dto";
@@ -211,13 +212,13 @@ describe("the verdict-write table (step 2g), one row each — with the control i
 });
 
 describe("precedence", () => {
-  it("under_review: the verdict lands in scanStatusPrev — no strike or mail; a csam outcome raises it", async () => {
+  it("under_review: the verdict lands in scanStatusPrev and an infected verdict still strikes and notifies (Addendum 2); a csam outcome raises it", async () => {
     const owner = await makeUser();
     const { file } = await uploadedFile(infectedBytes(), { owner, scanStatus: "under_review" });
     expect(await deliver([{ body: explicit(file) }])).toEqual(ack);
     expect(await nodeById(file.id)).toMatchObject({ scanStatus: "under_review", scanStatusPrev: "infected" });
-    expect(await strikesOf(owner.id)).toHaveLength(0);
-    expect(mails(owner, "quarantineNotice")).toBe(0);
+    expect(await strikesOf(owner.id)).toHaveLength(1);
+    expect(mails(owner, "quarantineNotice")).toBe(1);
 
     const bytes = cleanBytes();
     await listAs(await sha256Of(bytes), "csam");
@@ -226,6 +227,44 @@ describe("precedence", () => {
     expect((await nodeById(reviewed.file.id))!.scanStatus).toBe("under_review");
     expect(await deliver([{ body: explicit(reviewed.file) }])).toEqual(ack);
     expect((await nodeById(reviewed.file.id))!.scanStatus).toBe("suspected_csam");
+  });
+});
+
+describe("an under_review node whose server hash is blocklisted (Addendum 2)", () => {
+  it("dmca: taken down, link paused, a report — and dismissing the review restores the verdict but never an accessible file", async () => {
+    const owner = await makeUser();
+    const bytes = cleanBytes();
+    await listAs(await sha256Of(bytes), "dmca");
+    const { file } = await uploadedFile(bytes, { owner, scanStatus: "under_review" });
+    await makeLink(file.id, owner.id);
+    expect(await deliver([{ body: explicit(file) }])).toEqual(ack);
+    const row = (await nodeById(file.id))!;
+    expect(row).toMatchObject({
+      scanStatus: "under_review",
+      scanStatusPrev: "clean",
+      takedownReason: "dmca",
+    });
+    expect(row.takedownAt).toBeInstanceOf(Date);
+    const [link] = await testDb().select().from(shareLinks).where(eq(shareLinks.nodeId, file.id));
+    expect(link!.pauseReasons).toContain("moderation");
+    expect((await reportsOf(file.id)).filter((r) => r.source === "system")).toHaveLength(1);
+    // The admin dismisses the review: the true verdict comes back — and the takedown stays.
+    expect(await dismissReview(testDb(), file.id)).toEqual({ restored: "clean" });
+    const after = (await nodeById(file.id))!;
+    expect(after.scanStatus).toBe("clean");
+    expect(after.takedownAt).toBeInstanceOf(Date);
+    expect(await effectiveHidden(testDb(), file.id)).toBe(true);
+  });
+
+  it("malware: the restored status is infected, with its strike and notice", async () => {
+    const owner = await makeUser();
+    const bytes = cleanBytes();
+    await listAs(await sha256Of(bytes), "malware");
+    const { file } = await uploadedFile(bytes, { owner, scanStatus: "under_review" });
+    expect(await deliver([{ body: explicit(file) }])).toEqual(ack);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "under_review", scanStatusPrev: "infected" });
+    expect(await strikesOf(owner.id)).toHaveLength(1);
+    expect(await dismissReview(testDb(), file.id)).toEqual({ restored: "infected" });
   });
 });
 
