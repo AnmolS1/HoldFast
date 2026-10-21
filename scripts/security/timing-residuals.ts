@@ -22,7 +22,8 @@
 //             show what holding does to the time)
 //   api404    GET /api/nodes/:id as a non-owner: unknown, no share, taken down, trashed, not visible
 //             (infected), in a trashed folder, in a taken-down folder; and a visible one (200)
-//   delete    DELETE /nodes/:id on a trashed folder holding one file: held vs not held (T14 m10)
+//   delete    DELETE /nodes/:id on a trashed root: a held folder, a folder not held (one file each),
+//             and a file trashed on its own under a held folder (T14 m10; standing check (b))
 //   init      POST /api/uploads: this account (which holds purge-requested held trees once `delete`
 //             has run) vs --peer-session's account, which holds none (T23 d3)
 //   complete  upload complete of a small file whose declared hash is LISTED vs one that is merely
@@ -70,7 +71,8 @@ type Kinds = {
     { node: string; target: string; state: "replaced" | "trashed" | "taken down" | "none" }
   >;
   api404: Record<string, string>;
-  delete: { held: string[]; unheld: string[] };
+  /** Trashed roots: held folders, folders not held, and files whose (untrashed) folder is held. */
+  delete: { held: string[]; unheld: string[]; inherited: string[] };
   listedSha256: string;
 };
 
@@ -141,7 +143,7 @@ async function seed() {
     ownerId: owner,
     files404: {},
     api404: {},
-    delete: { held: [], unheld: [] },
+    delete: { held: [], unheld: [], inherited: [] },
     listedSha256: hex(crypto.getRandomValues(new Uint8Array(32))),
   };
 
@@ -240,13 +242,20 @@ async function seed() {
         (held ? kinds.delete.held : kinds.delete.unheld).push(id);
       }
     }
-    for (const id of [...kinds.delete.held, ...kinds.delete.unheld]) {
+    // Standing check (b): a file trashed on its own, under a folder that is held (inherited hold).
+    const heldParents: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const parent = await folder(owner, null, `timing delete parent ${rand(6)}`);
+      heldParents.push(parent);
+      kinds.delete.inherited.push(await file(owner, parent));
+    }
+    for (const id of [...kinds.delete.held, ...kinds.delete.unheld, ...kinds.delete.inherited]) {
       await apiPace();
       const answer = await api(cookie, `/nodes/${id}/trash`, { method: "POST" });
-      if (!answer.ok) fail(`trashing a delete-group folder: ${answer.status}`);
+      if (!answer.ok) fail(`trashing a delete-group node: ${answer.status}`);
       await answer.arrayBuffer();
     }
-    if (kinds.delete.held.length > 0) await set("legal_hold = true", kinds.delete.held);
+    if (n > 0) await set("legal_hold = true", [...kinds.delete.held, ...heldParents]);
 
     // The listed hash of the `complete` group: made up, so nobody's bytes can have it.
     await db.query("INSERT INTO hash_blocklist (sha256, reason) VALUES ($1, 'admin')", [kinds.listedSha256]);
@@ -258,7 +267,7 @@ async function seed() {
   chmodSync(out, 0o600);
   console.log(
     `timing-residuals: seeded (${target.target}) files404 ${Object.keys(kinds.files404).length} kinds, api404 ` +
-      `${Object.keys(kinds.api404).length} kinds, delete ${n}+${n} folders; the kinds file is at --out (mode 600)`,
+      `${Object.keys(kinds.api404).length} kinds, delete ${n}+${n}+${n} roots; the kinds file is at --out (mode 600)`,
   );
 }
 
@@ -422,11 +431,17 @@ async function measure() {
     );
   }
   if (groups.has("delete")) {
-    const rounds = Math.min(n, kinds.delete.held.length, kinds.delete.unheld.length);
+    const rounds = Math.min(
+      n,
+      kinds.delete.held.length,
+      kinds.delete.unheld.length,
+      kinds.delete.inherited.length,
+    );
+    const label = { held: "held folder", unheld: "folder not held", inherited: "file under a held folder" };
     await runGroup(
-      "DELETE /nodes/:id on a trashed folder: held vs not held (T14 m10; not equalised by ruling)",
-      (["held", "unheld"] as const).map((which) => ({
-        name: which === "held" ? "held" : "not held",
+      "DELETE /nodes/:id on a trashed root: held vs not held (T14 m10; not equalised by ruling)",
+      (["held", "unheld", "inherited"] as const).map((which) => ({
+        name: label[which],
         once: async (round: number) => {
           await apiPace();
           return timed(() => api(cookie, `/nodes/${kinds.delete[which][round]}`, { method: "DELETE" }));
