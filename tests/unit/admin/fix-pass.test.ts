@@ -156,6 +156,11 @@ describe("m3 — Release holds refuses while the report's own node is locked", (
       body: { reason: "Dismissed.", confirm: true },
     });
     expect([answer.status, answer.body?.details?.reason]).toEqual([409, "node_locked"]);
+    // The preview (no confirm) is refused the same way — the outer check, before any plan is shown.
+    const preview = await adminCall(who.as, "POST", `/reports/${t.reportId}/release-holds`, {
+      body: { reason: "Dismissed." },
+    });
+    expect([preview.status, preview.body?.details?.reason]).toEqual([409, "node_locked"]);
     expect((await nodeRowOf(t.file.id))!.legalHold).toBe(true);
     expect((await userRowOf(t.owner.id))!.legalHold).toBe(true);
   });
@@ -454,5 +459,52 @@ describe("m7 — accept the database's generation needs the pause switch ON", ()
     };
     const answer = await adminCall(who.as, "POST", "/system/generation", { body });
     expect([answer.status, answer.body?.details?.reason]).toEqual([409, "not_paused"]);
+  });
+});
+
+// ── m8 (the hand-set half): the toggle's audit row commits with the toggle ──────────────────
+
+describe("m8 — the hand-set hold's audit row is written in the toggle's transaction", () => {
+  it("an audit insert that fails rolls the toggle back (500, the hold as it was); control: it commits with its row", async () => {
+    const who = await admin();
+    const target = await member();
+    const failed = await adminCall(who.as, "POST", `/users/${target.id}/legal-hold`, {
+      body: { held: true, note: "Preservation request." },
+      core: {
+        insertAudit: async () => {
+          throw new Error("audit insert failed (made up)");
+        },
+      },
+    });
+    expect(failed.status).toBe(500);
+    expect((await userRowOf(target.id))!.legalHold).toBe(false);
+    const ok = await adminCall(who.as, "POST", `/users/${target.id}/legal-hold`, {
+      body: { held: true, note: "Preservation request." },
+    });
+    expect(ok.status).toBe(200);
+    expect((await userRowOf(target.id))!.legalHold).toBe(true);
+    expect(await auditOf("admin.legal_hold_set", target.id)).toHaveLength(1);
+  });
+});
+
+// ── M1 residual (SEAM took_down): a notice lifts only the takedowns IT made ─────────────────
+
+describe("M1 residual — a scanner-made dmca takedown is not a notice's to lift", () => {
+  it("the scanner took the file down (dmca, takedownBy null); a notice naming it is taken down and withdrawn → the file stays down; control: a file the notice itself took down is lifted", async () => {
+    const who = await admin();
+    const owner = await member();
+    const scanned = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "dmca", takedownBy: null })
+      .where(eq(nodes.id, scanned.id));
+    const own = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const made = await adminCall(who.as, "POST", "/dmca", { body: intake([scanned.id, own.id]) });
+    expect(made.status, made.text).toBe(200);
+    const notice = made.body.notices[0].id as string;
+    expect((await act(who, notice, "takedown")).status).toBe(200);
+    expect((await act(who, notice, "withdraw")).status).toBe(200);
+    expect((await nodeRowOf(scanned.id))!.takedownAt).not.toBeNull();
+    expect((await nodeRowOf(own.id))!.takedownAt).toBeNull();
   });
 });

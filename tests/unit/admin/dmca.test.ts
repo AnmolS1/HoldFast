@@ -120,7 +120,9 @@ describe("intake", () => {
       .select()
       .from(dmcaNoticeNodes)
       .where(eq(dmcaNoticeNodes.noticeId, made!.id));
-    expect(snapshot).toEqual([{ noticeId: made!.id, nodeId: file.id, nodeName: "photo.jpg", sha256 }]);
+    expect(snapshot).toEqual([
+      { noticeId: made!.id, nodeId: file.id, nodeName: "photo.jpg", sha256, tookDown: false },
+    ]);
     expect(await auditOf("admin.dmca_notice_created", made!.id)).toHaveLength(1);
   });
 

@@ -71,7 +71,7 @@ import {
 } from "../jobs/reconcile";
 import { captureError } from "../sentry";
 import { unsuspendUser } from "./account-state";
-import { audit } from "./audit";
+import { audit, auditInTx } from "./audit";
 import { now } from "./clock";
 import { sendContentRemovedCopyright, sendContentRestored, sendReportReviewed } from "./email";
 import { AppError } from "./errors";
@@ -1063,6 +1063,8 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       const before = await adminQ.nodeRow(tx, nodeId);
       if (!before || before.takedownAt !== null) continue;
       if (!(await takedownNode(tx, nodeId, { reason: "dmca", by: admin.id }))) continue;
+      // What this notice did, recorded on its own row (SEAM took_down): its restore lifts only this.
+      await adminQ.markTookDown(tx, notice.id, nodeId);
       await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
       // The hash is listed `dmca` only when it is listed for nothing yet: an entry another
       // reason made is never rewritten (and so never removed by this notice's restore).
@@ -1179,14 +1181,19 @@ async function restoreNotice(
       });
       if (!row) return false;
     }
-    const ours = new Set(notice.nodes.map((n) => n.nodeId));
-    for (const { nodeId } of notice.nodes) {
+    // Only the nodes THIS notice took down (its recorded effect, SEAM took_down) are its to lift.
+    const ours = new Set(notice.nodes.filter((n) => n.tookDown).map((n) => n.nodeId));
+    for (const nodeId of ours) {
       // Lifted only when no other cause remains (M1): a DMCA takedown, and no OTHER notice that
       // still holds a takedown on the node — by its recorded effect, whatever its status
       // (upheld and closed-after-takedown count). Read under the tree locks this transaction holds.
       const node = await adminQ.nodeRow(tx, nodeId);
       if (!node || node.takedownAt === null || node.takedownReason !== "dmca") continue;
-      if (await adminQ.otherActiveNoticeNames(tx, notice.id, { nodeId })) continue;
+      if (await adminQ.otherActiveNoticeNames(tx, notice.id, { nodeId })) {
+        // Kept down for the other notice: the takedown is handed to it, to lift when it ends.
+        await adminQ.handOverTakedown(tx, notice.id, nodeId);
+        continue;
+      }
       await restoreTakedown(tx, nodeId);
       await unpauseLinks(tx, { subtreeOf: nodeId }, "moderation");
       // The `dmca` entry goes only if a node of THIS notice put it there and no other notice in
@@ -1620,13 +1627,17 @@ export async function setLegalHold(c: C, userId: string, held: boolean, reason: 
     if (!(await adminQ.adminUser(tx, userId))) return false;
     if (!held && (await adminQ.userHeldByCsamCase(tx, userId, now(c)))) throw conflict("hold_not_releasable");
     await adminHooks.afterHoldUserLock?.(tx as Tx);
-    return setUserLegalHold(tx, userId, held);
+    if (!(await setUserLegalHold(tx, userId, held))) return false;
+    // In the SAME transaction (review m8): "Release holds" reads this row to tell a hand-set hold
+    // from a lock's, so the toggle never commits without it.
+    await auditInTx(
+      tx as Tx,
+      c,
+      held ? "admin.legal_hold_set" : "admin.legal_hold_cleared",
+      { type: "user", id: userId },
+      { reason },
+    );
+    return true;
   });
   if (!found) throw new AppError("not_found");
-  audit(
-    c,
-    held ? "admin.legal_hold_set" : "admin.legal_hold_cleared",
-    { type: "user", id: userId },
-    { reason },
-  );
 }

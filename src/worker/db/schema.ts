@@ -703,6 +703,12 @@ export const dmcaNoticeNodes = pgTable(
     // Snapshots.
     nodeName: text(),
     sha256: text(),
+    /**
+     * THIS notice's takedown took this node down (T25 SEAM, M1): its restore or withdraw lifts only
+     * such rows — a node that was already down (the scanner's `dmca` hit, an abuse takedown,
+     * another notice) is not the notice's to lift.
+     */
+    tookDown: boolean().notNull().default(false),
   },
   (t) => [primaryKey({ columns: [t.noticeId, t.nodeId] }), index("dmca_notice_nodes_node_idx").on(t.nodeId)],
 );

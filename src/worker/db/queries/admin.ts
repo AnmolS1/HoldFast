@@ -895,7 +895,7 @@ export async function hashKeepsBytes(tx: Executor, sha256: string): Promise<"lis
 // ── copyright notices ───────────────────────────────────────────────────────────────────────
 
 export type NoticeWithNodes = DmcaNotice & {
-  nodes: { nodeId: string; nodeName: string | null; sha256: string | null }[];
+  nodes: { nodeId: string; nodeName: string | null; sha256: string | null; tookDown: boolean }[];
 };
 
 async function withNodes(db: Executor, notices: DmcaNotice[]): Promise<NoticeWithNodes[]> {
@@ -913,7 +913,12 @@ async function withNodes(db: Executor, notices: DmcaNotice[]): Promise<NoticeWit
     ...notice,
     nodes: rows
       .filter((row) => row.noticeId === notice.id)
-      .map((row) => ({ nodeId: row.nodeId, nodeName: row.nodeName, sha256: row.sha256 })),
+      .map((row) => ({
+        nodeId: row.nodeId,
+        nodeName: row.nodeName,
+        sha256: row.sha256,
+        tookDown: row.tookDown,
+      })),
   }));
 }
 
@@ -1048,6 +1053,27 @@ export async function otherActiveNoticeNames(
         AND d.status NOT IN ('restored', 'withdrawn') AND ${match}
     ) AS found`);
   return result.rows[0]?.found === true;
+}
+
+/** Records that THIS notice's takedown took this node down (the only rows its restore may lift). */
+export async function markTookDown(tx: Executor, noticeId: string, nodeId: string): Promise<void> {
+  await tx
+    .update(dmcaNoticeNodes)
+    .set({ tookDown: true })
+    .where(and(eq(dmcaNoticeNodes.noticeId, noticeId), eq(dmcaNoticeNodes.nodeId, nodeId)));
+}
+
+/**
+ * A takedown THIS notice made but another notice still holds (`otherActiveNoticeNames`) is handed
+ * to every such notice: it becomes theirs to lift when the last of them ends — never the scanner's
+ * or anyone else's.
+ */
+export async function handOverTakedown(tx: Executor, noticeId: string, nodeId: string): Promise<void> {
+  await tx.execute(sql`
+    UPDATE dmca_notice_nodes dn SET took_down = true
+    FROM dmca_notices d
+    WHERE d.id = dn.notice_id AND dn.node_id = ${nodeId} AND d.id <> ${noticeId}
+      AND d.takedown_at IS NOT NULL AND d.status NOT IN ('restored', 'withdrawn')`);
 }
 
 export const NOTICE_OPEN: readonly DmcaNotice["status"][] = OPEN_NOTICE_STATUSES;
