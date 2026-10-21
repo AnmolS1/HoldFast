@@ -17,10 +17,12 @@ import type { Auth, SessionInfo } from "../../../src/worker/auth/types";
 import { statementsSent, type Db } from "../../../src/worker/db/client";
 import {
   EXPORT_DAILY_LIMIT,
+  EXPORT_LIMITS,
   EXPORT_MAX_RUNTIME_S,
   EXPORT_PAGE,
   EXPORT_RUNNING_MAX_S,
   exportSlotKeys,
+  refundExportDay,
 } from "../../../src/worker/db/queries/account";
 import type { CoreDeps } from "../../../src/worker/services/request-context";
 import { TEST_APP_ORIGIN } from "../../setup/test-vars";
@@ -207,5 +209,80 @@ describe("the export limiter", () => {
 
   it("an export ends by its own maximum runtime before its slot could be taken over (two never overlap)", () => {
     expect(EXPORT_MAX_RUNTIME_S).toBeLessThan(EXPORT_RUNNING_MAX_S);
+  });
+
+  it("a reader that stops reading cannot hold the export past its maximum runtime: it ends, and its slot is free for the next", async () => {
+    const who = await person();
+    await testDb().execute(sql`
+      INSERT INTO nodes (id, owner_id, created_by, parent_id, kind, name, name_key, ext, size, scan_status)
+      SELECT gen_random_uuid(), ${who.id}, ${who.id}, NULL, 'file', 'f-' || g || '.txt', 'f-' || g || '.txt', 'txt', 1, 'clean'
+      FROM generate_series(1, 10) AS g`);
+    const keys = exportSlotKeys(who.id);
+    const saved = EXPORT_LIMITS.maxRuntimeMs;
+    EXPORT_LIMITS.maxRuntimeMs = 800;
+    try {
+      const stalled = await startExport(who);
+      expect(stalled.response.status).toBe(200);
+      const reader = stalled.response.body!.getReader();
+      await reader.read();
+      // The client stops reading here. The producer's next write waits on it — until the deadline.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const slot = await testDb().execute(sql`SELECT 1 FROM rate_limit WHERE key = ${keys.running}`);
+      expect(slot.rows).toEqual([]);
+      const next = await startExport(who);
+      expect(next.response.status).toBe(200);
+      await readAll(next.response);
+      await next.settle();
+      // The stalled body ends in an error, never in a complete file.
+      await expect(
+        (async () => {
+          for (;;) if ((await reader.read()).done) return "complete";
+        })(),
+      ).rejects.toBeTruthy();
+      await stalled.settle();
+    } finally {
+      EXPORT_LIMITS.maxRuntimeMs = saved;
+    }
+  });
+
+  it("an export that failed AFTER bytes were handed over is not given back; one that failed before is (the account test above)", async () => {
+    const who = await person();
+    await testDb().execute(sql`
+      INSERT INTO nodes (id, owner_id, created_by, parent_id, kind, name, name_key, ext, size, scan_status)
+      SELECT gen_random_uuid(), ${who.id}, ${who.id}, NULL, 'file', 'f-' || g || '.txt', 'f-' || g || '.txt', 'txt', 1, 'clean'
+      FROM generate_series(1, ${EXPORT_PAGE + 1}) AS g`);
+    // A row the export's contract refuses, last in id order (the second page): our failure, mid-stream.
+    await testDb().execute(sql`
+      INSERT INTO nodes (id, owner_id, created_by, parent_id, kind, name, name_key, ext, size, scan_status, sha256)
+      VALUES (${`ffffffff-ffff-4fff-bfff-${crypto.randomUUID().slice(-12)}`}::uuid, ${who.id}, ${who.id}, NULL, 'file', 'bad.txt', 'bad.txt', 'txt', 1, 'clean', 'not-a-digest')`);
+    const keys = exportSlotKeys(who.id);
+    const run = await startExport(who);
+    expect(run.response.status).toBe(200);
+    await expect(readAll(run.response)).rejects.toBeTruthy();
+    await run.settle();
+    const day = await testDb().execute<{ count: number }>(
+      sql`SELECT count FROM rate_limit WHERE key = ${keys.day}`,
+    );
+    expect(day.rows.map((row) => Number(row.count))).toEqual([1]);
+    expect((await testDb().execute(sql`SELECT 1 FROM rate_limit WHERE key = ${keys.running}`)).rows).toEqual(
+      [],
+    );
+  });
+
+  it("a refund credits only the window it was charged in, never a later one", async () => {
+    const who = await person();
+    const { day } = exportSlotKeys(who.id);
+    await testDb().execute(
+      sql`INSERT INTO rate_limit (id, key, count, last_request) VALUES (gen_random_uuid()::text, ${day}, 3, 2000)`,
+    );
+    await refundExportDay(testDb(), who.id, 1000);
+    const count = async () =>
+      Number(
+        (await testDb().execute<{ count: number }>(sql`SELECT count FROM rate_limit WHERE key = ${day}`))
+          .rows[0]!.count,
+      );
+    expect(await count()).toBe(3);
+    await refundExportDay(testDb(), who.id, 2000);
+    expect(await count()).toBe(2);
   });
 });

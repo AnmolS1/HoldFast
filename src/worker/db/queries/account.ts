@@ -382,6 +382,8 @@ export const EXPORT_DAILY_LIMIT = 10;
 const EXPORT_DAY_S = 86_400;
 /** How long an export may run: it ends itself then (routes/account.ts). */
 export const EXPORT_MAX_RUNTIME_S = 25 * 60;
+/** The runtime as the export reads it — an object so that a test can shorten it. */
+export const EXPORT_LIMITS = { maxRuntimeMs: EXPORT_MAX_RUNTIME_S * 1000 };
 /**
  * How long a running slot is held at most (a stream that never ended frees it then) — longer than
  * an export may run, so a slot is never taken over from an export still running.
@@ -399,9 +401,13 @@ async function admitWindow(
   key: string,
   cap: number,
   windowSeconds: number,
-): Promise<{ ok: true } | { ok: false; retryAfterSeconds: number }> {
+): Promise<{ ok: true; windowStart: number } | { ok: false; retryAfterSeconds: number }> {
   const windowMs = windowSeconds * 1000;
-  const result = await db.execute<{ admitted: number | null; wait_ms: string | number | null }>(sql`
+  const result = await db.execute<{
+    admitted: number | null;
+    window_start: string | number | null;
+    wait_ms: string | number | null;
+  }>(sql`
     WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
     held AS (
       SELECT r.last_request + ${windowMs} - clock.ms AS wait_ms FROM rate_limit r, clock WHERE r.key = ${key}
@@ -415,11 +421,12 @@ async function admitWindow(
           CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN (SELECT ms FROM clock)
                ELSE r.last_request END
       WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs} OR r.count < ${cap}
-      RETURNING r.count
+      RETURNING r.count, r.last_request
     )
-    SELECT (SELECT count FROM admitted) AS admitted, (SELECT wait_ms FROM held) AS wait_ms`);
+    SELECT (SELECT count FROM admitted) AS admitted, (SELECT last_request FROM admitted) AS window_start,
+      (SELECT wait_ms FROM held) AS wait_ms`);
   const row = result.rows[0];
-  if (row && row.admitted !== null) return { ok: true };
+  if (row && row.admitted !== null) return { ok: true, windowStart: Number(row.window_start) };
   const waitMs = row?.wait_ms != null ? Number(row.wait_ms) : windowMs;
   return { ok: false, retryAfterSeconds: Math.min(windowSeconds, Math.max(1, Math.ceil(waitMs / 1000))) };
 }
@@ -465,7 +472,7 @@ async function takeRunningSlot(
 export async function admitExport(
   db: Executor,
   userId: string,
-): Promise<{ ok: true; token: string } | { ok: false; retryAfterSeconds: number }> {
+): Promise<{ ok: true; token: string; dayWindow: number } | { ok: false; retryAfterSeconds: number }> {
   const keys = exportSlotKeys(userId);
   const token = crypto.randomUUID();
   const running = await takeRunningSlot(db, keys.running, token);
@@ -475,13 +482,18 @@ export async function admitExport(
     await releaseExport(db, userId, token);
     return day;
   }
-  return { ok: true, token };
+  return { ok: true, token, dayWindow: day.windowStart };
 }
 
-/** Gives the day's count back for an export that failed on our side (nothing was handed over). */
-export async function refundExportDay(db: Executor, userId: string): Promise<void> {
+/**
+ * Gives the day's count back for an export that failed on our side before anything was handed
+ * over — to the window it was counted in (`dayWindow`, the window's start at admission): once
+ * that window has ended, a new one is not credited (Addendum 5b).
+ */
+export async function refundExportDay(db: Executor, userId: string, dayWindow: number): Promise<void> {
   await db.execute(
-    sql`UPDATE rate_limit SET count = greatest(count - 1, 0) WHERE key = ${exportSlotKeys(userId).day}`,
+    sql`UPDATE rate_limit SET count = greatest(count - 1, 0)
+        WHERE key = ${exportSlotKeys(userId).day} AND last_request = ${dayWindow}`,
   );
 }
 

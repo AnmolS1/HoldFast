@@ -50,7 +50,7 @@ import {
   deleteOwnSession,
   activeShareBetween,
   admitExport,
-  EXPORT_MAX_RUNTIME_S,
+  EXPORT_LIMITS,
   EXPORT_PAGE,
   exportLinks,
   exportNodePage,
@@ -264,6 +264,12 @@ router.delete(`/account/sessions/:id${BA_ID}`, async (c) => {
 // stream ends.
 
 const EXPORT_ACTIVITY_LIMIT = 1_000;
+/** The export's maximum runtime has passed. */
+class ExportExpired extends Error {
+  constructor() {
+    super("export: past its maximum runtime");
+  }
+}
 /** One node of the file, as the contract says it — parsed per node, never the whole list. */
 const ExportNode = ExportManifest.shape.nodes.element;
 /** The file without its nodes, parsed through the contract: nothing beyond its fields is written. */
@@ -378,52 +384,101 @@ router.get("/account/export", async (c) => {
   } catch (error) {
     // Nothing was handed over: the slot and the day's export are given back.
     await releaseExport(handle, user.id, admitted.token);
-    await refundExportDay(handle, user.id);
+    await refundExportDay(handle, user.id, admitted.dayWindow);
     throw error;
   }
   audit(c, "account.export", self(user.id));
 
   const encoder = new TextEncoder();
-  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  // The body is a stream THIS code controls: a chunk is put in only when the client has asked for
+  // one (`pull`, high-water mark 0 — backpressure), and at the deadline the stream is errored at
+  // once. (A TransformStream cannot do the second: its writer's abort waits for a write the
+  // stalled reader never takes.)
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  let asked = false;
+  let gone = false;
+  let wake: (() => void) | null = null;
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(ctrl) {
+        controller = ctrl;
+      },
+      pull() {
+        asked = true;
+        wake?.();
+        wake = null;
+      },
+      cancel() {
+        gone = true;
+        wake?.();
+        wake = null;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const demand = () => (asked || gone ? Promise.resolve() : new Promise<void>((resolve) => (wake = resolve)));
   const { env, executionCtx } = c;
   const produce = runBackground(
     env,
     executionCtx,
     async (bg) => {
-      const writer = writable.getWriter();
-      // An export ends by its own maximum runtime, inside the time its running slot is held: two
-      // exports of one account never overlap (queries/account.ts).
-      const deadline = Date.now() + EXPORT_MAX_RUNTIME_S * 1000;
-      let readFailed = false;
+      // THE DEADLINE BOUNDS EVERYTHING (Addendum 5b): every read and every wait for the client
+      // races it, so the export ends at its maximum runtime — inside the time its running slot is
+      // held, so two exports of one account never overlap — and the slot is given back.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const expired = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ExportExpired()), EXPORT_LIMITS.maxRuntimeMs);
+      });
+      expired.catch(() => {});
+      const inTime = <T>(work: Promise<T>): Promise<T> => Promise.race([work, expired]);
+      /** Bytes handed to the response so far: a refund only while there are none. */
+      let handedOver = false;
+      /** Whose failure it was: a client that went away or ran out the clock is not ours. */
+      let ours = false;
+      const send = async (bytes: Uint8Array) => {
+        await inTime(demand());
+        if (gone) throw new Error("export: the client went away");
+        asked = false;
+        controller.enqueue(bytes);
+        handedOver = true;
+      };
       try {
-        await writer.write(encoder.encode(head));
+        await send(encoder.encode(head));
         let after: string | null = null;
         let first = true;
         for (;;) {
-          if (Date.now() > deadline) throw new Error("export: past its maximum runtime");
-          const page: ExportNodeRow[] = await exportNodePage(bg.db, user.id, after).catch(
-            (error: unknown) => {
-              readFailed = true;
-              throw error;
-            },
-          );
+          let text: string;
+          let page: ExportNodeRow[];
+          try {
+            page = await inTime(exportNodePage(bg.db, user.id, after));
+            text = page.map((row) => JSON.stringify(exportNode(row))).join(",");
+          } catch (error) {
+            if (!(error instanceof ExportExpired)) ours = true;
+            throw error;
+          }
           if (page.length > 0) {
-            const text = page.map((row) => JSON.stringify(exportNode(row))).join(",");
-            await writer.write(encoder.encode((first ? "" : ",") + text));
+            await send(encoder.encode((first ? "" : ",") + text));
             first = false;
             after = page[page.length - 1]!.id;
           }
           if (page.length < EXPORT_PAGE) break;
         }
-        await writer.write(encoder.encode("]}"));
-        await writer.close();
+        await send(encoder.encode("]}"));
+        controller.close();
       } catch (error) {
-        // The client went away (the write is refused), it read too slowly for the maximum
-        // runtime, or a read failed: the body ends here. Only OUR failure gives the day's export
-        // back — a client that walks away has had its turn.
-        await writer.abort(error).catch(() => {});
-        if (readFailed) await refundExportDay(bg.db, user.id);
+        // The body ends here, in an error the client sees. Only OUR failure before a byte was
+        // handed over gives the day's export back — a client that walks away or stalls past the
+        // clock has had its turn.
+        if (!gone) {
+          try {
+            controller.error(error);
+          } catch {
+            // Already closed or errored.
+          }
+        }
+        if (ours && !handedOver) await refundExportDay(bg.db, user.id, admitted.dayWindow);
       } finally {
+        clearTimeout(timer);
         await releaseExport(bg.db, user.id, admitted.token);
       }
     },
@@ -436,7 +491,7 @@ router.get("/account/export", async (c) => {
   // eslint-disable-next-line no-restricted-syntax -- not database work on the request's client
   executionCtx.waitUntil(produce);
   const day = iso(at).slice(0, 10);
-  return c.body(readable, 200, {
+  return c.body(body, 200, {
     "content-type": "application/json; charset=utf-8",
     "content-disposition": `attachment; filename="holdfast-export-${day}.json"`,
     "cache-control": "no-store",
