@@ -35,13 +35,14 @@
     "tests/unit/harness/node/**/*.ts",
     "tests/unit/e2e-harness/**/*.ts"
   ],
-  // jsdom.ts belongs to tsconfig.tests.client.json, workers-env.d.ts to tsconfig.tests.workers.json
+  // jsdom.ts belongs to tsconfig.tests.client.json, workers-env.d.ts and workers-generation.ts to tsconfig.tests.workers.json
   // and node-db-env.d.ts to tsconfig.tests.db.json. scripts/spikes is git-ignored scratch.
   // The three scripts import src/worker/db/** and are checked by tsconfig.tests.db.json (keep
   // this list identical to the list there).
   "exclude": [
     "tests/setup/jsdom.ts",
     "tests/setup/workers-env.d.ts",
+    "tests/setup/workers-generation.ts",
     "tests/setup/node-db-env.d.ts",
     "scripts/spikes/**",
     "scripts/seed-dev.ts",

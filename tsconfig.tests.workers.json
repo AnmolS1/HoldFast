@@ -10,6 +10,8 @@
     "tests/unit/**/*.tsx",
     // `cloudflare:test` and the provided `holdfastDb`; `Env`, `Cloudflare.Env` and `exports`.
     "tests/setup/workers-env.d.ts",
+    // Each file's rollback detector in step (setupFiles of vitest.workers.config.ts).
+    "tests/setup/workers-generation.ts",
     "src/worker/env.d.ts"
   ],
   "exclude": [
