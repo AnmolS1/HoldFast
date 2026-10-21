@@ -100,8 +100,9 @@ export function PreviewRoute() {
   const coldParent = useRef<string | null>(null);
   // The cold folder's write, when the file was known at a moment it could not be written (above).
   // `onItem` is called once per file, so a write held back is kept here and written by the effect
-  // below as soon as the router is on this entry again.
-  const coldWrite = useRef<{ key: string; parent: string } | null>(null);
+  // below as soon as the router is on this entry again — for the account it was learnt under only:
+  // a write held across an account change is dropped (the folder is the other account's; review D3).
+  const coldWrite = useRef<{ key: string; parent: string; account: string | null } | null>(null);
   const writeCold = useCallback(
     (parent: string) => {
       coldWrite.current = null;
@@ -120,12 +121,16 @@ export function PreviewRoute() {
       // Close goes there from now on, whether or not the entry can record it yet.
       coldParent.current = parent;
       if (onEntry()) writeCold(parent);
-      else coldWrite.current = { key: location.key, parent };
+      else coldWrite.current = { key: location.key, parent, account: getKnownUserId() };
     },
     [from, onEntry, writeCold, location.key],
   );
   useEffect(() => {
     const held = coldWrite.current;
+    if (held && held.account !== getKnownUserId()) {
+      coldWrite.current = null;
+      return;
+    }
     if (held && held.key === location.key && from === undefined && onEntry()) writeCold(held.parent);
   });
 

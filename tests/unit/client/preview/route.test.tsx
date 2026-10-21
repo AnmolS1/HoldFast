@@ -23,6 +23,9 @@ import {
 
 setupPreview();
 
+/** A second account (made up), for the account-change cases. */
+const OTHER_ID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 const SIBLINGS = [ID.svg, ID.html, ID.other];
 const third = nodeOf({ ...NODES.svg, id: ID.other, name: "third.svg" });
 
@@ -383,5 +386,44 @@ describe("the account stamp on the route's history state", () => {
     expect(router.state.location.pathname).toBe(`/preview/${ID.svg}`);
     fireEvent.keyDown(dialog()!, { key: "Escape" });
     await waitFor(() => expect(router.state.location.pathname).toBe(`/folder/${ID.folder}`));
+  });
+
+  it("a held cold write when the tab's account has changed before it could be made: never written (review D3)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    // The second account cannot see the file: its own load of it answers 404.
+    let switched = false;
+    const { network } = arrange((call) =>
+      call.url.pathname === `/api/nodes/${ID.svg}` && call.method === "GET"
+        ? switched
+          ? envelope("not_found", 404)
+          : gate.then(() => json(detailOf(NODES.svg)))
+        : undefined,
+    );
+    await act(async () => void (await adoptIdentity(sessionOf())));
+    const { router } = renderRoutes(slower, [`/folder/${ID.folder}?q=list`, `/preview/${ID.svg}`]);
+    await waitFor(() => expect(dialog()).not.toBeNull());
+    await waitFor(() => expect(router.state.navigation.state).toBe("idle"));
+    await waitFor(() =>
+      expect(network.api().some((call) => call.url.pathname === `/api/nodes/${ID.svg}`)).toBe(true),
+    );
+    // Back: its loader (150 ms) runs; the file answers meanwhile; Forward before Back has landed.
+    void router.navigate(-1);
+    expect(router.state.navigation.state).toBe("loading");
+    await act(async () => {
+      release();
+      await gate;
+    });
+    await screen.findByText("sample.svg");
+    // Another account is adopted in this tab before the write could be made.
+    switched = true;
+    await act(async () => void (await adoptIdentity(sessionOf({ id: OTHER_ID }))));
+    void router.navigate(1);
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/preview/${ID.svg}`));
+    await waitFor(() => expect(router.state.navigation.state).toBe("idle"));
+    await settle(300);
+    // Not written: the folder was the OTHER account's, and the entry holds nothing of it.
+    expect(JSON.stringify(router.state.location.state ?? null)).not.toContain(ID.folder);
+    expect((router.state.location.state as { cold?: unknown } | null)?.cold).toBeUndefined();
   });
 });
