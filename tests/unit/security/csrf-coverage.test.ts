@@ -26,6 +26,9 @@ const EXEMPT = [
   `POST /api/public/links/${LINK}/download-urls`,
   `POST /api/public/links/${LINK}/unlock`,
   `POST /api/public/links/${LINK}/zip-manifest`,
+  // A visitor's report through a link: no session either; it proves the link (and its password by
+  // the same header) as the link routes do, so a cross-site poster holds what a direct one would.
+  "POST /api/public/report",
   "ALL /api/auth/*", // the Better Auth handler (method-agnostic: the canonical step admits only its own pairs)
 ].sort();
 
