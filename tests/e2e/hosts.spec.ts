@@ -58,7 +58,7 @@ test.describe("app origin", () => {
     expect(headers["cross-origin-resource-policy"]).toBe("same-origin");
     expect(headers["reporting-endpoints"]).toBe('csp="/api/public/csp-report"');
     expect(headers["permissions-policy"]).toContain("publickey-credentials-get=(self)");
-    expect(headers["cache-control"]).toBe("no-cache");
+    expect(headers["cache-control"]).toBe("no-store");
 
     // The shell must actually run under the policy: React renders.
     await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();

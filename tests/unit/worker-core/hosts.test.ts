@@ -277,7 +277,7 @@ describe("app host headers", () => {
     "object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; " +
     "report-uri /api/public/csp-report; report-to csp; upgrade-insecure-requests";
   const HTML_COMMON = {
-    "cache-control": "no-cache",
+    "cache-control": "no-store",
     "cross-origin-opener-policy": "same-origin",
     "cross-origin-resource-policy": "same-origin",
     "permissions-policy":

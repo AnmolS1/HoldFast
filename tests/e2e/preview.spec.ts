@@ -218,7 +218,7 @@ async function open(page: Page, nodeId: string): Promise<void> {
   const csp = response?.headers()["content-security-policy"] ?? "";
   expect(csp, "the page's Content-Security-Policy").toContain("default-src 'self'");
   expect(csp).toContain("worker-src 'self' blob:");
-  expect(csp).toMatch(/script-src 'self' 'wasm-unsafe-eval'/);
+  expect(csp).toMatch(/script-src 'nonce-[A-Za-z0-9+/]{22}==' 'strict-dynamic' 'wasm-unsafe-eval'/);
   expect(csp).not.toMatch(/script-src[^;]*'unsafe-(inline|eval)'/);
   await expect(dialog(page)).toBeVisible();
 }
