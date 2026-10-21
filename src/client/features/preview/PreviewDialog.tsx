@@ -276,7 +276,13 @@ function Body(props: BodyProps) {
               {t("preview.share")}
             </Button>
           ) : null}
-          {item ? <ReportLink target={{ nodeId: item.id }} /> : null}
+          {item ? (
+            <ReportLink
+              target={
+                source !== "owner" && source.reportTarget ? source.reportTarget(item.id) : { nodeId: item.id }
+              }
+            />
+          ) : null}
           <IconButton aria-label={t("preview.close")} onClick={onClose} data-preview-close>
             <X size={16} aria-hidden="true" />
           </IconButton>

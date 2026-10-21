@@ -217,6 +217,8 @@ export class LinkClient {
         const minted = await this.mint(nodeId, kind, { size });
         return { url: minted.url, expiresAt: minted.expiresAt };
       },
+      // The previewed file is reported with the link's token: what the visitor was shown.
+      reportTarget: (nodeId: string) => ({ nodeId, linkToken: this.token }),
     };
   }
 }
