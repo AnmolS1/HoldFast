@@ -380,7 +380,14 @@ type Verified = { sha256: string; hit: Awaited<ReturnType<typeof blocklist.looku
 async function abandonClaimed(
   c: Ctx,
   session: Upload,
-  opts: { assembled: boolean; declaredCsam: boolean; verified?: Verified | null; reason: string },
+  opts: {
+    assembled: boolean;
+    declaredCsam: boolean;
+    verified?: Verified | null;
+    reason: string;
+    /** What the client declared: kept in the owed audit row if the node cannot be written. */
+    declaredSha256: string;
+  },
 ): Promise<void> {
   let csamSha: string | null = opts.verified?.hit?.reason === "csam" ? opts.verified.sha256 : null;
   if (!opts.verified && opts.declaredCsam && (opts.assembled || !session.r2UploadId)) {
@@ -389,7 +396,7 @@ async function abandonClaimed(
   }
   metric("upload", { outcome: "aborted", kind: modeOf(session), reason: opts.reason });
   if (csamSha !== null) {
-    await preserveAndEnd(c, session, csamSha);
+    await preserveAndEnd(c, session, csamSha, opts.declaredSha256);
     return;
   }
   await releaseAndAbort(db(c), session, "claimed");
@@ -436,13 +443,33 @@ async function tellOperators(c: Ctx, session: Upload): Promise<void> {
 
 /**
  * Verified CSAM bytes whose node could not be written: the NODE IS OWED. The session is left
- * `completing` — its key referenced, its declared (listed) hash on it since the claim — which
- * keeps the object from every sweep until the repair (T22) writes the node; the audit row comes
- * first, then the operators are told by the session's id.
+ * `completing` — its key referenced — and THE SERVER'S csam hash is written on it in place of the
+ * client's declaration (Addendum 2, T22): that is what makes it owed (`owesLockedNode`) and keeps
+ * the object from every sweep until the repair (T22) writes the node, whatever the client
+ * declared (a hash listed for another reason, or none listed). The declaration is kept in the
+ * audit row (`declaredSha256`). Should that write fail too, the audit row is the backstop
+ * (`owesLockedNode` also matches it). Then the operators are told by the session's id.
  */
-async function oweNode(c: Ctx, session: Upload, error: unknown): Promise<void> {
+async function oweNode(
+  c: Ctx,
+  session: Upload,
+  error: unknown,
+  hashes: { server: string | null; declared: string | null },
+): Promise<void> {
   captureError(error, { kind: "upload_csam_preserve" });
-  audit(c, "upload.csam_node_owed", { type: "upload", id: session.id }, { nodeId: session.nodeId });
+  if (hashes.server !== null) {
+    try {
+      await sessions.setDeclaredHash(db(c), session.id, hashes.server);
+    } catch (writeError) {
+      captureError(writeError, { kind: "upload_csam_owed_hash" });
+    }
+  }
+  audit(
+    c,
+    "upload.csam_node_owed",
+    { type: "upload", id: session.id },
+    { nodeId: session.nodeId, ...(hashes.declared !== null ? { declaredSha256: hashes.declared } : {}) },
+  );
   metric("upload", { outcome: "csam_node_owed", kind: modeOf(session) });
   await tellOperators(c, session);
 }
@@ -469,7 +496,12 @@ const LOCKED = { scanStatus: "suspected_csam", legalHold: true } as const;
  * and its declared (listed) hash on it from the claim, which is what keeps the object from every
  * sweep — and the operators are told by the session's id; the node is still owed.
  */
-async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<void> {
+async function preserveAndEnd(
+  c: Ctx,
+  session: Upload,
+  sha256: string,
+  declaredSha256: string,
+): Promise<void> {
   const uploader = requireVerified(c);
   const own = session.ownerId === uploader.id;
   let written = false;
@@ -484,7 +516,7 @@ async function preserveAndEnd(c: Ctx, session: Upload, sha256: string): Promise<
     await lockOrRecord(c, node.id, session);
   } catch (error) {
     if (written) throw error;
-    await oweNode(c, session, error);
+    await oweNode(c, session, error, { server: sha256, declared: declaredSha256 });
     return;
   }
   // The node is written: the session ends (it may already be gone — a purge of its folder).
@@ -1236,7 +1268,13 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   let handedOver = false;
   const giveUp = (reason: string) => {
     if (evidence) handedOver = true;
-    return abandonClaimed(c, session, { assembled, declaredCsam, verified, reason });
+    return abandonClaimed(c, session, {
+      assembled,
+      declaredCsam,
+      verified,
+      reason,
+      declaredSha256: body.sha256,
+    });
   };
 
   /**
@@ -1368,7 +1406,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
         // object was being hashed): the bytes are evidence all the same.
         captureError(error, { kind: "upload_csam_finish" });
         handedOver = true;
-        await preserveAndEnd(c, session, sha256);
+        await preserveAndEnd(c, session, sha256, body.sha256);
         throw blocked();
       }
       handedOver = true;
@@ -1379,7 +1417,10 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   } catch (error) {
     // An unexpected error (a key that cannot seal, a database error in the re-check) after the
     // server found the bytes listed as CSAM: the node is owed — never a bare object, never silent.
-    if (evidence && !handedOver) await oweNode(c, session, error);
+    if (evidence && !handedOver) {
+      const server = (verified as Verified | null)?.sha256 ?? null;
+      await oweNode(c, session, error, { server, declared: body.sha256 });
+    }
     throw error;
   }
 
