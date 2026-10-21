@@ -187,7 +187,7 @@ type ResolveOptions = {
  * order: link state, then the password. (Rows 10–11, the file, are `nodeFor`'s.) The link scope
  * is set on success, so every access question after it is about the link alone.
  */
-async function resolveLink(c: Ctx, token: string, opts: ResolveOptions = {}): Promise<Resolved> {
+export async function resolveLink(c: Ctx, token: string, opts: ResolveOptions = {}): Promise<Resolved> {
   // 1
   const link = await findByTokenHash(db(c), await hashLinkToken(token));
   if (!link) throw new AppError("not_found");

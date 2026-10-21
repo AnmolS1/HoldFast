@@ -6,9 +6,12 @@
 // Both take `ReportBody` and answer `202 { received: true }`.
 //
 // PROOF OF ACCESS FIRST. A report is taken only from someone who was actually shown the file: a
-// token whose link (not revoked, not expired — a PAUSED link still takes reports) has the file at
+// token whose link ANSWERS — the public link routes' own availability table (`resolveLink`, rows
+// 1–9: not revoked, expired, at its download cap, paused, locked, links off, owner suspended; a
+// password link only with a valid link session in `X-Holdfast-Link-Session`) — and has the file at
 // or under its root, or a session holding a share role on it. Until that is proven every failure
-// is the one `404 not_found` of an unknown id — and Turnstile comes AFTER it, so its `403` says
+// is the one `404 not_found` of an unknown id (a link the visitor may not use is refused before any
+// node is looked at, so it says nothing about the node) — and Turnstile comes AFTER it, so its `403` says
 // nothing about the node either. The public route reads no session at all (the pipeline skips
 // it under /api/public/, and CSRF exempts the path): a signed-in victim's browser cannot be made
 // to file a report as them.
@@ -18,7 +21,8 @@
 // `suspected_csam` node is left as it is inside that helper), then the report row (T05
 // `insertReport`; a duplicate of an open report by the same reporter hash, node and category
 // writes nothing). Nothing is revoked, deleted or struck, and nothing moves a node towards
-// `suspected_csam`. A duplicate is answered exactly like a new report.
+// `suspected_csam`. A duplicate is answered exactly like a new report — while the link still answers:
+// a FILE link is itself paused by the first report, so a second report through it is the `404`.
 //
 // VOLUME. At most REPORTS_PER_REPORTER_DAY reports per reporter (the stable address hash — the
 // only reporter identifier) in 24 hours, counted under the reporter's own lock in the report's
@@ -30,7 +34,6 @@ import { Hono, type Context } from "hono";
 import { ReportBody, type ReportResponse } from "../../shared/schemas/report";
 import { verifyCaptcha } from "../auth/captcha";
 import { lockReporter, openReportsOnLink, reportsByReporterSince } from "../db/queries/abuse";
-import { findByTokenHash } from "../db/queries/links";
 import { insertReport, setUnderReview } from "../db/queries/moderation";
 import { getNode } from "../db/queries/nodes";
 import { isDescendantOrSelf, nodeVisibility } from "../db/queries/tree";
@@ -40,7 +43,6 @@ import { requireVerified } from "../middleware/guards";
 import { rateLimitByIp } from "../middleware/rate-limit";
 import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
-import { now } from "../services/clock";
 import { sendAdminAlert } from "../services/email";
 import { AppError } from "../services/errors";
 import { ipHashStable } from "../services/ip-hash";
@@ -48,7 +50,7 @@ import { metric } from "../services/metrics";
 import { getAccess } from "../services/permissions";
 import { auth, db, defer, deps, keys, type AppEnv } from "../services/request-context";
 import { adminListOf } from "../services/signup-policy";
-import { hashLinkToken } from "../services/tokens";
+import { resolveLink } from "./public-links";
 
 export const router = new Hono<AppEnv>();
 
@@ -77,15 +79,19 @@ type Proven = {
 const missing = () => new AppError("not_found");
 
 /**
- * The link of a token that proves something: found, not revoked, not expired. Paused links count
- * (another visitor may hold the same URL). Anything else is `404`.
+ * The link of a token that proves something: one the public link routes would answer, password
+ * included (`resolveLink` with `password: "required"`). Every refusal of it — expired, paused,
+ * password required, unknown — is the `404` of an unknown token; any other failure is not a
+ * refusal and is not hidden.
  */
 async function provingLink(c: Ctx, token: string | undefined): Promise<ShareLink> {
   if (token === undefined) throw missing();
-  const link = await findByTokenHash(db(c), await hashLinkToken(token));
-  if (!link || link.revokedAt !== null) throw missing();
-  if (link.expiresAt !== null && link.expiresAt.getTime() <= now(c).getTime()) throw missing();
-  return link;
+  try {
+    return (await resolveLink(c, token, { password: "required" })).link;
+  } catch (error) {
+    if (error instanceof AppError) throw missing();
+    throw error;
+  }
 }
 
 /**
