@@ -1,8 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { extname, join } from "node:path";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 
 // When there is no .dev.vars, the Cloudflare plugin falls back to loading `.env` into the Worker's
 // local `env`. `.env` is not a Worker vars file in this repo, so that fallback is switched off:
@@ -44,12 +45,80 @@ const host = "127.0.0.1";
 // next free port, and one of them dies with EADDRINUSE.
 const inspectorPort = port + 4000;
 
+// pdf.js's data files: the binary Adobe CMaps (CJK text), the standard fonts (a document that does
+// not embed Helvetica, Times…), the image decoders as WebAssembly (JPEG 2000, JBIG2, colour
+// profiles) and the one ICC profile. pdf.js asks for them by URL; they are this app's own static
+// files under /pdfjs/ — served from node_modules in dev, emitted into the client build. What is
+// NOT served: pdf.js's scripting engine (wasm/quickjs-*), which nothing here may run.
+const PDFJS_URL_BASE = "/pdfjs/";
+const PDFJS_DATA: Record<string, (name: string) => boolean> = {
+  cmaps: (name) => name.endsWith(".bcmap") || name === "LICENSE",
+  standard_fonts: (name) => /\.(pfb|ttf)$/.test(name) || name.startsWith("LICENSE"),
+  wasm: (name) => !name.startsWith("quickjs") && (/\.(wasm|js)$/.test(name) || name.startsWith("LICENSE")),
+  iccs: (name) => name.endsWith(".icc") || name === "LICENSE",
+};
+const PDFJS_TYPES: Record<string, string> = {
+  ".bcmap": "application/octet-stream",
+  ".pfb": "application/octet-stream",
+  ".ttf": "font/ttf",
+  ".wasm": "application/wasm",
+  ".js": "text/javascript",
+  ".icc": "application/vnd.iccprofile",
+};
+
+function pdfjsData(): Plugin {
+  const root = join(realpathSync("node_modules"), "pdfjs-dist");
+  /** The file a `/pdfjs/<dir>/<name>` path names, or null: listed directories and names only. */
+  const fileOf = (urlPath: string): string | null => {
+    const match = /^\/pdfjs\/([a-z_]+)\/([A-Za-z0-9._-]+)$/.exec(urlPath);
+    if (!match) return null;
+    const [, dir, name] = match as unknown as [string, string, string];
+    const allowed = PDFJS_DATA[dir];
+    if (!allowed || !allowed(name)) return null;
+    const file = join(root, dir, name);
+    return existsSync(file) ? file : null;
+  };
+  return {
+    name: "holdfast:pdfjs-data",
+    configureServer(server) {
+      server.middlewares.use((request, response, next) => {
+        const path = (request.url ?? "").split("?")[0] ?? "";
+        if (!path.startsWith(PDFJS_URL_BASE)) return next();
+        const file = fileOf(path);
+        if (!file) {
+          response.statusCode = 404;
+          response.setHeader("content-type", "text/plain");
+          response.end("Not found.");
+          return;
+        }
+        response.setHeader("content-type", PDFJS_TYPES[extname(file)] ?? "application/octet-stream");
+        response.end(readFileSync(file));
+      });
+    },
+    generateBundle() {
+      // The client build only; the Worker's bundle has no use for them.
+      if (this.environment.name !== "client") return;
+      for (const [dir, allowed] of Object.entries(PDFJS_DATA)) {
+        for (const name of readdirSync(join(root, dir)).sort()) {
+          if (!allowed(name)) continue;
+          this.emitFile({
+            type: "asset",
+            fileName: `pdfjs/${dir}/${name}`,
+            source: readFileSync(join(root, dir, name)),
+          });
+        }
+      }
+    },
+  };
+}
+
 export default defineConfig({
   // Vite's dependency cache defaults to node_modules/.vite, and worktrees share one node_modules
   // through a symlink: two checkouts with different imports would rewrite each other's cache and
   // break each other's running dev server. Keep it inside the checkout (.wrangler/ is ignored).
   cacheDir: ".wrangler/vite",
   plugins: [
+    pdfjsData(),
     react(),
     cloudflare({
       inspectorPort,
