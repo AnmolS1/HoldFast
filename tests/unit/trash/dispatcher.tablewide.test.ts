@@ -145,6 +145,8 @@ describe("the registry", () => {
     // The two that walk every account get twice the time.
     expect(softDeadlineOf("purge")).toBe(JOB_SOFT_DEADLINE_MS);
     expect([softDeadlineOf("user-purge"), softDeadlineOf("reconcile")]).toEqual([120_000, 120_000]);
+    // A whole-database export gets ten minutes (T27 R-4), not the default.
+    expect(softDeadlineOf("backup")).toBe(600_000);
   });
 
   it.each(Object.entries(SLOTS))(

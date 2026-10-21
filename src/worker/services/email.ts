@@ -348,10 +348,12 @@ export function render(env: Pick<Env, "APP_ORIGIN" | "SENTRY_ENVIRONMENT">, draf
 
 // ── operator alerts: fixed copy and ids ─────────────────────────────────────────────────────
 
-export type OperatorRoutineKind = "report" | "quarantine";
+export type OperatorRoutineKind = "report" | "quarantine" | "images_budget" | "kept_backstop";
 const OPERATOR_ROUTINE: Record<OperatorRoutineKind, string> = {
   report: "New abuse report",
   quarantine: "A file was quarantined",
+  images_budget: "The image-transform budget for today is nearly used up",
+  kept_backstop: "An account reached the limit on deleted files that are still kept",
 };
 const OPERATOR_CRITICAL = {
   csam_lock: "Content was locked as suspected CSAM and needs review now",

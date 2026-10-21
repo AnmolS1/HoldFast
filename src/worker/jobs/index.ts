@@ -67,11 +67,13 @@ export type Job = {
 
 /** A job's soft deadline, unless it is named below. */
 export const JOB_SOFT_DEADLINE_MS = 60_000;
-/** The two that walk every account. (`backup` keeps its own clock.) */
+/** The two that walk every account. */
 const LONG_SOFT_DEADLINE_MS = 120_000;
 const SOFT_DEADLINES: Record<string, number> = {
   "user-purge": LONG_SOFT_DEADLINE_MS,
   reconcile: LONG_SOFT_DEADLINE_MS,
+  // A whole-database export: 10 minutes, not the 60 s default it was getting (T27 R-4).
+  backup: 600_000,
 };
 
 export const softDeadlineOf = (name: string): number => SOFT_DEADLINES[name] ?? JOB_SOFT_DEADLINE_MS;

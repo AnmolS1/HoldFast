@@ -157,6 +157,12 @@ export type ScanDetail = {
   engine?: string;
   dbVersion?: string;
   durationMs?: number;
+  /** The blocklist reason the SERVER's hash matched (T21). */
+  blocklist?: (typeof blocklistReason.enumValues)[number];
+  /** PhotoDNA's outcome, when it ran (T21). */
+  photodna?: string;
+  /** Pixel dimensions of an image, read at scan time (T21). */
+  image?: { width: number; height: number };
 };
 
 // ── nodes ───────────────────────────────────────────────────────────────────────────────────
