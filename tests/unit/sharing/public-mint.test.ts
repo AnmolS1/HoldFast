@@ -396,24 +396,20 @@ describe("zip grants", () => {
     expect(await counts(other.id)).toEqual({ day: 1, max: 1 });
   });
 
-  it("the manifest lists a pending, an infected and a skipped file in `skipped` as `unavailable` only", async () => {
-    const { owner, root, link } = await tree();
-    const states = ["pending", "infected", "skipped", "under_review", "error"] as const;
+  it("a PUBLIC manifest never names a non-clean file: pending, infected, skipped, under review, error and suspected CSAM are simply absent (Addendum 8)", async () => {
+    const { owner, root, link, f, fa, fb } = await tree();
+    const states = ["pending", "infected", "skipped", "under_review", "error", "suspected_csam"] as const;
     const made = [];
     for (const state of states)
       made.push(await makeFile(owner.id, root.id, { scanStatus: state, name: `${state}.bin` }));
-    const csam = await makeFile(owner.id, root.id, { scanStatus: "suspected_csam", name: "hidden.bin" });
     const manifest = await visit(link.token, "/zip-manifest", { method: "POST" });
-    const body = manifest.body as {
-      entries: { nodeId: string }[];
-      skipped: { nodeId: string; path: string; reason: string }[];
-    };
-    expect(body.skipped.map((s) => s.nodeId).sort()).toEqual(made.map((m) => m.id).sort());
-    for (const skipped of body.skipped)
-      expect(Object.keys(skipped).sort()).toEqual(["nodeId", "path", "reason"]);
-    expect(new Set(body.skipped.map((s) => s.reason))).toEqual(new Set(["unavailable"]));
-    expect(JSON.stringify(body)).not.toContain(csam.id);
-    expect(JSON.stringify(body)).not.toMatch(/scan_|unscanned/);
+    const body = manifest.body as { entries: { nodeId: string }[]; skipped: unknown[] };
+    expect(body.skipped).toEqual([]);
+    expect(body.entries.map((entry) => entry.nodeId).sort()).toEqual([f.id, fa.id, fb.id].sort());
+    for (const file of made) expect(JSON.stringify(body)).not.toContain(file.id);
+    // The owner's own zip keeps its list of what is left out.
+    const own = await api(asCaller(owner), "/nodes/zip-manifest", { json: { nodeIds: [root.id] } });
+    expect((own.body as { skipped: unknown[] }).skipped).toHaveLength(5);
   });
 });
 

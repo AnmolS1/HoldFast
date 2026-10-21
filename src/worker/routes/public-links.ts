@@ -455,10 +455,10 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   if (root.kind !== "folder") refuse(c, link, root.id, "denied_scan", new AppError("not_found"));
   const owner = await ownerSubject(c, link);
   await previewOwnerCap(c, link, owner, root.id);
-  // Every file under the root that the link could ever serve: the clean ones are entries; one
-  // that is not clean is named once, as `unavailable` — never why. Hidden and trashed nodes, and
-  // suspected CSAM, are in neither list.
-  const manifest = await zipManifest(db(c), [{ id: root.id, label: root.name, owner: true }], {
+  // The clean files under the root, and nothing else: a file that is not clean does not exist for
+  // a visitor (PLAN §10), so it is not WALKED — never named, not even as left out (Addendum 8).
+  // The root is nobody's own here and no partner is named: only `clean` is listable.
+  const manifest = await zipManifest(db(c), [{ id: root.id, label: root.name, owner: false }], {
     maxFiles: ZIP_MAX_ENTRIES,
   });
   // One zip is one download: both counters, once, here.
@@ -480,7 +480,8 @@ router.post(`${BASE}/zip-manifest`, limited, async (c) => {
   return c.json({
     entries: manifest.entries,
     totalBytes: manifest.totalBytes,
-    skipped: manifest.skipped.map(({ nodeId, path }) => ({ nodeId, path, reason: "unavailable" as const })),
+    // Empty by construction: nothing that is not clean was walked.
+    skipped: [],
     truncated: manifest.truncated,
     zipGrant: grant.token,
   } satisfies PublicZipManifest);
