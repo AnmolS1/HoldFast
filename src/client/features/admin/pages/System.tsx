@@ -143,9 +143,11 @@ function JobRow({ job, onStopped }: { job: AdminSystemDto["jobs"][number]; onSto
       <Box sx={{ minWidth: 180 }}>
         <strong>{job.name}</strong> <span>{job.cron}</span> {job.guarded ? `· ${t("sys.guarded")}` : ""}
       </Box>
-      <Button size="small" disabled={running} onClick={() => setConfirm(true)}>
+      {/* A streamed job answers a stream lib/api.ts cannot read yet (a seam): not offered here. */}
+      <Button size="small" disabled={running || job.streamed} onClick={() => setConfirm(true)}>
         {t("sys.runNow")}
       </Button>
+      {job.streamed ? <span data-admin-job-streamed>{t("sys.streamedNote")}</span> : null}
       {running ? <span role="status">{t("sys.running", { passes })}</span> : null}
       {outcome ? (
         <span role="status" data-admin-job-outcome={outcome.kind}>

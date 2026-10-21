@@ -586,6 +586,7 @@ export const messages = {
   "sys.jobs": "Scheduled jobs",
   "sys.guarded": "stops while rolled back or paused",
   "sys.runNow": "Run now",
+  "sys.streamedNote": "Runs as a long streamed pass: start it with the operator script for now.",
   "sys.runConfirm": "Run {name} now?",
   "sys.runConfirmBody":
     "It runs in passes until it is done. It stops if the detector or the pause switch stops it.",
