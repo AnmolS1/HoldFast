@@ -95,6 +95,12 @@ export const en = {
 
   "toast.rateLimited": "Too many requests. Try again in {seconds} s.",
   "toast.rateLimitedSoon": "Too many requests. Try again shortly.",
+  "toast.ceilingReachedIn": "Daily limit reached. It resets in {wait}.",
+  "toast.ceilingReached": "Daily limit reached. It resets at midnight UTC.",
+  "time.seconds": "{count} s",
+  "time.minutes": "{count} min",
+  "time.hours": "{count} h",
+  "time.hoursMinutes": "{hours} h {minutes} min",
   "toast.impersonationReadOnly": "Read-only while impersonating",
   "toast.uploadsPaused": "Uploads are paused right now.",
   "toast.linksPaused": "Link sharing is paused right now.",

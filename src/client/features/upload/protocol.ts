@@ -14,12 +14,18 @@ import {
   type CompleteUploadBody,
   type InitUploadBody,
 } from "../../../shared/schemas/upload";
-import { api, ApiError } from "../../lib/api";
-import { INTERNAL_ERROR, isErrorCode } from "../../lib/contracts";
+import { api, ApiError, apiErrorOf } from "../../lib/api";
 import { t } from "./strings";
 
 export function initUpload(body: InitUploadBody, signal?: AbortSignal): Promise<InitUploadResponse> {
-  return api("/api/uploads", { method: "POST", body, schema: InitUploadResponse, signal });
+  // The daily ceiling is said by the ribbon and the row ("Daily upload limit reached…"): no toast.
+  return api("/api/uploads", {
+    method: "POST",
+    body,
+    schema: InitUploadResponse,
+    signal,
+    silent: ["ceiling_exceeded"],
+  });
 }
 
 export function completeUpload(
@@ -72,15 +78,6 @@ function abortError(): DOMException {
   return new DOMException("The upload was stopped.", "AbortError");
 }
 
-function retryAfterOf(xhr: XMLHttpRequest): number | undefined {
-  const value = xhr.getResponseHeader("retry-after");
-  if (!value) return undefined;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(0, Math.ceil(seconds));
-  const date = Date.parse(value);
-  return Number.isNaN(date) ? undefined : Math.max(0, Math.ceil((date - Date.now()) / 1000));
-}
-
 function parseJson(text: string): unknown {
   try {
     return JSON.parse(text) as unknown;
@@ -89,34 +86,12 @@ function parseJson(text: string): unknown {
   }
 }
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null;
-
-/** The failure of a body request, as the API client would report the same answer. */
+/** The failure of a body request: the ApiError the API client throws for the same answer. */
 function errorOf(xhr: XMLHttpRequest): ApiError {
-  const retryAfter = retryAfterOf(xhr);
-  const body = parseJson(xhr.responseText);
-  if (!isRecord(body) || typeof body.error !== "string" || typeof body.message !== "string") {
-    return new ApiError({ status: xhr.status, code: "http_error", message: t("row.failed"), retryAfter });
-  }
-  const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
-  if (isErrorCode(body.error)) {
-    return new ApiError({
-      status: xhr.status,
-      code: body.error,
-      message: body.message,
-      requestId,
-      details: isRecord(body.details) ? body.details : undefined,
-      retryAfter,
-    });
-  }
-  return new ApiError({
-    status: xhr.status,
-    code: body.error === INTERNAL_ERROR ? INTERNAL_ERROR : "http_error",
-    message: t("row.failed"),
-    requestId,
-    retryAfter,
-  });
+  return apiErrorOf(
+    { status: xhr.status, body: xhr.responseText, retryAfter: xhr.getResponseHeader("retry-after") },
+    t("row.failed"),
+  );
 }
 
 /**

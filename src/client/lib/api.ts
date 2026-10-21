@@ -237,6 +237,17 @@ export interface ApiOptions<T> {
   signal?: AbortSignal;
   /** Parses and types the response. Without it the parsed JSON is returned unchecked. */
   schema?: ZodType<T>;
+  /**
+   * The caller wants no body: any 2xx resolves to `undefined` without reading it (a `202` that
+   * may or may not carry one). A failure is read and thrown as usual.
+   */
+  empty?: boolean;
+  /**
+   * Codes this caller announces itself: no toast is shown for them (their other side effects
+   * still happen, and the error is thrown as usual). E.g. the uploader says "Daily upload limit
+   * reached" in its ribbon, so its init passes `["ceiling_exceeded"]`.
+   */
+  silent?: readonly ApiErrorCode[];
 }
 
 function isBodyInit(body: unknown): body is BodyInit {
@@ -271,27 +282,39 @@ function isEnvelope(value: unknown): value is RawEnvelope {
   return isRecord(value) && typeof value.error === "string" && typeof value.message === "string";
 }
 
-async function toApiError(response: Response): Promise<ApiError> {
-  const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
-  let body: unknown;
+/** A failed answer as its parts: what `apiErrorOf` reads (an XMLHttpRequest has no `Response`). */
+export interface FailedAnswer {
+  status: number;
+  /** The body as text; `undefined`/`null` when there was none. */
+  body?: string | null;
+  /** The raw `Retry-After` header, when there was one. */
+  retryAfter?: string | null;
+}
+
+function parseJsonText(text: string | null | undefined): unknown {
+  if (!text) return undefined;
   try {
-    body = await response.clone().json();
+    return JSON.parse(text) as unknown;
   } catch {
-    body = undefined;
+    return undefined;
   }
+}
+
+/** The error envelope (or its absence) as a typed ApiError; `fallback` is the client's own words. */
+function errorFrom(
+  status: number,
+  body: unknown,
+  retryAfter: number | undefined,
+  fallback: string,
+): ApiError {
   if (!isEnvelope(body)) {
-    return new ApiError({
-      status: response.status,
-      code: "http_error",
-      message: t("toast.generic"),
-      retryAfter,
-    });
+    return new ApiError({ status, code: "http_error", message: fallback, retryAfter });
   }
   // The request id is kept in every case: it is what support uses to find the call.
   const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
   if (isErrorCode(body.error)) {
     return new ApiError({
-      status: response.status,
+      status,
       code: body.error,
       message: body.message,
       requestId,
@@ -302,12 +325,42 @@ async function toApiError(response: Response): Promise<ApiError> {
   // An unexpected failure (`500 internal`), or a code newer than this build: a generic failure
   // in the client's own words — the server's text for these says nothing a user can act on.
   return new ApiError({
-    status: response.status,
+    status,
     code: body.error === INTERNAL_ERROR ? INTERNAL_ERROR : "http_error",
-    message: t("toast.generic"),
+    message: fallback,
     requestId,
     retryAfter,
   });
+}
+
+/**
+ * A failed answer read some other way than `fetch` (the upload bodies go through
+ * XMLHttpRequest): the same ApiError `api()` would have thrown. `fallback` is the message when
+ * the server's own text is not shown (no envelope, `internal`, a code this build does not know).
+ */
+export function apiErrorOf(answer: FailedAnswer, fallback: string = t("toast.generic")): ApiError {
+  return errorFrom(
+    answer.status,
+    parseJsonText(answer.body),
+    parseRetryAfter(answer.retryAfter ?? null),
+    fallback,
+  );
+}
+
+/** A failed `Response` as the ApiError `api()` throws for it. The response's body is not consumed. */
+export async function toApiError(response: Response): Promise<ApiError> {
+  let body: unknown;
+  try {
+    body = await response.clone().json();
+  } catch {
+    body = undefined;
+  }
+  return errorFrom(
+    response.status,
+    body,
+    parseRetryAfter(response.headers.get("retry-after")),
+    t("toast.generic"),
+  );
 }
 
 async function send(path: string, options: ApiOptions<unknown>): Promise<Response> {
@@ -351,8 +404,19 @@ async function readBody<T>(response: Response, schema: ZodType<T> | undefined): 
   return parsed.data;
 }
 
-/** Side effects of a failure that is not replayed. */
-function react(error: ApiError): void {
+/** "45 min", "1 h 30 min", "30 s": how long until a limit resets. */
+function waitWords(seconds: number): string {
+  if (seconds < 60) return t("time.seconds", { count: Math.max(1, seconds) });
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return t("time.minutes", { count: minutes });
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0 ? t("time.hours", { count: hours }) : t("time.hoursMinutes", { hours, minutes: rest });
+}
+
+/** Side effects of a failure that is not replayed. `silent`: codes whose toast the caller shows. */
+function react(error: ApiError, silent: readonly ApiErrorCode[] = []): void {
+  const quiet = silent.includes(error.code);
   const reason = typeof error.details?.reason === "string" ? error.details.reason : undefined;
   if (error.status === 403 && reason === "account_suspended") {
     environment.clearSession();
@@ -360,10 +424,24 @@ function react(error: ApiError): void {
     return;
   }
   if (error.status === 403 && reason === "impersonation_read_only") {
-    toast({ message: t("toast.impersonationReadOnly"), key: "impersonation" });
+    if (!quiet) toast({ message: t("toast.impersonationReadOnly"), key: "impersonation" });
+    return;
+  }
+  // A daily limit, not "too many requests": it resets at 00:00 UTC (the Retry-After says when).
+  if (error.status === 429 && error.code === "ceiling_exceeded") {
+    if (quiet) return;
+    toast({
+      message:
+        error.retryAfter === undefined
+          ? t("toast.ceilingReached")
+          : t("toast.ceilingReachedIn", { wait: waitWords(error.retryAfter) }),
+      requestId: error.requestId,
+      key: "rate",
+    });
     return;
   }
   if (error.status === 429) {
+    if (quiet) return;
     toast({
       message:
         error.retryAfter === undefined
@@ -376,17 +454,17 @@ function react(error: ApiError): void {
   }
   if (error.status === 503 && error.code === "read_only") {
     environment.patchConfig({ readOnly: true });
-    toast({ message: t("toast.readOnly"), key: "read-only" });
+    if (!quiet) toast({ message: t("toast.readOnly"), key: "read-only" });
     return;
   }
   if (error.status === 503 && error.code === "feature_disabled") {
     if (reason === "uploads_disabled") {
       environment.patchConfig({ uploadsEnabled: false });
-      toast({ message: t("toast.uploadsPaused"), key: "feature" });
+      if (!quiet) toast({ message: t("toast.uploadsPaused"), key: "feature" });
     } else if (reason === "links_disabled") {
       environment.patchConfig({ linksEnabled: false });
-      toast({ message: t("toast.linksPaused"), key: "feature" });
-    } else {
+      if (!quiet) toast({ message: t("toast.linksPaused"), key: "feature" });
+    } else if (!quiet) {
       toast({ message: t("toast.featurePaused"), key: "feature" });
     }
   }
@@ -402,7 +480,14 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
   let replayed = false;
   for (;;) {
     const response = await send(path, options);
-    if (response.ok) return readBody(response, options.schema);
+    if (response.ok) {
+      if (options.empty) {
+        // Not read: release the connection's body without parsing it.
+        void response.body?.cancel().catch(() => {});
+        return undefined as T;
+      }
+      return readBody(response, options.schema);
+    }
     const error = await toApiError(response);
     if (!replayed) {
       if (
@@ -424,7 +509,7 @@ export async function api<T = unknown>(path: string, options: ApiOptions<T> = {}
         continue;
       }
     }
-    react(error);
+    react(error, options.silent);
     throw error;
   }
 }
