@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
+import { getPrefs } from "../../../../src/client/lib/prefs";
 import { buildRoutes } from "../../../../src/client/router";
 import { fileNode } from "../explorer/fixtures/nodes";
 import {
@@ -81,6 +82,23 @@ describe("the page", () => {
     renderRoutes(buildRoutes(), ["/account"]);
     await waitFor(() => expect(document.querySelector("[data-account-error]")).not.toBeNull());
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+});
+
+describe("preferences", () => {
+  it("opening the Preferences page while the server's copy loads does not lose it: the server copy wins", async () => {
+    // Slow enough that the page's own prefs query mounts while the sync's load is in flight.
+    api((call) =>
+      call.path === "/api/account/prefs" && call.method === "GET"
+        ? new Promise<Response>((resolve) =>
+            setTimeout(() => resolve(json({ ...PREFS, theme: "dark", density: "comfortable" })), 50),
+          )
+        : undefined,
+    );
+    renderRoutes(buildRoutes(), ["/account/preferences"]);
+    const dark = await screen.findByRole("radio", { name: "Dark" });
+    await waitFor(() => expect((dark as HTMLInputElement).checked).toBe(true));
+    expect(getPrefs()).toMatchObject({ theme: "dark", density: "comfortable" });
   });
 });
 

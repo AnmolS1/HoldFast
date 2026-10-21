@@ -12,7 +12,7 @@ import type { PrefsDto } from "../../../shared/schemas/account";
 import { registerUserStatePurger, type SessionShape } from "../../lib/contracts";
 import { getPrefs, registerPrefsSync, type Prefs, type PrefsSync } from "../../lib/prefs";
 import { getKnownUserId, queryClient, sessionQuery } from "../../lib/query";
-import { patchPrefs, prefsQuery } from "./api";
+import { fetchPrefs, patchPrefs, prefsQuery } from "./api";
 
 const toPrefs = (dto: PrefsDto): Prefs => ({
   theme: dto.theme,
@@ -25,7 +25,10 @@ export function prefsSyncFor(userId: string): PrefsSync {
   return {
     async load() {
       const before = getPrefs();
-      const dto = await queryClient.fetchQuery({ ...prefsQuery, staleTime: 0 });
+      // A request of its own, not the prefs query: a component that mounts that query meanwhile
+      // (the Preferences page) would cancel this fetch to start its own, and the copy be lost.
+      const dto = await fetchPrefs();
+      if (getKnownUserId() === userId) queryClient.setQueryData(prefsQuery.queryKey, dto);
       // The person changed something while the server's copy was on its way: that change is
       // newer than the copy and is the one being saved — the copy must not undo it.
       if (getPrefs() !== before) return null;

@@ -1,13 +1,15 @@
 // The preferences sync the account feature registers (features/account/prefs-sync.ts): the server
 // copy wins at sign-in, changes are saved debounced (one PATCH per burst), and an account change
 // while a save is pending drops it — nothing of account A is saved as B.
-import { waitFor } from "@testing-library/react";
+import { renderHook, waitFor } from "@testing-library/react";
+import { useQuery } from "@tanstack/react-query";
+import { prefsQuery } from "../../../../src/client/features/account/api";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetPrefsSync, startPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { getPrefs, setPrefs, SYNC_DEBOUNCE_MS } from "../../../../src/client/lib/prefs";
 import { purgeUserState, queryClient, sessionQuery } from "../../../../src/client/lib/query";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
-import { json, mockFetch, sessionOf, setupShell, type MockCall } from "../shell/helpers";
+import { json, mockFetch, Providers, sessionOf, setupShell, type MockCall } from "../shell/helpers";
 
 setupShell();
 
@@ -171,6 +173,31 @@ describe("a change made while the server copy is loading", () => {
     expect(getPrefs().theme).toBe("dark");
     await waitFor(() => expect(patches(calls)).toHaveLength(1), { timeout: SYNC_DEBOUNCE_MS * 4 });
     expect(patches(calls)[0]!.body).toMatchObject({ theme: "dark" });
+  });
+});
+
+describe("the page's own prefs query", () => {
+  it("a component that mounts and unmounts it while the copy loads (the frame remounts on sign-in) cannot cancel the load", async () => {
+    let answer: (response: Response) => void = () => {};
+    let gets = 0;
+    mockFetch((call: MockCall) => {
+      if (call.path === "/api/auth/get-session") return json(sessionOf({ id: A, email: "aaaa@example.com" }));
+      if (call.path === "/api/account/prefs" && call.method === "GET") {
+        gets += 1;
+        return gets === 1
+          ? new Promise<Response>((resolve) => (answer = resolve))
+          : json(prefsOf({ theme: "dark", density: "comfortable" }));
+      }
+      return undefined;
+    });
+    browserSession = A;
+    await queryClient.fetchQuery({ ...sessionQuery, staleTime: 0 });
+    await waitFor(() => expect(gets).toBe(1));
+    // The Preferences section mounts its query, and the frame remounts it a moment later.
+    const view = renderHook(() => useQuery(prefsQuery), { wrapper: Providers });
+    view.unmount();
+    answer(json(prefsOf({ theme: "dark", density: "comfortable" })));
+    await waitFor(() => expect(getPrefs()).toMatchObject({ theme: "dark", density: "comfortable" }));
   });
 });
 

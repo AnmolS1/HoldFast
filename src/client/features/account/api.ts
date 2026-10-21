@@ -37,9 +37,13 @@ export function patchProfile(body: PatchProfileBody): Promise<ProfileDto> {
   return api("/api/account/profile", { method: "PATCH", body, schema: ProfileDto });
 }
 
+export function fetchPrefs(signal?: AbortSignal): Promise<PrefsDto> {
+  return api("/api/account/prefs", { schema: PrefsDto, signal });
+}
+
 export const prefsQuery = queryOptions({
   queryKey: accountKeys.prefs,
-  queryFn: ({ signal }) => api("/api/account/prefs", { schema: PrefsDto, signal }),
+  queryFn: ({ signal }) => fetchPrefs(signal),
 });
 
 export function patchPrefs(body: PatchPrefsBody): Promise<PrefsDto> {
