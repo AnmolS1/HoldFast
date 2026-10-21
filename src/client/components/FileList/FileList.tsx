@@ -24,6 +24,7 @@ import { t } from "../../lib/i18n";
 import { isApplePlatform } from "../../lib/shortcuts";
 import { TOUCH_QUERY, useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
+import { useTrail } from "../Breadcrumbs";
 import { Bytes } from "../Bytes";
 import { FileBadge, FolderGlyph } from "../FileBadge";
 import { ProgressUnderline } from "../ProgressUnderline";
@@ -181,6 +182,8 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
   const columns = props.columns ?? ALL_COLUMNS;
   const desktop = useIsDesktop();
   const touchRows = useMediaQuery(TOUCH_QUERY, { noSsr: true });
+  // The folder the breadcrumb trail ends in: its crumb already carries the transition's name.
+  const currentFolderId = useTrail()?.at(-1)?.id;
   const multi = selectionMode === "multi";
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -444,8 +447,10 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
         {item.name}
       </Box>
     );
-    // Folder names are the shared element of the folder-enter transition (name → breadcrumb).
-    return item.kind === "folder" ? (
+    // Folder names are the shared element of the folder-enter transition (name → breadcrumb). The
+    // row of the folder the trail is already in is not: its crumb holds the name, and two mounted
+    // at once make React drop the transition (going back up while the old trail is still set).
+    return item.kind === "folder" && item.id !== currentFolderId ? (
       <ViewTransition name={`hf-node-${item.id}`}>{name}</ViewTransition>
     ) : (
       name
