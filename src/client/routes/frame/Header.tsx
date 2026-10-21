@@ -24,9 +24,17 @@ export const SEARCH_INPUT_ID = "hf-search";
 export function SearchBox({ compact = false }: { compact?: boolean }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const [query, setQuery] = useState(() =>
-    location.pathname === "/search" ? (new URLSearchParams(location.search).get("q") ?? "") : "",
-  );
+  // The box follows the address: the query of /search, empty elsewhere — set again whenever the
+  // address's query changes (the search page's own box or filters, back / forward, leaving the
+  // page), and left alone while it does not, so what is typed here stays.
+  const addressQuery =
+    location.pathname === "/search" ? (new URLSearchParams(location.search).get("q") ?? "") : "";
+  const [query, setQuery] = useState(addressQuery);
+  const [followed, setFollowed] = useState(addressQuery);
+  if (followed !== addressQuery) {
+    setFollowed(addressQuery);
+    setQuery(addressQuery);
+  }
   const [focused, setFocused] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const onSubmit = (event: FormEvent) => {

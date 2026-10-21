@@ -90,6 +90,23 @@ describe("desktop frame", () => {
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeTruthy();
   });
 
+  // T19's seam: the box read `q` once, at mount; after the search page (its own box, a filter) or
+  // back / forward rewrote the address it kept its old text.
+  it("the header's search box follows the address: ?q on /search, empty elsewhere", async () => {
+    const { router } = await openAt(1280, "/search?q=first");
+    const box = () => screen.getByRole("searchbox", { name: "Search files" }) as HTMLInputElement;
+    expect(box().value).toBe("first");
+    await act(() => router.navigate("/search?q=second"));
+    await waitFor(() => expect(box().value).toBe("second"));
+    await act(() => router.navigate(-1));
+    await waitFor(() => expect(box().value).toBe("first"));
+    await act(() => router.navigate("/trash"));
+    await waitFor(() => expect(box().value).toBe(""));
+    // What is typed stays while the address does not change.
+    fireEvent.change(box(), { target: { value: "typed" } });
+    expect(box().value).toBe("typed");
+  });
+
   it("the storage bar shows its skeleton while usage is unknown", async () => {
     await openAt(1280);
     expect(
