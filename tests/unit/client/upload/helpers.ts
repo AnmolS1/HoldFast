@@ -281,9 +281,9 @@ const librarySessionStore = (): LibraryStore =>
   (betterAuthClient as unknown as { $store: { atoms: { session: LibraryStore } } }).$store.atoms.session;
 
 /**
- * Whether the auth library's own session store is mounted. Every purge mounts it (the shell's
- * purger reads it, `lib/auth-client.ts`), and it unmounts itself a second later from a timer that
- * touches `document`.
+ * Whether the auth library's own session store is mounted. A mounted store unmounts itself a
+ * second later from a timer that touches `document`; the shell's purger (`lib/auth-client.ts`)
+ * reads it without mounting it.
  */
 export function authSessionStoreMounted(): boolean {
   return librarySessionStore().active === true;

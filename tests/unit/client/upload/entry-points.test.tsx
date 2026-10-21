@@ -262,16 +262,13 @@ describe("the mark of the user's action", () => {
   });
 });
 
-// The two tests below run in this order (a file's tests run in sequence). A purge mounts the auth
-// library's own session store, which unmounts itself a second later from a timer that touches
-// `document`: after the file's last test that ran once jsdom was gone and failed the whole run.
+// A purge used to mount the auth library's own session store (the shell's purger read it with
+// `get()`), and the store unmounted itself a second later from a timer that touches `document`:
+// after the file's last test that ran once jsdom was gone and failed the whole run. The purger
+// reads `.value` now and mounts nothing; the shared clean-up stays as a net.
 describe("nothing a test started outlives it", () => {
-  it("a purge leaves the auth library's session store mounted for now", async () => {
+  it("a purge does not mount the auth library's session store", async () => {
     await purgeUserState();
-    expect(authSessionStoreMounted()).toBe(true);
-  });
-
-  it("the next test finds it unmounted: the shared clean-up did it while the document was there", () => {
     expect(authSessionStoreMounted()).toBe(false);
   });
 });

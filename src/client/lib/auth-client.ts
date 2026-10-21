@@ -108,15 +108,18 @@ export const authClient: AuthClientContract = {
 
 // The library keeps a session store of its own (unused by the shell). If anything ever fills it,
 // it is user-scoped state like any other: emptied on sign-out and on every change of identity.
+// Read through `.value`, never `.get()`: `get()` MOUNTS a store nobody listens to, and the session
+// store's mount asks `GET /api/auth/get-session`, listens for focus, and unmounts a second later
+// from a timer that touches `document`.
 registerUserStatePurger(() => {
   try {
     const store = (
       betterAuthClient as unknown as {
-        $store?: { atoms?: Record<string, { get(): unknown; set(value: unknown): void } | undefined> };
+        $store?: { atoms?: Record<string, { value: unknown; set(value: unknown): void } | undefined> };
       }
     ).$store;
     const session = store?.atoms?.session;
-    if (session) session.set({ ...(session.get() as object), data: null, error: null, isPending: false });
+    if (session) session.set({ ...(session.value as object), data: null, error: null, isPending: false });
   } catch {
     // Nothing to empty.
   }
