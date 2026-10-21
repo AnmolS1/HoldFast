@@ -12,12 +12,24 @@
 //     redaction first (a public-link page carries its token in the path);
 //   - nothing is logged, nothing is stored, no session is read (the pipeline skips
 //     /api/public/*), no cookie is set; the answer is 204 whatever was sent.
-// The address is limited by the pipeline's RL_API (by IP: no session is read here).
+//
+// THE COST IS BOUNDED, whoever sends. `report-uri` may name any URL, so a third-party page can aim
+// every one of its visitors' browsers here — from as many addresses as it has visitors. So:
+//   - a report whose document is not on this app's origin or the files origin is dropped
+//     uncounted (a worker's reports name its script, which is on the app origin);
+//   - at most 10 reports are taken from one body, and at most ONE Sentry message is sampled per
+//     request, whatever the body holds;
+//   - at most SENTRY_MESSAGES_PER_MINUTE messages a minute leave one isolate;
+//   - the endpoint has a bucket of its own on RL_API (`csp:<address>`); over it a report is
+//     dropped (204). The pipeline's RL_API by address applies first (over it: 429).
+//   - a body over the cap leaves one `oversize` data point, so the loss is visible.
 
 import * as Sentry from "@sentry/cloudflare";
 import { Hono } from "hono";
 import { redactText } from "../../shared/sentry-redact";
+import { normalise } from "../services/ip-hash";
 import { metric } from "../services/metrics";
+import { checkRateLimit } from "../services/ratelimit";
 import type { AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
@@ -25,8 +37,30 @@ export const router = new Hono<AppEnv>();
 export const MAX_REPORT_BYTES = 8 * 1024;
 /** Reports taken from one body (the Reporting API may batch several). */
 const MAX_REPORTS = 10;
-/** The share of accepted reports that become a Sentry message; the metric counts every one. */
+/** The share of requests whose (first) report becomes a Sentry message; the metric counts every report. */
 export const SENTRY_SAMPLE_RATE = 0.1;
+/** The most Sentry messages one isolate sends in a minute. */
+export const SENTRY_MESSAGES_PER_MINUTE = 10;
+
+// A ceiling, not an exact count: per isolate, reset each minute.
+const sentryBudget = { minute: 0, sent: 0 };
+
+function takeSentryBudget(nowMs: number): boolean {
+  const minute = Math.floor(nowMs / 60_000);
+  if (minute !== sentryBudget.minute) {
+    sentryBudget.minute = minute;
+    sentryBudget.sent = 0;
+  }
+  if (sentryBudget.sent >= SENTRY_MESSAGES_PER_MINUTE) return false;
+  sentryBudget.sent += 1;
+  return true;
+}
+
+/** Tests only: a fresh minute. */
+export function resetSentryBudgetForTests(): void {
+  sentryBudget.minute = 0;
+  sentryBudget.sent = 0;
+}
 
 /** Fetch directives, document, navigation and reporting directives of CSP Level 3, and the sub-kinds browsers report. */
 const DIRECTIVES = new Set([
@@ -70,8 +104,21 @@ const REPORT_TYPES = new Set(["application/csp-report", "application/reports+jso
 
 type Report = { directive: string; document: unknown; blocked: unknown; referrer: unknown; sample: unknown };
 
-/** The body, or null when it is longer than `max` bytes (then it is not read any further). */
-async function readCapped(body: ReadableStream<Uint8Array> | null, max: number): Promise<string | null> {
+/** Is the report about a document (or a worker script) of this app or of its files host? */
+function fromHere(report: Report, origins: ReadonlySet<string>): boolean {
+  if (typeof report.document !== "string") return false;
+  try {
+    return origins.has(new URL(report.document).origin);
+  } catch {
+    return false;
+  }
+}
+
+/** The body; `oversize` when it is longer than `max` bytes (then it is not read any further). */
+async function readCapped(
+  body: ReadableStream<Uint8Array> | null,
+  max: number,
+): Promise<string | "oversize" | null> {
   if (!body) return null;
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
@@ -82,7 +129,7 @@ async function readCapped(body: ReadableStream<Uint8Array> | null, max: number):
     total += value.byteLength;
     if (total > max) {
       await reader.cancel();
-      return null;
+      return "oversize";
     }
     chunks.push(value);
   }
@@ -164,12 +211,20 @@ router.post("/public/csp-report", async (c) => {
       await c.req.raw.body?.cancel();
       return c.body(null, 204);
     }
+    if (!(await checkRateLimit(c.env, "RL_API", `csp:${normalise(c.get("ip"))}`))) {
+      await c.req.raw.body?.cancel();
+      return c.body(null, 204);
+    }
     const text = await readCapped(c.req.raw.body, MAX_REPORT_BYTES);
-    if (text !== null) {
-      for (const report of parseReports(contentType, text)) {
-        metric("csp", { reason: report.directive });
-        if (Math.random() < SENTRY_SAMPLE_RATE) toSentry(report);
-      }
+    if (text === "oversize") {
+      metric("csp", { reason: "oversize" });
+    } else if (text !== null) {
+      const origins = new Set([new URL(c.env.APP_ORIGIN).origin, new URL(c.env.FILES_ORIGIN).origin]);
+      const reports = parseReports(contentType, text).filter((report) => fromHere(report, origins));
+      for (const report of reports) metric("csp", { reason: report.directive });
+      // One message at most per request, whatever the body held.
+      const first = reports[0];
+      if (first && Math.random() < SENTRY_SAMPLE_RATE && takeSentryBudget(Date.now())) toSentry(first);
     }
   } catch {
     // A body that cannot be read is dropped like a malformed one.

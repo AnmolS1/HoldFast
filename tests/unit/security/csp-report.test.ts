@@ -3,10 +3,15 @@
 // 8 KB while it streams; the Sentry message is sampled and its URIs and sample are redacted;
 // nothing reads a session or sets a cookie; the answer is 204 whatever was sent.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { directiveTag, MAX_REPORT_BYTES } from "../../../src/worker/routes/csp-report";
+import {
+  directiveTag,
+  MAX_REPORT_BYTES,
+  resetSentryBudgetForTests,
+  SENTRY_MESSAGES_PER_MINUTE,
+} from "../../../src/worker/routes/csp-report";
 import { metric } from "../../../src/worker/services/metrics";
 import { redactText } from "../../../src/shared/sentry-redact";
-import { TEST_APP_ORIGIN } from "../../setup/test-vars";
+import { TEST_APP_ORIGIN, TEST_FILES_ORIGIN } from "../../setup/test-vars";
 import { ALLOW_ALL, appWith, fakeCore, fakeCtx, testEnv } from "../worker-core/helpers";
 
 const sentry = vi.hoisted(() => ({
@@ -51,6 +56,7 @@ beforeEach(() => {
   vi.mocked(metric).mockClear();
   sentry.messages.length = 0;
   vi.restoreAllMocks();
+  resetSentryBudgetForTests();
 });
 
 type Post = {
@@ -75,7 +81,17 @@ async function post({ body, type = "application/csp-report", headers = {}, env =
   return { response, text, fake };
 }
 
-const legacy = (fields: Record<string, unknown>) => JSON.stringify({ "csp-report": fields });
+/** A report-uri body; its document is a page of the app unless the test says otherwise. */
+const legacy = (fields: Record<string, unknown>) =>
+  JSON.stringify({ "csp-report": { "document-uri": DOC, ...fields } });
+/** A Reporting-API batch of `count` csp-violation reports. */
+const batch = (count: number, documentURL = DOC) =>
+  JSON.stringify(
+    Array.from({ length: count }, (_, i) => ({
+      type: "csp-violation",
+      body: { effectiveDirective: "img-src", documentURL, sample: `s${i}` },
+    })),
+  );
 const metricReasons = () => vi.mocked(metric).mock.calls.map(([name, tags]) => `${name}:${tags?.reason}`);
 
 /** A body that arrives in pieces and declares no length. */
@@ -170,7 +186,8 @@ describe("the body cap: 8 KB, counted while it streams", () => {
     // A lying Content-Length changes nothing: the bytes are counted.
     const { response } = await post({ body: streamOf(padded(20_000)), headers: { "content-length": "100" } });
     expect(response.status).toBe(204);
-    expect(metricReasons()).toEqual([]);
+    // Not read, and not lost without a trace: one `oversize` point each (Addendum 3 F6).
+    expect(metricReasons()).toEqual(["csp:oversize", "csp:oversize", "csp:oversize"]);
   });
 
   it("a long body is not read to its end", async () => {
@@ -269,6 +286,83 @@ describe("no session, no cookie, limited by address", () => {
       headers: { "cf-connecting-ip": "203.0.113.7" },
       env: { RL_API },
     });
-    expect(keys).toEqual(["ip:203.0.113.7"]);
+    // The pipeline's RL_API by address, then the endpoint's own bucket (F9).
+    expect(keys).toEqual(["ip:203.0.113.7", "csp:203.0.113.7"]);
+  });
+});
+
+describe("the cost is bounded (Addendum 3 F1, F6, F9)", () => {
+  it("a report from a page that is not this app's is dropped: no metric, no Sentry message — 204 all the same", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    for (const doc of ["https://evil.example/page", "http://localhost.evil.example/", "not a url", ""]) {
+      const { response } = await post({
+        body: legacy({ "document-uri": doc, "violated-directive": "img-src" }),
+      });
+      expect(response.status, doc).toBe(204);
+    }
+    const { response } = await post({
+      body: batch(3, "https://evil.example/"),
+      type: "application/reports+json",
+    });
+    expect(response.status).toBe(204);
+    // A legacy report with no document at all is dropped too.
+    await post({ body: JSON.stringify({ "csp-report": { "violated-directive": "img-src" } }) });
+    expect(metricReasons()).toEqual([]);
+    expect(sentry.messages).toEqual([]);
+  });
+
+  it("a page of the app or a file of the files host (a worker's script, a document) is accepted", async () => {
+    await post({
+      body: legacy({
+        "document-uri": `${TEST_APP_ORIGIN}/assets/sha256.worker-x.js`,
+        "violated-directive": "connect-src",
+      }),
+    });
+    await post({
+      body: legacy({ "document-uri": `${TEST_FILES_ORIGIN}/i/x/y`, "violated-directive": "img-src" }),
+    });
+    expect(metricReasons()).toEqual(["csp:connect-src", "csp:img-src"]);
+  });
+
+  it("one body: at most 10 reports counted, at most ONE Sentry message whatever is sampled", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    await post({ body: batch(10), type: "application/reports+json" });
+    expect(metricReasons()).toHaveLength(10);
+    expect(sentry.messages).toHaveLength(1);
+    vi.mocked(metric).mockClear();
+    sentry.messages.length = 0;
+    resetSentryBudgetForTests();
+    await post({ body: batch(11), type: "application/reports+json" });
+    expect(metricReasons()).toHaveLength(10);
+    expect(sentry.messages).toHaveLength(1);
+  });
+
+  it(`at most ${SENTRY_MESSAGES_PER_MINUTE} Sentry messages a minute from one isolate, however many requests are sampled`, async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    for (let i = 0; i < SENTRY_MESSAGES_PER_MINUTE + 5; i++) {
+      await post({ body: legacy({ "violated-directive": "img-src" }) });
+    }
+    expect(sentry.messages).toHaveLength(SENTRY_MESSAGES_PER_MINUTE);
+    // Every report is still counted.
+    expect(metricReasons()).toHaveLength(SENTRY_MESSAGES_PER_MINUTE + 5);
+  });
+
+  it("over the endpoint's own bucket a report is dropped, 204 — and the address's API budget is a different key", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const RL_API = {
+      limit: async ({ key }: { key: string }) => ({ success: !key.startsWith("csp:") }),
+    };
+    const { response } = await post({ body: legacy({ "violated-directive": "img-src" }), env: { RL_API } });
+    expect(response.status).toBe(204);
+    expect(metricReasons()).toEqual([]);
+    expect(sentry.messages).toEqual([]);
+  });
+
+  it("a body over 8 KB is not read, and leaves one `oversize` data point (a fixed tag)", async () => {
+    const big = batch(60);
+    expect(new TextEncoder().encode(big).length).toBeGreaterThan(MAX_REPORT_BYTES);
+    const { response } = await post({ body: big, type: "application/reports+json" });
+    expect(response.status).toBe(204);
+    expect(vi.mocked(metric).mock.calls).toEqual([["csp", { reason: "oversize" }]]);
   });
 });
