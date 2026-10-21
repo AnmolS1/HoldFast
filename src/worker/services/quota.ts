@@ -21,9 +21,9 @@ export async function reserve(
   opts: { forEditor: boolean },
 ): Promise<void> {
   if (await quota.reserve(tx, ownerId, bytes)) return;
-  // Refused past the hold backstop (db/queries/quota.ts): the answer is a full account's, nothing
+  // Refused past the kept-bytes backstop (db/queries/quota.ts): the answer is a full account's, nothing
   // else; the operator learns it from the metric (T23 brief Addendum 4).
-  if (await quota.holdBackstopReached(tx, ownerId)) metric("upload", { outcome: "hold_backstop" });
+  if (await quota.keptBackstopReached(tx, ownerId)) metric("upload", { outcome: "hold_backstop" });
   throw new AppError("quota_exceeded", opts.forEditor ? OWNER_FULL_MESSAGE : undefined);
 }
 

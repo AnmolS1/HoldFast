@@ -5,24 +5,24 @@
 // Avatars (`system = 'avatar'`) never count. Hidden and held bytes count on purpose: the number
 // does not move when a file is hidden, so the meter reveals nothing.
 //
-// TWO FIGURES (T23 review M2, brief Addenda 3 and 4). `used_bytes` is the operator's: it keeps
-// what a hold keeps of a root its owner deleted for good (the purge-requested subtrees: their
-// files and old versions — what the purge would have given back). The ACCOUNT HOLDER's figure
-// leaves out the part a LEGAL HOLD keeps — and only that part: bytes kept for any other reason
-// (a file under review, suspected CSAM, an open notice) are visible states of the owner's own
-// files and keep counting, as before. That figure is the one everywhere the holder meets one:
-// the room `reserve` gives (enforcement), GET /api/account/usage and the data export. It is
-// DERIVED from the held rows (`legalHoldKeptBytes`), never kept in a counter of its own — so
-// releasing, purging and the reconcile formula are untouched, and the purge that runs once the
-// hold is lifted gives the bytes back exactly once.
-// THE BACKSTOP (Addendum 4). Left out without a bound, "upload, delete forever, upload again"
-// would let a held account store without limit. Past HOLD_KEPT_MAX_QUOTAS × its quota of
-// hold-kept bytes, `reserve` refuses as for a full account — the ordinary answer, no other
-// signal — and the account is shown full (`visibleUsedBytes`). So it never stores more than
-// its quota plus that multiple of it (one last upload past the line included).
+// TWO FIGURES (T23 review M2, brief Addenda 3-5). `used_bytes` is the operator's: it keeps what
+// is still stored of the roots the owner deleted for good (the purge-requested subtrees: their
+// files and old versions — what the purge would give back), whatever keeps them there — a legal
+// hold, a review, a notice, or a purge that has simply not run yet. The ACCOUNT HOLDER's figure
+// leaves ALL of those out: the request to delete for good is the holder's act, and what keeps the
+// bytes is not theirs to see — so placing or lifting a hold, or a review ending, never moves it
+// (Addendum 5, reversing Addendum 4's legal-hold-only rule). That figure is the one everywhere the
+// holder meets one: the room `reserve` gives (enforcement), GET /api/account/usage and the data
+// export. It is DERIVED from the rows (`deletedKeptBytes`), never kept in a counter of its own — so
+// releasing, purging and the reconcile formula are untouched, and the purge, whenever it runs,
+// gives the bytes back exactly once (they leave the stored counter and the derived set together).
+// THE BACKSTOP (Addenda 4-5). Left out without a bound, "upload, delete forever, upload again"
+// would let an account whose deletions are kept store without limit. Past KEPT_MAX_QUOTAS × its
+// quota of such bytes, `reserve` refuses as for a full account — the ordinary answer, no other
+// signal — and the account is shown full (`holderUsage`). It never stores more than its quota
+// plus that multiple of it (one last upload past the line included).
 
 import { eq, sql } from "drizzle-orm";
-import { inheritedCauses } from "./holds";
 import type { Executor } from "../client";
 import { QueryError } from "../errors";
 import { user } from "../schema";
@@ -40,91 +40,96 @@ function assertBytes(bytes: number): void {
  */
 export async function reserve(tx: Executor, ownerId: string, bytes: number): Promise<boolean> {
   assertBytes(bytes);
-  // The fit is judged on the account holder's figure: what a legal hold keeps of what they
-  // deleted for good is not theirs to be refused for — up to the backstop (see the header).
-  const kept = legalHoldKeptBytesSql(ownerId);
+  // The fit is judged on the account holder's figure: what is still kept of what they deleted
+  // for good is not theirs to be refused for — up to the backstop (see the header).
+  const kept = deletedKeptBytesSql(ownerId);
   const rows = await tx
     .update(user)
     .set({ usedBytes: sql`${user.usedBytes} + ${bytes}` })
     .where(
       sql`${user.id} = ${ownerId}
-        AND ${kept} <= ${HOLD_KEPT_MAX_QUOTAS} * ${user.quotaBytes}
+        AND ${kept} <= ${KEPT_MAX_QUOTAS} * ${user.quotaBytes}
         AND ${user.usedBytes} - ${kept} + ${bytes} <= ${user.quotaBytes}`,
     )
     .returning({ id: user.id });
   return rows.length > 0;
 }
 
-/** How many quotas of hold-kept bytes an account may carry before it is answered as full. */
-export const HOLD_KEPT_MAX_QUOTAS = 2;
+/** How many quotas of kept deleted-for-good bytes an account may carry before it is answered as full. */
+export const KEPT_MAX_QUOTAS = 2;
 
-/**
- * The account holder's used figure: the stored counter without the hold-kept bytes — or, past the
- * backstop, a full account (at least the quota), as `reserve` answers it.
- */
-export function visibleUsedBytes(stored: number, kept: number, quotaBytes: number): number {
-  const shown = Math.max(0, stored - kept);
-  return kept > HOLD_KEPT_MAX_QUOTAS * quotaBytes ? Math.max(shown, quotaBytes) : shown;
-}
-
-/** True when the account carries more hold-kept bytes than the backstop allows. */
-export async function holdBackstopReached(db: Executor, ownerId: string): Promise<boolean> {
+/** True when the account carries more kept deleted-for-good bytes than the backstop allows. */
+export async function keptBackstopReached(db: Executor, ownerId: string): Promise<boolean> {
   const result = await db.execute<{ reached: boolean }>(sql`
-    SELECT (${legalHoldKeptBytesSql(ownerId)} > ${HOLD_KEPT_MAX_QUOTAS} * u.quota_bytes) AS reached
+    SELECT (${deletedKeptBytesSql(ownerId)} > ${KEPT_MAX_QUOTAS} * u.quota_bytes) AS reached
     FROM "user" u WHERE u.id = ${ownerId}`);
   return result.rows[0]?.reached === true;
 }
 
 /**
- * The rows a LEGAL HOLD keeps of what the owner deleted for good: every purge-requested root the
- * hold protects — the owner is held, or the root, a folder above it or anything under it carries
- * a node hold (the gate keeps the root whole) — and everything under those roots, once each.
- * (Inside, the names `tree`, `kept_roots`, `asked`, `kr`, `ko`, `kx`, `held_up`, `ha`, `hp` are taken.)
+ * Every root the owner deleted for good that is still stored (`purge_requested_at` set — a purged
+ * root's rows are gone), and everything under it, once each — nested requested roots included
+ * once. (Inside, the name `asked` is taken.)
  */
-const legalHoldKeptTree = (ownerId: string) => sql`
-  WITH RECURSIVE tree(root, id) AS (
-    SELECT n.id, n.id FROM nodes n
+const deletedKeptTree = (ownerId: string) => sql`
+  WITH RECURSIVE asked(id) AS (
+    SELECT n.id FROM nodes n
     WHERE n.owner_id = ${ownerId} AND n.purge_requested_at IS NOT NULL
     UNION
-    SELECT tree.root, c.id FROM nodes c JOIN tree ON c.parent_id = tree.id
-  ),
-  kept_roots AS (
-    SELECT kr.id FROM nodes kr JOIN "user" ko ON ko.id = kr.owner_id
-    WHERE kr.id IN (SELECT root FROM tree)
-      AND (ko.legal_hold OR kr.legal_hold OR ${inheritedCauses(sql`kr`).node_legal_hold}
-        OR EXISTS (SELECT 1 FROM tree t2 JOIN nodes kx ON kx.id = t2.id WHERE t2.root = kr.id AND kx.legal_hold))
-  ),
-  asked AS (SELECT DISTINCT tree.id FROM tree JOIN kept_roots ON kept_roots.id = tree.root)`;
+    SELECT c.id FROM nodes c JOIN asked ON c.parent_id = asked.id
+  )`;
 
-/** `legalHoldKeptBytes` as one SQL expression (bigint), for a statement of its own. */
-function legalHoldKeptBytesSql(ownerId: string) {
+const keptFilesSql = sql`(SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
+  WHERE n.kind = 'file' AND n.system IS NULL)`;
+const keptVersionsSql = sql`(SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)`;
+
+/** `deletedKeptBytes` as one SQL expression (bigint), for a statement of its own. */
+function deletedKeptBytesSql(ownerId: string) {
   return sql`(
-    ${legalHoldKeptTree(ownerId)}
-    SELECT
-      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
-       WHERE n.kind = 'file' AND n.system IS NULL)
-      + (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)
+    ${deletedKeptTree(ownerId)}
+    SELECT ${keptFilesSql} + ${keptVersionsSql}
   )::bigint`;
 }
 
 /**
- * The bytes `used_bytes` keeps for what a LEGAL HOLD keeps of the owner's deleted-for-good roots
- * — the files and the kept old versions — apart. 0 and 0 for an account with none (an unheld
- * root is purged at once by the request). What the account holder is shown and given leaves them
- * out, up to the backstop (see the header).
+ * The bytes `used_bytes` keeps of what the owner deleted for good and is still stored — the files
+ * and the kept old versions — apart. 0 and 0 for an account with none. What the account holder is
+ * shown and given leaves them out, up to the backstop (see the header).
  */
-export async function legalHoldKeptBytes(
+export async function deletedKeptBytes(
   db: Executor,
   ownerId: string,
 ): Promise<{ files: number; versions: number }> {
   const result = await db.execute<{ files: string; versions: string }>(sql`
-    ${legalHoldKeptTree(ownerId)}
-    SELECT
-      (SELECT COALESCE(SUM(n.size), 0) FROM nodes n JOIN asked a ON a.id = n.id
-       WHERE n.kind = 'file' AND n.system IS NULL)::bigint AS files,
-      (SELECT COALESCE(SUM(v.size), 0) FROM node_versions v JOIN asked a ON a.id = v.node_id)::bigint AS versions`);
+    ${deletedKeptTree(ownerId)}
+    SELECT ${keptFilesSql}::bigint AS files, ${keptVersionsSql}::bigint AS versions`);
   const row = result.rows[0];
   return { files: Number(row?.files ?? 0), versions: Number(row?.versions ?? 0) };
+}
+
+/**
+ * The account holder's usage: the operator's breakdown without the kept deleted-for-good bytes
+ * (trash: the files, versions: their old versions). ONE RULE past the backstop: the account is
+ * shown full — `usedBytes` is raised to the quota and the difference is added to `filesBytes`,
+ * so the four parts still add up to `usedBytes`, as an ordinary full account's do.
+ */
+export function holderUsage(
+  usage: UsageBreakdown,
+  kept: { files: number; versions: number },
+): UsageBreakdown {
+  const trashBytes = Math.max(0, usage.trashBytes - kept.files);
+  const versionsBytes = Math.max(0, usage.versionsBytes - kept.versions);
+  const below = Math.max(0, usage.usedBytes - kept.files - kept.versions);
+  const usedBytes = holderUsedBytes(usage.usedBytes, kept.files + kept.versions, usage.quotaBytes);
+  // Shown full past the backstop: the difference is files, so the parts still add up.
+  const filesBytes = usage.filesBytes + (usedBytes - below);
+  return { ...usage, usedBytes, filesBytes, trashBytes, versionsBytes };
+}
+
+/** The holder's used figure alone (the export): the counter without `kept` — at least the quota past the backstop. */
+export function holderUsedBytes(stored: number, kept: number, quotaBytes: number): number {
+  const below = Math.max(0, stored - kept);
+  return kept > KEPT_MAX_QUOTAS * quotaBytes ? Math.max(below, quotaBytes) : below;
 }
 
 /** Gives bytes back (an aborted session, purged rows). Never goes below zero. */
