@@ -373,19 +373,17 @@ async function strikesFor(
 /** `strikesFor` for many users in ONE statement. */
 async function strikesForMany(db: Db, userIds: string[], n: number, opts: { daysAgo?: number } = {}) {
   const at = new Date(Date.now() - (opts.daysAgo ?? 364.5) * DAY);
-  await db
-    .insert(strikes)
-    .values(
-      userIds.flatMap((userId) =>
-        Array.from({ length: n }, () => ({
-          userId,
-          kind: "abuse" as const,
-          nodeId: uuidv7(),
-          at,
-          liftedAt: null,
-        })),
-      ),
-    );
+  await db.insert(strikes).values(
+    userIds.flatMap((userId) =>
+      Array.from({ length: n }, () => ({
+        userId,
+        kind: "abuse" as const,
+        nodeId: uuidv7(),
+        at,
+        liftedAt: null,
+      })),
+    ),
+  );
 }
 
 async function withSession(db: Db, userId: string) {
