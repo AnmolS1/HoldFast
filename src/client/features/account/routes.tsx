@@ -2,8 +2,11 @@
 // whichever account signs in (./prefs-sync.ts).
 import type { RouteObject } from "react-router";
 import { t } from "../../lib/i18n";
-import { AccountPage } from "./AccountPage";
+import { lazyPage } from "../lazy-page";
 import { startPrefsSync } from "./prefs-sync";
+
+// Its own chunk (../lazy-page.tsx).
+const AccountPage = lazyPage(() => import("./AccountPage"), "AccountPage");
 
 startPrefsSync();
 

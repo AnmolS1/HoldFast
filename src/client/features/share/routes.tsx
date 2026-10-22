@@ -1,6 +1,9 @@
 import type { RouteObject } from "react-router";
 import { t } from "../../lib/i18n";
-import { SharedWithMePage } from "./SharedWithMePage";
+import { lazyPage } from "../lazy-page";
+
+// Its own chunk (../lazy-page.tsx).
+const SharedWithMePage = lazyPage(() => import("./SharedWithMePage"), "SharedWithMePage");
 
 export const routes: RouteObject[] = [
   {
