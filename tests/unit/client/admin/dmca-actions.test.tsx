@@ -54,6 +54,20 @@ function notice(status: string, extra: Record<string, unknown> = {}) {
   };
 }
 
+/** A window far in the future (open on the client's clock), and one long closed. */
+const OPEN = {
+  counterReceivedAt: "2026-01-02T12:00:00.000Z",
+  counterForwardedAt: "2026-01-02T13:00:00.000Z",
+  restoreNotBefore: "2026-01-16T12:00:00.000Z",
+  restoreNotAfter: "2099-12-31T23:59:59.999Z",
+};
+const CLOSED = {
+  counterReceivedAt: "2026-01-02T12:00:00.000Z",
+  counterForwardedAt: null,
+  restoreNotBefore: "2026-01-16T12:00:00.000Z",
+  restoreNotAfter: "2026-01-23T23:59:59.999Z",
+};
+
 const FORWARDED = {
   counterReceivedAt: "2028-11-03T12:00:00.000Z",
   counterForwardedAt: "2028-11-06T09:00:00.000Z",
@@ -91,18 +105,16 @@ describe("the counter-notice window in the detail", () => {
     expect(await buttonsFor("counter_received", FORWARDED)).not.toContain("Forward counter-notice");
   });
 
-  it("shows when the counter-notice was received and the window; a restore after the window is refused with its reason", async () => {
+  it("shows when the counter-notice was received and the window; a refused restore says why", async () => {
     adminFetch((call) => {
       if (call.method === "GET" && call.path === `/api/admin/dmca/${NOTICE}`) {
-        return new Response(JSON.stringify(notice("counter_received", FORWARDED)), {
+        // A window far ahead: the restore is inside it on the client's clock; the server refuses.
+        return new Response(JSON.stringify(notice("counter_received", OPEN)), {
           headers: { "content-type": "application/json" },
         });
       }
       if (call.method === "POST" && call.path === `/api/admin/dmca/${NOTICE}/action`) {
-        return envelope("conflict", 409, {
-          reason: "after_window",
-          restoreNotAfter: FORWARDED.restoreNotAfter,
-        });
+        return envelope("conflict", 409, { reason: "window_closed", restoreNotAfter: OPEN.restoreNotAfter });
       }
       return undefined;
     });
@@ -116,13 +128,51 @@ describe("the counter-notice window in the detail", () => {
     expect(screen.getByText(/after the counter-notice was received/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
     const dialog = await screen.findByRole("dialog");
+    // Inside the window: no acknowledgement asked for.
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
     fireEvent.change(within(dialog).getByLabelText(/Note \(recorded in the audit log\)/), {
       target: { value: "Late." },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "Restore" }));
-    await waitFor(() =>
-      expect(within(dialog).getByText("Restore is possible only until the end of the window.")).toBeTruthy(),
-    );
+    await waitFor(() => expect(within(dialog).getByText(/past the 14-business-day window/)).toBeTruthy());
+    view.unmount();
+  });
+
+  it("after the window: Forward is not offered (and the detail says why); Restore asks for the late acknowledgement and sends acknowledgeLate", async () => {
+    const posted: unknown[] = [];
+    adminFetch((call) => {
+      if (call.method === "GET" && call.path === `/api/admin/dmca/${NOTICE}`) {
+        return new Response(JSON.stringify(notice("counter_received", CLOSED)), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (call.method === "POST" && call.path === `/api/admin/dmca/${NOTICE}/action`) {
+        posted.push(call.body);
+        return new Response(JSON.stringify(notice("restored", { ...CLOSED, restoredAt: AT })), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return undefined;
+    });
+    const view = openConsole(`/admin/dmca/${NOTICE}`);
+    await untilConsole();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy(), {
+      timeout: 10_000,
+    });
+    expect(screen.queryByRole("button", { name: "Forward counter-notice" })).toBeNull();
+    expect(screen.getByText(/can no longer be forwarded/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/Note \(recorded in the audit log\)/), {
+      target: { value: "Missed the window." },
+    });
+    const confirm = within(dialog).getByRole("button", { name: "Restore" }) as HTMLButtonElement;
+    expect(confirm.disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("checkbox", { name: /past the 14-business-day window/ }));
+    expect(confirm.disabled).toBe(false);
+    fireEvent.click(confirm);
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toMatchObject({ action: "restore", acknowledgeLate: true, note: "Missed the window." });
     view.unmount();
   });
 });

@@ -129,7 +129,7 @@ test.describe("users and links", () => {
 });
 
 test.describe("copyright notices", () => {
-  test("a full DMCA cycle — notice, takedown, counter-notice, forward, refused before and after the window, restore inside it — with the Worker's clock moved", async ({
+  test("a full DMCA cycle — notice, takedown, counter-notice, forward, refused before the window and late without the acknowledgement, restore inside it — with the Worker's clock moved", async ({
     page,
     browser,
     clientIp,
@@ -244,10 +244,11 @@ test.describe("copyright notices", () => {
       ).then((result) => result.rows[0]!.takedown_at);
     expect(await takenDown()).not.toBeNull();
 
-    // An hour after the window closed: refused too (the statute's "not more than 14").
+    // An hour after the window closed (on the Worker's clock only, so the page does not ask for the
+    // late acknowledgement): refused without it — 409 window_closed.
     await atClock(notAfter + 3_600_000);
     await restore();
-    await expect(dialog).toContainText("Restore is possible only until the end of the window.");
+    await expect(dialog).toContainText("This is past the 14-business-day window");
     await dialog.getByRole("button", { name: "Cancel" }).click();
     expect(await takenDown()).not.toBeNull();
 

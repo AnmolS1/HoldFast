@@ -303,6 +303,23 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
     expect(again.body.details.reason).toBe("already_forwarded");
   });
 
+  it("the window is fixed when the counter-notice is recorded (shown before any forward)", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await notice(who, [file.id]);
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(RECEIVED);
+    const recorded = await counter(who, made.id);
+    expect(recorded.status).toBe(200);
+    expect(recorded.body).toMatchObject({
+      counterForwardedAt: null,
+      restoreNotBefore: "2028-11-20T12:00:00.000Z",
+      restoreNotAfter: "2028-11-27T23:59:59.999Z",
+    });
+  });
+
   it("a window that would end past the holiday table is refused with its reason, nothing recorded", async () => {
     const who = await admin();
     const owner = await member();
@@ -311,41 +328,126 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2028-12-20T12:00:00.000Z"));
     expect((await act(who, made.id, "takedown")).status).toBe(200);
-    expect((await counter(who, made.id)).status).toBe(200);
-    const refused = await act(who, made.id, "forward_counter");
+    const refused = await counter(who, made.id);
     expect(refused.status).toBe(409);
     expect(refused.body.details.reason).toBe("holiday_table");
     const row = (await adminCall(who.as, "GET", `/dmca/${made.id}`)).body as DmcaNoticeDto;
-    expect([row.counterForwardedAt, row.restoreNotBefore, row.restoreNotAfter]).toEqual([null, null, null]);
+    expect(row.status).toBe("actioned");
+    expect([row.counterReceivedAt, row.restoreNotBefore, row.restoreNotAfter]).toEqual([null, null, null]);
   });
 
-  it("restore is refused before restoreNotBefore (409 before_window) and after restoreNotAfter (409 after_window), checked in the Worker; allowed inside", async () => {
+  it("restore before restoreNotBefore stays refused (409 before_window) — even with acknowledgeLate; inside the window it is allowed", async () => {
     const who = await admin();
     const owner = await member();
     const file = await makeFile(owner.id, null, { scanStatus: "clean" });
     const link = await makeLink(file.id, owner.id);
     const forwarded = await upToForward(who, [file.id], RECEIVED);
     vi.setSystemTime(new Date(new Date(forwarded.restoreNotBefore!).getTime() - 60_000));
-    const early = await act(who, forwarded.id, "restore");
-    expect(early.status).toBe(409);
-    expect(early.body.details).toMatchObject({
-      reason: "before_window",
-      restoreNotBefore: forwarded.restoreNotBefore,
-    });
-    vi.setSystemTime(new Date(new Date(forwarded.restoreNotAfter!).getTime() + 1));
-    const late = await act(who, forwarded.id, "restore");
-    expect(late.status).toBe(409);
-    expect(late.body.details).toMatchObject({
-      reason: "after_window",
-      restoreNotAfter: forwarded.restoreNotAfter,
-    });
+    for (const extra of [{}, { acknowledgeLate: true }]) {
+      const early = await act(who, forwarded.id, "restore", extra);
+      expect(early.status).toBe(409);
+      expect(early.body.details).toMatchObject({
+        reason: "before_window",
+        restoreNotBefore: forwarded.restoreNotBefore,
+      });
+    }
     expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
     expect((await linkRowOf(link.id)).pauseReasons).toEqual(["moderation"]);
-    expect(await auditOf("admin.dmca_restore", forwarded.id)).toHaveLength(0);
     vi.setSystemTime(new Date(forwarded.restoreNotAfter!));
     const restored = await act(who, forwarded.id, "restore");
     expect(restored.status).toBe(200);
     expect(restored.body.status).toBe("restored");
+    expect(await auditOf("admin.dmca_restore_late", forwarded.id)).toHaveLength(0);
+  });
+
+  it("restore after restoreNotAfter: 409 window_closed without acknowledgeLate; with it, restored, audited late with the dates, the complainant told", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const link = await makeLink(file.id, owner.id);
+    const complainant = `legal-${rand(8)}@example.test`;
+    const made = (
+      await adminCall(who.as, "POST", "/dmca", { body: intake([file.id], { complainantEmail: complainant }) })
+    ).body.notices[0] as DmcaNoticeDto;
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(RECEIVED);
+    expect((await counter(who, made.id)).status).toBe(200);
+    const forwarded = (await act(who, made.id, "forward_counter")).body as DmcaNoticeDto;
+    const lateAt = new Date(new Date(forwarded.restoreNotAfter!).getTime() + 1);
+    vi.setSystemTime(lateAt);
+    for (const extra of [{}, { acknowledgeLate: false }]) {
+      const refused = await act(who, made.id, "restore", extra);
+      expect(refused.status).toBe(409);
+      expect(refused.body.details).toMatchObject({
+        reason: "window_closed",
+        restoreNotAfter: forwarded.restoreNotAfter,
+      });
+    }
+    expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
+    const restored = await act(who, made.id, "restore", {
+      acknowledgeLate: true,
+      note: "Missed the window.",
+    });
+    expect(restored.status).toBe(200);
+    expect(restored.body.status).toBe("restored");
+    expect((await nodeRowOf(file.id))!.takedownAt).toBeNull();
+    expect((await linkRowOf(link.id)).pauseReasons).toEqual([]);
+    expect((await auditOf("admin.dmca_restore_late", made.id)).map((row) => row.meta)).toEqual([
+      {
+        counterReceivedAt: RECEIVED.toISOString(),
+        counterForwardedAt: forwarded.counterForwardedAt,
+        restoreNotBefore: forwarded.restoreNotBefore,
+        restoreNotAfter: forwarded.restoreNotAfter,
+        restoredAt: lateAt.toISOString(),
+      },
+    ]);
+    expect(await auditOf("admin.dmca_restore", made.id)).toHaveLength(1);
+    expect(mailTo(complainant, "dmcaRestoredComplainant")).toHaveLength(1);
+  });
+
+  it("a forward after the window closed is refused (409 forward_window_closed); the late restore still works without it", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const complainant = `legal-${rand(8)}@example.test`;
+    const made = (
+      await adminCall(who.as, "POST", "/dmca", { body: intake([file.id], { complainantEmail: complainant }) })
+    ).body.notices[0] as DmcaNoticeDto;
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(RECEIVED);
+    const recorded = (await counter(who, made.id)).body as DmcaNoticeDto;
+    vi.setSystemTime(new Date(new Date(recorded.restoreNotAfter!).getTime() + 1));
+    const forward = await act(who, made.id, "forward_counter");
+    expect(forward.status).toBe(409);
+    expect(forward.body.details).toMatchObject({
+      reason: "forward_window_closed",
+      restoreNotAfter: recorded.restoreNotAfter,
+    });
+    expect(mailTo(complainant, "dmcaCounterForwarded")).toEqual([]);
+    expect((await act(who, made.id, "restore")).body.details.reason).toBe("window_closed");
+    const restored = await act(who, made.id, "restore", { acknowledgeLate: true, note: "Late." });
+    expect(restored.status).toBe(200);
+    expect(restored.body.counterForwardedAt).toBeNull();
+    expect(await auditOf("admin.dmca_restore_late", made.id)).toHaveLength(1);
+    expect(mailTo(complainant, "dmcaRestoredComplainant")).toHaveLength(1);
+  });
+
+  it("inside the window a restore needs the forward first (409 not_forwarded)", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await notice(who, [file.id]);
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(RECEIVED);
+    const recorded = (await counter(who, made.id)).body as DmcaNoticeDto;
+    vi.setSystemTime(new Date(recorded.restoreNotBefore!));
+    const refused = await act(who, made.id, "restore", { acknowledgeLate: true });
+    expect(refused.status).toBe(409);
+    expect(refused.body.details.reason).toBe("not_forwarded");
+    expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
   });
 
   it("after a lawsuit notice the material stays down: restore 409 lawsuit, status upheld", async () => {

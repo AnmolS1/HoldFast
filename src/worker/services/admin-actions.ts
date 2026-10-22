@@ -986,6 +986,20 @@ export function restoreWindow(receivedAt: Date): { restoreNotBefore: Date; resto
 export const RESTORE_AFTER_BUSINESS_DAYS = 10;
 export const RESTORE_BY_BUSINESS_DAYS = 14;
 
+/** `restoreWindow`, with a date past the holiday table answered as `409 holiday_table`. */
+function windowOrRefuse(receivedAt: Date) {
+  try {
+    return restoreWindow(receivedAt);
+  } catch (error) {
+    if (!(error instanceof HolidayTableEndedError)) throw error;
+    throw conflict(
+      "holiday_table",
+      { day: error.day },
+      "The restore window runs past the US federal holiday table; extend it (services/business-days.ts).",
+    );
+  }
+}
+
 type NoticeInput = Omit<adminQ.NewNotice, "receivedAt"> & { receivedAt?: Date };
 
 /**
@@ -1165,18 +1179,35 @@ async function restoreNotice(
   notice: adminQ.NoticeWithNodes,
   mode: "restore" | "withdraw",
   note: string | null,
+  acknowledgeLate = false,
 ) {
+  let late = false;
   if (mode === "restore") {
+    // A recorded lawsuit notice keeps the material down: restore is refused, at any time.
     if (notice.lawsuitNoticeAt) throw conflict("lawsuit");
-    if (notice.status !== "counter_received" || !notice.restoreNotBefore)
+    if (notice.status !== "counter_received" || !notice.counterReceivedAt)
       throw conflict("state", { status: notice.status });
-    if (now(c).getTime() < notice.restoreNotBefore.getTime()) {
-      throw conflict("before_window", { restoreNotBefore: notice.restoreNotBefore.toISOString() });
+    // The window as recorded with the counter-notice (rows from before T30PREP: from the receipt).
+    const window =
+      notice.restoreNotBefore && notice.restoreNotAfter
+        ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+        : windowOrRefuse(notice.counterReceivedAt);
+    const at = now(c).getTime();
+    // "Not less than 10 business days": before it, refused — an acknowledgement changes nothing.
+    if (at < window.restoreNotBefore.getTime()) {
+      throw conflict("before_window", { restoreNotBefore: window.restoreNotBefore.toISOString() });
     }
-    // The statute's other end: "not more than 14 business days". A restore after it is refused
-    // too — the operator ends such a notice by hand (uphold / withdraw / close), see the report.
-    if (notice.restoreNotAfter && now(c).getTime() > notice.restoreNotAfter.getTime()) {
-      throw conflict("after_window", { restoreNotAfter: notice.restoreNotAfter.toISOString() });
+    if (at > window.restoreNotAfter.getTime()) {
+      // "Nor more than 14": later is not forbidden, only outside the safe harbour toward the
+      // subscriber — allowed once the operator says so explicitly (team-lead ruling 2026-10-22),
+      // forwarded or not (a forward is refused after the window: forward_window_closed).
+      if (!acknowledgeLate) {
+        throw conflict("window_closed", { restoreNotAfter: window.restoreNotAfter.toISOString() });
+      }
+      late = true;
+    } else if (!notice.counterForwardedAt) {
+      // Inside the window, the complainant must have had the counter-notice first (§512(g)(2)(B)).
+      throw conflict("not_forwarded");
     }
   }
   const moved = await retryOnDeadlock(db(c), async (tx) => {
@@ -1230,6 +1261,24 @@ async function restoreNotice(
   if (!moved) throw conflict("state", { status: notice.status });
   // Recorded now that it has committed — before the steps that follow, which may fail (m5).
   audit(c, `admin.dmca_${mode}`, { type: "dmca_notice", id: notice.id }, { reason: note });
+  if (late) {
+    const iso = (at: Date | null) => (at ? at.toISOString() : null);
+    const window = notice.restoreNotBefore
+      ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+      : restoreWindow(notice.counterReceivedAt!);
+    audit(
+      c,
+      "admin.dmca_restore_late",
+      { type: "dmca_notice", id: notice.id },
+      {
+        counterReceivedAt: iso(notice.counterReceivedAt),
+        counterForwardedAt: iso(notice.counterForwardedAt),
+        restoreNotBefore: iso(window.restoreNotBefore),
+        restoreNotAfter: iso(window.restoreNotAfter),
+        restoredAt: iso(now(c)),
+      },
+    );
+  }
   if (notice.strikeId) {
     try {
       await liftStrike(deps(c), notice.strikeId, admin.id);
@@ -1288,7 +1337,7 @@ export async function noticeAction(
   c: C,
   admin: Admin,
   noticeId: string,
-  body: { action: string; checklist?: Record<string, unknown>; note?: string },
+  body: { action: string; checklist?: Record<string, unknown>; note?: string; acknowledgeLate?: boolean },
 ) {
   const notice = await adminQ.noticeById(db(c), noticeId);
   if (!notice) throw new AppError("not_found");
@@ -1328,16 +1377,15 @@ export async function noticeAction(
         throw conflict("state", { status: notice.status });
       // Once: the window is fixed by the receipt, and the complainant is sent one copy.
       if (notice.counterForwardedAt) throw conflict("already_forwarded");
-      let window: ReturnType<typeof restoreWindow>;
-      try {
-        window = restoreWindow(notice.counterReceivedAt);
-      } catch (error) {
-        if (!(error instanceof HolidayTableEndedError)) throw error;
-        throw conflict(
-          "holiday_table",
-          { day: error.day },
-          "The restore window runs past the US federal holiday table; extend it (services/business-days.ts).",
-        );
+      // Fixed when the counter-notice was recorded (rows from before T30PREP: from the receipt).
+      const window =
+        notice.restoreNotBefore && notice.restoreNotAfter
+          ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+          : windowOrRefuse(notice.counterReceivedAt);
+      // Forwarding is the operator's own step: after the window it would announce dates already
+      // past. Refused; the late restore (acknowledgeLate) is the way on.
+      if (now(c).getTime() > window.restoreNotAfter.getTime()) {
+        throw conflict("forward_window_closed", { restoreNotAfter: window.restoreNotAfter.toISOString() });
       }
       await simple(["counter_received"], { counterForwardedAt: now(c), ...window }, false);
       mailComplainant(c, notice, "counter_forwarded", (to) =>
@@ -1367,7 +1415,7 @@ export async function noticeAction(
       await simple(["counter_received"], { status: "upheld" }, true);
       break;
     case "restore":
-      await restoreNotice(c, admin, notice, "restore", note);
+      await restoreNotice(c, admin, notice, "restore", note, body.acknowledgeLate === true);
       return (await adminQ.noticeById(db(c), noticeId))!;
     case "withdraw":
       if (notice.status === "received" || notice.status === "incomplete") {
@@ -1414,11 +1462,14 @@ export async function counterNotice(
       });
     }
   }
+  // The window is fixed here, by the receipt, so the console shows it before any forward.
+  const window = windowOrRefuse(receivedAt);
   const row = await retryOnDeadlock(db(c), (tx) =>
     adminQ.transitionNotice(tx, noticeId, ["actioned"], {
       ...(fields as Partial<DmcaNotice>),
       status: "counter_received",
       counterReceivedAt: receivedAt,
+      ...window,
       handledBy: admin.id,
     }),
   );
