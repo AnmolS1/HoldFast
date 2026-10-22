@@ -11,6 +11,9 @@
 // --session    a session file from scripts/create-session.ts (`header` is sent as the Cookie);
 //              the signed-in classes and the link-password class are skipped without one
 // --search-session  a second session (another user): search needs a budget of its own
+// --admin-session   a session of an admin whose session passed a second factor (create-session.ts
+//              --role admin --two-factor): the admin class. Locally, with none, a throwaway user's
+//              session — `RL_API` is spent before the admin guard, so its answers are 403 until the 429
 // --local      `vite dev` only: each class gets an address of its own through CF-Connecting-IP (the
 //              Worker trusts it locally; on a deploy Cloudflare sets it), and with no --session a
 //              throwaway account is signed up through the test Turnstile token and the test outbox
@@ -18,7 +21,9 @@
 // --recheck    after a class's 429, wait Retry-After seconds and check one request passes again
 //
 // NEVER solves a captcha: the auth class is probed on the invite lookup (RL_AUTH, key inv:<ip>),
-// which needs none. Nothing secret is printed: not the cookie, not a token, not an address.
+// which needs none; the report class sends a made-up link token, which is refused (404) before
+// Turnstile is looked at, so nothing is ever filed. Nothing secret is printed: not the cookie, not
+// a token, not an address.
 
 import { readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
@@ -57,6 +62,7 @@ const { values } = parseArgs({
     files: { type: "string" },
     session: { type: "string" },
     "search-session": { type: "string" },
+    "admin-session": { type: "string" },
     local: { type: "boolean", default: false },
     only: { type: "string" },
     recheck: { type: "boolean", default: false },
@@ -65,7 +71,7 @@ const { values } = parseArgs({
 
 if (!values.base) {
   console.error(
-    "usage: ratelimit-probe.ts --base <app origin> [--files <files origin>] [--session <file>] [--local] [--only a,b] [--recheck]",
+    "usage: ratelimit-probe.ts --base <app origin> [--files <files origin>] [--session <file>] [--search-session <file>] [--admin-session <file>] [--local] [--only a,b] [--recheck]",
   );
   process.exit(2);
 }
@@ -137,7 +143,12 @@ function sessionFromFile(path: string): string {
 }
 
 // ── the classes ────────────────────────────────────────────────────────────────────────────────
-function classes(cookie: string | null, searchCookie: string | null, passwordLink: string | null): Klass[] {
+function classes(
+  cookie: string | null,
+  searchCookie: string | null,
+  passwordLink: string | null,
+  adminCookie: string | null,
+): Klass[] {
   const ip = () => addressFor();
   const ipAuth = ip();
   const ipApi = ip();
@@ -146,6 +157,9 @@ function classes(cookie: string | null, searchCookie: string | null, passwordLin
   const ipUser = ip();
   const ipPassword = ip();
   const ipSearch = ip();
+  const ipReport = ip();
+  const ipAdmin = ip();
+  const ipAuthAdmin = ip();
   const json = (extra: Record<string, string> = {}) => ({
     origin: base,
     "sec-fetch-site": "same-origin",
@@ -212,6 +226,54 @@ function classes(cookie: string | null, searchCookie: string | null, passwordLin
           method: "POST",
           headers: headers(ipPassword, json({ "content-type": "application/json" })),
           body: JSON.stringify({ password: `wrong-${rand(8)}` }),
+        }),
+    },
+    {
+      // T22: the visitor's report shares RL_LINKS' `ip:` bucket with the public link API (a
+      // visitor browsing a folder link and reporting spends one budget). Behind it: Turnstile and
+      // 5 reports a day per stable address hash (in Postgres; tests/unit/abuse/reports.test.ts).
+      name: "report",
+      limiter: "RL_LINKS (30/60 s), shared with /api/public/links/*",
+      key: "ip:<address>",
+      limit: 30,
+      send: () =>
+        fetch(`${base}/api/public/report`, {
+          method: "POST",
+          headers: headers(ipReport, json({ "content-type": "application/json" })),
+          body: JSON.stringify({
+            nodeId: "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e",
+            linkToken: rand(22), // matches no link: refused 404 before Turnstile, nothing filed
+            category: "spam",
+            details: "",
+            turnstileToken: "ratelimit-probe-not-a-token",
+          }),
+        }),
+    },
+    {
+      // T25: the console's API has no limiter of its own — RL_API by user, spent before the guard.
+      name: "admin",
+      limiter: "RL_API (600/60 s), before requireAdmin",
+      key: "u:<user id>",
+      limit: 600,
+      needsSession: true,
+      send: () =>
+        fetch(`${base}/api/admin/dashboard`, {
+          headers: headers(ipAdmin, json({ cookie: adminCookie ?? "" })),
+        }),
+    },
+    {
+      // Better Auth's admin plugin (ban, unban, set role, impersonate): its POSTs spend the CALLER'S
+      // ADDRESS's sign-in budget (endpoint-policy.ts spendsAuthBudget). Sent with no session:
+      // refused by the plugin gate, counted all the same.
+      name: "auth-admin",
+      limiter: "RL_AUTH (20/60 s), the sign-in budget",
+      key: "ip:<address>",
+      limit: 20,
+      send: () =>
+        fetch(`${base}/api/auth/admin/list-user-sessions`, {
+          method: "POST",
+          headers: headers(ipAuthAdmin, json({ "content-type": "application/json" })),
+          body: JSON.stringify({ userId: "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL" }),
         }),
     },
   ];
@@ -300,9 +362,25 @@ async function main() {
   if (values["search-session"]) searchCookie = sessionFromFile(values["search-session"]);
   else if (local && wanted("search")) searchCookie = await localCookie(addressFor());
   const passwordLink = cookie && wanted("link-password") ? await makePasswordLink(cookie) : null;
+  // The admin class spends `u:<id>` too: an account of its own, like search.
+  let adminCookie: string | null = null;
+  if (values["admin-session"]) adminCookie = sessionFromFile(values["admin-session"]);
+  else if (local && wanted("admin")) adminCookie = await localCookie(addressFor());
   const results: Outcome[] = [];
-  for (const klass of classes(cookie, searchCookie, passwordLink)) {
+  for (const klass of classes(cookie, searchCookie, passwordLink, adminCookie)) {
     if (!wanted(klass.name)) continue;
+    if (klass.name === "admin" && !adminCookie) {
+      results.push({
+        ...klass,
+        sent: 0,
+        refusedAt: null,
+        retryAfter: null,
+        body: "",
+        ok: true,
+        note: "skipped: no --admin-session",
+      });
+      continue;
+    }
     if (klass.name === "search" && !searchCookie) {
       results.push({
         ...klass,
@@ -315,7 +393,7 @@ async function main() {
       });
       continue;
     }
-    if (klass.needsSession && !cookie) {
+    if (klass.needsSession && klass.name !== "admin" && !cookie) {
       results.push({
         ...klass,
         sent: 0,
