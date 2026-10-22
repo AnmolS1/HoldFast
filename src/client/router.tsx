@@ -21,7 +21,6 @@ import { configureApi } from "./lib/api";
 import type { PublicConfig, SessionShape } from "./lib/contracts";
 import { t } from "./lib/i18n";
 import { publicConfigQuery, queryClient, sessionQuery } from "./lib/query";
-import { initSentry } from "./lib/sentry";
 import {
   AuthLayout,
   ForgotPasswordPage,
@@ -41,10 +40,9 @@ import { AcceptTermsPage } from "./routes/legal-gate";
 import { NotFoundPage, RouteErrorPage, StartingPage } from "./routes/not-found";
 
 async function loadConfig(): Promise<PublicConfig> {
-  const config = await queryClient.fetchQuery(publicConfigQuery);
-  // Reporting starts once the config is known, and only when it carries a DSN.
-  void initSentry(config);
-  return config;
+  // Error reporting is NOT started here: main.tsx starts it on every entry page (public ones
+  // have no loader), once.
+  return queryClient.fetchQuery(publicConfigQuery);
 }
 
 function loadSession(): Promise<SessionShape> {
