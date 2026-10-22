@@ -8,10 +8,12 @@
 //   - A transfer in progress (an upload, a zip — anything on the transfer ribbon) is not thrown
 //     away by a reload: the user is asked instead, and decides when.
 // The event is never cancelled: the import still fails, so the error page shows until the reload
-// lands (or for good, when there is no reload).
+// lands (or for good, when there is no reload). A failure recovered from (reload or prompt) is not
+// an error report (lib/sentry.ts `markRecovered`); one that is not recovered from is reported.
 import { getRibbonSnapshot } from "../components/TransferRibbon";
 import { toast } from "../components/Toaster";
 import { t } from "./i18n";
+import { markRecovered } from "./sentry";
 
 export const RELOAD_STAMP = "hfChunkReloadAt";
 export const RELOAD_WINDOW_MS = 30_000;
@@ -74,7 +76,10 @@ export function onStaleChunk(overrides: Partial<StaleChunkDeps> = {}): StaleChun
 
 /** Listen for Vite's chunk-load failures. Returns the function that stops listening. */
 export function installStaleChunkReload(deps: Partial<StaleChunkDeps> = {}): () => void {
-  const listener = () => void onStaleChunk(deps);
+  const listener = (event: Event) => {
+    // Vite's preload helper puts the failure on the event and then throws that same object.
+    if (onStaleChunk(deps) !== "left") markRecovered((event as Event & { payload?: unknown }).payload);
+  };
   window.addEventListener("vite:preloadError", listener);
   return () => window.removeEventListener("vite:preloadError", listener);
 }

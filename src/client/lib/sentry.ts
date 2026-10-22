@@ -41,6 +41,20 @@ export function redactCrumbOrDrop<T>(item: T): T | null {
   }
 }
 
+// Errors the app has already recovered from, so not reported: a page chunk that a stale tab could
+// not fetch and that a reload (or the reload prompt) replaces (lib/stale-chunk.ts decides which).
+// By object identity, never by message: the same failure when it is NOT recovered is reported.
+const recovered = new WeakSet<object>();
+
+/** Do not report this error object: the app recovered from it. */
+export function markRecovered(error: unknown): void {
+  if (typeof error === "object" && error !== null) recovered.add(error);
+}
+
+function isRecovered(error: unknown): boolean {
+  return typeof error === "object" && error !== null && recovered.has(error);
+}
+
 export function initSentry(
   config: Pick<PublicConfig, "sentryDsnWeb" | "sentryEnvironment" | "release">,
   load: () => Promise<SentryModule> = () => import("@sentry/react"),
@@ -59,7 +73,7 @@ export function initSentry(
         // remove afterwards. No replay, feedback or HTTP-client integration is added either:
         // the SDK's defaults only.
         dataCollection: SENTRY_DATA_COLLECTION,
-        beforeSend: (event) => redactOrDrop(event),
+        beforeSend: (event, hint) => (isRecovered(hint?.originalException) ? null : redactOrDrop(event)),
         beforeBreadcrumb: (breadcrumb) => redactCrumbOrDrop(breadcrumb),
       });
       sdk = module;
