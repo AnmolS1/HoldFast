@@ -82,6 +82,21 @@ async function expectSignedIn(page: Page): Promise<void> {
   await expect(page.getByRole("button", { name: "Account menu" }).first()).toBeVisible();
 }
 
+/**
+ * Press "Confirm and set password" and wait for the server's answer before the screen is looked at:
+ * the submit hashes the password on the server, which on a slow runner outlasts the 5 s the
+ * "Sign in" heading gets (CI run on 248ec34, mobile-chrome). The heading is then drawing only.
+ */
+async function submitSetPassword(page: Page): Promise<void> {
+  const answered = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/account/confirm-email" &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Confirm and set password" }).click();
+  await answered;
+}
+
 async function expectSignInScreen(page: Page): Promise<void> {
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
 }
@@ -416,7 +431,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await owner.getByLabel("Month").fill("5");
     await owner.getByLabel("Year").fill("1990");
     await owner.getByRole("checkbox").check();
-    await owner.getByRole("button", { name: "Confirm and set password" }).click();
+    await submitSetPassword(owner);
     await expectSignInScreen(owner);
     await expect(owner.getByText("Password set. Sign in to continue.")).toBeVisible();
     expect((await userRow(email))?.email_verified).toBe(true);
@@ -560,7 +575,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await admin.getByLabel("Month").fill("5");
     await admin.getByLabel("Year").fill("1990");
     await admin.getByRole("checkbox").check();
-    await admin.getByRole("button", { name: "Confirm and set password" }).click();
+    await submitSetPassword(admin);
     await expectSignInScreen(admin);
     expect(await userRow(email)).toMatchObject({ email_verified: true, role: "user" });
     // The stranger's password: dead, and it granted nothing on the way.
