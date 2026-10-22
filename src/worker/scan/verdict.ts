@@ -41,16 +41,15 @@
 // transaction (`addStrike(bg, …, { tx })`), its `applySuspension()` is awaited after it.
 // Nothing here relies on `waitUntil` outliving the invocation: everything is awaited.
 
-import { sql } from "drizzle-orm";
 import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
-import { insertReport, takedownNode } from "../db/queries/moderation";
+import { insertReport, listAsLocked, takedownNode } from "../db/queries/moderation";
 import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import { hashBlocklist, type ScanDetail } from "../db/schema";
+import type { ScanDetail } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
@@ -292,7 +291,7 @@ export async function listInfected(
  * hit. Shared by `applyVerdict` (in its transaction, after the node and job rows) and the avatar
  * path of the upload route (one statement on its own, before the node's transaction).
  *
- * THE LOCK'S OWN STATEMENT (`lockSuspectedCsam`, queries/moderation.ts `lockRows`), with
+ * THE LOCK'S OWN STATEMENT (queries/moderation.ts `listAsLocked`, which `lockRows` writes), with
  * `nodeId` the node that is — or is about to be — locked: no entry → created, `sourceNodeId`
  * that node; an entry with another reason → RAISED to `csam` (`raisedFrom`, `raisedByNodeId`);
  * a `csam` entry → untouched. Never `blocklist.upsert(csam)` / `confirmCsam`: those make a
@@ -303,14 +302,7 @@ export async function listSuspectedCsam(
   db: Executor | Tx,
   input: { sha256: string; nodeId: string },
 ): Promise<void> {
-  await db
-    .insert(hashBlocklist)
-    .values({ sha256: input.sha256, reason: "csam", sourceNodeId: input.nodeId })
-    .onConflictDoUpdate({
-      target: hashBlocklist.sha256,
-      set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: input.nodeId },
-      setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
-    });
+  await listAsLocked(db, input.sha256, input.nodeId);
 }
 
 // ── applying it ─────────────────────────────────────────────────────────────────────────────
