@@ -158,6 +158,23 @@ function draftsWith(value: string) {
       counterNoticeUrl: `${APP}/dmca`,
     }),
     contentRestored: templates.contentRestored({ name: value, itemName: value }),
+    dmcaCounterForwarded: templates.dmcaCounterForwarded({
+      name: value,
+      noticeId: value,
+      counter: {
+        name: value,
+        address: `${value}\n${value}`,
+        phone: value,
+        email: value,
+        statement: `${value}\n${value}`,
+        consentJurisdiction: true,
+        signature: value,
+      },
+      notBefore: new Date("2028-11-20T12:00:00.000Z"),
+      notAfter: new Date("2028-11-27T23:59:59.999Z"),
+      dmcaUrl: `${APP}/dmca`,
+    }),
+    dmcaRestoredComplainant: templates.dmcaRestoredComplainant({ name: value, noticeId: value }),
     securityDigest: templates.securityDigest({ name: value, accountUrl: `${APP}/account` }),
   };
 }
@@ -208,6 +225,10 @@ describe("templates", () => {
         "reportReviewed",
         "contentRemovedCopyright",
         "contentRestored",
+        // Not in the plan's list: the complainant's copy of a counter-notice and the restore
+        // (§512(g)(2)(B); T30PREP, from T29DMCA's report item 8).
+        "dmcaCounterForwarded",
+        "dmcaRestoredComplainant",
       ].sort(),
     );
     expect(names.filter((name) => /weekly|linkDigest/i.test(name))).toEqual([]);

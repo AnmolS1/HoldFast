@@ -240,6 +240,7 @@ describe("every mailed link is inert on a GET, or bound to a proof the scanner d
     operatorCritical: "page: a link to a screen of the app or the estate site (a GET reads)",
     operatorDigest: "page: a link to a screen of the app or the estate site (a GET reads)",
     contentRemovedCopyright: "page: a link to a screen of the app or the estate site (a GET reads)",
+    dmcaCounterForwarded: "page: a link to a screen of the app or the estate site (a GET reads)",
     securityDigest: "page: a link to a screen of the app or the estate site (a GET reads)",
   };
 

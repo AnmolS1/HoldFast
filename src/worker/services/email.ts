@@ -774,6 +774,63 @@ export const templates = {
     heading: "Content restored",
     blocks: [{ text: greeting(d.name) }, { text: `Access to “${safeLabel(d.itemName)}” has been restored.` }],
   }),
+  /**
+   * To the complainant of a copyright notice, §512(g)(2)(B): a copy of the counter-notice and the
+   * window in which the material will be restored. Every field of the counter-notice is quoted
+   * (`safeQuote`: an address in it reads "x at y·z" — nothing in it can become a link); the
+   * owner's file name is not given (only the notice's own reference).
+   */
+  dmcaCounterForwarded: (d: {
+    name?: unknown;
+    noticeId: unknown;
+    counter: {
+      name: unknown;
+      address: unknown;
+      phone: unknown;
+      email: unknown;
+      statement: unknown;
+      consentJurisdiction: boolean;
+      signature: unknown;
+    };
+    notBefore: Date;
+    notAfter: Date;
+    dmcaUrl: string;
+  }): Draft => ({
+    subject: "A counter-notice was received about your copyright notice",
+    heading: "Counter-notice received",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: `Your copyright notice (reference ${safeId(d.noticeId)}) led us to remove access to the material it named. The person who made it available has sent the counter-notice copied below.`,
+      },
+      {
+        quote: [
+          `Name: ${safeQuote(d.counter.name, 500)}`,
+          `Address: ${safeQuote(d.counter.address, 2000)}`,
+          `Phone: ${safeQuote(d.counter.phone, 100) || "—"}`,
+          `Email: ${safeQuote(d.counter.email, 320)}`,
+          `Statement: ${safeQuote(d.counter.statement)}`,
+          `Consents to the jurisdiction of the federal court: ${d.counter.consentJurisdiction ? "yes" : "no"}`,
+          `Signature: ${safeQuote(d.counter.signature, 500)}`,
+        ].join("\n"),
+      },
+      {
+        text: `Under 17 U.S.C. §512(g), we will restore access to the material no sooner than ${formatInstant(d.notBefore)} and no later than ${formatInstant(d.notAfter)}, unless our designated agent first receives notice from you that you have filed an action seeking a court order to restrain this person from engaging in infringing activity relating to the material.`,
+      },
+      { link: { label: "Our designated agent's contact details", url: d.dmcaUrl } },
+    ],
+  }),
+  /** To the complainant: the material their notice named was restored after the counter-notice. */
+  dmcaRestoredComplainant: (d: { name?: unknown; noticeId: unknown }): Draft => ({
+    subject: "Material restored following a counter-notice",
+    heading: "Material restored",
+    blocks: [
+      { text: greeting(d.name) },
+      {
+        text: `Access to the material named in your copyright notice (reference ${safeId(d.noticeId)}) has been restored, as 17 U.S.C. §512(g) provides: the counter-notice we sent you was not followed by notice of a court action within the period it gave.`,
+      },
+    ],
+  }),
   /** Sent INSTEAD of further single notices once an hour's worth has gone out (see the header). */
   securityDigest: (d: { name?: unknown; accountUrl: string }): Draft => ({
     subject: "More security activity on your account",
@@ -835,6 +892,8 @@ export const KINDS = {
   reportReviewed: { class: "transactional_user", severity: "routine", bucket: "product" },
   contentRemovedCopyright: { class: "transactional_user", severity: "routine", bucket: "product" },
   contentRestored: { class: "transactional_user", severity: "routine", bucket: "product" },
+  dmcaCounterForwarded: { class: "transactional_user", severity: "routine", bucket: "product" },
+  dmcaRestoredComplainant: { class: "transactional_user", severity: "routine", bucket: "product" },
   operatorCritical: { class: "operator_alert", severity: "critical", bucket: "operator-critical" },
 } as const satisfies Record<TemplateName, KindRow>;
 
@@ -1503,3 +1562,21 @@ export const sendContentRemovedCopyright = (
   );
 export const sendContentRestored = (deps: ServiceDeps, d: To & { itemName: string }) =>
   deliver(deps, "contentRestored", d.to, () => templates.contentRestored(d), SYSTEM);
+export const sendDmcaCounterForwarded = (
+  deps: ServiceDeps,
+  d: To & {
+    noticeId: string;
+    counter: Parameters<typeof templates.dmcaCounterForwarded>[0]["counter"];
+    notBefore: Date;
+    notAfter: Date;
+  },
+) =>
+  deliver(
+    deps,
+    "dmcaCounterForwarded",
+    d.to,
+    () => templates.dmcaCounterForwarded({ ...d, dmcaUrl: appUrl(deps.env, "/dmca") }),
+    SYSTEM,
+  );
+export const sendDmcaRestoredComplainant = (deps: ServiceDeps, d: To & { noticeId: string }) =>
+  deliver(deps, "dmcaRestoredComplainant", d.to, () => templates.dmcaRestoredComplainant(d), SYSTEM);
