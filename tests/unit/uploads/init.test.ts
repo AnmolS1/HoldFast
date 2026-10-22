@@ -56,7 +56,13 @@ describe("who may call", () => {
     expect(code).not.toMatch(/lockUser/);
     expect(code).not.toMatch(/checkCeiling|consumeCeiling/);
     expect(code).not.toMatch(/SCAN_QUEUE/);
-    expect(code).not.toMatch(/blocklist\.(upsert|confirmCsam|remove)/);
+    expect(code).not.toMatch(/blocklist\.(confirmCsam|remove)/);
+    // ONE listing, authorised (AVSEAM (a), 2026-10-21): an infected avatar's server hash is listed
+    // `malware` as the scan consumer lists an infected file's — the avatar is scanned in the route.
+    expect(code.match(/blocklist\.upsert\(/g)).toHaveLength(1);
+    expect(code).toMatch(
+      /blocklist\.upsert\(tx, \{ sha256: node\.sha256!, reason: "malware", sourceNodeId: node\.id \}\)/,
+    );
     // The one admission call, and it is the first statement of its transaction.
     expect(code.match(/enforceUploadCeilings\(/g)).toHaveLength(1);
     expect(code).toMatch(/retryOnDeadlock\(db\(c\), async \(tx\) => \{\s*await enforceUploadCeilings\(/);
