@@ -207,7 +207,7 @@ test.describe("shell routes", () => {
   test("/dmca and /s/:token render outside the frame, signed out", async ({ page, origins }) => {
     await mockShell(page, origins.port, { user: null });
     await page.goto("/dmca");
-    await expect(page.getByText("This page is being prepared.")).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Copyright and DMCA" })).toBeVisible();
     await expect(page.locator("[data-frame]")).toHaveCount(0);
     await expect(page).toHaveURL(/\/dmca$/);
     await page.goto("/s/sometoken");

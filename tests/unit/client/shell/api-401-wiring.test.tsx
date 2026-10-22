@@ -42,7 +42,7 @@ describe("401 and the route that is showing", () => {
     arrange(sessionOf());
     seedSession(sessionOf());
     renderRoutes(buildRoutes(), ["/dmca"]);
-    await screen.findByText("This page is being prepared.");
+    await screen.findByRole("heading", { level: 1, name: "Copyright and DMCA" });
     await expect(api("/api/nodes")).rejects.toMatchObject({ status: 401 });
     expect(isReauthPending()).toBe(false);
   });

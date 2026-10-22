@@ -174,7 +174,7 @@ describe("route guards", () => {
   it("public routes render with no session, outside the frame, and read no session", async () => {
     const calls = shellFetch({ session: null });
     renderRoutes(buildRoutes(), ["/dmca"]);
-    expect(await screen.findByText("This page is being prepared.")).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "Copyright and DMCA" })).toBeTruthy();
     expect(document.querySelector("[data-frame]")).toBeNull();
     expect(calls.map((call) => call.path)).toEqual([]);
   });

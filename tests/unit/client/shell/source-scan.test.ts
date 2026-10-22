@@ -90,42 +90,31 @@ describe("tokens with restricted use", () => {
   });
 });
 
-// Every feature folder that is still the shell's placeholder, with its files. ONE FOLDER PER LINE:
-// the task that takes a folder over deletes that folder's line and nothing else. The order is
-// deliberate — folders of different Wave-2 tasks are never on neighbouring lines, so two tasks
-// deleting their lines do not meet in a merge. Keep it when adding a line.
-const PLACEHOLDER_FOLDERS: Record<string, string[]> = {
-  dmca: ["routes.tsx"],
-};
-
+// The shell's placeholders are all taken over (the last, /dmca, by T29): no feature module may
+// render one again. A placeholder is any of its three forms — the module marker comment, the
+// shell's <PlaceholderPage> component (src/client/components/PlaceholderPage, its own definition
+// is outside features/), or the "being prepared" text (`app.preparing` in en.ts).
 describe("placeholder modules", () => {
-  const MARKER = /PLACEHOLDER — taken over by/;
   const FEATURES = "/src/client/features/";
-  const featureFiles = Object.entries(sources).filter(
-    ([path]) => path.startsWith(FEATURES) && path !== `${FEATURES}index.ts`,
-  );
-  const folderOf = (path: string) => path.slice(FEATURES.length).split("/")[0]!;
-  const listed = Object.entries(PLACEHOLDER_FOLDERS).flatMap(([folder, files]) =>
-    files.map((file) => `${FEATURES}${folder}/${file}`),
-  );
+  const featureFiles = Object.entries(sources).filter(([path]) => path.startsWith(FEATURES));
+  const PLACEHOLDER = [
+    /PLACEHOLDER — taken over by/,
+    /\bPlaceholderPage\b/,
+    /app\.preparing/,
+    /This page is being prepared/,
+  ];
 
-  it("every listed placeholder file exists and says who takes it over", () => {
-    expect(listed.length).toBeGreaterThan(0);
-    for (const path of listed) expect(sources[path], path).toMatch(MARKER);
-    // The auth client is no longer one: it is the real Better Auth client.
+  it("the scan reads the feature modules (it cannot pass on an empty tree)", () => {
+    expect(featureFiles.length).toBeGreaterThan(0);
+    expect(featureFiles.map(([path]) => path)).toContain(`${FEATURES}dmca/routes.tsx`);
+  });
+
+  it("no feature module renders the shell's placeholder", () => {
+    const users = featureFiles
+      .filter(([, code]) => PLACEHOLDER.some((pattern) => pattern.test(code)))
+      .map(([path]) => path);
+    expect(users).toEqual([]);
+    // The auth client is no longer one either: it is the real Better Auth client.
     expect(sources["/src/client/lib/auth-client.ts"]).not.toMatch(/PLACEHOLDER/);
-  });
-
-  it("a listed folder holds exactly its listed files — nothing is added beside a placeholder", () => {
-    const inListedFolders = featureFiles
-      .map(([path]) => path)
-      .filter((path) => Object.hasOwn(PLACEHOLDER_FOLDERS, folderOf(path)));
-    expect(inListedFolders.sort()).toEqual([...listed].sort());
-  });
-
-  it("a file without the marker is in a folder that left the list, and no such folder still carries it", () => {
-    for (const [path, code] of featureFiles) {
-      expect(MARKER.test(code), path).toBe(Object.hasOwn(PLACEHOLDER_FOLDERS, folderOf(path)));
-    }
   });
 });
