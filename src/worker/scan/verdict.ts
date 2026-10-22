@@ -52,7 +52,8 @@ import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
 import { AppError } from "../services/errors";
-import type { BackgroundContext } from "../services/request-context";
+import type { Tx } from "../db/client";
+import type { BackgroundContext, ServiceDeps } from "../services/request-context";
 import { lockSuspectedCsam, type ScanReason, type ScanVerdict } from "../services/scanning";
 import { storage } from "../services/storage";
 import { addStrike, type StrikeResult } from "../services/strikes";
@@ -240,6 +241,45 @@ export async function imageDimensions(
   }
 }
 
+// ── infected content ────────────────────────────────────────────────────────────────────────
+
+/**
+ * What infected content costs, in the caller's transaction — shared by `applyVerdict` and the
+ * avatar path of the upload route (which scans in the request): when `list`, the SERVER hash is
+ * listed `malware` with the node as its source (`upsert` never lowers a csam entry; the caller
+ * decides whether the hash was unlisted), and when `strike`, the uploader is struck (`addStrike`
+ * in the `tx` form: its `applySuspension()` is the caller's to await after the commit). Upsert
+ * first, then the strike. `listed`: a row was written; `strike`: null when none was asked for or
+ * there is no uploader.
+ */
+export async function listInfected(
+  deps: ServiceDeps,
+  tx: Tx,
+  input: {
+    nodeId: string;
+    uploaderId: string | null;
+    sha256: string | undefined;
+    list: boolean;
+    strike: boolean;
+  },
+): Promise<{ listed: boolean; strike: StrikeResult | null }> {
+  const { nodeId, uploaderId, sha256 } = input;
+  let listed = false;
+  if (input.list && sha256) {
+    await blocklist.upsert(tx, { sha256, reason: "malware", sourceNodeId: nodeId });
+    listed = true;
+  }
+  const strike =
+    input.strike && uploaderId
+      ? await addStrike(
+          deps,
+          { userId: uploaderId, kind: "malware", nodeId, ...(sha256 ? { sha256 } : {}) },
+          { tx },
+        )
+      : null;
+  return { listed, strike };
+}
+
 // ── applying it ─────────────────────────────────────────────────────────────────────────────
 
 export type VerdictInput = {
@@ -407,16 +447,16 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       const uploader = node.createdBy;
       if (outcome.status === "infected") {
         // A hit that came from the list needs no row; an unlisted infected hash is listed now.
-        if (outcome.blocklist === null && !effects.blocklist && sha256) {
-          await blocklist.upsert(tx, { sha256, reason: "malware", sourceNodeId: node.id });
-          effects.blocklist = true;
-        }
-        if (uploader && !effects.strike) {
-          after.strike = await addStrike(
-            bg,
-            { userId: uploader, kind: "malware", nodeId: node.id, ...(sha256 ? { sha256 } : {}) },
-            { tx },
-          );
+        const infected = await listInfected(bg, tx, {
+          nodeId: node.id,
+          uploaderId: uploader,
+          sha256,
+          list: outcome.blocklist === null && !effects.blocklist,
+          strike: !effects.strike,
+        });
+        if (infected.listed) effects.blocklist = true;
+        if (infected.strike) {
+          after.strike = infected.strike;
           effects.strike = after.strike.strikeId;
         }
         if (!effects.quarantineNotice) {

@@ -69,6 +69,7 @@ import type { Executor } from "../db/client";
 import { asQueryError, LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
+import { listInfected } from "../scan/verdict";
 import { checkPhotoDna, photodnaNote, PhotoDnaTransientError, type PhotoDnaResult } from "../scan/photodna";
 import { findByR2Key, getNode, replaceVersion } from "../db/queries/nodes";
 import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/queries/trash";
@@ -1010,18 +1011,17 @@ async function finish(
       }
       node = await insertNamed(tx, becomes.values);
       if (becomes.as === "avatar" && becomes.infected) {
-        // What the scan consumer does for an infected file (scan/verdict.ts `applyVerdict`): an
+        // What the scan consumer does for an infected file (scan/verdict.ts `listInfected`): an
         // UNLISTED server hash is listed `malware` with this node as its source (an entry listed
         // since `inspect` read it — dmca, admin, csam — is never rewritten), and the uploader is
         // struck once per content — in the transaction that writes the node.
-        if (!(await blocklist.lookup(tx, node.sha256!))) {
-          await blocklist.upsert(tx, { sha256: node.sha256!, reason: "malware", sourceNodeId: node.id });
-        }
-        strike = await addStrike(
-          deps(c),
-          { userId: uploader.id, kind: "malware", nodeId: node.id, sha256: node.sha256! },
-          { tx },
-        );
+        ({ strike } = await listInfected(deps(c), tx, {
+          nodeId: node.id,
+          uploaderId: uploader.id,
+          sha256: node.sha256!,
+          list: !(await blocklist.lookup(tx, node.sha256!)),
+          strike: true,
+        }));
       }
     }
     if (session.purpose === "file") await quota.commit(tx, session.ownerId, session.size);
