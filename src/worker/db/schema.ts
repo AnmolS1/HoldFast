@@ -742,6 +742,11 @@ export const auditLog = pgTable(
     index("audit_log_at_idx").on(t.at.desc()),
     index("audit_log_actor_idx").on(t.actorUserId, t.at.desc()),
     index("audit_log_target_idx").on(t.targetType, t.targetId, t.at.desc()),
+    // The hourly owed-detection sweep (scan/verdict.ts `owedDetectionKeys`): PhotoDNA detection
+    // rows by time, without reading the rest of the log.
+    index("audit_log_photodna_detection_idx")
+      .on(t.at)
+      .where(sql`${t.action} = 'scan.photodna_detection'`),
   ],
 );
 
