@@ -136,6 +136,15 @@ describe("scanner_down: scanner health, not one file", () => {
     expect(mails()).toBe(1);
   });
 
+  it("the bounded suspect list keeps one entry per owner: one owner's flood takes one place", async () => {
+    const [a, flooder] = [await makeUser(), await makeUser()];
+    await deadLetter("timeout", a);
+    for (let i = 0; i < 60; i++) await deadLetter(i % 2 ? "timeout" : "engine", flooder);
+    const suspects = (await alertRow())?.suspects as { owner: string }[];
+    expect(suspects.map((entry) => entry.owner).sort()).toEqual([a.id, flooder.id].sort());
+    expect(mails()).toBe(0);
+  });
+
   it("CONTROL: 3 owners, but the first more than 30 min ago → none", async () => {
     const [a, b, c] = [await makeUser(), await makeUser(), await makeUser()];
     await deadLetter("timeout", a);

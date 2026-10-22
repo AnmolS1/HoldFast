@@ -497,7 +497,11 @@ async function scannerError(
     const now = at.toISOString();
     const decision = await changeScannerAlert<AlertDecision>(bg.db, key, (state) => {
       const windowStart = at.getTime() - SCANNER_SUSPECT_WINDOW_MS;
-      const suspects = state.suspects.filter((entry) => Date.parse(entry.at) >= windowStart);
+      // One entry per owner (the latest), so one owner's dead letters cannot push the others out of
+      // the bounded list; filling it then takes distinct owners, which open the episode anyway.
+      const suspects = state.suspects.filter(
+        (entry) => Date.parse(entry.at) >= windowStart && entry.owner !== event.owner,
+      );
       if (event.owner !== undefined) suspects.push({ owner: event.owner, at: now });
       const healthy =
         event.health || new Set(suspects.map((entry) => entry.owner)).size >= SCANNER_SUSPECT_OWNERS;
