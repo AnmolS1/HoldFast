@@ -20,6 +20,10 @@
 // --only       a comma-separated list of class names
 // --recheck    after a class's 429, wait Retry-After seconds and check one request passes again
 //
+// A class is `ok` only when refused AT its limit (within two requests). Classes that share a bucket —
+// links and report (RL_LINKS ip:), api-anon, report and auth-admin (RL_API ip:) — must not run in
+// the same minute from one address: without --local, run them one `--only` at a time, a minute apart.
+//
 // NEVER solves a captcha: the auth class is probed on the invite lookup (RL_AUTH, key inv:<ip>),
 // which needs none; the report class sends a made-up link token, which is refused (404) before
 // Turnstile is looked at, so nothing is ever filed. Nothing secret is printed: not the cookie, not
@@ -335,7 +339,15 @@ async function probe(klass: Klass): Promise<Outcome> {
     refusedAt,
     retryAfter,
     body: refusedAt ? (klass.plain ? "text/plain" : (/"error":"[a-z_]+"/.exec(body)?.[0] ?? "?")) : "",
-    ok: refusedAt !== null && retryAfter !== null && Number(retryAfter) > 0 && envelope,
+    // Refused AT its limit, not before: a 429 at request 1 means another class (or anyone at this
+    // address) had already spent the bucket — that proves nothing about this class. Two requests of
+    // slack: a signed-in class's setup requests share its `u:` budget.
+    ok:
+      refusedAt !== null &&
+      refusedAt >= klass.limit - 2 &&
+      retryAfter !== null &&
+      Number(retryAfter) > 0 &&
+      envelope,
   };
   if (values.recheck && refusedAt !== null && retryAfter) {
     // Honour it: nothing is sent to this class before the wait is over.

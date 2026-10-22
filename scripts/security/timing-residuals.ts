@@ -313,7 +313,7 @@ async function timed(run: () => Promise<Response>, read?: (body: ArrayBuffer) =>
   if (response.status === 429) {
     const code = /"error":"([a-z_]+)"/.exec(new TextDecoder().decode(body))?.[1] ?? "text";
     fail(
-      `429 (${code}) from the server — nothing more is sent (rate_limited: lower --rate-api / --rate-files)`,
+      `429 (${code}) from the server — nothing more is sent (rate_limited: lower --rate-api / --rate-files / --rate-links, or wait out another client's use of this address)`,
     );
   }
   return { ms, status: response.status };
@@ -501,11 +501,14 @@ async function measure() {
     };
     await runGroup(
       "POST /api/public/report: every 404 before Turnstile (T22 m9)",
+      // The m9 question is whether the LIVE-link kinds separate from each other: the first kind (the
+      // one every P is against) is one of them. The token of no link is last, for context only — it
+      // is cheaper by ruling (RPTFIX DECISION 3) and is expected to separate.
       [
-        { name: "token of no link", once: report(rand(22), absent) },
         { name: "live link, id that does not exist", once: report(token, absent) },
         { name: "live link, own file outside the root", once: report(token, outside) },
         { name: "live link, another account's file", once: report(token, otherOwner) },
+        { name: "token of no link (cheaper by ruling)", once: report(rand(22), absent) },
       ],
       n,
     );
