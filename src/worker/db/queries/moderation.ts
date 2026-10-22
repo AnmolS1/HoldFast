@@ -433,6 +433,45 @@ export async function listAsLocked(db: Executor, sha256: string, nodeId: string)
     });
 }
 
+/**
+ * Hands the lock's own entry for `sha256` from node `from` to node `to` — the twin hand-over of
+ * `releaseBlocklistEntry`, for bytes preserved as a NEW node (scan/consumer.ts): the entry a lock
+ * CREATED (`sourceNodeId`) or RAISED (`raisedByNodeId`) naming `from` names `to` afterwards, so
+ * that clearing `to` as a false positive undoes it. Any other state of the entry (confirmed,
+ * another node's, not csam) is left exactly as it is. One transaction.
+ */
+export async function handOverLockEntry(
+  db: Executor,
+  sha256: string,
+  from: string,
+  to: string,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx
+      .update(hashBlocklist)
+      .set({ sourceNodeId: to })
+      .where(
+        and(
+          eq(hashBlocklist.sha256, sha256),
+          eq(hashBlocklist.reason, "csam"),
+          sql`${hashBlocklist.raisedFrom} IS NULL`,
+          eq(hashBlocklist.sourceNodeId, from),
+        ),
+      );
+    await tx
+      .update(hashBlocklist)
+      .set({ raisedByNodeId: to })
+      .where(
+        and(
+          eq(hashBlocklist.sha256, sha256),
+          eq(hashBlocklist.reason, "csam"),
+          sql`${hashBlocklist.raisedFrom} IS NOT NULL`,
+          eq(hashBlocklist.raisedByNodeId, from),
+        ),
+      );
+  });
+}
+
 /** The node's csam case that is open, reviewing or actioned — the one still worked on first. */
 async function liveCsamCase(
   db: Executor,

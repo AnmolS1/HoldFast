@@ -41,12 +41,11 @@
 // transaction (`addStrike(bg, …, { tx })`), its `applySuspension()` is awaited after it.
 // Nothing here relies on `waitUntil` outliving the invocation: everything is awaited.
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
 import { insertReport, listAsLocked, takedownNode } from "../db/queries/moderation";
-import { uuidv7 } from "../db/ids";
 import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
@@ -314,15 +313,15 @@ export const PHOTODNA_SETTLED_ACTION = "scan.photodna_settled";
 
 /**
  * A PhotoDNA detection as recorded before the verdict's transaction — everything a later delivery
- * needs to preserve the bytes when their file is gone: the key, the server hash, the node the hash
- * is listed for (`preserveAs`: the file's own id while it was there, else the id the bytes are
- * to be preserved as), and of the file its id, uploader and declared type (never its name: audit
- * rows carry no file names).
+ * needs to preserve the bytes when their file is gone: the key, the server hash, and of the file
+ * its id (`fileId`: the node the scan was about — what the listing names until a preserved node
+ * takes it over), uploader and declared type (never its name: audit rows carry no file names).
+ * Nothing here is decided on a read: bytes are always preserved under a FRESH node id
+ * (scan/consumer.ts `preserveDetection`).
  */
 export type PhotoDnaDetection = {
   key: string;
   sha256: string;
-  preserveAs: string;
   fileId: string;
   uploaderId: string | null;
   mimeDeclared: string | null;
@@ -332,13 +331,13 @@ export type PhotoDnaDetection = {
 
 /**
  * Makes a detection durable, in ONE transaction of its own and BEFORE the verdict's: the listing
- * (`listSuspectedCsam`, naming `preserveAs`) and the held audit row (`legalHold`, kept past
+ * (`listSuspectedCsam`, naming the file) and the held audit row (`legalHold`, kept past
  * retention) targeting the KEY — so that a delivery whose verdict never commits leaves an OWED
  * detection the redelivery finds even when no node is on the key any more (scan/consumer.ts).
  */
 async function recordDetection(bg: BackgroundContext, detection: PhotoDnaDetection): Promise<void> {
   await bg.db.transaction(async (tx) => {
-    await listSuspectedCsam(tx, { sha256: detection.sha256, nodeId: detection.preserveAs });
+    await listSuspectedCsam(tx, { sha256: detection.sha256, nodeId: detection.fileId });
     await auditInTx(
       tx,
       bg,
@@ -347,7 +346,6 @@ async function recordDetection(bg: BackgroundContext, detection: PhotoDnaDetecti
       {
         sha256: detection.sha256,
         nodeId: detection.fileId,
-        preserveAs: detection.preserveAs,
         uploaderId: detection.uploaderId,
         mimeDeclared: detection.mimeDeclared,
         legalHold: true,
@@ -360,7 +358,7 @@ async function recordDetection(bg: BackgroundContext, detection: PhotoDnaDetecti
 export async function settleDetection(
   bg: BackgroundContext,
   key: string,
-  meta: { outcome: "locked" | "preserved" | "recorded"; nodeId?: string },
+  meta: { outcome: "locked" | "preserved" | "recorded" | "cleared"; nodeId?: string },
 ): Promise<void> {
   try {
     await bg.db.transaction((tx) =>
@@ -369,6 +367,23 @@ export async function settleDetection(
   } catch (error) {
     captureError(error, { kind: "scan", reason: "photodna_settle" });
   }
+}
+
+/**
+ * The keys of OWED detections — recorded before `olderThan` and never settled — oldest first, at
+ * most `limit`: what the hourly sweep (`sweepOwedDetections`, scan/consumer.ts) takes, so that no
+ * detection depends on a redelivery happening.
+ */
+export async function owedDetectionKeys(db: Executor, olderThan: Date, limit: number): Promise<string[]> {
+  const rows = await db.execute<{ key: string }>(sql`
+    SELECT a.target_id AS key FROM audit_log a
+    WHERE a.action = ${PHOTODNA_DETECTION_ACTION} AND a.target_type = 'scan_key' AND a.at < ${olderThan}
+      AND NOT EXISTS (SELECT 1 FROM audit_log s
+                      WHERE s.target_type = 'scan_key' AND s.target_id = a.target_id
+                        AND s.action = ${PHOTODNA_SETTLED_ACTION})
+    ORDER BY a.at
+    LIMIT ${limit}`);
+  return rows.rows.map((row) => row.key);
 }
 
 /**
@@ -388,13 +403,12 @@ export async function owedDetection(db: Executor, key: string): Promise<PhotoDna
     );
   if (rows.some((row) => row.action === PHOTODNA_SETTLED_ACTION)) return null;
   const meta = rows.find((row) => row.action === PHOTODNA_DETECTION_ACTION)?.meta;
-  if (!meta || typeof meta.sha256 !== "string" || typeof meta.preserveAs !== "string") return null;
+  if (!meta || typeof meta.sha256 !== "string" || typeof meta.nodeId !== "string") return null;
   const text = (value: unknown) => (typeof value === "string" ? value : null);
   return {
     key,
     sha256: meta.sha256,
-    preserveAs: meta.preserveAs,
-    fileId: text(meta.nodeId) ?? meta.preserveAs,
+    fileId: meta.nodeId,
     uploaderId: text(meta.uploaderId),
     mimeDeclared: text(meta.mimeDeclared),
     name: null,
@@ -421,7 +435,7 @@ export type Applied =
   /**
    * The key is no longer the node's current version (replaced, purged): nothing was written to any
    * node. `photodna`: PhotoDNA matched these bytes all the same — the detection is recorded and
-   * the server hash listed csam (naming `preserveAs`; null: no server hash, nothing recorded) and
+   * the server hash listed csam (naming the file; null: no server hash, nothing recorded) and
    * the CALLER owes it its preservation or its record (scan/consumer.ts).
    */
   | { kind: "gone"; photodna?: PhotoDnaDetection | null }
@@ -494,17 +508,14 @@ function jobVerdict(input: VerdictInput, outcome: Outcome, carried: Record<strin
 export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): Promise<Applied> {
   const { key, verdict } = input;
   const sha256 = verdict.sha256?.toLowerCase();
-  // A PhotoDNA match is made durable FIRST, before the transaction below can fail: listed, and
-  // recorded as owed on the key. The listing names the file while it is there; once it is gone
-  // (deleted before the verdict), the node its bytes are to be preserved as.
+  // A PhotoDNA match is made durable FIRST, before the transaction below can fail: listed (naming
+  // the file the scan is about) and recorded as owed on the key. Nothing is read to decide it.
   const matched = input.photodna !== null && "match" in input.photodna && input.photodna.match;
   let detection: PhotoDnaDetection | null = null;
   if (matched && sha256) {
-    const present = (await findByR2Key(bg.db, key))?.id === input.nodeId;
     detection = {
       key,
       sha256,
-      preserveAs: present ? input.nodeId : uuidv7(),
       fileId: input.nodeId,
       uploaderId: input.file.createdBy,
       mimeDeclared: input.file.mimeDeclared,
@@ -667,6 +678,10 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       ({ reportId } = await lockSuspectedCsam(bg, node.id, { source: outcome.csamSource ?? "system" }));
     } catch (error) {
       if (error instanceof AppError && error.code === "not_found") {
+        // Purged between the commit and the lock. A PhotoDNA detection goes back to the caller,
+        // which preserves the bytes (or records it) and settles it — the job is not finished
+        // here while it is owed (the purge took the job row with the node in any case).
+        if (detection) return { kind: "gone", photodna: detection };
         await finish(bg.db, input.claimed, "done", {
           ...jobVerdict(input, outcome, carried),
           outcome: "replaced",
