@@ -496,6 +496,70 @@ export async function clearDetectorMailed(db: Executor, field: DetectorMailField
   clearSettingsCache();
 }
 
+// ── the scanner-down alert's state (T27B; the detector's mail-time pattern) ──────────────────
+//
+// One settings row, `scannerAlert` = `{ since, mailedAt }` (ISO times; `getSettings` ignores the
+// key). Present while the scanner is believed down; gone once a real verdict came back. Unlike
+// the detector — which runs under the generation lock — dead letters are handled concurrently,
+// so the mail is CLAIMED in one statement and only the caller that gets the row back sends it.
+
+export const SCANNER_ALERT_KEY = "scannerAlert";
+
+/**
+ * Claims the scanner-down mail: true when no mail is recorded, or the last one is at least
+ * `everyMs` old — then `mailedAt` is `at` (and `since` kept, or `at` for a new episode). The
+ * previous `mailedAt` comes back for `releaseScannerDownMail`.
+ */
+export async function claimScannerDownMail(
+  db: Executor,
+  at: Date,
+  everyMs: number,
+): Promise<{ claimed: false } | { claimed: true; previous: string | null }> {
+  const now = at.toISOString();
+  const due = new Date(at.getTime() - everyMs).toISOString();
+  const result = await db.execute<{ previous: string | null }>(sql`
+    WITH before AS (SELECT value ->> 'mailedAt' AS mailed FROM settings WHERE key = ${SCANNER_ALERT_KEY})
+    INSERT INTO settings (key, value, updated_by)
+    VALUES (${SCANNER_ALERT_KEY}, jsonb_build_object('since', ${now}::text, 'mailedAt', ${now}::text), NULL)
+    ON CONFLICT (key) DO UPDATE
+      SET value = jsonb_build_object(
+            'since', COALESCE(${storedObject} ->> 'since', ${now}::text), 'mailedAt', ${now}::text),
+          updated_by = NULL, updated_at = now()
+      WHERE (${storedObject} ->> 'mailedAt') IS NULL
+         OR (${storedObject} ->> 'mailedAt') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+         OR (${storedObject} ->> 'mailedAt')::timestamptz <= ${due}::timestamptz
+    RETURNING (SELECT mailed FROM before) AS previous`);
+  const row = result.rows[0];
+  return row ? { claimed: true, previous: row.previous ?? null } : { claimed: false };
+}
+
+/** A claim whose mail reached nobody is given back: the next dead letter tries again. */
+export async function releaseScannerDownMail(
+  db: Executor,
+  claimedAt: Date,
+  previous: string | null,
+): Promise<void> {
+  if (previous === null) {
+    await db.execute(sql`
+      DELETE FROM settings WHERE key = ${SCANNER_ALERT_KEY} AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
+    return;
+  }
+  await db.execute(sql`
+    UPDATE settings SET value = jsonb_set(value, '{mailedAt}', to_jsonb(${previous}::text)), updated_at = now()
+    WHERE key = ${SCANNER_ALERT_KEY} AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
+}
+
+/**
+ * The scanner answered: the alert's state is over. One statement, nothing when no alert is
+ * recorded. Returns when the episode began (null: there was none).
+ */
+export async function clearScannerDown(db: Executor): Promise<{ since: string | null } | null> {
+  const result = await db.execute<{ since: string | null }>(sql`
+    DELETE FROM settings WHERE key = ${SCANNER_ALERT_KEY} RETURNING value ->> 'since' AS since`);
+  const row = result.rows[0];
+  return row ? { since: row.since ?? null } : null;
+}
+
 /**
  * Counts the database's generation up — only if it is still EXACTLY what was read (`from`: the
  * stored jsonb text as `readDetectorFields` gave it, null for none): a compare of the raw stored

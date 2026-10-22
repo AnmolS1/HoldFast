@@ -43,15 +43,22 @@
 //   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
 //                                            not taken down → `error`/`timeout`|`engine`; Sentry
 //                                            error tagged with the key; ack
+//   … and when the job's last error is the SCANNER's (`not_ready`, `engine`, `timeout`): the
+//   operators get OPERATOR_CRITICAL `scanner_down` — on the transition, then at most every 6 h
+//   while it lasts (`claimScannerDownMail`, one settings row); the next real verdict in the main
+//   queue records the recovery (audit `system.scanner_recovered`) and the next one is a transition.
 //
 // LOGS carry keys and node ids only — never a file name or an address.
 
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
+import { claimScannerDownMail, clearScannerDown, releaseScannerDownMail } from "../db/queries/trash-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { Node } from "../db/schema";
+import { mailOperators, ROLLBACK_MAIL_EVERY_MS } from "../jobs/reconcile";
 import { captureError } from "../sentry";
+import { auditInTx } from "../services/audit";
 import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
 import type { BackgroundContext } from "../services/request-context";
 import {
@@ -62,6 +69,7 @@ import {
   type ScanVerdict,
 } from "../services/scanning";
 import { storage } from "../services/storage";
+import { adminListOf } from "../services/signup-policy";
 import { enforceStrikeThreshold } from "../services/strikes";
 import {
   SCAN_MAX_BYTES,
@@ -185,6 +193,7 @@ async function scanClaimed(
       throw new VerdictError(verdict.reason === "timeout" ? "timeout" : "engine");
     // A verdict without the server's hash is not one this pipeline can stand on.
     if (!verdict.sha256) throw new VerdictError("engine");
+    await scannerAnswered(bg);
   }
 
   const photodna = await checkPhotoDna(bg, {
@@ -414,7 +423,75 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
   });
   captureError(new Error(`scan: dead-lettered (${reason})`), { kind: "scan", key: loggable(scan.key) });
   bg.metric("scan", { outcome: "dlq", reason });
+  if (job && SCANNER_ERRORS.has(job.lastError ?? "")) await alertScannerDown(bg);
   message.ack();
+}
+
+// ── scanner down: the operators' alert, and the recovery ───────────────────────────────────
+
+/**
+ * The last errors that are the SCANNER's own failure. Not `busy`/`reset` (a capacity wall or a
+ * deploy — re-sent once, and the scanner answered), not `photodna`, not a database message.
+ */
+const SCANNER_ERRORS = new Set(["not_ready", "engine", "timeout"]);
+
+/** The `scanner_down` mail at most this often while it lasts — the detector's 6 h. */
+export const SCANNER_DOWN_MAIL_EVERY_MS = ROLLBACK_MAIL_EVERY_MS;
+
+/**
+ * OPERATOR_CRITICAL `scanner_down`, on the transition and then at most every 6 h. Recipients are
+ * checked BEFORE the claim (an empty list spends nothing); a claim whose mail reached nobody is
+ * given back. Never throws: the dead letter is acked whatever happens here.
+ */
+async function alertScannerDown(bg: BackgroundContext): Promise<void> {
+  try {
+    if (adminListOf(bg.env).addresses.size === 0) {
+      bg.metric("scan", { outcome: "scanner_down", reason: "no_recipient" });
+      captureError(new Error("scan: the scanner is down and no operator address is configured"), {
+        kind: "scan",
+        reason: "scanner_down",
+      });
+      return;
+    }
+    const at = new Date();
+    const claim = await claimScannerDownMail(bg.db, at, SCANNER_DOWN_MAIL_EVERY_MS);
+    if (!claim.claimed) {
+      bg.metric("scan", { outcome: "scanner_down", reason: "claimed" });
+      return;
+    }
+    if (await mailOperators(bg, "scanner_down", { kind: "scan", job: "scanner_down" })) {
+      bg.metric("scan", { outcome: "scanner_down", reason: "mailed" });
+      return;
+    }
+    await releaseScannerDownMail(bg.db, at, claim.previous);
+    bg.metric("scan", { outcome: "scanner_down", reason: "send_failed" });
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "scanner_down" });
+  }
+}
+
+/**
+ * A real verdict came back: an alert episode, if one is recorded, is over — the metric and an
+ * audit row; the next scanner dead letter mails at once. One statement when there is none. Never
+ * throws: a scan never fails or retries because of this.
+ */
+async function scannerAnswered(bg: BackgroundContext): Promise<void> {
+  try {
+    const ended = await clearScannerDown(bg.db);
+    if (!ended) return;
+    bg.metric("scan", { outcome: "scanner_recovered" });
+    await bg.db.transaction((tx) =>
+      auditInTx(
+        tx,
+        bg,
+        "system.scanner_recovered",
+        { type: "system", id: "scanner" },
+        { since: ended.since },
+      ),
+    );
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "scanner_recovered" });
+  }
 }
 
 export async function queue(
