@@ -88,7 +88,9 @@ export const test = base.extend<HarnessFixtures, HarnessWorkerFixtures>({
   },
   clientIp: [
     async ({ context }, use, testInfo) => {
-      const ip = addressFor(`${testInfo.project.name}|${testInfo.testId}|${testInfo.retry}`);
+      const ip = addressFor(
+        `${testInfo.project.name}|${testInfo.testId}|${testInfo.retry}|${testInfo.repeatEachIndex}`,
+      );
       const app = appOrigin(e2ePort());
       // Browser requests to the app origin only. A spec's own page.route() mocks run first and
       // are untouched; what they pass on, and everything unmocked, carries the address.
@@ -167,7 +169,7 @@ export { expectNoA11yViolations } from "./axe";
 export type { ApiRequest, ApiRequests } from "./api-requests";
 export { testClock, TEST_NOW_HEADER, type TestClock } from "./clock";
 export type { AdminPage, OwnerPage, RolePage, Roles, ShareRole } from "./roles";
-export { navigateInApp } from "./navigate";
+export { DOCUMENT_LOAD, navigateInApp } from "./navigate";
 export {
   E2E_DIST,
   MOCK_USER,

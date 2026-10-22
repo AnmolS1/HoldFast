@@ -37,6 +37,16 @@ export const GENERATION_OBJECT = "sys/reconcile-generation";
 
 /** Every screen a test opens first, and the API modules behind them. */
 const WARM_PAGES = ["/login", "/signup", "/forgot-password", "/verify-email", "/reset-password", "/"];
+/**
+ * A page that is its own lazy chunk (`lazyPage`) is not built by the shell rendering: `#root > *`
+ * is attached before the chunk is even requested. The public link page's first load (its module
+ * graph: the file card, the report dialog, the previews) used to be paid by whichever test opened
+ * a /s/ address first — in a full run, two tests of report-interstitial.spec.ts at once. The
+ * address is made up; the page answers "not found" inside the same element.
+ */
+const WARM_LAZY_PAGES: Array<[path: string, ready: string]> = [
+  ["/s/warm-up-no-such-token", "[data-public-link-page]"],
+];
 const WARM_API = ["/api/public/config", "/api/auth/get-session", "/api/health"];
 /** The whole warm-up, however slow the machine: it happens once. */
 export const WARM_UP_BUDGET_MS = 240_000;
@@ -56,6 +66,10 @@ async function warm(baseURL: string): Promise<void> {
       // `load` and then the app's own root: the shell has rendered, so its modules are built.
       await page.goto(path, { timeout: left(), waitUntil: "load" });
       await page.locator("#root > *").first().waitFor({ state: "attached", timeout: left() });
+    }
+    for (const [path, ready] of WARM_LAZY_PAGES) {
+      await page.goto(path, { timeout: left(), waitUntil: "load" });
+      await page.locator(ready).first().waitFor({ state: "attached", timeout: left() });
     }
     // Once more: the second load is the one a test will see (and Vite may have re-optimised and
     // reloaded during the first).

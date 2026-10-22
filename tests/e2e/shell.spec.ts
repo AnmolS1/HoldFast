@@ -9,6 +9,7 @@
 // module graph are skipped there and say so.
 import type { Locator, Page, Route } from "@playwright/test";
 import {
+  DOCUMENT_LOAD,
   E2E_DIST,
   expect,
   expectNoA11yViolations,
@@ -150,11 +151,13 @@ test.describe("the real Worker (nothing under /api is mocked)", () => {
     await stubTurnstile(page);
     await page.goto("/");
     await expect(page).toHaveURL(/\/login\?next=%2F$/);
-    await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Sign in" })).toBeVisible(DOCUMENT_LOAD);
     await page.goto("/signup");
-    await expect(page.getByRole("heading", { level: 1, name: "Create your account" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: "Create your account" })).toBeVisible(
+      DOCUMENT_LOAD,
+    );
     await page.goto("/no/such/page");
-    await expect(notFound(page)).toBeVisible();
+    await expect(notFound(page)).toBeVisible(DOCUMENT_LOAD);
   });
 });
 
@@ -172,7 +175,7 @@ test.describe("shell routes", () => {
     test(`${path} renders signed out`, async ({ page, origins }) => {
       await mockShell(page, origins.port, { user: null });
       await page.goto(path);
-      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible(DOCUMENT_LOAD);
       await expect(page.locator("[data-frame]")).toHaveCount(0);
     });
   }
