@@ -17,6 +17,8 @@ export const en = {
   "app.more": "More",
   "app.comingSoon": "Coming soon",
   "app.preparing": "This page is being prepared.",
+  "app.newVersion": "A new version of Holdfast is available.",
+  "app.reload": "Reload",
 
   "nav.primary": "Primary",
   "nav.files": "Files",
