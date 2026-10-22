@@ -670,8 +670,8 @@ check_secrets() {
   return "${PIPESTATUS[0]}"
 }
 
-check_hyperdrive() {
-  local id
+hyperdrive_one() { # <dev|production>
+  local env="$1" id
   id="$(node -e '
     // JSONC: comments removed outside strings (a URL keeps its "//"), then trailing commas.
     const src = require("fs").readFileSync(process.argv[1], "utf8");
@@ -689,12 +689,20 @@ check_hyperdrive() {
     }
     const cfg = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
     const block = process.argv[2] === "production" ? cfg.env.production : cfg;
-    process.stdout.write(String(block.hyperdrive?.[0]?.id ?? ""));' "$root/wrangler.jsonc" "$env_name" 2>/dev/null)" || id=""
-  [ -n "$id" ] || { echo "no Hyperdrive id for $env_name in wrangler.jsonc" && return 1; }
+    process.stdout.write(String(block.hyperdrive?.[0]?.id ?? ""));' "$root/wrangler.jsonc" "$env" 2>/dev/null)" || id=""
+  [ -n "$id" ] || { echo "no Hyperdrive id for $env in wrangler.jsonc" && return 1; }
   # `hyperdrive get` prints connection details: kept in a file, only `.caching` is read.
-  (cd "$root" && npx wrangler hyperdrive get "$id") >"$tmpdir/hyperdrive.txt" 2>/dev/null || : >"$tmpdir/hyperdrive.txt"
-  eval_hyperdrive "$tmpdir/hyperdrive.txt" | sed "s|^|$env_name config $id: |"
+  (cd "$root" && npx wrangler hyperdrive get "$id") >"$tmpdir/hyperdrive-$env.txt" 2>/dev/null || : >"$tmpdir/hyperdrive-$env.txt"
+  eval_hyperdrive "$tmpdir/hyperdrive-$env.txt" | sed "s|^|$env config $id: |"
   return "${PIPESTATUS[0]}"
+}
+
+# Dev: the dev config. Production: BOTH configs (T30 step 9 — "the dev config is asserted the same way").
+check_hyperdrive() {
+  local rc=0
+  [ "$env_name" = "production" ] && { hyperdrive_one production || rc=1; }
+  hyperdrive_one dev || rc=1
+  return "$rc"
 }
 
 check_notification() {
