@@ -3,7 +3,8 @@
 // `suspected_csam` after the verdict's transaction committed. The verdict's transaction lists the
 // SERVER hash `csam` the way the lock does (`listSuspectedCsam`, `sourceNodeId` the node) before
 // that, so a redelivery on which PhotoDNA does not answer a match (switched off, skipped, down)
-// still ends the file LOCKED — held, reported, the object kept — never clean.
+// still ends the file LOCKED — held, reported, the object kept — never clean. And when the lock
+// keeps failing until the message dead-letters, the dead letter runs the lock — never `error`.
 // PhotoDNA is switched on for the first delivery only, with a made-up key and a mocked Match API.
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -23,6 +24,7 @@ vi.mock("../../../src/worker/services/scanning", async (original) => {
 // A made-up key: the request never leaves the test (fetch is mocked).
 const ON = { PHOTODNA_ENABLED: "true", PHOTODNA_SUBSCRIPTION_KEY: "made-up-photodna-test-key" };
 const realFetch = globalThis.fetch;
+const DLQ = "holdfast-scan-dev-dlq";
 
 beforeEach(() => {
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -69,5 +71,29 @@ describe("a PhotoDNA-matched file whose lock fails", () => {
     const cleared = await testDb().transaction((tx) => clearSuspectedCsam(tx, file.id));
     expect(cleared).toMatchObject({ cleared: true, blocklistRemoved: true, blocklistKept: null });
     expect(await blocklist.lookup(testDb(), server)).toBeNull();
+  });
+
+  it("whose lock fails on EVERY delivery until it dead-letters: the dead letter finds the verified hash listed csam and runs the lock — never `error`; a lock that fails there too is retried, the node left pending", async () => {
+    const bytes = png();
+    const server = await sha256Of(bytes);
+    const { file, owner } = await uploadedFile(bytes, { name: "p.png" });
+
+    // The last delivery: PhotoDNA matches, the lock fails. The job ends `failed`; the queue then
+    // hands the message to the dead-letter queue.
+    vi.mocked(lockSuspectedCsam).mockRejectedValueOnce(new Error("test: the lock cannot be written"));
+    expect(await deliver([{ body: explicit(file), attempts: 6 }], ON)).toMatchObject([{ outcome: "retry" }]);
+    expect(await blocklist.lookup(testDb(), server)).toEqual({ reason: "csam", sourceNodeId: file.id });
+
+    // The dead letter, the lock failing there too: retried — the node is NOT ended `error`.
+    vi.mocked(lockSuspectedCsam).mockRejectedValueOnce(new Error("test: the lock cannot be written"));
+    expect(await deliver([{ body: explicit(file) }], {}, DLQ)).toMatchObject([{ outcome: "retry" }]);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "pending", legalHold: false });
+
+    // The dead letter again: the lock runs.
+    expect(await deliver([{ body: explicit(file), attempts: 2 }], {}, DLQ)).toEqual([{ outcome: "ack" }]);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect(await reportsOf(file.id)).toMatchObject([{ category: "csam", status: "open" }]);
+    expect(await userRow(owner.id)).toMatchObject({ legalHold: true });
+    expect(await env.FILES.head(file.r2Key!)).not.toBeNull();
   });
 });

@@ -38,6 +38,9 @@
 //   no node for the key                      ack SILENTLY: metric dlq/no_node, nothing else
 //   job `done`                               ack
 //   job `running`, younger than 20 min       retry in 21 min (let the claim resolve first)
+//   the node's VERIFIED hash listed csam     the CSAM lock (`lockSuspectedCsam`, source system),
+//     (`scannedAt` set)                        metric dlq/csam_locked; ack — never `error`. A lock
+//                                              that fails: retried, the node left as it is
 //   job `failed` with `reset` or `busy`,     re-send once (`enqueueScan`, forced), mark the job
 //     node still `pending`, not re-sent yet    `requeuedFromDlq`; ack — no `error`, no Sentry error
 //   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
@@ -52,6 +55,7 @@
 //
 // LOGS carry keys and node ids only — never a file name or an address.
 
+import * as blocklist from "../db/queries/blocklist";
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
@@ -72,6 +76,7 @@ import type { BackgroundContext } from "../services/request-context";
 import {
   enqueueScan,
   getScanner,
+  lockSuspectedCsam,
   normalizeScanMessage,
   type ScanMessage,
   type ScanVerdict,
@@ -403,6 +408,20 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
   const staleAt = Date.now() - SCAN_CLAIM_STALE_MINUTES * 60_000;
   if (job?.status === "running" && job.startedAt.getTime() >= staleAt) {
     message.retry({ delaySeconds: DLQ_RUNNING_RETRY_SEC });
+    return;
+  }
+  // The node's hash was VERIFIED by a scan (`scannedAt`: `recordScan` writes the server hash with
+  // it) and is listed csam — a PhotoDNA match whose lock kept failing lists it in its verdict's
+  // transaction: the CSAM lock, never `error`. A lock that fails here too throws: the dead letter
+  // is retried, the node left as it is (in the end the pending-scan sweep sends it again).
+  if (
+    node.scannedAt !== null &&
+    node.sha256 !== null &&
+    (await blocklist.lookup(bg.db, node.sha256))?.reason === "csam"
+  ) {
+    await lockSuspectedCsam(bg, node.id, { source: "system" });
+    bg.metric("scan", { outcome: "dlq", reason: "csam_locked" });
+    message.ack();
     return;
   }
   const requeuedBefore = (job?.verdict as Record<string, unknown> | null)?.requeuedFromDlq === true;
