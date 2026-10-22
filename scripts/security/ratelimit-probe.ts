@@ -266,18 +266,20 @@ function classes(
         }),
     },
     {
-      // Better Auth's admin plugin (ban, unban, set role, impersonate): its POSTs spend the CALLER'S
-      // ADDRESS's sign-in budget (endpoint-policy.ts spendsAuthBudget). Sent with no session:
-      // refused by the plugin gate, counted all the same.
+      // Better Auth's admin plugin (ban, unban, set role, impersonate): a bucket of its own,
+      // RL_ADMIN, by the signed-in admin (by address when signed out, as here: refused by the
+      // plugin's gate, counted all the same) — never the address's sign-in budget (T26B Q-B1).
       name: "auth-admin",
-      limiter: "RL_AUTH (20/60 s), the sign-in budget",
-      key: "ip:<address>",
-      limit: 20,
-      send: () =>
-        fetch(`${base}/api/auth/admin/list-user-sessions`, {
+      limiter: "RL_ADMIN (60/60 s), not the sign-in budget",
+      key: "u:<user id>; ip:<address> signed out",
+      limit: 60,
+      // Three of the plugin's paths in turn: Better Auth's own limiter counts 30 a minute per
+      // address AND PATH, and would answer first on one path.
+      send: (n) =>
+        fetch(`${base}/api/auth/admin/${["unban-user", "set-role", "list-user-sessions"][n % 3]}`, {
           method: "POST",
           headers: headers(ipAuthAdmin, json({ "content-type": "application/json" })),
-          body: JSON.stringify({ userId: "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL" }),
+          body: JSON.stringify({ userId: "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0xL", role: "user" }),
         }),
     },
   ];
