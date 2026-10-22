@@ -389,24 +389,7 @@ async function lockRows(
     .where(eq(nodes.id, nodeId));
   await pauseLinks(sp, { nodeId }, "moderation");
   await sp.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
-  if (node.sha256 !== null) {
-    // NOT `blocklist.upsert`, which rewrites the whole entry. One atomic statement:
-    //   - no entry: one is created, `sourceNodeId` this node — the only entry this lock OWNS;
-    //   - an entry with another reason (an admin's, an earlier verdict's): it keeps its source,
-    //     its author and its note; its reason is RAISED to `csam`, and what it was and whose
-    //     lock raised it are recorded (`raisedFrom`, `raisedByNodeId`) so that a false positive
-    //     can be undone. Only an entry that is not `csam` is ever raised, so a raise that is in
-    //     force is never recorded over;
-    //   - a `csam` entry: untouched.
-    await sp
-      .insert(hashBlocklist)
-      .values({ sha256: node.sha256, reason: "csam", sourceNodeId: nodeId })
-      .onConflictDoUpdate({
-        target: hashBlocklist.sha256,
-        set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: nodeId },
-        setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
-      });
-  }
+  if (node.sha256 !== null) await listAsLocked(sp, node.sha256, nodeId);
 
   const existing = await liveCsamCase(sp, nodeId);
   // A REPEAT is a node that was locked AND has its case: a node that is `suspected_csam` with no
@@ -423,6 +406,70 @@ async function lockRows(
   }
   const reportId = await insertReport(sp, { nodeId, ownerId: node.ownerId, source, category: "csam" });
   return { reportId: reportId!, ownerId: node.ownerId, reportStatus: "open", alreadyLocked: false };
+}
+
+/**
+ * The blocklist entry a suspected-CSAM lock of `nodeId` writes for its hash — NOT
+ * `blocklist.upsert`, which rewrites the whole entry. One atomic statement:
+ *   - no entry: one is created, `sourceNodeId` this node — the only entry this lock OWNS;
+ *   - an entry with another reason (an admin's, an earlier verdict's): it keeps its source,
+ *     its author and its note; its reason is RAISED to `csam`, and what it was and whose
+ *     lock raised it are recorded (`raisedFrom`, `raisedByNodeId`) so that a false positive
+ *     can be undone. Only an entry that is not `csam` is ever raised, so a raise that is in
+ *     force is never recorded over;
+ *   - a `csam` entry: untouched.
+ * `clearSuspectedCsam` undoes exactly this. Also written ahead of the lock by a PhotoDNA match
+ * (scan/verdict.ts `listSuspectedCsam`), with the id of the node that is — or is about to be —
+ * locked. LOCK ORDER: the entry (4) — after the `user` rows and the `nodes` row.
+ */
+export async function listAsLocked(db: Executor, sha256: string, nodeId: string): Promise<void> {
+  await db
+    .insert(hashBlocklist)
+    .values({ sha256, reason: "csam", sourceNodeId: nodeId })
+    .onConflictDoUpdate({
+      target: hashBlocklist.sha256,
+      set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: nodeId },
+      setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
+    });
+}
+
+/**
+ * Hands the lock's own entry for `sha256` from node `from` to node `to` — the twin hand-over of
+ * `releaseBlocklistEntry`, for bytes preserved as a NEW node (scan/consumer.ts): the entry a lock
+ * CREATED (`sourceNodeId`) or RAISED (`raisedByNodeId`) naming `from` names `to` afterwards, so
+ * that clearing `to` as a false positive undoes it. Any other state of the entry (confirmed,
+ * another node's, not csam) is left exactly as it is. One transaction.
+ */
+export async function handOverLockEntry(
+  db: Executor,
+  sha256: string,
+  from: string,
+  to: string,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    await tx
+      .update(hashBlocklist)
+      .set({ sourceNodeId: to })
+      .where(
+        and(
+          eq(hashBlocklist.sha256, sha256),
+          eq(hashBlocklist.reason, "csam"),
+          sql`${hashBlocklist.raisedFrom} IS NULL`,
+          eq(hashBlocklist.sourceNodeId, from),
+        ),
+      );
+    await tx
+      .update(hashBlocklist)
+      .set({ raisedByNodeId: to })
+      .where(
+        and(
+          eq(hashBlocklist.sha256, sha256),
+          eq(hashBlocklist.reason, "csam"),
+          sql`${hashBlocklist.raisedFrom} IS NOT NULL`,
+          eq(hashBlocklist.raisedByNodeId, from),
+        ),
+      );
+  });
 }
 
 /** The node's csam case that is open, reviewing or actioned — the one still worked on first. */

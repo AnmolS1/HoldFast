@@ -8,6 +8,8 @@
 //   (0b) unrecorded_lock_sweep  sweepUnrecordedCsamLocks — a lock whose invocation died between
 //                               the node and its case is completed, recorded and announced
 //   (0c) owed_node_sweep        sweepOwedNodes (below) — a `completing` upload whose node is owed
+//   (0d) owed_detection_sweep   sweepOwedDetections (scan/consumer.ts) — a PhotoDNA detection
+//                               recorded and never settled: preserved, locked or recorded
 //   (a)  strike_sweep           sweepStrikeThresholds — three strikes not yet enforced
 //   (b)  anomaly_report         reportAnomalies (below) — findings filed and digested, nothing paused
 //   then the admin digest, one mail per operator per run, when there is anything in it.
@@ -68,6 +70,7 @@ import {
   storedSha256,
   writeLockedNode,
 } from "../routes/uploads";
+import { sweepOwedDetections } from "../scan/consumer";
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { effectiveLimits } from "../services/ceilings";
@@ -93,6 +96,7 @@ export const ABUSE_HOURLY_LIMITS = {
   csamAlerts: 50,
   unrecordedLocks: 50,
   owedNodes: 50,
+  owedDetections: 50,
   strikes: 200,
   pendingScans: 100,
   /** Findings per anomaly kind. */
@@ -120,6 +124,7 @@ export const parts = {
   sweepCsamAlerts,
   sweepUnrecordedCsamLocks,
   sweepOwedNodes,
+  sweepOwedDetections,
   sweepStrikeThresholds,
   sweepPendingScans,
   reportAnomalies,
@@ -590,6 +595,21 @@ export const job: Job = {
         bg.metric("job", { kind: KIND, outcome: "failed", reason: "owed_node_sweep" }, swept.failed);
       if (swept.locked > 0)
         digest.push({ label: "Owed upload nodes written and locked", value: swept.locked });
+    });
+
+    await part(bg, "owed_detection_sweep", async () => {
+      const swept = await parts.sweepOwedDetections(bg, {
+        limit: ABUSE_HOURLY_LIMITS.owedDetections,
+        stopAt,
+      });
+      ok("owed_detection_sweep", swept.preserved + swept.locked);
+      if (swept.failed > 0)
+        bg.metric("job", { kind: KIND, outcome: "failed", reason: "owed_detection_sweep" }, swept.failed);
+      if (swept.preserved + swept.locked > 0)
+        digest.push({
+          label: "Owed PhotoDNA detections preserved or locked",
+          value: swept.preserved + swept.locked,
+        });
     });
 
     await part(bg, "strike_sweep", async () => {

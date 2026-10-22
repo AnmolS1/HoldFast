@@ -15,6 +15,8 @@
 //
 // WHERE IT IS WRITTEN — decided on the row as LOCKED here, never on an earlier read:
 //   outcome suspected_csam, any state    the shared handler `lockSuspectedCsam`, AFTER the commit
+//                                          (a PhotoDNA match listed csam and recorded as owed on
+//                                          the key BEFORE this transaction — `recordDetection`)
 //   pending, not taken down              the status (and reason); the side effects below
 //   taken down (itself or a folder       status untouched; the outcome is kept in the detail and
 //     above it — `effectiveHidden`)        the job's verdict only
@@ -39,20 +41,21 @@
 // transaction (`addStrike(bg, …, { tx })`), its `applySuspension()` is awaited after it.
 // Nothing here relies on `waitUntil` outliving the invocation: everything is awaited.
 
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
-import { insertReport, takedownNode } from "../db/queries/moderation";
+import { insertReport, listAsLocked, takedownNode } from "../db/queries/moderation";
 import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import type { ScanDetail } from "../db/schema";
+import { auditLog, type Node, type ScanDetail } from "../db/schema";
 import { captureError } from "../sentry";
-import { audit } from "../services/audit";
+import { audit, auditInTx } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
 import { AppError } from "../services/errors";
-import type { Tx } from "../db/client";
+import type { Executor, Tx } from "../db/client";
 import type { BackgroundContext, ServiceDeps } from "../services/request-context";
 import { lockSuspectedCsam, type ScanReason, type ScanVerdict } from "../services/scanning";
 import { storage } from "../services/storage";
@@ -280,6 +283,142 @@ export async function listInfected(
   return { listed, strike };
 }
 
+// ── a PhotoDNA match ────────────────────────────────────────────────────────────────────────
+
+/**
+ * A PhotoDNA match puts the SERVER hash on the list BEFORE any write that makes the node locked —
+ * so a match whose lock then fails is not owed by an audit row alone: the list says csam, and
+ * whatever runs next (the scan's redelivery, T22's owed-node sweep) locks it like any other csam
+ * hit. Shared by `applyVerdict` (in its transaction, after the node and job rows) and the avatar
+ * path of the upload route (one statement on its own, before the node's transaction).
+ *
+ * THE LOCK'S OWN STATEMENT (queries/moderation.ts `listAsLocked`, which `lockRows` writes), with
+ * `nodeId` the node that is — or is about to be — locked: no entry → created, `sourceNodeId`
+ * that node; an entry with another reason → RAISED to `csam` (`raisedFrom`, `raisedByNodeId`);
+ * a `csam` entry → untouched. Never `blocklist.upsert(csam)` / `confirmCsam`: those make a
+ * CONFIRMED listing, which no clear undoes — a PhotoDNA false positive cleared by an admin must
+ * come off the list again (`clearSuspectedCsam` undoes an entry naming the cleared node).
+ */
+export async function listSuspectedCsam(
+  db: Executor | Tx,
+  input: { sha256: string; nodeId: string },
+): Promise<void> {
+  await listAsLocked(db, input.sha256, input.nodeId);
+}
+
+/** The held audit row that makes a PhotoDNA detection durable BEFORE the verdict's transaction. */
+export const PHOTODNA_DETECTION_ACTION = "scan.photodna_detection";
+/** Written once the detection ended in a lock, a preserved node or its record: nothing is owed. */
+export const PHOTODNA_SETTLED_ACTION = "scan.photodna_settled";
+
+/**
+ * A PhotoDNA detection as recorded before the verdict's transaction — everything a later delivery
+ * needs to preserve the bytes when their file is gone: the key, the server hash, and of the file
+ * its id (`fileId`: the node the scan was about — what the listing names until a preserved node
+ * takes it over), uploader and declared type (never its name: audit rows carry no file names).
+ * Nothing here is decided on a read: bytes are always preserved under a FRESH node id
+ * (scan/consumer.ts `preserveDetection`).
+ */
+export type PhotoDnaDetection = {
+  key: string;
+  sha256: string;
+  fileId: string;
+  uploaderId: string | null;
+  mimeDeclared: string | null;
+  /** Known only to the delivery that read the file; a later one names the node "preserved". */
+  name: string | null;
+  /** When the detection was recorded (its audit row's time); null before it is. */
+  recordedAt?: Date | null;
+};
+
+/**
+ * Makes a detection durable, in ONE transaction of its own and BEFORE the verdict's: the listing
+ * (`listSuspectedCsam`, naming the file) and the held audit row (`legalHold`, kept past
+ * retention) targeting the KEY — so that a delivery whose verdict never commits leaves an OWED
+ * detection the redelivery finds even when no node is on the key any more (scan/consumer.ts).
+ */
+async function recordDetection(bg: BackgroundContext, detection: PhotoDnaDetection): Promise<void> {
+  await bg.db.transaction(async (tx) => {
+    await listSuspectedCsam(tx, { sha256: detection.sha256, nodeId: detection.fileId });
+    await auditInTx(
+      tx,
+      bg,
+      PHOTODNA_DETECTION_ACTION,
+      { type: "scan_key", id: detection.key },
+      {
+        sha256: detection.sha256,
+        nodeId: detection.fileId,
+        uploaderId: detection.uploaderId,
+        mimeDeclared: detection.mimeDeclared,
+        legalHold: true,
+      },
+    );
+  });
+}
+
+/** Records that the key's detection is settled (durable: its own transaction). Never throws. */
+export async function settleDetection(
+  bg: BackgroundContext,
+  key: string,
+  meta: { outcome: "locked" | "preserved" | "recorded" | "cleared"; nodeId?: string },
+): Promise<void> {
+  try {
+    await bg.db.transaction((tx) =>
+      auditInTx(tx, bg, PHOTODNA_SETTLED_ACTION, { type: "scan_key", id: key }, { ...meta, legalHold: true }),
+    );
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "photodna_settle" });
+  }
+}
+
+/**
+ * The keys of OWED detections — recorded before `olderThan` and never settled — oldest first, at
+ * most `limit`: what the hourly sweep (`sweepOwedDetections`, scan/consumer.ts) takes, so that no
+ * detection depends on a redelivery happening.
+ */
+export async function owedDetectionKeys(db: Executor, olderThan: Date, limit: number): Promise<string[]> {
+  const rows = await db.execute<{ key: string }>(sql`
+    SELECT a.target_id AS key FROM audit_log a
+    WHERE a.action = ${PHOTODNA_DETECTION_ACTION} AND a.target_type = 'scan_key' AND a.at < ${olderThan}
+      AND NOT EXISTS (SELECT 1 FROM audit_log s
+                      WHERE s.target_type = 'scan_key' AND s.target_id = a.target_id
+                        AND s.action = ${PHOTODNA_SETTLED_ACTION})
+    ORDER BY a.at
+    LIMIT ${limit}`);
+  return rows.rows.map((row) => row.key);
+}
+
+/**
+ * The key's OWED detection — recorded and never settled — or null. Read by a delivery that finds
+ * no node on its key, before it would acknowledge the key as an orphan (the target index).
+ */
+export async function owedDetection(db: Executor, key: string): Promise<PhotoDnaDetection | null> {
+  const rows = await db
+    .select({ action: auditLog.action, meta: auditLog.meta, at: auditLog.at })
+    .from(auditLog)
+    .where(
+      and(
+        eq(auditLog.targetType, "scan_key"),
+        eq(auditLog.targetId, key),
+        inArray(auditLog.action, [PHOTODNA_DETECTION_ACTION, PHOTODNA_SETTLED_ACTION]),
+      ),
+    );
+  if (rows.some((row) => row.action === PHOTODNA_SETTLED_ACTION)) return null;
+  const recorded = rows.find((row) => row.action === PHOTODNA_DETECTION_ACTION);
+  const meta = recorded?.meta;
+  if (!meta || typeof meta.sha256 !== "string" || typeof meta.nodeId !== "string") return null;
+  const text = (value: unknown) => (typeof value === "string" ? value : null);
+  return {
+    key,
+    sha256: meta.sha256,
+    fileId: meta.nodeId,
+    uploaderId: text(meta.uploaderId),
+    mimeDeclared: text(meta.mimeDeclared),
+    name: null,
+    recordedAt: recorded!.at,
+  };
+}
+
 // ── applying it ─────────────────────────────────────────────────────────────────────────────
 
 export type VerdictInput = {
@@ -292,11 +431,18 @@ export type VerdictInput = {
   mimeSniffed: string;
   image: Dimensions | null;
   photodna: PhotoDnaResult | null;
+  /** The file as read before the claim: what preserving its bytes needs once its row is gone. */
+  file: Pick<Node, "name" | "mimeDeclared" | "createdBy">;
 };
 
 export type Applied =
-  /** The key is no longer the node's current version (replaced, purged): nothing was written. */
-  | { kind: "gone" }
+  /**
+   * The key is no longer the node's current version (replaced, purged): nothing was written to any
+   * node. `photodna`: PhotoDNA matched these bytes all the same — the detection is recorded and
+   * the server hash listed csam (naming the file; null: no server hash, nothing recorded) and
+   * the CALLER owes it its preservation or its record (scan/consumer.ts).
+   */
+  | { kind: "gone"; photodna?: PhotoDnaDetection | null }
   | {
       kind: "applied";
       outcome: Outcome;
@@ -366,8 +512,23 @@ function jobVerdict(input: VerdictInput, outcome: Outcome, carried: Record<strin
 export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): Promise<Applied> {
   const { key, verdict } = input;
   const sha256 = verdict.sha256?.toLowerCase();
+  // A PhotoDNA match is made durable FIRST, before the transaction below can fail: listed (naming
+  // the file the scan is about) and recorded as owed on the key. Nothing is read to decide it.
+  const matched = input.photodna !== null && "match" in input.photodna && input.photodna.match;
+  let detection: PhotoDnaDetection | null = null;
+  if (matched && sha256) {
+    detection = {
+      key,
+      sha256,
+      fileId: input.nodeId,
+      uploaderId: input.file.createdBy,
+      mimeDeclared: input.file.mimeDeclared,
+      name: input.file.name,
+    };
+    await recordDetection(bg, detection);
+  }
   type Decided =
-    | { kind: "gone" }
+    | { kind: "gone"; photodna?: PhotoDnaDetection | null }
     | {
         kind: "applied";
         outcome: Outcome;
@@ -390,7 +551,9 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     };
 
     if (!node || node.id !== input.nodeId) {
-      // Replaced or purged during the scan: nothing is written to any node.
+      // Replaced or purged during the scan: nothing is written to any node. A PhotoDNA match is a
+      // detection all the same — recorded and listed above — and the caller preserves the bytes,
+      // or records the detection (never dropped).
       const gone: Outcome = {
         status: verdict.status,
         reason: null,
@@ -406,7 +569,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
         }))
       )
         throw new LostClaimError();
-      return { kind: "gone" };
+      return { kind: "gone", ...(matched ? { photodna: detection } : {}) };
     }
 
     const listed = sha256 ? ((await blocklist.lookup(tx, sha256))?.reason ?? null) : null;
@@ -519,6 +682,10 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       ({ reportId } = await lockSuspectedCsam(bg, node.id, { source: outcome.csamSource ?? "system" }));
     } catch (error) {
       if (error instanceof AppError && error.code === "not_found") {
+        // Purged between the commit and the lock. A PhotoDNA detection goes back to the caller,
+        // which preserves the bytes (or records it) and settles it — the job is not finished
+        // here while it is owed (the purge took the job row with the node in any case).
+        if (detection) return { kind: "gone", photodna: detection };
         await finish(bg.db, input.claimed, "done", {
           ...jobVerdict(input, outcome, carried),
           outcome: "replaced",
@@ -528,6 +695,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       throw error;
     }
     carried.effects.csamLock = reportId;
+    if (detection) await settleDetection(bg, key, { outcome: "locked", nodeId: node.id });
     if (!(await finish(bg.db, input.claimed, "done", jobVerdict(input, outcome, carried)))) {
       throw new LostClaimError();
     }

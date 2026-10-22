@@ -1,14 +1,21 @@
-// AVSEAM residual: a PhotoDNA match on an avatar whose node cannot be written is OWED only by the
-// route's `upload.csam_node_owed` audit row — PhotoDNA matched, the blocklist does not list the
-// hash. What T22's repair sweep (abuse-hourly part 0c) does with such a session, end to end: the
-// real upload route owes it, the sweep's own listing finds it, and the sweep's one-session step
-// settles it. Not table-wide: the listing is only read, and only this test's session is settled.
-// PhotoDNA is switched on for the requests only, with a made-up key and a mocked Match API.
+// AVSEAM residual, closed by OWEDLOCK: a PhotoDNA match on an avatar whose node cannot be written.
+// The route lists the SERVER hash `csam` the way the lock itself does (scan/verdict.ts
+// `listSuspectedCsam`: `sourceNodeId` the node the upload becomes) BEFORE any node write, so
+// T22's repair sweep (abuse-hourly part 0c) takes its csam branch: the node written locked, held,
+// reported, the object kept, the session ended — like every other CSAM detection. And because
+// the entry is the lock's own (not a confirmed listing), an admin clearing it as a false positive
+// takes the hash off the list again.
+// End to end: the real upload route owes it, the sweep's own listing finds it, and the sweep's
+// one-session step settles it. Not table-wide: the listing is only read, and only this test's
+// session is settled. PhotoDNA is switched on for the requests only, with a made-up key and a
+// mocked Match API.
 import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { owedSessions } from "../../../src/worker/db/queries/abuse";
+import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { utcDay } from "../../../src/worker/db/queries/ledger";
+import { clearSuspectedCsam } from "../../../src/worker/db/queries/moderation";
 import { nodes, reports, uploads } from "../../../src/worker/db/schema";
 import { settleOwedSession } from "../../../src/worker/jobs/abuse-hourly";
 import { PHOTODNA_MATCH_URL } from "../../../src/worker/scan/photodna";
@@ -33,14 +40,21 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+async function sha256Of(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 describe("a PhotoDNA-matched avatar whose node cannot be written", () => {
-  it("is owed by the audit row alone; T22's sweep lists it and HOLDS it (object kept, session completing, operators told once) — it does not write or lock the node", async () => {
+  it("is listed csam (the lock's own entry) before the node write; T22's sweep then LOCKS it — node written locked, held, reported, object kept, session ended — and a false-positive clear unlists it", async () => {
     const ops = operators();
     const user = await uploader();
+    // Unique content: a match lists its hash, and the bare fixture PNG is other files' avatar.
     const base = pngBytes(32, 32);
     const bytes = new Uint8Array(base.length + 16);
     bytes.set(base);
     crypto.getRandomValues(bytes.subarray(base.length));
+    const server = await sha256Of(bytes);
     const session = await init(user, {
       purpose: "avatar",
       mimeDeclared: "image/png",
@@ -66,8 +80,9 @@ describe("a PhotoDNA-matched avatar whose node cannot be written", () => {
     expect(await env.FILES.head(row.r2Key)).not.toBeNull();
     expect(await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key))).toHaveLength(0);
     expect(await auditFor("upload.csam_node_owed", session.uploadId)).toHaveLength(1);
-    const alertsAtRoute = mailTo(ops.address).length;
-    expect(alertsAtRoute).toBe(1);
+    // The SERVER hash is listed csam — the entry the lock itself writes, naming the node to be.
+    expect(await blocklist.lookup(testDb(), server)).toEqual({ reason: "csam", sourceNodeId: row.nodeId });
+    expect(mailTo(ops.address)).toHaveLength(1);
 
     // Past the stale clock, as the sweep requires.
     await testDb()
@@ -75,30 +90,41 @@ describe("a PhotoDNA-matched avatar whose node cannot be written", () => {
       .set({ completingAt: new Date(Date.now() - 2 * 3_600_000) })
       .where(eq(uploads.id, session.uploadId));
 
-    // The sweep's own listing finds it — by the audit row; the hash is on no list.
     const listed = (await owedSessions(testDb(), 10_000, utcDay(new Date()))).find(
       (entry) => entry.session.id === session.uploadId,
     );
     expect(listed).toMatchObject({ owedRow: true });
 
     const ctx = jobContext({ env: ops.env });
-    expect(await settleOwedSession(ctx.bg, listed!, async () => true)).toBe("held");
+    expect(await settleOwedSession(ctx.bg, listed!, async () => true)).toBe("locked");
     await ctx.settle();
-    expect(ctx.metric.mock.calls).toContainEqual([
+    expect(ctx.metric.mock.calls).not.toContainEqual([
       "job",
       { kind: "abuse-hourly", outcome: "error", reason: "owed_not_csam" },
     ]);
-    // Held: nothing deleted, nothing ended — and nothing locked (no node, no report, no hold).
-    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "completing" });
+    // LOCKED: the node written (the uploader's, on the session's key), suspected_csam and held;
+    // a csam report; the uploader held; the object kept; the session ended.
+    const written = await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key));
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatchObject({
+      id: row.nodeId,
+      ownerId: user.id,
+      sha256: server,
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    expect(await testDb().select().from(reports).where(eq(reports.nodeId, written[0]!.id))).toMatchObject([
+      { category: "csam", status: "open" },
+    ]);
+    expect(await userRow(user.id)).toMatchObject({ legalHold: true });
     expect(await env.FILES.head(row.r2Key)).not.toBeNull();
-    expect(await testDb().select().from(nodes).where(eq(nodes.r2Key, row.r2Key))).toHaveLength(0);
-    expect(await testDb().select().from(reports).where(eq(reports.ownerId, user.id))).toHaveLength(0);
-    expect(await userRow(user.id)).toMatchObject({ legalHold: false });
-    // The operators are told — once: a second run holds it again and tells nobody.
-    const told = mailTo(ops.address).length;
-    expect(told).toBe(alertsAtRoute + 1);
-    expect(await settleOwedSession(ctx.bg, listed!, async () => true)).toBe("held");
-    await ctx.settle();
-    expect(mailTo(ops.address)).toHaveLength(told);
+    // Ended the way the route's preserve path ends it (`endPreserved`): the node holds the key now.
+    expect(await sessionRow(session.uploadId)).toMatchObject({ status: "aborted" });
+
+    // A false positive: the admin's clear takes the hash off the list again — the entry was the
+    // lock's own, not a confirmed (permanent) listing.
+    const cleared = await testDb().transaction((tx) => clearSuspectedCsam(tx, written[0]!.id));
+    expect(cleared).toMatchObject({ cleared: true, blocklistRemoved: true, blocklistKept: null });
+    expect(await blocklist.lookup(testDb(), server)).toBeNull();
   });
 });

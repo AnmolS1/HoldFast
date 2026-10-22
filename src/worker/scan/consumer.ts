@@ -35,9 +35,14 @@
 // inequality.
 //
 // THE DEAD-LETTER QUEUE (same Worker, per message):
+//   no node for the key, an OWED PhotoDNA    preserved / recorded (`preserveDetection`); metric
+//     detection on it (`owedDetection`)        dlq/photodna_owed; ack
 //   no node for the key                      ack SILENTLY: metric dlq/no_node, nothing else
 //   job `done`                               ack
 //   job `running`, younger than 20 min       retry in 21 min (let the claim resolve first)
+//   the node's VERIFIED hash listed csam     the CSAM lock (`lockSuspectedCsam`, source system),
+//     (`scannedAt` set)                        metric dlq/csam_locked; ack — never `error`. A lock
+//                                              that fails: retried, the node left as it is
 //   job `failed` with `reset` or `busy`,     re-send once (`enqueueScan`, forced), mark the job
 //     node still `pending`, not re-sent yet    `requeuedFromDlq`; ack — no `error`, no Sentry error
 //   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
@@ -52,6 +57,10 @@
 //
 // LOGS carry keys and node ids only — never a file name or an address.
 
+import * as blocklist from "../db/queries/blocklist";
+import { and, eq, gte } from "drizzle-orm";
+import { uuidv7 } from "../db/ids";
+import { CSAM_CLEARED_RESOLUTION, handOverLockEntry } from "../db/queries/moderation";
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
@@ -63,20 +72,23 @@ import {
   SCANNER_ALERT_KEY,
 } from "../db/queries/trash-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import type { Node } from "../db/schema";
+import { reports, type Node } from "../db/schema";
 import { mailOperators, ROLLBACK_MAIL_EVERY_MS } from "../jobs/reconcile";
+import { writeLockedNode } from "../routes/uploads";
 import { captureError } from "../sentry";
-import { auditInTx } from "../services/audit";
+import { audit, auditInTx } from "../services/audit";
+import { sendOperatorCritical } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
 import type { BackgroundContext } from "../services/request-context";
 import {
   enqueueScan,
   getScanner,
+  lockSuspectedCsam,
   normalizeScanMessage,
   type ScanMessage,
   type ScanVerdict,
 } from "../services/scanning";
-import { storage } from "../services/storage";
+import { keyFor, storage } from "../services/storage";
 import { adminListOf } from "../services/signup-policy";
 import { enforceStrikeThreshold } from "../services/strikes";
 import {
@@ -87,7 +99,15 @@ import {
   ScannerTransportError,
 } from "./container";
 import { checkPhotoDna, PhotoDnaTransientError } from "./photodna";
-import { applyVerdict, imageDimensions } from "./verdict";
+import {
+  applyVerdict,
+  imageDimensions,
+  owedDetection,
+  owedDetectionKeys,
+  PHOTODNA_SETTLED_ACTION,
+  settleDetection,
+  type PhotoDnaDetection,
+} from "./verdict";
 
 /** How long to wait for the upload's request to insert the node. */
 export const NO_NODE_RETRY_SEC = 10;
@@ -221,10 +241,14 @@ async function scanClaimed(
     mimeSniffed,
     image,
     photodna,
+    file: node,
   });
   const kind = verdict.engine === "stub" ? "stub" : "clamav";
   if (applied.kind === "gone") {
     bg.metric("scan", { outcome: "replaced", kind });
+    if (applied.photodna !== undefined) {
+      await preserveDetection(bg, scan.key, { id: node.id, createdBy: node.createdBy }, applied.photodna);
+    }
   } else {
     if (photodna && "skipped" in photodna)
       bg.metric("scan", { outcome: "photodna_skipped", reason: photodna.skipped });
@@ -243,6 +267,221 @@ async function scanClaimed(
     }
   }
   message.ack();
+}
+
+/**
+ * A PhotoDNA match on a key that is no longer its file's (deleted — purged — or replaced before the
+ * verdict), or an OWED detection a later delivery found on a key with no node (`owedDetection`:
+ * recorded before a verdict transaction that never committed). A detection is never dropped:
+ * `applyVerdict` recorded it and listed the server hash csam, naming the file, and here —
+ *   the object still there   its bytes are COPIED to a key of their own (`keyFor(uploader, <a
+ *                            FRESH node id>, …)`: the purge that removed the row deletes the old key
+ *                            right after its commit and asks nothing — a row on the old key would
+ *                            point at a missing object) and become a node of the UPLOADER's own,
+ *                            top level, written LOCKED (`writeLockedNode`, as the upload route
+ *                            preserves bytes — the folder's owner is not held for it), then the
+ *                            listing is handed over from the file to that node
+ *                            (`handOverLockEntry`: the clear of a false positive finds it its own)
+ *                            and the shared CSAM lock (source photodna): reported, the uploader held;
+ *   otherwise                the detection is RECORDED: `scan.csam_detection_unpreserved` with the
+ *                            hash, held from retention (`legalHold`), and the critical operator
+ *                            alert by the deleted file's id — also when the copy or the node fails.
+ * Either way the detection is then SETTLED (`settleDetection`), so no later delivery preserves it
+ * twice. NEVER THROWS: the message is acknowledged after it. The bytes are counted on the uploader
+ * by the next reconcile (the purge has released them; nothing is reserved here).
+ */
+async function preserveDetection(
+  bg: BackgroundContext,
+  key: string,
+  file: { id: string; createdBy: string | null },
+  detection: PhotoDnaDetection | null,
+): Promise<void> {
+  let copied: string | null = null;
+  const uploader = detection ? detection.uploaderId : file.createdBy;
+  const record = async (reason: string) => {
+    // Durable before the alert, with the settle mark in the same transaction.
+    await bg.db.transaction(async (tx) => {
+      await auditInTx(
+        tx,
+        bg,
+        "scan.csam_detection_unpreserved",
+        { type: "node", id: file.id },
+        {
+          key,
+          source: "photodna",
+          reason,
+          ...(detection ? { sha256: detection.sha256 } : {}),
+          ...(uploader ? { uploaderId: uploader } : {}),
+          ...(copied ? { copiedTo: copied } : {}),
+          // Kept past the audit retention: it is the only record of the detection.
+          legalHold: true,
+        },
+      );
+      if (detection) {
+        await auditInTx(
+          tx,
+          bg,
+          PHOTODNA_SETTLED_ACTION,
+          { type: "scan_key", id: key },
+          { outcome: "recorded", legalHold: true },
+        );
+      }
+    });
+    bg.metric("error", { kind: "scan_csam_unpreserved", reason });
+    for (const to of adminListOf(bg.env).addresses) {
+      await sendOperatorCritical(bg, { to, event: "csam_lock", id: file.id }).catch((error: unknown) =>
+        captureError(error, { kind: "scan", reason: "csam_alert" }),
+      );
+    }
+  };
+  const alertOnly = async () => {
+    // The record itself failed: the operators are told all the same (the detection stays owed).
+    for (const to of adminListOf(bg.env).addresses) {
+      await sendOperatorCritical(bg, { to, event: "csam_lock", id: file.id }).catch(() => undefined);
+    }
+  };
+  let preserved: Node;
+  try {
+    if (!detection) return await record("no_server_hash");
+    if (!uploader) return await record("no_uploader");
+    const store = storage(bg.env);
+    const read = await store.get(key);
+    if (read?.kind !== "body") return await record("object_gone");
+    // Always a FRESH id: nothing read earlier decides it (the file may be gone, or still there
+    // under another key). The original id is in the audit row (`fromNodeId`).
+    const nodeId = uuidv7();
+    const versionId = uuidv7();
+    const r2Key = keyFor(uploader, nodeId, versionId);
+    await store.put(r2Key, read.object.body, { size: read.object.size });
+    copied = r2Key;
+    preserved = await writeLockedNode(
+      bg,
+      {
+        ownerId: uploader,
+        nodeId,
+        replaceNodeId: null,
+        purpose: "file",
+        name: detection.name ?? "preserved",
+        size: read.object.size,
+        mimeDeclared: detection.mimeDeclared,
+        r2Key,
+        versionId,
+        parentId: null,
+      },
+      { uploaderId: uploader, sha256: detection.sha256, size: read.object.size, sealed: null },
+    );
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "csam_preserve" });
+    try {
+      await record("preserve_failed");
+    } catch (inner) {
+      captureError(inner, { kind: "scan", reason: "csam_preserve" });
+      await alertOnly();
+    }
+    return;
+  }
+  audit(
+    bg,
+    "scan.csam_preserved",
+    { type: "node", id: preserved.id },
+    { fromNodeId: file.id, key, source: "photodna" },
+  );
+  if (detection) {
+    try {
+      await handOverLockEntry(bg.db, detection.sha256, detection.fileId, preserved.id);
+    } catch (error) {
+      // The entry still names the file: listed all the same (a clear cannot undo it — fail closed).
+      captureError(error, { kind: "scan", reason: "csam_preserve_handover" });
+    }
+  }
+  await settleDetection(bg, key, { outcome: "preserved", nodeId: preserved.id });
+  try {
+    await lockSuspectedCsam(bg, preserved.id, { source: "photodna" });
+  } catch (error) {
+    // The node is written locked and hidden; the unrecorded-lock sweep (abuse-hourly 0b) completes it.
+    captureError(error, { kind: "scan", reason: "csam_preserve_lock" });
+  }
+}
+
+/** An owed detection is left to its own deliveries (retries, dead letter) this long first. */
+export const OWED_DETECTION_MIN_AGE_MS = 2 * 3_600_000;
+export const OWED_DETECTION_SWEEP_LIMIT = 50;
+
+/**
+ * The hourly pass over OWED PhotoDNA detections (abuse-hourly part 0d) — so that no detection
+ * relies on a redelivery happening. At most `limit`, oldest first, each re-read before it is
+ * acted on; one that fails is counted and does not stop the rest:
+ *   no node on the key        `preserveDetection` (preserved, or recorded and the operators told);
+ *   the node locked already   settled (`locked`: the settle mark was lost);
+ *   CLEARED                   settled (`cleared`), never locked again — decided from the blocklist,
+ *                             the one source of truth after T25's false-positive clear: the hash is
+ *                             NOT listed csam any more AND a csam case on the node opened after
+ *                             this detection was recorded was dismissed `false_positive`
+ *                             (`detectionCleared`). An older case says nothing about it;
+ *   otherwise                 the shared CSAM lock (source photodna), then settled — when in
+ *                             doubt, FAIL CLOSED.
+ */
+export async function sweepOwedDetections(
+  bg: BackgroundContext,
+  opts: { limit?: number; stopAt?: number; now?: Date } = {},
+): Promise<{ checked: number; preserved: number; locked: number; failed: number }> {
+  const limit = Math.max(1, Math.min(opts.limit ?? OWED_DETECTION_SWEEP_LIMIT, 1_000));
+  const olderThan = new Date((opts.now ?? new Date()).getTime() - OWED_DETECTION_MIN_AGE_MS);
+  const keys = await owedDetectionKeys(bg.db, olderThan, limit);
+  const result = { checked: 0, preserved: 0, locked: 0, failed: 0 };
+  for (const key of keys) {
+    if (opts.stopAt !== undefined && Date.now() >= opts.stopAt) break;
+    result.checked += 1;
+    try {
+      const owed = await owedDetection(bg.db, key);
+      if (!owed) continue;
+      const node = await findByR2Key(bg.db, key);
+      if (!node) {
+        await preserveDetection(bg, key, { id: owed.fileId, createdBy: owed.uploaderId }, owed);
+        result.preserved += 1;
+      } else if (node.scanStatus === "suspected_csam") {
+        await settleDetection(bg, key, { outcome: "locked", nodeId: node.id });
+      } else if (await detectionCleared(bg.db, owed, node.id)) {
+        await settleDetection(bg, key, { outcome: "cleared", nodeId: node.id });
+      } else {
+        await lockSuspectedCsam(bg, node.id, { source: "photodna" });
+        await settleDetection(bg, key, { outcome: "locked", nodeId: node.id });
+        result.locked += 1;
+      }
+    } catch (error) {
+      captureError(error, { kind: "scan", reason: "owed_detection_sweep" });
+      result.failed += 1;
+    }
+  }
+  return result;
+}
+
+/**
+ * True only when THIS detection was cleared as a false positive: its hash is no longer listed
+ * csam, and a csam case on the node, opened at or after the detection was recorded (the lock that
+ * followed it), was dismissed with `CSAM_CLEARED_RESOLUTION` — what `clearSuspectedCsam` writes.
+ */
+async function detectionCleared(
+  db: BackgroundContext["db"],
+  detection: PhotoDnaDetection,
+  nodeId: string,
+): Promise<boolean> {
+  if ((await blocklist.lookup(db, detection.sha256))?.reason === "csam") return false;
+  if (!detection.recordedAt) return false;
+  const [row] = await db
+    .select({ id: reports.id })
+    .from(reports)
+    .where(
+      and(
+        eq(reports.nodeId, nodeId),
+        eq(reports.category, "csam"),
+        eq(reports.status, "dismissed"),
+        eq(reports.resolution, CSAM_CLEARED_RESOLUTION),
+        gte(reports.createdAt, detection.recordedAt),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
 }
 
 /**
@@ -284,6 +523,14 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
 
   const node = await findByR2Key(bg.db, scan.key);
   if (!node) {
+    // An OWED PhotoDNA detection on the key (its verdict's transaction never committed, and the
+    // file is gone since): preserved — or recorded and the operators told — never acked as an orphan.
+    const owed = await owedDetection(bg.db, scan.key);
+    if (owed) {
+      await preserveDetection(bg, scan.key, { id: owed.fileId, createdBy: owed.uploaderId }, owed);
+      message.ack();
+      return;
+    }
     const reference = await keyReference(bg.db, scan.key);
     if (reference?.kind === "upload") {
       // The event beat the upload's commit (S8: every time), or a single PUT whose complete has
@@ -390,6 +637,15 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
   }
   const node = await findByR2Key(bg.db, scan.key);
   if (!node) {
+    // An OWED PhotoDNA detection on the key: preserved (or recorded, the operators told) — never
+    // acked as no_node.
+    const owed = await owedDetection(bg.db, scan.key);
+    if (owed) {
+      await preserveDetection(bg, scan.key, { id: owed.fileId, createdBy: owed.uploaderId }, owed);
+      bg.metric("scan", { outcome: "dlq", reason: "photodna_owed" });
+      message.ack();
+      return;
+    }
     // An abandoned single PUT, a superseded or deleted key: not a fault (ruling S8-a).
     bg.metric("scan", { outcome: "dlq", reason: "no_node" });
     message.ack();
@@ -403,6 +659,20 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
   const staleAt = Date.now() - SCAN_CLAIM_STALE_MINUTES * 60_000;
   if (job?.status === "running" && job.startedAt.getTime() >= staleAt) {
     message.retry({ delaySeconds: DLQ_RUNNING_RETRY_SEC });
+    return;
+  }
+  // The node's hash was VERIFIED by a scan (`scannedAt`: `recordScan` writes the server hash with
+  // it) and is listed csam — a PhotoDNA match whose lock kept failing lists it in its verdict's
+  // transaction: the CSAM lock, never `error`. A lock that fails here too throws: the dead letter
+  // is retried, the node left as it is (in the end the pending-scan sweep sends it again).
+  if (
+    node.scannedAt !== null &&
+    node.sha256 !== null &&
+    (await blocklist.lookup(bg.db, node.sha256))?.reason === "csam"
+  ) {
+    await lockSuspectedCsam(bg, node.id, { source: "system" });
+    bg.metric("scan", { outcome: "dlq", reason: "csam_locked" });
+    message.ack();
     return;
   }
   const requeuedBefore = (job?.verdict as Record<string, unknown> | null)?.requeuedFromDlq === true;

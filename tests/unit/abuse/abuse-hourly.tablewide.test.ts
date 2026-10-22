@@ -70,6 +70,7 @@ function only(...keep: Array<keyof typeof parts>) {
     sweepCsamAlerts: async () => ({ checked: 0, alerted: 0, recorded: 0 }),
     sweepUnrecordedCsamLocks: async () => ({ checked: 0, completed: 0, repeated: 0, skipped: 0, failed: 0 }),
     sweepOwedNodes: async () => ({ checked: 0, locked: 0, refused: 0, stale: 0, skipped: 0, failed: 0 }),
+    sweepOwedDetections: async () => ({ checked: 0, preserved: 0, locked: 0, failed: 0 }),
     sweepStrikeThresholds: async () => ({ checked: 0, suspended: 0, failed: 0 }),
     sweepPendingScans: async () => ({ checked: 0, requeued: 0 }),
     reportAnomalies: async () => [],
