@@ -3,7 +3,7 @@
 // link — in every template; and no class of mail can use up, or slip past, another's count.
 import { env } from "cloudflare:workers";
 import { sql } from "drizzle-orm";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as ledger from "../../../src/worker/db/queries/email-ledger";
 import {
   ACTOR_CAPS,
@@ -69,6 +69,32 @@ import {
 // for tests that do one thing; on a slow or busy machine (a CI runner) these need room. The
 // assertions are what they are — only the clock is generous.
 vi.setConfig({ testTimeout: 30_000 });
+
+// The ledger's windows are the UTC hour (`date_trunc('hour', now(), 'UTC')`): a test that sends mail
+// across :00 has its counts split between two windows and its caps start over, so what it asserts
+// about "this hour" is false through no fault of the code (a full run that started at 21:59:43 failed
+// N5 this way). A test never starts in the last 40 s of an hour — it waits for the next one, the one
+// real event it is waiting on — and a test is at most 30 s long.
+/** How long to wait before a test may start: until the next hour, if fewer than 40 s of this one are left. */
+function msUntilSafeStart(now: number): number {
+  const msLeft = 3_600_000 - (now % 3_600_000);
+  return msLeft < 40_000 ? msLeft + 500 : 0;
+}
+beforeEach(async () => {
+  const wait = msUntilSafeStart(Date.now());
+  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+}, 60_000);
+
+describe("the hour-boundary guard", () => {
+  it("waits out the last 40 s of a UTC hour and never otherwise", () => {
+    const at = (minute: number, second: number) => Date.UTC(2026, 9, 22, 21, minute, second);
+    expect(msUntilSafeStart(at(59, 43))).toBe(17_500);
+    expect(msUntilSafeStart(at(59, 59))).toBe(1_500);
+    expect(msUntilSafeStart(at(59, 20))).toBe(0);
+    expect(msUntilSafeStart(at(0, 0))).toBe(0);
+    expect(msUntilSafeStart(at(30, 0))).toBe(0);
+  });
+});
 
 vi.mock("../../../src/worker/db/queries/email-ledger", async (original) => {
   const real = await original<typeof import("../../../src/worker/db/queries/email-ledger")>();
