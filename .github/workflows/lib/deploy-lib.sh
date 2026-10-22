@@ -609,10 +609,13 @@ cmd_cvd_cache() {
       (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/$f" --file "$dir/$f" --content-type application/octet-stream --remote) >/dev/null ||
         fail "cvd-cache: could not write $f back to the cache"
     done
-    printf '%s' "$now" >"$dir/.fetched-at"
-    (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/fetched-at" --file "$dir/.fetched-at" --content-type text/plain --remote) >/dev/null ||
-      fail "cvd-cache: could not write the cache's timestamp"
-    rm -f "$dir/.fetched-at"
+    # Not inside $dir: freshclam's container leaves it owned by root on the runner (Permission denied).
+    local stampfile
+    stampfile="$(mktemp)"
+    printf '%s' "$now" >"$stampfile"
+    (cd "$repo_root" && npx wrangler r2 object put "$CVD_BUCKET/$CVD_PREFIX/fetched-at" --file "$stampfile" --content-type text/plain --remote) >/dev/null ||
+      { rm -f "$stampfile"; fail "cvd-cache: could not write the cache's timestamp"; }
+    rm -f "$stampfile"
   fi
   for f in $CVD_FILES; do [ -s "$dir/$f" ] || fail "cvd-cache: $f is empty"; done
   echo "cvd-cache: OK ($(du -sh "$dir" | cut -f1) in containers/clamav/cvd)"
