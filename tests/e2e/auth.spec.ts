@@ -34,6 +34,16 @@ import {
 import { readVars } from "../setup/e2e-preflight";
 import { localDbName, localDbUrl } from "../setup/local-env";
 import { expect, latestMailTo, linksIn, stubTurnstile, test } from "./fixtures";
+import { addressFor } from "./fixtures/address";
+
+/**
+ * A client address of this test's own, one per `role` within the test (review: a literal shared by
+ * both projects' runs of a test — or by two tests — shares their limiter buckets; T28 Addendum 3).
+ */
+const own = (role: string) => {
+  const info = test.info();
+  return addressFor(`${info.project.name}|${info.testId}|${info.retry}|${role}`);
+};
 
 const run = promisify(execFile);
 
@@ -393,7 +403,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
 
     // The owner opens the mailed link in THEIR browser: a page of ours, and nothing has happened.
-    const owner = await otherBrowser(browser, origins.app, "10.99.1.1");
+    const owner = await otherBrowser(browser, origins.app, own("1.1"));
     await owner.goto(link);
     await expect(owner.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
     // Nobody is signed in, the token is not left in the address bar, and the GET changed nothing.
@@ -412,19 +422,19 @@ test.describe("the verification link, opened in a browser that did not sign up",
     expect((await userRow(email))?.email_verified).toBe(true);
     // The stranger's password opens nothing — from the stranger's own browser or anywhere.
     const outsider = await playwright.request.newContext({ baseURL: origins.app });
-    expect(await passwordOpens(outsider, origins.app, "10.99.1.2", email, FIXTURE_PASSWORD)).toBe(401);
+    expect(await passwordOpens(outsider, origins.app, own("1.2"), email, FIXTURE_PASSWORD)).toBe(401);
     expect(await passwordOpens(page.request, origins.app, clientIp, email, FIXTURE_PASSWORD)).toBe(401);
     await fillSignIn(owner, email, NEW_PASSWORD);
     await expectSignedIn(owner);
     expect((await sessionOf(owner.request))?.user).toMatchObject({ email, emailVerified: true });
 
     // The link again, from a third browser: "confirmed, sign in" — and no session.
-    const third = await otherBrowser(browser, origins.app, "10.99.1.3");
+    const third = await otherBrowser(browser, origins.app, own("1.3"));
     await third.goto(link);
     await expectSignInScreen(third);
     await expect(third.getByText("Email confirmed. Sign in to continue.")).toBeVisible();
     expect(await sessionOf(third.request)).toBeNull();
-    expect(await passwordOpens(outsider, origins.app, "10.99.1.4", email, FIXTURE_PASSWORD)).toBe(401);
+    expect(await passwordOpens(outsider, origins.app, own("1.4"), email, FIXTURE_PASSWORD)).toBe(401);
     await outsider.dispose();
     await owner.context().close();
     await third.context().close();
@@ -452,13 +462,13 @@ test.describe("the verification link, opened in a browser that did not sign up",
     const scanner = await playwright.request.newContext({ baseURL: origins.app });
     const fetched = await scanner.get(link, {
       maxRedirects: 0,
-      headers: { "cf-connecting-ip": "10.99.2.1" },
+      headers: { "cf-connecting-ip": own("2.1") },
     });
     expect(fetched.status()).toBe(302);
     expect(fetched.headers()["location"]).toContain("/set-password#token=");
-    expect((await scanner.get(link, { headers: { "cf-connecting-ip": "10.99.2.1" } })).status()).toBe(200);
+    expect((await scanner.get(link, { headers: { "cf-connecting-ip": own("2.1") } })).status()).toBe(200);
     await scanner.dispose();
-    const sandbox = await otherBrowser(browser, origins.app, "10.99.2.2");
+    const sandbox = await otherBrowser(browser, origins.app, own("2.2"));
     await sandbox.goto(link);
     await expect(sandbox.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
     await sandbox.context().close();
@@ -470,7 +480,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     expect((await sessionOf(page.request))?.user).toMatchObject({ email, emailVerified: true });
     // …and the password they chose at sign-up is the account's password.
     const elsewhere = await playwright.request.newContext({ baseURL: origins.app });
-    expect(await passwordOpens(elsewhere, origins.app, "10.99.2.3", email, FIXTURE_PASSWORD)).toBe(200);
+    expect(await passwordOpens(elsewhere, origins.app, own("2.3"), email, FIXTURE_PASSWORD)).toBe(200);
     await elsewhere.dispose();
   });
 
@@ -490,7 +500,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     const link = new URL(await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email"));
     const good = link.searchParams.get("token")!;
 
-    const other = await otherBrowser(browser, origins.app, "10.99.2.1");
+    const other = await otherBrowser(browser, origins.app, own("2.1"));
     // Tampered: the same token with its signature changed.
     link.searchParams.set("token", `${good.slice(0, -4)}${good.endsWith("AAAA") ? "BBBB" : "AAAA"}`);
     await other.goto(link.toString());
@@ -540,7 +550,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     expect(signUp.status()).toBe(200);
     const link = await linkFromMail(email, "Confirm your email address", "/api/auth/verify-email");
 
-    const admin = await otherBrowser(browser, origins.app, "10.99.3.1");
+    const admin = await otherBrowser(browser, origins.app, own("3.1"));
     await admin.goto(link);
     await expect(admin.getByRole("heading", { name: CONFIRM_TITLE })).toBeVisible();
     // The click changed nothing.
@@ -1032,7 +1042,7 @@ test.describe("changing the address of a verified account", () => {
     // Opened in ANOTHER browser, signed in to nothing (the owner's phone — or a scanner's sandbox).
     const context = await browser.newContext();
     await context.route(`${origins.app}/**`, (route) =>
-      route.continue({ headers: { ...route.request().headers(), "cf-connecting-ip": "10.99.7.1" } }),
+      route.continue({ headers: { ...route.request().headers(), "cf-connecting-ip": own("7.1") } }),
     );
     const other = await context.newPage();
     await stubTurnstile(other);
