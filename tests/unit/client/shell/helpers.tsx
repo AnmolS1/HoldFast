@@ -3,7 +3,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { render, type RenderResult } from "@testing-library/react";
 import type { ReactElement, ReactNode } from "react";
 import { createMemoryRouter, RouterProvider, type RouteObject } from "react-router";
-import { afterEach, beforeEach, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, vi } from "vitest";
 import { resetBreadcrumbsForTests } from "../../../../src/client/components/Breadcrumbs";
 import { resetCommandsForTests } from "../../../../src/client/components/CommandPalette";
 import { resetDetailsPanelForTests } from "../../../../src/client/components/DetailsPanel";
@@ -20,6 +20,8 @@ import {
   resetIdentityForTests,
   sessionQuery,
 } from "../../../../src/client/lib/query";
+import { featureRoutes, publicRoutes } from "../../../../src/client/features";
+import type { LazyPage } from "../../../../src/client/features/lazy-page";
 import { connectRouter } from "../../../../src/client/router";
 import { closeShortcuts } from "../../../../src/client/routes/help";
 import { HoldfastThemeProvider } from "../../../../src/client/theme";
@@ -318,8 +320,23 @@ export async function flush(ms = 0): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Load every page that is a lazy chunk (src/client/features/lazy-page.tsx) before the tests, so a
+ * test renders it at once, as when the pages were part of the main bundle. Not the admin console:
+ * tests/unit/client/shell/admin-chunk.test.tsx proves who loads that one.
+ */
+export async function preloadPages(): Promise<void> {
+  const pages = [...featureRoutes, ...publicRoutes]
+    .filter((route) => !route.path?.startsWith("admin"))
+    .map((route) => (route.element as ReactElement<unknown, LazyPage> | undefined)?.type)
+    .filter((type): type is LazyPage => typeof type === "function" && "preload" in type);
+  await Promise.all(pages.map((page) => page.preload()));
+}
+
 /** Call once at the top of a test file: installs the stubs and resets every store between tests. */
 export function setupShell(): void {
+  // A cold import of the pages can take seconds on a CI runner; it is paid here, not in a test.
+  beforeAll(preloadPages, 60_000);
   beforeEach(() => {
     installMatchMedia();
     installObservers();

@@ -1,6 +1,9 @@
 import type { RouteObject } from "react-router";
 import { t } from "../../lib/i18n";
-import { TrashPage } from "./TrashPage";
+import { lazyPage } from "../lazy-page";
+
+// Its own chunk (../lazy-page.tsx).
+const TrashPage = lazyPage(() => import("./TrashPage"), "TrashPage");
 
 export const routes: RouteObject[] = [
   {

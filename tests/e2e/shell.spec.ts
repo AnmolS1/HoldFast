@@ -350,6 +350,22 @@ test.describe("navigation", () => {
     await expect(page.locator("[data-admin-page]")).toHaveCount(0);
   });
 
+  // The console's code is not even downloaded for them: no request for any admin module but the
+  // route table (dev serves modules by source path; a build names the chunk AdminConsole-<hash>).
+  // The admin's deep-link test above is the other side: there the console loads and renders.
+  test("a non-admin asking for /admin never downloads the admin console", async ({ page, origins }) => {
+    const adminCode = /\/features\/admin\/(?!routes\.tsx)|\/assets\/AdminConsole-/;
+    const fetched: string[] = [];
+    page.on("request", (request) => {
+      if (adminCode.test(new URL(request.url()).pathname)) fetched.push(request.url());
+    });
+    await mockShell(page, origins.port);
+    await page.goto("/admin/users");
+    await expect(notFound(page)).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    expect(fetched).toEqual([]);
+  });
+
   test("the breakpoint flips at 1024: 1023 is mobile, 1024 is desktop", async ({ page, origins }) => {
     await mockShell(page, origins.port);
     await page.setViewportSize({ width: 1023, height: 800 });
