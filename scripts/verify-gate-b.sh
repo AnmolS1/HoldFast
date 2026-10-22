@@ -6,6 +6,11 @@
 #   bash scripts/verify-gate-b.sh --self-test      # every evaluator gives the right verdict on made-up input
 #   bash scripts/verify-gate-b.sh --local-only     # the file checks only; never a gate result (exit 3)
 #   … [--plan DIR]                                 # the plan directory (default: the main checkout's holdfast-plan/)
+#   … [--agent-file FILE]                          # the DMCA agent file (default: src/client/features/dmca/agent.ts; tests)
+#
+# HOLDFAST_GATE_B_FAKE=<dir> (unit tests only) runs NO remote command: each one's output comes from
+# <dir>/<key>.out (see `remote` below). Such a run prints "FAKE RUNNER" and, all green, exits 4 —
+# never 0. Every remote check prints, under its verdict, exactly the command(s) it ran ("ran: …").
 #
 # EVERY check runs, whatever the others did, and prints one line: PASS or FAIL, its id, who owns
 # it, and what it compared. The gate exits 0 only when every check of the mode ran and passed; a
@@ -181,6 +186,22 @@ eval_health_config() { # <body of GET /api/health>
   [ "$ok" = "true" ] && [ "$config" = "true" ] ||
     { echo "health: ok='$ok' config='$config', expected both true" && return 1; }
   echo "health: ok and config are true"
+}
+
+eval_files_host() { # <headers of GET <files origin>/ (curl -D -)> — the bare files host (T26 §3)
+  local file="$1" status ctype
+  status="$(grep -E '^HTTP/' "$file" 2>/dev/null | tail -n 1 | tr -d '\r' | awk '{ print $2 }')"
+  [ -n "$status" ] || { echo "no HTTP answer captured" && return 1; }
+  if grep -qi '^cf-mitigated:' "$file"; then
+    echo "Cloudflare challenged the request before the Worker ran (cf-mitigated): NOT checked — Bot Fight Mode on the files zone (deploy-lib files-host)"
+    return 1
+  fi
+  ctype="$(grep -i '^content-type:' "$file" | tail -n 1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')"
+  if [ "$status" != "404" ] || [[ "$ctype" != text/plain* ]] || grep -qi '^set-cookie:' "$file"; then
+    echo "answered $status, content-type '${ctype:-none}'$(grep -qi '^set-cookie:' "$file" && echo ', with a cookie'); expected 404 text/plain and no cookie"
+    return 1
+  fi
+  echo "404, $ctype, no cookie"
 }
 
 eval_secrets() { # <file with `wrangler secret list --format json`>
@@ -464,6 +485,18 @@ self_test() {
   expect fail "ok false" eval_health_config "$tmp/health-down.json"
   expect fail "empty answer" eval_health_config "$tmp/meta-empty.json"
 
+  echo "files host:"
+  printf 'HTTP/2 404\r\ncontent-type: text/plain; charset=utf-8\r\nserver: cloudflare\r\n\r\n' >"$tmp/fh-ok.txt"
+  printf 'HTTP/2 200\r\ncontent-type: text/html\r\n\r\n' >"$tmp/fh-html.txt"
+  printf 'HTTP/2 404\r\ncontent-type: text/plain\r\nset-cookie: a=b\r\n\r\n' >"$tmp/fh-cookie.txt"
+  printf 'HTTP/2 403\r\ncf-mitigated: challenge\r\ncontent-type: text/html\r\n\r\n' >"$tmp/fh-challenge.txt"
+  : >"$tmp/fh-none.txt"
+  expect pass "404 text/plain, no cookie" eval_files_host "$tmp/fh-ok.txt"
+  expect fail "an HTML page" eval_files_host "$tmp/fh-html.txt"
+  expect fail "a cookie" eval_files_host "$tmp/fh-cookie.txt"
+  expect fail "an edge challenge (not checked is not a pass)" eval_files_host "$tmp/fh-challenge.txt"
+  expect fail "no answer" eval_files_host "$tmp/fh-none.txt"
+
   echo "secrets (ten names):"
   local names
   names="$(printf '"%s",' $REQUIRED_SECRETS)"
@@ -592,10 +625,13 @@ NODE
 # ── the gate: every check runs; a summary at the end ─────────────────────────────────────────────
 ran=0
 failed_ids=""
+current_check=""
 
 check() { # <id> <owner> <command...> — runs it, prints PASS/FAIL with its reason, never stops the gate
   local id="$1" owner="$2" out rc
   shift 2
+  current_check="$id"
+  : >"$tmpdir/ran.$id"
   out="$("$@" 2>&1)" && rc=0 || rc=$?
   ran=$((ran + 1))
   local first rest
@@ -608,6 +644,8 @@ check() { # <id> <owner> <command...> — runs it, prints PASS/FAIL with its rea
     failed_ids="$failed_ids $id"
   fi
   [ -z "$rest" ] || printf '%s\n' "$rest" | sed 's/^/      /'
+  # Exactly what the check ran, after its verdict.
+  [ ! -s "$tmpdir/ran.$id" ] || sed 's/^/      ran: /' "$tmpdir/ran.$id"
 }
 
 bookkeeping_verdict() { # <ran> <failed count> <expected>
@@ -623,7 +661,7 @@ resolve_plan() {
 
 local_checks() {
   check legal-files "HUMAN/T29" eval_legal_files "$plan_dir"
-  check dmca-agent-page "HUMAN/T29 §B" eval_agent "$root/$AGENT_FILE"
+  check dmca-agent-page "HUMAN/T29 §B" eval_agent "$agent_file"
   check dmca-registered "HUMAN/T29 §B.1" eval_dmca_registered "$plan_dir/legal/gate-b-legal.md"
   check dmca-procedure "HUMAN/T29 §B.3" eval_adopted "$plan_dir/legal/dmca-procedure.md"
   check csam-procedure "HUMAN/T29 §C.1" eval_adopted "$plan_dir/legal/csam-procedure.md"
@@ -633,46 +671,77 @@ local_checks() {
 LOCAL_CHECKS=7
 
 # ── remote checks (read-only) ──
+#
+# EVERY remote command goes through `remote`. It records the exact command (printed under the
+# check's verdict as "ran: …") and runs it in the repository root. With HOLDFAST_GATE_B_FAKE=<dir>
+# (the unit tests: tests/unit/harness/node/verify-gate-b.test.ts) NOTHING runs: the command's output
+# is <dir>/<key>.out, its exit status <dir>/<key>.rc (default 0), and a file the command would have
+# written is copied from <dir>/<key>.writes. A key with no fixture is exit 127 — never a silent pass.
+remote() { # <key> [--writes <path>] <command...>
+  local key="$1" writes="" status
+  shift
+  if [ "${1:-}" = "--writes" ]; then
+    writes="$2"
+    shift 2
+  fi
+  { printf '%q ' "$@" | sed 's/ $//'; echo; } >>"$tmpdir/ran.$current_check"
+  if [ -n "${HOLDFAST_GATE_B_FAKE:-}" ]; then
+    local f="$HOLDFAST_GATE_B_FAKE/$key"
+    if [ ! -e "$f.out" ] && [ ! -e "$f.rc" ] && [ ! -e "$f.writes" ]; then
+      echo "fake runner: no fixture for '$key'" >&2
+      return 127
+    fi
+    if [ -n "$writes" ] && [ -f "$f.writes" ]; then cp "$f.writes" "$writes"; fi
+    if [ -f "$f.out" ]; then cat "$f.out"; fi
+    status="$(cat "$f.rc" 2>/dev/null || echo 0)"
+    return "$status"
+  fi
+  (cd "$root" && "$@")
+}
+
 check_ponderance() {
-  local d="$tmpdir/ponderance" p
+  local d="$tmpdir/ponderance"
   mkdir -p "$d"
-  for p in privacy terms; do curl -fsS --max-time 20 "$PONDERANCE/$p" >"$d/$p.html" 2>/dev/null || : >"$d/$p.html"; done
-  curl -fsS --max-time 20 "$PONDERANCE/support/holdfast" >"$d/support.html" 2>/dev/null || : >"$d/support.html"
+  remote ponderance-privacy curl -fsS --max-time 20 "$PONDERANCE/privacy" >"$d/privacy.html" 2>/dev/null || : >"$d/privacy.html"
+  remote ponderance-terms curl -fsS --max-time 20 "$PONDERANCE/terms" >"$d/terms.html" 2>/dev/null || : >"$d/terms.html"
+  remote ponderance-support curl -fsS --max-time 20 "$PONDERANCE/support/holdfast" >"$d/support.html" 2>/dev/null || : >"$d/support.html"
   eval_ponderance "$d"
 }
 
+# The head of origin/<branch>, read with `git ls-remote` (read-only; nothing fetched).
+branch_head() {
+  remote branch-head git ls-remote origin "refs/heads/$branch" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
 check_stamp() {
-  git -C "$root" fetch --quiet origin "$branch" 2>/dev/null || { echo "could not fetch origin/$branch" && return 1; }
-  branch_sha="$(git -C "$root" rev-parse "origin/$branch")"
-  curl -sS --max-time 15 -H 'cache-control: no-cache' "$app_url/__meta" >"$tmpdir/meta.json" 2>/dev/null || : >"$tmpdir/meta.json"
-  eval_meta "$tmpdir/meta.json" "$branch_sha" | sed "s|^|$app_url/__meta: |; s|expected '|origin/$branch '|"
+  local sha
+  sha="$(branch_head)"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "could not read the head of origin/$branch" && return 1; }
+  remote meta curl -sS --max-time 15 -H 'cache-control: no-cache' "$app_url/__meta" >"$tmpdir/meta.json" 2>/dev/null || : >"$tmpdir/meta.json"
+  eval_meta "$tmpdir/meta.json" "$sha" | sed "s|^|$app_url/__meta: |; s|expected '|origin/$branch '|"
   return "${PIPESTATUS[0]}"
 }
 
 check_health() {
-  curl -sS --max-time 15 "$app_url/api/health" >"$tmpdir/health.json" 2>/dev/null || : >"$tmpdir/health.json"
+  remote health curl -sS --max-time 15 "$app_url/api/health" >"$tmpdir/health.json" 2>/dev/null || : >"$tmpdir/health.json"
   eval_health_config "$tmpdir/health.json"
 }
 
 check_files_host() {
-  local out rc=0
-  out="$(bash "$lib" files-host "$files_url/" 2>&1)" || rc=$?
-  if [ "$rc" = "0" ]; then echo "$files_url/ → 404 text/plain, no cookie (deploy-lib files-host)"; else
-    echo "deploy-lib files-host refused $files_url/:"
-    printf '%s\n' "$out" | grep -v -E 'postgres(ql)?://' | tail -n 8
-  fi
-  return "$rc"
+  remote files-host curl -sS --max-time 15 -D - -o /dev/null "$files_url/" >"$tmpdir/files-host.headers" 2>/dev/null || : >"$tmpdir/files-host.headers"
+  eval_files_host "$tmpdir/files-host.headers" | sed "1s|^|$files_url/: |"
+  return "${PIPESTATUS[0]}"
 }
 
 check_secrets() {
-  (cd "$root" && npx wrangler secret list --name "$worker" --format json) >"$tmpdir/secrets.json" 2>/dev/null || : >"$tmpdir/secrets.json"
+  # Names only: `wrangler secret list` never returns values, and only `.name` is read.
+  remote secrets npx wrangler secret list --name "$worker" --format json >"$tmpdir/secrets.json" 2>/dev/null || : >"$tmpdir/secrets.json"
   eval_secrets "$tmpdir/secrets.json" | sed "s|^|$worker: |"
   return "${PIPESTATUS[0]}"
 }
 
-hyperdrive_one() { # <dev|production>
-  local env="$1" id
-  id="$(node -e '
+hyperdrive_id() { # <dev|production> — from wrangler.jsonc
+  node -e '
     // JSONC: comments removed outside strings (a URL keeps its "//"), then trailing commas.
     const src = require("fs").readFileSync(process.argv[1], "utf8");
     let out = "", inString = false;
@@ -689,24 +758,32 @@ hyperdrive_one() { # <dev|production>
     }
     const cfg = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
     const block = process.argv[2] === "production" ? cfg.env.production : cfg;
-    process.stdout.write(String(block.hyperdrive?.[0]?.id ?? ""));' "$root/wrangler.jsonc" "$env" 2>/dev/null)" || id=""
+    process.stdout.write(String(block.hyperdrive?.[0]?.id ?? ""));' "$root/wrangler.jsonc" "$1" 2>/dev/null
+}
+
+hyperdrive_one() { # <dev|production>
+  local env="$1" id
+  id="$(hyperdrive_id "$env")" || id=""
   [ -n "$id" ] || { echo "no Hyperdrive id for $env in wrangler.jsonc" && return 1; }
   # `hyperdrive get` prints connection details: kept in a file, only `.caching` is read.
-  (cd "$root" && npx wrangler hyperdrive get "$id") >"$tmpdir/hyperdrive-$env.txt" 2>/dev/null || : >"$tmpdir/hyperdrive-$env.txt"
+  remote "hyperdrive-$env" npx wrangler hyperdrive get "$id" >"$tmpdir/hyperdrive-$env.txt" 2>/dev/null || : >"$tmpdir/hyperdrive-$env.txt"
   eval_hyperdrive "$tmpdir/hyperdrive-$env.txt" | sed "s|^|$env config $id: |"
   return "${PIPESTATUS[0]}"
 }
 
 # Dev: the dev config. Production: BOTH configs (T30 step 9 — "the dev config is asserted the same way").
 check_hyperdrive() {
-  local rc=0
-  [ "$env_name" = "production" ] && { hyperdrive_one production || rc=1; }
+  local rc=0 out
+  if [ "$env_name" = "production" ]; then
+    out="$(hyperdrive_one production)" || rc=1
+    printf '%s; ' "$out"
+  fi
   hyperdrive_one dev || rc=1
   return "$rc"
 }
 
 check_notification() {
-  (cd "$root" && npx wrangler r2 bucket notification list "$bucket") >"$tmpdir/notification.txt" 2>/dev/null || : >"$tmpdir/notification.txt"
+  remote r2-rule npx wrangler r2 bucket notification list "$bucket" >"$tmpdir/notification.txt" 2>/dev/null || : >"$tmpdir/notification.txt"
   eval_notification "$tmpdir/notification.txt" "$queue" | sed "1s|^|$bucket: |"
   return "${PIPESTATUS[0]}"
 }
@@ -714,11 +791,11 @@ check_notification() {
 check_probe() { eval_probe "$plan_dir/gate-b-report.md"; }
 
 check_headers() {
-  local d="$tmpdir/headers" slug url
+  local d="$tmpdir/headers" pair slug
   mkdir -p "$d"
-  for slug in app-root:"$app_url/" app-health:"$app_url/api/health" app-share:"$app_url/s/x" files-root:"$files_url/" files-d:"$files_url/d/abc/def"; do
-    url="${slug#*:}"
-    curl -sS --max-time 15 -D "$d/${slug%%:*}.headers" -o /dev/null "$url" 2>/dev/null || rm -f "$d/${slug%%:*}.headers"
+  for pair in app-root:"$app_url/" app-health:"$app_url/api/health" app-share:"$app_url/s/x" files-root:"$files_url/" files-d:"$files_url/d/abc/def"; do
+    slug="${pair%%:*}"
+    remote "headers-$slug" curl -sS --max-time 15 -D - -o /dev/null "${pair#*:}" >"$d/$slug.headers" 2>/dev/null || rm -f "$d/$slug.headers"
   done
   eval_headers "$root/$HEADER_SNAPSHOT" "$d" "$app_url" "$files_url"
 }
@@ -726,30 +803,34 @@ check_headers() {
 check_prod_safe() {
   local rc=0
   [ -f "$root/$DMCA_SPEC" ] || { echo "$DMCA_SPEC missing" && return 1; }
-  (cd "$root" && HOLDFAST_E2E_BASE_URL="$app_url" HOLDFAST_E2E_FAIL_ON_SKIP=1 PLAYWRIGHT_JSON_OUTPUT_FILE="$tmpdir/pw.json" \
-    npx playwright test --grep @prod-safe --reporter="list,json,./tests/e2e/fixtures/skip-reporter.ts") >"$tmpdir/pw.log" 2>&1 || rc=$?
+  remote prod-safe --writes "$tmpdir/pw.json" env HOLDFAST_E2E_BASE_URL="$app_url" HOLDFAST_E2E_FAIL_ON_SKIP=1 \
+    PLAYWRIGHT_JSON_OUTPUT_FILE="$tmpdir/pw.json" npx playwright test --grep @prod-safe \
+    --reporter=list,json,./tests/e2e/fixtures/skip-reporter.ts >"$tmpdir/pw.log" 2>&1 || rc=$?
   eval_playwright "$tmpdir/pw.json" "$rc" || { grep -E 'skip|SKIP' "$tmpdir/pw.log" | grep -v '^\s*$' | head -n 8 | sed 's/^/   | /'; return 1; }
 }
 
 check_backup() {
-  local schema day d found=""
+  local schema i day d found=""
   schema="$(ls "$root"/drizzle/meta/*_snapshot.json 2>/dev/null | sort | tail -n 1)"
   [ -n "$schema" ] || { echo "no drizzle snapshot to read the table list from" && return 1; }
-  # Today's set, or — before today's 02:00 UTC run has written it — yesterday's.
-  for day in "$(date -u +%Y-%m-%d)" "$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u -d yesterday +%Y-%m-%d)"; do
-    d="$tmpdir/manifest-$day.json"
-    (cd "$root" && npx wrangler r2 object get "$bucket/b/db/$day/_manifest.json" --remote --pipe) >"$d" 2>/dev/null || : >"$d"
+  # Today's set (key manifest-0), or — before today's 02:00 UTC run has written it — yesterday's (manifest-1).
+  for i in 0 1; do
+    if [ "$i" = 0 ]; then day="$(date -u +%Y-%m-%d)"; else day="$(date -u -v-1d +%Y-%m-%d 2>/dev/null || date -u -d yesterday +%Y-%m-%d)"; fi
+    d="$tmpdir/manifest-$i.json"
+    remote "manifest-$i" npx wrangler r2 object get "$bucket/b/db/$day/_manifest.json" --remote --pipe >"$d" 2>/dev/null || : >"$d"
     if json_tail <"$d" | jq -e '.tables' >/dev/null 2>&1; then found="$day" && break; fi
   done
   [ -n "$found" ] || { echo "no _manifest.json for today or yesterday in $bucket/b/db/ (trigger T25's backup job, or wait for 02:00 UTC)" && return 1; }
-  eval_manifest "$tmpdir/manifest-$found.json" "$schema" "$found"
+  eval_manifest "$d" "$schema" "$found"
 }
 
 check_ci() {
-  [ -n "${branch_sha:-}" ] || branch_sha="$(git -C "$root" rev-parse "origin/$branch" 2>/dev/null)"
-  (cd "$root" && gh run list --workflow "$workflow" --branch "$branch" --limit 40 --json headSha,status,conclusion,databaseId) >"$tmpdir/runs.json" 2>/dev/null ||
+  local sha
+  sha="$(branch_head)"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "could not read the head of origin/$branch" && return 1; }
+  remote ci-runs gh run list --workflow "$workflow" --branch "$branch" --limit 40 --json headSha,status,conclusion,databaseId >"$tmpdir/runs.json" 2>/dev/null ||
     { echo "'gh run list --workflow $workflow' failed" && return 1; }
-  eval_run "$tmpdir/runs.json" "$branch_sha" | sed "s|^|$workflow on $branch: |"
+  eval_run "$tmpdir/runs.json" "$sha" | sed "s|^|$workflow on $branch: |"
   return "${PIPESTATUS[0]}"
 }
 
@@ -761,23 +842,26 @@ remote_checks() {
   check secrets "T30 §5 / T27" check_secrets
   check hyperdrive "infra" check_hyperdrive
   check r2-rule "T30 §7" check_notification
-  [ "$env_name" = "production" ] && check r2-probe "T30 §7 evidence" check_probe
+  if [ "$env_name" = "production" ]; then check r2-probe "T30 §7 evidence" check_probe; fi
   check headers "T26 snapshot" check_headers
   check prod-safe-e2e "T28/T29 §B" check_prod_safe
   check backup-manifest "T27/T25" check_backup
   check ci-run "CI" check_ci
 }
+REMOTE_CHECKS=11
 
 gate() {
   tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-gate-b.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmpdir'" EXIT
-  local tool missing=""
-  for tool in git jq curl node npx gh; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
+  local tool tools="jq node" missing=""
+  [ -n "${HOLDFAST_GATE_B_FAKE:-}" ] || tools="git jq curl node npx gh"
+  for tool in $tools; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
   if [ -n "$missing" ]; then echo "verify-gate-b: missing tools:$missing" >&2 && exit 1; fi
 
   echo "Gate B against $env_name ($app_url, $files_url); plan directory $plan_dir"
-  local expected=$((LOCAL_CHECKS + 11))
+  [ -z "${HOLDFAST_GATE_B_FAKE:-}" ] || echo "FAKE RUNNER: no command runs; outputs from $HOLDFAST_GATE_B_FAKE (tests only — never a gate result)"
+  local expected=$((LOCAL_CHECKS + REMOTE_CHECKS))
   [ "$env_name" = "production" ] && expected=$((expected + 1))
   local_checks
   remote_checks
@@ -785,6 +869,11 @@ gate() {
   nfail="$(printf '%s' "$failed_ids" | wc -w | tr -d ' ')"
   echo "──"
   if bookkeeping_verdict "$ran" "$nfail" "$expected"; then
+    if [ -n "${HOLDFAST_GATE_B_FAKE:-}" ]; then
+      # Deliberately not 0: a run on faked outputs must never be read as the gate.
+      echo "GATE B ($env_name): every check passed ON FAKED OUTPUTS — $ran of $expected — this is NOT a Gate B result"
+      exit 4
+    fi
     echo "GATE B ($env_name): PASS — $ran of $expected checks ran and passed"
     echo "Not automated (evidence in gate-b-report.md): C2 abort test, load test, abuse drill, kill switches, Orrery, the HUMAN dashboard steps."
     exit 0
@@ -796,6 +885,7 @@ gate() {
 mode="gate"
 env_name="dev"
 plan_dir=""
+agent_file="$root/$AGENT_FILE"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --self-test) mode="self-test" ;;
@@ -804,6 +894,11 @@ while [ "$#" -gt 0 ]; do
     --plan)
       [ "$#" -ge 2 ] || { echo "--plan needs a directory" >&2 && exit 2; }
       plan_dir="$2"
+      shift
+      ;;
+    --agent-file)
+      [ "$#" -ge 2 ] || { echo "--agent-file needs a file" >&2 && exit 2; }
+      agent_file="$2"
       shift
       ;;
     -h | --help)
@@ -831,6 +926,9 @@ case "$mode" in
   self-test) self_test ;;
   local)
     command -v jq >/dev/null 2>&1 || { echo "jq not found" >&2 && exit 1; }
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-gate-b.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmpdir'" EXIT
     echo "Gate B local checks (files only; plan directory $plan_dir)"
     local_checks
     nfail="$(printf '%s' "$failed_ids" | wc -w | tr -d ' ')"
