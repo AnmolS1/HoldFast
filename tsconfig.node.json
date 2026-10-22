@@ -47,6 +47,7 @@
     "scripts/spikes/**",
     "scripts/seed-dev.ts",
     "scripts/create-invite.ts",
-    "scripts/create-session.ts"
+    "scripts/create-session.ts",
+    "scripts/lib/seed-session.ts"
   ]
 }

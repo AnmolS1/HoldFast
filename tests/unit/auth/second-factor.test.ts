@@ -1323,6 +1323,7 @@ describe("the only writers of secondFactorAt (source scan)", () => {
     ...import.meta.glob("../../../src/**/*.ts", { query: "?raw", import: "default", eager: true }),
     ...import.meta.glob("../../../src/**/*.tsx", { query: "?raw", import: "default", eager: true }),
     ...import.meta.glob("../../../scripts/*.ts", { query: "?raw", import: "default", eager: true }),
+    ...import.meta.glob("../../../scripts/lib/*.ts", { query: "?raw", import: "default", eager: true }),
   };
   const mentions = (pattern: RegExp) =>
     Object.entries(sources)
@@ -1341,6 +1342,9 @@ describe("the only writers of secondFactorAt (source scan)", () => {
       (line) => !line.startsWith("src/worker/auth/second-factor.ts:"),
     );
     expect(outside).toEqual([
+      // WRITE 3 (T26B SEAM 1): create-session.ts --two-factor seeds an admin's session as one that
+      // passed a code now — a script run against a database, never reachable from a request
+      "scripts/lib/seed-session.ts: secondFactorAt: options.twoFactor ? now : null,",
       // read
       "src/worker/auth/admin-gate.ts: hasSecondFactor(session.session as { secondFactorAt?: unknown });",
       // declared: not settable by any request body
