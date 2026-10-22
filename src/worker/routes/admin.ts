@@ -109,6 +109,7 @@ import {
   runBackground,
   type AppEnv,
 } from "../services/request-context";
+import { analyticsTiles } from "../services/metrics-queries";
 import { enqueueRescan } from "../services/scanning";
 import { SIGNUP_VELOCITY_DEFAULTS } from "../services/signup-policy";
 import { storage } from "../services/storage";
@@ -135,13 +136,13 @@ function requiredReason(value: string | undefined): string {
 // ── the analytics tiles (T27's import point) ────────────────────────────────────────────────
 
 /**
- * THE ANALYTICS-TILES SWAP (EXECUTION.md): the Analytics Engine tiles need T27's query module and
- * token. Until the orchestrator replaces this body at Wave-4 integration it answers
- * `{ available: false }`, and the console shows the tiles as "Unavailable".
+ * THE ANALYTICS-TILES SWAP (EXECUTION.md), done (T27B P-2): the request tiles come from T27's
+ * `analyticsTiles` (one Analytics Engine SQL request). Without the account id, the token or a
+ * known environment — or on any answer it cannot read — it is `{ available: false }`, and the
+ * console shows the tiles as "Unavailable".
  */
 export async function loadAnalyticsTiles(c: C): Promise<AnalyticsTilesDto> {
-  void c;
-  return { available: false };
+  return analyticsTiles(c.env);
 }
 
 // ── row → contract ──────────────────────────────────────────────────────────────────────────
@@ -1278,7 +1279,9 @@ function streamedRun(c: C, name: string): Response {
     const value = JSON.parse(await found.object.text()) as { attempt?: unknown };
     return typeof value.attempt === "string" ? value.attempt : null;
   };
-  const report = async () => {
+  // `echo: false` (once, before the run) only records what is already there: a call that finds
+  // the set complete, or another pass running, did not write those records.
+  const report = async (echo = true) => {
     for (const day of new Set([startDay, new Date().toISOString().slice(0, 10)])) {
       try {
         const current = await attemptOf(`b/db/${day}/_attempt.json`);
@@ -1288,10 +1291,12 @@ function streamedRun(c: C, name: string): Response {
         do {
           const page = await store.list(prefix, cursor);
           for (const object of page.objects) {
-            if (seen.has(object.key)) continue;
+            // Keyed by attempt too: a new attempt rewrites the same `_progress/<table>.json` keys.
+            const mark = `${current} ${object.key}`;
+            if (seen.has(mark)) continue;
             if ((await attemptOf(object.key)) !== current) continue;
-            seen.add(object.key);
-            await line({ progress: object.key.slice(prefix.length) });
+            seen.add(mark);
+            if (echo) await line({ progress: object.key.slice(prefix.length) });
           }
           cursor = page.cursor ?? undefined;
         } while (cursor);
@@ -1309,6 +1314,7 @@ function streamedRun(c: C, name: string): Response {
       await report();
       if (running) timer = setTimeout(tick, PROGRESS_POLL_MS);
     };
+    await report(false);
     timer = setTimeout(tick, PROGRESS_POLL_MS);
     try {
       const result = await runBackground(c.env, c.executionCtx, (bg) =>

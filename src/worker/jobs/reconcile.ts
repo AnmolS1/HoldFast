@@ -65,7 +65,7 @@ import {
 } from "../db/queries/trash-jobs";
 import { captureError } from "../sentry";
 import { auditInTx } from "../services/audit";
-import { sendOperatorCritical } from "../services/email";
+import { sendOperatorCritical, type OperatorCriticalEvent } from "../services/email";
 import { coreFor, type BackgroundContext } from "../services/request-context";
 import { adminListOf } from "../services/signup-policy";
 import { AVATAR_PREFIX, type ListedObject, storage, THUMB_PREFIX, UPLOAD_PREFIX } from "../services/storage";
@@ -383,12 +383,14 @@ async function recordRollback(
 
 /**
  * The critical mail to every operator, sent at once (never counted or coalesced) — the one call
- * site for both of the detector's states. Awaited: nothing a job starts may outlive it. True
- * when at least one was handed over; when none was, the next reading mails again.
+ * site for both of the detector's states, and for the scan consumer's `scanner_down` (its own
+ * `source` tag). Awaited: nothing a job starts may outlive it. True when at least one was handed
+ * over; when none was, the next reading mails again.
  */
-async function mailOperators(
+export async function mailOperators(
   bg: BackgroundContext,
-  event: "database_rollback" | "detector_unreadable",
+  event: OperatorCriticalEvent,
+  source: { kind: string; job?: string } = { kind: "job", job: "reconcile" },
 ): Promise<boolean> {
   const operators = [...adminListOf(bg.env).addresses];
   const sent = await Promise.all(
@@ -396,7 +398,7 @@ async function mailOperators(
       sendOperatorCritical(bg, { to, event }).then(
         () => true,
         (error: unknown) => {
-          captureError(error, { kind: "job", job: "reconcile" });
+          captureError(error, source);
           return false;
         },
       ),

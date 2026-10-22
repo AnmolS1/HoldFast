@@ -11,6 +11,8 @@ import {
   verdictCounts24h,
   backupLastOk,
   noOperatorRecipient24h,
+  requestTiles1h,
+  analyticsTiles,
 } from "../../../src/worker/services/metrics-queries";
 
 const ACCOUNT = "0123456789abcdef0123456789abcdef"; // made up
@@ -149,6 +151,58 @@ describe("configured", () => {
         reason: "not_configured",
       });
       expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("Part B: the console's request tiles (T25's AnalyticsTilesDto, the analytics-tiles swap)", () => {
+  it("requestTiles1h: ONE request — the hour's requests, 5xx and the sample-weighted p95 of `ms`", async () => {
+    const fetcher = recorder(() => Response.json({ data: [{ requests: "1200", errors: "6", p95: 182.5 }] }));
+    expect(await requestTiles1h(configured, fetcher)).toEqual({
+      available: true,
+      rows: [{ requests: 1200, errors: 6, p95Ms: 182.5 }],
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const sql = String(fetcher.mock.calls[0]![1]!.body);
+    expect(sql).toContain("index1 = 'request'");
+    expect(sql).toContain("blob6 = 'dev'");
+    expect(sql).toContain("SUM(_sample_interval) AS requests");
+    expect(sql).toContain("sumIf(_sample_interval, blob2 = '5xx') AS errors");
+    expect(sql).toContain("quantileExactWeighted(0.95, double2, _sample_interval) AS p95");
+    expect(sql).toContain("INTERVAL '1' HOUR");
+  });
+
+  it("analyticsTiles: the frozen DTO — per minute, a 0..1 rate, p95 in ms", async () => {
+    const fetcher = recorder(() => Response.json({ data: [{ requests: "1200", errors: "6", p95: 182.5 }] }));
+    expect(await analyticsTiles(configured, fetcher)).toEqual({
+      available: true,
+      requestsPerMinute: 20,
+      errorRate: 0.005,
+      p95LatencyMs: 182.5,
+    });
+  });
+
+  it("analyticsTiles: an idle hour is zeros (a p95 of no rows is not a number), never unavailable", async () => {
+    const fetcher = recorder(() => Response.json({ data: [{ requests: "0", errors: "0", p95: "nan" }] }));
+    expect(await analyticsTiles(configured, fetcher)).toEqual({
+      available: true,
+      requestsPerMinute: 0,
+      errorRate: 0,
+      p95LatencyMs: 0,
+    });
+  });
+
+  it("analyticsTiles: not configured, a failed request, a bad or missing row → { available: false } (the console's Unavailable)", async () => {
+    const never = recorder(() => Response.json({ data: [] }));
+    expect(await analyticsTiles(env, never)).toEqual({ available: false });
+    expect(never).not.toHaveBeenCalled();
+    for (const answer of [
+      () => new Response("no", { status: 500 }),
+      () => Response.json({ data: [] }),
+      () => Response.json({ data: [{ requests: "lots", errors: "0", p95: 1 }] }),
+      () => Response.json({ data: [{ requests: "10", errors: "11", p95: 1 }] }),
+    ]) {
+      expect(await analyticsTiles(configured, recorder(answer))).toEqual({ available: false });
     }
   });
 });

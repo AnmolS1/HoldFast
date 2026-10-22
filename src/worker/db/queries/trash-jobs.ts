@@ -496,6 +496,111 @@ export async function clearDetectorMailed(db: Executor, field: DetectorMailField
   clearSettingsCache();
 }
 
+// ── the scanner-down alert's state (T27B; the detector's mail-time pattern) ──────────────────
+//
+// One settings row (`scannerAlert`; `getSettings` ignores the key), a JSON object:
+//   since        the open episode's start (null: none open)       endedAt      when it was ended
+//   mailedAt     the last scanner_down mail — NEVER reset by a recovery (one mail per 6 h, across
+//                episodes)                                         lastErrorAt  the last scanner error
+//   suspects     `{ owner, at }` of recent engine/timeout dead letters (bounded): one owner's file
+//                can cause those, so they count only from enough DISTINCT owners
+// Dead letters are handled concurrently: every change is read-decide-write under the row's lock.
+
+export const SCANNER_ALERT_KEY = "scannerAlert";
+
+export type ScannerAlertState = {
+  since: string | null;
+  endedAt: string | null;
+  mailedAt: string | null;
+  lastErrorAt: string | null;
+  suspects: Array<{ owner: string; at: string }>;
+};
+
+const text = (value: unknown): string | null => (typeof value === "string" && value !== "" ? value : null);
+
+function readAlertState(value: unknown): ScannerAlertState {
+  const object = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const suspects = Array.isArray(object.suspects)
+    ? object.suspects.flatMap((entry) => {
+        const item = entry as { owner?: unknown; at?: unknown } | null;
+        const owner = text(item?.owner);
+        const at = text(item?.at);
+        return owner && at ? [{ owner, at }] : [];
+      })
+    : [];
+  return {
+    since: text(object.since),
+    endedAt: text(object.endedAt),
+    mailedAt: text(object.mailedAt),
+    lastErrorAt: text(object.lastErrorAt),
+    suspects,
+  };
+}
+
+/**
+ * Reads, changes and writes the alert row in one transaction, the row locked (created empty
+ * first if absent): concurrent dead letters see each other's changes.
+ */
+export async function changeScannerAlert<T>(
+  db: Executor,
+  key: string,
+  change: (state: ScannerAlertState) => { next: ScannerAlertState; result: T },
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      INSERT INTO settings (key, value, updated_by) VALUES (${key}, '{}'::jsonb, NULL) ON CONFLICT (key) DO NOTHING`);
+    const found = await tx.execute<{ value: unknown }>(
+      sql`SELECT value FROM settings WHERE key = ${key} FOR UPDATE`,
+    );
+    const { next, result } = change(readAlertState(found.rows[0]?.value));
+    await tx.execute(sql`
+      UPDATE settings SET value = ${JSON.stringify(next)}::jsonb, updated_by = NULL, updated_at = now() WHERE key = ${key}`);
+    return result;
+  });
+}
+
+/** A scanner error while an episode is open: its time, for the recovery's quiet period. One statement. */
+export async function noteScannerError(db: Executor, key: string, at: Date): Promise<void> {
+  await db.execute(sql`
+    UPDATE settings SET value = jsonb_set(value, '{lastErrorAt}', to_jsonb(${at.toISOString()}::text)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object'
+      AND value ->> 'since' IS NOT NULL AND value ->> 'endedAt' IS NULL`);
+}
+
+/**
+ * A real verdict: the open episode ends — only when its last scanner error is at least `quietMs`
+ * old (hysteresis). `mailedAt` is KEPT. One statement; nothing when no episode is open. Returns
+ * the episode's start when it ended one.
+ */
+export async function endScannerEpisode(
+  db: Executor,
+  key: string,
+  at: Date,
+  quietMs: number,
+): Promise<{ since: string } | null> {
+  const quietSince = new Date(at.getTime() - quietMs).toISOString();
+  const result = await db.execute<{ since: string }>(sql`
+    UPDATE settings SET value = jsonb_set(value, '{endedAt}', to_jsonb(${at.toISOString()}::text)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object'
+      AND value ->> 'since' IS NOT NULL AND value ->> 'endedAt' IS NULL
+      AND COALESCE(value ->> 'lastErrorAt', value ->> 'since') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+      AND COALESCE(value ->> 'lastErrorAt', value ->> 'since')::timestamptz <= ${quietSince}::timestamptz
+    RETURNING value ->> 'since' AS since`);
+  return result.rows[0] ?? null;
+}
+
+/** A claimed mail that reached nobody is given back (only if nothing claimed after it). */
+export async function releaseScannerDownMail(
+  db: Executor,
+  key: string,
+  claimedAt: Date,
+  previous: string | null,
+): Promise<void> {
+  await db.execute(sql`
+    UPDATE settings SET value = jsonb_set(value, '{mailedAt}', COALESCE(to_jsonb(${previous}::text), 'null'::jsonb)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object' AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
+}
+
 /**
  * Counts the database's generation up — only if it is still EXACTLY what was read (`from`: the
  * stored jsonb text as `readDetectorFields` gave it, null for none): a compare of the raw stored
