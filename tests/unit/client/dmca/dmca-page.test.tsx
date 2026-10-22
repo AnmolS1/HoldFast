@@ -21,8 +21,9 @@ describe("agent.ts — the designated agent's details as data", () => {
   // deferred to Gate B on 2026-10-22). Until he supplies the details exactly as registered, every
   // field carries `TODO_`; the page renders it as it is, and the Gate-B checks fail while it does:
   // the @prod-safe agent-details test in tests/e2e/dmca.spec.ts skips (and a skip fails the gate
-  // run), and verify-gate-b.sh greps this file. When the details arrive, replace the four values
-  // and this test's expectation flips with them — nothing else.
+  // run), and verify-gate-b.sh will grep agent.ts once T30 writes it. When the details arrive:
+  // replace the four values in agent.ts AND, in the same commit, flip this first test (every field
+  // must then NOT match /^TODO_/, `agentHasSentinel` false) — it goes red on filled details by design.
   it("carries the TODO_ sentinel in every field until the registration is done", () => {
     expect(SENTINEL).toBe("TODO_");
     expect(AGENT_FIELDS).toEqual(["name", "address", "phone", "email"]);

@@ -4,7 +4,7 @@
 // NOT REGISTERED YET (T29 §B.1 is Anmol's step; deferred to Gate B). Until the registration is done
 // every field carries the sentinel (`SENTINEL` below), and the page renders it as it is: the Gate-B
 // checks fail while it does (tests/e2e/dmca.spec.ts's agent-details test skips, and a skip fails the
-// gate run; verify-gate-b.sh greps this file). Never put a guessed name, address or phone here.
+// gate run; verify-gate-b.sh will grep this file once T30 writes it). Never put a guessed name, address or phone here.
 //
 // Plain data on purpose: the e2e spec imports this file in Node.
 
