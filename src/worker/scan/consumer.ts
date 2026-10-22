@@ -44,7 +44,8 @@
 //                                            not taken down → `error`/`timeout`|`engine`; Sentry
 //                                            error tagged with the key; ack
 //   … and when the job's last error is the SCANNER's (`not_ready`, `engine`, `timeout`): the
-//   operators get OPERATOR_CRITICAL `scanner_down` — on the transition, then at most every 6 h
+//   operators get OPERATOR_CRITICAL `scanner_down` (and earlier: a main-queue delivery failing on
+//   the scanner ≥ 10 min after its message was first sent) — on the transition, then at most every 6 h
 //   while it lasts (`claimScannerDownMail`, one settings row); the next real verdict in the main
 //   queue records the recovery (audit `system.scanner_recovered`) and the next one is a transition.
 //
@@ -358,6 +359,11 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
     await finish(bg.db, claimed, "failed", null, failure.error).catch((inner: unknown) =>
       captureError(inner, { kind: "scan" }),
     );
+    // The scanner itself failing for SCANNER_STUCK_MS since the message was first sent (its own
+    // timestamp, kept across retries): the operators hear now, not ≈ 32 min later at the DLQ.
+    if (SCANNER_ERRORS.has(failure.error) && Date.now() - message.timestamp.getTime() >= SCANNER_STUCK_MS) {
+      await alertScannerDown(bg);
+    }
     message.retry({ delaySeconds: Math.max(backoff(message.attempts), failure.minDelay) });
   }
 }
@@ -434,6 +440,12 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
  * deploy — re-sent once, and the scanner answered), not `photodna`, not a database message.
  */
 const SCANNER_ERRORS = new Set(["not_ready", "engine", "timeout"]);
+
+/**
+ * A scan answered by a failing scanner this long after its message was first sent alerts before
+ * the DLQ. Not shorter: a cold container with clamd loading answers `not_ready` for 1–3 minutes.
+ */
+export const SCANNER_STUCK_MS = 10 * 60_000;
 
 /** The `scanner_down` mail at most this often while it lasts — the detector's 6 h. */
 export const SCANNER_DOWN_MAIL_EVERY_MS = ROLLBACK_MAIL_EVERY_MS;

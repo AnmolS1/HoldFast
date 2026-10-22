@@ -8,14 +8,30 @@
 // vitest.workers.config.ts tests/unit/observability/scanner-down.tablewide.test.ts`): the alert's
 // state is ONE settings row (`scannerAlert`) for the whole estate. Each test starts with it gone.
 // The operator address is made up and this file's own.
+import { createExecutionContext, createMessageBatch, getQueueResult } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { claim } from "../../../src/worker/db/queries/scan-jobs";
 import { scanJobs } from "../../../src/worker/db/schema";
+import {
+  scanObject,
+  ScannerBusyError,
+  ScannerNotReadyError,
+  ScannerTransportError,
+} from "../../../src/worker/scan/container";
+import { queue } from "../../../src/worker/scan/consumer";
+import { runBackground } from "../../../src/worker/services/request-context";
+import { realCore } from "../auth/helpers";
 import { cleanBytes, deliver, explicit, mailTo, rand, testDb, uploadedFile } from "../scan/helpers";
 
 /** The settings row the alert keeps (`db/queries/trash-jobs.ts`). */
 const SCANNER_ALERT_KEY = "scannerAlert";
+vi.mock("../../../src/worker/scan/container", async (original) => {
+  const real = await original<typeof import("../../../src/worker/scan/container")>();
+  return { ...real, scanObject: vi.fn(real.scanObject) };
+});
+
 const OPS = `t27b-scanner-${rand()}@example.test`; // made up
 const asOps = { ADMIN_EMAILS: OPS, E2E_ADMIN_EMAILS: "" };
 const DLQ = "holdfast-scan-dev-dlq";
@@ -104,5 +120,50 @@ describe("scanner_down", () => {
     expect(row.rows).toHaveLength(0);
     await deadLetter("not_ready");
     expect(scannerMails().length - before).toBe(1);
+  });
+});
+
+/**
+ * One main-queue delivery of `file`'s message, first sent `ageMs` ago (the message's own
+ * timestamp is kept across its retries), the real scanner path (`SCAN_STUB` off) answering `error`.
+ */
+async function failingFor(ageMs: number, error: () => Error) {
+  const { file } = await uploadedFile(cleanBytes());
+  vi.mocked(scanObject).mockRejectedValueOnce(error());
+  const runEnv = { ...env, ...asOps, SCAN_STUB: "0" } as unknown as Env;
+  const batch = createMessageBatch("holdfast-scan-dev", [
+    { id: `m-${rand()}`, timestamp: new Date(Date.now() - ageMs), body: explicit(file), attempts: 2 },
+  ]);
+  const ctx = createExecutionContext();
+  await runBackground(runEnv, ctx, (bg) => queue(batch, runEnv, ctx, bg), realCore);
+  const result = await getQueueResult(batch, ctx);
+  expect(result.retryMessages).toHaveLength(1);
+}
+
+describe("scanner_down before the DLQ: a scan answered by a failing scanner for 10 minutes", () => {
+  const MIN = 60_000;
+  it.each([
+    ["not_ready", () => new ScannerNotReadyError("clamd_loading", null, 30)],
+    ["engine", () => new ScannerTransportError("engine", "scanner answered 502")],
+    ["timeout", () => new ScannerTransportError("timeout", "no answer")],
+  ])(
+    "%s: 9 minutes after the message was first sent no mail; 10 minutes → one mail; again within 6 h → none",
+    async (_label, error) => {
+      const before = scannerMails().length;
+      await failingFor(9 * MIN, error);
+      expect(scannerMails().length - before).toBe(0);
+      await failingFor(10 * MIN, error);
+      expect(scannerMails().length - before).toBe(1);
+      await failingFor(30 * MIN, error);
+      expect(scannerMails().length - before).toBe(1);
+    },
+  );
+
+  it("CONTROL: busy for an hour (capacity — the scanner answers) mails nothing", async () => {
+    const before = scannerMails().length;
+    await failingFor(60 * MIN, () => new ScannerBusyError(15));
+    expect(scannerMails().length - before).toBe(0);
+    const row = await testDb().execute(sql`SELECT 1 FROM settings WHERE key = ${SCANNER_ALERT_KEY}`);
+    expect(row.rows).toHaveLength(0);
   });
 });
