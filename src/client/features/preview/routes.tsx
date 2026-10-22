@@ -3,15 +3,12 @@
 //   navigate("/preview/" + id, { state: stamped({ siblingIds, from }) })   (lib/history-state.ts)
 import type { RouteObject } from "react-router";
 import { t } from "../../lib/i18n";
-import { lazyPage } from "../lazy-page";
-
-// Its own chunk (../lazy-page.tsx).
-const PreviewRoute = lazyPage(() => import("./PreviewRoute"), "PreviewRoute");
+import { LazyPreviewRoute } from "./LazyPreviewRoute";
 
 export const routes: RouteObject[] = [
   {
     path: "preview/:nodeId",
-    element: <PreviewRoute />,
+    element: <LazyPreviewRoute />,
     handle: { overlay: true, title: t("nav.preview") },
   },
 ];
