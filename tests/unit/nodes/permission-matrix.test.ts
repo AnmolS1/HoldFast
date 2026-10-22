@@ -1,7 +1,7 @@
 // The permission matrix: owner, editor, viewer, a person whose share was never activated, and a
 // stranger — against every endpoint of the nodes API. `404` for the last two on every route that
 // names a node: no access and no such node are one answer.
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { replaceVersion } from "../../../src/worker/db/queries/nodes";
 import { keyFor } from "../../../src/worker/services/storage";
 import { BY_ID } from "./by-id-routes";
@@ -369,45 +369,60 @@ describe("a share partner and files that are not clean", () => {
     }
   });
 
-  it("every kind of 404 costs one number of statements on a route: unknown, no share, hidden, trashed, not visible", async () => {
-    const { t, folder, files, callers } = await withUploads();
-    const down = await makeFile(t.owner.id, folder.id, { scanStatus: "clean" });
-    await takeDown(down.id);
-    const locked = await makeFile(t.owner.id, folder.id, {});
-    await setStatus(locked.id, "suspected_csam");
-    const trashed = await makeFile(t.owner.id, folder.id, {
-      scanStatus: "clean",
-      deletedAt: new Date(),
-      trashedRoot: true,
-    });
-    const kinds: [string, string][] = [
-      ["no share to it", t.secret.id],
-      ["taken down", down.id],
-      ["locked", locked.id],
-      ["in the trash", trashed.id],
-      ["under review", files.under_review.id],
-      ["pending, someone else's", files.pending.id],
-      ["infected, someone else's", files.infected.id],
-    ];
-    for (const viewer of ["otherEditor", "viewer"] as const) {
-      for (const route of BY_ID) {
-        const unknown = await route.call(callers[viewer], crypto.randomUUID(), t);
-        const counts = new Map<string, number>([["unknown", unknown.statements]]);
-        for (const [label, id] of kinds) {
-          const answer = await route.call(callers[viewer], id, t);
-          expect(answer.status, `${viewer} ${route.name} ${label}`).toBe(unknown.status);
-          counts.set(label, answer.statements);
-        }
-        expect(new Set(counts.values()).size, `${viewer} ${route.name}: ${JSON.stringify([...counts])}`).toBe(
-          1,
-        );
-      }
+  // One test per viewer and route (8 requests each) and one per route for the stranger, over one
+  // arrangement: the request count is what the time was — 306 requests in one test took 2.4 s alone
+  // at load 6.5 and timed out at 5 s under load, which is why it carried a 30 s timeout. The counts
+  // compared are statements; nothing here measures time.
+  describe("every kind of 404 costs one number of statements on a route: unknown, no share, hidden, trashed, not visible", () => {
+    let arranged: Awaited<ReturnType<typeof arrange404s>>;
+    async function arrange404s() {
+      const { t, folder, files, callers } = await withUploads();
+      const down = await makeFile(t.owner.id, folder.id, { scanStatus: "clean" });
+      await takeDown(down.id);
+      const locked = await makeFile(t.owner.id, folder.id, {});
+      await setStatus(locked.id, "suspected_csam");
+      const trashed = await makeFile(t.owner.id, folder.id, {
+        scanStatus: "clean",
+        deletedAt: new Date(),
+        trashedRoot: true,
+      });
+      const kinds: [string, string][] = [
+        ["no share to it", t.secret.id],
+        ["taken down", down.id],
+        ["locked", locked.id],
+        ["in the trash", trashed.id],
+        ["under review", files.under_review.id],
+        ["pending, someone else's", files.pending.id],
+        ["infected, someone else's", files.infected.id],
+      ];
+      return { t, files, callers, kinds };
     }
+    beforeAll(async () => {
+      arranged = await arrange404s();
+    });
+
+    it.each(
+      (["otherEditor", "viewer"] as const).flatMap((viewer) => BY_ID.map((route) => ({ viewer, route }))),
+    )("$viewer, $route.name", async ({ viewer, route }) => {
+      const { t, callers, kinds } = arranged;
+      const unknown = await route.call(callers[viewer], crypto.randomUUID(), t);
+      const counts = new Map<string, number>([["unknown", unknown.statements]]);
+      for (const [label, id] of kinds) {
+        const answer = await route.call(callers[viewer], id, t);
+        expect(answer.status, `${viewer} ${route.name} ${label}`).toBe(unknown.status);
+        counts.set(label, answer.statements);
+      }
+      expect(new Set(counts.values()).size, `${viewer} ${route.name}: ${JSON.stringify([...counts])}`).toBe(
+        1,
+      );
+    });
+
     // The stranger, who has no share at all: the same number for a real id and a made-up one.
-    for (const route of BY_ID) {
+    it.each(BY_ID)("the stranger, $name", async (route) => {
+      const { t, files } = arranged;
       const unknown = await route.call(t.stranger.as, crypto.randomUUID(), t);
       const real = await route.call(t.stranger.as, files.clean.id, t);
       expect(real.statements, route.name).toBe(unknown.statements);
-    }
-  }, 30_000);
+    });
+  });
 });
