@@ -81,11 +81,12 @@ describe("the streamed on-demand backup, the real job behind T25's endpoint", ()
     }
   }, 600_000);
 
-  it("a repeated call once the set is complete answers {done:true} and rewrites nothing", async () => {
+  it("a repeated call once the set is complete answers only {done:true} — no echoed progress — and rewrites nothing", async () => {
     const who = await admin();
     const before = await listAll(`b/db/${today()}/`);
     const answer = await runBackup(who.as);
-    expect(lines(answer.text).at(-1)).toEqual({ name: "backup", done: true });
+    // No progress line: this call wrote no record (the finished attempt's are not echoed).
+    expect(lines(answer.text)).toEqual([{ name: "backup", done: true }]);
     expect(await listAll(`b/db/${today()}/`)).toEqual(before);
   }, 120_000);
 

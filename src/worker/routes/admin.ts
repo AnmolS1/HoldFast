@@ -1278,7 +1278,9 @@ function streamedRun(c: C, name: string): Response {
     const value = JSON.parse(await found.object.text()) as { attempt?: unknown };
     return typeof value.attempt === "string" ? value.attempt : null;
   };
-  const report = async () => {
+  // `echo: false` (once, before the run) only records what is already there: a call that finds
+  // the set complete, or another pass running, did not write those records.
+  const report = async (echo = true) => {
     for (const day of new Set([startDay, new Date().toISOString().slice(0, 10)])) {
       try {
         const current = await attemptOf(`b/db/${day}/_attempt.json`);
@@ -1288,10 +1290,12 @@ function streamedRun(c: C, name: string): Response {
         do {
           const page = await store.list(prefix, cursor);
           for (const object of page.objects) {
-            if (seen.has(object.key)) continue;
+            // Keyed by attempt too: a new attempt rewrites the same `_progress/<table>.json` keys.
+            const mark = `${current} ${object.key}`;
+            if (seen.has(mark)) continue;
             if ((await attemptOf(object.key)) !== current) continue;
-            seen.add(object.key);
-            await line({ progress: object.key.slice(prefix.length) });
+            seen.add(mark);
+            if (echo) await line({ progress: object.key.slice(prefix.length) });
           }
           cursor = page.cursor ?? undefined;
         } while (cursor);
@@ -1309,6 +1313,7 @@ function streamedRun(c: C, name: string): Response {
       await report();
       if (running) timer = setTimeout(tick, PROGRESS_POLL_MS);
     };
+    await report(false);
     timer = setTimeout(tick, PROGRESS_POLL_MS);
     try {
       const result = await runBackground(c.env, c.executionCtx, (bg) =>
