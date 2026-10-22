@@ -43,11 +43,15 @@
 // overlapping call answers at once, `overlap`, done: false.
 //
 // THE ROLLBACK DETECTOR (brief R-10). Backup destroys nothing, so it is not `guarded` and never
-// stops on a rollback reading. It RECORDS one: each pass asks `readsRolledBack` (a read; fail
-// closed — what cannot be read reads as rolled back), and each table's record and the manifest
-// carry `detection: "ok" | "rollback"`. The restore script warns before loading a set written
-// while rolled back. (`"unknown"` and `"not_read"` stay in the type for sets from elsewhere: a
-// reader must not switch exhaustively over the values.)
+// stops on a rollback reading or on T25's pause switch. It RECORDS them: each pass reads the pause
+// switch first (`readPauseSwitch`; on or unreadable → `"paused"`, as the restore runbook's step 1
+// leaves it), else asks `readsRolledBack` (a read; fail closed — what cannot be read reads as
+// rolled back), and each table's record and the manifest carry `detection: "ok" | "rollback" |
+// "paused"`. The restore script warns before loading a set written while either was read. (An
+// unreadable switch hides a real rollback behind "paused", and a failed generation read records
+// "rollback", not "unknown": telling them apart needs the generation state `reconcile.ts` keeps
+// private. `"unknown"` and `"not_read"` stay in the type for sets from elsewhere: a reader must not
+// switch exhaustively over the values.)
 //
 // THREE ALARMS RUN IN THE TAIL OF EVERY PASS — done or not, failed or not (brief R-6), each on its own:
 //   images   the month's image transformations (the `transform_user` ledger units) at or past
@@ -83,7 +87,7 @@ import { sendAdminAlert, sendOperatorCritical } from "../services/email";
 import type { BackgroundContext } from "../services/request-context";
 import { adminListOf } from "../services/signup-policy";
 import type { Job, JobResult, JobRunOptions } from "./index";
-import { readsRolledBack } from "./reconcile";
+import { readPauseSwitch, readsRolledBack } from "./reconcile";
 
 /** Every non-final part of a table's object is exactly this long (≥ R2's 5 MiB minimum). */
 export const BACKUP_PART_BYTES = 8 * 1024 * 1024;
@@ -101,7 +105,7 @@ const KEPT_ALARM_MAX = 50;
 /** …chosen, longest-unnamed first, from at most this many accounts past the backstop. */
 const KEPT_ALARM_SCAN = 1_000;
 
-export type Detection = "ok" | "rollback" | "unknown" | "not_read";
+export type Detection = "ok" | "rollback" | "paused" | "unknown" | "not_read";
 
 export type TableRecord = {
   name: string;
@@ -394,7 +398,12 @@ export async function backupPass(bg: BackgroundContext, options: PassOptions = {
         httpMetadata: { contentType: "application/json" },
       },
     );
-    const detection: Detection = (await readsRolledBack(bg.env, bg.db)) ? "rollback" : "ok";
+    const detection: Detection =
+      (await readPauseSwitch(bg.env)) !== "off"
+        ? "paused"
+        : (await readsRolledBack(bg.env, bg.db))
+          ? "rollback"
+          : "ok";
     // ONE SNAPSHOT for the whole set (Addendum 3, M1): every page of every table is read in this
     // one REPEATABLE READ, READ ONLY transaction, so no move, purge or insert during the pass can
     // put two moments into the set.

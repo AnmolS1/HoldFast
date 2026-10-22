@@ -29,6 +29,7 @@ import {
   tableKey,
   type Manifest,
 } from "../../../src/worker/jobs/backup";
+import { DESTROY_PAUSED_KEY } from "../../../src/worker/jobs/reconcile";
 import { cronEvent, jobContext } from "../trash/helpers";
 import { makeFile, makeFolder, makeUser, rand, testDb } from "../services-core/helpers";
 
@@ -368,6 +369,34 @@ describe("the nightly export, run as the cron slot runs it", () => {
     const loaded = await restoreSet({ date, read: readLocal, sql: target.sql, acceptDetection: true });
     expect(loaded.warnings).toEqual([expect.stringContaining('read "rollback"')]);
   }, 300_000);
+
+  it('Part B / R-10: a pass while T25\'s pause switch is on records "paused" (not "rollback"); the restore refuses it until acknowledged', async () => {
+    const date = "2099-04-02";
+    await env.FILES.put(DESTROY_PAUSED_KEY, "made-up reason: restore drill");
+    let result;
+    try {
+      result = await backupPass(ctx().bg, { date, softDeadlineMs: 600_000 });
+    } finally {
+      await env.FILES.delete(DESTROY_PAUSED_KEY);
+    }
+    expect(result).toMatchObject({ done: true, outcome: "ok" });
+    const manifest = await readManifest(date);
+    expect(manifest.detection).toBe("paused");
+    const record = (await (await env.FILES.get(`b/db/${date}/_progress/nodes.json`))!.json()) as {
+      detection: string;
+    };
+    expect(record.detection).toBe("paused");
+    const target = await scratchTarget();
+    await expect(restoreSet({ date, read: readLocal, sql: target.sql })).rejects.toThrow(
+      /rollback detector read "paused"/,
+    );
+    const loaded = await restoreSet({ date, read: readLocal, sql: target.sql, acceptDetection: true });
+    expect(loaded.warnings).toEqual([expect.stringContaining('read "paused"')]);
+    // The switch off again: the next set reads ok.
+    const after = "2099-04-03";
+    await backupPass(ctx().bg, { date: after, softDeadlineMs: 600_000 });
+    expect((await readManifest(after)).detection).toBe("ok");
+  }, 600_000);
 
   it("B1/M2: another schema version is refused — a table missing or extra, another migration level", async () => {
     const target = await scratchTarget();
