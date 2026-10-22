@@ -43,18 +43,25 @@
 //   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
 //                                            not taken down → `error`/`timeout`|`engine`; Sentry
 //                                            error tagged with the key; ack
-//   … and when the job's last error is the SCANNER's (`not_ready`, `engine`, `timeout`): the
-//   operators get OPERATOR_CRITICAL `scanner_down` (and earlier: a main-queue delivery failing on
-//   the scanner ≥ 10 min after its message was first sent) — on the transition, then at most every 6 h
-//   while it lasts (`claimScannerDownMail`, one settings row); the next real verdict in the main
-//   queue records the recovery (audit `system.scanner_recovered`) and the next one is a transition.
+//   … and OPERATOR_CRITICAL `scanner_down` when the SCANNER is unhealthy — never because of one
+//   file: a `not_ready` dead letter (or a delivery still `not_ready` 10 min after its message was
+//   first sent), or `engine`/`timeout` dead letters from ≥ 3 distinct owners within 30 min (one
+//   crafted file can cause those). At most one mail per 6 h across episodes; a real verdict ends
+//   the episode (audit `system.scanner_recovered`) only once the last scanner error is ≥ 10 min
+//   old. State: one settings row (`changeScannerAlert`).
 //
 // LOGS carry keys and node ids only — never a file name or an address.
 
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
-import { claimScannerDownMail, clearScannerDown, releaseScannerDownMail } from "../db/queries/trash-jobs";
+import {
+  changeScannerAlert,
+  endScannerEpisode,
+  noteScannerError,
+  releaseScannerDownMail,
+  SCANNER_ALERT_KEY,
+} from "../db/queries/trash-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { Node } from "../db/schema";
 import { mailOperators, ROLLBACK_MAIL_EVERY_MS } from "../jobs/reconcile";
@@ -359,10 +366,12 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
     await finish(bg.db, claimed, "failed", null, failure.error).catch((inner: unknown) =>
       captureError(inner, { kind: "scan" }),
     );
-    // The scanner itself failing for SCANNER_STUCK_MS since the message was first sent (its own
-    // timestamp, kept across retries): the operators hear now, not ≈ 32 min later at the DLQ.
-    if (SCANNER_ERRORS.has(failure.error) && Date.now() - message.timestamp.getTime() >= SCANNER_STUCK_MS) {
-      await alertScannerDown(bg);
+    // The scanner's own errors keep an open episode open (the recovery's quiet period), and
+    // `not_ready` — the scanner, never a file — for SCANNER_STUCK_MS since the message was first
+    // sent (its own timestamp, kept across retries) alerts now, not ≈ 32 min later at the DLQ.
+    if (SCANNER_ERRORS.has(failure.error)) {
+      const stuck = Date.now() - message.timestamp.getTime() >= SCANNER_STUCK_MS;
+      await scannerError(bg, failure.error === "not_ready" && stuck ? { health: true } : { health: false });
     }
     message.retry({ delaySeconds: Math.max(backoff(message.attempts), failure.minDelay) });
   }
@@ -429,35 +438,88 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
   });
   captureError(new Error(`scan: dead-lettered (${reason})`), { kind: "scan", key: loggable(scan.key) });
   bg.metric("scan", { outcome: "dlq", reason });
-  if (job && SCANNER_ERRORS.has(job.lastError ?? "")) await alertScannerDown(bg);
+  if (job?.lastError === "not_ready") await scannerError(bg, { health: true });
+  else if (job?.lastError === "engine" || job?.lastError === "timeout") {
+    await scannerError(bg, { health: false, owner: node.ownerId });
+  }
   message.ack();
 }
 
 // ── scanner down: the operators' alert, and the recovery ───────────────────────────────────
 
-/**
- * The last errors that are the SCANNER's own failure. Not `busy`/`reset` (a capacity wall or a
- * deploy — re-sent once, and the scanner answered), not `photodna`, not a database message.
- */
+/** The scanner errors of step e: `not_ready` is the scanner's own; `engine`/`timeout` may be one file's. */
 const SCANNER_ERRORS = new Set(["not_ready", "engine", "timeout"]);
 
 /**
- * A scan answered by a failing scanner this long after its message was first sent alerts before
+ * A delivery still answered `not_ready` this long after its message was first sent alerts before
  * the DLQ. Not shorter: a cold container with clamd loading answers `not_ready` for 1–3 minutes.
  */
 export const SCANNER_STUCK_MS = 10 * 60_000;
 
-/** The `scanner_down` mail at most this often while it lasts — the detector's 6 h. */
+/** `engine`/`timeout` dead letters count as the scanner's health only from this many owners… */
+export const SCANNER_SUSPECT_OWNERS = 3;
+/** …within this window. */
+export const SCANNER_SUSPECT_WINDOW_MS = 30 * 60_000;
+/** A real verdict ends an episode only when the last scanner error is at least this old. */
+export const SCANNER_RECOVERY_QUIET_MS = 10 * 60_000;
+/** The suspects kept in the row (bounded). */
+const SUSPECTS_KEPT = 50;
+
+/** What one locked change decided: send the mail (and what to give back if it reaches nobody). */
+type AlertDecision = { mail: boolean; previous: string | null; noRecipient: boolean };
+
+/** Test seam: the settings row the alert keeps. A test file sets its own key (module per file). */
+export const scannerAlertScope = { key: SCANNER_ALERT_KEY };
+
+/** The `scanner_down` mail at most this often — across episodes; the detector's 6 h. */
 export const SCANNER_DOWN_MAIL_EVERY_MS = ROLLBACK_MAIL_EVERY_MS;
 
 /**
- * OPERATOR_CRITICAL `scanner_down`, on the transition and then at most every 6 h. Recipients are
- * checked BEFORE the claim (an empty list spends nothing); a claim whose mail reached nobody is
- * given back. Never throws: the dead letter is acked whatever happens here.
+ * One scanner error. `health: true` is the scanner's own (`not_ready`): it opens an episode.
+ * `health: false` with an `owner` is an `engine`/`timeout` dead letter: recorded as a suspect,
+ * and it opens an episode only when ≥ 3 distinct owners' are within 30 min. Without either, only
+ * an open episode's last-error time moves (one statement). The mail is claimed in the same locked
+ * change — at most one per 6 h, whatever the episodes — and only with an operator address; a
+ * claim that reached nobody is given back. Never throws.
  */
-async function alertScannerDown(bg: BackgroundContext): Promise<void> {
+async function scannerError(
+  bg: BackgroundContext,
+  event: { health: boolean; owner?: string },
+): Promise<void> {
+  const key = scannerAlertScope.key;
   try {
-    if (adminListOf(bg.env).addresses.size === 0) {
+    const at = new Date();
+    if (!event.health && event.owner === undefined) {
+      await noteScannerError(bg.db, key, at);
+      return;
+    }
+    const recipients = adminListOf(bg.env).addresses.size > 0;
+    const now = at.toISOString();
+    const decision = await changeScannerAlert<AlertDecision>(bg.db, key, (state) => {
+      const windowStart = at.getTime() - SCANNER_SUSPECT_WINDOW_MS;
+      const suspects = state.suspects.filter((entry) => Date.parse(entry.at) >= windowStart);
+      if (event.owner !== undefined) suspects.push({ owner: event.owner, at: now });
+      const healthy =
+        event.health || new Set(suspects.map((entry) => entry.owner)).size >= SCANNER_SUSPECT_OWNERS;
+      const open = state.since !== null && state.endedAt === null;
+      const next = {
+        ...state,
+        suspects: suspects.slice(-SUSPECTS_KEPT),
+        lastErrorAt: open || healthy ? now : state.lastErrorAt,
+      };
+      if (!healthy) return { next, result: { mail: false, previous: null, noRecipient: false } };
+      if (!open) Object.assign(next, { since: now, endedAt: null });
+      const last = state.mailedAt === null ? Number.NaN : Date.parse(state.mailedAt);
+      const due = !Number.isFinite(last) || at.getTime() - last >= SCANNER_DOWN_MAIL_EVERY_MS;
+      if (!due || !recipients) {
+        return { next, result: { mail: false, previous: null, noRecipient: due && !recipients } };
+      }
+      return {
+        next: { ...next, mailedAt: now },
+        result: { mail: true, previous: state.mailedAt, noRecipient: false },
+      };
+    });
+    if (decision.noRecipient) {
       bg.metric("scan", { outcome: "scanner_down", reason: "no_recipient" });
       captureError(new Error("scan: the scanner is down and no operator address is configured"), {
         kind: "scan",
@@ -465,17 +527,12 @@ async function alertScannerDown(bg: BackgroundContext): Promise<void> {
       });
       return;
     }
-    const at = new Date();
-    const claim = await claimScannerDownMail(bg.db, at, SCANNER_DOWN_MAIL_EVERY_MS);
-    if (!claim.claimed) {
-      bg.metric("scan", { outcome: "scanner_down", reason: "claimed" });
-      return;
-    }
+    if (!decision.mail) return;
     if (await mailOperators(bg, "scanner_down", { kind: "scan", job: "scanner_down" })) {
       bg.metric("scan", { outcome: "scanner_down", reason: "mailed" });
       return;
     }
-    await releaseScannerDownMail(bg.db, at, claim.previous);
+    await releaseScannerDownMail(bg.db, key, at, decision.previous);
     bg.metric("scan", { outcome: "scanner_down", reason: "send_failed" });
   } catch (error) {
     captureError(error, { kind: "scan", reason: "scanner_down" });
@@ -483,13 +540,14 @@ async function alertScannerDown(bg: BackgroundContext): Promise<void> {
 }
 
 /**
- * A real verdict came back: an alert episode, if one is recorded, is over — the metric and an
- * audit row; the next scanner dead letter mails at once. One statement when there is none. Never
- * throws: a scan never fails or retries because of this.
+ * A real verdict came back: an open episode ends — once its last scanner error is ≥ 10 min old
+ * (one statement; nothing when none is open) — with the metric and an audit row. The mail
+ * throttle is NOT reset. Never throws: a scan never fails or retries because of this.
  */
 async function scannerAnswered(bg: BackgroundContext): Promise<void> {
+  const key = scannerAlertScope.key;
   try {
-    const ended = await clearScannerDown(bg.db);
+    const ended = await endScannerEpisode(bg.db, key, new Date(), SCANNER_RECOVERY_QUIET_MS);
     if (!ended) return;
     bg.metric("scan", { outcome: "scanner_recovered" });
     await bg.db.transaction((tx) =>
@@ -498,7 +556,7 @@ async function scannerAnswered(bg: BackgroundContext): Promise<void> {
         bg,
         "system.scanner_recovered",
         { type: "system", id: "scanner" },
-        { since: ended.since },
+        { since: ended.since, key },
       ),
     );
   } catch (error) {

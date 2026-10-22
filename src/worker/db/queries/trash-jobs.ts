@@ -498,66 +498,107 @@ export async function clearDetectorMailed(db: Executor, field: DetectorMailField
 
 // ── the scanner-down alert's state (T27B; the detector's mail-time pattern) ──────────────────
 //
-// One settings row, `scannerAlert` = `{ since, mailedAt }` (ISO times; `getSettings` ignores the
-// key). Present while the scanner is believed down; gone once a real verdict came back. Unlike
-// the detector — which runs under the generation lock — dead letters are handled concurrently,
-// so the mail is CLAIMED in one statement and only the caller that gets the row back sends it.
+// One settings row (`scannerAlert`; `getSettings` ignores the key), a JSON object:
+//   since        the open episode's start (null: none open)       endedAt      when it was ended
+//   mailedAt     the last scanner_down mail — NEVER reset by a recovery (one mail per 6 h, across
+//                episodes)                                         lastErrorAt  the last scanner error
+//   suspects     `{ owner, at }` of recent engine/timeout dead letters (bounded): one owner's file
+//                can cause those, so they count only from enough DISTINCT owners
+// Dead letters are handled concurrently: every change is read-decide-write under the row's lock.
 
 export const SCANNER_ALERT_KEY = "scannerAlert";
 
-/**
- * Claims the scanner-down mail: true when no mail is recorded, or the last one is at least
- * `everyMs` old — then `mailedAt` is `at` (and `since` kept, or `at` for a new episode). The
- * previous `mailedAt` comes back for `releaseScannerDownMail`.
- */
-export async function claimScannerDownMail(
-  db: Executor,
-  at: Date,
-  everyMs: number,
-): Promise<{ claimed: false } | { claimed: true; previous: string | null }> {
-  const now = at.toISOString();
-  const due = new Date(at.getTime() - everyMs).toISOString();
-  const result = await db.execute<{ previous: string | null }>(sql`
-    WITH before AS (SELECT value ->> 'mailedAt' AS mailed FROM settings WHERE key = ${SCANNER_ALERT_KEY})
-    INSERT INTO settings (key, value, updated_by)
-    VALUES (${SCANNER_ALERT_KEY}, jsonb_build_object('since', ${now}::text, 'mailedAt', ${now}::text), NULL)
-    ON CONFLICT (key) DO UPDATE
-      SET value = jsonb_build_object(
-            'since', COALESCE(${storedObject} ->> 'since', ${now}::text), 'mailedAt', ${now}::text),
-          updated_by = NULL, updated_at = now()
-      WHERE (${storedObject} ->> 'mailedAt') IS NULL
-         OR (${storedObject} ->> 'mailedAt') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
-         OR (${storedObject} ->> 'mailedAt')::timestamptz <= ${due}::timestamptz
-    RETURNING (SELECT mailed FROM before) AS previous`);
-  const row = result.rows[0];
-  return row ? { claimed: true, previous: row.previous ?? null } : { claimed: false };
+export type ScannerAlertState = {
+  since: string | null;
+  endedAt: string | null;
+  mailedAt: string | null;
+  lastErrorAt: string | null;
+  suspects: Array<{ owner: string; at: string }>;
+};
+
+const text = (value: unknown): string | null => (typeof value === "string" && value !== "" ? value : null);
+
+function readAlertState(value: unknown): ScannerAlertState {
+  const object = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const suspects = Array.isArray(object.suspects)
+    ? object.suspects.flatMap((entry) => {
+        const item = entry as { owner?: unknown; at?: unknown } | null;
+        const owner = text(item?.owner);
+        const at = text(item?.at);
+        return owner && at ? [{ owner, at }] : [];
+      })
+    : [];
+  return {
+    since: text(object.since),
+    endedAt: text(object.endedAt),
+    mailedAt: text(object.mailedAt),
+    lastErrorAt: text(object.lastErrorAt),
+    suspects,
+  };
 }
 
-/** A claim whose mail reached nobody is given back: the next dead letter tries again. */
+/**
+ * Reads, changes and writes the alert row in one transaction, the row locked (created empty
+ * first if absent): concurrent dead letters see each other's changes.
+ */
+export async function changeScannerAlert<T>(
+  db: Executor,
+  key: string,
+  change: (state: ScannerAlertState) => { next: ScannerAlertState; result: T },
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      INSERT INTO settings (key, value, updated_by) VALUES (${key}, '{}'::jsonb, NULL) ON CONFLICT (key) DO NOTHING`);
+    const found = await tx.execute<{ value: unknown }>(
+      sql`SELECT value FROM settings WHERE key = ${key} FOR UPDATE`,
+    );
+    const { next, result } = change(readAlertState(found.rows[0]?.value));
+    await tx.execute(sql`
+      UPDATE settings SET value = ${JSON.stringify(next)}::jsonb, updated_by = NULL, updated_at = now() WHERE key = ${key}`);
+    return result;
+  });
+}
+
+/** A scanner error while an episode is open: its time, for the recovery's quiet period. One statement. */
+export async function noteScannerError(db: Executor, key: string, at: Date): Promise<void> {
+  await db.execute(sql`
+    UPDATE settings SET value = jsonb_set(value, '{lastErrorAt}', to_jsonb(${at.toISOString()}::text)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object'
+      AND value ->> 'since' IS NOT NULL AND value ->> 'endedAt' IS NULL`);
+}
+
+/**
+ * A real verdict: the open episode ends — only when its last scanner error is at least `quietMs`
+ * old (hysteresis). `mailedAt` is KEPT. One statement; nothing when no episode is open. Returns
+ * the episode's start when it ended one.
+ */
+export async function endScannerEpisode(
+  db: Executor,
+  key: string,
+  at: Date,
+  quietMs: number,
+): Promise<{ since: string } | null> {
+  const quietSince = new Date(at.getTime() - quietMs).toISOString();
+  const result = await db.execute<{ since: string }>(sql`
+    UPDATE settings SET value = jsonb_set(value, '{endedAt}', to_jsonb(${at.toISOString()}::text)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object'
+      AND value ->> 'since' IS NOT NULL AND value ->> 'endedAt' IS NULL
+      AND COALESCE(value ->> 'lastErrorAt', value ->> 'since') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+      AND COALESCE(value ->> 'lastErrorAt', value ->> 'since')::timestamptz <= ${quietSince}::timestamptz
+    RETURNING value ->> 'since' AS since`);
+  return result.rows[0] ?? null;
+}
+
+/** A claimed mail that reached nobody is given back (only if nothing claimed after it). */
 export async function releaseScannerDownMail(
   db: Executor,
+  key: string,
   claimedAt: Date,
   previous: string | null,
 ): Promise<void> {
-  if (previous === null) {
-    await db.execute(sql`
-      DELETE FROM settings WHERE key = ${SCANNER_ALERT_KEY} AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
-    return;
-  }
   await db.execute(sql`
-    UPDATE settings SET value = jsonb_set(value, '{mailedAt}', to_jsonb(${previous}::text)), updated_at = now()
-    WHERE key = ${SCANNER_ALERT_KEY} AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
-}
-
-/**
- * The scanner answered: the alert's state is over. One statement, nothing when no alert is
- * recorded. Returns when the episode began (null: there was none).
- */
-export async function clearScannerDown(db: Executor): Promise<{ since: string | null } | null> {
-  const result = await db.execute<{ since: string | null }>(sql`
-    DELETE FROM settings WHERE key = ${SCANNER_ALERT_KEY} RETURNING value ->> 'since' AS since`);
-  const row = result.rows[0];
-  return row ? { since: row.since ?? null } : null;
+    UPDATE settings SET value = jsonb_set(value, '{mailedAt}', COALESCE(to_jsonb(${previous}::text), 'null'::jsonb)), updated_at = now()
+    WHERE key = ${key} AND jsonb_typeof(value) = 'object' AND value ->> 'mailedAt' = ${claimedAt.toISOString()}`);
 }
 
 /**
