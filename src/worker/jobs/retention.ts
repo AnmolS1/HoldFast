@@ -4,6 +4,8 @@
 //   link_access_log         180 days        email_ledger             48 hours
 //   audit_log               180 days        finished upload sessions 7 days
 //   upload_ips               90 days
+//   session                  1 day after it expired (the raw IP and user agent go with the row)
+//   reports                  reporter_ip_hash_stable set NULL 90 days after the report was resolved
 //
 // NOTHING THAT CONCERNS A HELD ACCOUNT OR A PROTECTED NODE IS DELETED. What that means is one
 // definition (queries/holds.ts), applied inside each deleting statement: this job never deletes
@@ -13,16 +15,20 @@
 // tied to an account, and go with their age. A hold lifted later makes its rows eligible again
 // at the next run: there is no backlog flag, the age test simply applies.
 //
-// No DMCA notice is closed here (auto-close is off in v1), no session row is trimmed, and no
-// hold is set or released: nothing in jobs/ writes a hold flag.
+// No DMCA notice is closed here (auto-close is off in v1) and no hold is set or released: nothing
+// in jobs/ writes a hold flag. A session row is deleted only after it expired — a held account's
+// stays — and a live session keeps its address (the account's sessions list and the rate limit
+// read it): a raw session IP lives at most the 14-day session + 1 day.
 
 import type { Executor } from "../db/client";
 import {
+  deleteExpiredSessions,
   deleteIdlePasswordAttempts,
   deleteOldAudit,
   deleteOldEmailWindows,
   deleteOldLedger,
   deleteOldLinkAccess,
+  nullStaleReporterHashes,
 } from "../db/queries/trash-jobs";
 import { deleteExpired, UPLOAD_IP_RETENTION_DAYS } from "../db/queries/upload-ips";
 import { trimFinished } from "../db/queries/uploads";
@@ -47,6 +53,9 @@ export const RETENTION_STEPS: ReadonlyArray<{
   { table: "link_password_attempts", delete: (db, limit) => deleteIdlePasswordAttempts(db, limit) },
   { table: "email_ledger", delete: (db, limit) => deleteOldEmailWindows(db, limit) },
   { table: "uploads", delete: (db, limit) => trimFinished(db, FINISHED_UPLOAD_RETENTION_DAYS, limit) },
+  { table: "session", delete: (db, limit) => deleteExpiredSessions(db, limit) },
+  // Not a delete: the row stays, its address hash goes. Rows already nulled no longer match.
+  { table: "reports", delete: (db, limit) => nullStaleReporterHashes(db, limit) },
 ];
 
 export const job: Job = {

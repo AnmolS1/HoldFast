@@ -13,6 +13,7 @@
 import { and, eq, gt, inArray, isNotNull, isNull, lt, lte, not, or, sql } from "drizzle-orm";
 import { UUID_PARAM } from "../../../shared/ids";
 import type { Executor } from "../client";
+import { session } from "../auth-schema";
 import { isUuid } from "../ids";
 import {
   auditLog,
@@ -20,6 +21,7 @@ import {
   nodes,
   nodeVersions,
   pendingUserPurges,
+  reports,
   type Upload,
   uploads,
   user,
@@ -196,6 +198,72 @@ export async function deleteOldAudit(
     .orderBy(auditLog.id)
     .limit(limit);
   const rows = await db.delete(auditLog).where(inArray(auditLog.id, doomed)).returning({ id: auditLog.id });
+  return rows.length;
+}
+
+/** A session row is kept this long after it expired: the raw address and agent go with the row. */
+export const SESSION_EXPIRED_GRACE_DAYS = 1;
+/** A report's reporter address hash is kept this long after the report was resolved. */
+export const REPORTER_HASH_RETENTION_DAYS = 90;
+
+/**
+ * Better Auth session rows that expired more than the grace ago — a browser that never comes
+ * back is the only way a row ever reaches this (a returning token is deleted by Better Auth
+ * itself), and its raw `ip_address` / `user_agent` would otherwise stay for ever. Never a live
+ * session, and never a held account's: the purge keeps that session (T29 §C). The column is a
+ * `timestamp` without a zone written in UTC, so it is compared with UTC now.
+ */
+export async function deleteExpiredSessions(
+  db: Executor,
+  limit: number,
+  graceDays: number = SESSION_EXPIRED_GRACE_DAYS,
+): Promise<number> {
+  const doomed = db
+    .select({ id: session.id })
+    .from(session)
+    .where(
+      and(
+        lt(session.expiresAt, sql`(now() AT TIME ZONE 'UTC') - make_interval(days => ${graceDays})`),
+        not(userHeld(sql`${session.userId}`)),
+      ),
+    )
+    .limit(limit);
+  const rows = await db.delete(session).where(inArray(session.id, doomed)).returning({ id: session.id });
+  return rows.length;
+}
+
+/**
+ * Sets `reporter_ip_hash_stable` to NULL on reports resolved (`actioned` / `dismissed`, with a
+ * `resolved_at`) more than the period ago. Nothing else on the row changes. An unresolved
+ * report, and a closed one with no `resolved_at`, keeps it. Kept too: a report on a node the
+ * purge gate protects, or one whose owner or reporter account is held — a preserved case is not
+ * edited. Everything that reads the hash (the open-report dedupe, the per-reporter 24 h cap, the
+ * admin's distinct-reporter count) looks at open reports or the last 24 hours.
+ */
+export async function nullStaleReporterHashes(
+  db: Executor,
+  limit: number,
+  afterDays: number = REPORTER_HASH_RETENTION_DAYS,
+): Promise<number> {
+  const doomed = db
+    .select({ id: reports.id })
+    .from(reports)
+    .where(
+      and(
+        isNotNull(reports.reporterIpHashStable),
+        inArray(reports.status, ["actioned", "dismissed"]),
+        lt(reports.resolvedAt, sql`now() - make_interval(days => ${afterDays})`),
+        not(nodeProtected(sql`${reports.nodeId}`)),
+        not(userHeld(sql`${reports.ownerId}`)),
+        not(userHeld(sql`${reports.reporterUserId}`)),
+      ),
+    )
+    .limit(limit);
+  const rows = await db
+    .update(reports)
+    .set({ reporterIpHashStable: null })
+    .where(inArray(reports.id, doomed))
+    .returning({ id: reports.id });
   return rows.length;
 }
 
