@@ -101,30 +101,46 @@ test.describe("app origin", () => {
     // (5 a minute, another envelope), which would answer first — this one is under its default of
     // 30, so the pipeline's 20 is what trips. (Not sign-out either: signing out carries no
     // credential and is never counted.)
-    let refusedAfter = 0;
-    for (let attempt = 1; attempt <= 41 && refusedAfter === 0; attempt++) {
-      const answer = await request.post("/api/auth/verify-password", {
-        headers: { ...headers, origin: origins.app },
-        data: { password: "correct horse battery staple 9!" },
-      });
-      if (answer.status() === 429) {
-        expect(await answer.json()).toMatchObject({ error: "rate_limited" });
-        refusedAfter = attempt;
-      } else {
-        expect(answer.status(), `attempt ${attempt}`).toBe(401);
+    // The limiter's windows are aligned to the wall clock (a minute each, miniflare's
+    // `floor(now / 60 s)`), so a minute boundary can fall anywhere — inside the drain (allowed for:
+    // the first refusal comes at the 21st to the 41st POST) or between the refusal and the sign-in
+    // below, which must then meet a fresh bucket. The second case is detected (the two answers in
+    // different windows) and the drain is done once more; two boundaries in one drain cannot be.
+    const window = () => Math.floor(Date.now() / 60_000);
+    const drainThenSignIn = async () => {
+      let refusedAfter = 0;
+      let refusedIn = 0;
+      for (let attempt = 1; attempt <= 41 && refusedAfter === 0; attempt++) {
+        const answer = await request.post("/api/auth/verify-password", {
+          headers: { ...headers, origin: origins.app },
+          data: { password: "correct horse battery staple 9!" },
+        });
+        if (answer.status() === 429) {
+          expect(await answer.json()).toMatchObject({ error: "rate_limited" });
+          refusedAfter = attempt;
+          refusedIn = window();
+        } else {
+          expect(answer.status(), `attempt ${attempt}`).toBe(401);
+        }
       }
-    }
-    expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);
+      expect(refusedAfter, "the auth limiter refused a sign-in attempt").toBeGreaterThanOrEqual(21);
+      const signIn = await request.post("/api/auth/sign-in/email", {
+        headers: { ...headers, origin: origins.app, "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" },
+        data: { email: "nobody@holdfast-e2e.example", password: "correct horse battery staple 9!" },
+      });
+      return { signIn, sameWindow: window() === refusedIn };
+    };
 
     // The ruling's own words — a SIGN-IN attempt from that address is refused too, and by the
     // pipeline's limiter, not Better Auth's: ours answers with the app's envelope
     // (`error: "rate_limited"`, a request id, Retry-After: 60); Better Auth's own 5-a-minute rule
     // on this path answers `{ message }` with no `error` and an X-Retry-After header.
-    const signIn = await request.post("/api/auth/sign-in/email", {
-      headers: { ...headers, origin: origins.app, "x-captcha-response": "XXXX.DUMMY.TOKEN.XXXX" },
-      data: { email: "nobody@holdfast-e2e.example", password: "correct horse battery staple 9!" },
-    });
-    expect(signIn.status()).toBe(429);
+    let { signIn, sameWindow } = await drainThenSignIn();
+    // NOT a retry of the assertion: when a minute boundary fell between the refusal and the sign-in,
+    // the sign-in met a fresh bucket — the PRECONDITION (an empty bucket) no longer held. Draining
+    // once more restores it; the assertion below is made once, on that attempt (T28 Addendum 3).
+    if (!sameWindow && signIn.status() !== 429) ({ signIn, sameWindow } = await drainThenSignIn());
+    expect(signIn.status(), sameWindow ? "in the refusal's window" : "after a minute boundary").toBe(429);
     const refusal = (await signIn.json()) as { error?: string; requestId?: string };
     expect(refusal.error).toBe("rate_limited");
     expect(refusal.requestId).toMatch(/^[0-9a-f-]{36}$/);
