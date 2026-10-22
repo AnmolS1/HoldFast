@@ -114,7 +114,6 @@ describe("a PhotoDNA-matched file whose lock fails", () => {
     expect(await userRow(owner.id)).toMatchObject({ legalHold: true });
     expect(await env.FILES.head(file.r2Key!)).not.toBeNull();
   });
-
 });
 
 describe("a PhotoDNA match on a file deleted before its verdict (the key is no longer a node's)", () => {
@@ -151,7 +150,9 @@ describe("a PhotoDNA match on a file deleted before its verdict (the key is no l
     // The copy is the matched bytes.
     const copy = await env.FILES.get(node.r2Key!);
     expect(await sha256Of(new Uint8Array(await copy!.arrayBuffer()))).toBe(server);
-    expect(await reportsOf(node.id)).toMatchObject([{ category: "csam", source: "photodna", status: "open" }]);
+    expect(await reportsOf(node.id)).toMatchObject([
+      { category: "csam", source: "photodna", status: "open" },
+    ]);
     expect(await userRow(uploader.id)).toMatchObject({ legalHold: true });
     expect(await blocklist.lookup(testDb(), server)).toEqual({ reason: "csam", sourceNodeId: node.id });
     expect(await auditRows({ action: "scan.csam_preserved", targetId: node.id })).toHaveLength(1);
