@@ -5,13 +5,16 @@
 //   - it never prints the host or the URL — only the database NAME and whether it is local or
 //     remote — on success and on failure alike.
 // Run as a person runs it: a child process. The "remote" database here is a loopback address
-// (in its IPv4-mapped spelling, which is not on the script's list of local names) on a port
-// nothing listens on: it classifies as remote, is refused at once, and no packet leaves the machine.
+// (in its IPv4-mapped spelling, which is not on the script's list of local names) on a port of a
+// listener of this test's own, which counts the connections it is offered and closes each at once:
+// it classifies as remote, and no packet leaves the machine. "Before connecting" is that count —
+// not a time: the child's start-up alone (npx, tsx) took 24.6 s on a loaded machine.
 import { execFile } from "node:child_process";
+import { createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Client } from "pg";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { localDbName, localDbUrl } from "../../../setup/local-env";
 
 const run = promisify(execFile);
@@ -19,7 +22,23 @@ const root = fileURLToPath(new URL("../../../../", import.meta.url));
 
 const REMOTE_HOST = "[::ffff:127.0.0.1]";
 const REMOTE_PASSWORD = "zzSECRETzzpassword";
-const REMOTE_URL = `postgres://zzuser:${REMOTE_PASSWORD}@${REMOTE_HOST}:1/zzremotedb`;
+
+/** The "remote" database: a listener that counts connection attempts and drops each one. */
+let listener: Server;
+let attempts = 0;
+let REMOTE_URL = "";
+beforeAll(async () => {
+  listener = createServer((socket) => {
+    attempts += 1;
+    socket.destroy();
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const { port } = listener.address() as { port: number };
+  REMOTE_URL = `postgres://zzuser:${REMOTE_PASSWORD}@${REMOTE_HOST}:${port}/zzremotedb`;
+});
+afterAll(async () => {
+  await new Promise<void>((resolve) => listener.close(() => resolve()));
+});
 
 async function invite(args: string[], url: string) {
   const env = { ...process.env, DATABASE_URL_DIRECT: url, CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false" };
@@ -48,19 +67,22 @@ function expectNoTarget(text: string): void {
 
 describe("scripts/create-invite.ts", () => {
   it("refuses a remote database without --remote — before connecting, naming neither host nor URL", async () => {
-    const started = Date.now();
+    const before = attempts;
     const out = await invite(["--uses", "1"], REMOTE_URL);
     expect(out.code).toBe(1);
     expect(out.stdout).toBe("");
     expect(out.stderr).toContain('database "zzremotedb" (remote)');
     expect(out.stderr).toContain("--remote");
     expectNoTarget(out.stderr);
-    // No connection attempt: the refusal is immediate.
-    expect(Date.now() - started).toBeLessThan(15_000);
+    // No connection attempt: the listener was never offered one.
+    expect(attempts - before).toBe(0);
   }, 30_000);
 
   it("with --remote it goes on to connect — and a failure still names neither host nor URL", async () => {
+    const before = attempts;
     const out = await invite(["--uses", "1", "--remote"], REMOTE_URL);
+    // It did connect (the listener counts it): the count above can see an attempt.
+    expect(attempts - before).toBeGreaterThan(0);
     expect(out.code).toBe(1);
     expect(out.stdout).toBe("");
     expect(out.stderr).toMatch(/^create-invite: the database could not be written to( \([A-Z0-9_]+\))?\n$/);

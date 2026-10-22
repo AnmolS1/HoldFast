@@ -1234,12 +1234,15 @@ describe("strangers cannot use up the mail an address asks for itself (R5)", () 
         for (const email of targets) {
           const client = caller();
           await forgetAddressRule(client);
+          // A delta: the request's own charge. The client's address is a fresh random one, but this
+          // hour's ledger row for it may already hold another client's charge (any file, any run).
+          const before = await clientCount(client);
           const done = await measured(client, path, { json: body(email), headers: CAPTCHA });
           seen.push({
             status: done.sent.status,
             body: done.sent.body,
             statements: done.statements,
-            chargedToClient: await clientCount(client),
+            chargedToClient: (await clientCount(client)) - before,
           });
         }
         for (const one of seen) {

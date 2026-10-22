@@ -436,7 +436,14 @@ test.describe("previews (mocked API and files host)", () => {
     page.on("request", (request) => {
       if (/pdf\.worker/.test(request.url())) workers.push(request.url());
     });
+    // The renderer's code is the ready signal: pdf.js is 9.4 MB (2.6 MB + its 6.8 MB worker),
+    // fetched and run cold in every test (a page with routes has no HTTP cache) — 2.7 s of the
+    // 5 s below at 8× CPU throttle. Once the worker's code is here, the 5 s are for drawing only.
+    const pdfWorker = page.waitForResponse((response) =>
+      /\/pdf\.worker\.min(-[\w-]+)?\.mjs$/.test(new URL(response.url()).pathname),
+    );
     await open(page, ID.pdf);
+    await pdfWorker;
     await expect(renderer(page, "pdf")).toBeVisible();
     await expect(page.locator("[data-pdf-page-count]")).toHaveText("of 3");
 
@@ -489,9 +496,20 @@ test.describe("previews (mocked API and files host)", () => {
 
   test("a .ts file is highlighted, and the markup in it stays text", async ({ page, origins }) => {
     const arranged = await arrange(page, origins, [NODES.ts]);
+    // The ready signals (as in the PDF test above): the file's bytes for the viewer, the grammar's
+    // code for the highlighting — each fetched cold in every test.
+    const bytes = page.waitForResponse((response) =>
+      new URL(response.url()).pathname.startsWith(`/i/${ID.ts}/`),
+    );
+    // (dev: the optimised dependency `shiki_langs_typescript…`; a build: its `typescript-<hash>.js` chunk)
+    const grammar = page.waitForResponse((response) =>
+      /shiki[_/]langs[_/]typescript|\/assets\/typescript-[\w-]+\.js$/.test(new URL(response.url()).pathname),
+    );
     await open(page, ID.ts);
     const text = renderer(page, "text");
+    await bytes;
     await expect(text).toBeVisible();
+    await grammar;
     await expect(text).toHaveAttribute("data-highlighted", "true");
     await expect(text.locator('[data-token="keyword"]').first()).toBeVisible();
     await expect(text.locator('[data-token="comment"]').first()).toHaveText(
