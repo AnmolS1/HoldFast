@@ -614,8 +614,12 @@ describe("changing to an address: what the caller can and cannot learn (A7)", ()
 });
 
 describe("races (real concurrent requests against Postgres)", () => {
-  it("the owner's confirmation against the stranger moving the address: never a verified account with the stranger's password", async () => {
-    for (let round = 0; round < 8; round++) {
+  // Eight rounds, eight tests: each is a fresh race (sign-up, landing, then the two requests at
+  // once), so each interleaving gets its own budget — one test of eight rounds took 4.2 s alone
+  // at load 6.5 against the 5 s default, and timed out in most full runs.
+  it.each(Array.from({ length: 8 }, (_, round) => round + 1))(
+    "the owner's confirmation against the stranger moving the address: never a verified account with the stranger's password (round %i)",
+    async () => {
       const { stranger, email, link, id } = await strangerSignsUp();
       const elsewhere = freshEmail();
       const victim = newClient();
@@ -652,8 +656,8 @@ describe("races (real concurrent requests against Postgres)", () => {
       }
       expect(victim.cookies.has(SESSION_COOKIE)).toBe(false);
       await purgeAuthRows(testDb(), id);
-    }
-  });
+    },
+  );
 
   it("three confirmations at once (three devices of the owner): one takes effect, the others are 'no longer valid' — one password, no session, never a 500", async () => {
     const { email, link, id } = await strangerSignsUp();
