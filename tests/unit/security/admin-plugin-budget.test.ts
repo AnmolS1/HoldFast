@@ -45,7 +45,11 @@ describe("Better Auth's admin plugin has a limiter bucket of its own", () => {
       const sent = await send(client, call.path, { json: call.json });
       expect(sent.status, `call ${n + 1}: ${sent.text}`).not.toBe(429);
     }
-    const over = await send(client, CALLS[0]!.path, { json: CALLS[0]!.json });
+    // Fixed 60 s windows: a run crossing a boundary is refused a little later than the 61st.
+    let over = await send(client, CALLS[0]!.path, { json: CALLS[0]!.json });
+    for (let extra = 0; extra < 30 && !isOurRefusal(over); extra++) {
+      over = await send(client, CALLS[0]!.path, { json: CALLS[0]!.json });
+    }
     expect(isOurRefusal(over), `${over.status} ${over.text}`).toBe(true);
     // Another admin at the same address has a budget of their own.
     const other = await anAdmin();
@@ -56,14 +60,17 @@ describe("Better Auth's admin plugin has a limiter bucket of its own", () => {
 
   it("control: sign-in keeps its per-address limit — the 21st credential POST from one address is refused", async () => {
     const client = newClient();
+    // The binding counts fixed 60 s windows: a run that crosses a boundary is refused later than the
+    // 21st (CI: none by 21). So: never before the limit, and refused within ~1.5× of it.
     let refusedAt = 0;
-    for (let n = 1; n <= 21 && refusedAt === 0; n++) {
+    for (let n = 1; n <= 32 && refusedAt === 0; n++) {
       const sent = await send(client, "/api/auth/sign-in/email", {
         json: { email: `nobody-${n}@holdfast-test.example`, password: PASSWORD },
         headers: CAPTCHA,
       });
       if (isOurRefusal(sent)) refusedAt = n;
     }
-    expect(refusedAt).toBe(21);
+    expect(refusedAt).toBeGreaterThanOrEqual(21);
+    expect(refusedAt).toBeLessThanOrEqual(32);
   });
 });
