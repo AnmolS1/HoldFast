@@ -22,6 +22,8 @@
 //
 // Every SQL text here is built from constants: no value a caller passes reaches a query.
 
+import type { AnalyticsTilesDto } from "../../shared/schemas/admin";
+
 type MetricsQueryEnv = {
   CF_ACCOUNT_ID?: string;
   CF_ANALYTICS_TOKEN?: string;
@@ -311,6 +313,52 @@ export async function deferredAbandoned24h(
   );
 }
 
+/**
+ * The console's request tiles for the last hour (Part B): requests, those answered 5xx, and the
+ * 95th percentile of `request{ms}` weighted by the sample interval (`quantileExactWeighted`, the
+ * SQL API's documented form for sampled data). One row; an hour with no request has a p95 that is
+ * not a number, read as 0.
+ */
+export async function requestTiles1h(
+  env: MetricsQueryEnv,
+  fetcher?: typeof fetch,
+): Promise<QueryResult<{ requests: number; errors: number; p95Ms: number }>> {
+  const { table, environment } = scopeOf(env);
+  const sqlText = [
+    `SELECT SUM(_sample_interval) AS requests, sumIf(_sample_interval, blob2 = '5xx') AS errors,`,
+    `  quantileExactWeighted(0.95, double2, _sample_interval) AS p95`,
+    `FROM ${table}`,
+    `WHERE index1 = 'request' AND blob6 = ${literal(environment)} AND ${since("1 HOUR")}`,
+  ].join("\n");
+  return mapRows(
+    await runSql<{ requests?: unknown; errors?: unknown; p95?: unknown }>(env, sqlText, fetcher),
+    (row) => {
+      const requests = num(row.requests);
+      return { requests, errors: num(row.errors), p95Ms: requests === 0 ? 0 : num(row.p95) };
+    },
+  );
+}
+
+/**
+ * T25's `AnalyticsTilesDto` from `requestTiles1h` — THE ANALYTICS-TILES SWAP is `loadAnalyticsTiles`
+ * (routes/admin.ts) returning `analyticsTiles(c.env)`. Anything not read (no configuration, a
+ * failed request, no row, a row that does not add up) is `{ available: false }`, never zeros.
+ */
+export async function analyticsTiles(
+  env: MetricsQueryEnv,
+  fetcher?: typeof fetch,
+): Promise<AnalyticsTilesDto> {
+  const result = await requestTiles1h(env, fetcher);
+  const row = result.available && result.rows.length === 1 ? result.rows[0]! : null;
+  if (!row || row.errors > row.requests || row.requests < 0 || row.p95Ms < 0) return { available: false };
+  return {
+    available: true,
+    requestsPerMinute: row.requests / 60,
+    errorRate: row.requests === 0 ? 0 : row.errors / row.requests,
+    p95LatencyMs: row.p95Ms,
+  };
+}
+
 /** Every named query, for the catalogue and the tests. */
 export const NAMED_QUERIES = {
   verdictCounts24h,
@@ -323,4 +371,5 @@ export const NAMED_QUERIES = {
   holdBackstop24h,
   jobOutcomes24h,
   deferredAbandoned24h,
+  requestTiles1h,
 } as const;

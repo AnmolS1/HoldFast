@@ -48,6 +48,14 @@ const PINS: Record<keyof typeof NAMED_QUERIES, Pin[]> = {
   holdBackstop24h: [{ name: "upload", tags: { outcome: "hold_backstop" } }],
   jobOutcomes24h: [{ name: "job", tags: {} }],
   deferredAbandoned24h: [{ name: "error", tags: { kind: "deferred_abandoned" } }],
+  // The request line's outcome is computed the same way (`${Math.floor(status / 100)}xx`).
+  requestTiles1h: [
+    {
+      name: "request",
+      tags: { outcome: "5xx" },
+      via: /writeMetric\(c\.env, "request", \{\s*outcome: `\$\{Math\.floor\(status \/ 100\)\}xx`/,
+    },
+  ],
 };
 
 const configured = {
@@ -97,19 +105,20 @@ describe("the named queries read what the code emits", () => {
     ).toBe(true);
   });
 
-  it.each(Object.keys(PINS) as Array<keyof typeof NAMED_QUERIES>)(
+  // Over the QUERIES, not the pins: a new named query without pins goes red here.
+  it.each(Object.keys(NAMED_QUERIES) as Array<keyof typeof NAMED_QUERIES>)(
     "%s: its pins are what its SQL filters on, and nothing it filters on is unpinned",
     async (query) => {
       const sql = await sqlOf(NAMED_QUERIES[query]);
       const names = [...sql.matchAll(/index1 = '([a-z]+)'/g)].map((m) => m[1]);
-      expect(new Set(names)).toEqual(new Set(PINS[query].map((pin) => pin.name)));
+      expect(new Set(names)).toEqual(new Set((PINS[query] ?? []).map((pin) => pin.name)));
       const filtered = new Set<string>();
       for (const m of sql.matchAll(/(blob[2-4]) = '([a-z0-9_]+)'/g)) filtered.add(`${m[1]}=${m[2]}`);
       for (const m of sql.matchAll(/(blob[2-4]) IN \(([^)]*)\)/g)) {
         for (const v of m[2]!.matchAll(/'([a-z0-9_]+)'/g)) filtered.add(`${m[1]}=${v[1]}`);
       }
       const pinned = new Set<string>();
-      for (const pin of PINS[query]) {
+      for (const pin of PINS[query] ?? []) {
         for (const [tag, value] of Object.entries(pin.tags) as Array<[Tag, string]>) {
           // `IN` lists and per-reason pins: a pinned value the SQL only groups by (no filter) is fine
           // for `reason` (scanDlq24h groups by it); anything else must be in the SQL.
