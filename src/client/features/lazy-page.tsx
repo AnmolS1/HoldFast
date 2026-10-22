@@ -21,8 +21,9 @@ export function lazyPage<K extends string>(load: () => Promise<Record<K, Compone
         Loaded = module[name];
       },
       (error: unknown) => {
-        // A chunk that failed to load (a dropped connection, a new deploy) is tried again on the
-        // next render; the error goes to the route's error boundary meanwhile.
+        // A chunk that failed to load (a dropped connection, a new deploy) is imported again on
+        // the next render (whether the browser refetches it is the browser's choice); the error
+        // goes to the route's error boundary meanwhile.
         loading = null;
         throw error;
       },
