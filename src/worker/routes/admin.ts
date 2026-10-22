@@ -109,6 +109,7 @@ import {
   runBackground,
   type AppEnv,
 } from "../services/request-context";
+import { analyticsTiles } from "../services/metrics-queries";
 import { enqueueRescan } from "../services/scanning";
 import { SIGNUP_VELOCITY_DEFAULTS } from "../services/signup-policy";
 import { storage } from "../services/storage";
@@ -135,13 +136,13 @@ function requiredReason(value: string | undefined): string {
 // ── the analytics tiles (T27's import point) ────────────────────────────────────────────────
 
 /**
- * THE ANALYTICS-TILES SWAP (EXECUTION.md): the Analytics Engine tiles need T27's query module and
- * token. Until the orchestrator replaces this body at Wave-4 integration it answers
- * `{ available: false }`, and the console shows the tiles as "Unavailable".
+ * THE ANALYTICS-TILES SWAP (EXECUTION.md), done (T27B P-2): the request tiles come from T27's
+ * `analyticsTiles` (one Analytics Engine SQL request). Without the account id, the token or a
+ * known environment — or on any answer it cannot read — it is `{ available: false }`, and the
+ * console shows the tiles as "Unavailable".
  */
 export async function loadAnalyticsTiles(c: C): Promise<AnalyticsTilesDto> {
-  void c;
-  return { available: false };
+  return analyticsTiles(c.env);
 }
 
 // ── row → contract ──────────────────────────────────────────────────────────────────────────
