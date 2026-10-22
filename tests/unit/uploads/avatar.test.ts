@@ -5,10 +5,10 @@ import { and, eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { NodeDto } from "../../../src/shared/schemas/node";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
-import { nodes, reports, user as userTable } from "../../../src/worker/db/schema";
+import { hashBlocklist, nodes, reports, user as userTable } from "../../../src/worker/db/schema";
 import { BLOCKED_MESSAGE } from "../../../src/worker/routes/uploads";
 import { eicarBytes, pngBytes } from "../../setup/fixture-bytes";
-import { nodeById, testDb } from "../services-core/helpers";
+import { auditRows, mailTo, nodeById, testDb } from "../services-core/helpers";
 import {
   auditFor,
   complete,
@@ -155,7 +155,10 @@ describe("avatar", () => {
     expect((await userRow(user.id)).avatarNodeId).toBe(good.answer.body.id);
     expect(await avatarNodes(user.id)).toHaveLength(2);
     // Another flagged one replaces the first flagged one: never more than the avatar and one more.
-    await sendAvatar(user, flagged);
+    // (Other bytes: the first one's hash is on the blocklist now — see "an infected avatar" below.)
+    const flagged2 = flagged.slice();
+    crypto.getRandomValues(flagged2.subarray(PNG.byteLength + 68));
+    expect((await sendAvatar(user, flagged2)).answer.body.scanStatus).toBe("infected");
     expect(await avatarNodes(user.id)).toHaveLength(2);
     const next = await sendAvatar(user, picture(2));
     expect((await avatarNodes(user.id)).map((node) => node.id)).toEqual([next.answer.body.id]);
@@ -295,5 +298,60 @@ describe("avatar: the blocklist acts on the server's hash, never the declared on
     expect(node.sha256).toBe(await sha256Of(bytes));
     expect(node.sha256).not.toBe(declared);
     expect((await userRow(user.id)).avatarNodeId).toBe(answer.body.id);
+  });
+});
+
+/** A picture the stub scanner flags: the PNG, EICAR, and a per-run tail. */
+const infectedPicture = () => {
+  const bytes = new Uint8Array(PNG.byteLength + 68 + 16);
+  bytes.set(PNG);
+  bytes.set(eicarBytes(), PNG.byteLength);
+  crypto.getRandomValues(bytes.subarray(PNG.byteLength + 68));
+  return bytes;
+};
+
+// AVSEAM (a): an infected avatar is handled as the scan consumer handles an infected file — its
+// server hash listed `malware` (source: the node), the uploader struck, the notice sent.
+describe("an infected avatar", () => {
+  it("is listed malware by its server hash, struck once, noticed — and the same bytes again are refused as listed", async () => {
+    const user = await uploader();
+    const good = await sendAvatar(user, uniquePicture());
+    const bytes = infectedPicture();
+    const sha256 = await sha256Of(bytes);
+    const bad = await sendAvatar(user, bytes);
+    expect(bad.answer.status).toBe(201);
+    expect(bad.answer.body.scanStatus).toBe("infected");
+    const nodeId = String(bad.answer.body.id);
+    expect((await userRow(user.id)).avatarNodeId).toBe(good.answer.body.id);
+    expect(await testDb().select().from(hashBlocklist).where(eq(hashBlocklist.sha256, sha256))).toMatchObject(
+      [{ reason: "malware", sourceNodeId: nodeId }],
+    );
+    expect(await strikesOf(user.id)).toMatchObject([
+      { kind: "malware", nodeId, contentSha256: sha256, liftedAt: null },
+    ]);
+    expect(await auditRows({ action: "scan.infected", targetId: nodeId })).toHaveLength(1);
+    expect(mailTo(user.email, "quarantineNotice")).toHaveLength(1);
+
+    // The same bytes again (any declared hash): the blocklist refuses them — still ONE strike.
+    const again = await sendAvatar(user, bytes, {}, sha());
+    expect(again.answer.status).toBe(403);
+    expect(again.answer.body).toMatchObject({ error: "forbidden", message: BLOCKED_MESSAGE });
+    expect(await strikesOf(user.id)).toHaveLength(1);
+    expect((await userRow(user.id)).avatarNodeId).toBe(good.answer.body.id);
+  });
+
+  it("a clean avatar lists nothing and strikes nobody (the control)", async () => {
+    const user = await uploader();
+    const bytes = uniquePicture();
+    const { answer } = await sendAvatar(user, bytes);
+    expect(answer.status).toBe(201);
+    expect(
+      await testDb()
+        .select()
+        .from(hashBlocklist)
+        .where(eq(hashBlocklist.sha256, await sha256Of(bytes))),
+    ).toHaveLength(0);
+    expect(await strikesOf(user.id)).toHaveLength(0);
+    expect(mailTo(user.email, "quarantineNotice")).toHaveLength(0);
   });
 });

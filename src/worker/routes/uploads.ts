@@ -69,6 +69,7 @@ import type { Executor } from "../db/client";
 import { asQueryError, LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
+import { checkPhotoDna, photodnaNote, PhotoDnaTransientError, type PhotoDnaResult } from "../scan/photodna";
 import { findByR2Key, getNode, replaceVersion } from "../db/queries/nodes";
 import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/queries/trash";
 import { lockOwnerTree } from "../db/queries/tree";
@@ -95,7 +96,7 @@ import { now } from "../services/clock";
 import { AppError } from "../services/errors";
 import { byteLength, extOf, fitName, MAX_NAME_BYTES, nameKeyOf, sanitizeName } from "../services/filename";
 import { metric } from "../services/metrics";
-import { sendOperatorCritical } from "../services/email";
+import { sendOperatorCritical, sendQuarantineNotice } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES, thumbEligible } from "../services/mime";
 import { toNodeDto, toOwnAvatarDto } from "../services/node-dto";
 import { requireRole, requireUpload, type Role } from "../services/permissions";
@@ -105,7 +106,7 @@ import { db, deps, type AppEnv, type ServiceDeps } from "../services/request-con
 import { adminListOf } from "../services/signup-policy";
 import { enqueueScan, lockSuspectedCsam, scanSmallObject, type ScanVerdict } from "../services/scanning";
 import { avatarKey, keyFor, storage, thumbKey, type Storage, type UploadedPart } from "../services/storage";
-import { addStrike } from "../services/strikes";
+import { addStrike, type StrikeResult } from "../services/strikes";
 import { sealIp } from "../services/tokens";
 
 export const router = new Hono<AppEnv>();
@@ -413,9 +414,14 @@ async function abandonClaimed(
  * failure is recorded and the operators are told by the session's id, and the handler completes
  * the job when it is called again for the node.
  */
-async function lockOrRecord(c: Ctx, nodeId: string, session: Upload): Promise<void> {
+async function lockOrRecord(
+  c: Ctx,
+  nodeId: string,
+  session: Upload,
+  source: "system" | "photodna" = "system",
+): Promise<void> {
   try {
-    await lockSuspectedCsam(deps(c), nodeId, { source: "system" });
+    await lockSuspectedCsam(deps(c), nodeId, { source });
   } catch (error) {
     captureError(error, { kind: "upload_csam_lock" });
     metric("error", { kind: "upload_csam_lock" });
@@ -509,6 +515,7 @@ async function preserveAndEnd(
   session: Upload,
   sha256: string,
   declaredSha256: string,
+  source: "system" | "photodna" = "system",
 ): Promise<void> {
   const uploader = requireVerified(c);
   const own = session.ownerId === uploader.id;
@@ -521,7 +528,7 @@ async function preserveAndEnd(
     written = true;
     audit(c, "upload.csam_preserved", { type: "node", id: node.id }, { uploadId: session.id });
     metric("upload", { outcome: "csam_preserved", kind: modeOf(session) });
-    await lockOrRecord(c, node.id, session);
+    await lockOrRecord(c, node.id, session, source);
   } catch (error) {
     if (written) throw error;
     await oweNode(c, session, error, { server: sha256, declared: declaredSha256 });
@@ -930,7 +937,7 @@ async function insertNamed(
 type Becomes =
   | { as: "replace"; sha256: string }
   | { as: "new"; values: NodeValues }
-  | { as: "avatar"; values: NodeValues; current: boolean };
+  | { as: "avatar"; values: NodeValues; current: boolean; infected: boolean };
 
 type Finished = {
   node: Node;
@@ -939,6 +946,8 @@ type Finished = {
   removed: DeletedRows[];
   /** Avatar nodes a hold kept. */
   keptHeld: number;
+  /** An infected avatar's strike, written in the transaction: its suspension is applied after it. */
+  strike: StrikeResult | null;
 };
 
 class ReplaceRefused extends Error {}
@@ -962,6 +971,7 @@ async function finish(
     let previousVersionId: string | null = null;
     const removed: DeletedRows[] = [];
     let keptHeld = 0;
+    let strike: StrikeResult | null = null;
     if (becomes.as === "replace") {
       // First: it takes the owner's `user` row, then the node.
       try {
@@ -999,6 +1009,20 @@ async function finish(
         if (becomes.current) await sessions.setAvatarNode(tx, uploader.id, becomes.values.id!);
       }
       node = await insertNamed(tx, becomes.values);
+      if (becomes.as === "avatar" && becomes.infected) {
+        // What the scan consumer does for an infected file (scan/verdict.ts `applyVerdict`): an
+        // UNLISTED server hash is listed `malware` with this node as its source (an entry listed
+        // since `inspect` read it — dmca, admin, csam — is never rewritten), and the uploader is
+        // struck once per content — in the transaction that writes the node.
+        if (!(await blocklist.lookup(tx, node.sha256!))) {
+          await blocklist.upsert(tx, { sha256: node.sha256!, reason: "malware", sourceNodeId: node.id });
+        }
+        strike = await addStrike(
+          deps(c),
+          { userId: uploader.id, kind: "malware", nodeId: node.id, sha256: node.sha256! },
+          { tx },
+        );
+      }
     }
     if (session.purpose === "file") await quota.commit(tx, session.ownerId, session.size);
     await sessions.setDeclaredHash(tx, session.id, declaredSha256);
@@ -1017,7 +1041,7 @@ async function finish(
       iv: sealed.iv,
       keyVersion: sealed.keyVersion,
     });
-    return { node, previousVersionId, removed, keptHeld };
+    return { node, previousVersionId, removed, keptHeld, strike };
   });
 }
 
@@ -1055,6 +1079,65 @@ async function avatarVerdict(
   const bytes = new Uint8Array(await read.object.arrayBuffer());
   const verdict = await scanSmallObject(env, bytes);
   return { verdict, mimeSniffed: await sniff(bytes.subarray(0, SNIFF_PREFIX_BYTES), session.name) };
+}
+
+/**
+ * After the commit of an infected avatar, what follows the consumer's for an infected file: the
+ * `scan.infected` audit row, the strike's suspension (a failure is logged; the hourly sweep
+ * completes it) and the quarantine notice to the uploader (its failure is logged, never thrown).
+ */
+async function afterInfectedAvatar(
+  c: Ctx,
+  user: SessionUser,
+  node: Node,
+  strike: StrikeResult | null,
+): Promise<void> {
+  audit(
+    c,
+    "scan.infected",
+    { type: "node", id: node.id },
+    { signatures: node.scanDetail?.signatures ?? [], blocklist: null },
+  );
+  if (strike?.applySuspension) {
+    try {
+      await strike.applySuspension();
+    } catch (error) {
+      captureError(error, { kind: "upload_strike" });
+      metric("error", { kind: "upload_strike" });
+    }
+  }
+  await sendQuarantineNotice(deps(c), { to: user.email, fileName: node.name }).catch((error: unknown) => {
+    captureError(error, { kind: "upload_avatar_notice" });
+  });
+}
+
+/**
+ * The PhotoDNA check the scan consumer runs on every image (scan/photodna.ts; off unless
+ * `PHOTODNA_ENABLED`), for an avatar. `failed`: PhotoDNA could not CHECK it (the consumer's
+ * `PhotoDnaTransientError`, which there ends `error` after its retries): FAIL CLOSED — the
+ * avatar is written `error` and never becomes current; the user uploads again.
+ */
+async function avatarPhotoDna(
+  c: Ctx,
+  session: Upload,
+  mimeSniffed: string,
+): Promise<{ result: PhotoDnaResult | null; failed: boolean }> {
+  try {
+    const result = await checkPhotoDna(deps(c), {
+      key: session.r2Key,
+      size: session.size,
+      mimeSniffed,
+      ownerId: session.ownerId,
+    });
+    if (result && "skipped" in result)
+      metric("scan", { outcome: "photodna_skipped", reason: result.skipped });
+    return { result, failed: false };
+  } catch (error) {
+    if (!(error instanceof PhotoDnaTransientError)) throw error;
+    captureError(error, { kind: "upload_avatar_photodna" });
+    metric("scan", { outcome: "photodna_failed", kind: "avatar" });
+    return { result: null, failed: true };
+  }
 }
 
 /**
@@ -1370,6 +1453,15 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   let place!: Place;
   let sha256!: string;
   let hit: Verified["hit"] = null;
+  /** The avatar's scan and PhotoDNA check — run once the blocklist has not stopped it. */
+  let scanned: {
+    verdict: ScanVerdict;
+    mimeSniffed: string;
+    photodna: PhotoDnaResult | null;
+    photodnaFailed: boolean;
+  } | null = null;
+  /** Who found the bytes to be suspected CSAM: the blocklist (`system`) or PhotoDNA. */
+  let csamSource: "system" | "photodna" | null = null;
   let sealed!: Awaited<ReturnType<typeof sealIp>>;
   try {
     if (declared) {
@@ -1395,9 +1487,27 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       }
     }
 
+    if (hit) csamSource = "system";
+
+    if (avatar && !csamSource) {
+      const { verdict, mimeSniffed } = await avatarVerdict(store, c.env, session);
+      // An avatar is a picture the image service takes — decided from the bytes, not the declared
+      // type. Anything else is not stored at all.
+      if (!thumbEligible({ mimeSniffed, size: session.size, scanStatus: "clean" })) {
+        await giveUp("not_image");
+        throw new AppError("validation", "An avatar is an image.");
+      }
+      const photodna = await avatarPhotoDna(c, session, mimeSniffed);
+      scanned = { verdict, mimeSniffed, photodna: photodna.result, photodnaFailed: photodna.failed };
+      if (photodna.result && "match" in photodna.result && photodna.result.match) {
+        csamSource = "photodna";
+        evidence = true;
+      }
+    }
+
     sealed = await sealIp(c.env, c.get("ip"));
 
-    if (hit) {
+    if (csamSource) {
       // Suspected CSAM: nothing is deleted. The object becomes a node — for a replace a row of its
       // own, the existing file untouched — written ALREADY LOCKED, in the transaction that creates
       // it; the one shared handler then files the report, holds the accounts and tells the
@@ -1414,12 +1524,12 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
         // object was being hashed): the bytes are evidence all the same.
         captureError(error, { kind: "upload_csam_finish" });
         handedOver = true;
-        await preserveAndEnd(c, session, sha256, body.sha256);
+        await preserveAndEnd(c, session, sha256, body.sha256, csamSource);
         throw blocked();
       }
       handedOver = true;
       audit(c, "node.upload", { type: "node", id: node.id }, { uploadId: session.id, size: session.size });
-      await lockOrRecord(c, node.id, session);
+      await lockOrRecord(c, node.id, session, csamSource);
       throw blocked();
     }
   } catch (error) {
@@ -1436,23 +1546,23 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   if (replacing) {
     becomes = { as: "replace", sha256 };
   } else if (avatar) {
-    const { verdict, mimeSniffed } = await avatarVerdict(store, c.env, session);
-    // An avatar is a picture the image service takes — decided from the bytes, not the declared
-    // type. Anything else is not stored at all.
-    if (!thumbEligible({ mimeSniffed, size: session.size, scanStatus: "clean" })) {
-      await giveUp("not_image");
-      throw new AppError("validation", "An avatar is an image.");
-    }
+    const { verdict, mimeSniffed, photodna, photodnaFailed } = scanned!;
+    // A PhotoDNA check that failed is `error` — what the consumer's dead-letter queue ends such a
+    // file with — and never the avatar.
+    const status = photodnaFailed ? "error" : verdict.status;
     becomes = {
       as: "avatar",
-      current: verdict.status === "clean",
+      current: status === "clean",
+      infected: status === "infected",
       values: {
         ...nodeValues(session, user.id, sha256),
-        scanStatus: verdict.status,
-        scanReason: verdict.reason ?? null,
+        scanStatus: status,
+        scanReason: photodnaFailed ? "engine" : (verdict.reason ?? null),
         scanDetail: {
           engine: verdict.engine,
           ...(verdict.signatures.length > 0 ? { signatures: verdict.signatures } : {}),
+          ...(photodna ? { photodna: photodnaNote(photodna) } : {}),
+          ...(photodnaFailed ? { photodna: "error" } : {}),
         },
         scannedAt: now(c),
         mimeSniffed,
@@ -1498,6 +1608,7 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       );
     }
     if (finished.keptHeld > 0) metric("upload", { outcome: "avatar_kept_held" }, finished.keptHeld);
+    if (becomes.infected) await afterInfectedAvatar(c, user, node, finished.strike);
     await discardRemoved(c, store, finished.removed);
     return c.json(await toOwnAvatarDto(db(c), node, { viewerId: user.id }), 201);
   }
