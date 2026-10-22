@@ -19,3 +19,13 @@ export async function navigateInApp(page: Page, path: string): Promise<void> {
   }, path);
   await page.waitForURL((url) => url.pathname + url.search === path);
 }
+
+/**
+ * The budget for the FIRST thing a test asserts after a document load (`goto`, `reload`). That
+ * assertion waits for the whole load — ~320 uncached module requests to ONE single-threaded dev
+ * server, then the page's lazy chunk and its first API read — and with three browsers loading at
+ * once it stalled past Playwright's default 5 s on a run at load 10–19 (a /signup load that takes
+ * 2–3 s settled took 6.5 s; two runs, five tests: avseam's e2e3 and t27b's e2e). Not reproducible by
+ * CPU load alone, so the budget is a measured margin (3× the slowest settled load seen), not a cure.
+ */
+export const DOCUMENT_LOAD = { timeout: 15_000 } as const;

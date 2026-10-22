@@ -87,7 +87,7 @@ async function expectStatus(
 export function rolesFor(deps: RoleDeps): Roles & { close(): Promise<void> } {
   const { page, browser, testInfo, maxLoads } = deps;
   const extras: Array<{ context: BrowserContext; loads: string[]; role: string }> = [];
-  const seed = `${testInfo.project.name}|${testInfo.testId}|${testInfo.retry}`;
+  const seed = `${testInfo.project.name}|${testInfo.testId}|${testInfo.retry}|${testInfo.repeatEachIndex}`;
   const made = new Map<string, Promise<unknown>>();
   const once = <T>(role: string, make: () => Promise<T>): Promise<T> => {
     if (remoteMode() !== null) {

@@ -42,7 +42,7 @@ import { addressFor } from "./fixtures/address";
  */
 const own = (role: string) => {
   const info = test.info();
-  return addressFor(`${info.project.name}|${info.testId}|${info.retry}|${role}`);
+  return addressFor(`${info.project.name}|${info.testId}|${info.retry}|${info.repeatEachIndex}|${role}`);
 };
 
 const run = promisify(execFile);

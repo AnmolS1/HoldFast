@@ -10,7 +10,7 @@ import type { Page } from "@playwright/test";
 import { HEADER_LINK_SESSION } from "../../src/shared/constants";
 import { localDb, signedInUser } from "../setup/auth-fixtures";
 import { appOrigin, e2ePort } from "../setup/local-env";
-import { expect, stubTurnstile, test } from "./fixtures";
+import { DOCUMENT_LOAD, expect, stubTurnstile, test } from "./fixtures";
 
 /** A clean file of `ownerId` (at their top level, or in `parentId`), as rows only (no object is stored). */
 async function seedFile(
@@ -71,7 +71,7 @@ test("a visitor's report hides the file: the confirmation, the link 'temporarily
   await stubTurnstile(page);
 
   await page.goto(`/s/${token}`);
-  await expect(page.getByRole("heading", { name })).toBeVisible();
+  await expect(page.getByRole("heading", { name })).toBeVisible(DOCUMENT_LOAD);
   await page.locator("[data-report-link]").click();
   const dialog = page.getByRole("dialog", { name: "Report this file" });
   await dialog.getByLabel("Phishing or a scam").check();
@@ -84,7 +84,9 @@ test("a visitor's report hides the file: the confirmation, the link 'temporarily
 
   // The link itself is paused for the report.
   await page.reload();
-  await expect(page.getByRole("heading", { name: "This link is temporarily unavailable." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "This link is temporarily unavailable." })).toBeVisible(
+    DOCUMENT_LOAD,
+  );
 
   // The owner, in the app: "Under review" on the file — no category, no reporter, no count.
   await page.goto("/");
@@ -105,7 +107,7 @@ test("a dangerous file: the interstitial first, the acknowledged download works 
   page.context().on("page", (opened) => void opened.close().catch(() => {}));
 
   await page.goto(`/s/${token}`);
-  await expect(page.getByRole("heading", { name })).toBeVisible();
+  await expect(page.getByRole("heading", { name })).toBeVisible(DOCUMENT_LOAD);
   let minted = 0;
   page.on("request", (request) => {
     if (request.url().endsWith("/download-url")) minted += 1;

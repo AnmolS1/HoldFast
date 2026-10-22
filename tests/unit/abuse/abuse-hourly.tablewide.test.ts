@@ -30,7 +30,8 @@ import { csamAlertMarker, lockSuspectedCsam } from "../../../src/worker/services
 import { nameKeyOf } from "../../../src/worker/services/filename";
 import { keyFor } from "../../../src/worker/services/storage";
 import { mailTo, makeLink } from "../auth/helpers";
-import { cronEvent, jobContext, makeFile, member, rand, testDb } from "../trash/helpers";
+import { cronEvent, jobContext, makeFile, member, rand, TERMS, testDb } from "../trash/helpers";
+import { baId } from "../services-core/helpers";
 import { operators, sessionReport } from "./helpers";
 import { makeFolder, makeShare } from "../sharing/helpers";
 
@@ -369,6 +370,22 @@ async function strikesFor(
   }
 }
 
+/** `strikesFor` for many users in ONE statement. */
+async function strikesForMany(db: Db, userIds: string[], n: number, opts: { daysAgo?: number } = {}) {
+  const at = new Date(Date.now() - (opts.daysAgo ?? 364.5) * DAY);
+  await db.insert(strikes).values(
+    userIds.flatMap((userId) =>
+      Array.from({ length: n }, () => ({
+        userId,
+        kind: "abuse" as const,
+        nodeId: uuidv7(),
+        at,
+        liftedAt: null,
+      })),
+    ),
+  );
+}
+
 async function withSession(db: Db, userId: string) {
   await db.insert(authSession).values({
     id: rand(16),
@@ -457,11 +474,22 @@ describe("(a) the strike sweep in abuse-hourly", () => {
       only("sweepStrikeThresholds");
       const failing = 201; // > the job's limit of 200
       const stuck: string[] = [];
-      for (let i = 0; i < failing; i++) {
-        const u = await member();
-        stuck.push(u.id);
-        await strikesFor(db, u.id, 3, { daysAgo: 364.9 });
-      }
+      // The 201 users and their strikes are two statements, not 804 round trips: a database busy with
+      // other suites made the serial version run past the test's 5 s budget while it only built fixtures.
+      const stuckUsers = Array.from({ length: failing }, () => {
+        const id = baId();
+        return {
+          id,
+          name: `Test ${id.slice(0, 6)}`,
+          email: `${id.toLowerCase()}@services-core.example.test`,
+          emailVerified: true,
+          termsVersion: TERMS,
+          termsAcceptedAt: new Date(),
+        };
+      });
+      await db.insert(userTable).values(stuckUsers);
+      stuck.push(...stuckUsers.map((u) => u.id));
+      await strikesForMany(db, stuck, 3, { daysAgo: 364.9 });
       const ordinary = await member();
       await strikesFor(db, ordinary.id, 3, { daysAgo: 364.8 });
       // Every suspension of one of the `stuck` users fails (its transaction is refused).
