@@ -355,7 +355,10 @@ describe("every mutating admin route writes an audit row with the admin as actor
       targetId === null
         ? await testDb().select().from(auditLog).where(eq(auditLog.actorUserId, who.id))
         : await auditAbout(targetId)
-    ).filter((row) => row.action === action && row.at >= started);
+    )
+      // A shared target (the scanner instances) is also audited by other files running at the same
+      // time (system.test.ts' scanner-check), so only this admin's rows are this scenario's.
+      .filter((row) => row.action === action && row.at >= started && row.actorUserId === who.id);
     expect(rows.length, `${action} for ${key}`).toBeGreaterThanOrEqual(1);
     for (const row of rows) {
       expect(row.actorUserId).toBe(who.id);
