@@ -1,4 +1,4 @@
-// Wrapper over the Workers Rate Limiting bindings (RL_AUTH, RL_API, RL_FILES, RL_LINKS).
+// Wrapper over the Workers Rate Limiting bindings (RL_AUTH, RL_API, RL_FILES, RL_LINKS, RL_ADMIN).
 //
 // The binding is per-colo and eventually consistent: it is a coarse abuse control, nothing more.
 // A hard daily limit is a database ledger, not this. The binding reports only success or failure,
@@ -10,7 +10,7 @@
 import { AppError } from "./errors";
 import { writeMetric } from "./metrics";
 
-export type LimiterName = "RL_AUTH" | "RL_API" | "RL_FILES" | "RL_LINKS";
+export type LimiterName = "RL_AUTH" | "RL_API" | "RL_FILES" | "RL_LINKS" | "RL_ADMIN";
 
 /** Every limiter in wrangler.jsonc has `period: 60`. */
 export const RATE_LIMIT_PERIOD_SECONDS = 60;

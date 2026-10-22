@@ -81,8 +81,9 @@ describe("CSRF: every state-changing /api/* route outside the exemptions refuses
 
   it("403 csrf for a cross-site Origin, for Sec-Fetch-Site: cross-site, and for neither header", async () => {
     const routes = [...stateChangingRoutes()].filter(([path]) => !isExemptPath(path));
-    // The real registry (T11–T24, 29 state-changing patterns at 113011a); grows with every merge.
-    expect(routes.length).toBeGreaterThanOrEqual(29);
+    // The real registry: 29 state-changing patterns at 113011a (T11–T24), 62 at 6bfe8d5 (+ T22's
+    // signed-in report, T25's admin console); grows with every merge.
+    expect(routes.length).toBeGreaterThanOrEqual(62);
     const fake = fakeCore();
     const app = appWith(fake);
     let checked = 0;
@@ -106,7 +107,18 @@ describe("CSRF: every state-changing /api/* route outside the exemptions refuses
     }
     // Refused before anything opened the database or read a session.
     expect(fake.calls).toEqual([]);
-    expect(checked).toBeGreaterThanOrEqual(29 * 4);
+    expect(checked).toBeGreaterThanOrEqual(62 * 4);
+  });
+
+  it("the walk includes the Wave-3 routes: the signed-in report and every admin console mutation (T22, T25)", () => {
+    const walked = [...stateChangingRoutes()]
+      .filter(([path]) => !isExemptPath(path))
+      .flatMap(([path, methods]) => [...methods].map((method) => `${method} ${path}`));
+    expect(walked).toContain("POST /api/reports");
+    // routes/admin.ts at 6bfe8d5: 32 state-changing (method, pattern) pairs, none of them exempt.
+    expect(walked.filter((route) => route.includes(" /api/admin/")).length).toBeGreaterThanOrEqual(32);
+    expect(walked).toContain("PATCH /api/admin/settings");
+    expect(walked).toContain("POST /api/admin/moderation/lock-csam");
   });
 
   it("control: the same requests from the app origin are not refused as cross-site", async () => {

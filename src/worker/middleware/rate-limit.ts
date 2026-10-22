@@ -17,6 +17,11 @@
 //             A GET, a HEAD or an OPTIONS under /api/auth/* never spends it — above all the
 //             session read the shell makes in every route guard and on every window focus:
 //             people behind one address would otherwise spend each other's sign-in attempts.
+//             Nor does Better Auth's admin plugin (/api/auth/admin/*): see RL_ADMIN.
+//   RL_ADMIN  every request under /api/auth/admin/* (the admin plugin: ban, unban, set role,
+//             impersonate), 60 a minute, keyed by the signed-in user (`u:<id>`; by address when
+//             signed out, which the plugin's gate refuses anyway). An operator's bulk moderation
+//             must not spend the sign-in budget of the address they sign in from (T26B Q-B1).
 //   RL_API    by user (`u:<id>`) when signed in, else by client address, on every /api/* path
 //             but the CSP report endpoint, which spends a bucket of its own (`csp:<address>`, in
 //             routes/csp-report.ts): a page with a repeating violation must not use up its
@@ -55,6 +60,7 @@ import type { AppEnv } from "../services/request-context";
 export function authBudgetOf(method: string, path: string): "ip" | "intent" | "inv" | null {
   if (path === "/api/auth-intent") return method === "POST" ? "intent" : null;
   if (path.startsWith("/api/invites/")) return "inv";
+  if (path.startsWith(ADMIN_PLUGIN_PREFIX)) return null;
   if (path.startsWith(`${AUTH_PREFIX}/`) && spendsAuthBudget(method, path.slice(AUTH_PREFIX.length))) {
     return "ip";
   }
@@ -65,6 +71,9 @@ export function authBudgetOf(method: string, path: string): "ip" | "intent" | "i
 export function ipKey(ip: string): string {
   return `ip:${normalise(ip)}`;
 }
+
+/** Better Auth's admin plugin: RL_ADMIN, never RL_AUTH (see the header). */
+const ADMIN_PLUGIN_PREFIX = `${AUTH_PREFIX}/admin/`;
 
 /** Limited by its own bucket in its route (see the header). */
 const CSP_REPORT_PATH = "/api/public/csp-report";
@@ -78,6 +87,8 @@ export const rateLimit: MiddlewareHandler<AppEnv> = async (c, next) => {
     await enforceRateLimit(c.env, "RL_AUTH", budget === "ip" ? key : `${budget}:${normalise(c.get("ip"))}`);
   if (path === CSP_REPORT_PATH) return next();
   const user = c.get("user");
+  if (path.startsWith(ADMIN_PLUGIN_PREFIX))
+    await enforceRateLimit(c.env, "RL_ADMIN", user ? `u:${user.id}` : key);
   await enforceRateLimit(c.env, "RL_API", user ? `u:${user.id}` : key);
   return next();
 };

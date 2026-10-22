@@ -15,6 +15,7 @@
     "scripts/seed-dev.ts",
     "scripts/create-invite.ts",
     "scripts/create-session.ts",
+    "scripts/lib/seed-session.ts",
     "tests/setup/node-db-env.d.ts"
   ],
   "exclude": []

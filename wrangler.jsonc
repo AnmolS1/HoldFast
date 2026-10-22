@@ -93,6 +93,7 @@
     { "name": "RL_API", "namespace_id": "1002", "simple": { "limit": 600, "period": 60 } },
     { "name": "RL_FILES", "namespace_id": "1003", "simple": { "limit": 300, "period": 60 } },
     { "name": "RL_LINKS", "namespace_id": "1004", "simple": { "limit": 30, "period": 60 } },
+    { "name": "RL_ADMIN", "namespace_id": "1005", "simple": { "limit": 60, "period": 60 } },
   ],
   "containers": [
     {
@@ -180,6 +181,7 @@
         { "name": "RL_API", "namespace_id": "2002", "simple": { "limit": 600, "period": 60 } },
         { "name": "RL_FILES", "namespace_id": "2003", "simple": { "limit": 300, "period": 60 } },
         { "name": "RL_LINKS", "namespace_id": "2004", "simple": { "limit": 30, "period": 60 } },
+        { "name": "RL_ADMIN", "namespace_id": "2005", "simple": { "limit": 60, "period": 60 } },
       ],
       "containers": [
         {

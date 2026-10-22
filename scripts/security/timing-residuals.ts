@@ -13,7 +13,8 @@
 //       --out "$DIR/kinds.json" [--n 200] [--non-prod-host <db host>]
 //   npx tsx scripts/security/timing-residuals.ts measure --base <app> --files <files origin> \
 //       --session owner.json --kinds "$DIR/kinds.json" [--peer-session peer.json] \
-//       [--groups files404,api404,delete,init,complete] [--n 200] [--rate-api 8] [--rate-files 4] [--local]
+//       [--groups files404,api404,delete,init,complete,report404] [--n 200] [--rate-api 8] [--rate-files 4]
+//       [--rate-links 0.4] [--local]
 //
 // Groups (the residuals of T26 item 17 and the brief's additions):
 //   files404  files host, every kind of 404 for the URL's own user: a replaced version, trashed,
@@ -28,9 +29,15 @@
 //             has run) vs --peer-session's account, which holds none (T23 d3)
 //   complete  upload complete of a small file whose declared hash is LISTED vs one that is merely
 //             wrong (T12 Addendum 8 (1)); the bytes are never the listed ones
+//   report404 POST /api/public/report, every 404 before Turnstile (T22 review m9): a token that is
+//             no link; a live link (the caller's own folder) with an id that does not exist, with
+//             the caller's file OUTSIDE the link's root, and with another account's file. Every
+//             answer must be the 404 — anything else stops the run — and the Turnstile token is
+//             made up, so no report can ever be filed (a filed report would pause the link)
 //
-// Rates: the limits are RL_API 600/60 s per user and RL_FILES 300/60 s per address; the defaults
-// stay under them. A 429 stops the run. Nothing secret is printed.
+// Rates: the limits are RL_API 600/60 s per user, RL_FILES 300/60 s and RL_LINKS 30/60 s per
+// address; the defaults stay under them (report404 at 0.4/s: 4 × 200 requests take 33 minutes).
+// A 429 stops the run. Nothing secret is printed.
 
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
@@ -53,9 +60,10 @@ const { values, positionals } = parseArgs({
     kinds: { type: "string" },
     out: { type: "string" },
     n: { type: "string", default: "200" },
-    groups: { type: "string", default: "files404,api404,delete,init,complete" },
+    groups: { type: "string", default: "files404,api404,delete,init,complete,report404" },
     "rate-api": { type: "string", default: "8" },
     "rate-files": { type: "string", default: "4" },
+    "rate-links": { type: "string", default: "0.4" },
     "non-prod-host": { type: "string" },
     local: { type: "boolean", default: false },
   },
@@ -74,6 +82,8 @@ type Kinds = {
   /** Trashed roots: held folders, folders not held, and files whose (untrashed) folder is held. */
   delete: { held: string[]; unheld: string[]; inherited: string[] };
   listedSha256: string;
+  /** A live link on a folder of the caller (its token: the kinds file is mode 600) and the ids. */
+  report404?: { token: string; absent: string; outside: string; otherOwner: string };
 };
 
 const fail = (message: string): never => {
@@ -110,6 +120,7 @@ function pacer(rate: number) {
 }
 const apiPace = pacer(Number(values["rate-api"]));
 const filesPace = pacer(Number(values["rate-files"]));
+const linksPace = pacer(Number(values["rate-links"]));
 
 function api(
   cookie: string,
@@ -233,6 +244,23 @@ async function seed() {
     // The URLs are minted by `measure`, block by block (a download token lives 300 s).
     await set("legal_hold = true", [ownHeld]);
 
+    // report404: a link on a folder of the caller's (made through the API, as the owner would),
+    // and three ids it does not prove: none, the caller's own file outside it, another account's.
+    const linked = await folder(owner, null, `timing report ${rand(4)}`);
+    await file(owner, linked);
+    await apiPace();
+    const link = await api(cookie, `/nodes/${linked}/links`, { json: { allowPreview: true } });
+    if (!link.ok) fail(`report404: the link: ${link.status}`);
+    const { url } = (await link.json()) as { url: string | null };
+    const token = url ? new URL(url).pathname.split("/")[2] : undefined;
+    if (!token) fail("report404: no token in the link's url");
+    kinds.report404 = {
+      token: token!,
+      absent: uuidv7(),
+      outside: await file(owner, null),
+      otherOwner: kinds.api404["no share"]!,
+    };
+
     // DELETE: n trashed folders of one file each, held and not held. Trashed through the API (the
     // route's own bookkeeping); the hold set after, as an admin would.
     for (const held of [true, false]) {
@@ -285,7 +313,7 @@ async function timed(run: () => Promise<Response>, read?: (body: ArrayBuffer) =>
   if (response.status === 429) {
     const code = /"error":"([a-z_]+)"/.exec(new TextDecoder().decode(body))?.[1] ?? "text";
     fail(
-      `429 (${code}) from the server — nothing more is sent (rate_limited: lower --rate-api / --rate-files)`,
+      `429 (${code}) from the server — nothing more is sent (rate_limited: lower --rate-api / --rate-files / --rate-links, or wait out another client's use of this address)`,
     );
   }
   return { ms, status: response.status };
@@ -448,6 +476,41 @@ async function measure() {
         },
       })),
       rounds,
+    );
+  }
+  if (groups.has("report404")) {
+    if (!kinds.report404) fail("report404: the kinds file has no report404 entry (seed again)");
+    const { token, absent, outside, otherOwner } = kinds.report404!;
+    const report = (linkToken: string, nodeId: string) => async () => {
+      await linksPace();
+      const sample = await timed(() =>
+        fetch(`${base}/api/public/report`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: base, "sec-fetch-site": "same-origin" },
+          body: JSON.stringify({
+            nodeId,
+            linkToken,
+            category: "spam",
+            details: "",
+            turnstileToken: "timing-residuals-not-a-token", // made up: never a pass
+          }),
+        }),
+      );
+      if (sample.status !== 404) fail(`report404: a ${sample.status}, not the 404 — stopped`);
+      return sample;
+    };
+    await runGroup(
+      "POST /api/public/report: every 404 before Turnstile (T22 m9)",
+      // The m9 question is whether the LIVE-link kinds separate from each other: the first kind (the
+      // one every P is against) is one of them. The token of no link is last, for context only — it
+      // is cheaper by ruling (RPTFIX DECISION 3) and is expected to separate.
+      [
+        { name: "live link, id that does not exist", once: report(token, absent) },
+        { name: "live link, own file outside the root", once: report(token, outside) },
+        { name: "live link, another account's file", once: report(token, otherOwner) },
+        { name: "token of no link (cheaper by ruling)", once: report(rand(22), absent) },
+      ],
+      n,
     );
   }
   if (groups.has("init")) {
