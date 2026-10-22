@@ -540,6 +540,26 @@ async function preserveAndEnd(
 }
 
 /**
+ * What `writeLockedNode` (and `nodeValues`) read of a session — all of it what the bytes ARE and
+ * where they were meant to go. A session passes itself; the scan consumer, preserving the bytes
+ * of a file deleted before its PhotoDNA verdict (scan/consumer.ts), passes the file's own values
+ * and the key it copied them to.
+ */
+export type LockedNodeSource = Pick<
+  Upload,
+  | "ownerId"
+  | "nodeId"
+  | "replaceNodeId"
+  | "purpose"
+  | "name"
+  | "size"
+  | "mimeDeclared"
+  | "r2Key"
+  | "versionId"
+  | "parentId"
+>;
+
+/**
  * The database half of preserving: the session's verified CSAM bytes become a file node of the
  * UPLOADER's own, at their top level, `LOCKED` from the row's first commit — one transaction
  * (`retryOnDeadlock`; on a transaction it runs in a savepoint): the editor's reservation (the
@@ -550,7 +570,7 @@ async function preserveAndEnd(
  */
 export async function writeLockedNode(
   deps: { db: Executor },
-  session: Upload,
+  session: LockedNodeSource,
   opts: { uploaderId: string; sha256: string; size: number; sealed: SealedIp | null },
 ): Promise<Node> {
   const { uploaderId, sha256, size, sealed } = opts;
@@ -1045,7 +1065,12 @@ async function finish(
   });
 }
 
-function nodeValues(session: Upload, uploaderId: string, sha256: string, id = session.nodeId): NodeValues {
+function nodeValues(
+  session: Omit<LockedNodeSource, "replaceNodeId">,
+  uploaderId: string,
+  sha256: string,
+  id = session.nodeId,
+): NodeValues {
   return {
     id,
     ownerId: session.ownerId,

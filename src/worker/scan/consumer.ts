@@ -56,6 +56,7 @@
 // LOGS carry keys and node ids only — never a file name or an address.
 
 import * as blocklist from "../db/queries/blocklist";
+import { uuidv7 } from "../db/ids";
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
@@ -69,8 +70,10 @@ import {
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { Node } from "../db/schema";
 import { mailOperators, ROLLBACK_MAIL_EVERY_MS } from "../jobs/reconcile";
+import { writeLockedNode } from "../routes/uploads";
 import { captureError } from "../sentry";
-import { auditInTx } from "../services/audit";
+import { audit, auditInTx } from "../services/audit";
+import { sendOperatorCritical } from "../services/email";
 import { sniff, SNIFF_PREFIX_BYTES } from "../services/mime";
 import type { BackgroundContext } from "../services/request-context";
 import {
@@ -81,7 +84,7 @@ import {
   type ScanMessage,
   type ScanVerdict,
 } from "../services/scanning";
-import { storage } from "../services/storage";
+import { keyFor, storage } from "../services/storage";
 import { adminListOf } from "../services/signup-policy";
 import { enforceStrikeThreshold } from "../services/strikes";
 import {
@@ -230,6 +233,15 @@ async function scanClaimed(
   const kind = verdict.engine === "stub" ? "stub" : "clamav";
   if (applied.kind === "gone") {
     bg.metric("scan", { outcome: "replaced", kind });
+    if (applied.photodna) {
+      await preserveDetection(
+        bg,
+        scan.key,
+        node,
+        verdict.sha256?.toLowerCase() ?? null,
+        applied.photodna.preserveAs,
+      );
+    }
   } else {
     if (photodna && "skipped" in photodna)
       bg.metric("scan", { outcome: "photodna_skipped", reason: photodna.skipped });
@@ -248,6 +260,106 @@ async function scanClaimed(
     }
   }
   message.ack();
+}
+
+/**
+ * A PhotoDNA match on a key that is no longer its file's (deleted — purged — or replaced before the
+ * verdict). A detection is never dropped: `applyVerdict` has listed the server hash csam, naming
+ * `preserveAs`, and here —
+ *   the object still there   its bytes are COPIED to a key of their own (`keyFor(uploader,
+ *                            preserveAs, …)`: the purge that removed the row deletes the old key
+ *                            right after its commit and asks nothing — a row on the old key would
+ *                            point at a missing object) and become a node of the UPLOADER's own,
+ *                            top level, written LOCKED (`writeLockedNode`, as the upload route
+ *                            preserves bytes — the folder's owner is not held for it), then the
+ *                            shared CSAM lock (source photodna): reported, the uploader held;
+ *   otherwise                the detection is RECORDED: `scan.csam_detection_unpreserved` with the
+ *                            hash, held from retention (`legalHold`), and the critical operator
+ *                            alert by the deleted file's id — also when the copy or the node fails.
+ * NEVER THROWS: a redelivery finds no node for the key and acknowledges it (an orphan), so a throw
+ * here would be the silent drop. The bytes are counted on the uploader by the next reconcile (the
+ * purge has released them; nothing is reserved here).
+ */
+async function preserveDetection(
+  bg: BackgroundContext,
+  key: string,
+  file: Node,
+  sha256: string | null,
+  preserveAs: string | null,
+): Promise<void> {
+  let copied: string | null = null;
+  const record = async (reason: string) => {
+    audit(
+      bg,
+      "scan.csam_detection_unpreserved",
+      { type: "node", id: file.id },
+      {
+        key,
+        source: "photodna",
+        reason,
+        ...(sha256 ? { sha256 } : {}),
+        ...(file.createdBy ? { uploaderId: file.createdBy } : {}),
+        ...(copied ? { copiedTo: copied } : {}),
+        // Kept past the audit retention: it is the only record of the detection.
+        legalHold: true,
+      },
+    );
+    bg.metric("error", { kind: "scan_csam_unpreserved", reason });
+    for (const to of adminListOf(bg.env).addresses) {
+      await sendOperatorCritical(bg, { to, event: "csam_lock", id: file.id }).catch((error: unknown) =>
+        captureError(error, { kind: "scan", reason: "csam_alert" }),
+      );
+    }
+  };
+  const uploader = file.createdBy;
+  let preserved: Node;
+  try {
+    if (!sha256 || !preserveAs) return await record("no_server_hash");
+    if (!uploader) return await record("no_uploader");
+    const store = storage(bg.env);
+    const read = await store.get(key);
+    if (read?.kind !== "body") return await record("object_gone");
+    const versionId = uuidv7();
+    const r2Key = keyFor(uploader, preserveAs, versionId);
+    await store.put(r2Key, read.object.body, { size: read.object.size });
+    copied = r2Key;
+    preserved = await writeLockedNode(
+      bg,
+      {
+        ownerId: uploader,
+        nodeId: preserveAs,
+        replaceNodeId: null,
+        purpose: "file",
+        name: file.name,
+        size: read.object.size,
+        mimeDeclared: file.mimeDeclared,
+        r2Key,
+        versionId,
+        parentId: null,
+      },
+      { uploaderId: uploader, sha256, size: read.object.size, sealed: null },
+    );
+  } catch (error) {
+    captureError(error, { kind: "scan", reason: "csam_preserve" });
+    try {
+      await record("preserve_failed");
+    } catch (inner) {
+      captureError(inner, { kind: "scan", reason: "csam_preserve" });
+    }
+    return;
+  }
+  audit(
+    bg,
+    "scan.csam_preserved",
+    { type: "node", id: preserved.id },
+    { fromNodeId: file.id, source: "photodna" },
+  );
+  try {
+    await lockSuspectedCsam(bg, preserved.id, { source: "photodna" });
+  } catch (error) {
+    // The node is written locked and hidden; the unrecorded-lock sweep (abuse-hourly 0b) completes it.
+    captureError(error, { kind: "scan", reason: "csam_preserve_lock" });
+  }
 }
 
 /**

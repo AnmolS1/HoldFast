@@ -45,6 +45,7 @@ import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
 import { insertReport, listAsLocked, takedownNode } from "../db/queries/moderation";
+import { uuidv7 } from "../db/ids";
 import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
@@ -320,8 +321,13 @@ export type VerdictInput = {
 };
 
 export type Applied =
-  /** The key is no longer the node's current version (replaced, purged): nothing was written. */
-  | { kind: "gone" }
+  /**
+   * The key is no longer the node's current version (replaced, purged): nothing was written to any
+   * node. `photodna`: PhotoDNA matched these bytes all the same — the server hash is listed csam
+   * (naming `preserveAs`, the node the caller is to preserve them as; null without a server hash)
+   * and the CALLER owes the detection its preservation or its record (scan/consumer.ts).
+   */
+  | { kind: "gone"; photodna?: { preserveAs: string | null } }
   | {
       kind: "applied";
       outcome: Outcome;
@@ -392,7 +398,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
   const { key, verdict } = input;
   const sha256 = verdict.sha256?.toLowerCase();
   type Decided =
-    | { kind: "gone" }
+    | { kind: "gone"; photodna?: { preserveAs: string | null } }
     | {
         kind: "applied";
         outcome: Outcome;
@@ -415,7 +421,12 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     };
 
     if (!node || node.id !== input.nodeId) {
-      // Replaced or purged during the scan: nothing is written to any node.
+      // Replaced or purged during the scan: nothing is written to any node. A PhotoDNA match is a
+      // detection all the same: its hash is listed now — naming the node the bytes are to be
+      // preserved as — and the caller preserves them, or records the detection (never dropped).
+      const matched = input.photodna !== null && "match" in input.photodna && input.photodna.match;
+      const preserveAs = matched && sha256 ? uuidv7() : null;
+      if (preserveAs && sha256) await listSuspectedCsam(tx, { sha256, nodeId: preserveAs });
       const gone: Outcome = {
         status: verdict.status,
         reason: null,
@@ -431,7 +442,7 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
         }))
       )
         throw new LostClaimError();
-      return { kind: "gone" };
+      return { kind: "gone", ...(matched ? { photodna: { preserveAs } } : {}) };
     }
 
     const listed = sha256 ? ((await blocklist.lookup(tx, sha256))?.reason ?? null) : null;
