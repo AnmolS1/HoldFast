@@ -72,8 +72,16 @@ import {
 import { captureError } from "../sentry";
 import { unsuspendUser } from "./account-state";
 import { audit, auditInTx } from "./audit";
+import { addBusinessDays, endOfUtcDay, HolidayTableEndedError } from "./business-days";
 import { now } from "./clock";
-import { sendContentRemovedCopyright, sendContentRestored, sendReportReviewed } from "./email";
+import {
+  sendContentRemovedCopyright,
+  sendContentRestored,
+  sendDmcaCounterForwarded,
+  sendDmcaRestoredComplainant,
+  sendReportReviewed,
+  type EmailOutcome,
+} from "./email";
 import { AppError } from "./errors";
 import { metric } from "./metrics";
 import { db, deps, type AppEnv } from "./request-context";
@@ -99,7 +107,6 @@ export type Admin = { id: string };
 const conflict = (reason: string, details: Record<string, unknown> = {}, message?: string) =>
   new AppError("conflict", message, { reason, ...details });
 
-const DAY_MS = 86_400_000;
 /** 18 U.S.C. § 2258A(h)(1): preserved for one year AFTER the submission to the CyberTipline. */
 export function releasableAt(filedAt: Date): Date {
   const at = new Date(filedAt.getTime());
@@ -964,20 +971,34 @@ async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause
 
 // ── copyright notices (section 7) ───────────────────────────────────────────────────────────
 
-/** `n` business days after `from` (weekends skipped; US federal holidays are NOT modelled). */
-export function addBusinessDays(from: Date, n: number): Date {
-  const at = new Date(from.getTime());
-  let left = n;
-  while (left > 0) {
-    at.setTime(at.getTime() + DAY_MS);
-    const day = at.getUTCDay();
-    if (day !== 0 && day !== 6) left -= 1;
-  }
-  return at;
+/**
+ * The window of §512(g)(2)(C), counted from the counter-notice's RECEIPT (`counterReceivedAt`), not
+ * from the forward: not before 10 business days after it, and by the END of the 14th (weekends and
+ * observed US federal holidays skipped — the table and its end are in ./business-days).
+ */
+export function restoreWindow(receivedAt: Date): { restoreNotBefore: Date; restoreNotAfter: Date } {
+  return {
+    restoreNotBefore: addBusinessDays(receivedAt, RESTORE_AFTER_BUSINESS_DAYS),
+    restoreNotAfter: endOfUtcDay(addBusinessDays(receivedAt, RESTORE_BY_BUSINESS_DAYS)),
+  };
 }
 
 export const RESTORE_AFTER_BUSINESS_DAYS = 10;
 export const RESTORE_BY_BUSINESS_DAYS = 14;
+
+/** `restoreWindow`, with a date past the holiday table answered as `409 holiday_table`. */
+function windowOrRefuse(receivedAt: Date) {
+  try {
+    return restoreWindow(receivedAt);
+  } catch (error) {
+    if (!(error instanceof HolidayTableEndedError)) throw error;
+    throw conflict(
+      "holiday_table",
+      { day: error.day },
+      "The restore window runs past the US federal holiday table; extend it (services/business-days.ts).",
+    );
+  }
+}
 
 type NoticeInput = Omit<adminQ.NewNotice, "receivedAt"> & { receivedAt?: Date };
 
@@ -1158,13 +1179,35 @@ async function restoreNotice(
   notice: adminQ.NoticeWithNodes,
   mode: "restore" | "withdraw",
   note: string | null,
+  acknowledgeLate = false,
 ) {
+  let late = false;
   if (mode === "restore") {
+    // A recorded lawsuit notice keeps the material down: restore is refused, at any time.
     if (notice.lawsuitNoticeAt) throw conflict("lawsuit");
-    if (notice.status !== "counter_received" || !notice.restoreNotBefore)
+    if (notice.status !== "counter_received" || !notice.counterReceivedAt)
       throw conflict("state", { status: notice.status });
-    if (now(c).getTime() < notice.restoreNotBefore.getTime()) {
-      throw conflict("before_window", { restoreNotBefore: notice.restoreNotBefore.toISOString() });
+    // The window as recorded with the counter-notice (rows from before T30PREP: from the receipt).
+    const window =
+      notice.restoreNotBefore && notice.restoreNotAfter
+        ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+        : windowOrRefuse(notice.counterReceivedAt);
+    const at = now(c).getTime();
+    // "Not less than 10 business days": before it, refused — an acknowledgement changes nothing.
+    if (at < window.restoreNotBefore.getTime()) {
+      throw conflict("before_window", { restoreNotBefore: window.restoreNotBefore.toISOString() });
+    }
+    if (at > window.restoreNotAfter.getTime()) {
+      // "Nor more than 14": later is not forbidden, only outside the safe harbour toward the
+      // subscriber — allowed once the operator says so explicitly (team-lead ruling 2026-10-22),
+      // forwarded or not (a forward is refused after the window: forward_window_closed).
+      if (!acknowledgeLate) {
+        throw conflict("window_closed", { restoreNotAfter: window.restoreNotAfter.toISOString() });
+      }
+      late = true;
+    } else if (!notice.counterForwardedAt) {
+      // Inside the window, the complainant must have had the counter-notice first (§512(g)(2)(B)).
+      throw conflict("not_forwarded");
     }
   }
   const moved = await retryOnDeadlock(db(c), async (tx) => {
@@ -1218,6 +1261,24 @@ async function restoreNotice(
   if (!moved) throw conflict("state", { status: notice.status });
   // Recorded now that it has committed — before the steps that follow, which may fail (m5).
   audit(c, `admin.dmca_${mode}`, { type: "dmca_notice", id: notice.id }, { reason: note });
+  if (late) {
+    const iso = (at: Date | null) => (at ? at.toISOString() : null);
+    const window = notice.restoreNotBefore
+      ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+      : restoreWindow(notice.counterReceivedAt!);
+    audit(
+      c,
+      "admin.dmca_restore_late",
+      { type: "dmca_notice", id: notice.id },
+      {
+        counterReceivedAt: iso(notice.counterReceivedAt),
+        counterForwardedAt: iso(notice.counterForwardedAt),
+        restoreNotBefore: iso(window.restoreNotBefore),
+        restoreNotAfter: iso(window.restoreNotAfter),
+        restoredAt: iso(now(c)),
+      },
+    );
+  }
   if (notice.strikeId) {
     try {
       await liftStrike(deps(c), notice.strikeId, admin.id);
@@ -1229,6 +1290,11 @@ async function restoreNotice(
   for (const { nodeId } of notice.nodes) {
     const node = await adminQ.nodeRow(db(c), nodeId);
     if (node?.scanStatus === "pending") await rescanQuietly(c, nodeId);
+  }
+  if (mode === "restore") {
+    mailComplainant(c, notice, "restored", (to) =>
+      sendDmcaRestoredComplainant(deps(c), { to, name: notice.complainantName, noticeId: notice.id }),
+    );
   }
   const found = await ownerOf(c, notice);
   if (found) {
@@ -1242,12 +1308,36 @@ async function restoreNotice(
   }
 }
 
+/**
+ * A mail to the complainant the procedure promises (the counter-notice forwarded, the restore),
+ * sent after the commit. Whether it went is RECORDED (`admin.dmca_complainant_mail`, with the
+ * outcome — `no_address` for a notice received without one, `capped`/`failed` from delivery), so
+ * the operator can see from the audit log when the statutory copy must be sent by hand.
+ */
+function mailComplainant(
+  c: C,
+  notice: adminQ.NoticeWithNodes,
+  kind: "counter_forwarded" | "restored",
+  send: (to: string) => Promise<EmailOutcome>,
+) {
+  const target = { type: "dmca_notice", id: notice.id } as const;
+  if (!notice.complainantEmail) {
+    audit(c, "admin.dmca_complainant_mail", target, { kind, outcome: "no_address" });
+    return;
+  }
+  deps(c).defer(
+    send(notice.complainantEmail).then((outcome) =>
+      audit(c, "admin.dmca_complainant_mail", target, { kind, outcome }),
+    ),
+  );
+}
+
 /** One DMCA action. Each answers the notice as it now stands; a state that does not allow it is `409 state`. */
 export async function noticeAction(
   c: C,
   admin: Admin,
   noticeId: string,
-  body: { action: string; checklist?: Record<string, unknown>; note?: string },
+  body: { action: string; checklist?: Record<string, unknown>; note?: string; acknowledgeLate?: boolean },
 ) {
   const notice = await adminQ.noticeById(db(c), noticeId);
   if (!notice) throw new AppError("not_found");
@@ -1283,15 +1373,38 @@ export async function noticeAction(
       if (body.checklist) await adminQ.updateNotice(db(c), noticeId, { checklist: body.checklist });
       return takedownNotice(c, admin, notice, note);
     case "forward_counter": {
-      const at = now(c);
-      await simple(
-        ["counter_received"],
-        {
-          counterForwardedAt: at,
-          restoreNotBefore: addBusinessDays(at, RESTORE_AFTER_BUSINESS_DAYS),
-          restoreNotAfter: addBusinessDays(at, RESTORE_BY_BUSINESS_DAYS),
-        },
-        false,
+      if (notice.status !== "counter_received" || !notice.counterReceivedAt)
+        throw conflict("state", { status: notice.status });
+      // Once: the window is fixed by the receipt, and the complainant is sent one copy.
+      if (notice.counterForwardedAt) throw conflict("already_forwarded");
+      // Fixed when the counter-notice was recorded (rows from before T30PREP: from the receipt).
+      const window =
+        notice.restoreNotBefore && notice.restoreNotAfter
+          ? { restoreNotBefore: notice.restoreNotBefore, restoreNotAfter: notice.restoreNotAfter }
+          : windowOrRefuse(notice.counterReceivedAt);
+      // Forwarding is the operator's own step: after the window it would announce dates already
+      // past. Refused; the late restore (acknowledgeLate) is the way on.
+      if (now(c).getTime() > window.restoreNotAfter.getTime()) {
+        throw conflict("forward_window_closed", { restoreNotAfter: window.restoreNotAfter.toISOString() });
+      }
+      await simple(["counter_received"], { counterForwardedAt: now(c), ...window }, false);
+      mailComplainant(c, notice, "counter_forwarded", (to) =>
+        sendDmcaCounterForwarded(deps(c), {
+          to,
+          name: notice.complainantName,
+          noticeId: notice.id,
+          counter: {
+            name: notice.counterName,
+            address: notice.counterAddress,
+            phone: notice.counterPhone,
+            email: notice.counterEmail,
+            statement: notice.counterStatement,
+            consentJurisdiction: notice.counterConsentJurisdiction === true,
+            signature: notice.counterSignature,
+          },
+          notBefore: window.restoreNotBefore,
+          notAfter: window.restoreNotAfter,
+        }),
       );
       break;
     }
@@ -1302,7 +1415,7 @@ export async function noticeAction(
       await simple(["counter_received"], { status: "upheld" }, true);
       break;
     case "restore":
-      await restoreNotice(c, admin, notice, "restore", note);
+      await restoreNotice(c, admin, notice, "restore", note, body.acknowledgeLate === true);
       return (await adminQ.noticeById(db(c), noticeId))!;
     case "withdraw":
       if (notice.status === "received" || notice.status === "incomplete") {
@@ -1334,11 +1447,29 @@ export async function counterNotice(
   counter: Record<string, unknown> & { counterReceivedAt?: string },
 ) {
   const { counterReceivedAt, ...fields } = counter;
+  // The receipt starts the restore window (§512(g)(2)(C)), so a date the notice cannot have been
+  // received on — later than now, or before the takedown it answers — is refused.
+  const receivedAt = counterReceivedAt ? new Date(counterReceivedAt) : now(c);
+  if (counterReceivedAt) {
+    const current = await adminQ.noticeById(db(c), noticeId);
+    if (!current) throw new AppError("not_found");
+    if (
+      receivedAt.getTime() > now(c).getTime() ||
+      (current.takedownAt && receivedAt.getTime() < current.takedownAt.getTime())
+    ) {
+      throw new AppError("validation", "The counter-notice cannot have been received then.", {
+        reason: "counter_received_at",
+      });
+    }
+  }
+  // The window is fixed here, by the receipt, so the console shows it before any forward.
+  const window = windowOrRefuse(receivedAt);
   const row = await retryOnDeadlock(db(c), (tx) =>
     adminQ.transitionNotice(tx, noticeId, ["actioned"], {
       ...(fields as Partial<DmcaNotice>),
       status: "counter_received",
-      counterReceivedAt: counterReceivedAt ? new Date(counterReceivedAt) : now(c),
+      counterReceivedAt: receivedAt,
+      ...window,
       handledBy: admin.id,
     }),
   );

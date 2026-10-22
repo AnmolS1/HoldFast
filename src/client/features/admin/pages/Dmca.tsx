@@ -245,6 +245,13 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
   });
   const [consent, setConsent] = useState(false);
   const [counterStatus, setCounterStatus] = useState<string | null>(null);
+  const [lateAck, setLateAck] = useState(false);
+  // Past the end of the 14th business day after receipt: no forward; a restore needs the
+  // operator's explicit acknowledgement (the server refuses it otherwise: window_closed).
+  // The clock is read once, when the detail opens (a render must not read it).
+  const [openedAt] = useState(() => Date.now());
+  const windowClosed = notice.restoreNotAfter !== null && openedAt > Date.parse(notice.restoreNotAfter);
+  const lateRestore = action === "restore" && windowClosed;
 
   const update = (next: DmcaNoticeDto) => client.setQueryData(adminKeys.notice(notice.id), next);
   const act = async (note: string) => {
@@ -252,12 +259,23 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
     setBusy(true);
     setError(null);
     try {
-      update(await noticeAction(notice.id, { action, note, checklist }));
+      update(
+        await noticeAction(notice.id, {
+          action,
+          note,
+          checklist,
+          ...(lateRestore ? { acknowledgeLate: lateAck } : {}),
+        }),
+      );
       setAction(null);
     } catch (failure) {
       setError(
         refusalText(failure, {
           before_window: t("dmca.beforeWindow"),
+          window_closed: t("dmca.windowClosed"),
+          forward_window_closed: t("dmca.forwardClosed"),
+          not_forwarded: t("dmca.notForwarded"),
+          already_forwarded: t("dmca.alreadyForwarded"),
           lawsuit: t("dmca.lawsuitBlocks"),
           state: t("dmca.wrongState"),
         }),
@@ -313,6 +331,7 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
             [t("dmca.nodes"), notice.nodes.map((node) => node.nodeName ?? node.nodeId).join(", ") || "—"],
             [t("dmca.takedownAt"), when(notice.takedownAt)],
             [t("dmca.notified"), when(notice.ownerNotifiedAt)],
+            [t("dmca.counterReceived"), when(notice.counterReceivedAt)],
             [t("dmca.counterForwarded"), when(notice.counterForwardedAt)],
             [
               t("dmca.window"),
@@ -328,16 +347,25 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
           ]}
         />
         <Note>{t("dmca.holidays")}</Note>
+        {notice.status === "counter_received" && windowClosed && !notice.counterForwardedAt ? (
+          <Note>{t("dmca.forwardClosed")}</Note>
+        ) : null}
         <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-          {(ACTIONS[notice.status] ?? []).map((name) => (
-            <Button
-              key={name}
-              onClick={() => setAction(name)}
-              color={name === "takedown" ? "error" : "primary"}
-            >
-              {label("dmcaAction", name)}
-            </Button>
-          ))}
+          {(ACTIONS[notice.status] ?? [])
+            // Forwarded once, and never after the window (the server refuses both).
+            .filter((name) => !(name === "forward_counter" && (notice.counterForwardedAt || windowClosed)))
+            .map((name) => (
+              <Button
+                key={name}
+                onClick={() => {
+                  setLateAck(false);
+                  setAction(name);
+                }}
+                color={name === "takedown" ? "error" : "primary"}
+              >
+                {label("dmcaAction", name)}
+              </Button>
+            ))}
         </Box>
       </Section>
       <Section id="checklist" title={t("dmca.checklist")}>
@@ -391,9 +419,12 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
           action === "takedown"
             ? t("dmca.takedownBody")
             : action === "restore"
-              ? t("dmca.restoreBody")
+              ? lateRestore
+                ? t("dmca.restoreLateBody")
+                : t("dmca.restoreBody")
               : undefined
         }
+        canSubmit={!lateRestore || lateAck}
         confirmLabel={action ? label("dmcaAction", action) : ""}
         reasonLabel={t("dmca.note")}
         destructive={action === "takedown"}
@@ -401,7 +432,14 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
         error={error}
         onSubmit={(note) => void act(note)}
         onCancel={() => setAction(null)}
-      />
+      >
+        {lateRestore ? (
+          <FormControlLabel
+            control={<Checkbox checked={lateAck} onChange={(event) => setLateAck(event.target.checked)} />}
+            label={t("dmca.lateAck")}
+          />
+        ) : null}
+      </ReasonDialog>
       <Box>
         <Button component={RouterLink} to="/admin/dmca">
           {t("common.back")}

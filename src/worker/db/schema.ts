@@ -685,7 +685,10 @@ export const dmcaNotices = pgTable(
     counterSignature: text(),
     /** When the copy went to the complainant. */
     counterForwardedAt: ts(),
-    /** 10 and 14 business days after `counterForwardedAt`. */
+    /**
+     * 10 business days, and the end of the 14th, after `counterReceivedAt` — weekends and observed US
+     * federal holidays skipped (services/business-days.ts); set when the counter-notice is recorded.
+     */
     restoreNotBefore: ts(),
     restoreNotAfter: ts(),
     /** The complainant says an action was filed: the material stays down. */

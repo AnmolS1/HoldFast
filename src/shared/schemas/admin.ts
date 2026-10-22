@@ -278,6 +278,8 @@ export const DmcaActionBody = z.strictObject({
   ]),
   checklist: z.record(z.string(), z.unknown()).optional(),
   note: z.string().max(2000).optional(),
+  /** `restore` after `restoreNotAfter`: the operator's explicit "past the 14-business-day window". */
+  acknowledgeLate: z.boolean().optional(),
 });
 export type DmcaActionBody = z.infer<typeof DmcaActionBody>;
 

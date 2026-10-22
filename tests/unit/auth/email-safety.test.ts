@@ -198,6 +198,23 @@ function draftsWith(value: string): Record<TemplateName, ReturnType<(typeof temp
       counterNoticeUrl: `${APP}/dmca`,
     }),
     contentRestored: templates.contentRestored({ name: value, itemName: value }),
+    dmcaCounterForwarded: templates.dmcaCounterForwarded({
+      name: value,
+      noticeId: value,
+      counter: {
+        name: value,
+        address: `${value}\n${value}`,
+        phone: value,
+        email: value,
+        statement: `${value}\n${value}`,
+        consentJurisdiction: true,
+        signature: value,
+      },
+      notBefore: new Date("2028-11-20T12:00:00.000Z"),
+      notAfter: new Date("2028-11-27T23:59:59.999Z"),
+      dmcaUrl: `${APP}/dmca`,
+    }),
+    dmcaRestoredComplainant: templates.dmcaRestoredComplainant({ name: value, noticeId: value }),
   };
 }
 
@@ -268,7 +285,9 @@ describe("a typed value is a label: nothing link-like, in any template, in eithe
         ).toBe(true);
       }
       // Length: a value is capped wherever it lands (the quoted notice has its own, larger cap).
-      expect(message.text.length, name).toBeLessThan(name === "contentRemovedCopyright" ? 20_000 : 2_500);
+      expect(message.text.length, name).toBeLessThan(
+        name === "contentRemovedCopyright" || name === "dmcaCounterForwarded" ? 20_000 : 2_500,
+      );
     }
   });
 

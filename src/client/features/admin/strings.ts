@@ -495,13 +495,14 @@ export const messages = {
   "dmca.statements": "Statements (good faith / accuracy)",
   "dmca.takedownAt": "Taken down",
   "dmca.notified": "Owner notified",
+  "dmca.counterReceived": "Counter-notice received on",
   "dmca.counterForwarded": "Counter-notice forwarded",
   "dmca.window": "Restore window",
   "dmca.windowValue": "From {from} to {to}",
   "dmca.lawsuit": "Lawsuit notice",
   "dmca.restored": "Restored",
   "dmca.holidays":
-    "The window is 10 to 14 business days; weekends are skipped, US federal holidays are not modelled.",
+    "The window runs from 10 to the end of 14 business days after the counter-notice was received (weekends and US federal holidays skipped). Restore is refused before it; after it, only with an explicit acknowledgement.",
   "dmca.checklist": "Completeness",
   "dmca.check.identification": "Identifies the copyrighted work",
   "dmca.check.work": "Identifies the material",
@@ -518,6 +519,15 @@ export const messages = {
     "Each file is taken down, its links paused, its hash blocklisted, the uploader struck once and the owner emailed the notice.",
   "dmca.restoreBody": "The files come back, their links resume and the strike is lifted.",
   "dmca.beforeWindow": "Restore is possible only from the start of the window.",
+  "dmca.windowClosed":
+    "This is past the 14-business-day window: confirm the late restore to go ahead (it is no longer covered by §512(g)).",
+  "dmca.forwardClosed":
+    "The 14-business-day window after receipt has closed: the counter-notice can no longer be forwarded. Restore late, uphold or close.",
+  "dmca.notForwarded": "Forward the counter-notice to the complainant before restoring.",
+  "dmca.restoreLateBody":
+    "The window has closed. A late restore is allowed but not protected by §512(g); the complainant is told and the dates are recorded.",
+  "dmca.lateAck": "This is past the 14-business-day window",
+  "dmca.alreadyForwarded": "This counter-notice has already been forwarded.",
   "dmca.lawsuitBlocks": "A lawsuit notice was recorded: the material stays down.",
   "dmca.wrongState": "That is not possible from this notice's status.",
 
