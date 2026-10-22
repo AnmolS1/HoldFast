@@ -1,0 +1,1 @@
+CREATE INDEX "audit_log_photodna_detection_idx" ON "audit_log" USING btree ("at") WHERE "audit_log"."action" = 'scan.photodna_detection';
