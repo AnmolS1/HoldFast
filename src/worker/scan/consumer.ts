@@ -58,9 +58,9 @@
 // LOGS carry keys and node ids only — never a file name or an address.
 
 import * as blocklist from "../db/queries/blocklist";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte } from "drizzle-orm";
 import { uuidv7 } from "../db/ids";
-import { handOverLockEntry } from "../db/queries/moderation";
+import { CSAM_CLEARED_RESOLUTION, handOverLockEntry } from "../db/queries/moderation";
 import { findByR2Key, keyReference } from "../db/queries/nodes";
 import { abortedUploadOf, failJob, jobOf, markRequeuedFromDlq, markScanError } from "../db/queries/scan";
 import { claim, finish, SCAN_CLAIM_STALE_MINUTES, type ClaimResult } from "../db/queries/scan-jobs";
@@ -413,9 +413,13 @@ export const OWED_DETECTION_SWEEP_LIMIT = 50;
  * acted on; one that fails is counted and does not stop the rest:
  *   no node on the key        `preserveDetection` (preserved, or recorded and the operators told);
  *   the node locked already   settled (`locked`: the settle mark was lost);
- *   a csam case on it was     settled (`cleared`): an admin cleared it as a false positive —
- *     dismissed                 never locked again by this sweep;
- *   otherwise                 the shared CSAM lock (source photodna), then settled.
+ *   CLEARED                   settled (`cleared`), never locked again — decided from the blocklist,
+ *                             the one source of truth after T25's false-positive clear: the hash is
+ *                             NOT listed csam any more AND a csam case on the node opened after
+ *                             this detection was recorded was dismissed `false_positive`
+ *                             (`detectionCleared`). An older case says nothing about it;
+ *   otherwise                 the shared CSAM lock (source photodna), then settled — when in
+ *                             doubt, FAIL CLOSED.
  */
 export async function sweepOwedDetections(
   bg: BackgroundContext,
@@ -437,7 +441,7 @@ export async function sweepOwedDetections(
         result.preserved += 1;
       } else if (node.scanStatus === "suspected_csam") {
         await settleDetection(bg, key, { outcome: "locked", nodeId: node.id });
-      } else if (await csamCaseDismissed(bg.db, node.id)) {
+      } else if (await detectionCleared(bg.db, owed, node.id)) {
         await settleDetection(bg, key, { outcome: "cleared", nodeId: node.id });
       } else {
         await lockSuspectedCsam(bg, node.id, { source: "photodna" });
@@ -452,11 +456,30 @@ export async function sweepOwedDetections(
   return result;
 }
 
-async function csamCaseDismissed(db: BackgroundContext["db"], nodeId: string): Promise<boolean> {
+/**
+ * True only when THIS detection was cleared as a false positive: its hash is no longer listed
+ * csam, and a csam case on the node, opened at or after the detection was recorded (the lock that
+ * followed it), was dismissed with `CSAM_CLEARED_RESOLUTION` — what `clearSuspectedCsam` writes.
+ */
+async function detectionCleared(
+  db: BackgroundContext["db"],
+  detection: PhotoDnaDetection,
+  nodeId: string,
+): Promise<boolean> {
+  if ((await blocklist.lookup(db, detection.sha256))?.reason === "csam") return false;
+  if (!detection.recordedAt) return false;
   const [row] = await db
     .select({ id: reports.id })
     .from(reports)
-    .where(and(eq(reports.nodeId, nodeId), eq(reports.category, "csam"), eq(reports.status, "dismissed")))
+    .where(
+      and(
+        eq(reports.nodeId, nodeId),
+        eq(reports.category, "csam"),
+        eq(reports.status, "dismissed"),
+        eq(reports.resolution, CSAM_CLEARED_RESOLUTION),
+        gte(reports.createdAt, detection.recordedAt),
+      ),
+    )
     .limit(1);
   return row !== undefined;
 }

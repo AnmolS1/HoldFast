@@ -327,6 +327,8 @@ export type PhotoDnaDetection = {
   mimeDeclared: string | null;
   /** Known only to the delivery that read the file; a later one names the node "preserved". */
   name: string | null;
+  /** When the detection was recorded (its audit row's time); null before it is. */
+  recordedAt?: Date | null;
 };
 
 /**
@@ -392,7 +394,7 @@ export async function owedDetectionKeys(db: Executor, olderThan: Date, limit: nu
  */
 export async function owedDetection(db: Executor, key: string): Promise<PhotoDnaDetection | null> {
   const rows = await db
-    .select({ action: auditLog.action, meta: auditLog.meta })
+    .select({ action: auditLog.action, meta: auditLog.meta, at: auditLog.at })
     .from(auditLog)
     .where(
       and(
@@ -402,7 +404,8 @@ export async function owedDetection(db: Executor, key: string): Promise<PhotoDna
       ),
     );
   if (rows.some((row) => row.action === PHOTODNA_SETTLED_ACTION)) return null;
-  const meta = rows.find((row) => row.action === PHOTODNA_DETECTION_ACTION)?.meta;
+  const recorded = rows.find((row) => row.action === PHOTODNA_DETECTION_ACTION);
+  const meta = recorded?.meta;
   if (!meta || typeof meta.sha256 !== "string" || typeof meta.nodeId !== "string") return null;
   const text = (value: unknown) => (typeof value === "string" ? value : null);
   return {
@@ -412,6 +415,7 @@ export async function owedDetection(db: Executor, key: string): Promise<PhotoDna
     uploaderId: text(meta.uploaderId),
     mimeDeclared: text(meta.mimeDeclared),
     name: null,
+    recordedAt: recorded!.at,
   };
 }
 

@@ -6,7 +6,9 @@ import { and, eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { lockJob } from "../../../src/worker/db/queries/scan";
-import { nodes } from "../../../src/worker/db/schema";
+import { clearSuspectedCsam, CSAM_CLEARED_RESOLUTION } from "../../../src/worker/db/queries/moderation";
+import { nodes, reports } from "../../../src/worker/db/schema";
+import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
 import { parts } from "../../../src/worker/jobs/abuse-hourly";
 import { PHOTODNA_MATCH_URL } from "../../../src/worker/scan/photodna";
 import { pngBytes } from "../../setup/fixture-bytes";
@@ -19,12 +21,17 @@ import {
   explicit,
   mailTo,
   makeUser,
+  nodeById,
   reportsOf,
   sha256Of,
   testDb,
   uploadedFile,
 } from "./helpers";
 
+vi.mock("../../../src/worker/services/scanning", async (original) => {
+  const real = await original<typeof import("../../../src/worker/services/scanning")>();
+  return { ...real, lockSuspectedCsam: vi.fn(real.lockSuspectedCsam) };
+});
 vi.mock("../../../src/worker/db/queries/scan", async (original) => {
   const real = await original<typeof import("../../../src/worker/db/queries/scan")>();
   return { ...real, lockJob: vi.fn(real.lockJob) };
@@ -48,7 +55,21 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.mocked(lockJob).mockClear();
+  vi.mocked(lockSuspectedCsam).mockClear();
 });
+
+/** A detection left OWED on a file that is still there: PhotoDNA matched, the lock failed. */
+async function owedOnPresentFile(ops: ReturnType<typeof operators>) {
+  const owner = await makeUser();
+  const bytes = png();
+  const server = await sha256Of(bytes);
+  const { file } = await uploadedFile(bytes, { name: "p.png", owner });
+  vi.mocked(lockSuspectedCsam).mockRejectedValueOnce(new Error("test: the lock cannot be written"));
+  expect(await deliver([{ body: explicit(file) }], { ...ON, ...ops.env })).toMatchObject([
+    { outcome: "retry" },
+  ]);
+  return { file, owner, server };
+}
 
 const png = () => {
   const base = pngBytes(32, 32);
@@ -124,5 +145,86 @@ describe("the hourly owed-detection sweep (abuse-hourly 0d)", () => {
     expect(recorded).toHaveLength(1);
     expect(recorded[0]!.meta).toMatchObject({ sha256: server, reason: "object_gone", legalHold: true });
     expect(mailTo(ops.address)).toHaveLength(1);
+  });
+
+  it("REVIEW HIGH — an OLD dismissed csam report on the file says nothing about a NEW detection: the hash is still listed, so the sweep LOCKS it (fail closed)", async () => {
+    const ops = operators();
+    const { file, owner, server } = await owedOnPresentFile(ops);
+    // A false positive cleared a day before this detection.
+    const dayAgo = new Date(Date.now() - 24 * HOURS);
+    await testDb().insert(reports).values({
+      nodeId: file.id,
+      ownerId: owner.id,
+      source: "photodna",
+      category: "csam",
+      status: "dismissed",
+      resolution: CSAM_CLEARED_RESOLUTION,
+      createdAt: dayAgo,
+      resolvedAt: dayAgo,
+    });
+    const ctx = jobContext({ env: ops.env });
+    await parts.sweepOwedDetections(ctx.bg, { limit: 1_000, now: new Date(Date.now() + 3 * HOURS) });
+    await ctx.settle();
+    expect((await blocklist.lookup(testDb(), server))?.reason).toBe("csam");
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+    expect(await auditRows({ action: "scan.photodna_settled", targetId: file.r2Key! })).toMatchObject([
+      { meta: { outcome: "locked" } },
+    ]);
+  });
+
+  it("CONTROL — a detection GENUINELY cleared (locked, then T25's clear: listing removed, its case dismissed as false_positive): settled as cleared, never locked again", async () => {
+    const ops = operators();
+    const { file, server } = await owedOnPresentFile(ops);
+    const ctx = jobContext({ env: ops.env });
+    await lockSuspectedCsam(ctx.bg, file.id, { source: "photodna" });
+    await ctx.settle();
+    const cleared = await testDb().transaction((tx) => clearSuspectedCsam(tx, file.id));
+    expect(cleared).toMatchObject({ cleared: true, blocklistRemoved: true });
+    await parts.sweepOwedDetections(ctx.bg, { limit: 1_000, now: new Date(Date.now() + 3 * HOURS) });
+    await ctx.settle();
+    expect(await blocklist.lookup(testDb(), server)).toBeNull();
+    expect((await nodeById(file.id))!.scanStatus).not.toBe("suspected_csam");
+    expect(await auditRows({ action: "scan.photodna_settled", targetId: file.r2Key! })).toMatchObject([
+      { meta: { outcome: "cleared" } },
+    ]);
+  });
+
+  it("REVIEW HIGH (the blocklist guard) — a dismissed false_positive case NEWER than the detection, but the hash still listed csam: not cleared, LOCKED", async () => {
+    const ops = operators();
+    const { file, owner } = await owedOnPresentFile(ops);
+    await testDb().insert(reports).values({
+      nodeId: file.id,
+      ownerId: owner.id,
+      source: "photodna",
+      category: "csam",
+      status: "dismissed",
+      resolution: CSAM_CLEARED_RESOLUTION,
+      resolvedAt: new Date(),
+    });
+    const ctx = jobContext({ env: ops.env });
+    await parts.sweepOwedDetections(ctx.bg, { limit: 1_000, now: new Date(Date.now() + 3 * HOURS) });
+    await ctx.settle();
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
+  });
+
+  it("REVIEW HIGH (the time guard) — the listing gone some other way (an admin's delete) and only an OLD dismissed case: not this detection's clear, LOCKED", async () => {
+    const ops = operators();
+    const { file, owner, server } = await owedOnPresentFile(ops);
+    await blocklist.remove(testDb(), server);
+    const dayAgo = new Date(Date.now() - 24 * HOURS);
+    await testDb().insert(reports).values({
+      nodeId: file.id,
+      ownerId: owner.id,
+      source: "photodna",
+      category: "csam",
+      status: "dismissed",
+      resolution: CSAM_CLEARED_RESOLUTION,
+      createdAt: dayAgo,
+      resolvedAt: dayAgo,
+    });
+    const ctx = jobContext({ env: ops.env });
+    await parts.sweepOwedDetections(ctx.bg, { limit: 1_000, now: new Date(Date.now() + 3 * HOURS) });
+    await ctx.settle();
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "suspected_csam", legalHold: true });
   });
 });
