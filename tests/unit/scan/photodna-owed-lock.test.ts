@@ -13,6 +13,7 @@ import * as blocklist from "../../../src/worker/db/queries/blocklist";
 import { clearSuspectedCsam } from "../../../src/worker/db/queries/moderation";
 import { nodes } from "../../../src/worker/db/schema";
 import { PHOTODNA_MATCH_URL } from "../../../src/worker/scan/photodna";
+import { lockJob } from "../../../src/worker/db/queries/scan";
 import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
 import { pngBytes } from "../../setup/fixture-bytes";
 import { operators } from "../abuse/helpers";
@@ -30,6 +31,10 @@ import {
   uploadedFile,
 } from "./helpers";
 
+vi.mock("../../../src/worker/db/queries/scan", async (original) => {
+  const real = await original<typeof import("../../../src/worker/db/queries/scan")>();
+  return { ...real, lockJob: vi.fn(real.lockJob) };
+});
 vi.mock("../../../src/worker/services/scanning", async (original) => {
   const real = await original<typeof import("../../../src/worker/services/scanning")>();
   return { ...real, lockSuspectedCsam: vi.fn(real.lockSuspectedCsam) };
@@ -54,6 +59,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.mocked(lockSuspectedCsam).mockClear();
+  vi.mocked(lockJob).mockClear();
 });
 
 /** A PNG with bytes of its own after its end: a match lists its hash, so it is unique per test. */
@@ -66,7 +72,7 @@ const png = () => {
 };
 
 describe("a PhotoDNA-matched file whose lock fails", () => {
-  it("is listed csam by the verdict's transaction; the redelivery — PhotoDNA off — LOCKS it (held, reported, object kept), and a false-positive clear unlists it", async () => {
+  it("is listed csam before the verdict's transaction; the redelivery — PhotoDNA off — LOCKS it (held, reported, object kept), and a false-positive clear unlists it", async () => {
     const bytes = png();
     const server = await sha256Of(bytes);
     const { file, owner } = await uploadedFile(bytes, { name: "p.png" });
@@ -184,5 +190,54 @@ describe("a PhotoDNA match on a file deleted before its verdict (the key is no l
       legalHold: true,
     });
     expect(mailTo(ops.address)).toHaveLength(1);
+  });
+
+  it("the gone branch's own transaction fails: the detection was made durable BEFORE it (listed + held audit row), so the redelivery that finds no node preserves it — never acked as an orphan; a later one finds it settled", async () => {
+    const ops = operators();
+    const owner = await makeUser();
+    const uploader = await makeUser();
+    const bytes = png();
+    const server = await sha256Of(bytes);
+    const { file } = await uploadedFile(bytes, { name: "p.png", owner, uploader });
+    beforeAnswer = async () => {
+      await testDb().delete(nodes).where(eq(nodes.id, file.id));
+    };
+    vi.mocked(lockJob).mockRejectedValueOnce(new Error("test: the verdict's transaction fails"));
+    expect(await deliver([{ body: explicit(file) }], { ...ON, ...ops.env })).toMatchObject([
+      { outcome: "retry" },
+    ]);
+    // Durable already: listed, and the detection's held audit row.
+    expect((await blocklist.lookup(testDb(), server))?.reason).toBe("csam");
+    const detection = await auditRows({ action: "scan.photodna_detection", targetId: file.r2Key! });
+    expect(detection).toHaveLength(1);
+    expect(detection[0]!.meta).toMatchObject({ sha256: server, uploaderId: uploader.id, legalHold: true });
+
+    // The redelivery — at the attempt where a key with no node is given up on as an orphan.
+    beforeAnswer = null;
+    expect(await deliver([{ body: explicit(file), attempts: 3 }], { ...ON, ...ops.env })).toEqual([
+      { outcome: "ack" },
+    ]);
+    const preserved = await testDb()
+      .select()
+      .from(nodes)
+      .where(and(eq(nodes.sha256, server), eq(nodes.createdBy, uploader.id)));
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0]).toMatchObject({
+      ownerId: uploader.id,
+      scanStatus: "suspected_csam",
+      legalHold: true,
+    });
+    expect(await reportsOf(preserved[0]!.id)).toMatchObject([{ category: "csam", source: "photodna" }]);
+    expect(await userRow(uploader.id)).toMatchObject({ legalHold: true });
+    expect(await blocklist.lookup(testDb(), server)).toEqual({
+      reason: "csam",
+      sourceNodeId: preserved[0]!.id,
+    });
+
+    // Settled: one more redelivery preserves nothing twice.
+    expect(await deliver([{ body: explicit(file), attempts: 3 }], { ...ON, ...ops.env })).toEqual([
+      { outcome: "ack" },
+    ]);
+    expect(await testDb().select().from(nodes).where(eq(nodes.sha256, server))).toHaveLength(1);
   });
 });

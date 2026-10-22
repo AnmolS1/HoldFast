@@ -95,7 +95,14 @@ import {
   ScannerTransportError,
 } from "./container";
 import { checkPhotoDna, PhotoDnaTransientError } from "./photodna";
-import { applyVerdict, imageDimensions } from "./verdict";
+import {
+  applyVerdict,
+  imageDimensions,
+  owedDetection,
+  PHOTODNA_SETTLED_ACTION,
+  settleDetection,
+  type PhotoDnaDetection,
+} from "./verdict";
 
 /** How long to wait for the upload's request to insert the node. */
 export const NO_NODE_RETRY_SEC = 10;
@@ -229,18 +236,13 @@ async function scanClaimed(
     mimeSniffed,
     image,
     photodna,
+    file: node,
   });
   const kind = verdict.engine === "stub" ? "stub" : "clamav";
   if (applied.kind === "gone") {
     bg.metric("scan", { outcome: "replaced", kind });
-    if (applied.photodna) {
-      await preserveDetection(
-        bg,
-        scan.key,
-        node,
-        verdict.sha256?.toLowerCase() ?? null,
-        applied.photodna.preserveAs,
-      );
+    if (applied.photodna !== undefined) {
+      await preserveDetection(bg, scan.key, { id: node.id, createdBy: node.createdBy }, applied.photodna);
     }
   } else {
     if (photodna && "skipped" in photodna)
@@ -264,8 +266,9 @@ async function scanClaimed(
 
 /**
  * A PhotoDNA match on a key that is no longer its file's (deleted — purged — or replaced before the
- * verdict). A detection is never dropped: `applyVerdict` has listed the server hash csam, naming
- * `preserveAs`, and here —
+ * verdict), or an OWED detection a later delivery found on a key with no node (`owedDetection`:
+ * recorded before a verdict transaction that never committed). A detection is never dropped:
+ * `applyVerdict` recorded it and listed the server hash csam, naming `preserveAs`, and here —
  *   the object still there   its bytes are COPIED to a key of their own (`keyFor(uploader,
  *                            preserveAs, …)`: the purge that removed the row deletes the old key
  *                            right after its commit and asks nothing — a row on the old key would
@@ -276,34 +279,47 @@ async function scanClaimed(
  *   otherwise                the detection is RECORDED: `scan.csam_detection_unpreserved` with the
  *                            hash, held from retention (`legalHold`), and the critical operator
  *                            alert by the deleted file's id — also when the copy or the node fails.
- * NEVER THROWS: a redelivery finds no node for the key and acknowledges it (an orphan), so a throw
- * here would be the silent drop. The bytes are counted on the uploader by the next reconcile (the
- * purge has released them; nothing is reserved here).
+ * Either way the detection is then SETTLED (`settleDetection`), so no later delivery preserves it
+ * twice. NEVER THROWS: the message is acknowledged after it. The bytes are counted on the uploader
+ * by the next reconcile (the purge has released them; nothing is reserved here).
  */
 async function preserveDetection(
   bg: BackgroundContext,
   key: string,
-  file: Node,
-  sha256: string | null,
-  preserveAs: string | null,
+  file: { id: string; createdBy: string | null },
+  detection: PhotoDnaDetection | null,
 ): Promise<void> {
   let copied: string | null = null;
+  const uploader = detection ? detection.uploaderId : file.createdBy;
   const record = async (reason: string) => {
-    audit(
-      bg,
-      "scan.csam_detection_unpreserved",
-      { type: "node", id: file.id },
-      {
-        key,
-        source: "photodna",
-        reason,
-        ...(sha256 ? { sha256 } : {}),
-        ...(file.createdBy ? { uploaderId: file.createdBy } : {}),
-        ...(copied ? { copiedTo: copied } : {}),
-        // Kept past the audit retention: it is the only record of the detection.
-        legalHold: true,
-      },
-    );
+    // Durable before the alert, with the settle mark in the same transaction.
+    await bg.db.transaction(async (tx) => {
+      await auditInTx(
+        tx,
+        bg,
+        "scan.csam_detection_unpreserved",
+        { type: "node", id: file.id },
+        {
+          key,
+          source: "photodna",
+          reason,
+          ...(detection ? { sha256: detection.sha256 } : {}),
+          ...(uploader ? { uploaderId: uploader } : {}),
+          ...(copied ? { copiedTo: copied } : {}),
+          // Kept past the audit retention: it is the only record of the detection.
+          legalHold: true,
+        },
+      );
+      if (detection) {
+        await auditInTx(
+          tx,
+          bg,
+          PHOTODNA_SETTLED_ACTION,
+          { type: "scan_key", id: key },
+          { outcome: "recorded", legalHold: true },
+        );
+      }
+    });
     bg.metric("error", { kind: "scan_csam_unpreserved", reason });
     for (const to of adminListOf(bg.env).addresses) {
       await sendOperatorCritical(bg, { to, event: "csam_lock", id: file.id }).catch((error: unknown) =>
@@ -311,33 +327,38 @@ async function preserveDetection(
       );
     }
   };
-  const uploader = file.createdBy;
+  const alertOnly = async () => {
+    // The record itself failed: the operators are told all the same (the detection stays owed).
+    for (const to of adminListOf(bg.env).addresses) {
+      await sendOperatorCritical(bg, { to, event: "csam_lock", id: file.id }).catch(() => undefined);
+    }
+  };
   let preserved: Node;
   try {
-    if (!sha256 || !preserveAs) return await record("no_server_hash");
+    if (!detection) return await record("no_server_hash");
     if (!uploader) return await record("no_uploader");
     const store = storage(bg.env);
     const read = await store.get(key);
     if (read?.kind !== "body") return await record("object_gone");
     const versionId = uuidv7();
-    const r2Key = keyFor(uploader, preserveAs, versionId);
+    const r2Key = keyFor(uploader, detection.preserveAs, versionId);
     await store.put(r2Key, read.object.body, { size: read.object.size });
     copied = r2Key;
     preserved = await writeLockedNode(
       bg,
       {
         ownerId: uploader,
-        nodeId: preserveAs,
+        nodeId: detection.preserveAs,
         replaceNodeId: null,
         purpose: "file",
-        name: file.name,
+        name: detection.name ?? "preserved",
         size: read.object.size,
-        mimeDeclared: file.mimeDeclared,
+        mimeDeclared: detection.mimeDeclared,
         r2Key,
         versionId,
         parentId: null,
       },
-      { uploaderId: uploader, sha256, size: read.object.size, sealed: null },
+      { uploaderId: uploader, sha256: detection.sha256, size: read.object.size, sealed: null },
     );
   } catch (error) {
     captureError(error, { kind: "scan", reason: "csam_preserve" });
@@ -345,6 +366,7 @@ async function preserveDetection(
       await record("preserve_failed");
     } catch (inner) {
       captureError(inner, { kind: "scan", reason: "csam_preserve" });
+      await alertOnly();
     }
     return;
   }
@@ -352,8 +374,9 @@ async function preserveDetection(
     bg,
     "scan.csam_preserved",
     { type: "node", id: preserved.id },
-    { fromNodeId: file.id, source: "photodna" },
+    { fromNodeId: file.id, key, source: "photodna" },
   );
+  await settleDetection(bg, key, { outcome: "preserved", nodeId: preserved.id });
   try {
     await lockSuspectedCsam(bg, preserved.id, { source: "photodna" });
   } catch (error) {
@@ -401,6 +424,14 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
 
   const node = await findByR2Key(bg.db, scan.key);
   if (!node) {
+    // An OWED PhotoDNA detection on the key (its verdict's transaction never committed, and the
+    // file is gone since): preserved — or recorded and the operators told — never acked as an orphan.
+    const owed = await owedDetection(bg.db, scan.key);
+    if (owed) {
+      await preserveDetection(bg, scan.key, { id: owed.fileId, createdBy: owed.uploaderId }, owed);
+      message.ack();
+      return;
+    }
     const reference = await keyReference(bg.db, scan.key);
     if (reference?.kind === "upload") {
       // The event beat the upload's commit (S8: every time), or a single PUT whose complete has
