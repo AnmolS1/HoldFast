@@ -18,8 +18,9 @@
 // No DMCA notice is closed here (auto-close is off in v1) and no hold is set or released: nothing
 // in jobs/ writes a hold flag. A session row is deleted only after it expired — a held account's
 // stays — and a live session keeps its address (the account's sessions list and the rate limit
-// read it): a raw session IP is deleted 1 day after its session expires, and a session expires 14
-// days after it was last used (it slides with use) or at sign-out.
+// read it): a raw session IP goes at sign-out, or 1–2 days after its session expires (deleted once
+// more than a day past, by a daily run); a session expires 13–14 days after last use (renewed at most
+// daily). Privacy text: "within 2 days after the session expires … about 14 days after you last used it".
 
 import type { Executor } from "../db/client";
 import {
