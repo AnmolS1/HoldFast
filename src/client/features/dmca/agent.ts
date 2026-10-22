@@ -2,13 +2,15 @@
 // registered in the Copyright Office's DMCA Designated Agent Directory.
 //
 // NOT REGISTERED YET (T29 §B.1 is Anmol's step; deferred to Gate B). Until the registration is done
-// every field carries the `TODO_` sentinel, and the page renders it as it is: the Gate-B checks fail
-// while it does (tests/e2e/dmca.spec.ts's agent-details test skips, and a skip fails the gate run;
-// verify-gate-b.sh greps this file). Never put a guessed name, address or phone here.
+// every field carries the sentinel (`SENTINEL` below), and the page renders it as it is: the Gate-B
+// checks fail while it does (tests/e2e/dmca.spec.ts's agent-details test skips, and a skip fails the
+// gate run; verify-gate-b.sh greps this file). Never put a guessed name, address or phone here.
 //
 // Plain data on purpose: the e2e spec imports this file in Node.
 
-export const SENTINEL = "TODO_";
+// Spelled in two parts so that the literal appears in this file only in a field still to be filled:
+// `grep -c` of it here is the number of fields left (0 once the details are in, T29 Verification).
+export const SENTINEL = "TODO" + "_";
 
 export interface DesignatedAgent {
   name: string;

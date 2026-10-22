@@ -75,9 +75,11 @@ describe("/dmca", () => {
   it("shows the designated agent's name, address, phone and email from agent.ts, the email as a mailto link", async () => {
     await open();
     const agent = screen.getByRole("region", { name: "Designated agent" });
-    expect(within(agent).getByText(AGENT.name)).toBeTruthy();
-    expect(within(agent).getByText(AGENT.address)).toBeTruthy();
-    expect(within(agent).getByText(AGENT.phone)).toBeTruthy();
+    const details = agent.querySelector("[data-dmca-agent]")!.textContent ?? "";
+    // The address may run over several lines ("\n" in agent.ts): each line is shown.
+    for (const field of AGENT_FIELDS) {
+      for (const line of AGENT[field].split("\n")) expect(details, field).toContain(line);
+    }
     const mail = within(agent).getByRole("link", { name: AGENT.email });
     expect(mail.getAttribute("href")).toBe(`mailto:${AGENT.email}`);
   });
