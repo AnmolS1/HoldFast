@@ -258,6 +258,8 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
       setError(
         refusalText(failure, {
           before_window: t("dmca.beforeWindow"),
+          after_window: t("dmca.afterWindow"),
+          already_forwarded: t("dmca.alreadyForwarded"),
           lawsuit: t("dmca.lawsuitBlocks"),
           state: t("dmca.wrongState"),
         }),
@@ -313,6 +315,7 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
             [t("dmca.nodes"), notice.nodes.map((node) => node.nodeName ?? node.nodeId).join(", ") || "—"],
             [t("dmca.takedownAt"), when(notice.takedownAt)],
             [t("dmca.notified"), when(notice.ownerNotifiedAt)],
+            [t("dmca.counterReceived"), when(notice.counterReceivedAt)],
             [t("dmca.counterForwarded"), when(notice.counterForwardedAt)],
             [
               t("dmca.window"),
@@ -329,15 +332,18 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
         />
         <Note>{t("dmca.holidays")}</Note>
         <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
-          {(ACTIONS[notice.status] ?? []).map((name) => (
-            <Button
-              key={name}
-              onClick={() => setAction(name)}
-              color={name === "takedown" ? "error" : "primary"}
-            >
-              {label("dmcaAction", name)}
-            </Button>
-          ))}
+          {(ACTIONS[notice.status] ?? [])
+            // Forwarded once: the window is fixed by the receipt (the server refuses a second).
+            .filter((name) => !(name === "forward_counter" && notice.counterForwardedAt))
+            .map((name) => (
+              <Button
+                key={name}
+                onClick={() => setAction(name)}
+                color={name === "takedown" ? "error" : "primary"}
+              >
+                {label("dmcaAction", name)}
+              </Button>
+            ))}
         </Box>
       </Section>
       <Section id="checklist" title={t("dmca.checklist")}>

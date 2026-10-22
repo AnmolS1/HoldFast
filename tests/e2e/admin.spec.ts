@@ -129,7 +129,7 @@ test.describe("users and links", () => {
 });
 
 test.describe("copyright notices", () => {
-  test("a full DMCA cycle — notice, takedown, counter-notice, forward, restore inside the window — with the Worker's clock moved", async ({
+  test("a full DMCA cycle — notice, takedown, counter-notice, forward, refused before and after the window, restore inside it — with the Worker's clock moved", async ({
     page,
     browser,
     clientIp,
@@ -175,7 +175,8 @@ test.describe("copyright notices", () => {
       ).then((result) => result.rows);
     expect(await strikesOf()).toHaveLength(1);
 
-    // The counter-notice, then forwarded: the window is computed from now (10 / 14 business days).
+    // The counter-notice (received now), then forwarded: the window runs from the RECEIPT, 10 to the
+    // end of 14 business days (weekends and US federal holidays skipped).
     await page.getByLabel("Name", { exact: true }).fill("The Uploader");
     await page.getByLabel("Address", { exact: true }).fill("2 Example Road");
     await page.getByLabel("Email", { exact: true }).fill("uploader@example.test");
@@ -189,11 +190,18 @@ test.describe("copyright notices", () => {
     await dialogButton(page, "Forward counter-notice").click();
     await expect(dialog).toBeHidden();
     const row = await localDb((db) =>
-      db.query<{ restore_not_before: Date }>("SELECT restore_not_before FROM dmca_notices WHERE id = $1", [
-        noticeId,
-      ]),
+      db.query<{ restore_not_before: Date; restore_not_after: Date }>(
+        "SELECT restore_not_before, restore_not_after FROM dmca_notices WHERE id = $1",
+        [noticeId],
+      ),
     );
     const notBefore = row.rows[0]!.restore_not_before.getTime();
+    const notAfter = row.rows[0]!.restore_not_after.getTime();
+    expect(notAfter).toBeGreaterThan(notBefore);
+    // The detail shows the receipt and the window; Forward is not offered a second time.
+    await expect(notice).toContainText("Counter-notice received on");
+    await expect(notice).toContainText(/From .+ to .+/);
+    await expect(page.getByRole("button", { name: "Forward counter-notice", exact: true })).toHaveCount(0);
     expect(notBefore).toBeGreaterThan(Date.now() + 9 * 86_400_000);
 
     // THE WORKER'S CLOCK: `restoreNotBefore` is compared with `clock.now(c)`, which only the
@@ -234,6 +242,13 @@ test.describe("copyright notices", () => {
       localDb((db) =>
         db.query<{ takedown_at: Date | null }>("SELECT takedown_at FROM nodes WHERE id = $1", [file.id]),
       ).then((result) => result.rows[0]!.takedown_at);
+    expect(await takenDown()).not.toBeNull();
+
+    // An hour after the window closed: refused too (the statute's "not more than 14").
+    await atClock(notAfter + 3_600_000);
+    await restore();
+    await expect(dialog).toContainText("Restore is possible only until the end of the window.");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
     expect(await takenDown()).not.toBeNull();
 
     // An hour into the window: restored — the file back, its link live, the strike lifted.

@@ -1,7 +1,8 @@
 // The DMCA workflow (T25 section 7) on T05's columns: intake (snapshotted, split per alleged
 // infringer), take down (links PAUSED with `moderation`, the strike, the owner's mail once), the
-// counter-notice and its window (10 / 14 business days, weekends skipped, compared with the
-// Worker's clock), restore inside the window, the lawsuit notice, close — and a FOLDER taken down
+// counter-notice and its window (10 / 14 business days after the counter-notice's RECEIPT,
+// weekends and US federal holidays skipped, compared with the Worker's clock — both ends), the
+// complainant's mails (the counter-notice forwarded, the restore), restore inside the window, the lawsuit notice, close — and a FOLDER taken down
 // and restored by subtree, with a file inside taken down separately keeping its own pause.
 //
 // Time: `vi.useFakeTimers({ toFake: ["Date"] })` moves the Worker's clock (`now(c)`) and the
@@ -28,6 +29,7 @@ import {
   makeShare,
   member,
   nodeRowOf,
+  rand,
   strikesOfUser,
   testDb,
   uploadAddress,
@@ -77,19 +79,23 @@ const counter = (who: Admin, id: string) =>
     },
   });
 
-/** The next Friday at noon UTC after `from` (a forward on a Friday crosses two weekends). */
+/** The next Friday at noon UTC after `from` (a window from a Friday crosses two weekends). */
 function nextFriday(from: Date): Date {
   const at = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate() + 1, 12));
   while (at.getUTCDay() !== 5) at.setUTCDate(at.getUTCDate() + 1);
   return at;
 }
 
-/** Notice → take down → counter-notice → forwarded at `forwardAt` (the clock set there). */
-async function upToForward(who: Admin, nodeIds: string[], forwardAt: Date) {
+/**
+ * Notice → take down → counter-notice RECEIVED at `receivedAt` → forwarded at `forwardAt` (by
+ * default the same moment). The clock is set to each in turn.
+ */
+async function upToForward(who: Admin, nodeIds: string[], receivedAt: Date, forwardAt = receivedAt) {
   const made = await notice(who, nodeIds);
   expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
-  expect((await counter(who, made.id)).status).toBe(200);
   vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(receivedAt);
+  expect((await counter(who, made.id)).status).toBe(200);
   vi.setSystemTime(forwardAt);
   const forwarded = await act(who, made.id, "forward_counter");
   expect(forwarded.status).toBe(200);
@@ -207,34 +213,136 @@ describe("an open notice holds the node; a closed one releases it", () => {
   });
 });
 
-describe("the counter-notice window: 10 and 14 business days after the forward", () => {
-  it("forwarded on a Friday: both weekends skipped — not before Friday + 14 days, by Thursday + 20", async () => {
+describe("the counter-notice window: 10 and 14 business days after RECEIPT of the counter-notice", () => {
+  // A fixed date inside the holiday table (business-days.ts ends 2028-12-31), not 2099: the
+  // window is computed from the table, and a date past it is refused. Received Friday 3 November
+  // 2028; Veterans Day is observed on Friday 10 November and Thanksgiving is Thursday 23 November.
+  const RECEIVED = new Date("2028-11-03T12:00:00.000Z");
+
+  it("counted from the receipt, not the forward click; weekends and US federal holidays skipped; the end is the whole 14th day", async () => {
     const who = await admin();
     const owner = await member();
     const file = await makeFile(owner.id, null, { scanStatus: "clean" });
-    const forwardAt = nextFriday(new Date());
-    const forwarded = await upToForward(who, [file.id], forwardAt);
+    // Forwarded the next Monday: a window from the click would run 21 to 28 November.
+    const forwardAt = new Date("2028-11-06T09:00:00.000Z");
+    const forwarded = await upToForward(who, [file.id], RECEIVED, forwardAt);
+    expect(forwarded.counterReceivedAt).toBe(RECEIVED.toISOString());
     expect(forwarded.counterForwardedAt).toBe(forwardAt.toISOString());
-    expect(forwarded.restoreNotBefore).toBe(new Date(forwardAt.getTime() + 14 * DAY).toISOString());
-    expect(forwarded.restoreNotAfter).toBe(new Date(forwardAt.getTime() + 20 * DAY).toISOString());
-    expect(new Date(forwarded.restoreNotBefore!).getUTCDay()).toBe(5);
-    expect(new Date(forwarded.restoreNotAfter!).getUTCDay()).toBe(4);
+    // 10 business days after Fri 3 Nov: 6–9, (10 Veterans Day), 13–17, 20 → Mon 20 Nov.
+    expect(forwarded.restoreNotBefore).toBe("2028-11-20T12:00:00.000Z");
+    // 14: 21, 22, (23 Thanksgiving), 24, 27 → the whole of Mon 27 Nov.
+    expect(forwarded.restoreNotAfter).toBe("2028-11-27T23:59:59.999Z");
   });
 
-  it("restore is refused before restoreNotBefore (409 before_window, checked in the Worker) and allowed from it", async () => {
+  it("a counter-notice recorded later with its real receipt date: the window is from that date", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await notice(who, [file.id]);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2028-11-01T08:00:00.000Z"));
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    // Typed in on Wednesday 8 November; it arrived on Friday 3 November.
+    vi.setSystemTime(new Date("2028-11-08T10:00:00.000Z"));
+    const recorded = await adminCall(who.as, "POST", `/dmca/${made.id}/counter`, {
+      body: {
+        counterName: "The Uploader",
+        counterAddress: "2 Example Road",
+        counterEmail: "uploader@example.test",
+        counterStatement: "I believe in good faith the file was removed by mistake.",
+        counterConsentJurisdiction: true,
+        counterSignature: "The Uploader",
+        counterReceivedAt: RECEIVED.toISOString(),
+      },
+    });
+    expect(recorded.status).toBe(200);
+    const forwarded = await act(who, made.id, "forward_counter");
+    expect(forwarded.status).toBe(200);
+    expect(forwarded.body.restoreNotBefore).toBe("2028-11-20T12:00:00.000Z");
+    expect(forwarded.body.restoreNotAfter).toBe("2028-11-27T23:59:59.999Z");
+  });
+
+  it("a receipt date in the future, or before the takedown, is refused (it would move the window)", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await notice(who, [file.id]);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2028-11-01T08:00:00.000Z"));
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    vi.setSystemTime(RECEIVED);
+    const at = (counterReceivedAt: string) =>
+      adminCall(who.as, "POST", `/dmca/${made.id}/counter`, {
+        body: {
+          counterName: "The Uploader",
+          counterAddress: "2 Example Road",
+          counterEmail: "uploader@example.test",
+          counterStatement: "Removed by mistake.",
+          counterConsentJurisdiction: true,
+          counterSignature: "The Uploader",
+          counterReceivedAt,
+        },
+      });
+    const future = await at("2028-11-04T12:00:00.000Z");
+    expect(future.status).toBe(400);
+    expect(future.body.details.reason).toBe("counter_received_at");
+    const beforeTakedown = await at("2028-10-31T12:00:00.000Z");
+    expect(beforeTakedown.status).toBe(400);
+    expect(beforeTakedown.body.details.reason).toBe("counter_received_at");
+    expect((await act(who, made.id, "forward_counter")).status).toBe(409);
+  });
+
+  it("forwarded once: a second forward is refused and the window does not move", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const forwarded = await upToForward(who, [file.id], RECEIVED);
+    vi.setSystemTime(new Date("2028-11-07T12:00:00.000Z"));
+    const again = await act(who, forwarded.id, "forward_counter");
+    expect(again.status).toBe(409);
+    expect(again.body.details.reason).toBe("already_forwarded");
+  });
+
+  it("a window that would end past the holiday table is refused with its reason, nothing recorded", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await notice(who, [file.id]);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2028-12-20T12:00:00.000Z"));
+    expect((await act(who, made.id, "takedown")).status).toBe(200);
+    expect((await counter(who, made.id)).status).toBe(200);
+    const refused = await act(who, made.id, "forward_counter");
+    expect(refused.status).toBe(409);
+    expect(refused.body.details.reason).toBe("holiday_table");
+    const row = (await adminCall(who.as, "GET", `/dmca/${made.id}`)).body as DmcaNoticeDto;
+    expect([row.counterForwardedAt, row.restoreNotBefore, row.restoreNotAfter]).toEqual([null, null, null]);
+  });
+
+  it("restore is refused before restoreNotBefore (409 before_window) and after restoreNotAfter (409 after_window), checked in the Worker; allowed inside", async () => {
     const who = await admin();
     const owner = await member();
     const file = await makeFile(owner.id, null, { scanStatus: "clean" });
     const link = await makeLink(file.id, owner.id);
-    const forwardAt = nextFriday(new Date());
-    const forwarded = await upToForward(who, [file.id], forwardAt);
+    const forwarded = await upToForward(who, [file.id], RECEIVED);
     vi.setSystemTime(new Date(new Date(forwarded.restoreNotBefore!).getTime() - 60_000));
     const early = await act(who, forwarded.id, "restore");
     expect(early.status).toBe(409);
-    expect(early.body.details.reason).toBe("before_window");
+    expect(early.body.details).toMatchObject({
+      reason: "before_window",
+      restoreNotBefore: forwarded.restoreNotBefore,
+    });
+    vi.setSystemTime(new Date(new Date(forwarded.restoreNotAfter!).getTime() + 1));
+    const late = await act(who, forwarded.id, "restore");
+    expect(late.status).toBe(409);
+    expect(late.body.details).toMatchObject({
+      reason: "after_window",
+      restoreNotAfter: forwarded.restoreNotAfter,
+    });
     expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
     expect((await linkRowOf(link.id)).pauseReasons).toEqual(["moderation"]);
-    vi.setSystemTime(new Date(forwarded.restoreNotBefore!));
+    expect(await auditOf("admin.dmca_restore", forwarded.id)).toHaveLength(0);
+    vi.setSystemTime(new Date(forwarded.restoreNotAfter!));
     const restored = await act(who, forwarded.id, "restore");
     expect(restored.status).toBe(200);
     expect(restored.body.status).toBe("restored");
@@ -255,6 +363,99 @@ describe("the counter-notice window: 10 and 14 business days after the forward",
     expect(refused.status).toBe(409);
     expect(refused.body.details.reason).toBe("lawsuit");
     expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
+  });
+});
+
+describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded, and the restore", () => {
+  const RECEIVED = new Date("2028-11-03T12:00:00.000Z");
+
+  async function noticeFor(who: Admin, nodeIds: string[], complainantEmail: string | undefined) {
+    const answer = await adminCall(who.as, "POST", "/dmca", {
+      body: intake(nodeIds, { complainantEmail }),
+    });
+    expect(answer.status).toBe(200);
+    return answer.body.notices[0] as DmcaNoticeDto;
+  }
+
+  async function forwardFor(who: Admin, id: string) {
+    expect((await act(who, id, "takedown")).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(RECEIVED);
+    const recorded = await adminCall(who.as, "POST", `/dmca/${id}/counter`, {
+      body: {
+        counterName: "Ada Uploader",
+        counterAddress: "2 Example Road\nSpringfield",
+        counterPhone: "555 0100",
+        counterEmail: "uploader@example.test",
+        counterStatement: "I swear under penalty of perjury the file was removed by mistake.",
+        counterConsentJurisdiction: true,
+        counterSignature: "/Ada Uploader/",
+      },
+    });
+    expect(recorded.status).toBe(200);
+    const forwarded = await act(who, id, "forward_counter");
+    expect(forwarded.status).toBe(200);
+    return forwarded.body as DmcaNoticeDto;
+  }
+
+  it("forward: the complainant gets a copy of the counter-notice and the window; restore: the outcome; each recorded in the audit", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", name: "secret-name.jpg" });
+    // Made up for the test: one address per test, so the outbox is read for this notice only.
+    const complainant = `legal-${rand(8)}@example.test`;
+    const made = await noticeFor(who, [file.id], complainant);
+    const forwarded = await forwardFor(who, made.id);
+    const [copy, ...more] = mailTo(complainant, "dmcaCounterForwarded");
+    expect(more).toEqual([]);
+    expect(copy!.text).toContain("Ada Uploader");
+    expect(copy!.text).toContain("Springfield");
+    expect(copy!.text).toContain("555 0100");
+    expect(copy!.text).toContain("removed by mistake");
+    expect(copy!.text).toContain("Consents to the jurisdiction of the federal court: yes");
+    expect(copy!.text).toContain("20 November 2028");
+    expect(copy!.text).toContain("27 November 2028");
+    expect(copy!.text).toContain(made.id);
+    // The complainant is not told the owner's file name (only what their own notice said).
+    expect(copy!.text).not.toContain("secret-name");
+    expect(mailTo(complainant, "dmcaRestoredComplainant")).toEqual([]);
+    expect((await auditOf("admin.dmca_complainant_mail", made.id)).map((row) => row.meta)).toEqual([
+      { kind: "counter_forwarded", outcome: "sent" },
+    ]);
+
+    vi.setSystemTime(new Date(forwarded.restoreNotBefore!));
+    expect((await act(who, made.id, "restore")).status).toBe(200);
+    const [outcome, ...again] = mailTo(complainant, "dmcaRestoredComplainant");
+    expect(again).toEqual([]);
+    expect(outcome!.text).toContain(made.id);
+    expect(outcome!.text).toContain("restored");
+    expect((await auditOf("admin.dmca_complainant_mail", made.id)).map((row) => row.meta)).toEqual([
+      { kind: "counter_forwarded", outcome: "sent" },
+      { kind: "restored", outcome: "sent" },
+    ]);
+  });
+
+  it("a notice with no complainant address (received by post): nothing mailed, and the audit says so", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const made = await noticeFor(who, [file.id], undefined);
+    expect(made.complainantEmail).toBeNull();
+    await forwardFor(who, made.id);
+    expect((await auditOf("admin.dmca_complainant_mail", made.id)).map((row) => row.meta)).toEqual([
+      { kind: "counter_forwarded", outcome: "no_address" },
+    ]);
+  });
+
+  it("a refused restore (before the window) mails nobody", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const complainant = `legal-${rand(8)}@example.test`;
+    const made = await noticeFor(who, [file.id], complainant);
+    await forwardFor(who, made.id);
+    expect((await act(who, made.id, "restore")).status).toBe(409);
+    expect(mailTo(complainant, "dmcaRestoredComplainant")).toEqual([]);
   });
 });
 
@@ -332,9 +533,9 @@ describe("a FOLDER taken down and restored by subtree", () => {
     const second = await notice(who, [inSub.id]);
     expect((await act(who, second.id, "takedown")).status).toBe(200);
 
-    expect((await counter(who, first.id)).status).toBe(200);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(forwardAt);
+    expect((await counter(who, first.id)).status).toBe(200);
     expect((await act(who, first.id, "forward_counter")).status).toBe(200);
     vi.setSystemTime(new Date(forwardAt.getTime() + 15 * DAY));
     expect((await act(who, first.id, "restore")).status).toBe(200);
