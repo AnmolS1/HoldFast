@@ -5,9 +5,16 @@
 // Route classes: login (the Turnstile stand-in), the explorer, a PDF preview, a video preview and
 // the public link page — each listening for `securitypolicyviolation` events, CSP console lines,
 // page errors and the reports the browser posts to /api/public/csp-report (the only place a
-// WORKER's violations show). Zero of each. Admin, the report dialog and the interstitial pages are
-// Part B (T25, T22). Runs on the projects playwright.config.ts has (chromium, mobile-chrome) until
-// the firefox / webkit projects land (a T28 seam).
+// WORKER's violations show). Zero of each. Part B adds the admin console's Data Grid pages (T25)
+// and, on the public link page, the report dialog and the dangerous-file interstitial (T22). Runs
+// on the projects playwright.config.ts has (chromium, mobile-chrome) until the firefox / webkit
+// projects land (a T28 seam).
+//
+// The Data Grid inserts a <style> of its own CSS variables outside Emotion (spike S5), which only
+// the `nonce` prop of AdminDataGrid.tsx makes legal. The grid LOOKS right without it, so only the
+// violation count catches a regression: zero on three grid pages, and the control — the same
+// wrapper served without its nonce — one `style-src-elem` violation per grid, whose sample is the
+// grid's own CSS, and which the browser reports to the endpoint.
 //
 // Workers: under `vite dev` a worker's script is not an /assets/ file, so it carries no policy of
 // its own (the built app's do: tests/unit/security/csp.test.ts, and `vite preview` in the report).
@@ -30,7 +37,7 @@ import type { Page } from "@playwright/test";
 import { FakeDrive } from "../unit/client/explorer/fixtures/drive";
 import { fileNode, folderNode } from "../unit/client/explorer/fixtures/nodes";
 import { detailOf, ID, NODES, pageOf } from "../unit/client/preview/fixtures";
-import { expect, mockedOnly, mockShell, stubTurnstile, test } from "./fixtures";
+import { expect, mockedOnly, mockShell, navigateInApp, stubTurnstile, test } from "./fixtures";
 
 const FILES_DIR = join(dirname(fileURLToPath(import.meta.url)), "../unit/client/preview/fixtures/files");
 const BYTES: Record<string, { body: Buffer; type: string }> = {
@@ -264,7 +271,13 @@ test.describe("the policy in a real browser (mocked API)", () => {
     const watched = await watch(page);
     const policy = documentPolicy(page);
     const served = await policyOnScripts(page, /pdf\.worker/, policy);
+    // As preview.spec.ts does: pdf.js's worker is fetched and run cold (no HTTP cache with routes),
+    // most of the 5 s at 8× CPU throttle — wait for it, so that the 5 s below are for drawing only.
+    const pdfWorker = page.waitForResponse((response) =>
+      /pdf\.worker/.test(new URL(response.url()).pathname),
+    );
     await page.goto(`/preview/${ID.pdf}`);
+    await pdfWorker;
     await expectPdfDrawn(page);
     expect(served.length, "pdf.js's worker script was served with the policy").toBeGreaterThan(0);
 
@@ -307,6 +320,260 @@ test.describe("the policy in a real browser (mocked API)", () => {
     const response = await page.goto("/s/AbCdEfGhIjKlMnOpQrStUv");
     expect(response?.headers()["referrer-policy"]).toBe("no-referrer");
     await expect(page.getByRole("heading", { name: "This link is protected" })).toBeVisible();
+    expect(watched.problems).toEqual([]);
+    expect(watched.reports).toEqual([]);
+  });
+});
+
+const AT = "2099-01-01T00:00:00.000Z";
+const ADMIN_ANSWERS: Record<string, unknown> = {
+  "/api/admin/users": {
+    items: [
+      {
+        id: "b".repeat(32),
+        email: "grace@example.com",
+        displayName: "Grace Hopper",
+        role: "user",
+        emailVerified: true,
+        twoFactorEnabled: false,
+        createdAt: AT,
+        quotaBytes: 5_000_000_000,
+        usedBytes: 1234,
+        banned: false,
+        banReason: null,
+        suspendedAt: null,
+        suspendedReason: null,
+        deleteScheduledAt: null,
+        legalHold: false,
+        activeStrikes: 0,
+        lastActiveAt: null,
+      },
+    ],
+    nextCursor: null,
+  },
+  "/api/admin/invites": {
+    items: [
+      {
+        code: "made-up-invite-code-for-e2e",
+        createdBy: "a".repeat(32),
+        maxUses: 1,
+        uses: 0,
+        expiresAt: null,
+        revokedAt: null,
+        note: null,
+        createdAt: AT,
+      },
+    ],
+    nextCursor: null,
+  },
+  "/api/admin/audit": {
+    items: [
+      {
+        id: "0199d3c2-7a10-7000-8000-0000000000e1",
+        at: AT,
+        actorUserId: "a".repeat(32),
+        actorType: "admin",
+        action: "admin.user_suspended",
+        targetType: "user",
+        targetId: "b".repeat(32),
+        ua: "Chrome",
+        country: null,
+        requestId: "req-e2e",
+        meta: null,
+      },
+    ],
+    nextCursor: null,
+    actors: { ["a".repeat(32)]: null },
+  },
+};
+
+/** The signed-in SPA as an admin, with one row on each of three Data Grid pages. */
+async function arrangeAdmin(page: Page, port: number) {
+  await mockShell(page, port, {
+    user: { role: "admin" },
+    api: async (route, path) => {
+      const answer = ADMIN_ANSWERS[path];
+      if (answer === undefined) return false;
+      await route.fulfill({ json: answer });
+      return true;
+    },
+  });
+}
+
+/** Visit the three grid pages (one document load), each with its grid mounted and its row drawn. */
+async function visitGrids(page: Page) {
+  await page.goto("/admin/users");
+  for (const [path, row] of [
+    ["/admin/users", "grace@example.com"],
+    ["/admin/invites", "made-up-invite-code-for-e2e"],
+    ["/admin/audit", "admin.user_suspended"],
+  ] as const) {
+    if (path !== "/admin/users") await navigateInApp(page, path);
+    const grid = page.locator(".MuiDataGrid-root");
+    await expect(grid, path).toHaveCount(1);
+    await expect(grid.locator(".MuiDataGrid-row"), path).toHaveCount(1);
+    await expect(grid.getByText(row, { exact: false }), path).toBeVisible();
+  }
+}
+
+type Violation = { directive: string; sample: string };
+const violationsOf = (page: Page) =>
+  page.evaluate(() => (window as unknown as { __violations: Violation[] }).__violations);
+
+test.describe("the admin console's Data Grid (mocked API)", () => {
+  test.beforeEach(() => mockedOnly());
+
+  test("three grid pages: no violation — the grid's own <style> carries the page's nonce", async ({
+    page,
+    origins,
+  }) => {
+    await arrangeAdmin(page, origins.port);
+    const watched = await watch(page);
+    await visitGrids(page);
+    // The grid's variables really are in the document, inside a nonced <style>.
+    const styles = await page.evaluate(() =>
+      [...document.querySelectorAll("style")]
+        .filter((style) => style.textContent?.startsWith(".MuiDataGridVariables-"))
+        .map((style) => style.nonce),
+    );
+    expect(styles.length).toBeGreaterThan(0);
+    for (const nonce of styles) expect(nonce).not.toBe("");
+    expect(await violationsOf(page)).toEqual([]);
+    expect(watched.problems).toEqual([]);
+    expect(watched.reports).toEqual([]);
+  });
+
+  test("control: the wrapper served WITHOUT its nonce — one style-src-elem violation per grid, its sample the grid's CSS, reported to the endpoint", async ({
+    page,
+    origins,
+  }) => {
+    await arrangeAdmin(page, origins.port);
+    const watched = await watch(page);
+    // AdminDataGrid.tsx as Vite serves it, the nonce prop's value taken out (the module that is
+    // the ONE door to the grid; eslint and a source scan keep it so).
+    let rewritten = 0;
+    await page.route(
+      (url) => url.pathname === "/src/client/features/admin/components/AdminDataGrid.tsx",
+      async (route) => {
+        const response = await route.fetch();
+        const text = await response.text();
+        const without = text.replace("nonce: readNonceFromMeta()", "nonce: undefined");
+        expect(without, "the transformed module still names the nonce prop as expected").not.toBe(text);
+        rewritten += 1;
+        await route.fulfill({ response, body: without });
+      },
+    );
+    // The document's policy WITHOUT `report-to`: with it, Chromium sends nothing on http (Part A,
+    // the burst test below), and the report this control shows would never leave the page.
+    await page.route(
+      (url) => url.pathname.startsWith("/admin"),
+      async (route) => {
+        if (route.request().resourceType() !== "document") return route.fallback();
+        const response = await route.fetch();
+        const policy = response.headers()["content-security-policy"] ?? "";
+        expect(policy).toContain("; report-to csp");
+        await route.fulfill({
+          response,
+          headers: {
+            ...response.headers(),
+            "content-security-policy": policy.replace("; report-to csp", ""),
+          },
+        });
+      },
+    );
+    await visitGrids(page);
+    expect(rewritten).toBe(1);
+    // One more thing differs from the page above, and it is dev-only: once the document itself is
+    // answered through page.route, Vite's HMR client (/@vite/client) falls back from its first
+    // socket to ws://127.0.0.1:<port>, outside `connect-src 'self'` — the shape the PDF test allows
+    // on pdf.js's worker. The built app has no Vite client. Nothing else is allowed.
+    const viteHmr = (text: string) => /connect-src/.test(text) && /ws:\/\/127\.0\.0\.1:\d+\//.test(text);
+    const violations = (await violationsOf(page)).filter(
+      (violation) => violation.directive !== "connect-src",
+    );
+    expect(violations.length).toBeGreaterThan(0);
+    for (const violation of violations) {
+      expect(violation.directive).toBe("style-src-elem");
+      expect(violation.sample).toMatch(/^\.MuiDataGridVariables-/);
+    }
+    // Every console line and page error is one of those violations — nothing else broke.
+    expect(
+      watched.problems.filter((line) => !/style-src-elem|style-src '/.test(line) && !viteHmr(line)),
+    ).toEqual([]);
+    expect(
+      watched.reports.filter((body) => !body.includes("MuiDataGridVariables-") && !viteHmr(body)),
+    ).toEqual([]);
+    // …and the browser posted it, with its sample ('report-sample'), to the report endpoint.
+    await expect
+      .poll(() => watched.reports.filter((body) => body.includes("MuiDataGridVariables-")).length)
+      .toBeGreaterThan(0);
+    const report = JSON.parse(watched.reports.find((body) => body.includes("MuiDataGridVariables-"))!) as {
+      "csp-report": {
+        "effective-directive"?: string;
+        "violated-directive"?: string;
+        "script-sample"?: string;
+      };
+    };
+    expect(report["csp-report"]["effective-directive"] ?? report["csp-report"]["violated-directive"]).toBe(
+      "style-src-elem",
+    );
+    expect(report["csp-report"]["script-sample"]).toMatch(/^\.MuiDataGridVariables-/);
+  });
+});
+
+test.describe("the report dialog and the dangerous-file interstitial (mocked API)", () => {
+  test.beforeEach(() => mockedOnly());
+
+  const TOKEN = "AbCdEfGhIjKlMnOpQrStUv";
+  const file = {
+    id: "0199d3c2-7a10-7000-8000-0000000000f2",
+    name: "setup.exe",
+    kind: "file",
+    size: 1234,
+    mimeCategory: "other",
+    ext: "exe",
+    mimeSniffed: "application/x-msdownload",
+    thumb: false,
+  };
+
+  test("the public file page of a dangerous file: the interstitial, then the report dialog with its Turnstile — no violation", async ({
+    page,
+    origins,
+  }) => {
+    let minted = 0;
+    await mockShell(page, origins.port, {
+      user: null,
+      api: async (route, path) => {
+        if (path === `/api/public/links/${TOKEN}`) {
+          await route.fulfill({
+            json: { requiresPassword: false, node: file, allowPreview: true, dangerous: true },
+          });
+          return true;
+        }
+        if (path.startsWith(`/api/public/links/${TOKEN}/download-url`)) minted += 1;
+        return false;
+      },
+    });
+    const watched = await watch(page);
+    await page.goto(`/s/${TOKEN}`);
+    await expect(page.getByRole("heading", { name: file.name })).toBeVisible();
+
+    // The interstitial: a dialog of its own, nothing minted until the visitor chooses.
+    await page.locator("[data-public-download]").click();
+    const warning = page.getByRole("dialog", { name: `Download ${file.name}?` });
+    await expect(warning).toBeVisible();
+    await warning.getByRole("button", { name: "Cancel" }).click();
+    await expect(warning).toBeHidden();
+    expect(minted).toBe(0);
+
+    // The report dialog, with the Turnstile widget rendered by the page's own code.
+    await page.locator("[data-report-link]").click();
+    const dialog = page.getByRole("dialog", { name: "Report this file" });
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator("[data-turnstile='ready']")).toBeAttached();
+    await dialog.getByLabel("Spam").check();
+
+    expect(await violationsOf(page)).toEqual([]);
     expect(watched.problems).toEqual([]);
     expect(watched.reports).toEqual([]);
   });
