@@ -461,7 +461,8 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       await recordScan(tx, node.id, key, seen);
       // A PhotoDNA match is listed NOW, in this transaction: should the lock below fail, the
       // redelivery finds the hash listed csam whatever PhotoDNA answers then.
-      if (outcome.csamSource === "photodna" && sha256) await listSuspectedCsam(tx, { sha256, nodeId: node.id });
+      if (outcome.csamSource === "photodna" && sha256)
+        await listSuspectedCsam(tx, { sha256, nodeId: node.id });
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);
