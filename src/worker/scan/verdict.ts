@@ -15,6 +15,8 @@
 //
 // WHERE IT IS WRITTEN — decided on the row as LOCKED here, never on an earlier read:
 //   outcome suspected_csam, any state    the shared handler `lockSuspectedCsam`, AFTER the commit
+//                                          (a PhotoDNA match's hash listed csam BEFORE it, in this
+//                                          transaction — `listSuspectedCsam`)
 //   pending, not taken down              the status (and reason); the side effects below
 //   taken down (itself or a folder       status untouched; the outcome is kept in the detail and
 //     above it — `effectiveHidden`)        the job's verdict only
@@ -39,6 +41,7 @@
 // transaction (`addStrike(bg, …, { tx })`), its `applySuspension()` is awaited after it.
 // Nothing here relies on `waitUntil` outliving the invocation: everything is awaited.
 
+import { sql } from "drizzle-orm";
 import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
@@ -47,12 +50,12 @@ import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import type { ScanDetail } from "../db/schema";
+import { hashBlocklist, type ScanDetail } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
 import { AppError } from "../services/errors";
-import type { Tx } from "../db/client";
+import type { Executor, Tx } from "../db/client";
 import type { BackgroundContext, ServiceDeps } from "../services/request-context";
 import { lockSuspectedCsam, type ScanReason, type ScanVerdict } from "../services/scanning";
 import { storage } from "../services/storage";
@@ -280,6 +283,36 @@ export async function listInfected(
   return { listed, strike };
 }
 
+// ── a PhotoDNA match ────────────────────────────────────────────────────────────────────────
+
+/**
+ * A PhotoDNA match puts the SERVER hash on the list BEFORE any write that makes the node locked —
+ * so a match whose lock then fails is not owed by an audit row alone: the list says csam, and
+ * whatever runs next (the scan's redelivery, T22's owed-node sweep) locks it like any other csam
+ * hit. Shared by `applyVerdict` (in its transaction, after the node and job rows) and the avatar
+ * path of the upload route (one statement on its own, before the node's transaction).
+ *
+ * THE LOCK'S OWN STATEMENT (`lockSuspectedCsam`, queries/moderation.ts `lockRows`), with
+ * `nodeId` the node that is — or is about to be — locked: no entry → created, `sourceNodeId`
+ * that node; an entry with another reason → RAISED to `csam` (`raisedFrom`, `raisedByNodeId`);
+ * a `csam` entry → untouched. Never `blocklist.upsert(csam)` / `confirmCsam`: those make a
+ * CONFIRMED listing, which no clear undoes — a PhotoDNA false positive cleared by an admin must
+ * come off the list again (`clearSuspectedCsam` undoes an entry naming the cleared node).
+ */
+export async function listSuspectedCsam(
+  db: Executor | Tx,
+  input: { sha256: string; nodeId: string },
+): Promise<void> {
+  await db
+    .insert(hashBlocklist)
+    .values({ sha256: input.sha256, reason: "csam", sourceNodeId: input.nodeId })
+    .onConflictDoUpdate({
+      target: hashBlocklist.sha256,
+      set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: input.nodeId },
+      setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
+    });
+}
+
 // ── applying it ─────────────────────────────────────────────────────────────────────────────
 
 export type VerdictInput = {
@@ -426,6 +459,9 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     if (outcome.status === "suspected_csam") {
       // From ANY state: it only ever raises. The lock itself is the shared handler's, after commit.
       await recordScan(tx, node.id, key, seen);
+      // A PhotoDNA match is listed NOW, in this transaction: should the lock below fail, the
+      // redelivery finds the hash listed csam whatever PhotoDNA answers then.
+      if (outcome.csamSource === "photodna" && sha256) await listSuspectedCsam(tx, { sha256, nodeId: node.id });
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);

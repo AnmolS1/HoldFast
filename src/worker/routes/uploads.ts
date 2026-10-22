@@ -69,7 +69,7 @@ import type { Executor } from "../db/client";
 import { asQueryError, LegalHoldError, QueryError } from "../db/errors";
 import { uuidv7 } from "../db/ids";
 import * as blocklist from "../db/queries/blocklist";
-import { listInfected } from "../scan/verdict";
+import { listInfected, listSuspectedCsam } from "../scan/verdict";
 import { checkPhotoDna, photodnaNote, PhotoDnaTransientError, type PhotoDnaResult } from "../scan/photodna";
 import { findByR2Key, getNode, replaceVersion } from "../db/queries/nodes";
 import { assertPurgeable, deleteSubtreeRows, type DeletedRows } from "../db/queries/trash";
@@ -1502,6 +1502,10 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
       if (photodna.result && "match" in photodna.result && photodna.result.match) {
         csamSource = "photodna";
         evidence = true;
+        // Listed csam BEFORE any node is written — one statement of its own, outside the node's
+        // transaction — the way the lock lists it (`sourceNodeId` the node this upload becomes):
+        // if the node is owed, the repair sweep finds the hash listed and locks it.
+        await listSuspectedCsam(db(c), { sha256, nodeId: session.nodeId });
       }
     }
 
