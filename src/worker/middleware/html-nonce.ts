@@ -35,7 +35,7 @@ async function stamped(res: Response, c: Context<AppEnv>): Promise<Response> {
       element.setAttribute("nonce", nonce);
     },
   };
-  return new HTMLRewriter()
+  const rewritten = new HTMLRewriter()
     .on("script", stamp)
     .on("style", stamp)
     .on('link[rel="modulepreload"]', stamp)
@@ -48,6 +48,15 @@ async function stamped(res: Response, c: Context<AppEnv>): Promise<Response> {
       },
     })
     .transform(response);
+  // The deployed asset binding answers `text/html` with no charset (local Miniflare adds one): name it,
+  // so no browser guesses the shell's encoding (T26 headers snapshot, Gate-B run 2026-10-22).
+  const headers = new Headers(rewritten.headers);
+  headers.set("content-type", "text/html; charset=utf-8");
+  return new Response(rewritten.body, {
+    status: rewritten.status,
+    statusText: rewritten.statusText,
+    headers,
+  });
 }
 
 export const htmlNonce = (res: Response, c: Context<AppEnv>): Response | Promise<Response> => stamped(res, c);

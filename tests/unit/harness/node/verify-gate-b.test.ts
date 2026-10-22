@@ -240,9 +240,9 @@ describe("the gate on the fake runner (no remote call)", () => {
     const { gate } = setup("dev");
     const { out } = gate();
     expect(ranUnder(out, "ponderance-pages")).toEqual([
-      "curl -fsS --max-time 20 https://ponderance.dev/privacy",
-      "curl -fsS --max-time 20 https://ponderance.dev/terms",
-      "curl -fsS --max-time 20 https://ponderance.dev/support/holdfast",
+      "curl -fsSL --max-time 20 https://ponderance.dev/privacy/",
+      "curl -fsSL --max-time 20 https://ponderance.dev/terms/",
+      "curl -fsSL --max-time 20 https://ponderance.dev/support/holdfast/",
     ]);
     expect(ranUnder(out, "stamp")).toEqual([
       "git ls-remote origin refs/heads/dev",

@@ -129,6 +129,13 @@ const appCall = (path: string, options: CallOptions = {}) => call(appWith(fakeCo
 const nonceOfHeader = (csp: string) => /script-src 'nonce-([^']+)'/.exec(csp)?.[1];
 
 describe("the SPA shell", () => {
+  it("names its charset even when the asset binding does not (the deployed binding answers bare text/html)", async () => {
+    const { response } = await appCall("/files", {
+      env: { ASSETS: shellAssets(SHELL, { "content-type": "text/html" }) },
+    });
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+  });
+
   it("every <script>, <style> and module preload carries the response's nonce, and so does the meta the Emotion cache reads", async () => {
     const { response } = await appCall("/files", { env: { ASSETS: shellAssets() } });
     const csp = response.headers.get("content-security-policy") ?? "";

@@ -702,9 +702,9 @@ remote() { # <key> [--writes <path>] <command...>
 check_ponderance() {
   local d="$tmpdir/ponderance"
   mkdir -p "$d"
-  remote ponderance-privacy curl -fsS --max-time 20 "$PONDERANCE/privacy" >"$d/privacy.html" 2>/dev/null || : >"$d/privacy.html"
-  remote ponderance-terms curl -fsS --max-time 20 "$PONDERANCE/terms" >"$d/terms.html" 2>/dev/null || : >"$d/terms.html"
-  remote ponderance-support curl -fsS --max-time 20 "$PONDERANCE/support/holdfast" >"$d/support.html" 2>/dev/null || : >"$d/support.html"
+  remote ponderance-privacy curl -fsSL --max-time 20 "$PONDERANCE/privacy/" >"$d/privacy.html" 2>/dev/null || : >"$d/privacy.html"
+  remote ponderance-terms curl -fsSL --max-time 20 "$PONDERANCE/terms/" >"$d/terms.html" 2>/dev/null || : >"$d/terms.html"
+  remote ponderance-support curl -fsSL --max-time 20 "$PONDERANCE/support/holdfast/" >"$d/support.html" 2>/dev/null || : >"$d/support.html"
   eval_ponderance "$d"
 }
 
