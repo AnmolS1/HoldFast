@@ -197,7 +197,10 @@ let pauseWaiters: Array<() => void> = [];
 /** A landed file whose scan is being followed. */
 interface ScanEntry {
   id: string;
-  /** When it landed. */
+  /**
+   * When it landed (or was checked again), moved forward by every pause of the loop since:
+   * `now - since` is the time the loop could have asked about it.
+   */
   since: number;
   /** How often it has been asked about. */
   asks: number;
@@ -210,6 +213,10 @@ let scanQueue: ScanEntry[] = [];
 let frameUp = true;
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let scanBusy = false;
+/** The file whose request is on its way (it is out of the queue meanwhile). */
+let scanAsking: ScanEntry | null = null;
+/** Since when the loop cannot ask (tab hidden, frame gone); null while it can. */
+let scanPausedSince: number | null = null;
 let scanBackoff = 0;
 /** The scan loop does not ask before this (its backoff, a `Retry-After`) — also after a remount or a tab switch. */
 let scanNotBefore = 0;
@@ -955,8 +962,10 @@ function forgetFolderProblems(item: UploadItem): void {
 
 // ---------------------------------------------------------------------------------------------
 // After the file landed: tell the other features, then follow the scan — with ONE loop for the
-// whole queue. It asks about one file per interval however many wait, backs off when the server
-// says to, does not ask while the tab is hidden, and stops asking about a file after a bound.
+// whole queue. It asks about one file per interval however many wait, asks each file less often
+// the longer it waits, backs off when the server says to, does not ask while the tab is hidden or
+// the frame is gone (and that time does not count), and stops asking about a file after a bound —
+// where the row offers "Check again". A verdict the explorer's listing learns settles the row too.
 
 function landed(id: string, node: NodeDto): void {
   const item = findItem(id);
@@ -977,8 +986,10 @@ function landed(id: string, node: NodeDto): void {
     settleScan(id, node);
     return;
   }
+  syncScanClock();
   const now = Date.now();
-  scanQueue.push({ id, since: now, asks: 0, nextAt: now + SCAN_FILE_WAIT_MS[0] });
+  // A file that lands while the loop cannot ask starts its clock when the loop goes on.
+  scanQueue.push({ id, since: scanPausedSince ?? now, asks: 0, nextAt: now + SCAN_FILE_WAIT_MS[0] });
   scheduleScan(SCAN_INTERVAL_MS);
 }
 
@@ -1011,7 +1022,77 @@ function settleScan(id: string, node: Pick<NodeDto, "scanStatus" | "scanReason" 
   sweep();
 }
 
+/**
+ * What a listing of the explorer shows about files: a row still waiting for one of their verdicts
+ * (scanning, or given up as still being checked) takes it, so the listing and the ribbon never
+ * disagree. The listing has its own poll and says the verdict itself: nothing is announced here,
+ * and nothing is asked to refresh. Ids are the server's, so a listing of another account matches
+ * no row.
+ */
+export function scanVerdictsSeen(nodes: readonly NodeDto[]): void {
+  const verdicts = new Map<string, NodeDto>();
+  for (const node of nodes) {
+    if (node.kind === "file" && node.scanStatus !== null && node.scanStatus !== "pending") {
+      verdicts.set(node.id, node);
+    }
+  }
+  if (verdicts.size === 0) return;
+  let settled = false;
+  for (const item of currentItems()) {
+    const waiting = item.state === "scanning" || (item.state === "done" && item.scanStatus === "pending");
+    const node = waiting && item.nodeId ? verdicts.get(item.nodeId) : undefined;
+    if (!node) continue;
+    // Its entry in the loop's queue is dropped when the loop next looks (the row is no longer scanning).
+    patchItem(item.id, { state: "done", scanStatus: node.scanStatus, scanReason: node.scanReason });
+    settled = true;
+  }
+  if (settled) sweep();
+}
+
+/** "Check again" on a row the bound gave up on: the file is followed again, for a whole new bound. */
+export function recheckItem(id: string): void {
+  const item = findItem(id);
+  if (!item || item.state !== "done" || item.scanStatus !== "pending" || !item.nodeId) return;
+  patchItem(id, { state: "scanning" });
+  syncScanClock();
+  const now = Date.now();
+  scanQueue.push({ id, since: scanPausedSince ?? now, asks: 0, nextAt: now });
+  // Asked at the loop's next turn, not after a wait some other file set (the loop's own
+  // `scanNotBefore` still keeps it at one request per interval).
+  if (!scanBusy) {
+    clearTimeout(scanTimer);
+    scanTimer = undefined;
+  }
+  scheduleScan(0);
+}
+
+/** "Check again" for every row the bound gave up on (the panel counts those it does not draw). */
+export function recheckAll(): void {
+  for (const item of currentItems()) {
+    if (item.state === "done" && item.scanStatus === "pending") recheckItem(item.id);
+  }
+}
+
 const tabHidden = (): boolean => typeof document !== "undefined" && document.visibilityState === "hidden";
+const scanPaused = (): boolean => tabHidden() || !frameUp;
+
+/**
+ * Time the loop cannot ask (the tab hidden, the frame gone) does not count against any file's
+ * bound: when it ends, every file's clock moves forward by it. (A file that was due meanwhile is
+ * asked as soon as the loop goes on.) Called wherever the tab or the frame changes.
+ */
+function syncScanClock(): void {
+  const now = Date.now();
+  if (scanPaused()) {
+    scanPausedSince ??= now;
+    return;
+  }
+  if (scanPausedSince === null) return;
+  const pause = now - scanPausedSince;
+  scanPausedSince = null;
+  for (const entry of scanQueue) entry.since += pause;
+  if (scanAsking) scanAsking.since += pause;
+}
 
 function scheduleScan(wait: number): void {
   if (scanTimer !== undefined || scanBusy || scanQueue.length === 0 || tabHidden() || !frameUp) return;
@@ -1047,7 +1128,10 @@ function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait:
       scanQueue.splice(index, 1);
       return { entry, item };
     }
-    soonest = Math.min(soonest, entry.nextAt);
+    // Woken at its bound too, so that the row says "still being checked" then — not up to a
+    // whole wait later.
+    const bound = entry.since + (entry.asks >= SCAN_MIN_ASKS ? SCAN_FOLLOW_LIMIT_MS : SCAN_HARD_LIMIT_MS);
+    soonest = Math.min(soonest, entry.nextAt, bound);
     index += 1;
   }
   return soonest === Infinity ? null : { wait: soonest - now };
@@ -1068,10 +1152,12 @@ async function scanTick(then: Mark): Promise<void> {
   }
   const { entry, item } = next;
   scanBusy = true;
+  scanAsking = entry;
   let wait: number = SCAN_INTERVAL_MS;
   try {
     const detail = await getNode(item.nodeId ?? "");
     if (!live(then)) return;
+    scanAsking = null;
     scanBackoff = 0;
     if (detail.node.scanStatus === "pending") {
       entry.asks += 1;
@@ -1080,6 +1166,7 @@ async function scanTick(then: Mark): Promise<void> {
     } else settleScan(item.id, detail.node);
   } catch (cause) {
     if (!live(then)) return;
+    scanAsking = null;
     const status = cause instanceof ApiError ? cause.status : 0;
     if (status >= 400 && status < 500 && status !== 429) {
       // The file is gone, or no longer ours to see: there is nothing left to follow.
@@ -1107,6 +1194,7 @@ async function scanTick(then: Mark): Promise<void> {
  */
 export function frameMounted(up: boolean): void {
   frameUp = up;
+  syncScanClock();
   if (up) {
     scheduleScan(SCAN_INTERVAL_MS);
     return;
@@ -1955,6 +2043,8 @@ function dropQueue(): void {
   clearTimeout(scanTimer);
   scanTimer = undefined;
   scanBusy = false;
+  scanAsking = null;
+  scanPausedSince = null;
   scanBackoff = 0;
   scanNotBefore = 0;
   localRestore = null;
@@ -1991,6 +2081,7 @@ if (typeof window !== "undefined") {
   });
   window.addEventListener(AUTH_RESTORED_EVENT, () => resumeQueue("auth"));
   document.addEventListener("visibilitychange", () => {
+    syncScanClock();
     if (tabHidden()) {
       clearTimeout(scanTimer);
       scanTimer = undefined;

@@ -44,6 +44,7 @@ import {
 // The uploader is a sibling feature: its slot is a stub here, and the call is what is asserted.
 vi.mock("../../../../src/client/features/upload", () => ({
   requestUpload: vi.fn(),
+  scanVerdictsSeen: vi.fn(),
   UploadDropOverlay: () => null,
   routes: [],
 }));

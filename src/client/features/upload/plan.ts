@@ -23,22 +23,27 @@ export const COMPLETE_WAIT_LIMIT_MS = 120_000;
 
 /**
  * The scan is followed by ONE loop for the whole queue: at most one request per interval however
- * many files wait, each file for at most `SCAN_FOLLOW_LIMIT_MS`.
+ * many files wait, each file until its verdict or for at most `SCAN_FOLLOW_LIMIT_MS`.
  */
 export const SCAN_INTERVAL_MS = 1_000;
-/** One file is asked about again after these waits (the last repeats): a stuck file costs little. */
-export const SCAN_FILE_WAIT_MS = [1_000, 1_000, 2_000, 2_000, 3_000, 5_000] as const;
 /**
- * A file is given up ("still being checked") once it has waited this long AND has been asked
- * about at least `SCAN_MIN_ASKS` times — so in a long queue no file is given up unasked.
+ * One file is asked about again after these waits (the last repeats): quick at first, then once
+ * every 30 s — a cold scanner takes minutes, and a file waiting on it costs two requests a minute.
  */
-export const SCAN_FOLLOW_LIMIT_MS = 5 * 60_000;
+export const SCAN_FILE_WAIT_MS = [1_000, 1_000, 2_000, 2_000, 3_000, 5_000, 10_000, 20_000, 30_000] as const;
+/**
+ * A file is given up ("still being checked", with "Check again" on its row) once it has been
+ * followed this long AND has been asked about at least `SCAN_MIN_ASKS` times — so in a long queue
+ * no file is given up unasked. Followed means time the loop could ask: while the tab is hidden or
+ * the frame is gone nothing is asked, and that time does not count.
+ */
+export const SCAN_FOLLOW_LIMIT_MS = 15 * 60_000;
 export const SCAN_MIN_ASKS = 3;
 /**
- * And whatever the asks, no file is followed longer than this after it landed: a long queue
- * waiting on a stuck scanner costs at most this many seconds of one request a second (1,800),
- * then every row says "still being checked". (Inside it, 600 files are each asked three times.)
- * A batch status route is the real answer for long queues.
+ * And whatever the asks, no file is followed longer than this (counted the same way): a long
+ * queue waiting on a stuck scanner costs at most this many seconds of one request a second
+ * (1,800), then every row says "still being checked". (Inside it, 600 files are each asked three
+ * times.) A batch status route would be the real answer for long queues.
  */
 export const SCAN_HARD_LIMIT_MS = 30 * 60_000;
 export const SCAN_BACKOFF_MAX_MS = 60_000;

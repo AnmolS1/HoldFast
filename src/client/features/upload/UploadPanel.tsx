@@ -16,6 +16,8 @@ import {
   cancelItem,
   pauseAll,
   pauseItem,
+  recheckAll,
+  recheckItem,
   removeItem,
   resumeAll,
   resumeItem,
@@ -61,6 +63,8 @@ const Row = memo(function Row({ item, onGone }: { item: UploadItem; onGone(): vo
   const removable =
     item.state === "error" || item.state === "refused" || waitsForFile || item.state === "done";
   const cancellable = canCancel(item) && item.state !== "error";
+  // Given up by the scan bound: the file can be followed again.
+  const recheckable = item.state === "done" && item.scanStatus === "pending" && item.nodeId !== null;
   // Red means blocked, and nothing else (a refusal is one); an upload that did not finish is
   // said in the ordinary text colour.
   const tone = item.state === "refused" ? hf.danger : item.state === "error" ? hf.text : hf.textSecondary;
@@ -132,6 +136,11 @@ const Row = memo(function Row({ item, onGone }: { item: UploadItem; onGone(): vo
       ) : null}
       {item.state === "error" && item.canRetry && !isRestored(item) ? (
         <RowButton label={t("action.retry", { name })} onClick={() => retryItem(item.id)}>
+          <RotateCw size={16} aria-hidden="true" />
+        </RowButton>
+      ) : null}
+      {recheckable ? (
+        <RowButton label={t("action.checkAgain", { name })} onClick={() => recheckItem(item.id)}>
           <RotateCw size={16} aria-hidden="true" />
         </RowButton>
       ) : null}
@@ -240,13 +249,16 @@ export function UploadPanel() {
         </Typography>
       ) : null}
       {checking > 0 ? (
-        <Typography
-          variant="body2"
-          data-upload-checking
-          sx={{ color: hf.textSecondary, py: 2, pr: 3, pl: 5 }}
-        >
-          {checking === 1 ? t("panel.checking.one") : t("panel.checking.other", { count: checking })}
-        </Typography>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 2, py: 2, pr: 3, pl: 5 }}>
+          <Typography variant="body2" data-upload-checking sx={{ flex: "1 1 auto", color: hf.textSecondary }}>
+            {checking === 1 ? t("panel.checking.one") : t("panel.checking.other", { count: checking })}
+          </Typography>
+          {items.some((item) => item.state === "done" && item.scanStatus === "pending") ? (
+            <Button size="small" onClick={recheckAll}>
+              {t("panel.checkAgain")}
+            </Button>
+          ) : null}
+        </Box>
       ) : null}
     </Box>
   );
