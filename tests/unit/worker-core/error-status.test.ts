@@ -28,10 +28,18 @@ const expected: Record<string, number> = {
   feature_disabled: 503,
   // (added with AVWARM: an avatar's scan waited out on a cold scanner, routes/uploads.ts)
   scanner_starting: 503,
+  // (added with R1: a JSON body over its byte cap, services/body.ts; and the codes of the R1 fix
+  // packages for account lifecycle, moderation and uploads)
+  body_too_large: 413,
+  deletion_admin_scheduled: 409,
+  self_action: 400,
+  last_admin: 409,
+  not_quarantined: 409,
+  replace_in_progress: 409,
 };
 
 describe("error status table", () => {
-  it("maps exactly the 22 codes to their statuses", () => {
+  it("maps exactly the 28 codes to their statuses", () => {
     expect(ERROR_STATUS).toEqual(expected);
   });
 

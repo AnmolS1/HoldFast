@@ -54,6 +54,12 @@ const DEFAULT_MESSAGE: Record<ErrorCode, string> = {
   read_only: "Holdfast is read-only right now.",
   feature_disabled: "This feature is switched off right now.",
   scanner_starting: "The virus scanner is starting up. Try again in a minute.",
+  body_too_large: "The request is too large.",
+  deletion_admin_scheduled: "This deletion was scheduled by an admin and cannot be cancelled here.",
+  self_action: "You cannot do this to your own account.",
+  last_admin: "This would leave no admin.",
+  not_quarantined: "This item is not in quarantine.",
+  replace_in_progress: "A new version of this file is still being uploaded.",
 };
 
 export class AppError extends Error {
