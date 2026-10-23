@@ -60,7 +60,7 @@
     "pg": "^8.16.3",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "react-router": "7.18.4",
+    "react-router": "8.5.0",
     "resend": "6.32.1",
     "shiki": "4.5.0",
     "ua-parser-js": "2.0.10",
