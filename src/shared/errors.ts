@@ -30,7 +30,10 @@ export type ErrorCode =
   | "self_action"
   | "last_admin"
   | "not_quarantined"
-  | "replace_in_progress";
+  | "replace_in_progress"
+  | "already_taken_down"
+  | "not_taken_down"
+  | "dmca_restore_only";
 
 /** HTTP status of every error code. 401 has one meaning only: the session is missing or expired. */
 export const ERROR_STATUS = {
@@ -72,6 +75,12 @@ export const ERROR_STATUS = {
   not_quarantined: 409,
   // A file whose replacement upload is still in progress.
   replace_in_progress: 409,
+  // An admin takedown of an item that is already taken down.
+  already_taken_down: 409,
+  // An admin restore of an item that is not taken down.
+  not_taken_down: 409,
+  // An admin restore of a takedown a copyright notice holds: only that notice's own restore lifts it.
+  dmca_restore_only: 409,
 } as const satisfies Record<ErrorCode, number>;
 
 /**

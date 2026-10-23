@@ -838,7 +838,7 @@ describe("a query helper's QueryError is answered like an AppError", () => {
 
   it("uses the shared status table for every code, with the default message", async () => {
     const codes = Object.keys(ERROR_STATUS) as ErrorCode[];
-    expect(codes).toHaveLength(28);
+    expect(codes).toHaveLength(31);
     for (const code of codes) {
       const answer = await get(`/api/_qe/code/${code}`);
       expect(answer.status, code).toBe(ERROR_STATUS[code]);

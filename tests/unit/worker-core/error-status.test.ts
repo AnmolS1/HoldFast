@@ -36,10 +36,13 @@ const expected: Record<string, number> = {
   last_admin: 409,
   not_quarantined: 409,
   replace_in_progress: 409,
+  already_taken_down: 409,
+  not_taken_down: 409,
+  dmca_restore_only: 409,
 };
 
 describe("error status table", () => {
-  it("maps exactly the 28 codes to their statuses", () => {
+  it("maps exactly the 31 codes to their statuses", () => {
     expect(ERROR_STATUS).toEqual(expected);
   });
 

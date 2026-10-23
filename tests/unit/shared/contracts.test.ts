@@ -1191,6 +1191,9 @@ describe("the error table equals PLAN §10", () => {
     last_admin: 409,
     not_quarantined: 409,
     replace_in_progress: 409,
+    already_taken_down: 409,
+    not_taken_down: 409,
+    dmca_restore_only: 409,
   };
 
   it("every row of the plan is in the table with its status", () => {
