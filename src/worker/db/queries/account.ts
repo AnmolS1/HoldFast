@@ -17,9 +17,11 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import {
+  account,
   auditLog,
   type Node,
   nodes,
+  passkey,
   session,
   type Share,
   shareLinks,
@@ -293,6 +295,11 @@ export type ExportUserRow = {
   usedBytes: number;
   termsAcceptedAt: Date | null;
   termsVersion: string | null;
+  demoNoticeAcceptedAt: Date | null;
+  demoNoticeVersion: string | null;
+  ageVerifiedAt: Date | null;
+  emailVerified: boolean;
+  twoFactorEnabled: boolean | null;
 };
 
 export async function exportUser(db: Executor, userId: string): Promise<ExportUserRow | null> {
@@ -308,11 +315,40 @@ export async function exportUser(db: Executor, userId: string): Promise<ExportUs
       usedBytes: user.usedBytes,
       termsAcceptedAt: user.termsAcceptedAt,
       termsVersion: user.termsVersion,
+      demoNoticeAcceptedAt: user.demoNoticeAcceptedAt,
+      demoNoticeVersion: user.demoNoticeVersion,
+      ageVerifiedAt: user.ageVerifiedAt,
+      emailVerified: user.emailVerified,
+      twoFactorEnabled: user.twoFactorEnabled,
     })
     .from(user)
     .where(eq(user.id, userId))
     .limit(1);
   return row ?? null;
+}
+
+/** The account's passkeys, as the export lists them: never the key or the credential id. */
+export async function exportPasskeys(db: Executor, userId: string) {
+  return db
+    .select({
+      name: passkey.name,
+      createdAt: passkey.createdAt,
+      deviceType: passkey.deviceType,
+      backedUp: passkey.backedUp,
+      aaguid: passkey.aaguid,
+    })
+    .from(passkey)
+    .where(eq(passkey.userId, userId))
+    .orderBy(passkey.createdAt, passkey.id);
+}
+
+/** How the account signs in (a password, Google): never a token or the password's hash. */
+export async function exportSignInMethods(db: Executor, userId: string) {
+  return db
+    .select({ provider: account.providerId, accountId: account.accountId, createdAt: account.createdAt })
+    .from(account)
+    .where(eq(account.userId, userId))
+    .orderBy(account.createdAt, account.id);
 }
 
 /** The export's node set, as a predicate over `nodes` (see the header). */
@@ -334,6 +370,7 @@ export type ExportNodeRow = Pick<
   | "createdAt"
   | "updatedAt"
   | "deletedAt"
+  | "lastAccessedAt"
 >;
 
 /** Read in pages of this many rows (keyset on the id). */
@@ -363,6 +400,7 @@ export async function exportNodePage(
       createdAt: nodes.createdAt,
       updatedAt: nodes.updatedAt,
       deletedAt: nodes.deletedAt,
+      lastAccessedAt: nodes.lastAccessedAt,
     })
     .from(nodes)
     .where(and(exportable(userId), after === null ? undefined : sql`${nodes.id} > ${after}::uuid`))

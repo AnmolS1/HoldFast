@@ -54,7 +54,9 @@ import {
   EXPORT_PAGE,
   exportLinks,
   exportNodePage,
+  exportPasskeys,
   exportSharesGiven,
+  exportSignInMethods,
   exportUser,
   FAILED_ACTIVITY_ACTIONS,
   getPrefs,
@@ -309,6 +311,7 @@ const exportNode = (row: ExportNodeRow) =>
     createdAt: iso(row.createdAt),
     updatedAt: iso(row.updatedAt),
     deletedAt: row.deletedAt ? iso(row.deletedAt) : null,
+    lastAccessedAt: row.lastAccessedAt ? iso(row.lastAccessedAt) : null,
   });
 
 router.get("/account/export", async (c) => {
@@ -330,15 +333,21 @@ router.get("/account/export", async (c) => {
   }
   let head: string;
   try {
-    const [account, prefs, given, received, links, activity, held] = await Promise.all([
-      exportUser(handle, user.id),
-      getPrefs(handle, user.id),
-      exportSharesGiven(handle, user.id),
-      sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
-      exportLinks(handle, user.id),
-      recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
-      deletedKeptBytes(handle, user.id),
-    ]);
+    const [account, prefs, given, received, links, activity, held, sessions, passkeys, methods] =
+      await Promise.all([
+        exportUser(handle, user.id),
+        getPrefs(handle, user.id),
+        exportSharesGiven(handle, user.id),
+        sharedWithMe(handle, user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES }),
+        exportLinks(handle, user.id),
+        recentActivity(handle, user.id, EXPORT_ACTIVITY_LIMIT),
+        deletedKeptBytes(handle, user.id),
+        // Live ones only, as Settings → Devices lists them: an expired row a hold keeps past its
+        // period (jobs/retention.ts) would make a held account's export tell the hold.
+        ownSessions(handle, user.id, at),
+        exportPasskeys(handle, user.id),
+        exportSignInMethods(handle, user.id),
+      ]);
     if (!account) throw new AppError("not_found");
     const owners = await displayNames(
       handle,
@@ -359,6 +368,11 @@ router.get("/account/export", async (c) => {
         usedBytes: holderUsedBytes(account.usedBytes, held.files + held.versions, account.quotaBytes),
         termsAcceptedAt: account.termsAcceptedAt ? iso(account.termsAcceptedAt) : null,
         termsVersion: account.termsVersion,
+        demoNoticeAcceptedAt: account.demoNoticeAcceptedAt ? iso(account.demoNoticeAcceptedAt) : null,
+        demoNoticeVersion: account.demoNoticeVersion,
+        ageVerifiedAt: account.ageVerifiedAt ? iso(account.ageVerifiedAt) : null,
+        emailVerified: account.emailVerified,
+        twoFactorEnabled: account.twoFactorEnabled === true,
       },
       prefs: toPrefsDto(prefs),
       shares: given.map((row) => ({
@@ -385,6 +399,21 @@ router.get("/account/export", async (c) => {
         createdAt: iso(row.createdAt),
       })),
       activity: activity.map(toActivityDto),
+      sessions: sessions.map((row) => ({
+        createdAt: iso(row.createdAt),
+        lastActiveAt: iso(row.updatedAt),
+        expiresAt: iso(row.expiresAt),
+        ipAddress: row.ipAddress,
+        userAgent: row.userAgent,
+        country: row.country,
+      })),
+      passkeys: passkeys.map((row) => ({ ...row, createdAt: row.createdAt ? iso(row.createdAt) : null })),
+      // A password's "account id" is the user's own id: nothing to say.
+      signInMethods: methods.map((row) => ({
+        provider: row.provider,
+        accountId: row.provider === "credential" ? null : row.accountId,
+        createdAt: iso(row.createdAt),
+      })),
     });
     head = `${JSON.stringify(rest).slice(0, -1)},"nodes":[`;
   } catch (error) {

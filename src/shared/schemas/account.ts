@@ -83,7 +83,12 @@ export type ActivityDto = z.infer<typeof ActivityDto>;
 export const DeletionStatusDto = z.object({ scheduledFor: Timestamp.nullable() });
 export type DeletionStatusDto = z.infer<typeof DeletionStatusDto>;
 
-/** No secrets, no link URLs, no avatar and no hidden nodes. */
+/**
+ * No secrets, no link URLs, no avatar and no hidden nodes. What the account holds about its owner
+ * beside the files (R1 legal-8): the assents, the state of the sign-in, the live sessions as
+ * Settings → Devices lists them, the passkeys and the sign-in methods — never a token, key, hash
+ * or password of any.
+ */
 export const ExportManifest = z.object({
   version: z.literal(1),
   exportedAt: Timestamp,
@@ -98,6 +103,11 @@ export const ExportManifest = z.object({
     usedBytes: Bytes,
     termsAcceptedAt: Timestamp.nullable(),
     termsVersion: z.string().nullable(),
+    demoNoticeAcceptedAt: Timestamp.nullable(),
+    demoNoticeVersion: z.string().nullable(),
+    ageVerifiedAt: Timestamp.nullable(),
+    emailVerified: z.boolean(),
+    twoFactorEnabled: z.boolean(),
   }),
   prefs: PrefsDto,
   nodes: z.array(
@@ -114,6 +124,7 @@ export const ExportManifest = z.object({
       createdAt: Timestamp,
       updatedAt: Timestamp,
       deletedAt: Timestamp.nullable(),
+      lastAccessedAt: Timestamp.nullable(),
     }),
   ),
   shares: z.array(
@@ -141,6 +152,29 @@ export const ExportManifest = z.object({
     }),
   ),
   activity: z.array(ActivityDto),
+  sessions: z.array(
+    z.object({
+      createdAt: Timestamp,
+      lastActiveAt: Timestamp,
+      expiresAt: Timestamp,
+      ipAddress: z.string().nullable(),
+      userAgent: z.string().nullable(),
+      country: z.string().nullable(),
+    }),
+  ),
+  passkeys: z.array(
+    z.object({
+      name: z.string().nullable(),
+      createdAt: Timestamp.nullable(),
+      deviceType: z.string(),
+      backedUp: z.boolean(),
+      aaguid: z.string().nullable(),
+    }),
+  ),
+  /** `accountId`: the provider's id for the person (Google's); null for a password. */
+  signInMethods: z.array(
+    z.object({ provider: z.string(), accountId: z.string().nullable(), createdAt: Timestamp }),
+  ),
 });
 export type ExportManifest = z.infer<typeof ExportManifest>;
 

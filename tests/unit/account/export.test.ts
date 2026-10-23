@@ -8,7 +8,7 @@ import { storedAuthLimitKey } from "../../../src/worker/auth/rate-limit-store";
 import { EXPORT_DAILY_LIMIT, exportSlotKeys } from "../../../src/worker/db/queries/account";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
-import { nodes, shareLinks, user } from "../../../src/worker/db/schema";
+import { account, nodes, passkey, session, shareLinks, user } from "../../../src/worker/db/schema";
 import { makeLink, newClient, signIn } from "../auth/helpers";
 import { testKeys } from "../sharing/helpers";
 import {
@@ -224,6 +224,17 @@ describe("a held account", () => {
     const doomed = await makeFile(who.id, null, { name: "doomed.txt", scanStatus: "clean", size: 100 });
     const folder = await makeFolder(who.id, null, { name: "folder" });
     await makeFile(who.id, folder.id, { name: "in-folder.txt", scanStatus: "clean", size: 100 });
+    // A session that expired a month ago: the retention job deleted the unheld account's and kept
+    // the held one's (jobs/retention.ts) — the export lists live sessions only, so the hold does not show.
+    if (legalHold) {
+      await testDb().insert(session).values({
+        id: `sess${rand(14)}`,
+        token: `made-up-token-${rand(8)}`,
+        userId: who.id,
+        expiresAt: new Date(Date.now() - 30 * 86_400_000),
+        updatedAt: new Date(),
+      });
+    }
     // The counter as uploads would have left it: the three files.
     await testDb().update(user).set({ usedBytes: 300 }).where(eq(user.id, who.id));
     expect((await api(who.as, "POST", `/nodes/${doomed.id}/trash`)).status).toBe(200);
@@ -236,7 +247,7 @@ describe("a held account", () => {
   /** Everything but what differs by construction: ids, the address, the instants — and usedBytes (see below). */
   function shape(manifest: Manifest) {
     return {
-      user: { ...manifest.user, id: "", email: "", createdAt: "" },
+      user: { ...manifest.user, id: "", email: "", createdAt: "", ageVerifiedAt: "" },
       prefs: manifest.prefs,
       nodes: manifest.nodes
         .map((node) => [node.name, node.kind, node.deletedAt !== null, node.scanStatus])
@@ -245,6 +256,9 @@ describe("a held account", () => {
       sharedWithMe: manifest.sharedWithMe.length,
       links: manifest.links.length,
       activity: manifest.activity.map((row) => row.action),
+      sessions: manifest.sessions.length,
+      passkeys: manifest.passkeys.length,
+      signInMethods: manifest.signInMethods.map((method) => method.provider),
     };
   }
 
@@ -263,6 +277,102 @@ describe("a held account", () => {
     // moved by the un-held file only"); the export answers it without them.
     expect(a.user.usedBytes).toBe(b.user.usedBytes);
     expect(a.user.usedBytes).toBe(100);
+  });
+});
+
+describe("what the export says about the account itself (R1 legal-8)", () => {
+  it("the demo and age assent, verification and two-factor state, each file's last opening, live sessions, passkeys and sign-in methods — no secret of any", async () => {
+    const owner = await person({ name: "Complete Owner" });
+    const DEMO_AT = new Date("2099-01-02T03:04:05.000Z");
+    await testDb()
+      .update(user)
+      .set({ demoNoticeAcceptedAt: DEMO_AT, demoNoticeVersion: "demo-zz-1", ageVerifiedAt: DEMO_AT, twoFactorEnabled: true })
+      .where(eq(user.id, owner.id));
+    const OPENED = new Date("2099-02-03T04:05:06.000Z");
+    const file = await makeFile(owner.id, null, { name: `opened-${rand()}.txt`, scanStatus: "clean" });
+    await testDb().update(nodes).set({ lastAccessedAt: OPENED }).where(eq(nodes.id, file.id));
+    const live = (over: Partial<typeof session.$inferInsert> = {}) => ({
+      id: `sess${rand(14)}`,
+      // Made-up: no real token or address (198.51.100.0/24 is documentation space).
+      token: `zz-secret-token-${rand(8)}`,
+      userId: owner.id,
+      expiresAt: new Date(Date.now() + 86_400_000),
+      updatedAt: new Date(),
+      ipAddress: "198.51.100.23",
+      userAgent: "zz-agent/1.0",
+      country: "NL",
+      ...over,
+    });
+    await testDb().insert(session).values([
+      live(),
+      live({ expiresAt: new Date(Date.now() - 86_400_000), ipAddress: "198.51.100.99" }),
+      // An operator's impersonation session is not the user's (as Settings → Devices).
+      live({ impersonatedBy: owner.id, ipAddress: "198.51.100.77" }),
+    ]);
+    await testDb().insert(passkey).values({
+      id: `pk${rand(14)}`,
+      name: "zz laptop key",
+      publicKey: "zz-secret-public-key",
+      userId: owner.id,
+      credentialID: "zz-secret-credential",
+      counter: 3,
+      deviceType: "multiDevice",
+      backedUp: true,
+      createdAt: DEMO_AT,
+      aaguid: "00000000-0000-0000-0000-00000000aaaa",
+    });
+    const googleSub = `zz-google-sub-${rand()}`;
+    await testDb().insert(account).values([
+      {
+        id: `acc${rand(14)}`,
+        accountId: googleSub,
+        providerId: "google",
+        userId: owner.id,
+        idToken: "zz-secret-id-token",
+        createdAt: DEMO_AT,
+        updatedAt: DEMO_AT,
+      },
+      {
+        id: `acc${rand(14)}`,
+        accountId: owner.id,
+        providerId: "credential",
+        userId: owner.id,
+        password: "zz-secret-scrypt",
+        createdAt: DEMO_AT,
+        updatedAt: DEMO_AT,
+      },
+    ]);
+
+    const answer = await exportOf(owner);
+    expect(answer.status).toBe(200);
+    const manifest = ExportManifest.parse(answer.body);
+    expect(manifest.user).toMatchObject({
+      demoNoticeAcceptedAt: DEMO_AT.toISOString(),
+      demoNoticeVersion: "demo-zz-1",
+      ageVerifiedAt: DEMO_AT.toISOString(),
+      twoFactorEnabled: true,
+    });
+    expect(typeof manifest.user.emailVerified).toBe("boolean");
+    expect(manifest.nodes.find((node) => node.id === file.id)?.lastAccessedAt).toBe(OPENED.toISOString());
+    expect(manifest.sessions).toEqual([
+      expect.objectContaining({ ipAddress: "198.51.100.23", userAgent: "zz-agent/1.0", country: "NL" }),
+    ]);
+    expect(manifest.passkeys).toEqual([
+      {
+        name: "zz laptop key",
+        createdAt: DEMO_AT.toISOString(),
+        deviceType: "multiDevice",
+        backedUp: true,
+        aaguid: "00000000-0000-0000-0000-00000000aaaa",
+      },
+    ]);
+    expect(manifest.signInMethods.sort((a, b) => a.provider.localeCompare(b.provider))).toEqual([
+      { provider: "credential", accountId: null, createdAt: DEMO_AT.toISOString() },
+      { provider: "google", accountId: googleSub, createdAt: DEMO_AT.toISOString() },
+    ]);
+    const text = JSON.stringify(answer.body);
+    expect(text).not.toContain("zz-secret");
+    expect(text).not.toMatch(/198\.51\.100\.(99|77)/);
   });
 });
 
