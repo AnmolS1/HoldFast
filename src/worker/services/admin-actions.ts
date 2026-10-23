@@ -951,13 +951,17 @@ export async function markFalsePositive(c: C, nodeId: string, reason: string) {
 
 /**
  * Confirm delete: purge now through T14's `purgeRoot` (`"account"` — the one rule that takes a
- * root that is not in the trash), keeping the hash in the blocklist. FIRST `readsRolledBack`
+ * root that is not in the trash), keeping the hash in the blocklist. Only a member of the
+ * quarantine (`409 not_quarantined`, nothing written). Then `readsRolledBack`
  * (rolled back or paused → `409 destroy_paused`, nothing written: an admin is the operator, so
  * the refusal needs no disguise). A held node is `409 held` with every cause.
  */
 export async function confirmDelete(c: C, nodeId: string, reason: string) {
   const node = await adminQ.nodeRow(db(c), nodeId);
   if (!node || node.system !== null) throw new AppError("not_found");
+  // Only what the quarantine lists (safety-7): an id pasted from elsewhere — anyone's clean file,
+  // a whole folder — is not purged from here.
+  if (!inQuarantine(node)) throw new AppError("not_quarantined");
   if (await readsRolledBack(c.env, db(c))) {
     throw conflict(
       "destroy_paused",
@@ -982,6 +986,19 @@ export async function confirmDelete(c: C, nodeId: string, reason: string) {
   );
   return { purged: true };
 }
+
+/** The scan statuses the quarantine lists (db/queries/admin.ts `listQuarantine`), besides a takedown. */
+const QUARANTINE_STATUSES: readonly Node["scanStatus"][] = [
+  "infected",
+  "suspected_csam",
+  "under_review",
+  "error",
+  "skipped",
+];
+
+/** A member of the quarantine: one of its statuses, or taken down itself (`listQuarantine`). */
+const inQuarantine = (node: Node) =>
+  node.takedownAt !== null || QUARANTINE_STATUSES.includes(node.scanStatus);
 
 /** The node's own and inherited causes, and its subtree's (the gate's view), by the console's names. */
 async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause[]> {
