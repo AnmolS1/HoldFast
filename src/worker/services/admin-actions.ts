@@ -86,7 +86,7 @@ import {
 import { AppError } from "./errors";
 import { metric } from "./metrics";
 import { db, deps, type AppEnv } from "./request-context";
-import { enqueueRescan, lockSuspectedCsam } from "./scanning";
+import { enqueueRescan, enqueueScan, lockSuspectedCsam } from "./scanning";
 import { storage } from "./storage";
 import { addStrike, enforceStrikeThreshold, liftStrike, type StrikeKind } from "./strikes";
 import { openIp } from "./tokens";
@@ -188,6 +188,29 @@ export async function dismissReport(c: C, reportId: string, resolution: string) 
   metric("report", { outcome: "dismissed" });
   tellReporter(c, done.report);
   return done.report;
+}
+
+/**
+ * An admin's suspected-CSAM lock (escalation, the NCMEC start, lock from a notice): T10's one
+ * handler, with the hash listed ONLY if the server computed it (safety-1, Anmol's ruling Q8: the
+ * lock, the holds and the report now; the listing once the server has the hash). A file no scan
+ * will come for any more — `error`, `skipped`, never scanned — is sent one forced scan: its
+ * verdict brings the server's hash, which the verdict then lists (scan/verdict.ts). A file still
+ * waiting for its scan (`pending`, or under review over `pending`) gets that scan anyway.
+ */
+async function lockAsAdmin(c: C, node: Node): Promise<{ reportId: string }> {
+  const locked = await lockSuspectedCsam(deps(c), node.id, { source: "admin", onlyVerifiedHash: true });
+  const awaitingScan =
+    node.scanStatus === "pending" ||
+    (node.scanStatus === "under_review" && node.scanStatusPrev === "pending");
+  if (node.scannedAt === null && !awaitingScan && node.r2Key) {
+    try {
+      await enqueueScan(deps(c), { nodeId: node.id, key: node.r2Key, force: true });
+    } catch (error) {
+      captureError(error, { kind: "admin", reason: "lock_scan" });
+    }
+  }
+  return locked;
 }
 
 /** A rescan whose refusal is not this caller's business (a folder, a node gone meanwhile). */
@@ -320,7 +343,7 @@ export async function escalateReport(c: C, reportId: string, resolution: string)
   if (!node || node.system !== null) throw conflict("no_node");
   if (node.kind !== "file") throw conflict("folder");
 
-  const { reportId: csamReportId } = await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+  const { reportId: csamReportId } = await lockAsAdmin(c, node);
   let report = seen;
   if (seen.category !== "csam") {
     report = await retryOnDeadlock(db(c), async (tx) => {
@@ -390,7 +413,7 @@ export async function ncmecStart(c: C, reportId: string) {
     const node = await adminQ.nodeRow(db(c), seen.nodeId);
     if (node && node.scanStatus !== "suspected_csam") {
       if (node.kind !== "file" || node.system !== null) throw conflict("folder");
-      await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+      await lockAsAdmin(c, node);
     }
   }
   const { report, changed } = await retryOnDeadlock(db(c), async (tx) => {
@@ -881,7 +904,7 @@ export async function lockFromNotice(
     scanStatus: node.scanStatus,
   };
   if (!confirm) return { confirmed: false, referenceKind: resolved.kind, match, reportId: null };
-  const { reportId } = await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+  const { reportId } = await lockAsAdmin(c, node);
   audit(
     c,
     "admin.csam_lock_manual",

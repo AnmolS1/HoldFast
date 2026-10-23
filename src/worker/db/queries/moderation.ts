@@ -472,8 +472,9 @@ export async function listAsLocked(db: Executor, sha256: string, nodeId: string)
  * file, safety-1) is listed now — `listAsLocked` with this node as the lock behind the entry —
  * and, when a `csam` report on the node was FILED meanwhile, confirmed (`blocklist.confirmCsam`):
  * the filing's confirmation that waited for a verified hash. The caller is the verdict, in its
- * transaction, holding the node's row (lock order: node, entry, then the reports read here);
- * `sha256` is the hash the scan computed. Nothing for a node that is not locked. Safe to repeat.
+ * transaction, holding the node's row (lock order: node, then the reports and the entry — the
+ * reports are only READ here); `sha256` is the hash the scan computed. Nothing for a node that
+ * is not locked, or is locked with no case (see below). Safe to repeat.
  */
 export async function listLockedOnScan(tx: Executor, nodeId: string, sha256: string): Promise<void> {
   if (!isUuid(nodeId)) return;
@@ -483,6 +484,11 @@ export async function listLockedOnScan(tx: Executor, nodeId: string, sha256: str
     .where(eq(nodes.id, nodeId))
     .for("update");
   if (!node || node.scanStatus !== "suspected_csam") return;
+  // Only a lock that has its case: every lock files it in its own transaction. A node that is
+  // `suspected_csam` with none was written locked by the upload route with the SERVER's hash,
+  // already listed (the hit that locked it); the repair sweep completes it, and lists that hash.
+  const live = await liveCsamCase(tx, nodeId);
+  if (!live) return;
   await listAsLocked(tx, sha256, nodeId);
   const [filed] = await tx
     .select({ id: reports.id })

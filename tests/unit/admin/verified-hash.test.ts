@@ -11,7 +11,8 @@ import {
   listLockedOnScan,
   lockSuspectedCsam as lockRowsOnly,
 } from "../../../src/worker/db/queries/moderation";
-import { dmcaNoticeNodes, reports } from "../../../src/worker/db/schema";
+import { dmcaNoticeNodes, nodes, reports } from "../../../src/worker/db/schema";
+import { cleanBytes, deliver, explicit, sha256Of, uploadedFile } from "../scan/helpers";
 import {
   admin,
   adminCall,
@@ -20,10 +21,12 @@ import {
   makeFile,
   member,
   nodeRowOf,
+  operators,
   reported,
   reportRowOf,
   strikesOfUser,
   testDb,
+  userRowOf,
 } from "./helpers";
 
 type Admin = Awaited<ReturnType<typeof admin>>;
@@ -178,5 +181,112 @@ describe("a filing confirms only a server hash; the scan that brings it confirms
     const server = madeUpSha();
     await testDb().transaction((tx) => listLockedOnScan(tx, file.id, server));
     expect(await blocklistRow(server)).toBeNull();
+  });
+});
+
+describe("an admin's lock of a file whose hash is the client's: the lock now, the listing when the server has the hash", () => {
+  /** V2's chain: Mallory uploads bytes X declaring the hash of an innocent file Y. */
+  async function mallorysUpload() {
+    const innocent = await sha256Of(cleanBytes("innocent"));
+    const bytes = cleanBytes("mallory");
+    const { file, owner } = await uploadedFile(bytes, { declared: innocent });
+    return { file, owner, innocent, server: await sha256Of(bytes) };
+  }
+  const lockCsam = (who: Admin, nodeId: string, env: Record<string, unknown> = operators().env) =>
+    adminCall(who.as, "POST", "/moderation/lock-csam", {
+      body: { reference: nodeId, reason: "An outside tip.", confirm: true },
+      env,
+    });
+
+  it("lock first: locked, held, reported — the declared hash NOT listed; the scan then lists the server's as this lock's entry", async () => {
+    const who = await admin();
+    const t = await mallorysUpload();
+    const locked = await lockCsam(who, t.file.id);
+    expect(locked.status).toBe(200);
+    expect((await nodeRowOf(t.file.id))!.scanStatus).toBe("suspected_csam");
+    expect((await userRowOf(t.owner.id))!.legalHold).toBe(true);
+    expect(locked.body.reportId).toEqual(expect.any(String));
+    expect(await blocklistRow(t.innocent)).toBeNull();
+    expect(await blocklistRow(t.server)).toBeNull();
+
+    await deliver([{ body: explicit(t.file) }]);
+    expect((await nodeRowOf(t.file.id))!.sha256).toBe(t.server);
+    expect(await blocklistRow(t.server)).toMatchObject({ reason: "csam", sourceNodeId: t.file.id });
+    expect(await blocklistRow(t.innocent)).toBeNull();
+  });
+
+  it("scan first: the lock finds the server's hash and lists it", async () => {
+    const who = await admin();
+    const t = await mallorysUpload();
+    await deliver([{ body: explicit(t.file) }]);
+    expect((await nodeRowOf(t.file.id))!.scannedAt).not.toBeNull();
+    expect((await lockCsam(who, t.file.id)).status).toBe(200);
+    expect(await blocklistRow(t.server)).toMatchObject({ reason: "csam", sourceNodeId: t.file.id });
+    expect(await blocklistRow(t.innocent)).toBeNull();
+  });
+
+  it("lock and scan at once: the server's hash is listed (one entry, this node's), the declared one never", async () => {
+    const who = await admin();
+    const t = await mallorysUpload();
+    const [locked] = await Promise.all([lockCsam(who, t.file.id), deliver([{ body: explicit(t.file) }])]);
+    expect(locked.status).toBe(200);
+    expect((await nodeRowOf(t.file.id))!.scanStatus).toBe("suspected_csam");
+    expect(await blocklistRow(t.server)).toMatchObject({ reason: "csam", sourceNodeId: t.file.id });
+    expect(await blocklistRow(t.innocent)).toBeNull();
+  });
+
+  it("a lock cleared (false positive) before the scan arrives: the scan lists nothing", async () => {
+    const who = await admin();
+    const t = await mallorysUpload();
+    const locked = await lockCsam(who, t.file.id);
+    const sent: { body: unknown }[] = [];
+    const cleared = await adminCall(who.as, "POST", `/reports/${locked.body.reportId}/clear-lock`, {
+      body: { reason: "Not what the tip said.", confirm: true },
+      env: { ...operators().env, SCAN_QUEUE: { send: async (body: unknown) => void sent.push({ body }) } },
+    });
+    expect(cleared.status).toBe(200);
+    // The clear's own rescan, delivered: the scan of a node that is no longer locked (its bytes
+    // do not match the declared hash: `error`, as for any such upload).
+    expect(sent).toHaveLength(1);
+    await deliver(sent);
+    expect((await nodeRowOf(t.file.id))!.scanStatus).toBe("error");
+    expect(await blocklistRow(t.server)).toBeNull();
+    expect(await blocklistRow(t.innocent)).toBeNull();
+  });
+
+  it("an `error` file (no scan will come): the lock sends ONE forced scan of its object; a pending file none", async () => {
+    const who = await admin();
+    for (const status of ["error", "pending"] as const) {
+      const t = await mallorysUpload();
+      if (status === "error") {
+        await testDb()
+          .update(nodes)
+          .set({ scanStatus: "error", scanReason: "engine" })
+          .where(eq(nodes.id, t.file.id));
+      }
+      const sent: unknown[] = [];
+      const env = {
+        ...operators().env,
+        SCAN_QUEUE: { send: async (message: unknown) => void sent.push(message) },
+      };
+      expect((await lockCsam(who, t.file.id, env)).status, status).toBe(200);
+      expect(sent, status).toEqual(
+        status === "error" ? [{ v: 1, nodeId: t.file.id, key: t.file.r2Key, force: true }] : [],
+      );
+      expect(await blocklistRow(t.innocent), status).toBeNull();
+    }
+  });
+
+  it("escalating a report on an unscanned file locks it without listing the declared hash", async () => {
+    const who = await admin();
+    const t = await mallorysUpload();
+    const reportId = await reported(t.file.id, t.owner.id, "other");
+    const answer = await adminCall(who.as, "POST", `/reports/${reportId}/action`, {
+      body: { action: "escalate_csam", resolution: "Looks like CSAM by the description." },
+      env: operators().env,
+    });
+    expect(answer.status).toBe(200);
+    expect((await nodeRowOf(t.file.id))!.scanStatus).toBe("suspected_csam");
+    expect(await blocklistRow(t.innocent)).toBeNull();
   });
 });
