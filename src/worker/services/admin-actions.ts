@@ -72,7 +72,7 @@ import {
 import { captureError } from "../sentry";
 import { unsuspendUser } from "./account-state";
 import { audit, auditInTx } from "./audit";
-import { addBusinessDays, endOfUtcDay, HolidayTableEndedError } from "./business-days";
+import { addBusinessDays, endOfNewYorkDay, HolidayTableEndedError } from "./business-days";
 import { now } from "./clock";
 import {
   sendContentRemovedCopyright,
@@ -973,13 +973,14 @@ async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause
 
 /**
  * The window of §512(g)(2)(C), counted from the counter-notice's RECEIPT (`counterReceivedAt`), not
- * from the forward: not before 10 business days after it, and by the END of the 14th (weekends and
- * observed US federal holidays skipped — the table and its end are in ./business-days).
+ * from the forward: not before 10 business days after it, and by the END of the 14th — New York
+ * business days, weekends and observed US federal holidays skipped (the zone, the table and its end
+ * are in ./business-days).
  */
 export function restoreWindow(receivedAt: Date): { restoreNotBefore: Date; restoreNotAfter: Date } {
   return {
     restoreNotBefore: addBusinessDays(receivedAt, RESTORE_AFTER_BUSINESS_DAYS),
-    restoreNotAfter: endOfUtcDay(addBusinessDays(receivedAt, RESTORE_BY_BUSINESS_DAYS)),
+    restoreNotAfter: endOfNewYorkDay(addBusinessDays(receivedAt, RESTORE_BY_BUSINESS_DAYS)),
   };
 }
 

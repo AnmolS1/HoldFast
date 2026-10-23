@@ -3,17 +3,20 @@
 //
 //   addBusinessDays(receivedAt, 10)      // weekends and US federal holidays skipped
 //
-// A business day is a UTC calendar day that is neither a Saturday, a Sunday nor a US federal
-// holiday AS OBSERVED (5 U.S.C. §6103: a Saturday holiday is observed on the Friday before, a
-// Sunday one on the Monday after). UTC, not America/New_York: every timestamp here (the receipt,
-// the Worker's clock, the stored window) is UTC and the statute names no zone; a receipt on a US
-// evening can therefore count from the next day, which moves both ends one day later. The table below is copied from OPM's published lists
+// A business day is a calendar day IN NEW YORK (America/New_York) that is neither a Saturday, a
+// Sunday nor a US federal holiday AS OBSERVED (5 U.S.C. §6103: a Saturday holiday is observed on
+// the Friday before, a Sunday one on the Monday after). New York, not UTC (team-lead ruling
+// 2026-10-22): the holidays are US days and the Copyright Office keeps Eastern time, and a UTC
+// count could end the 14th day up to a day AFTER the US reading — the unsafe side of a deadline.
+// Only this arithmetic is zoned: every stored timestamp, and the Worker's clock, stays UTC. Zone
+// rules come from the runtime's Intl (Workers has it), so EST/EDT changes need no table here.
+// The holiday table below is copied from OPM's published lists
 // (https://www.opm.gov/policy-data-oversight/pay-leave/federal-holidays/, read 2026-10-22). It ends
 // on HOLIDAYS_KNOWN_UNTIL: a count that would step past that day throws `HolidayTableEndedError`
 // rather than treat unknown days as working days — extend the table from OPM's next list
 // (tests/unit/admin/business-days.test.ts goes red 180 days before the end, as the reminder).
 
-/** Observed US federal holidays, YYYY-MM-DD (UTC calendar days), 2026 through 2028. */
+/** Observed US federal holidays, YYYY-MM-DD (New York calendar days), 2026 through 2028. */
 export const US_FEDERAL_HOLIDAYS: readonly string[] = [
   // 2026
   "2026-01-01", // New Year's Day
@@ -69,34 +72,80 @@ export class HolidayTableEndedError extends Error {
 const DAY_MS = 86_400_000;
 const HOLIDAYS = new Set(US_FEDERAL_HOLIDAYS);
 
-export const utcDay = (at: Date) => at.toISOString().slice(0, 10);
+export const BUSINESS_TIME_ZONE = "America/New_York";
 
-/** True for a weekday that is not an observed federal holiday. Throws outside the table. */
-export function isBusinessDay(at: Date, holidays: ReadonlySet<string> = HOLIDAYS): boolean {
-  const day = utcDay(at);
+const NEW_YORK = new Intl.DateTimeFormat("en-US", {
+  timeZone: BUSINESS_TIME_ZONE,
+  hourCycle: "h23",
+  year: "numeric",
+  month: "numeric",
+  day: "numeric",
+  hour: "numeric",
+  minute: "numeric",
+  second: "numeric",
+});
+
+/** The New York wall clock at `ms`, written as if it were a UTC time (ms since the epoch). */
+function wallClock(ms: number): number {
+  const part: Record<string, number> = {};
+  for (const { type, value } of NEW_YORK.formatToParts(new Date(ms))) part[type] = Number(value);
+  const wholeSecond = Date.UTC(
+    part.year!,
+    part.month! - 1,
+    part.day!,
+    part.hour!,
+    part.minute!,
+    part.second!,
+  );
+  return wholeSecond + (((ms % 1000) + 1000) % 1000);
+}
+
+/** The instant at which New York's wall clock reads `wall` (asked only of times that exist once). */
+function fromWallClock(wall: number): number {
+  const guess = wall - (wallClock(wall) - wall);
+  return wall - (wallClock(guess) - guess);
+}
+
+const dayOf = (wall: number) => new Date(wall).toISOString().slice(0, 10);
+
+/** `at`'s calendar day in New York, YYYY-MM-DD. */
+export const newYorkDay = (at: Date) => dayOf(wallClock(at.getTime()));
+
+/** True for a New York day `day` (YYYY-MM-DD) that is a weekday and not an observed holiday. */
+function isBusinessDayOn(day: string, holidays: ReadonlySet<string>): boolean {
   if (holidays === HOLIDAYS && (day < HOLIDAYS_KNOWN_FROM || day > HOLIDAYS_KNOWN_UNTIL)) {
     throw new HolidayTableEndedError(day);
   }
-  const weekday = at.getUTCDay();
+  const weekday = new Date(`${day}T00:00:00Z`).getUTCDay();
   return weekday !== 0 && weekday !== 6 && !holidays.has(day);
 }
 
-/**
- * `n` business days after `from`, at the same time of day: the days after `from`'s own day are
- * counted, weekends and observed US federal holidays skipped. `holidays` is for tests that need
- * dates outside the table; production code always uses the table.
- */
-export function addBusinessDays(from: Date, n: number, holidays: ReadonlySet<string> = HOLIDAYS): Date {
-  const at = new Date(from.getTime());
-  let left = n;
-  while (left > 0) {
-    at.setTime(at.getTime() + DAY_MS);
-    if (isBusinessDay(at, holidays)) left -= 1;
-  }
-  return at;
+/** True when `at` falls on a New York business day. Throws outside the table. */
+export function isBusinessDay(at: Date, holidays: ReadonlySet<string> = HOLIDAYS): boolean {
+  return isBusinessDayOn(newYorkDay(at), holidays);
 }
 
-/** The last instant of `at`'s UTC day (a window that ends "on" a day includes all of it). */
-export function endOfUtcDay(at: Date): Date {
-  return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate(), 23, 59, 59, 999));
+/**
+ * `n` business days after `from`, at the same New York time of day: the New York days after
+ * `from`'s own are counted, weekends and observed US federal holidays skipped. `holidays` is for
+ * tests that need dates outside the table; production code always uses the table. (A result is
+ * always a weekday, so its time of day is never inside a clock change, which happens on Sundays.)
+ */
+export function addBusinessDays(from: Date, n: number, holidays: ReadonlySet<string> = HOLIDAYS): Date {
+  const wall = wallClock(from.getTime());
+  const timeOfDay = ((wall % DAY_MS) + DAY_MS) % DAY_MS;
+  let day = wall - timeOfDay;
+  let left = n;
+  while (left > 0) {
+    day += DAY_MS;
+    if (isBusinessDayOn(dayOf(day), holidays)) left -= 1;
+  }
+  return new Date(fromWallClock(day + timeOfDay));
+}
+
+/** The last instant of `at`'s New York day (a window that ends "on" a day includes all of it). */
+export function endOfNewYorkDay(at: Date): Date {
+  const wall = wallClock(at.getTime());
+  const nextMidnight = wall - (((wall % DAY_MS) + DAY_MS) % DAY_MS) + DAY_MS;
+  return new Date(fromWallClock(nextMidnight) - 1);
 }
