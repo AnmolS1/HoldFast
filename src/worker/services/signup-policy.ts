@@ -5,7 +5,9 @@
 //
 // A NEW ACCOUNT passes these, in order — each refusal is a plain sentence and a stable code:
 //   1. kill switch        `settings.readOnly` → no sign-ups
-//   2. assent             `acceptTerms === true`; the accepted version is the CURRENT one
+//   2. assent             `acceptTerms === true`; the accepted version is the CURRENT one.
+//                         While `settings.demoMode` is on (the closed test) also
+//                         `acceptDemo === true`: the demo notice, DEMO_NOTICE_VERSION (`demoAssent`)
 //   3. age                birth month and year, 13 or older — and the date is then thrown away:
 //                         only `ageVerifiedAt` is stored, nowhere a year, a month or an age
 //   4. allowed domains    when `SIGNUP_ALLOWED_DOMAINS` is set, only those (and 5 is skipped)
@@ -62,6 +64,7 @@ import { ipHashDaily, ipPrefix } from "./ip-hash";
 export const SIGNUP_REFUSALS = {
   SIGNUP_PAUSED: "Sign-up is paused right now. Try again later.",
   TERMS_NOT_ACCEPTED: "You need to accept the Terms and Privacy Policy.",
+  DEMO_NOT_ACCEPTED: "You need to accept the closed-test notice.",
   // Neutral on purpose: it does not say which answer would have been accepted.
   SIGNUP_NOT_AVAILABLE: "We can't create an account with these details.",
   EMAIL_NOT_ALLOWED: "This email address can't be used to sign up.",
@@ -101,7 +104,32 @@ export type SignupStatement = {
   birthYear: number;
   birthMonth: number;
   acceptTerms: true;
+  /** Assent to the closed-test notice. Only asked for (and only recorded) while `demoMode` is on. */
+  acceptDemo: boolean;
 };
+
+/**
+ * The version of the closed-test notice the sign-up forms show (client en.ts `signup.demo.*`).
+ * Change it together with the notice's text.
+ */
+export const DEMO_NOTICE_VERSION = "demo-2026-10";
+
+export type DemoAssent = { demoNoticeAcceptedAt: Date | null; demoNoticeVersion: string | null };
+
+/**
+ * The closed-test notice's part of a statement: while `demoMode` is on the assent is required
+ * (`DEMO_NOT_ACCEPTED` otherwise) and is recorded with the notice's version; while it is off
+ * nothing is asked and nothing is recorded — an assent sent anyway is not one to a notice shown.
+ */
+export function demoAssent(
+  settings: { demoMode?: boolean },
+  statement: Pick<SignupStatement, "acceptDemo">,
+  at: Date,
+): DemoAssent {
+  if (!settings.demoMode) return { demoNoticeAcceptedAt: null, demoNoticeVersion: null };
+  if (!statement.acceptDemo) throw new SignupRefusal("DEMO_NOT_ACCEPTED");
+  return { demoNoticeAcceptedAt: at, demoNoticeVersion: DEMO_NOTICE_VERSION };
+}
 
 const isInt = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value);
 
@@ -116,7 +144,14 @@ export function parseStatement(raw: unknown, at: Date = now()): SignupStatement 
   if (!isInt(birthYear) || !isInt(birthMonth)) throw new SignupRefusal("SIGNUP_NOT_AVAILABLE");
   if (!isThirteenOrOlder(birthYear, birthMonth, at)) throw new SignupRefusal("SIGNUP_NOT_AVAILABLE");
   const code = typeof body.inviteCode === "string" ? body.inviteCode.trim() : "";
-  return { inviteCode: code && code.length <= 128 ? code : null, birthYear, birthMonth, acceptTerms: true };
+  return {
+    inviteCode: code && code.length <= 128 ? code : null,
+    birthYear,
+    birthMonth,
+    acceptTerms: true,
+    // Strict like the terms: a JSON `true`. Whether it is needed is `demoAssent`'s (it reads settings).
+    acceptDemo: body.acceptDemo === true,
+  };
 }
 
 /**
@@ -352,6 +387,8 @@ export async function precheckSignup(
 ): Promise<void> {
   const settings = await scope.settings();
   if (settings.readOnly) throw new SignupRefusal("SIGNUP_PAUSED");
+  // Before anything about the address: the same answer whether or not it has an account.
+  demoAssent(settings, statement, now());
   if (email !== null) {
     const problem = await emailProblem(scope, email);
     if (problem) throw new SignupRefusal(problem);
@@ -375,7 +412,7 @@ export async function precheckSignup(
   }
 }
 
-export type SignupGrant = {
+export type SignupGrant = DemoAssent & {
   termsAcceptedAt: Date;
   termsVersion: string;
   ageVerifiedAt: Date;
@@ -399,6 +436,7 @@ export async function takeSignup(
   const at = now();
   const settings = await scope.settings();
   if (settings.readOnly) throw new SignupRefusal("SIGNUP_PAUSED");
+  const demo = demoAssent(settings, statement, at);
   const problem = await emailProblem(scope, email);
   if (problem) throw new SignupRefusal(problem);
 
@@ -425,6 +463,7 @@ export async function takeSignup(
   return {
     termsAcceptedAt: at,
     termsVersion: settings.termsVersion,
+    ...demo,
     ageVerifiedAt: at,
     invitedBy: result.invitedBy,
     quotaBytes: Number.isSafeInteger(quota) && quota > 0 ? quota : 5_000_000_000,

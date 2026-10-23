@@ -205,7 +205,13 @@ export async function beforeVerifyEmail(scope: AuthScope, ctx: VerifyContext): P
   throw redirect(env, `${SET_PASSWORD_PATH}#token=${token}`);
 }
 
-export type MailboxStatement = { termsAcceptedAt: Date; termsVersion: string; ageVerifiedAt: Date };
+export type MailboxStatement = {
+  termsAcceptedAt: Date;
+  termsVersion: string;
+  demoNoticeAcceptedAt: Date | null;
+  demoNoticeVersion: string | null;
+  ageVerifiedAt: Date;
+};
 
 /**
  * The destructive step, for `POST /api/account/confirm-email`: the holder of a sign-up

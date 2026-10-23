@@ -844,12 +844,22 @@ describe("GET /api/public/config", () => {
       uploadsEnabled: true,
       linksEnabled: true,
       readOnly: false,
+      // The closed-test notice is off unless the settings table says otherwise (DEMONOTICE).
+      demoMode: false,
       sentryDsnWeb: null,
       sentryEnvironment: "test",
       turnstileSiteKey: "1x00000000000000000000AA",
     });
     expect(Object.keys(config).sort()).toEqual(Object.keys(PublicConfig.shape).sort());
     expect(fake.calls).not.toContain("getSession");
+  });
+
+  it("demoMode follows the settings row (the operator's switch, no deploy)", async () => {
+    const { fake, send } = setup();
+    fake.state.settings = { demoMode: true };
+    expect(PublicConfig.parse((await send("/api/public/config")).body).demoMode).toBe(true);
+    fake.state.settings = { demoMode: false };
+    expect(PublicConfig.parse((await send("/api/public/config")).body).demoMode).toBe(false);
   });
 
   // "Reflects a settings override" is proven against the real settings table in

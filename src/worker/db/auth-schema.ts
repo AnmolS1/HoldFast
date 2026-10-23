@@ -32,6 +32,8 @@ export const user = pgTable("user", {
   ageVerifiedAt: timestamp("age_verified_at"),
   termsAcceptedAt: timestamp("terms_accepted_at"),
   termsVersion: text("terms_version"),
+  demoNoticeAcceptedAt: timestamp("demo_notice_accepted_at"),
+  demoNoticeVersion: text("demo_notice_version"),
   invitedBy: text("invited_by"),
   suspendedAt: timestamp("suspended_at"),
   suspendedReason: text("suspended_reason"),

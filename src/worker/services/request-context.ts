@@ -105,13 +105,14 @@ export type CoreDeps = {
  */
 export type ResolvedSettings = Omit<
   Settings,
-  "signupMode" | "termsVersion" | "uploadsEnabled" | "linksEnabled" | "readOnly"
+  "signupMode" | "termsVersion" | "uploadsEnabled" | "linksEnabled" | "readOnly" | "demoMode"
 > & {
   signupMode: "invite" | "open";
   termsVersion: string;
   uploadsEnabled: boolean;
   linksEnabled: boolean;
   readOnly: boolean;
+  demoMode: boolean;
 };
 
 /** One per request. Everything but the first three members is lazy and memoized. */
@@ -166,6 +167,7 @@ export function resolveSettings(
     uploadsEnabled: stored.uploadsEnabled ?? true,
     linksEnabled: stored.linksEnabled ?? true,
     readOnly: stored.readOnly ?? false,
+    demoMode: stored.demoMode ?? false,
   };
 }
 

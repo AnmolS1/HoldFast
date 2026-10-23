@@ -300,6 +300,7 @@ export function buildHooks(scope: AuthScope) {
         birthYear: 0,
         birthMonth: 0,
         acceptTerms: true as const,
+        acceptDemo: intent.acceptDemo,
       };
       // Invite, velocity and the intent's single use: taken as for any new sign-up.
       const grant = await takeSignup(scope, owner.email, statement, clientOf(scope, ctx), intent.nonce);
@@ -392,6 +393,7 @@ export function buildHooks(scope: AuthScope) {
                 birthYear: 0,
                 birthMonth: 0,
                 acceptTerms: true as const,
+                acceptDemo: intent.acceptDemo,
               };
               const grant = await takeSignup(scope, email, statement, client, intent.nonce);
               return { data: grant };

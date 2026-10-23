@@ -35,6 +35,10 @@ export const userAdditionalFields = {
   ageVerifiedAt: { type: "date", required: false, input: false },
   termsAcceptedAt: { type: "date", required: false, input: false },
   termsVersion: { type: "string", required: false, input: false },
+  // The closed-test notice's assent (signup-policy.ts `demoAssent`); written like the terms
+  // assent, never returned (the look-alike sign-up answer has nothing of it to imitate).
+  demoNoticeAcceptedAt: { type: "date", required: false, input: false, returned: false },
+  demoNoticeVersion: { type: "string", required: false, input: false, returned: false },
   invitedBy: { type: "string", required: false, input: false, returned: false },
   suspendedAt: { type: "date", required: false, input: false },
   suspendedReason: { type: "string", required: false, input: false, returned: false },

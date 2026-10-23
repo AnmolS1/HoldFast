@@ -195,13 +195,18 @@ export async function verify(
 
 // ── the sign-up intent ──────────────────────────────────────────────────────────────────────
 
-export type Intent = { nonce: string; inviteCode: string | null };
+/** `acceptDemo`: the closed-test notice was accepted at the intent step (signup-policy.ts `demoAssent`). */
+export type Intent = { nonce: string; inviteCode: string | null; acceptDemo: boolean };
 
-/** The value of a fresh intent cookie and its single-use nonce (the caller records the nonce). */
+/**
+ * The value of a fresh intent cookie and its single-use nonce (the caller records the nonce).
+ * The demo assent is in the payload (`d`) only when it was given.
+ */
 export async function mintIntent(
   keys: Keys,
   inviteCode: string | null,
   at: Date,
+  acceptDemo = false,
 ): Promise<{ value: string; nonce: string; expiresAt: Date }> {
   const nonce = toBase64Url(crypto.getRandomValues(new Uint8Array(18)));
   const expiresAt = new Date(at.getTime() + INTENT_COOKIE.maxAge * 1000);
@@ -209,6 +214,7 @@ export async function mintIntent(
     e: Math.floor(expiresAt.getTime() / 1000),
     n: nonce,
     i: inviteCode,
+    ...(acceptDemo ? { d: true } : {}),
   });
   return { value, nonce, expiresAt };
 }
@@ -227,7 +233,7 @@ export async function readIntent(
   );
   if (!payload || typeof payload.n !== "string" || payload.n.length < 16) return null;
   if (payload.i !== null && typeof payload.i !== "string") return null;
-  return { nonce: payload.n, inviteCode: payload.i };
+  return { nonce: payload.n, inviteCode: payload.i, acceptDemo: payload.d === true };
 }
 
 // ── the pending sign-up ─────────────────────────────────────────────────────────────────────

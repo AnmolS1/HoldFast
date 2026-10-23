@@ -588,6 +588,7 @@ async function settingsAnswer(c: C) {
     uploadsEnabled: resolved.uploadsEnabled,
     linksEnabled: resolved.linksEnabled,
     readOnly: resolved.readOnly,
+    demoMode: resolved.demoMode,
     orphanDeleteEnabled: stored.orphanDeleteEnabled !== false,
     ceilings: (stored.ceilings ?? {}) as SettingsDto["ceilings"],
     termsVersion: resolved.termsVersion,

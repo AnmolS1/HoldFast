@@ -627,6 +627,7 @@ const EXAMPLES: Record<string, unknown> = {
     uploadsEnabled: true,
     linksEnabled: true,
     readOnly: false,
+    demoMode: false,
     orphanDeleteEnabled: true,
     ceilings: { CEIL_LINKS_DAY: 20 },
     termsVersion: "2026-10",
@@ -727,6 +728,7 @@ const EXAMPLES: Record<string, unknown> = {
       uploadsEnabled: true,
       linksEnabled: true,
       readOnly: false,
+      demoMode: false,
       orphanDeleteEnabled: true,
       ceilings: {},
       termsVersion: "2026-10",
@@ -1204,7 +1206,7 @@ describe("the error table equals PLAN §10", () => {
 });
 
 describe("PublicConfig", () => {
-  it("is the worker core's one object, with its fourteen fields", () => {
+  it("is the worker core's one object, with its fifteen fields", () => {
     expect(ClientPublicConfig).toBe(PublicConfig);
     expect(Object.keys(PublicConfig.shape)).toEqual([
       "signupMode",
@@ -1218,6 +1220,7 @@ describe("PublicConfig", () => {
       "uploadsEnabled",
       "linksEnabled",
       "readOnly",
+      "demoMode",
       "sentryDsnWeb",
       "sentryEnvironment",
       "release",

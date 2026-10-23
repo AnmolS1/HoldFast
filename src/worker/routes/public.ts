@@ -1,6 +1,6 @@
 // GET /api/public/config → PublicConfig (src/shared/public-config.ts). No auth, no session read.
-// Env values, with the settings table over them for signupMode, termsVersion and the three
-// switches. Nothing secret is ever added to this object.
+// Env values, with the settings table over them for signupMode, termsVersion, the three
+// switches and demoMode. Nothing secret is ever added to this object.
 
 import { Hono } from "hono";
 import { PublicConfig } from "../../shared/public-config";
@@ -24,6 +24,7 @@ router.get("/public/config", async (c) => {
     uploadsEnabled: current.uploadsEnabled,
     linksEnabled: current.linksEnabled,
     readOnly: current.readOnly,
+    demoMode: current.demoMode,
     sentryDsnWeb: env.SENTRY_DSN_WEB || null,
     sentryEnvironment: env.SENTRY_ENVIRONMENT,
     release: buildMeta().commit,

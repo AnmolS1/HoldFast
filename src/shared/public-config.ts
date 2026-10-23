@@ -16,6 +16,8 @@ export const PublicConfig = z.object({
   uploadsEnabled: z.boolean(),
   linksEnabled: z.boolean(),
   readOnly: z.boolean(),
+  /** The closed test: the sign-up forms show the demo notice and ask for assent. */
+  demoMode: z.boolean(),
   sentryDsnWeb: z.string().nullable(),
   sentryEnvironment: z.string(),
   release: z.string(),

@@ -13,6 +13,8 @@ export type Settings = {
   uploadsEnabled?: boolean;
   linksEnabled?: boolean;
   readOnly?: boolean;
+  /** The closed test: sign-up asks for assent to the demo notice (signup-policy.ts). Default off. */
+  demoMode?: boolean;
   /** Partial overrides, keyed by var name plus the four sign-up velocity keys. */
   ceilings?: Record<string, number>;
   /** The source of the current terms version; the `TERMS_VERSION` var is only its default. */
@@ -54,6 +56,9 @@ function parse(rows: { key: string; value: unknown }[]): Settings {
         break;
       case "readOnly":
         if (isBoolean(value)) out.readOnly = value;
+        break;
+      case "demoMode":
+        if (isBoolean(value)) out.demoMode = value;
         break;
       case "orphanDeleteEnabled":
         if (isBoolean(value)) out.orphanDeleteEnabled = value;
