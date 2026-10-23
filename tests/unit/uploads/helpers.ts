@@ -3,7 +3,7 @@
 // vars of its own (never the shared `settings` table). Postgres is shared by every test file:
 // every fixture has random ids and no test counts a whole table.
 import { env } from "cloudflare:workers";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { PART_BYTES } from "../../../src/shared/constants";
 import type { InitUploadBody, InitUploadResponse } from "../../../src/shared/schemas/upload";
 import { createApp } from "../../../src/worker/app";
@@ -82,11 +82,13 @@ export const ledgerOf = (subjectType: "upload_user" | "upload_editor", subjectId
     .from(downloadLedger)
     .where(and(eq(downloadLedger.subjectType, subjectType), eq(downloadLedger.subjectId, subjectId)));
 
+// Oldest first: two rows written in the same burst may share `at`, so the id (uuidv7) breaks the tie.
 export const auditFor = (action: string, targetId: string) =>
   testDb()
     .select()
     .from(auditLog)
-    .where(and(eq(auditLog.action, action), eq(auditLog.targetId, targetId)));
+    .where(and(eq(auditLog.action, action), eq(auditLog.targetId, targetId)))
+    .orderBy(asc(auditLog.at), asc(auditLog.id));
 
 // ── requests ────────────────────────────────────────────────────────────────────────────────
 
