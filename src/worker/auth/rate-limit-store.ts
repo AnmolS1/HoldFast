@@ -42,7 +42,15 @@ export async function storedAuthLimitKey(keys: Keys, key: string): Promise<strin
   return `${await authLimitClientPrefix(keys, client)}${path}`;
 }
 
-/** The store Better Auth's limiter counts in (`rateLimit.customStorage`). */
+/**
+ * The store Better Auth's limiter counts in (`rateLimit.customStorage`).
+ *
+ * Rows Better Auth wrote under the raw address before this store went live (`<ip>|<path>`, read
+ * here by that key, never written) are TAKEN OVER, not forgotten: a client's count inside its
+ * window is where the hashed row starts — at the limit, the request is refused on it — and the
+ * raw row is deleted as soon as the hashed one exists. One past its window counts for nothing.
+ * (Any left over go with the retention job two days after their last use.)
+ */
 export function authLimitStore(db: Executor, keys: Keys): BetterAuthRateLimitStorage {
   return {
     async consume(key, rule) {
@@ -50,17 +58,28 @@ export function authLimitStore(db: Executor, keys: Keys): BetterAuthRateLimitSto
       const windowMs = rule.window * 1000;
       const result = await db.execute<{ admitted: number | null; wait_ms: string | number | null }>(sql`
         WITH clock AS (SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint AS ms),
+        legacy AS (
+          SELECT l.count, l.last_request FROM rate_limit l, clock
+          WHERE l.key = ${key} AND l.last_request > clock.ms - ${windowMs}
+        ),
         held AS (
-          SELECT r.last_request + ${windowMs} - clock.ms AS wait_ms FROM rate_limit r, clock WHERE r.key = ${stored}
+          SELECT coalesce(
+            (SELECT r.last_request FROM rate_limit r WHERE r.key = ${stored}),
+            (SELECT last_request FROM legacy)
+          ) + ${windowMs} - clock.ms AS wait_ms FROM clock
         ),
         admitted AS (
           INSERT INTO rate_limit AS r (id, key, count, last_request)
-          SELECT gen_random_uuid()::text, ${stored}, 1, clock.ms FROM clock
+          SELECT gen_random_uuid()::text, ${stored}, coalesce((SELECT count FROM legacy), 0) + 1, clock.ms FROM clock
+          WHERE coalesce((SELECT count FROM legacy), 0) < ${rule.max}
           ON CONFLICT (key) DO UPDATE SET
             count = CASE WHEN r.last_request <= (SELECT ms FROM clock) - ${windowMs} THEN 1 ELSE r.count + 1 END,
             last_request = (SELECT ms FROM clock)
           WHERE r.last_request <= (SELECT ms FROM clock) - ${windowMs} OR r.count < ${rule.max}
           RETURNING r.count
+        ),
+        taken_over AS (
+          DELETE FROM rate_limit WHERE key = ${key} AND EXISTS (SELECT 1 FROM admitted) RETURNING 1
         )
         SELECT (SELECT count FROM admitted) AS admitted, (SELECT wait_ms FROM held) AS wait_ms`);
       const row = result.rows[0];
