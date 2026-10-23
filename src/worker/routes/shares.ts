@@ -18,7 +18,6 @@
 
 import { Hono, type Context } from "hono";
 import { UUID_PARAM } from "../../shared/ids";
-import type { NodeDto } from "../../shared/schemas/node";
 import {
   CreateShareBody,
   PatchShareBody,
@@ -49,7 +48,7 @@ import { consumeCeiling } from "../services/ceilings";
 import { sendShareInvitation } from "../services/email";
 import { AppError } from "../services/errors";
 import { metric } from "../services/metrics";
-import { toNodeDto } from "../services/node-dto";
+import { toNodeDtos } from "../services/node-dto";
 import { getAccess } from "../services/permissions";
 import { db, defer, deps, type AppEnv } from "../services/request-context";
 import { linkDtos, parse, scanGate, sharedNode } from "./links";
@@ -96,17 +95,19 @@ router.get("/shares/mine", async (c) => {
 router.get("/shared-with-me", async (c) => {
   const user = requireVerified(c);
   const rows = await sharedWithMe(db(c), user.id, { visibleStatuses: SHARED_VISIBLE_STATUSES });
-  const items: SharedWithMeDto[] = [];
-  for (const { share, node } of rows) {
-    // Each row is the root of the caller's view of it: it goes out without its parent. The role
-    // is the share's own (an outer share of another role is listed as its own row).
-    const dto: NodeDto = await toNodeDto(db(c), node, {
-      viewerId: user.id,
-      role: share.role,
-      shareRootId: node.id,
-    });
-    items.push({ node: dto, role: share.role, owner: dto.owner, sharedAt: share.createdAt.toISOString() });
-  }
+  // Mapped in ONE batch: the owners' names and the rest are read once for the page (R1 perfops-8).
+  // The role is the share's own (an outer share of another role is listed as its own row).
+  const roleOf = new Map(rows.map(({ node, share }) => [node, share.role]));
+  const dtos = await toNodeDtos(db(c), [...roleOf.keys()], {
+    viewerId: user.id,
+    role: (node) => roleOf.get(node)!,
+  });
+  const items = rows.map(({ share }, index): SharedWithMeDto => {
+    // Each row is the root of the caller's view of it: it goes out without its parent (what
+    // `shareRootId` does for one node; this page has one root per row).
+    const node = { ...dtos[index]!, parentId: null };
+    return { node, role: share.role, owner: node.owner, sharedAt: share.createdAt.toISOString() };
+  });
   return c.json(items satisfies SharedWithMeDto[]);
 });
 
