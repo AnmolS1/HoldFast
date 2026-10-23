@@ -145,6 +145,10 @@ export async function runScheduled(
         softDeadlineMs: softDeadlineOf(job.name),
         ...(job.guarded ? { detection } : {}),
       });
+      // It returned (done or stopped at its deadline). A slot the runtime kills, or a trigger that
+      // stops firing, leaves this count missing — what alerts.md C10 watches for.
+      // (Its own kind, so a job's own outcomes stay its own: `job{kind:"slot", outcome:"ran", reason:<job>}`.)
+      bg.metric("job", { kind: "slot", outcome: "ran", reason: job.name });
     } catch (error) {
       captureError(error, { kind: "job", job: job.name });
       bg.metric("job", { kind: job.name, outcome: "error" });

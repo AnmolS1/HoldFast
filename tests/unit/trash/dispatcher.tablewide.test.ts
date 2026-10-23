@@ -110,6 +110,15 @@ function watch(stub: boolean) {
   return ran;
 }
 
+/** The jobs the dispatcher counted as having run to their end (`job{kind:"slot", outcome:"ran"}`). */
+const ranJobs = (job: ReturnType<typeof jobContext>) =>
+  job.metric.mock.calls
+    .filter(([name, tags]) => name === "job" && (tags as { kind?: string }).kind === "slot")
+    .map(
+      ([, tags]) =>
+        `${(tags as { outcome?: string }).outcome === "ran" ? "" : "?"}${(tags as { reason?: string }).reason}`,
+    );
+
 async function plantExpired(): Promise<string> {
   const id = `dispatch${rand(12)}`;
   const at = new Date();
@@ -176,6 +185,9 @@ describe("the registry", () => {
       // One reading, handed to every guarded job of the slot; this file's numbers are in step.
       expect(readings.size).toBe(1);
       expect([...readings][0]).toMatchObject({ state: "ok" });
+      // Each job that returned is counted as having run (R1 perfops-5: a slot killed mid-way, or a
+      // trigger that stopped firing, shows as a missing `ran` — alerts.md C10); its own outcomes untouched.
+      expect(ranJobs(job)).toEqual(names);
       expect(job.outcomes(names[0]!)).toEqual([]);
     },
   );
@@ -216,6 +228,8 @@ describe("the registry", () => {
     expect(ran).toEqual(["restore-heartbeat", "abuse-hourly", "operator-digests"]);
     expect(job.metric.mock.calls).toContainEqual(["job", { kind: "stale-uploads", outcome: "error" }]);
     expect(job.outcomes("abuse-hourly")).toEqual([]);
+    // The one that threw did not run to its end: counted as an error, never as run.
+    expect(ranJobs(job)).toEqual(["restore-heartbeat", "abuse-hourly", "operator-digests"]);
   });
 
   it("does not resolve before a slow job has finished, and starts the next only after it", async () => {
