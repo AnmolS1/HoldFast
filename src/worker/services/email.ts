@@ -116,6 +116,7 @@ import {
   tryConsume,
   tryConsumeAll,
 } from "../db/queries/email-ledger";
+import { BUSINESS_TIME_ZONE } from "./business-days";
 import { isTestMode } from "./clock";
 import { countFor, reportError } from "../auth/observe";
 import { normalise as normaliseIp } from "./ip-hash";
@@ -292,6 +293,25 @@ function assertLink(env: Pick<Env, "APP_ORIGIN">, url: string): string {
   if (/[\s\u0000-\u001f\u007f<>"']/.test(url)) throw new Error("email: a malformed link was refused");
   return url;
 }
+
+// The DMCA window is counted in New York business days (./business-days): its dates are written
+// as New York dates with the zone named. A UTC clock time ("28 November, 04:59 UTC") reads a day late.
+const EASTERN_DATE = new Intl.DateTimeFormat("en-GB", {
+  timeZone: BUSINESS_TIME_ZONE,
+  day: "numeric",
+  month: "long",
+  year: "numeric",
+});
+const EASTERN_TIME = new Intl.DateTimeFormat("en-GB", {
+  timeZone: BUSINESS_TIME_ZONE,
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+/** "20 November 2028, 08:00 US Eastern time" — the start of the window. */
+const easternInstant = (at: Date) => `${EASTERN_DATE.format(at)}, ${EASTERN_TIME.format(at)} US Eastern time`;
+/** "27 November 2028 (end of day, US Eastern time)" — the window's last day, all of it. */
+const easternEndOfDay = (at: Date) => `${EASTERN_DATE.format(at)} (end of day, US Eastern time)`;
 
 function formatInstant(at: Date): string {
   const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September"];
@@ -815,7 +835,7 @@ export const templates = {
         ].join("\n"),
       },
       {
-        text: `Under 17 U.S.C. §512(g), we will restore access to the material no sooner than ${formatInstant(d.notBefore)} and no later than ${formatInstant(d.notAfter)}, unless our designated agent first receives notice from you that you have filed an action seeking a court order to restrain this person from engaging in infringing activity relating to the material.`,
+        text: `Under 17 U.S.C. §512(g), we will restore access to the material no sooner than ${easternInstant(d.notBefore)} and no later than ${easternEndOfDay(d.notAfter)}, unless our designated agent first receives notice from you that you have filed an action seeking a court order to restrain this person from engaging in infringing activity relating to the material.`,
       },
       { link: { label: "Our designated agent's contact details", url: d.dmcaUrl } },
     ],

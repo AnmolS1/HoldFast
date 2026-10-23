@@ -71,8 +71,8 @@ const CLOSED = {
 const FORWARDED = {
   counterReceivedAt: "2028-11-03T12:00:00.000Z",
   counterForwardedAt: "2028-11-06T09:00:00.000Z",
-  restoreNotBefore: "2028-11-20T12:00:00.000Z",
-  restoreNotAfter: "2028-11-27T23:59:59.999Z",
+  restoreNotBefore: "2028-11-20T13:00:00.000Z",
+  restoreNotAfter: "2028-11-28T04:59:59.999Z",
 };
 
 async function buttonsFor(status: string, extra: Record<string, unknown> = {}) {
@@ -103,6 +103,24 @@ describe("the DMCA detail's actions", () => {
 describe("the counter-notice window in the detail", () => {
   it("a forwarded notice is not offered Forward again", async () => {
     expect(await buttonsFor("counter_received", FORWARDED)).not.toContain("Forward counter-notice");
+  });
+
+  it("the window's dates are New York dates with the zone named, whatever the viewer's zone", async () => {
+    adminFetch((call) =>
+      call.method === "GET" && call.path === `/api/admin/dmca/${NOTICE}`
+        ? new Response(JSON.stringify(notice("counter_received", FORWARDED)), {
+            headers: { "content-type": "application/json" },
+          })
+        : undefined,
+    );
+    const view = openConsole(`/admin/dmca/${NOTICE}`);
+    await untilConsole();
+    // 2028-11-28T04:59:59.999Z is the end of 27 November in New York (EST): never "28 November".
+    const row = await screen.findByText(/^From .+ to .+$/, undefined, { timeout: 10_000 });
+    expect(row.textContent).toBe(
+      "From Nov 20, 2028, 08:00 (US Eastern) to November 27, 2028 (end of day, US Eastern)",
+    );
+    view.unmount();
   });
 
   it("shows when the counter-notice was received and the window; a refused restore says why", async () => {

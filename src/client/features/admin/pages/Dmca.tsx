@@ -25,7 +25,7 @@ import { AdminDataGrid, type GridColDef } from "../components/AdminDataGrid";
 import { useAdminQuery } from "../query";
 import { t } from "../strings";
 import { ErrorState, Facts, Field, Loading, Mono, Note, ReasonDialog, Section, StatusLine } from "../ui";
-import { label, refusalText, when } from "../words";
+import { eastern, label, refusalText, when } from "../words";
 
 const CHECKLIST = [
   "identification",
@@ -337,8 +337,8 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
               t("dmca.window"),
               notice.restoreNotBefore
                 ? t("dmca.windowValue", {
-                    from: when(notice.restoreNotBefore),
-                    to: when(notice.restoreNotAfter),
+                    from: t("dmca.windowFrom", { at: eastern(notice.restoreNotBefore, "dateTime") }),
+                    to: t("dmca.windowTo", { date: eastern(notice.restoreNotAfter, "long") }),
                   })
                 : "—",
             ],

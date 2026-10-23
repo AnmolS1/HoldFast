@@ -228,10 +228,11 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
     const forwarded = await upToForward(who, [file.id], RECEIVED, forwardAt);
     expect(forwarded.counterReceivedAt).toBe(RECEIVED.toISOString());
     expect(forwarded.counterForwardedAt).toBe(forwardAt.toISOString());
-    // 10 business days after Fri 3 Nov: 6–9, (10 Veterans Day), 13–17, 20 → Mon 20 Nov.
-    expect(forwarded.restoreNotBefore).toBe("2028-11-20T12:00:00.000Z");
-    // 14: 21, 22, (23 Thanksgiving), 24, 27 → the whole of Mon 27 Nov.
-    expect(forwarded.restoreNotAfter).toBe("2028-11-27T23:59:59.999Z");
+    // 10 New York business days after Fri 3 Nov (08:00 EDT): 6–9, (10 Veterans Day), 13–17, 20 →
+    // Mon 20 Nov, 08:00 EST (the clocks went back on the 5th).
+    expect(forwarded.restoreNotBefore).toBe("2028-11-20T13:00:00.000Z");
+    // 14: 21, 22, (23 Thanksgiving), 24, 27 → the whole of Mon 27 Nov in New York.
+    expect(forwarded.restoreNotAfter).toBe("2028-11-28T04:59:59.999Z");
   });
 
   it("a counter-notice recorded later with its real receipt date: the window is from that date", async () => {
@@ -258,8 +259,8 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
     expect(recorded.status).toBe(200);
     const forwarded = await act(who, made.id, "forward_counter");
     expect(forwarded.status).toBe(200);
-    expect(forwarded.body.restoreNotBefore).toBe("2028-11-20T12:00:00.000Z");
-    expect(forwarded.body.restoreNotAfter).toBe("2028-11-27T23:59:59.999Z");
+    expect(forwarded.body.restoreNotBefore).toBe("2028-11-20T13:00:00.000Z");
+    expect(forwarded.body.restoreNotAfter).toBe("2028-11-28T04:59:59.999Z");
   });
 
   it("a receipt date in the future, or before the takedown, is refused (it would move the window)", async () => {
@@ -315,8 +316,8 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
     expect(recorded.status).toBe(200);
     expect(recorded.body).toMatchObject({
       counterForwardedAt: null,
-      restoreNotBefore: "2028-11-20T12:00:00.000Z",
-      restoreNotAfter: "2028-11-27T23:59:59.999Z",
+      restoreNotBefore: "2028-11-20T13:00:00.000Z",
+      restoreNotAfter: "2028-11-28T04:59:59.999Z",
     });
   });
 
@@ -515,8 +516,11 @@ describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded
     expect(copy!.text).toContain("555 0100");
     expect(copy!.text).toContain("removed by mistake");
     expect(copy!.text).toContain("Consents to the jurisdiction of the federal court: yes");
-    expect(copy!.text).toContain("20 November 2028");
-    expect(copy!.text).toContain("27 November 2028");
+    // New York dates with the zone named — never a UTC clock time that reads a day late.
+    expect(copy!.text).toContain("no sooner than 20 November 2028, 08:00 US Eastern time");
+    expect(copy!.text).toContain("no later than 27 November 2028 (end of day, US Eastern time)");
+    expect(copy!.text).not.toContain("UTC");
+    expect(copy!.text).not.toContain("28 November");
     expect(copy!.text).toContain(made.id);
     // The complainant is not told the owner's file name (only what their own notice said).
     expect(copy!.text).not.toContain("secret-name");
@@ -638,8 +642,11 @@ describe("a FOLDER taken down and restored by subtree", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(forwardAt);
     expect((await counter(who, first.id)).status).toBe(200);
-    expect((await act(who, first.id, "forward_counter")).status).toBe(200);
-    vi.setSystemTime(new Date(forwardAt.getTime() + 15 * DAY));
+    const forwarded = await act(who, first.id, "forward_counter");
+    expect(forwarded.status).toBe(200);
+    // At the window's opening as the forward recorded it — never "+N calendar days": a federal
+    // holiday inside the window moves it (CI ec88714: Veterans Day, +15 days was a 409 before_window).
+    vi.setSystemTime(new Date((forwarded.body as DmcaNoticeDto).restoreNotBefore!));
     expect((await act(who, first.id, "restore")).status).toBe(200);
 
     expect(await reasons()).toEqual({

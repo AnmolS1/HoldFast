@@ -53,6 +53,13 @@ export function waitText(seconds: number): string {
 export const bytes = (value: number | null | undefined) => formatBytes(value);
 export const when = (value: string | null | undefined) =>
   value ? formatDate(value, { style: "dateTime" }) : "—";
+/**
+ * A DMCA window date on New York's calendar, whatever the viewer's zone: the window is counted in
+ * New York business days (src/worker/services/business-days.ts), so a local or UTC reading of its
+ * end can show the day after.
+ */
+export const eastern = (value: string | null | undefined, style: "dateTime" | "long") =>
+  value ? formatDate(value, { timeZone: "America/New_York", style }) : "—";
 
 /** A label from the catalogue for a known value, else the value itself. */
 export function label(prefix: string, value: string): string {

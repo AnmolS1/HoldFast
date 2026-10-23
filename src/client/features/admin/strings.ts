@@ -499,6 +499,8 @@ export const messages = {
   "dmca.counterForwarded": "Counter-notice forwarded",
   "dmca.window": "Restore window",
   "dmca.windowValue": "From {from} to {to}",
+  "dmca.windowFrom": "{at} (US Eastern)",
+  "dmca.windowTo": "{date} (end of day, US Eastern)",
   "dmca.lawsuit": "Lawsuit notice",
   "dmca.restored": "Restored",
   "dmca.holidays":

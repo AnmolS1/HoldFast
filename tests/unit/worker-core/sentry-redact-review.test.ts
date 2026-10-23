@@ -342,12 +342,31 @@ describe("S9 — the breach lookup's hash prefix", () => {
 });
 
 describe("S6 — the cost of redaction is bounded", () => {
+  // Growth, not a wall-clock limit (one call under CI load took 40 ms, ec88714): sixteen times the
+  // text costs about sixteen times as much when linear, 256 times when quadratic (measured: 12–21
+  // here, 60–100 for a quadratic mutant). Sizes stay within MAX_INPUT (4096) — past it, a run with
+  // no space is clipped to nothing and costs nothing.
+  /** Milliseconds per call, over calls repeated for 25 ms (the Workers clock moves in whole ms). */
+  const perCall = (text: string) => {
+    const started = performance.now();
+    let calls = 0;
+    let elapsed = 0;
+    do {
+      redactText(text);
+      calls += 1;
+      elapsed = performance.now() - started;
+    } while (elapsed < 25);
+    return elapsed / calls;
+  };
+
   it("one long run of one character is scanned in linear time", () => {
     for (const filler of ["a", "a.", "a@", "/", "x-"]) {
-      const text = filler.repeat(Math.ceil(4096 / filler.length));
-      const started = performance.now();
-      redactText(text);
-      expect(performance.now() - started, filler).toBeLessThan(40);
+      const small = filler.repeat(256 / filler.length);
+      const large = filler.repeat(4096 / filler.length);
+      // Small and large measured in turn, the median of the rounds' ratios: load that comes and
+      // goes moves both sides of a round alike.
+      const ratios = Array.from({ length: 5 }, () => perCall(large) / perCall(small)).sort((a, b) => a - b);
+      expect(ratios[2], `${filler}: ${ratios.map((r) => r.toFixed(1)).join(" ")}`).toBeLessThan(40);
     }
   });
 
