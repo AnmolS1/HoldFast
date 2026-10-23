@@ -3,7 +3,7 @@
 //
 //   17 */6 * * *   purge
 //   3 * * * *      restore-heartbeat, stale-uploads, abuse-hourly, operator-digests
-//   5 0 * * *      retention, unpause-midnight, verification-sweep
+//   5 0 * * *      retention, unpause-midnight, verification-sweep   + watchdog: backup_missing
 //   0 2 * * *      backup, user-purge, reconcile        (backup FIRST: that night's purges must
 //                                                         still be in that night's export)
 //
@@ -21,6 +21,14 @@
 // reconcile do not count the generation up. The other jobs run as usual. `runJob` hands no
 // reading: a guarded job then reads for itself.
 //
+// WATCHDOGS. A slot that is killed (CPU or wall time) runs no `finally`, so an alarm in a job's
+// own tail never fires on the night it is needed — and a slot that dies every night says nothing.
+// A watchdog is that alarm, run by ANOTHER slot after its jobs (R1 perfops-5): today one, the
+// 00:05 slot asking whether the 02:00 backup of the night before completed (`backup_missing`,
+// one mail per UTC day shared with the backup's tail). It is not a job: "run job" does not list
+// it. A cron that never fires at all is not seen from inside — that check is external
+// (runbooks/alerts.md).
+//
 // BUDGET. Every job works in bounded batches, looks at the clock after each and stops at the
 // soft deadline it is handed, leaving the rest — which is still due — for the next tick. Nothing
 // a job starts is left running when it returns: the database client is closed once the handler
@@ -29,7 +37,7 @@
 import { captureError } from "../sentry";
 import type { BackgroundContext } from "../services/request-context";
 import { job as abuseHourly } from "./abuse-hourly";
-import { job as backup } from "./backup";
+import { backupMissingAlarm, job as backup } from "./backup";
 import { job as operatorDigests } from "./operator-digests";
 import { job as purge } from "./purge";
 import { detectRollback, job as reconcile, type Detection } from "./reconcile";
@@ -93,13 +101,22 @@ export const jobs: Job[] = [
   reconcile,
 ];
 
+/** Per cron expression: the other slots' alarms it runs after its own jobs, in this order. */
+const WATCHDOGS: Record<
+  string,
+  Array<{ name: string; run(bg: BackgroundContext, at: Date): Promise<unknown> }>
+> = {
+  "5 0 * * *": [{ name: "backup_missing", run: (bg, at) => backupMissingAlarm(bg, at) }],
+};
+
 /** What "run job" may name. */
 export const jobNames: string[] = jobs.map((job) => job.name);
 
 /**
  * The cron entry's whole body: the jobs whose `cron` is this event's, one after the other, each
- * awaited — after one reading of the rollback detector when the slot has a guarded job. A job
- * that throws is reported and counted, and the next one still runs.
+ * awaited — after one reading of the rollback detector when the slot has a guarded job — then the
+ * slot's watchdogs. A job or watchdog that throws is reported and counted, and the next one still
+ * runs.
  */
 export async function runScheduled(
   event: ScheduledController,
@@ -131,6 +148,15 @@ export async function runScheduled(
     } catch (error) {
       captureError(error, { kind: "job", job: job.name });
       bg.metric("job", { kind: job.name, outcome: "error" });
+    }
+  }
+  // At the slot's own time: a run that started late still asks about the night before it.
+  for (const watchdog of WATCHDOGS[event.cron] ?? []) {
+    try {
+      await watchdog.run(bg, new Date(event.scheduledTime));
+    } catch (error) {
+      captureError(error, { kind: "job", job: "watchdog", reason: watchdog.name });
+      bg.metric("job", { kind: "watchdog", outcome: "error", reason: watchdog.name });
     }
   }
 }
