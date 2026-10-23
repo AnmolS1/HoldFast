@@ -26,10 +26,12 @@ const expected: Record<string, number> = {
   second_factor_throttled: 429,
   read_only: 503,
   feature_disabled: 503,
+  // (added with AVWARM: an avatar's scan waited out on a cold scanner, routes/uploads.ts)
+  scanner_starting: 503,
 };
 
 describe("error status table", () => {
-  it("maps exactly the 21 codes to their statuses", () => {
+  it("maps exactly the 22 codes to their statuses", () => {
     expect(ERROR_STATUS).toEqual(expected);
   });
 
