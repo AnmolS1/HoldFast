@@ -6,21 +6,30 @@
 // Outcomes: "ok" — the picture is the avatar now; "not_image" — the server's image service did not
 // take it ("An avatar is an image."); "unchecked" — the scanner could not check it: either the
 // complete failed (`5xx`, no scanner at all) or it answered a node that is not clean (stored with
-// its verdict, never made the avatar) — ONE message for both; "too_large"; "failed" otherwise.
+// its verdict, never made the avatar) — ONE message for both; "scanner_starting" — the scanner was
+// still starting when the server's wait (up to two minutes) ran out: nothing was kept, the same file
+// can simply be sent again; "too_large"; "failed" otherwise.
 import { AVATAR_MAX_BYTES } from "../../../shared/constants";
 import { NodeDto } from "../../../shared/schemas/node";
 import { InitUploadResponse, SinglePutResponse } from "../../../shared/schemas/upload";
 import { api, ApiError } from "../../lib/api";
 
-export type AvatarOutcome = "ok" | "not_image" | "unchecked" | "too_large" | "failed";
+export type AvatarOutcome = "ok" | "not_image" | "unchecked" | "scanner_starting" | "too_large" | "failed";
 
 async function sha256Hex(blob: Blob): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** Uploads `file` as the avatar. Never throws. `signal`: the page went away. */
-export async function uploadAvatar(file: File, signal?: AbortSignal): Promise<AvatarOutcome> {
+/**
+ * Uploads `file` as the avatar. Never throws. `signal`: the page went away. `onChecking`: the bytes
+ * are stored and the server is scanning them — which can take up to two minutes on a cold scanner.
+ */
+export async function uploadAvatar(
+  file: File,
+  signal?: AbortSignal,
+  onChecking?: () => void,
+): Promise<AvatarOutcome> {
   if (file.size > AVATAR_MAX_BYTES) return "too_large";
   if (!file.type.toLowerCase().startsWith("image/")) return "not_image";
   const silent = ["validation", "file_too_large"] as const;
@@ -49,6 +58,7 @@ export async function uploadAvatar(file: File, signal?: AbortSignal): Promise<Av
       signal,
       silent,
     });
+    onChecking?.();
     let node: NodeDto;
     try {
       node = await api(`/api/uploads/${started.uploadId}/complete`, {
@@ -56,10 +66,11 @@ export async function uploadAvatar(file: File, signal?: AbortSignal): Promise<Av
         body: { sha256, parts: [] },
         schema: NodeDto,
         signal,
-        silent: [...silent, "internal", "http_error"],
+        silent: [...silent, "internal", "http_error", "scanner_starting"],
       });
     } catch (cause) {
       if (cause instanceof ApiError && cause.code === "validation") return "not_image";
+      if (cause instanceof ApiError && cause.code === "scanner_starting") return "scanner_starting";
       if (cause instanceof ApiError && (cause.status >= 500 || cause.status === 0)) return "unchecked";
       throw cause;
     }
