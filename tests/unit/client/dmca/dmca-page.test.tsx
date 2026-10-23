@@ -12,6 +12,7 @@ import {
   hasSentinel,
   SENTINEL,
 } from "../../../../src/client/features/dmca/agent";
+import { DmcaPage } from "../../../../src/client/features/dmca/DmcaPage";
 import { renderRoutes, setupShell, shellFetch } from "../shell/helpers";
 
 setupShell();
@@ -73,16 +74,42 @@ describe("/dmca", () => {
     ]);
   });
 
-  it("shows the designated agent's name, address, phone and email from agent.ts, the email as a mailto link", async () => {
+  // Anmol's choice (DEMONOTICE, 2026-10-22): while agent.ts carries the sentinel the page says the
+  // registration is pending — not a single `TODO_` reaches the DOM (text or attribute). The Gate-B
+  // checks still fail on agent.ts itself; this only changes what the public sees meanwhile.
+  it("while agent.ts carries the sentinel: says the registration is pending, and no TODO_ reaches the DOM", async () => {
+    expect(agentHasSentinel).toBe(true);
     await open();
     const agent = screen.getByRole("region", { name: "Designated agent" });
+    expect(agent.textContent).toContain("Designated agent registration pending");
+    expect(agent.querySelector("[data-dmca-agent]")).toBeNull();
+    expect(within(agent).queryByRole("link")).toBeNull();
+    // The whole document, attributes included (a mailto: href is not text).
+    expect(document.documentElement.outerHTML).not.toContain(SENTINEL);
+    // The rest of the page is as built.
+    expect(screen.getByRole("region", { name: "Sending a notice" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Counter-notice" })).toBeTruthy();
+  });
+
+  it("with the details filled: shows the agent's name, address, phone and email, the email as a mailto link", async () => {
+    // Obviously made-up details: the page as it will be once agent.ts is filled.
+    const filled = {
+      name: "Example Agent",
+      address: "1 Example St\nSpringfield, XX 00000",
+      phone: "+1 555 0100",
+      email: "agent@example.test",
+    };
+    shellFetch({ session: null });
+    renderRoutes([{ path: "/dmca", element: <DmcaPage agent={filled} /> }], ["/dmca"]);
+    const agent = await screen.findByRole("region", { name: "Designated agent" });
+    expect(agent.textContent).not.toContain("registration pending");
     const details = agent.querySelector("[data-dmca-agent]")!.textContent ?? "";
     // The address may run over several lines ("\n" in agent.ts): each line is shown.
     for (const field of AGENT_FIELDS) {
-      for (const line of AGENT[field].split("\n")) expect(details, field).toContain(line);
+      for (const line of filled[field].split("\n")) expect(details, field).toContain(line);
     }
-    const mail = within(agent).getByRole("link", { name: AGENT.email });
-    expect(mail.getAttribute("href")).toBe(`mailto:${AGENT.email}`);
+    const mail = within(agent).getByRole("link", { name: filled.email });
+    expect(mail.getAttribute("href")).toBe(`mailto:${filled.email}`);
   });
 
   it("lists the six elements of a notice (§512(c)(3)(A)), the signature among them", async () => {

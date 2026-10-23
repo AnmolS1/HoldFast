@@ -57,6 +57,22 @@ test.describe("/dmca", () => {
     await expect(counter).toContainText("not less than 10 and not more than 14 business days");
   });
 
+  // Never skips, in either state (a skip fails the gate run): while the sentinel is in agent.ts the
+  // page says the registration is pending; at all times no sentinel reaches the served page —
+  // text or attribute (DEMONOTICE, 2026-10-22).
+  test("@prod-safe no sentinel on the page; registration pending while agent.ts has one", async ({ page }) => {
+    await openDmca(page);
+    const agent = page.getByRole("region", { name: "Designated agent" });
+    const pending = agent.getByText("Designated agent registration pending");
+    if (agentHasSentinel) {
+      await expect(pending).toBeVisible();
+      await expect(agent.getByRole("link")).toHaveCount(0);
+    } else {
+      await expect(pending).toHaveCount(0);
+    }
+    expect(await page.content()).not.toContain(SENTINEL);
+  });
+
   test("@prod-safe the designated agent's details, exactly as registered", async ({ page }) => {
     test.skip(agentHasSentinel, "DMCA agent details not supplied yet (HUMAN, T29 §B.1)");
     await openDmca(page);

@@ -2,6 +2,9 @@
 // the elements of a notice (§512(c)(3)), the counter-notice and its 10–14 business-day window
 // (§512(g)), and the repeat-infringer policy from T10's constants. Signed out, outside the frame;
 // it reads nothing from the API. The owner's "content removed" mail links here for the counter-notice.
+// While agent.ts still carries the sentinel (registration not done) the agent section says the
+// registration is pending instead: no sentinel text reaches the page (Anmol, 2026-10-22). The
+// Gate-B checks read agent.ts itself, so they keep failing until the details are filled.
 import Box from "@mui/material/Box";
 import Typography from "@mui/material/Typography";
 import type { ReactNode } from "react";
@@ -9,7 +12,7 @@ import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../../shared/constant
 import { LegalFooter } from "../../components/LegalFooter";
 import { Wordmark } from "../../components/Mark";
 import { hf, layout } from "../../theme/tokens";
-import { AGENT } from "./agent";
+import { AGENT, hasSentinel, type DesignatedAgent } from "./agent";
 import { t } from "./strings";
 
 const NOTICE_ELEMENTS = [
@@ -28,7 +31,7 @@ const COUNTER_ELEMENTS = [
   "dmca.counter.identity",
 ] as const;
 
-// Long unbroken values (an address, the sentinel) wrap instead of widening the page.
+// Long unbroken values (an address) wrap instead of widening the page.
 const wrap = { overflowWrap: "anywhere" } as const;
 
 function Section({ id, title, children }: { id: string; title: string; children: ReactNode }) {
@@ -55,23 +58,55 @@ function List({ items }: { items: readonly string[] }) {
   );
 }
 
-export function DmcaPage() {
+function AgentDetails({ agent }: { agent: DesignatedAgent }) {
+  if (hasSentinel(agent)) return <Typography data-dmca-agent-pending>{t("dmca.agent.pending")}</Typography>;
   const rows: Array<[string, ReactNode]> = [
-    [t("dmca.agent.name"), AGENT.name],
+    [t("dmca.agent.name"), agent.name],
     [
       t("dmca.agent.address"),
       <Box component="span" sx={{ whiteSpace: "pre-line" }}>
-        {AGENT.address}
+        {agent.address}
       </Box>,
     ],
-    [t("dmca.agent.phone"), AGENT.phone],
+    [t("dmca.agent.phone"), agent.phone],
     [
       t("dmca.agent.email"),
-      <Box component="a" href={`mailto:${AGENT.email}`} sx={{ color: hf.text, textDecoration: "underline" }}>
-        {AGENT.email}
+      <Box component="a" href={`mailto:${agent.email}`} sx={{ color: hf.text, textDecoration: "underline" }}>
+        {agent.email}
       </Box>,
     ],
   ];
+  return (
+    <>
+      <Typography>{t("dmca.agent.lead")}</Typography>
+      <Box
+        component="dl"
+        data-dmca-agent
+        sx={{
+          margin: 0,
+          display: "grid",
+          gridTemplateColumns: "max-content 1fr",
+          gap: "8px 16px",
+          ...wrap,
+        }}
+      >
+        {rows.map(([label, value]) => (
+          <Box key={label} sx={{ display: "contents" }}>
+            <Box component="dt" sx={{ color: hf.textSecondary }}>
+              {label}
+            </Box>
+            <Box component="dd" sx={{ margin: 0, minWidth: 0 }}>
+              {value}
+            </Box>
+          </Box>
+        ))}
+      </Box>
+    </>
+  );
+}
+
+/** `agent`: the registered details (agent.ts); a test passes made-up ones. */
+export function DmcaPage({ agent = AGENT }: { agent?: DesignatedAgent }) {
   return (
     <Box
       data-dmca-page
@@ -107,29 +142,7 @@ export function DmcaPage() {
         </Box>
 
         <Section id="agent" title={t("dmca.agent.title")}>
-          <Typography>{t("dmca.agent.lead")}</Typography>
-          <Box
-            component="dl"
-            data-dmca-agent
-            sx={{
-              margin: 0,
-              display: "grid",
-              gridTemplateColumns: "max-content 1fr",
-              gap: "8px 16px",
-              ...wrap,
-            }}
-          >
-            {rows.map(([label, value]) => (
-              <Box key={label} sx={{ display: "contents" }}>
-                <Box component="dt" sx={{ color: hf.textSecondary }}>
-                  {label}
-                </Box>
-                <Box component="dd" sx={{ margin: 0, minWidth: 0 }}>
-                  {value}
-                </Box>
-              </Box>
-            ))}
-          </Box>
+          <AgentDetails agent={agent} />
         </Section>
 
         <Section id="notice" title={t("dmca.notice.title")}>
