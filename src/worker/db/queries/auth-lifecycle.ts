@@ -515,6 +515,21 @@ export async function adminDeletionMarked(db: Executor, userId: string): Promise
   return rows.length > 0;
 }
 
+/**
+ * Whose deletion link this is (the user id Better Auth stored with `delete-account-<token>`), or
+ * null for a token it does not know. READS only: Better Auth's callback consumes the token BEFORE
+ * it compares users, so a link opened in another account's session would burn it (R1 func-9) —
+ * routes/auth.ts asks this first. (Identifiers are stored plain: no `verification.storeIdentifier`.)
+ */
+export async function deletionTokenOwner(db: Executor, token: string): Promise<string | null> {
+  const [row] = await db
+    .select({ value: verification.value })
+    .from(verification)
+    .where(eq(verification.identifier, `delete-account-${token}`))
+    .limit(1);
+  return row?.value ?? null;
+}
+
 /** Takes the user's row lock (the estate's lock order: the user row first). False: no such user. */
 export async function lockUser(tx: Executor, userId: string): Promise<boolean> {
   const rows = await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");

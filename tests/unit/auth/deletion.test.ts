@@ -78,22 +78,23 @@ describe("requesting deletion", () => {
     expect(await auditRows({ action: "account.deletion_scheduled", targetId: row.id })).toHaveLength(1);
     expect(mailTo(email, "deletionScheduled")).toHaveLength(1);
 
-    // The link is single-use: a second click is Better Auth's own 404, and changes nothing.
+    // The link is single-use: a second click is a page, not Better Auth's 404 JSON (R1 func-9) —
+    // the account page with the cue that the link did not work — and changes nothing.
     const scheduledAt = (await userById(row.id))!.deleteScheduledAt!.getTime();
     const again = await send(client, link!);
-    expect(again.status).toBe(404);
-    expect(again.body).toMatchObject({ code: "INVALID_TOKEN" });
+    expect(again.status).toBe(302);
+    expect(again.headers.get("location")).toBe("http://localhost/account?deletion=link_invalid");
     expect((await userById(row.id))!.deleteScheduledAt!.getTime()).toBe(scheduledAt);
     expect(await intact(row.id)).toEqual({ user: true, sessions: 1, accounts: 1 });
     expect(mailTo(email, "deletionScheduled")).toHaveLength(1);
   });
 
-  it("the link without a session: 404, nothing happens, and the token is still usable afterwards", async () => {
+  it("the link without a session: the sign-in page saying so (not JSON), nothing happens, and the token is still usable afterwards", async () => {
     const { client, user: row, email } = await verifiedUser();
     const { link } = await requestDeletion(client, email);
     const anonymous = await send(newClient(), link!);
-    expect(anonymous.status).toBe(404);
-    expect(anonymous.body).toMatchObject({ code: "FAILED_TO_GET_USER_INFO" });
+    expect(anonymous.status).toBe(302);
+    expect(anonymous.headers.get("location")).toBe("http://localhost/login?error=DELETION_SIGN_IN");
     expect((await userById(row.id))!.deleteScheduledAt).toBeNull();
     expect(await intact(row.id)).toEqual({ user: true, sessions: 1, accounts: 1 });
     // The token was not consumed by the anonymous attempt.
@@ -106,11 +107,17 @@ describe("requesting deletion", () => {
     const other = await verifiedUser();
     const { link } = await requestDeletion(victim.client, victim.email);
     const tried = await send(other.client, link!);
-    expect(tried.status).toBe(404);
+    expect(tried.status).toBe(302);
+    expect(tried.headers.get("location")).toBe("http://localhost/account?deletion=other_account");
     expect((await userById(victim.user.id))!.deleteScheduledAt).toBeNull();
     expect((await userById(other.user.id))!.deleteScheduledAt).toBeNull();
     expect(await intact(victim.user.id)).toEqual({ user: true, sessions: 1, accounts: 1 });
     expect(await intact(other.user.id)).toEqual({ user: true, sessions: 1, accounts: 1 });
+    // The token was NOT burned by the other account (R1 func-9): its owner's click still works.
+    const owner = await send(victim.client, link!);
+    expect(owner.status).toBe(302);
+    expect(owner.headers.get("location")).toBe("http://localhost/account?deletion=scheduled");
+    expect((await userById(victim.user.id))!.deleteScheduledAt).toBeInstanceOf(Date);
   });
 
   it("the token in the body of POST /delete-user: 200 'Deletion scheduled', same rows, account intact", async () => {
@@ -151,7 +158,8 @@ describe("requesting deletion", () => {
     const { client, user: row, email } = await verifiedUser();
     const { link } = await requestDeletion(client, email);
     const forged = await send(client, "/api/auth/delete-user/callback?token=" + "a".repeat(32));
-    expect(forged.status).toBe(404);
+    expect(forged.status).toBe(302);
+    expect(forged.headers.get("location")).toBe("http://localhost/account?deletion=link_invalid");
     expect((await userById(row.id))!.deleteScheduledAt).toBeNull();
     expect((await send(client, link!)).status).toBe(302);
   });

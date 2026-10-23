@@ -38,6 +38,10 @@ const REDIRECT_ERRORS = new Map<string, MessageKey>([
   ["INVALID_TOKEN", "auth.redirect.linkInvalid"],
   ["USER_NOT_FOUND", "auth.redirect.linkInvalid"],
   ["INVALID_USER", "auth.redirect.linkOtherAccount"],
+  // The deletion link opened while signed out (src/worker/routes/auth.ts `DELETION_SIGN_IN`).
+  // (Its own sentence — "Sign in, then open the deletion link from your email again." — is a
+  // string seam to the account-strings owner; until it lands, the generic one.)
+  ["DELETION_SIGN_IN", "auth.redirect.generic"],
   // The provider, or the person at its consent screen.
   ["access_denied", "auth.redirect.cancelled"],
   ["email_not_found", "auth.redirect.providerNoEmail"],
