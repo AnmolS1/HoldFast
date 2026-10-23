@@ -274,6 +274,13 @@ describe("an admin's lock of a file whose hash is the client's: the lock now, th
         status === "error" ? [{ v: 1, nodeId: t.file.id, key: t.file.r2Key, force: true }] : [],
       );
       expect(await blocklistRow(t.innocent), status).toBeNull();
+      if (status === "error") {
+        // Delivered: the forced scan takes over the finished job, reaches the locked node, and the
+        // verdict lists the server's hash as this lock's entry.
+        await deliver(sent.map((body) => ({ body })));
+        expect(await blocklistRow(t.server)).toMatchObject({ reason: "csam", sourceNodeId: t.file.id });
+        expect(await blocklistRow(t.innocent)).toBeNull();
+      }
     }
   });
 
