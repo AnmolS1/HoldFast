@@ -30,6 +30,7 @@ import {
   TURNSTILE_TEST_SECRET_PASS,
 } from "../../../src/worker/auth/test-outbound";
 import { user } from "../../../src/worker/db/schema";
+import { ipKey } from "../../../src/worker/middleware/rate-limit";
 import createAuthSource from "../../../src/worker/auth/create-auth.ts?raw";
 import {
   CAPTCHA,
@@ -491,28 +492,33 @@ describe("rate limits", () => {
     expect((await signIn(newClient(), email)).status).toBe(200);
   });
 
-  it("RL_AUTH: from one address the 21st auth write in a minute is 429 with our envelope — and 60 session reads still pass", async () => {
+  // RL_AUTH counts FIXED one-minute windows, and Better Auth's own limiter (30 a minute per path,
+  // reset only after a quiet minute) answers in front of it once a window rolls over part-way: no
+  // count of real requests that should be refused is deterministic against the real binding
+  // (R1 func-1). So the behaviour is proven with a stand-in binding that counts the calls it is
+  // asked about and refuses this address from its 21st call on — the binding's own interface,
+  // as in tests/unit/security/admin-plugin-budget.test.ts — and the real binding is only asked
+  // what a window crossing cannot break (it can reset a count, never add to one).
+  it("RL_AUTH: from one address the 21st auth write is 429 with our envelope — and session reads never ask it", async () => {
     const ip = newClient().ip;
-    const a = newClient({ ip });
-    const b = newClient({ ip });
-    // An unauthenticated POST /verify-password is answered 401 and is limited by Better Auth at
-    // its default 30 a minute, so RL_AUTH (20) trips first.
-    // The limiter counts in fixed one-minute windows. Twenty writes pass in any window, so the
-    // first refusal is the 21st write — or, when the minute rolls over part-way (a loaded
-    // machine), the 21st of the new window: never earlier than the 21st, never later than the 41st.
-    let refused: Awaited<ReturnType<typeof send>> | null = null;
-    let refusedAt = 0;
-    for (let i = 1; i <= 41 && refused === null; i++) {
+    const asked: string[] = [];
+    const RL_AUTH = {
+      limit: async ({ key }: { key: string }) => {
+        asked.push(key);
+        return { success: asked.filter((one) => one === ipKey(ip)).length <= 20 };
+      },
+    };
+    const a = newClient({ ip, env: { RL_AUTH } });
+    const b = newClient({ ip, env: { RL_AUTH } });
+    // An unauthenticated POST /verify-password is answered 401 (and Better Auth's own limit for it
+    // is 30 a minute, so RL_AUTH's 20 is the one that answers).
+    for (let i = 1; i <= 20; i++) {
       const sent = await send(i % 2 ? a : b, "/api/auth/verify-password", { json: { password: PASSWORD } });
-      if (sent.status === 429) {
-        refused = sent;
-        refusedAt = i;
-      } else {
-        expect(sent.status, `write ${i}`).toBe(401);
-      }
+      expect(sent.status, `write ${i}`).toBe(401);
     }
-    expect(refusedAt, "the first refused write").toBeGreaterThanOrEqual(21);
-    if (refused === null) throw new Error("41 writes in at most two windows were all let through");
+    expect(asked).toEqual(Array.from({ length: 20 }, () => ipKey(ip)));
+    const refused = await send(b, "/api/auth/verify-password", { json: { password: PASSWORD } });
+    expect(refused.status).toBe(429);
     expect(refused.body).toMatchObject({ error: "rate_limited" });
     expect(refused.headers.get("retry-after")).toBe("60");
     // The ruling's own words: the 21st SIGN-IN attempt from that address is a 429 too.
@@ -520,10 +526,26 @@ describe("rate limits", () => {
     expect(signInAttempt.status).toBe(429);
     expect(signInAttempt.body).toMatchObject({ error: "rate_limited" });
     // Signing out is not a credential: it is never counted, so it still answers.
+    const before = asked.length;
     expect((await send(a, "/api/auth/sign-out", { json: {} })).status).toBe(200);
-    // …while the shell's session read, from two clients behind that one address, is not counted.
-    // (60, not 30: Better Auth's own default limit of 30 a minute per address must not apply
-    // to this endpoint either.)
+    // …and the shell's session read, from two clients behind that one address, is not counted
+    // either. (60, not 30: Better Auth's own default limit of 30 a minute per address must not
+    // apply to this endpoint.)
+    for (let i = 1; i <= 60; i++) {
+      const read = await send(i % 2 ? a : b, "/api/auth/get-session");
+      expect(read.status, `read ${i}`).toBe(200);
+    }
+    expect(asked.length, "sign-out and session reads asked RL_AUTH").toBe(before);
+  });
+
+  it("RL_AUTH, the real binding: twenty writes from one address pass, and 60 session reads after them", async () => {
+    const ip = newClient().ip;
+    const a = newClient({ ip });
+    const b = newClient({ ip });
+    for (let i = 1; i <= 20; i++) {
+      const sent = await send(i % 2 ? a : b, "/api/auth/verify-password", { json: { password: PASSWORD } });
+      expect(sent.status, `write ${i}`).toBe(401);
+    }
     for (let i = 1; i <= 60; i++) {
       const read = await send(i % 2 ? a : b, "/api/auth/get-session");
       expect(read.status, `read ${i}`).toBe(200);
