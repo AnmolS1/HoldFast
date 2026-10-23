@@ -23,7 +23,8 @@ export type ErrorCode =
   | "link_expired"
   | "link_paused"
   | "read_only"
-  | "feature_disabled";
+  | "feature_disabled"
+  | "scanner_starting";
 
 /** HTTP status of every error code. 401 has one meaning only: the session is missing or expired. */
 export const ERROR_STATUS = {
@@ -50,6 +51,9 @@ export const ERROR_STATUS = {
   link_paused: 423,
   read_only: 503,
   feature_disabled: 503,
+  // routes/uploads.ts: an avatar's synchronous scan waited out its budget for a scanner that is
+  // starting (or busy) — retryable, with `Retry-After`; nothing was kept.
+  scanner_starting: 503,
 } as const satisfies Record<ErrorCode, number>;
 
 export type ErrorEnvelope = {

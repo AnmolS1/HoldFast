@@ -14,7 +14,11 @@ import {
 } from "../../../src/worker/scan/container";
 import { scannerOver, verdictOf } from "../../../src/worker/scan/adapter";
 import { classify, isDeployReset, DEPLOY_RESET_MESSAGE } from "../../../src/worker/scan/consumer";
-import { scanSmallObject } from "../../../src/worker/services/scanning";
+import {
+  scanSmallObject,
+  ScannerStartingError,
+  SMALL_SCAN_WAIT_MS,
+} from "../../../src/worker/services/scanning";
 import { pngBytes } from "../../setup/fixture-bytes";
 import { nodeById } from "../services-core/helpers";
 import { complete, init, putSingle, uploader, userRow } from "../uploads/helpers";
@@ -52,6 +56,20 @@ function fake(answer: (request: Request) => Promise<Response>) {
     },
   });
   return { names, stub };
+}
+
+/** A virtual clock for `scanSmallObject`'s waits: `sleep` only moves it; `slept` lists each wait. */
+function clock() {
+  const c = {
+    t: 0,
+    slept: [] as number[],
+    now: () => c.t,
+    sleep: async (ms: number) => {
+      c.slept.push(ms);
+      c.t += ms;
+    },
+  };
+  return c;
 }
 
 const body = (bytes: Uint8Array) =>
@@ -186,31 +204,29 @@ describe("scanSmallObject (fold #15)", () => {
     });
   });
 
-  it("unavailable, not ready, busy, transport, refused → RETURNS error/engine with the server sha256 — never throws", async () => {
+  it("unavailable, transport, refused → RETURNS error/engine with the server sha256 — never throws", async () => {
     const bytes = enc("an avatar");
     const errors = [
-      new ScannerNotReadyError("signatures", 99, 30),
-      new ScannerBusyError(15),
       new ScannerTransportError("engine", "scanner call failed"),
       new ScannerTransportError("timeout", "no answer"),
       new ScannerRefusedError(400, "short_body"),
     ];
     for (const error of errors) {
       vi.mocked(scanSmall).mockRejectedValueOnce(error);
-      expect(await scanSmallObject(OFF, bytes), error.name).toMatchObject({
+      expect(await scanSmallObject(OFF, bytes, clock()), error.name).toMatchObject({
         status: "error",
         reason: "engine",
         sha256: await sha256Of(bytes),
       });
     }
     // No SCANNER binding at all.
-    expect(await scanSmallObject({ ...OFF, SCANNER: undefined as never }, bytes)).toMatchObject({
+    expect(await scanSmallObject({ ...OFF, SCANNER: undefined as never }, bytes, clock())).toMatchObject({
       status: "error",
       reason: "engine",
     });
   });
 
-  it("the avatar route: a busy scanner stores the avatar error and never makes it current (no 5xx)", async () => {
+  it("the avatar route: a scanner busy once is waited out — the avatar is scanned and current (AVWARM)", async () => {
     const user = await uploader();
     // A picture of its own (bytes after the PNG's end): nothing another test listed.
     const base = pngBytes(32, 32);
@@ -224,11 +240,118 @@ describe("scanSmallObject (fold #15)", () => {
       size: PNG.byteLength,
     });
     expect((await putSingle(user, session.uploadId, PNG)).status).toBe(200);
-    vi.mocked(scanSmall).mockRejectedValueOnce(new ScannerBusyError(15));
+    // Retry-After 0: the wait is the first backoff step (1 s), not the shim's 15 s.
+    vi.mocked(scanSmall)
+      .mockRejectedValueOnce(new ScannerBusyError(0))
+      .mockResolvedValueOnce(shim({ sha256: await sha256Of(PNG), bytes: PNG.byteLength }));
     const answer = await complete(user, session.uploadId, {}, { env: { SCAN_STUB: "0" }, sent: [] });
     expect(answer.status).toBe(201);
     const node = (await nodeById(String((answer.body as { id: string }).id)))!;
-    expect(node).toMatchObject({ scanStatus: "error", system: "avatar" });
-    expect((await userRow(user.id)).avatarNodeId).not.toBe(node.id);
+    expect(node).toMatchObject({ scanStatus: "clean", system: "avatar" });
+    expect((await userRow(user.id)).avatarNodeId).toBe(node.id);
+  });
+});
+
+describe("scanSmallObject waits out a scanner that is starting or busy (AVWARM)", () => {
+  const OFF = { SCAN_STUB: "0", SENTRY_ENVIRONMENT: "test", SCANNER: {} as never };
+  const calls = () => vi.mocked(scanSmall).mock.calls.length;
+  const notReady = (retryAfter = 30) => new ScannerNotReadyError("clamd_loading", null, retryAfter);
+
+  it("a cold scanner (not_ready three times, then clean): the verdict, after the shim's Retry-After each time", async () => {
+    const bytes = enc("a cold start");
+    const time = clock();
+    const before = calls();
+    vi.mocked(scanSmall)
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(new ScannerNotReadyError("signatures", 30, 30))
+      .mockResolvedValueOnce(shim({ sha256: await sha256Of(bytes), bytes: bytes.byteLength }));
+    expect(await scanSmallObject(OFF, bytes, time)).toMatchObject({ status: "clean" });
+    expect(calls() - before).toBe(4);
+    expect(time.slept).toEqual([30_000, 30_000, 30_000]);
+  });
+
+  it("never ready: attempts at 0, 30, 60, 90 and 120 s, then ScannerStartingError with the Retry-After — never a verdict", async () => {
+    const time = clock();
+    const before = calls();
+    const at: number[] = [];
+    for (let n = 0; n < 5; n++) {
+      vi.mocked(scanSmall).mockImplementationOnce(async () => {
+        at.push(time.now());
+        throw notReady();
+      });
+    }
+    const thrown = await scanSmallObject(OFF, enc("never ready"), time).catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(ScannerStartingError);
+    expect(thrown).toMatchObject({ reason: "not_ready", retryAfter: 30 });
+    expect(calls() - before).toBe(5);
+    expect(at).toEqual([0, 30_000, 60_000, 90_000, 120_000]);
+    expect(SMALL_SCAN_WAIT_MS).toBe(120_000);
+  });
+
+  it("busy is waited out too, honouring its Retry-After; the backoff is the floor when it asks for less", async () => {
+    const bytes = enc("busy then clean");
+    const verdict = shim({ sha256: await sha256Of(bytes), bytes: bytes.byteLength });
+    const honoured = clock();
+    vi.mocked(scanSmall)
+      .mockRejectedValueOnce(new ScannerBusyError(15))
+      .mockRejectedValueOnce(new ScannerBusyError(60))
+      .mockResolvedValueOnce(verdict);
+    expect(await scanSmallObject(OFF, bytes, honoured)).toMatchObject({ status: "clean" });
+    expect(honoured.slept).toEqual([15_000, 60_000]);
+
+    const floor = clock();
+    vi.mocked(scanSmall)
+      .mockRejectedValueOnce(new ScannerBusyError(0))
+      .mockRejectedValueOnce(new ScannerBusyError(0))
+      .mockRejectedValueOnce(new ScannerBusyError(0))
+      .mockResolvedValueOnce(verdict);
+    expect(await scanSmallObject(OFF, bytes, floor)).toMatchObject({ status: "clean" });
+    expect(floor.slept).toEqual([1_000, 2_000, 4_000]);
+  });
+
+  it("busy to the end gives up as busy, with its Retry-After", async () => {
+    const time = clock();
+    for (let n = 0; n < 3; n++) {
+      vi.mocked(scanSmall).mockImplementationOnce(async () => {
+        time.t += 30_000; // each refusal took a while (a container starting)
+        throw new ScannerBusyError(15);
+      });
+    }
+    const thrown = await scanSmallObject(OFF, enc("always busy"), time).catch((error: unknown) => error);
+    expect(thrown).toMatchObject({ name: "ScannerStartingError", reason: "busy", retryAfter: 15 });
+  });
+
+  it("the time a call takes counts against the budget, and the last wait is cut to the budget's end", async () => {
+    const slow = clock();
+    const before = calls();
+    for (let n = 0; n < 2; n++) {
+      vi.mocked(scanSmall).mockImplementationOnce(async () => {
+        slow.t += 50_000;
+        throw notReady();
+      });
+    }
+    // 0 → 50 s, wait 30 → 80 s, → 130 s: past the budget, no third call.
+    await expect(scanSmallObject(OFF, enc("slow"), slow)).rejects.toBeInstanceOf(ScannerStartingError);
+    expect(calls() - before).toBe(2);
+
+    const long = clock();
+    for (let n = 0; n < 3; n++) vi.mocked(scanSmall).mockRejectedValueOnce(notReady(100));
+    await expect(scanSmallObject(OFF, enc("long"), long)).rejects.toBeInstanceOf(ScannerStartingError);
+    expect(long.slept).toEqual([100_000, 20_000]);
+  });
+
+  it("each attempt is bounded by what is left of the budget (at least 30 s), not the queue's 12 minutes", async () => {
+    const bytes = enc("bounded");
+    const time = clock();
+    const before = calls();
+    vi.mocked(scanSmall)
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(notReady())
+      .mockRejectedValueOnce(notReady())
+      .mockResolvedValueOnce(shim({ sha256: await sha256Of(bytes), bytes: bytes.byteLength }));
+    await scanSmallObject(OFF, bytes, time);
+    const timeouts = vi.mocked(scanSmall).mock.calls.slice(before).map((call) => call[2]?.timeoutMs);
+    expect(timeouts).toEqual([120_000, 90_000, 60_000, 30_000]);
   });
 });

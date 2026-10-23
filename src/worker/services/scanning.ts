@@ -39,7 +39,7 @@ import { clearRequeuedFromDlq, pendingScanCandidates } from "../db/queries/scan"
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
 import { scannerOver } from "../scan/adapter";
-import { ScannerNotReadyError } from "../scan/container";
+import { ScannerBusyError, ScannerNotReadyError } from "../scan/container";
 import { captureError } from "../sentry";
 import { audit } from "./audit";
 import { sendOperatorCritical } from "./email";
@@ -221,34 +221,91 @@ export function getScanner(env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT" | "
 }
 
 /**
+ * How long the synchronous path waits out a scanner that is not ready or busy before it gives up.
+ * A container asleep after `sleepAfter` answers `not_ready` while clamd loads: 19–20 s at ½ vCPU,
+ * and 43–47 s to the first verdict when the boot freshclam run makes clamd RELOAD a stale bake
+ * (T20's measurements) — about 70 s plus the container's own boot. At the shim's `Retry-After: 30`
+ * the attempts are at 0, 30, 60, 90 and 120 s. A request has no wall-time limit while its client
+ * is connected, so the wait is the client's.
+ */
+export const SMALL_SCAN_WAIT_MS = 120_000;
+/** The wait before each further attempt when the scanner asks for less (its `Retry-After` wins). */
+const SMALL_SCAN_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+/** One attempt's own limit, at least: a 5 MB picture on a ready clamd takes well under a second. */
+const SMALL_SCAN_MIN_ATTEMPT_MS = 30_000;
+
+/**
+ * The scanner was still starting (`not_ready`) or busy when `SMALL_SCAN_WAIT_MS` ran out: nothing
+ * was scanned. Retryable — `retryAfter` (seconds) is the scanner's last `Retry-After`.
+ */
+export class ScannerStartingError extends Error {
+  readonly reason: "not_ready" | "busy";
+  readonly retryAfter: number;
+  constructor(reason: "not_ready" | "busy", retryAfter: number) {
+    super(`scanner still ${reason === "busy" ? "busy" : "starting"} after the wait`);
+    this.name = "ScannerStartingError";
+    this.reason = reason;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/** The clock `scanSmallObject` waits on: the real one in production, a virtual one in tests. */
+export interface SmallScanClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const realClock: SmallScanClock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+};
+
+/**
  * The synchronous path for small objects (avatars, at most 5 MB): scanned before they are stored.
- * IT NEVER THROWS for want of a scanner: unavailable, not ready, busy, a transport failure or a
- * refusal all RETURN `{ status: 'error', reason: 'engine' }` — the caller stores such an avatar as
- * `error` and never shows it; the user uploads again. (A small scan needs room for one extracted
- * member, so an avatar sent while a large archive is being extracted is answered `busy` and ends
- * `error`: accepted, T20 d6.) The verdict always carries the SERVER's `sha256`: the scanner's, or
- * — when it gave none — this Worker's own.
+ * A scanner that is NOT READY (a cold container loading clamd, or signatures not yet fresh) or BUSY
+ * is waited out — `max(backoff, Retry-After)` between attempts, the last wait cut to the budget's
+ * end — for at most `SMALL_SCAN_WAIT_MS`; those answers are the scanner's normal weather and are
+ * not reported. Still not ready (or busy) then: throws `ScannerStartingError` — never a verdict.
+ * Anything else that keeps a scanner from answering — no scanner, a transport failure or timeout,
+ * a refusal — is reported and RETURNS `{ status: 'error', reason: 'engine' }`: the caller stores
+ * such an avatar as `error` and never shows it; the user uploads again. The verdict always carries
+ * the SERVER's `sha256`: the scanner's, or — when it gave none — this Worker's own.
  */
 export async function scanSmallObject(
   env: Pick<Env, "SCAN_STUB" | "SENTRY_ENVIRONMENT" | "SCANNER">,
   bytes: Uint8Array,
+  clock: SmallScanClock = realClock,
 ): Promise<ScanVerdict> {
-  try {
-    const verdict = await getScanner(env).scanBytes(bytes);
-    return verdict.sha256
-      ? verdict
-      : { ...verdict, sha256: hex(await crypto.subtle.digest("SHA-256", bytes)) };
-  } catch (error) {
-    captureError(error, { kind: "scan", reason: "small" });
-    return {
-      status: "error",
-      reason: "engine",
-      signatures: [],
-      pua: [],
-      sha256: hex(await crypto.subtle.digest("SHA-256", bytes)),
-      bytes: bytes.length,
-      engine: SCANNER_UNAVAILABLE,
-    };
+  const deadline = clock.now() + SMALL_SCAN_WAIT_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // Each attempt bounded by what is left of the wait (the queue's 12 minutes would void it).
+      const timeoutMs = Math.max(deadline - clock.now(), SMALL_SCAN_MIN_ATTEMPT_MS);
+      const scanner = stubEnabled(env) || !env.SCANNER ? getScanner(env) : scannerOver(env, { timeoutMs });
+      const verdict = await scanner.scanBytes(bytes);
+      return verdict.sha256
+        ? verdict
+        : { ...verdict, sha256: hex(await crypto.subtle.digest("SHA-256", bytes)) };
+    } catch (error) {
+      if (error instanceof ScannerNotReadyError || error instanceof ScannerBusyError) {
+        const left = deadline - clock.now();
+        const reason = error instanceof ScannerBusyError ? "busy" : "not_ready";
+        if (left <= 0) throw new ScannerStartingError(reason, error.retryAfter);
+        const backoff = SMALL_SCAN_BACKOFF_MS[Math.min(attempt, SMALL_SCAN_BACKOFF_MS.length - 1)]!;
+        await clock.sleep(Math.min(Math.max(backoff, error.retryAfter * 1000), left));
+        continue;
+      }
+      captureError(error, { kind: "scan", reason: "small" });
+      return {
+        status: "error",
+        reason: "engine",
+        signatures: [],
+        pua: [],
+        sha256: hex(await crypto.subtle.digest("SHA-256", bytes)),
+        bytes: bytes.length,
+        engine: SCANNER_UNAVAILABLE,
+      };
+    }
   }
 }
 
