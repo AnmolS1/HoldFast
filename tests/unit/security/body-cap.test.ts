@@ -12,10 +12,16 @@
 //
 // Every link password and address here is made up.
 import { describe, expect, it } from "vitest";
-import { JSON_BODY_MAX_BYTES } from "../../../src/worker/services/body";
+import {
+  DMCA_NOTICE_BODY_MAX_BYTES,
+  JSON_BODY_MAX_BYTES,
+  UPLOAD_COMPLETE_BODY_MAX_BYTES,
+} from "../../../src/worker/services/body";
 import { MAX_ECHOED_ISSUES } from "../../../src/worker/services/errors";
 import { api, asCaller, errorOf, makeFile, makeFolder, member, settingsWith } from "../sharing/helpers";
 import { linkTo, visit } from "../sharing/public-helpers";
+import { admin, adminCall } from "../admin/helpers";
+import { complete, init, uploader } from "../uploads/helpers";
 
 const UNKNOWN_TOKEN = "AAAAAAAAAAAAAAAAAAAAAA";
 
@@ -132,5 +138,63 @@ describe("public download-urls resolves the link before it validates the body", 
       settings: settingsWith({ linksEnabled: false }),
     });
     expect([answer.status, errorOf(answer).error]).toEqual([423, "link_paused"]);
+  });
+});
+
+describe("the routes whose legitimate bodies are larger ask for a larger cap", () => {
+  /** `n` parts as the client sends them: R2's quoted 32-hex etags. */
+  const parts = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ n: i + 1, etag: `"${"0123456789abcdef".repeat(2)}"` }));
+  /** CJK text: 3 bytes of UTF-8 for each character zod counts. */
+  const cjk = (chars: number) => "\u6587".repeat(chars);
+
+  it("upload complete: 10,000 parts (well over 64 KiB) are read; past its own cap it is 413", async () => {
+    const user = await uploader();
+    const session = await init(user);
+    expect(JSON.stringify({ parts: parts(10_000) }).length).toBeGreaterThan(JSON_BODY_MAX_BYTES);
+    const full = await complete(user, session.uploadId, { parts: parts(10_000) });
+    expect(full.status).not.toBe(413);
+    const over = await complete(user, session.uploadId, {
+      parts: [{ n: 1, etag: "x".repeat(UPLOAD_COMPLETE_BODY_MAX_BYTES) }],
+    });
+    expect(over.status).toBe(413);
+  });
+
+  it("a DMCA notice with its longest texts in CJK is read; past its own cap it is 413", async () => {
+    const who = await admin();
+    const notice = {
+      receivedVia: "email",
+      complainantName: cjk(500),
+      complainantAddress: cjk(2000),
+      workDescription: cjk(20_000),
+      infringingDescription: cjk(20_000),
+      statementGoodFaith: true,
+      statementAccuracy: true,
+      signature: cjk(500),
+      rawText: cjk(200_000),
+      nodeIds: [],
+    };
+    const made = await adminCall(who.as, "POST", "/dmca", { body: notice });
+    expect(made.status, made.text.slice(0, 200)).not.toBe(413);
+    const over = await adminCall(who.as, "POST", "/dmca", {
+      body: { ...notice, rawText: "x".repeat(DMCA_NOTICE_BODY_MAX_BYTES) },
+    });
+    expect(over.status).toBe(413);
+  });
+
+  it("a counter-notice with every text at its longest in CJK is read (about 70 KB)", async () => {
+    const who = await admin();
+    const counter = {
+      counterName: cjk(500),
+      counterAddress: cjk(2000),
+      counterPhone: cjk(100),
+      counterEmail: "counter@example.test",
+      counterStatement: cjk(20_000),
+      counterConsentJurisdiction: true,
+      counterSignature: cjk(500),
+    };
+    expect(new TextEncoder().encode(JSON.stringify(counter)).byteLength).toBeGreaterThan(JSON_BODY_MAX_BYTES);
+    const sent = await adminCall(who.as, "POST", `/dmca/${crypto.randomUUID()}/counter`, { body: counter });
+    expect(sent.status, sent.text.slice(0, 200)).not.toBe(413);
   });
 });

@@ -92,7 +92,7 @@ import { requireSwitch } from "../middleware/kill-switch";
 import { readsRolledBack } from "../jobs/reconcile";
 import { captureError } from "../sentry";
 import { audit } from "../services/audit";
-import { jsonBody } from "../services/body";
+import { jsonBody, UPLOAD_COMPLETE_BODY_MAX_BYTES } from "../services/body";
 import { enforceUploadCeilings, recordUsage } from "../services/ceilings";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
@@ -1349,7 +1349,7 @@ async function completedAgain(c: Ctx, user: SessionUser, session: Upload, body: 
 router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
   const user = requireVerified(c);
   const open = await loadSession(c);
-  const body = CompleteUploadBody.parse(await jsonBody(c));
+  const body = CompleteUploadBody.parse(await jsonBody(c, UPLOAD_COMPLETE_BODY_MAX_BYTES));
   // A complete that is sent again — a lost answer, a retry — must be safe.
   if (open.status === "done" || open.status === "aborted") return completedAgain(c, user, open, body);
   if (open.status === "completing") throw stillCompleting();

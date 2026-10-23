@@ -18,7 +18,7 @@ export const JSON_BODY_MAX_BYTES = 64 * 1024;
 /** `POST /api/uploads/:id/complete`: up to `MAX_PARTS` (10,000) parts of about 50 bytes each. */
 export const UPLOAD_COMPLETE_BODY_MAX_BYTES = 2 * 1024 * 1024;
 /** Admin DMCA notice and counter-notice: 200,000 + 2 × 20,000 characters of text at most. */
-export const ADMIN_LONG_TEXT_BODY_MAX_BYTES = 1024 * 1024;
+export const DMCA_NOTICE_BODY_MAX_BYTES = 1024 * 1024;
 
 const tooLarge = (maxBytes: number) => new AppError("body_too_large", undefined, { maxBytes });
 
