@@ -10,7 +10,15 @@ import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
 import { adoptIdentity, queryClient, sessionQuery } from "../../../../src/client/lib/query";
 import { buildRoutes } from "../../../../src/client/router";
 import { fileNode } from "../explorer/fixtures/nodes";
-import { json, renderRoutes, sessionOf, setupShell, shellFetch, type MockCall } from "../shell/helpers";
+import {
+  envelope,
+  json,
+  renderRoutes,
+  sessionOf,
+  setupShell,
+  shellFetch,
+  type MockCall,
+} from "../shell/helpers";
 
 setupShell();
 beforeEach(() => resetPrefsSync());
@@ -165,6 +173,42 @@ describe("the account changes while a step waits", () => {
     await expectOnlyB(api.calls, before);
     expect(screen.queryByText("Couldn't check that image. Try again.")).toBeNull();
     expect(getToasts().map((toast) => toast.message)).not.toContain("Profile picture updated.");
+  });
+
+  it("the avatar's 'Try again' after scanner_starting: gone once B is signed in — A's picture is never sent as B's", async () => {
+    const api = scripted({
+      path: () => false,
+      answer: () => json({}),
+      extra: (call) => {
+        if (call.path === "/api/uploads" && call.method === "POST")
+          return json({
+            uploadId: "0199c6f0-7b1e-7c3a-9d2e-4f5a6b7c8d9e",
+            mode: "single",
+            partBytes: 67108864,
+            partCount: 1,
+            resumedParts: [],
+            finalName: "me.png",
+            expiresAt: LATER(),
+          });
+        if (call.path.endsWith("/single")) return json({ etag: "e1" });
+        if (call.path.endsWith("/complete"))
+          return envelope("scanner_starting", 503, undefined, { "Retry-After": "30" });
+        return undefined;
+      },
+    });
+    renderRoutes(buildRoutes(), ["/account"]);
+    await screen.findByDisplayValue("Ada Lovelace");
+    const input = document.querySelector<HTMLInputElement>("[data-avatar-input]")!;
+    fireEvent.change(input, {
+      target: { files: [new File([new Uint8Array([1, 2, 3])], "me.png", { type: "image/png" })] },
+    });
+    const retry = await screen.findByRole("button", { name: "Try again" });
+    await api.switchToB();
+    const before = api.calls.length;
+    fireEvent.click(retry);
+    await expectOnlyB(api.calls, before);
+    expect(api.calls.slice(before).filter((call) => call.path === "/api/uploads")).toEqual([]);
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("the export: A's file is never handed over once B is signed in", async () => {

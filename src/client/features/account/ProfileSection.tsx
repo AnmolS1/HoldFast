@@ -62,8 +62,12 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
   const [phase, setPhase] = useState<"idle" | "uploading" | "checking">("idle");
   const busy = phase !== "idle";
   const [problem, setProblem] = useState<string | null>(null);
-  /** The picture to send again when the scanner was still starting (nothing of it was kept). */
-  const [retry, setRetry] = useState<File | null>(null);
+  /**
+   * The picture to send again when the scanner was still starting (nothing of it was kept) — with
+   * the account it was chosen for: after a switch it is never offered, nor sent, as another's.
+   */
+  const [retry, setRetry] = useState<{ file: File; epoch: ReturnType<typeof accountEpoch> } | null>(null);
+  const retryable = retry !== null && sameAccount(retry.epoch) ? retry.file : null;
 
   const onFile = async (file: File | undefined) => {
     if (!file) return;
@@ -84,7 +88,7 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
     }
     // The initials stay: nothing became the avatar.
     setProblem(t(AVATAR_TEXT[outcome]));
-    if (outcome === "scanner_starting") setRetry(file);
+    if (outcome === "scanner_starting") setRetry({ file, epoch: then });
   };
 
   return (
@@ -140,9 +144,16 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
         <Note>{t("profile.avatar.help")}</Note>
         <StatusLine tone="ok">{phase === "checking" ? t("profile.avatar.checkingHelp") : null}</StatusLine>
         <StatusLine tone="error">{problem}</StatusLine>
-        {retry && !busy ? (
+        {retryable && !busy ? (
           <Box>
-            <Button variant="outlined" data-avatar-retry onClick={() => void onFile(retry)}>
+            <Button
+              variant="outlined"
+              data-avatar-retry
+              onClick={() => {
+                if (retry && sameAccount(retry.epoch)) void onFile(retry.file);
+                else setRetry(null);
+              }}
+            >
               {t("profile.avatar.tryAgain")}
             </Button>
           </Box>
