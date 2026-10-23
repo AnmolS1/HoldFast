@@ -156,3 +156,12 @@ jobs:
       # not a code fix; still a failure, because the Worker was not observed); 12 = no answer.
       - name: Files host answers 404 and nothing else
         run: bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
+
+      # Only after an image was pushed: see scanner-image.yml (R1 perfops-4). The dev container
+      # application and its repository are holdfast-dev-scannercontainer.
+      - name: Drop registry images no rollback can need
+        if: steps.plan.outputs.rollout == 'build'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh prune-images holdfast-dev-scannercontainer holdfast-dev --delete
