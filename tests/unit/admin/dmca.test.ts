@@ -516,9 +516,11 @@ describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded
     expect(copy!.text).toContain("555 0100");
     expect(copy!.text).toContain("removed by mistake");
     expect(copy!.text).toContain("Consents to the jurisdiction of the federal court: yes");
-    // The instants in UTC (the mail's format): 08:00 EST Mon 20 Nov, and the end of Mon 27 Nov in New York.
-    expect(copy!.text).toContain("20 November 2028, 13:00 UTC");
-    expect(copy!.text).toContain("28 November 2028, 04:59 UTC");
+    // New York dates with the zone named — never a UTC clock time that reads a day late.
+    expect(copy!.text).toContain("no sooner than 20 November 2028, 08:00 US Eastern time");
+    expect(copy!.text).toContain("no later than 27 November 2028 (end of day, US Eastern time)");
+    expect(copy!.text).not.toContain("UTC");
+    expect(copy!.text).not.toContain("28 November");
     expect(copy!.text).toContain(made.id);
     // The complainant is not told the owner's file name (only what their own notice said).
     expect(copy!.text).not.toContain("secret-name");
