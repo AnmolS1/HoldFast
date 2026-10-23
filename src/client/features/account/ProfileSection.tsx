@@ -21,6 +21,7 @@ import { LabeledField, Note, Section, StatusLine } from "./ui";
 
 const AVATAR_TEXT: Record<Exclude<AvatarOutcome, "ok">, Parameters<typeof t>[0]> = {
   unchecked: "profile.avatar.unchecked",
+  scanner_starting: "profile.avatar.scannerStarting",
   not_image: "profile.avatar.notImage",
   too_large: "profile.avatar.tooLarge",
   failed: "account.failed",
@@ -57,18 +58,29 @@ function Initials({ profile }: { profile: ProfileDto }) {
 function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }) {
   const queryClient = useQueryClient();
   const input = useRef<HTMLInputElement | null>(null);
-  const [busy, setBusy] = useState(false);
+  /** Where the upload is: the bytes going up, then the server scanning them. */
+  const [phase, setPhase] = useState<"idle" | "uploading" | "checking">("idle");
+  const busy = phase !== "idle";
   const [problem, setProblem] = useState<string | null>(null);
+  /**
+   * The picture to send again when the scanner was still starting (nothing of it was kept) — with
+   * the account it was chosen for: after a switch it is never offered, nor sent, as another's.
+   */
+  const [retry, setRetry] = useState<{ file: File; epoch: ReturnType<typeof accountEpoch> } | null>(null);
+  const retryable = retry !== null && sameAccount(retry.epoch) ? retry.file : null;
 
   const onFile = async (file: File | undefined) => {
     if (!file) return;
     const then = accountEpoch();
-    setBusy(true);
+    setPhase("uploading");
     setProblem(null);
-    const outcome = await uploadAvatar(file);
+    setRetry(null);
+    const outcome = await uploadAvatar(file, undefined, () => {
+      if (sameAccount(then)) setPhase("checking");
+    });
     // Another account by now: nothing of this upload is shown or cached for it.
     if (!sameAccount(then)) return;
-    setBusy(false);
+    setPhase("idle");
     if (outcome === "ok") {
       toast({ message: t("profile.avatar.done"), key: "avatar" });
       await queryClient.invalidateQueries({ queryKey: profileQuery.queryKey });
@@ -76,6 +88,7 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
     }
     // The initials stay: nothing became the avatar.
     setProblem(t(AVATAR_TEXT[outcome]));
+    if (outcome === "scanner_starting") setRetry({ file, epoch: then });
   };
 
   return (
@@ -108,7 +121,11 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
       <Box sx={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: "1 1 240px" }}>
         <Box>
           <Button variant="outlined" onClick={() => input.current?.click()} disabled={busy}>
-            {busy ? t("profile.avatar.uploading") : t("profile.avatar.change")}
+            {phase === "checking"
+              ? t("profile.avatar.checking")
+              : phase === "uploading"
+                ? t("profile.avatar.uploading")
+                : t("profile.avatar.change")}
           </Button>
           <input
             ref={input}
@@ -125,7 +142,22 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
           />
         </Box>
         <Note>{t("profile.avatar.help")}</Note>
+        <StatusLine tone="ok">{phase === "checking" ? t("profile.avatar.checkingHelp") : null}</StatusLine>
         <StatusLine tone="error">{problem}</StatusLine>
+        {retryable && !busy ? (
+          <Box>
+            <Button
+              variant="outlined"
+              data-avatar-retry
+              onClick={() => {
+                if (retry && sameAccount(retry.epoch)) void onFile(retry.file);
+                else setRetry(null);
+              }}
+            >
+              {t("profile.avatar.tryAgain")}
+            </Button>
+          </Box>
+        ) : null}
       </Box>
     </Box>
   );

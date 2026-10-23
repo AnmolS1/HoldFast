@@ -47,7 +47,7 @@ describe("error envelope", () => {
 
   it("every code answers its status with { error, message, requestId, details }", async () => {
     const codes = Object.keys(ERROR_STATUS) as ErrorCode[];
-    expect(codes).toHaveLength(21);
+    expect(codes).toHaveLength(22);
     for (const code of codes) {
       const { response, ctx } = await call(app(), `/api/_err/${code}`);
       expect(response.status, code).toBe(ERROR_STATUS[code]);

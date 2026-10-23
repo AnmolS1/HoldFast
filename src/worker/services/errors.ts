@@ -53,6 +53,7 @@ const DEFAULT_MESSAGE: Record<ErrorCode, string> = {
   link_paused: "This link is not available right now.",
   read_only: "Holdfast is read-only right now.",
   feature_disabled: "This feature is switched off right now.",
+  scanner_starting: "The virus scanner is starting up. Try again in a minute.",
 };
 
 export class AppError extends Error {

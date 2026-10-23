@@ -45,6 +45,7 @@
 // ONE AVATAR PER USER: the transaction that makes an avatar current removes the others (a held
 // one stays), so avatars — which never count against the quota — cannot pile up.
 
+import * as Sentry from "@sentry/cloudflare";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import {
   AVATAR_MAX_BYTES,
@@ -105,7 +106,13 @@ import * as quotaRows from "../db/queries/quota";
 import * as quota from "../services/quota";
 import { db, deps, type AppEnv, type ServiceDeps } from "../services/request-context";
 import { adminListOf } from "../services/signup-policy";
-import { enqueueScan, lockSuspectedCsam, scanSmallObject, type ScanVerdict } from "../services/scanning";
+import {
+  enqueueScan,
+  lockSuspectedCsam,
+  ScannerStartingError,
+  scanSmallObject,
+  type ScanVerdict,
+} from "../services/scanning";
 import { avatarKey, keyFor, storage, thumbKey, type Storage, type UploadedPart } from "../services/storage";
 import { addStrike, type StrikeResult } from "../services/strikes";
 import { sealIp } from "../services/tokens";
@@ -1092,7 +1099,9 @@ function nodeValues(
 
 /**
  * The avatar path: no notification is sent for a key outside `u/`, so the object is read back
- * (at most AVATAR_MAX_BYTES) and scanned here, and the node is written with its verdict.
+ * (at most AVATAR_MAX_BYTES) and scanned here, and the node is written with its verdict. A scanner
+ * that is starting or busy is waited out inside `scanSmallObject` (up to SMALL_SCAN_WAIT_MS); past
+ * that it throws `ScannerStartingError`, which complete answers as `scannerStarting`.
  */
 async function avatarVerdict(
   store: Storage,
@@ -1104,6 +1113,18 @@ async function avatarVerdict(
   const bytes = new Uint8Array(await read.object.arrayBuffer());
   const verdict = await scanSmallObject(env, bytes);
   return { verdict, mimeSniffed: await sniff(bytes.subarray(0, SNIFF_PREFIX_BYTES), session.name) };
+}
+
+/**
+ * The scanner was still starting when the avatar's wait ran out: `503 scanner_starting` with its
+ * Retry-After. Expected weather, not a fault — one warning-level event, never an exception.
+ */
+function scannerStarting(error: ScannerStartingError): AppError {
+  Sentry.captureMessage(`avatar scan gave up: scanner ${error.reason}`, "warning");
+  metric("scan", { outcome: "small_gave_up", reason: error.reason });
+  return new AppError("scanner_starting", undefined, undefined, {
+    "Retry-After": String(Math.max(error.retryAfter, 1)),
+  });
 }
 
 /**
@@ -1515,7 +1536,16 @@ router.post(`/uploads/${ID}/complete`, verified, uploadsOn, async (c) => {
     if (hit) csamSource = "system";
 
     if (avatar && !csamSource) {
-      const { verdict, mimeSniffed } = await avatarVerdict(store, c.env, session);
+      let read: Awaited<ReturnType<typeof avatarVerdict>>;
+      try {
+        read = await avatarVerdict(store, c.env, session);
+      } catch (error) {
+        if (!(error instanceof ScannerStartingError)) throw error;
+        // Nothing was scanned: nothing is kept. "Try again" is a new upload.
+        await giveUp("scanner_starting");
+        throw scannerStarting(error);
+      }
+      const { verdict, mimeSniffed } = read;
       // An avatar is a picture the image service takes — decided from the bytes, not the declared
       // type. Anything else is not stored at all.
       if (!thumbEligible({ mimeSniffed, size: session.size, scanStatus: "clean" })) {
