@@ -93,7 +93,8 @@ test.describe("app origin", () => {
   }) => {
     // An address of this run only, so neither another test nor the previous run shares its buckets.
     const octet = () => 1 + Math.floor(Math.random() * 254);
-    const headers = { "cf-connecting-ip": `10.${octet()}.${octet()}.${octet()}` };
+    const freshAddress = () => ({ "cf-connecting-ip": `10.${octet()}.${octet()}.${octet()}` });
+    let headers = freshAddress();
 
     // Empty the address's auth bucket with credential POSTs. 20 are let through to the auth
     // handler; allow for the limiter's minute rolling over part-way. `/verify-password` with no
@@ -116,7 +117,13 @@ test.describe("app origin", () => {
           data: { password: "correct horse battery staple 9!" },
         });
         if (answer.status() === 429) {
-          expect(await answer.json()).toMatchObject({ error: "rate_limited" });
+          const body = (await answer.json()) as { error?: string; message?: string };
+          // Better Auth's own limit on this path (30 a minute, `{ message }`) can answer first when a
+          // minute boundary stretched our drain past 30 (CI 5de4095): that run proves nothing about
+          // ours, so it is started again on a fresh address — once (see below).
+          if (body.error === undefined && typeof body.message === "string")
+            return { betterAuthFirst: true as const };
+          expect(body).toMatchObject({ error: "rate_limited" });
           refusedAfter = attempt;
           refusedIn = window();
         } else {
@@ -130,16 +137,25 @@ test.describe("app origin", () => {
       });
       return { signIn, sameWindow: window() === refusedIn };
     };
+    const drain = async () => {
+      const first = await drainThenSignIn();
+      if (!("betterAuthFirst" in first)) return first;
+      headers = freshAddress();
+      const again = await drainThenSignIn();
+      if ("betterAuthFirst" in again)
+        throw new Error("Better Auth's own limit answered first twice: two boundaries in two drains");
+      return again;
+    };
 
     // The ruling's own words — a SIGN-IN attempt from that address is refused too, and by the
     // pipeline's limiter, not Better Auth's: ours answers with the app's envelope
     // (`error: "rate_limited"`, a request id, Retry-After: 60); Better Auth's own 5-a-minute rule
     // on this path answers `{ message }` with no `error` and an X-Retry-After header.
-    let { signIn, sameWindow } = await drainThenSignIn();
+    let { signIn, sameWindow } = await drain();
     // NOT a retry of the assertion: when a minute boundary fell between the refusal and the sign-in,
     // the sign-in met a fresh bucket — the PRECONDITION (an empty bucket) no longer held. Draining
     // once more restores it; the assertion below is made once, on that attempt (T28 Addendum 3).
-    if (!sameWindow && signIn.status() !== 429) ({ signIn, sameWindow } = await drainThenSignIn());
+    if (!sameWindow && signIn.status() !== 429) ({ signIn, sameWindow } = await drain());
     expect(signIn.status(), sameWindow ? "in the refusal's window" : "after a minute boundary").toBe(429);
     const refusal = (await signIn.json()) as { error?: string; requestId?: string };
     expect(refusal.error).toBe("rate_limited");
