@@ -11,7 +11,7 @@ import { usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions } from "./errors";
-import { AuthCard, Field, FormError, FormNotice, TurnstileBox } from "./parts";
+import { AuthCard, DemoAssent, Field, FormError, FormNotice, TurnstileBox } from "./parts";
 import { isEmail, isThirteenOrOlder, parseBirth, PASSWORD_MAX, PASSWORD_MIN, storedForm } from "./validation";
 
 const backSx = {
@@ -252,7 +252,15 @@ export function SetPasswordPage() {
   const [birthMonth, setBirthMonth] = useState("");
   const [birthYear, setBirthYear] = useState("");
   const [acceptTerms, setAcceptTerms] = useState(false);
-  const [errors, setErrors] = useState<{ password?: string; birth?: string; assent?: string }>({});
+  // The closed test: the notice must be accepted by the person confirming (the server refuses without it).
+  const demoMode = config?.demoMode === true;
+  const [acceptDemo, setAcceptDemo] = useState(false);
+  const [errors, setErrors] = useState<{
+    password?: string;
+    birth?: string;
+    assent?: string;
+    demo?: string;
+  }>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [invalid, setInvalid] = useState(false);
   const [unset, setUnset] = useState(false);
@@ -269,6 +277,7 @@ export function SetPasswordPage() {
     if (!birth) found.birth = t("signup.error.birth");
     else if (!isThirteenOrOlder(birth.year, birth.month)) found.birth = t("signup.error.age");
     if (!acceptTerms) found.assent = t("signup.error.assent");
+    if (demoMode && !acceptDemo) found.demo = t("signup.error.demo");
     setErrors(found);
     if (Object.keys(found).length > 0 || !birth) return;
     if (config?.turnstileSiteKey && !turnstile.token) {
@@ -285,6 +294,7 @@ export function SetPasswordPage() {
           birthYear: birth.year,
           birthMonth: birth.month,
           acceptTerms: true,
+          ...(demoMode ? { acceptDemo: true } : {}),
         },
         ...captchaOptions(turnstile.token),
       });
@@ -406,6 +416,7 @@ export function SetPasswordPage() {
             </Box>
             {errors.assent ? <FormError>{errors.assent}</FormError> : null}
           </Box>
+          {demoMode ? <DemoAssent checked={acceptDemo} onChange={setAcceptDemo} error={errors.demo} /> : null}
           {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
           <FormError>{formError}</FormError>
           <Button type="submit" variant="contained" size="large" disabled={busy}>

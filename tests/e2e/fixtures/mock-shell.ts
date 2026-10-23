@@ -102,6 +102,7 @@ export async function mockShell(page: Page, port: number, options: MockShellOpti
     uploadsEnabled: true,
     linksEnabled: true,
     readOnly: false,
+    demoMode: false,
     sentryDsnWeb: null,
     sentryEnvironment: "test",
     release: "e2e",

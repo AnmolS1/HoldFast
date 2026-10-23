@@ -1,9 +1,9 @@
 // The public /dmca page (T29 §B.2), signed out, against the real server. Every test is `@prod-safe`
 // (ruling 2026-10-08): it creates nothing and signs in nowhere, so T28's remote read-only mode runs
-// it against a deploy. The agent-details test SKIPS, with its reason, while agent.ts still carries
-// the TODO_ sentinel — a HUMAN item of unknown date must not turn the suite red — and the gate runs
-// (HOLDFAST_E2E_FAIL_ON_SKIP=1, tests/e2e/fixtures/skip-reporter.ts) fail on that skip, so it can
-// never carry Gate B.
+// it against a deploy. While agent.ts still carries the TODO_ sentinel the page says the registration
+// is pending, and the agent-details test SKIPS, with its reason — a HUMAN item of unknown date must
+// not turn the suite red — and the gate runs (HOLDFAST_E2E_FAIL_ON_SKIP=1,
+// tests/e2e/fixtures/skip-reporter.ts) fail on that skip, so it can never carry Gate B.
 import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../src/shared/constants";
 import { AGENT, AGENT_FIELDS, agentHasSentinel, SENTINEL } from "../../src/client/features/dmca/agent";
 import { expect, expectNoA11yViolations, test } from "./fixtures";
@@ -55,6 +55,24 @@ test.describe("/dmca", () => {
     await expect(counter.getByRole("listitem")).toHaveCount(4);
     await expect(counter).toContainText(/consent to the jurisdiction/);
     await expect(counter).toContainText("not less than 10 and not more than 14 business days");
+  });
+
+  // Never skips, in either state (a skip fails the gate run): while the sentinel is in agent.ts the
+  // page says the registration is pending; at all times no sentinel reaches the served page —
+  // text or attribute (DEMONOTICE, 2026-10-22).
+  test("@prod-safe no sentinel on the page; registration pending while agent.ts has one", async ({
+    page,
+  }) => {
+    await openDmca(page);
+    const agent = page.getByRole("region", { name: "Designated agent" });
+    const pending = agent.getByText("Designated agent registration pending");
+    if (agentHasSentinel) {
+      await expect(pending).toBeVisible();
+      await expect(agent.getByRole("link")).toHaveCount(0);
+    } else {
+      await expect(pending).toHaveCount(0);
+    }
+    expect(await page.content()).not.toContain(SENTINEL);
   });
 
   test("@prod-safe the designated agent's details, exactly as registered", async ({ page }) => {

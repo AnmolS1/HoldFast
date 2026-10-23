@@ -35,7 +35,7 @@
 // token, verified once (auth/captcha.ts — this is our route, Better Auth's plugin never sees it);
 // and only then anything in the database, the MX lookup, or a mail.
 //
-// ── POST /api/account/confirm-email { token, newPassword, acceptTerms, birthYear, birthMonth } ──
+// ── POST /api/account/confirm-email { token, newPassword, acceptTerms, acceptDemo, birthYear, birthMonth } ──
 //
 // The step a verification link takes when it is opened anywhere but the sign-up browser
 // (auth/mailbox-proof.ts). The GET of the link changes nothing and lands on our set-password
@@ -87,11 +87,14 @@ import { AppError } from "../services/errors";
 import { enforceRateLimit } from "../services/ratelimit";
 import { auth, db, defer, deps, type AppEnv } from "../services/request-context";
 import {
+  demoAssent,
   emailProblem,
   parseStatement,
   SIGNUP_REFUSALS,
   SignupRefusal,
   takeAddressChange,
+  type DemoAssent,
+  type SignupStatement,
 } from "../services/signup-policy";
 
 export const router = new Hono<AppEnv>();
@@ -270,6 +273,8 @@ const ConfirmBody = z.object({
   token: z.string().min(1).max(2048),
   newPassword: z.string().min(PASSWORD_MIN).max(PASSWORD_MAX),
   acceptTerms: z.unknown(),
+  // Only sent while the closed-test notice is shown (public config `demoMode`).
+  acceptDemo: z.unknown().optional(),
   birthYear: z.unknown(),
   birthMonth: z.unknown(),
 });
@@ -296,8 +301,9 @@ router.post(
       // What costs nothing: the captcha header, the body, the statement, the token's signature.
       const captcha = captchaToken(c.req.raw);
       const body = ConfirmBody.parse(await jsonBody(c));
+      let statement: SignupStatement;
       try {
-        parseStatement(body, now(c));
+        statement = parseStatement(body, now(c));
       } catch (error) {
         if (error instanceof SignupRefusal) {
           throw new AppError("validation", error.message, { reason: error.code });
@@ -325,9 +331,20 @@ router.post(
 
       const at = now(c);
       const settings = await scope.settings();
+      // The closed-test notice, while it is shown: the prover's own assent (the creator's is not theirs).
+      let demo: DemoAssent;
+      try {
+        demo = demoAssent(settings, statement, at);
+      } catch (error) {
+        if (error instanceof SignupRefusal) {
+          throw new AppError("validation", error.message, { reason: error.code });
+        }
+        throw error;
+      }
       const userId = await confirmMailbox(scope, claims, {
         termsAcceptedAt: at,
         termsVersion: settings.termsVersion,
+        ...demo,
         ageVerifiedAt: at,
       });
       if (userId === null) {

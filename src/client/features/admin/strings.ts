@@ -258,6 +258,9 @@ export const messages = {
   "settings.uploadsEnabled": "Uploads",
   "settings.linksEnabled": "Public links",
   "settings.readOnly": "Read-only mode",
+  "settings.demoMode": "Closed-test notice at sign-up",
+  "settings.demoModeNote":
+    "While on, sign-up asks every new account to accept the closed-test notice (files may be deleted when the test ends). Turn it off at launch.",
   "settings.orphanDeleteEnabled": "Delete orphaned objects",
   "settings.orphanWarning":
     "This setting lives in the database, so a restore brings back the value it had then. The restore runbook turns the pause switch on first, then this off, and this on again last.",

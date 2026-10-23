@@ -38,6 +38,7 @@ export const CONFIG: PublicConfig = {
   uploadsEnabled: true,
   linksEnabled: true,
   readOnly: false,
+  demoMode: false,
   sentryDsnWeb: null,
   sentryEnvironment: "test",
   release: "test",

@@ -9,6 +9,8 @@ export const messages = {
 
   "dmca.agent.title": "Designated agent",
   "dmca.agent.lead": "Send notices and counter-notices to:",
+  // Shown instead of the details while agent.ts still carries the sentinel (agent.ts).
+  "dmca.agent.pending": "Designated agent registration pending.",
   "dmca.agent.name": "Name",
   "dmca.agent.address": "Address",
   "dmca.agent.phone": "Phone",

@@ -282,6 +282,12 @@ export const en = {
   "signup.assent.before": "I agree to the ",
   "signup.assent.and": " and ",
   "signup.assent.after": ".",
+  // The closed-test notice (public config `demoMode`). The address is the app's support mailbox
+  // (worker services/email.ts SUPPORT_EMAIL). Its version is the server's DEMO_NOTICE_VERSION
+  // (services/signup-policy.ts): change the two together.
+  "signup.demo.notice":
+    "Holdfast is in a closed test. Don't store anything important — files may be deleted when the test ends. Report problems to support@holdfast.ponderance.dev.",
+  "signup.demo.accept": "I understand",
   "signup.submit": "Create account",
   "signup.have": "Already have an account? Sign in",
   "signup.error.name": "Enter your name.",
@@ -292,6 +298,7 @@ export const en = {
   "signup.error.birth": "Enter the month (1–12) and a four-digit year.",
   "signup.error.age": "You need to be 13 or older to use Holdfast.",
   "signup.error.assent": "You need to accept the Terms and Privacy Policy.",
+  "signup.error.demo": "Accept the closed-test notice to continue.",
   "signup.error.inviteUsed":
     "This invite code isn't valid, or it has already been used. If you signed up with it before, check your email for the confirmation link — or sign in.",
 

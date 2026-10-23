@@ -60,6 +60,8 @@ async function unverified() {
 const RESET = {
   termsAcceptedAt: new Date(),
   termsVersion: "2026-10-01",
+  demoNoticeAcceptedAt: null,
+  demoNoticeVersion: null,
   ageVerifiedAt: new Date(),
   invitedBy: null,
   quotaBytes: 1,
@@ -81,7 +83,13 @@ describe("each function waits for the row it locks — and (the control) for no 
     expect(free.waiting).toBe(false);
   });
 
-  const STATEMENT = { termsAcceptedAt: new Date(), termsVersion: "2026-10", ageVerifiedAt: new Date() };
+  const STATEMENT = {
+    termsAcceptedAt: new Date(),
+    termsVersion: "2026-10",
+    demoNoticeAcceptedAt: null,
+    demoNoticeVersion: null,
+    ageVerifiedAt: new Date(),
+  };
   it("clearForMailboxProof locks the user row", async () => {
     const row = await unverified();
     const held = await whileHeld(holdUser(row.id), () =>

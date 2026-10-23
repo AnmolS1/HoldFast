@@ -70,6 +70,8 @@ export interface SignupValues {
   birthMonth: string;
   birthYear: string;
   acceptTerms: boolean;
+  /** The closed-test notice's checkbox; asked only while the public config's `demoMode` is on. */
+  acceptDemo?: boolean;
 }
 
 export type SignupField = keyof SignupValues | "birth";
@@ -90,7 +92,7 @@ export function parseBirth(
 /** The checks shared by email sign-up and the pre-OAuth intent step. */
 export function validateIntent(
   values: SignupValues,
-  options: { inviteRequired: boolean; now?: Date },
+  options: { inviteRequired: boolean; demoMode?: boolean; now?: Date },
 ): SignupErrors {
   const errors: SignupErrors = {};
   if (options.inviteRequired && values.inviteCode.trim() === "") errors.inviteCode = "signup.error.invite";
@@ -98,12 +100,13 @@ export function validateIntent(
   if (!birth) errors.birth = "signup.error.birth";
   else if (!isThirteenOrOlder(birth.year, birth.month, options.now)) errors.birth = "signup.error.age";
   if (!values.acceptTerms) errors.acceptTerms = "signup.error.assent";
+  if (options.demoMode && !values.acceptDemo) errors.acceptDemo = "signup.error.demo";
   return errors;
 }
 
 export function validateSignup(
   values: SignupValues,
-  options: { inviteRequired: boolean; now?: Date },
+  options: { inviteRequired: boolean; demoMode?: boolean; now?: Date },
 ): SignupErrors {
   const errors: SignupErrors = {};
   if (values.name.trim() === "") errors.name = "signup.error.name";

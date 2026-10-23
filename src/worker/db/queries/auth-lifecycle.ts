@@ -558,6 +558,9 @@ export type UnprovenReset = {
   /** What the person who now PROVES the address stated at the intent step. */
   termsAcceptedAt: Date;
   termsVersion: string;
+  /** The closed-test notice's assent (null: none was asked for). */
+  demoNoticeAcceptedAt: Date | null;
+  demoNoticeVersion: string | null;
   ageVerifiedAt: Date;
   invitedBy: string | null;
   quotaBytes: number;
@@ -624,6 +627,8 @@ export async function clearUnprovenAccount(
         role: "user",
         termsAcceptedAt: reset.termsAcceptedAt,
         termsVersion: reset.termsVersion,
+        demoNoticeAcceptedAt: reset.demoNoticeAcceptedAt,
+        demoNoticeVersion: reset.demoNoticeVersion,
         ageVerifiedAt: reset.ageVerifiedAt,
         invitedBy: reset.invitedBy,
         quotaBytes: reset.quotaBytes,
@@ -644,8 +649,8 @@ export async function clearUnprovenAccount(
  * a verification link, in a browser that did not create the account, confirmed it with a POST. Under the row lock and only while the account is
  * still unverified AND still at `email` (the address the link proves): every credential and
  * session, every passkey, two-factor secret and token is deleted, the profile its creator typed
- * is reset, and the address is marked verified — one transaction. The terms and age statement on
- * the row becomes `statement` — the PROVER's own, given with the confirmation — and the invite
+ * is reset, and the address is marked verified — one transaction. The terms and age statement
+ * (and the demo notice's assent) on the row becomes `statement` — the PROVER's own, given with the confirmation — and the invite
  * reference is cleared: what the row's creator stated is not what the owner stated. The quota
  * stays. Null when the row is not in that state: nothing is touched.
  */
@@ -653,7 +658,13 @@ export async function clearForMailboxProof(
   db: Executor,
   userId: string,
   email: string,
-  statement: { termsAcceptedAt: Date; termsVersion: string; ageVerifiedAt: Date },
+  statement: {
+    termsAcceptedAt: Date;
+    termsVersion: string;
+    demoNoticeAcceptedAt: Date | null;
+    demoNoticeVersion: string | null;
+    ageVerifiedAt: Date;
+  },
 ): Promise<{
   accounts: number;
   sessions: number;
@@ -689,6 +700,8 @@ export async function clearForMailboxProof(
         role: "user",
         termsAcceptedAt: statement.termsAcceptedAt,
         termsVersion: statement.termsVersion,
+        demoNoticeAcceptedAt: statement.demoNoticeAcceptedAt,
+        demoNoticeVersion: statement.demoNoticeVersion,
         ageVerifiedAt: statement.ageVerifiedAt,
         invitedBy: null,
       })

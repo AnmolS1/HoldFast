@@ -192,6 +192,7 @@ export const DEFAULT_ADMIN: Record<string, unknown> = {
       uploadsEnabled: true,
       linksEnabled: true,
       readOnly: false,
+      demoMode: false,
       orphanDeleteEnabled: true,
       ceilings: {},
       termsVersion: "2026-10",

@@ -39,6 +39,8 @@ export interface SignUpEmailInput {
   birthYear: number;
   birthMonth: number;
   acceptTerms: boolean;
+  /** Sent only while the closed-test notice is shown (public config `demoMode`). */
+  acceptDemo?: boolean;
   fetchOptions?: AuthFetchOptions;
 }
 

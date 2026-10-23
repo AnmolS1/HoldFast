@@ -1,13 +1,14 @@
 // POST /api/auth-intent — the step before "Continue with Google" on the sign-up screen.
 //
-// A Google sign-up cannot carry the invite code, the age check or the terms assent through
-// Google and back, so the sign-up screen states them here first. This route applies what can be
-// checked without an address — the kill switch, assent, age, and that the invite would admit a
-// sign-up (nothing is consumed) — and answers with a short-lived signed cookie (`hf_intent`,
-// auth/signed-cookie.ts). When Google's callback is about to create the account, the sign-up
-// policy reads that cookie, checks the address (allowed domains, disposable, velocity), uses the
-// invite and deletes the intent's single-use marker. Without the cookie a Google SIGN-UP is
-// refused; a Google sign-in of an existing account never needs it.
+// A Google sign-up cannot carry the invite code, the age check or the terms assent (in the closed
+// test also the demo notice's) through Google and back, so the sign-up screen states them here
+// first. This route applies what can be checked without an address — the kill switch, assent,
+// age, and that the invite would admit a sign-up (nothing is consumed) — and answers with a
+// short-lived signed cookie (`hf_intent`, auth/signed-cookie.ts). When Google's callback is about
+// to create the account, the sign-up policy reads that cookie, checks the address (allowed
+// domains, disposable, velocity), uses the invite and deletes the intent's single-use marker.
+// Without the cookie a Google SIGN-UP is refused; a Google sign-in of an existing account never
+// needs it.
 //
 // Paths are relative to /api. CSRF and RL_AUTH are applied by the pipeline.
 
@@ -40,7 +41,7 @@ router.post(
         country: typeof cf?.country === "string" ? cf.country : null,
         userAgent: c.req.header("user-agent") ?? null,
       });
-      const intent = await mintIntent(scope.keys, statement.inviteCode, at);
+      const intent = await mintIntent(scope.keys, statement.inviteCode, at, statement.acceptDemo);
       await insertIntent(scope.db, {
         id: generateId(),
         nonce: intent.nonce,

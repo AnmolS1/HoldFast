@@ -111,11 +111,75 @@ export function Field({
 }
 
 /** A form-level error, announced as it appears. */
-export function FormError({ children }: { children: ReactNode }) {
+export function FormError({ children, id }: { children: ReactNode; id?: string }) {
   if (!children) return null;
   return (
-    <Box role="alert" data-form-error sx={{ color: hf.danger, fontSize: 12, lineHeight: "16px" }}>
+    <Box role="alert" id={id} data-form-error sx={{ color: hf.danger, fontSize: 12, lineHeight: "16px" }}>
       {children}
+    </Box>
+  );
+}
+
+/**
+ * The closed-test notice and its checkbox (sign-up and set-password screens, while the public
+ * config's `demoMode` is on). The checkbox is described by the notice and, when it is in error,
+ * by the error too.
+ */
+export function DemoAssent({
+  checked,
+  onChange,
+  error,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  error?: string | null;
+}) {
+  const noticeId = useId();
+  const errorId = useId();
+  return (
+    <Box>
+      <Box
+        id={noticeId}
+        data-demo-notice
+        sx={{
+          border: `1px solid ${hf.hairline}`,
+          borderRadius: `${layout.radius.card}px`,
+          padding: "10px 12px",
+          marginBottom: 1,
+          fontSize: 12,
+          lineHeight: "16px",
+          color: hf.text,
+        }}
+      >
+        {t("signup.demo.notice")}
+      </Box>
+      <Box
+        component="label"
+        sx={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 2,
+          fontSize: 12,
+          lineHeight: "16px",
+          color: hf.textSecondary,
+          minHeight: 24,
+          cursor: "pointer",
+          "@media (max-width:1023.95px)": { minHeight: 44, alignItems: "center" },
+        }}
+      >
+        <Box
+          component="input"
+          type="checkbox"
+          name="acceptDemo"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          aria-describedby={error ? `${noticeId} ${errorId}` : noticeId}
+          aria-invalid={error ? true : undefined}
+          sx={{ width: 16, height: 16, margin: 0, flex: "none" }}
+        />
+        <span>{t("signup.demo.accept")}</span>
+      </Box>
+      {error ? <FormError id={errorId}>{error}</FormError> : null}
     </Box>
   );
 }
