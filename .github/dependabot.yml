@@ -1,9 +1,12 @@
 # The scanner image's base digests (containers/clamav/Dockerfile pins `tag@sha256`): a bump PR
 # when a tag moves, so ClamAV engine fixes are not frozen out by the pin (T20 review m5). Each PR
 # rebuilds the image, which runs the shim's Go tests.
+# Every PR targets `dev` (the working branch): `prod` is the default branch and deploys to the live
+# demo on push, so an update must pass dev's CI and be promoted dev → prod like any other change.
 version: 2
 updates:
   - package-ecosystem: docker
+    target-branch: dev
     directory: /containers/clamav
     schedule:
       interval: weekly
@@ -14,6 +17,7 @@ updates:
       prefix: "scanner image"
   # The app's dependencies (T26). Weekly; a PR per update, reviewed like any other change.
   - package-ecosystem: npm
+    target-branch: dev
     directory: /
     schedule:
       interval: weekly
@@ -21,6 +25,7 @@ updates:
       prefix: "deps"
   # Every workflow action is pinned by commit SHA: this keeps the pins moving.
   - package-ecosystem: github-actions
+    target-branch: dev
     directory: /
     schedule:
       interval: weekly
