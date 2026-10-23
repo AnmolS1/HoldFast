@@ -232,9 +232,13 @@ export function buildAuthOptions(scope: AuthScope) {
         // another address than the one that was vouched for. An address that is not printable
         // ASCII is dropped here (the callback then answers `email_not_found`); upper-case ASCII
         // letters are lower-cased, which changes no mailbox.
+        // `image: null`: the provider maps the profile's picture to `user.image` (social-providers/
+        // google.mjs), which nothing reads and the privacy text does not name (R1 legal-6).
         mapProfileToUser: (profile: { email?: unknown }) => {
           const address = typeof profile.email === "string" ? asciiLower(profile.email) : "";
-          return isStoredFormAddress(address) ? { email: address } : { email: "", emailVerified: false };
+          return isStoredFormAddress(address)
+            ? { email: address, image: null }
+            : { email: "", emailVerified: false, image: null };
         },
       },
     },

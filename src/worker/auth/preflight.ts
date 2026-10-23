@@ -116,7 +116,9 @@ export const PREFLIGHT: Readonly<Record<string, Spec>> = Object.freeze({
   },
   "/request-password-reset": { captcha: true, fields: { email, redirectTo: link } },
   "/send-verification-email": { captcha: true, fields: { email, callbackURL: link } },
-  "/update-user": { fields: { name: optional(personName) } },
+  // No `image`: `user.image` is never stored (nothing reads it; R1 secsrv-n4) — the profile
+  // picture is the avatar, uploaded and scanned like a file (routes/account.ts).
+  "/update-user": { fields: { name: optional(personName), image: (value) => value === undefined } },
   // `password`: the owner again (auth/mailbox-proof.ts `beforeChangeEmail`); absent for an
   // account that has none.
   "/change-email": {
