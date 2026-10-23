@@ -1,6 +1,7 @@
 # The gate every push goes through: the same five commands that are run by hand before a merge
 #   npm run typecheck && npm run lint && npm test && npm run build && npm run e2e
-# plus the two things a fresh runner needs first (a migrated Postgres and a .dev.vars).
+# plus the two things a fresh runner needs first (a migrated Postgres and a .dev.vars), and the
+# bundle budget on the build.
 #
 # This workflow holds NO secret and must stay that way: it runs for pull requests, including ones
 # from forks. Deploying is deploy-dev.yml / deploy-prod.yml, which call this file and deploy only
@@ -138,8 +139,10 @@ jobs:
             if (r.numTotalTests !== expected || r.numPassedTests !== expected) process.exit(1);
           '
 
+      # `--manifest` only adds dist/client/.vite/manifest.json, which the budget step reads. This
+      # build is never deployed (each deploy workflow builds its own).
       - name: Build
-        run: npm run build
+        run: npm run build -- --manifest
 
       - name: The build is a dev build
         run: bash .github/workflows/lib/deploy-lib.sh built-env dev
@@ -150,6 +153,12 @@ jobs:
       # both evaluated at start-up, the pre-seed first, and no lazy chunk brings in either.
       - name: C2 static guards on the built Worker
         run: node scripts/c2-abort-test.mjs --static
+
+      # The bundle budget against the real build (R1 perfops-7): the main bundle — the entry and
+      # every chunk it imports statically — at most 350 kB gzip, and the admin console and pdf.js
+      # lazy. Node 24 runs the TypeScript file directly; nothing is downloaded.
+      - name: Bundle budget
+        run: node scripts/lhci/budgets.ts dist/client
 
       - name: Install the Playwright browser
         run: npx playwright install --with-deps chromium chromium-headless-shell
