@@ -191,11 +191,11 @@ describe("the dead-letter table", () => {
     expect(dlqMetrics()).toEqual(["timeout"]);
   });
 
-  it("not_ready and busy map to engine; no job at all → engine", async () => {
+  it("not_ready re-sent once already stays pending (R1 m17, safety-5: the scanner's state, never a file's); no job at all → engine", async () => {
     const a = await uploadedFile(cleanBytes());
-    await jobIn(a.file, { status: "failed", lastError: "not_ready" });
+    await jobIn(a.file, { status: "failed", lastError: "not_ready", verdict: { requeuedFromDlq: true } });
     await deliver([{ body: explicit(a.file) }], {}, DLQ);
-    expect((await nodeById(a.file.id))!.scanReason).toBe("engine");
+    expect(await nodeById(a.file.id)).toMatchObject({ scanStatus: "pending", scanReason: null });
     const b = await uploadedFile(cleanBytes());
     await deliver([{ body: explicit(b.file) }], {}, DLQ);
     expect((await nodeById(b.file.id))!.scanReason).toBe("engine");
@@ -219,8 +219,11 @@ describe("the dead-letter table", () => {
   });
 });
 
-describe("acceptance: not_ready leaves the node pending, retries with backoff, and after the DLQ it is error — never clean", () => {
-  it("every delivery up to max_retries, then the dead letter", async () => {
+// R1 m17 (safety-5, triage P5): the acceptance was "after the DLQ it is error"; a scanner outage
+// longer than the retries then left every upload made during it `error`/`engine` for good, with no
+// blocklist check. Now: re-sent once like `busy`, then left `pending` for the hourly sweep.
+describe("acceptance: not_ready leaves the node pending, retries with backoff, and after the DLQ it is STILL pending — never clean, never error", () => {
+  it("every delivery up to max_retries, then the dead letter (re-sent once), then the second dead letter", async () => {
     const { file } = await uploadedFile(enc("HF-STUB-NOT-READY — the scanner never becomes ready"));
     for (let attempts = 1; attempts <= SCAN_MAX_RETRIES + 1; attempts++) {
       expect(await deliver([{ body: explicit(file), attempts }])).toEqual([
@@ -229,8 +232,16 @@ describe("acceptance: not_ready leaves the node pending, retries with backoff, a
       expect((await nodeById(file.id))!.scanStatus).toBe("pending");
     }
     expect(await deliver([{ body: explicit(file) }], {}, DLQ)).toEqual(ack);
+    expect(dlqMetrics()).toEqual(["requeued"]);
+    expect((await nodeById(file.id))!.scanStatus).toBe("pending");
+    // The re-sent message is not ready through every retry too.
+    expect(await deliver([{ body: explicit(file), attempts: SCAN_MAX_RETRIES + 1 }])).toEqual([
+      { outcome: "retry", delaySeconds: Math.max(backoff(SCAN_MAX_RETRIES + 1), 30) },
+    ]);
+    expect(await deliver([{ body: explicit(file) }], {}, DLQ)).toEqual(ack);
+    expect(dlqMetrics()).toEqual(["requeued", "scanner_not_ready"]);
     const row = (await nodeById(file.id))!;
-    expect(row).toMatchObject({ scanStatus: "error", scanReason: "engine" });
-    expect(row.scanStatus).not.toBe("clean");
+    expect(row).toMatchObject({ scanStatus: "pending", scanReason: null });
+    expect(sentryCalls()).toBe(0);
   });
 });

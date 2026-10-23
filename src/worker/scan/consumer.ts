@@ -21,7 +21,9 @@
 //  h. Ack only after the verdict's transaction has committed and its after-commit work is done.
 //
 // FAILURES — the job is finished `failed` first, so the redelivery reclaims at once:
-//   ScannerNotReadyError                     not_ready   retry(max(backoff, Retry-After))
+//   ScannerNotReadyError                     not_ready   retry(max(backoff, Retry-After)) — a container
+//                                                         still loading clamd is first waited out IN the
+//                                                         delivery (below)
 //   ScannerBusyError                         busy        retry(max(backoff, Retry-After))
 //   ScannerTransportError, cause "Durable    reset       retry(backoff) — a deploy; never why a file
 //     Object reset because its code was                   ends `error` (the DLQ re-sends it once)
@@ -33,6 +35,14 @@
 // all, deliberately longer than the 20-minute claim takeover (`SCAN_CLAIM_STALE_MINUTES`): a
 // message is still being retried when a dead claim becomes claimable. A unit test holds the
 // inequality.
+// A COLD START is not left to that ladder (R1 m17: it made a cold verdict ≈ 2.6 min): a delivery
+// whose message is younger than `SCANNER_COLD_WINDOW_MS` and that is answered `not_ready` with
+// clamd still LOADING asks the instance's health every `SCANNER_WAIT_POLL_MS`, for at most
+// `SCANNER_WAIT_MS`, and scans again — the object read again — once it is ready. Anything else (stale
+// signatures, busy, a health call that fails, the wait run out) is the retry above. No keep-warm.
+// An UNEXPECTED failure (not the scanner's weather) goes to Sentry on a message's first delivery
+// only; the dead letter reports it again (perfops-10: one database outage must not use up the
+// quota that also carries the operator alerts). Every retry is still a metric.
 //
 // THE DEAD-LETTER QUEUE (same Worker, per message):
 //   no node for the key, an OWED PhotoDNA    preserved / recorded (`preserveDetection`); metric
@@ -43,8 +53,13 @@
 //   the node's VERIFIED hash listed csam     the CSAM lock (`lockSuspectedCsam`, source system),
 //     (`scannedAt` set)                        metric dlq/csam_locked; ack — never `error`. A lock
 //                                              that fails: retried, the node left as it is
-//   job `failed` with `reset` or `busy`,     re-send once (`enqueueScan`, forced), mark the job
-//     node still `pending`, not re-sent yet    `requeuedFromDlq`; ack — no `error`, no Sentry error
+//   job `failed` with `reset`, `busy` or     re-send once (`enqueueScan`, forced), mark the job
+//     `not_ready`, node still `pending`, not   `requeuedFromDlq`; ack — no `error`, no Sentry error
+//     re-sent yet
+//   job `failed` with `not_ready`, node      LEFT `pending` (safety-5: the scanner's state is never a
+//     still `pending`, re-sent already         file's verdict) — the hourly pending-scan sweep sends it
+//                                              again once the scanner is back; metric
+//                                              dlq/scanner_not_ready; no Sentry error; ack
 //   anything else (failed, stale, no job)    job → failed; node, if still `pending` on this key and
 //                                            not taken down → `error`/`timeout`|`engine`; Sentry
 //                                            error tagged with the key; ack
@@ -85,6 +100,7 @@ import {
   getScanner,
   lockSuspectedCsam,
   normalizeScanMessage,
+  stubEnabled,
   type ScanMessage,
   type ScanVerdict,
 } from "../services/scanning";
@@ -92,10 +108,12 @@ import { keyFor, storage } from "../services/storage";
 import { adminListOf } from "../services/signup-policy";
 import { enforceStrikeThreshold } from "../services/strikes";
 import {
+  preferredInstance,
   SCAN_MAX_BYTES,
   ScannerBusyError,
   ScannerNotReadyError,
   ScannerRefusedError,
+  scannerHealth,
   ScannerTransportError,
 } from "./container";
 import { checkPhotoDna, PhotoDnaTransientError } from "./photodna";
@@ -129,6 +147,43 @@ export function backoff(attempts: number): number {
 }
 
 type Claimed = Extract<ClaimResult, { claimed: true }>;
+
+/**
+ * A delivery is waited out in a cold start only while its message is this young: past it, `not_ready`
+ * is an outage (or a scanner stuck loading), and the queue's ladder — with the `scanner_down` alert
+ * at `SCANNER_STUCK_MS` — is the answer.
+ */
+export const SCANNER_COLD_WINDOW_MS = 5 * 60_000;
+/**
+ * The longest a delivery waits for clamd to load. A cold container is ready in ≈ 20–70 s (T20,
+ * AVWARM); far inside the 20-minute claim takeover and the consumer's wall time.
+ */
+export const SCANNER_WAIT_MS = 150_000;
+/** How often the instance's health is asked during that wait. */
+export const SCANNER_WAIT_POLL_MS = 5_000;
+
+/** Test seam: the wait's clock, and the health question (the key's preferred instance). */
+export const scannerWait = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  ready: async (env: Env, key: string): Promise<boolean> =>
+    (await scannerHealth(env, preferredInstance(key))).ready,
+};
+
+/** True once the instance says it is ready, within `SCANNER_WAIT_MS`; false when the wait runs out or health fails. */
+async function readyWithin(env: Env, key: string): Promise<boolean> {
+  const deadline = scannerWait.now() + SCANNER_WAIT_MS;
+  for (;;) {
+    try {
+      if (await scannerWait.ready(env, key)) return true;
+    } catch {
+      return false;
+    }
+    const left = deadline - scannerWait.now();
+    if (left <= 0) return false;
+    await scannerWait.sleep(Math.min(SCANNER_WAIT_POLL_MS, left));
+  }
+}
 
 /** The `lastError` codes of step e; anything else is a message, reported as `failed`. */
 const RETRY_REASONS = new Set(["not_ready", "busy", "reset", "timeout", "engine", "photodna"]);
@@ -213,10 +268,29 @@ async function scanClaimed(
       engine: "none",
     };
   } else {
-    const read = await store.get(scan.key);
-    if (read?.kind !== "body") throw new Error("scan: the object is gone");
-    // The R2 body itself — the runtime sets its length from it (spike S9); never re-wrapped.
-    verdict = await getScanner(env).scanStream(read.object.body, { key: scan.key, size: read.object.size });
+    const scanOnce = async () => {
+      // Read for each attempt: an attempt spends its body.
+      const read = await store.get(scan.key);
+      if (read?.kind !== "body") throw new Error("scan: the object is gone");
+      // The R2 body itself — the runtime sets its length from it (spike S9); never re-wrapped.
+      return getScanner(env).scanStream(read.object.body, { key: scan.key, size: read.object.size });
+    };
+    try {
+      verdict = await scanOnce();
+    } catch (error) {
+      // A cold start (see the header): clamd loading, the message young, a real scanner (the stub
+      // has no health). Not ready after the wait — or anything else — is the queue's retry.
+      if (
+        !(error instanceof ScannerNotReadyError) ||
+        error.reason !== "clamd_loading" ||
+        stubEnabled(env) ||
+        Date.now() - message.timestamp.getTime() >= SCANNER_COLD_WINDOW_MS ||
+        !(await readyWithin(env, scan.key))
+      ) {
+        throw error;
+      }
+      verdict = await scanOnce();
+    }
     if (verdict.status === "error")
       throw new VerdictError(verdict.reason === "timeout" ? "timeout" : "engine");
     // A verdict without the server's hash is not one this pipeline can stand on.
@@ -601,12 +675,12 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
       outcome: "retry",
       reason: RETRY_REASONS.has(failure.error) ? failure.error : "failed",
     });
-    // An unexpected failure is reported; the scanner's own states are the normal weather.
-    if (!(
-      error instanceof ScannerNotReadyError ||
-      error instanceof ScannerBusyError ||
-      isDeployReset(error)
-    )) {
+    // An unexpected failure is reported — once, on the message's first delivery (the dead letter
+    // reports it again); the scanner's own states are the normal weather.
+    if (
+      !(error instanceof ScannerNotReadyError || error instanceof ScannerBusyError || isDeployReset(error)) &&
+      firstDelivery(message)
+    ) {
       captureError(error, { kind: "scan" });
     }
     // Best effort: a failed row is claimable at once by the redelivery.
@@ -626,8 +700,11 @@ async function handle(message: Message<unknown>, env: Env, bg: BackgroundContext
 
 // ── the dead-letter queue ───────────────────────────────────────────────────────────────────
 
-/** The last errors that are a deploy or a capacity wall: re-sent once, never `error`. */
-const REQUEUED_ERRORS = new Set(["reset", "busy"]);
+/** The last errors that are a deploy, a capacity wall or a scanner not ready: re-sent once, never `error`. */
+const REQUEUED_ERRORS = new Set(["reset", "busy", "not_ready"]);
+
+/** Sentry hears of an unexpected failure on a message's first delivery only (perfops-10). */
+const firstDelivery = (message: Message<unknown>) => message.attempts <= 1;
 
 async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext): Promise<void> {
   const scan = normalizeScanMessage(message.body);
@@ -688,6 +765,17 @@ async function handleDeadLetter(message: Message<unknown>, bg: BackgroundContext
     await markRequeuedFromDlq(bg.db, job.id);
     await enqueueScan(bg, { nodeId: node.id, key: scan.key, force: true });
     bg.metric("scan", { outcome: "dlq", reason: "requeued" });
+    message.ack();
+    return;
+  }
+  // The scanner was not ready through every retry, twice (safety-5): an outage, never this file's
+  // verdict. The node stays `pending` — served to nobody — and the hourly pending-scan sweep sends
+  // it again once the scanner is back (its owner or an operator may rescan it too). The alert is
+  // the scanner's.
+  if (job?.status === "failed" && job.lastError === "not_ready" && node.scanStatus === "pending") {
+    await failJob(bg.db, job.id, "not_ready");
+    bg.metric("scan", { outcome: "dlq", reason: "scanner_not_ready" });
+    await scannerError(bg, { health: true });
     message.ack();
     return;
   }
@@ -861,8 +949,9 @@ export async function queue(
       if (deadLetters) await handleDeadLetter(message, bg);
       else await handle(message, env, bg);
     } catch (error) {
-      // Before the claim (a database error, say): nothing to mark, try again.
-      captureError(error, { kind: "scan" });
+      // Before the claim (a database error, say): nothing to mark, try again. Reported on the
+      // first delivery only, as above.
+      if (firstDelivery(message)) captureError(error, { kind: "scan" });
       message.retry({ delaySeconds: deadLetters ? DLQ_RUNNING_RETRY_SEC : backoff(message.attempts) });
     }
   }
