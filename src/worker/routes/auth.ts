@@ -145,7 +145,7 @@ router.all(
     if (method === "GET" && relativePath === DELETION_CALLBACK) {
       const viewer = c.get("user")?.id ?? null;
       if (viewer === null) return c.redirect(`${c.env.APP_ORIGIN}${DELETION_SIGN_IN}`, 302);
-      const token = new URL(request.url).searchParams.get("token") ?? "";
+      const token = c.req.query("token") ?? "";
       const owner = token ? await deletionTokenOwner(db(c), token) : null;
       if (owner !== null && owner !== viewer) {
         return c.redirect(`${c.env.APP_ORIGIN}${DELETION_OTHER_ACCOUNT}`, 302);
