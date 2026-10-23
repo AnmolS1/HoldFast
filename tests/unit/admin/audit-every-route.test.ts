@@ -110,6 +110,14 @@ const scenarios: Record<string, Scenario> = {
     });
     return { answer, targetId: file.id, action: "admin.false_positive" };
   },
+  "POST /admin/quarantine/:nodeId/legal-hold": async (who) => {
+    const owner = await member();
+    const folder = await makeFolder(owner.id);
+    const answer = await adminCall(who.as, "POST", `/quarantine/${folder.id}/legal-hold`, {
+      body: { held: true, note: "Lawsuit: notice 1." },
+    });
+    return { answer, targetId: folder.id, action: "admin.node_legal_hold_set" };
+  },
   "POST /admin/kept-uploads/:uploadId/resolve": async (who) => {
     const owner = await member();
     const nodeId = uuidv7();

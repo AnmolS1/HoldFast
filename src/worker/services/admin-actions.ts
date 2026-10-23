@@ -1024,6 +1024,159 @@ async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause
   return [...found];
 }
 
+// ── the console's takedown, restore and node legal hold (safety-4, R1 ruling Q9) ───────────
+//
+// For ANY file or folder, not only a quarantine member. ONE transaction each, in the moderation
+// lock order: the owner's TREE LOCK, then the node's row — every check is made on that row, and
+// every refusal is thrown before the first write — then the T05 helper (it takes the same tree
+// lock again: re-entrant), the links, the blocklist entry. Audited after the commit. Nothing here
+// deletes an object.
+
+/** "Any notice": `otherActiveNoticeNames` excludes the one id it is given — this is no notice's. */
+const ANY_NOTICE = "00000000-0000-0000-0000-000000000000";
+
+/** The node to act on, or 404 (unknown, malformed, a system node). */
+async function consoleNode(c: C, nodeId: string): Promise<Node> {
+  const node = await adminQ.nodeRow(db(c), nodeId);
+  if (!node || node.system !== null) throw new AppError("not_found");
+  return node;
+}
+
+/**
+ * Take down a file or a folder — hidden from its owner and every partner and visitor, every link
+ * in its subtree paused `moderation` (paused, never revoked). Reason `admin`; `csam` (a FOLDER
+ * only) also puts it on legal hold, and so everything under it (T05 `takedownNode`). A FILE
+ * suspected as CSAM is LOCKED instead — that holds its owner and uploaders and opens the case —
+ * so a csam takedown of a file is `409 use_lock`. Already down: `409 already_taken_down`.
+ */
+export async function takedownByAdmin(c: C, admin: Admin, nodeId: string, reason: string, csam: boolean) {
+  const node = await consoleNode(c, nodeId);
+  if (csam && node.kind !== "folder") {
+    throw conflict(
+      "use_lock",
+      {},
+      "A file suspected as CSAM is locked (Lock from a notice), not taken down.",
+    );
+  }
+  const row = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const locked = await adminQ.lockNodeRow(tx, nodeId);
+    if (!locked) throw new AppError("not_found");
+    if (locked.takedownAt !== null) throw new AppError("already_taken_down");
+    await takedownNode(tx, nodeId, { reason: csam ? "csam" : "admin", by: admin.id });
+    await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
+    return (await adminQ.nodeRow(tx, nodeId))!;
+  });
+  audit(c, "admin.takedown", { type: "node", id: nodeId }, { reason, csam, kind: node.kind });
+  return row;
+}
+
+/**
+ * Restore a takedown that is not a copyright notice's: an abuse report's, an admin's, the
+ * scanner's for a `dmca`/`admin` blocklist hit, a csam one (a folder's) once its hold is cleared.
+ * Refused, nothing written:
+ *   - `409 not_taken_down`;
+ *   - `409 dmca_restore_only` — a notice's own takedown, or a node any notice still holds a
+ *     takedown on (`otherActiveNoticeNames`: also one that found it already down, and an upheld or
+ *     closed one): only the notice's restore lifts it, inside its window;
+ *   - `409 held` — a csam takedown whose legal hold is still set ("Clear legal hold" first).
+ * The scanner's takedown for a blocklist hit also REMOVES that entry (ruling Q9) — the node's
+ * verified hash, only while its reason is still the takedown's (a raised or confirmed csam entry
+ * is never touched), and `409 dmca_restore_only` while a notice in force names that content.
+ * Then the subtree's `moderation` pause is lifted (kept where something else still hides a node).
+ * After the commit: audited; a node left `pending` is scanned. An abuse takedown issued no strike
+ * (a report is actioned by a takedown OR a strike): the node's unlifted report strikes are
+ * RETURNED for the console to offer "Lift strike" — nothing is lifted here.
+ */
+export async function restoreByAdmin(c: C, nodeId: string, reason: string) {
+  const node = await consoleNode(c, nodeId);
+  const done = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const row = await adminQ.lockNodeRow(tx, nodeId);
+    if (!row) throw new AppError("not_found");
+    if (row.takedownAt === null) throw new AppError("not_taken_down");
+    const noticeTakedown = row.takedownReason === "dmca" && row.takedownBy !== null;
+    if (noticeTakedown || (await adminQ.otherActiveNoticeNames(tx, ANY_NOTICE, { nodeId }))) {
+      throw new AppError("dmca_restore_only");
+    }
+    if (row.takedownReason === "csam" && row.legalHold) {
+      throw conflict("held", {}, "The takedown keeps a legal hold: clear the legal hold first.");
+    }
+    const hit =
+      row.takedownBy === null && (row.takedownReason === "dmca" || row.takedownReason === "admin")
+        ? row.takedownReason
+        : null;
+    const sha256 = verifiedSha256(row);
+    let listed: string | null = null;
+    if (hit && sha256 && (await blocklist.lookup(tx, sha256))?.reason === hit) {
+      if (await adminQ.otherActiveNoticeNames(tx, ANY_NOTICE, { sha256 }))
+        throw new AppError("dmca_restore_only");
+      listed = sha256;
+    }
+    await restoreTakedown(tx, nodeId);
+    await unpauseLinks(tx, { subtreeOf: nodeId }, "moderation");
+    const removed = hit && listed ? await blocklist.remove(tx, listed, { onlyIfReason: hit }) : false;
+    return { before: row, removed };
+  });
+  audit(
+    c,
+    "admin.takedown_restored",
+    { type: "node", id: nodeId },
+    {
+      reason,
+      takedownReason: done.before.takedownReason,
+      byScanner: done.before.takedownBy === null,
+      blocklistRemoved: done.removed,
+    },
+  );
+  const after = (await adminQ.nodeRow(db(c), nodeId))!;
+  if (after.scanStatus === "pending") await rescanQuietly(c, nodeId);
+  return { node: after, blocklistRemoved: done.removed, reportStrikeIds: await reportStrikesOn(c, after) };
+}
+
+/** The unlifted strikes report actions gave the node's current uploader for this node. */
+async function reportStrikesOn(c: C, node: Node): Promise<string[]> {
+  const uploader = await currentUploader(c, node);
+  if (!uploader) return [];
+  return (await adminQ.strikesOf(db(c), uploader))
+    .filter((s) => s.nodeId === node.id && s.reportId !== null && s.liftedAt === null)
+    .filter((s) => s.kind === "abuse" || s.kind === "malware")
+    .map((s) => s.id);
+}
+
+/**
+ * A file's or a folder's legal hold — on a folder it protects everything under it (T05
+ * `setNodeLegalHold`, under the owner's tree lock). Clearing is `409 hold_not_releasable` while a
+ * CSAM lock's hold applies: the node is `suspected_csam`, or a `csam` report on it is not yet
+ * releasable — "Release holds" on the report does that. Audited (`admin.node_legal_hold_set` /
+ * `_cleared`, `{ reason, changed }`).
+ */
+export async function setNodeHold(c: C, nodeId: string, held: boolean, reason: string) {
+  const node = await consoleNode(c, nodeId);
+  const at = now(c);
+  const changed = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const row = await adminQ.lockNodeRow(tx, nodeId);
+    if (!row) throw new AppError("not_found");
+    if (!held) {
+      const lockHolds =
+        row.scanStatus === "suspected_csam" ||
+        (await adminQ.csamReportsOn(tx, nodeId)).some((report) => !releaseStateOf(report, at).allowed);
+      if (lockHolds) throw conflict("hold_not_releasable");
+    }
+    if (row.legalHold === held) return false;
+    await setNodeLegalHold(tx, nodeId, held);
+    return true;
+  });
+  audit(
+    c,
+    held ? "admin.node_legal_hold_set" : "admin.node_legal_hold_cleared",
+    { type: "node", id: nodeId },
+    { reason, changed, kind: node.kind },
+  );
+  return (await adminQ.nodeRow(db(c), nodeId))!;
+}
+
 // ── copyright notices (section 7) ───────────────────────────────────────────────────────────
 
 /**

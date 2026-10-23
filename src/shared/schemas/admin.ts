@@ -119,8 +119,15 @@ export const QuarantinePage = Page(QuarantineItemDto);
 export type QuarantinePage = z.infer<typeof QuarantinePage>;
 
 export const QuarantineActionBody = z.strictObject({
-  action: z.enum(["release", "delete", "rescan"]),
+  /**
+   * `takedown` / `restore` (R1 ruling Q9) work on ANY file or folder, not only a quarantine member:
+   * the console's own takedown (reason `admin`, or `csam` for a folder) and the restore of a
+   * takedown that is not a copyright notice's.
+   */
+  action: z.enum(["release", "delete", "rescan", "takedown", "restore"]),
   note: z.string().max(500).optional(),
+  /** `takedown` of a FOLDER as suspected CSAM: also holds it, and so everything under it. */
+  csam: z.boolean().optional(),
 });
 export type QuarantineActionBody = z.infer<typeof QuarantineActionBody>;
 
@@ -595,6 +602,11 @@ export const QuarantineActionResponse = z.object({
   rescan: AdminRescanResponse.optional(),
   /** `delete`: the subtree is gone. */
   purged: z.boolean().optional(),
+  /**
+   * `restore`: the unlifted strikes report actions gave the current uploader for this node —
+   * offered for lifting (`liftStrike`), never lifted by the restore.
+   */
+  reportStrikeIds: z.array(RowId).optional(),
 });
 export type QuarantineActionResponse = z.infer<typeof QuarantineActionResponse>;
 

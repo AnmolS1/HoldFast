@@ -18,7 +18,7 @@
 //   POST /admin/users/:userId/{suspend,unsuspend,revoke-sessions,revoke-links,strikes,legal-hold,deletion,deletion/cancel}
 //   PATCH /admin/users/:userId/quota  ·  POST /admin/strikes/:strikeId/lift
 //   GET|PATCH /admin/settings
-//   GET  /admin/quarantine  ·  GET|POST /admin/quarantine/:nodeId
+//   GET  /admin/quarantine  ·  GET|POST /admin/quarantine/:nodeId  ·  POST /admin/quarantine/:nodeId/legal-hold
 //   GET  /admin/kept-uploads  ·  POST /admin/kept-uploads/:uploadId/resolve
 //   GET  /admin/reports  ·  GET /admin/reports/:id  ·  POST /admin/reports/:id/{assign,action,ncmec/start,ncmec/evidence,ncmec/filed,release-holds,clear-lock}
 //   POST /admin/moderation/lock-csam
@@ -645,8 +645,13 @@ router.get(`/admin/quarantine/${NODE}`, async (c) => {
   requireAdmin(c);
   const node = await adminQ.nodeRow(db(c), c.req.param("nodeId"));
   if (!node || node.system !== null) throw new AppError("not_found");
+  return c.json(await quarantineDetail(c, node));
+});
+
+/** The quarantine item's detail (`AdminQuarantineDetailDto`) — any file or folder. */
+async function quarantineDetail(c: C, node: Node) {
   const [item] = await quarantineItems(c, [node]);
-  return c.json({
+  return {
     item: item!,
     owner: item!.node.owner,
     scanReason: node.scanReason,
@@ -655,11 +660,11 @@ router.get(`/admin/quarantine/${NODE}`, async (c) => {
     holds: await adminQ.holdCausesOf(db(c), node.id),
     links: (await adminQ.linksOnNode(db(c), node.id)).map(linkDto),
     malwareStrikeId: await adminQ.malwareStrikeFor(db(c), node.createdBy, node.id),
-  });
-});
+  };
+}
 
 router.post(`/admin/quarantine/${NODE}`, async (c) => {
-  requireAdmin(c);
+  const admin = requireAdmin(c);
   const nodeId = c.req.param("nodeId");
   const body = QuarantineActionBody.parse(await jsonBody(c));
   if (body.action === "rescan") {
@@ -671,6 +676,18 @@ router.post(`/admin/quarantine/${NODE}`, async (c) => {
     return c.json({ node: node ? (await toAdminNodeDtos(db(c), [node]))[0]! : null, rescan });
   }
   const reason = requiredReason(body.note);
+  if (body.action === "takedown") {
+    const node = await actions.takedownByAdmin(c, admin, nodeId, reason, body.csam === true);
+    return c.json({ node: (await toAdminNodeDtos(db(c), [node]))[0]! });
+  }
+  if (body.action === "restore") {
+    const done = await actions.restoreByAdmin(c, nodeId, reason);
+    return c.json({
+      node: (await toAdminNodeDtos(db(c), [done.node]))[0]!,
+      blocklistRemoved: done.blocklistRemoved,
+      reportStrikeIds: done.reportStrikeIds,
+    });
+  }
   if (body.action === "release") {
     const done = await actions.markFalsePositive(c, nodeId, reason);
     return c.json({
@@ -681,6 +698,15 @@ router.post(`/admin/quarantine/${NODE}`, async (c) => {
   }
   await actions.confirmDelete(c, nodeId, reason);
   return c.json({ node: null, purged: true });
+});
+
+/** A file's or a folder's legal hold (R1 ruling Q9); answers the item's detail as it now is. */
+router.post(`/admin/quarantine/${NODE}/legal-hold`, async (c) => {
+  requireAdmin(c);
+  const nodeId = c.req.param("nodeId");
+  const body = SetLegalHoldBody.parse(await jsonBody(c));
+  const node = await actions.setNodeHold(c, nodeId, body.held, requiredReason(body.note));
+  return c.json(await quarantineDetail(c, node));
 });
 
 // ── uploads kept under "keep and alert" ─────────────────────────────────────────────────────
