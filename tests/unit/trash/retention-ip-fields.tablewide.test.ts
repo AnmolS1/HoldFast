@@ -21,7 +21,11 @@ import {
 } from "../../../src/worker/db/queries/trash-jobs";
 import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
 import { rateLimit, reports } from "../../../src/worker/db/schema";
-import { job as retentionJob, RATE_LIMIT_RETENTION_MS, RETENTION_STEPS } from "../../../src/worker/jobs/retention";
+import {
+  job as retentionJob,
+  RATE_LIMIT_RETENTION_MS,
+  RETENTION_STEPS,
+} from "../../../src/worker/jobs/retention";
 import { createKeys } from "../../../src/worker/services/keys";
 import { newClient, signIn } from "../auth/helpers";
 import { cronEvent, generationInStep, jobContext, makeFile, member, rand, setNode, testDb } from "./helpers";

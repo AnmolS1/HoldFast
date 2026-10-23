@@ -227,13 +227,15 @@ describe("a held account", () => {
     // A session that expired a month ago: the retention job deleted the unheld account's and kept
     // the held one's (jobs/retention.ts) — the export lists live sessions only, so the hold does not show.
     if (legalHold) {
-      await testDb().insert(session).values({
-        id: `sess${rand(14)}`,
-        token: `made-up-token-${rand(8)}`,
-        userId: who.id,
-        expiresAt: new Date(Date.now() - 30 * 86_400_000),
-        updatedAt: new Date(),
-      });
+      await testDb()
+        .insert(session)
+        .values({
+          id: `sess${rand(14)}`,
+          token: `made-up-token-${rand(8)}`,
+          userId: who.id,
+          expiresAt: new Date(Date.now() - 30 * 86_400_000),
+          updatedAt: new Date(),
+        });
     }
     // The counter as uploads would have left it: the three files.
     await testDb().update(user).set({ usedBytes: 300 }).where(eq(user.id, who.id));
@@ -286,7 +288,12 @@ describe("what the export says about the account itself (R1 legal-8)", () => {
     const DEMO_AT = new Date("2099-01-02T03:04:05.000Z");
     await testDb()
       .update(user)
-      .set({ demoNoticeAcceptedAt: DEMO_AT, demoNoticeVersion: "demo-zz-1", ageVerifiedAt: DEMO_AT, twoFactorEnabled: true })
+      .set({
+        demoNoticeAcceptedAt: DEMO_AT,
+        demoNoticeVersion: "demo-zz-1",
+        ageVerifiedAt: DEMO_AT,
+        twoFactorEnabled: true,
+      })
       .where(eq(user.id, owner.id));
     const OPENED = new Date("2099-02-03T04:05:06.000Z");
     const file = await makeFile(owner.id, null, { name: `opened-${rand()}.txt`, scanStatus: "clean" });
@@ -303,45 +310,51 @@ describe("what the export says about the account itself (R1 legal-8)", () => {
       country: "NL",
       ...over,
     });
-    await testDb().insert(session).values([
-      live(),
-      live({ expiresAt: new Date(Date.now() - 86_400_000), ipAddress: "198.51.100.99" }),
-      // An operator's impersonation session is not the user's (as Settings → Devices).
-      live({ impersonatedBy: owner.id, ipAddress: "198.51.100.77" }),
-    ]);
-    await testDb().insert(passkey).values({
-      id: `pk${rand(14)}`,
-      name: "zz laptop key",
-      publicKey: "zz-secret-public-key",
-      userId: owner.id,
-      credentialID: "zz-secret-credential",
-      counter: 3,
-      deviceType: "multiDevice",
-      backedUp: true,
-      createdAt: DEMO_AT,
-      aaguid: "00000000-0000-0000-0000-00000000aaaa",
-    });
+    await testDb()
+      .insert(session)
+      .values([
+        live(),
+        live({ expiresAt: new Date(Date.now() - 86_400_000), ipAddress: "198.51.100.99" }),
+        // An operator's impersonation session is not the user's (as Settings → Devices).
+        live({ impersonatedBy: owner.id, ipAddress: "198.51.100.77" }),
+      ]);
+    await testDb()
+      .insert(passkey)
+      .values({
+        id: `pk${rand(14)}`,
+        name: "zz laptop key",
+        publicKey: "zz-secret-public-key",
+        userId: owner.id,
+        credentialID: "zz-secret-credential",
+        counter: 3,
+        deviceType: "multiDevice",
+        backedUp: true,
+        createdAt: DEMO_AT,
+        aaguid: "00000000-0000-0000-0000-00000000aaaa",
+      });
     const googleSub = `zz-google-sub-${rand()}`;
-    await testDb().insert(account).values([
-      {
-        id: `acc${rand(14)}`,
-        accountId: googleSub,
-        providerId: "google",
-        userId: owner.id,
-        idToken: "zz-secret-id-token",
-        createdAt: DEMO_AT,
-        updatedAt: DEMO_AT,
-      },
-      {
-        id: `acc${rand(14)}`,
-        accountId: owner.id,
-        providerId: "credential",
-        userId: owner.id,
-        password: "zz-secret-scrypt",
-        createdAt: DEMO_AT,
-        updatedAt: DEMO_AT,
-      },
-    ]);
+    await testDb()
+      .insert(account)
+      .values([
+        {
+          id: `acc${rand(14)}`,
+          accountId: googleSub,
+          providerId: "google",
+          userId: owner.id,
+          idToken: "zz-secret-id-token",
+          createdAt: DEMO_AT,
+          updatedAt: DEMO_AT,
+        },
+        {
+          id: `acc${rand(14)}`,
+          accountId: owner.id,
+          providerId: "credential",
+          userId: owner.id,
+          password: "zz-secret-scrypt",
+          createdAt: DEMO_AT,
+          updatedAt: DEMO_AT,
+        },
+      ]);
 
     const answer = await exportOf(owner);
     expect(answer.status).toBe(200);
@@ -397,7 +410,10 @@ describe("the export's day budget", () => {
     const client = newClient();
     const nobody = `nobody-${rand()}@example.test`;
     expect((await signIn(client, nobody, "made-up password 1!")).status).toBe(401);
-    const stored = [`${client.ip}|/sign-in/email`, await storedAuthLimitKey(testKeys(), `${client.ip}|/sign-in/email`)];
+    const stored = [
+      `${client.ip}|/sign-in/email`,
+      await storedAuthLimitKey(testKeys(), `${client.ip}|/sign-in/email`),
+    ];
     const aged = await testDb().execute(
       sql`UPDATE rate_limit SET last_request = last_request - ${2 * HOUR}
           WHERE key IN (${stored[0]}, ${stored[1]}) RETURNING key`,
@@ -428,7 +444,12 @@ describe("the export's day budget", () => {
     expect(await auditRows({ action: "account.export", targetId: owner.id })).toHaveLength(0);
     // The control: the app's own link (same-origin), a typed address (none) and a client that sends
     // no Fetch Metadata at all are served — and counted.
-    for (const [i, headers] of [{ "sec-fetch-site": "same-origin" }, { "sec-fetch-site": "none" }, {}].entries()) {
+    const allowed: Record<string, string>[] = [
+      { "sec-fetch-site": "same-origin" },
+      { "sec-fetch-site": "none" },
+      {},
+    ];
+    for (const [i, headers] of allowed.entries()) {
       const answer = await api(owner.as, "GET", "/account/export", { headers });
       expect(answer.status, JSON.stringify(headers)).toBe(200);
       expect(await dayCount(owner.id)).toBe(i + 1);

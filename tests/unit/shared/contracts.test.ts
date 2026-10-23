@@ -478,7 +478,14 @@ const EXAMPLES: Record<string, unknown> = {
     ],
     activity: [activity],
     sessions: [
-      { createdAt: AT, lastActiveAt: AT, expiresAt: AT, ipAddress: "192.0.2.1", userAgent: "Mozilla/5.0", country: "DE" },
+      {
+        createdAt: AT,
+        lastActiveAt: AT,
+        expiresAt: AT,
+        ipAddress: "192.0.2.1",
+        userAgent: "Mozilla/5.0",
+        country: "DE",
+      },
     ],
     passkeys: [{ name: "Laptop", createdAt: AT, deviceType: "multiDevice", backedUp: true, aaguid: null }],
     signInMethods: [{ provider: "google", accountId: "1234567890", createdAt: AT }],

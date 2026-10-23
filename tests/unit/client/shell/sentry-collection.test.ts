@@ -95,7 +95,11 @@ describe("the browser SDK with the app's options", () => {
         return { statusCode: 200 };
       });
     await initSentry(
-      { sentryDsnWeb: "https://public@o0.ingest.sentry.example.test/1", sentryEnvironment: "test", release: "abc" },
+      {
+        sentryDsnWeb: "https://public@o0.ingest.sentry.example.test/1",
+        sentryEnvironment: "test",
+        release: "abc",
+      },
       async () =>
         ({
           ...real,
@@ -121,7 +125,8 @@ describe("the browser SDK with the app's options", () => {
     expect(wire).toContain("zz-control crumb");
     expect(wire).not.toContain("ui.click");
     expect(wire).not.toContain("ui.input");
-    for (const needle of ["divorce settlement", "therapy session"]) expect(wire, needle).not.toContain(needle);
+    for (const needle of ["divorce settlement", "therapy session"])
+      expect(wire, needle).not.toContain(needle);
     button.remove();
     input.remove();
     await client.close(100);

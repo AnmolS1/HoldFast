@@ -42,7 +42,8 @@ describe("a row Better Auth wrote under the raw address before the store went li
     expect(await row(await storedAuthLimitKey(keys, `${client.ip}|${PATH}`))).toMatchObject({ count: 3 });
     expect(await row(`${client.ip}|${PATH}`)).toBeUndefined();
     // …and the limit is the same limit: two more, then refused.
-    for (let i = 4; i <= MAX; i++) expect((await signIn(client, freshEmail(), WRONG)).status, `#${i}`).toBe(401);
+    for (let i = 4; i <= MAX; i++)
+      expect((await signIn(client, freshEmail(), WRONG)).status, `#${i}`).toBe(401);
     expect((await signIn(client, freshEmail(), WRONG)).status).toBe(429);
   });
 
