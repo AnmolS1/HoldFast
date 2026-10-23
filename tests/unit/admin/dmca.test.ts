@@ -157,6 +157,32 @@ describe("intake", () => {
   });
 });
 
+describe("the removal mail quotes the notice's description of the material only (safety-8)", () => {
+  it("no infringingDescription: the mail carries a fixed sentence — not the notice as received (address, phone, signature); control: given, it is quoted", async () => {
+    const who = await admin();
+    for (const given of [false, true]) {
+      const owner = await member();
+      const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
+      const raw = "From A. Rights-Holder, 1 Example Street, phone 555-0100. /s/ A. Rights-Holder";
+      const answer = await adminCall(who.as, "POST", "/dmca", {
+        body: intake([file.id], {
+          rawText: raw,
+          infringingDescription: given ? "The photograph at the named path." : undefined,
+        }),
+      });
+      expect(answer.status).toBe(200);
+      const made = answer.body.notices[0] as DmcaNoticeDto;
+      expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+      const [mail] = mailTo(owner.row.email, "contentRemovedCopyright");
+      const text = `${mail!.subject} ${mail!.text ?? ""} ${mail!.html ?? ""}`;
+      expect(text, String(given)).not.toContain("555-0100");
+      expect(text, String(given)).not.toContain("Example Street");
+      if (given) expect(text).toContain("The photograph at the named path.");
+      else expect(text).toContain("The notice did not describe the material beyond naming this item.");
+    }
+  });
+});
+
 describe("take down", () => {
   it("links are PAUSED (moderation), never revoked; the node is hidden; the uploader struck; the dmca entry listed; the owner mailed once", async () => {
     const who = await admin();

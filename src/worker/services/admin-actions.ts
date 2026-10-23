@@ -1210,6 +1210,15 @@ async function ownerOf(c: C, notice: adminQ.NoticeWithNodes) {
   return null;
 }
 
+/** What a removal mail quotes when the notice did not describe the material (safety-8). */
+const NO_DESCRIPTION = "The notice did not describe the material beyond naming this item.";
+
+/**
+ * The notice's description of the material — all a removal mail quotes (`/dmca` promises exactly
+ * that). NEVER the notice as received (`rawText`: the complainant's address, phone, signature).
+ */
+const removalText = (notice: DmcaNotice) => notice.infringingDescription?.trim() || NO_DESCRIPTION;
+
 /** The "content removed" mail — sent by the one takedown that moved the notice. */
 async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
   // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
@@ -1220,7 +1229,7 @@ async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
       to: found.owner.email,
       name: found.owner.name,
       itemName: found.itemName,
-      noticeText: notice.infringingDescription ?? notice.rawText ?? "",
+      noticeText: removalText(notice),
     }),
   );
 }

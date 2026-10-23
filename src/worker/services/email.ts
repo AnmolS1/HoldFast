@@ -780,7 +780,7 @@ export const templates = {
     blocks: [
       { text: greeting(d.name) },
       {
-        text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice is quoted below.`,
+        text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice's description of the material is quoted below.`,
       },
       { quote: safeQuote(d.noticeText) },
       {
