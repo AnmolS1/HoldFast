@@ -11,7 +11,7 @@ import { SCAN_FOLLOW_LIMIT_MS } from "../../../../src/client/features/upload/pla
 import { getUploads } from "../../../../src/client/features/upload/store";
 import { summarise } from "../../../../src/client/features/upload/summary";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
-import { purgeUserState } from "../../../../src/client/lib/query";
+import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import { renderShell, setupShell } from "../shell/helpers";
 import { nodeDetail, nodeDto } from "./fixtures";
 import {
@@ -60,6 +60,21 @@ beforeEach(async () => {
 });
 
 const items = () => getUploads().items;
+const said = () => getUploads().announcements.map((entry) => entry.text);
+
+/** The shell's purge has started (its epoch moved) and holds in `cancelQueries`: this feature's purger has not run. */
+function openWindow(): () => Promise<void> {
+  let finish!: () => void;
+  const cancelling = vi
+    .spyOn(queryClient, "cancelQueries")
+    .mockImplementation(() => new Promise<void>((resolve) => (finish = resolve)));
+  const purging = purgeUserState({ keepSession: true });
+  return async () => {
+    cancelling.mockRestore();
+    finish();
+    await purging;
+  };
+}
 const polls = () => server.count("GET", /^\/api\/nodes\//);
 const ribbon = () => summarise(getUploads());
 const hide = (hidden: boolean) => {
@@ -177,10 +192,28 @@ describe("past the bound", () => {
     expect(items()).toEqual([]);
     expect(ribbon()).toMatchObject({ sentence: "1 upload complete", status: "done" });
   });
+
+  it("Check again inside the shell's purge window asks nothing for the old account", async () => {
+    await land(1);
+    await settle(SCAN_FOLLOW_LIMIT_MS + 60_000);
+    const asked = polls();
+    renderShell(<UploadPanel />);
+    const close = openWindow();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Check f0.txt again" }));
+      await settle(5_000);
+    });
+    expect(polls()).toBe(asked);
+    await act(close);
+    await settle(5_000);
+    expect(polls()).toBe(asked);
+  });
 });
 
 describe("one source of truth: a verdict the listing learns", () => {
-  const seen = (id: string, scanStatus: NodeDto["scanStatus"]) => nodeDto({ id, scanStatus });
+  // "v1" is the version every upload of the stand-in server lands as.
+  const seen = (id: string, scanStatus: NodeDto["scanStatus"], etag = "v1") =>
+    nodeDto({ id, scanStatus, etag });
 
   it("settles a row still scanning, and the loop asks about it no more", async () => {
     const [first, second] = await land(2);
@@ -208,6 +241,28 @@ describe("one source of truth: a verdict the listing learns", () => {
     scanVerdictsSeen([seen(second!, "clean")]);
     expect(items().map((row) => row.nodeId)).toEqual([first]);
     expect(ribbon()?.sentence).not.toMatch(/still being checked/);
+  });
+
+  it("a blocked verdict the listing saw first is said, as the loop would have said it", async () => {
+    const [first] = await land(1);
+    scanVerdictsSeen([{ ...seen(first!, "infected"), name: "f0.txt" }]);
+    expect(said()).toContain("f0.txt was blocked — flagged by the malware scan");
+  });
+
+  it("a listing read before this upload replaced the file (same id, the old version) settles nothing", async () => {
+    const [first] = await land(1);
+    scanVerdictsSeen([seen(first!, "clean", "v0")]);
+    expect(items()[0]).toMatchObject({ state: "scanning" });
+    scanVerdictsSeen([seen(first!, "infected", "v1")]);
+    expect(items()[0]).toMatchObject({ state: "done", scanStatus: "infected" });
+  });
+
+  it("inside the shell's purge window a verdict from the listing touches nothing", async () => {
+    const [first] = await land(1);
+    const close = openWindow();
+    scanVerdictsSeen([seen(first!, "clean")]);
+    expect(items()[0]).toMatchObject({ state: "scanning" });
+    await close();
   });
 
   it("after the account changed, a verdict from the old listing touches nothing", async () => {

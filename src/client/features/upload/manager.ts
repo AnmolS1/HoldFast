@@ -161,6 +161,11 @@ interface Work {
   init: { body: string; asked: Promise<InitUploadResponse> } | null;
   /** The account this upload was started for: every body names it (the identity pin). */
   account: string | null;
+  /**
+   * The version the file landed as (the node's `etag`). A replace keeps the node's id, so a
+   * listing's verdict is this file's only when it is about this version.
+   */
+  etag: string | null;
 }
 
 interface FolderFlight {
@@ -242,6 +247,7 @@ function workOf(id: string): Work {
       row: null,
       init: null,
       account: currentAccount(),
+      etag: null,
     };
     works.set(id, work);
   }
@@ -971,6 +977,7 @@ function landed(id: string, node: NodeDto): void {
   const item = findItem(id);
   if (!item) return;
   void dropResumeRow(id);
+  workOf(id).etag = node.etag;
   patchItem(id, {
     state: "scanning",
     nodeId: node.id,
@@ -1010,7 +1017,12 @@ function landedUnseen(id: string, uploadId: string): void {
   sweep();
 }
 
-function settleScan(id: string, node: Pick<NodeDto, "scanStatus" | "scanReason" | "name">): void {
+/** `fromListing`: the verdict came from the explorer's listing, which needs no telling. */
+function settleScan(
+  id: string,
+  node: Pick<NodeDto, "scanStatus" | "scanReason" | "name">,
+  { fromListing = false } = {},
+): void {
   const item = findItem(id);
   if (!item) return;
   patchItem(id, { state: "done", scanStatus: node.scanStatus, scanReason: node.scanReason });
@@ -1018,18 +1030,20 @@ function settleScan(id: string, node: Pick<NodeDto, "scanStatus" | "scanReason" 
   else if (node.scanStatus === "error" || node.scanStatus === "skipped")
     announce(t("live.unscanned", { name: node.name }));
   // The listing shows the same status: let it read it now rather than at its next refresh.
-  emitNodesChanged([item.parentId]);
+  if (!fromListing) emitNodesChanged([item.parentId]);
   sweep();
 }
 
 /**
- * What a listing of the explorer shows about files: a row still waiting for one of their verdicts
- * (scanning, or given up as still being checked) takes it, so the listing and the ribbon never
- * disagree. The listing has its own poll and says the verdict itself: nothing is announced here,
- * and nothing is asked to refresh. Ids are the server's, so a listing of another account matches
- * no row.
+ * What a listing of the explorer shows about files: a row still waiting for the verdict on that
+ * version of the file (scanning, or given up as still being checked) takes it, so the listing and
+ * the ribbon never disagree. Said as the loop says it (blocked, couldn't scan) — a refetch that
+ * shows the verdict first leaves the listing's own poll nothing to say — and the listing is not
+ * asked to refresh. Nothing happens once the queue is no longer the account's (the shell's purge
+ * has begun): ids are the server's, and the queue is about to be emptied.
  */
 export function scanVerdictsSeen(nodes: readonly NodeDto[]): void {
+  if (!live(queueOwner)) return;
   const verdicts = new Map<string, NodeDto>();
   for (const node of nodes) {
     if (node.kind === "file" && node.scanStatus !== null && node.scanStatus !== "pending") {
@@ -1037,20 +1051,20 @@ export function scanVerdictsSeen(nodes: readonly NodeDto[]): void {
     }
   }
   if (verdicts.size === 0) return;
-  let settled = false;
   for (const item of currentItems()) {
     const waiting = item.state === "scanning" || (item.state === "done" && item.scanStatus === "pending");
     const node = waiting && item.nodeId ? verdicts.get(item.nodeId) : undefined;
-    if (!node) continue;
+    // A listing read before this upload replaced the file shows the old version's verdict.
+    if (!node || node.etag !== works.get(item.id)?.etag) continue;
     // Its entry in the loop's queue is dropped when the loop next looks (the row is no longer scanning).
-    patchItem(item.id, { state: "done", scanStatus: node.scanStatus, scanReason: node.scanReason });
-    settled = true;
+    settleScan(item.id, node, { fromListing: true });
   }
-  if (settled) sweep();
 }
 
 /** "Check again" on a row the bound gave up on: the file is followed again, for a whole new bound. */
 export function recheckItem(id: string): void {
+  // A click after the shell's epoch moved and before the purger ran asks nothing for the old account.
+  if (!live(queueOwner)) return;
   const item = findItem(id);
   if (!item || item.state !== "done" || item.scanStatus !== "pending" || !item.nodeId) return;
   patchItem(id, { state: "scanning" });
