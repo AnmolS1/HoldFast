@@ -465,8 +465,8 @@ describe("the scan loop's bound and the queue's length", () => {
   it("a queue long enough that nobody can be asked three times inside the time bound: none is given up without having been asked about, and each at least three times", async () => {
     keepResumeListInMemory();
     // Long enough that, at one ask a second, no file has had its third ask when the time bound
-    // passes (two rounds take 2 × 200 s > 5 min): the asks, not the time, decide.
-    const count = 200;
+    // passes (two rounds take 2 × count s > the bound + 10 s): the asks, not the time, decide.
+    const count = Math.ceil((SCAN_FOLLOW_LIMIT_MS + 10_000) / 2_000) + 40;
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
     await addFiles(

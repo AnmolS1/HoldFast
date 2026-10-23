@@ -62,7 +62,7 @@ import { queryClient } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ShareDialog } from "../share";
-import { requestUpload } from "../upload";
+import { requestUpload, scanVerdictsSeen } from "../upload";
 import { ActionMenu, type MenuAnchor, type MenuEntry } from "./ActionMenu";
 import {
   announce,
@@ -545,6 +545,8 @@ function Explorer({ folderId }: { folderId: string | null }) {
       nodes.filter((node) => node.kind === "file" && node.scanStatus === "pending").map((node) => node.id),
     [nodes],
   );
+  // What the listing knows about a scan — from its poll or a refetch — the upload ribbon knows too.
+  useEffect(() => scanVerdictsSeen(nodes), [nodes]);
   const stillScanning = useScanPolling(
     pendingIds,
     {
