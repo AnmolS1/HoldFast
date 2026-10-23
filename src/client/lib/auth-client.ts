@@ -71,6 +71,7 @@ export const betterAuthClient = createAuthClient({
         birthYear: { type: "number", required: true },
         birthMonth: { type: "number", required: true },
         acceptTerms: { type: "boolean", required: true },
+        acceptDemo: { type: "boolean", required: false },
       },
     }),
   ],

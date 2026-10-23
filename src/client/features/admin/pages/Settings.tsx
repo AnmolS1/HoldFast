@@ -23,7 +23,7 @@ export function SettingsPage() {
   return <SettingsForm data={query.data} />;
 }
 
-const SWITCHES = ["uploadsEnabled", "linksEnabled", "readOnly", "orphanDeleteEnabled"] as const;
+const SWITCHES = ["uploadsEnabled", "linksEnabled", "readOnly", "demoMode", "orphanDeleteEnabled"] as const;
 
 function SettingsForm({ data }: { data: AdminSettingsResponse }) {
   const client = useQueryClient();
@@ -80,6 +80,7 @@ function SettingsForm({ data }: { data: AdminSettingsResponse }) {
               label={t(`settings.${name}`)}
             />
             {name === "orphanDeleteEnabled" ? <Note>{t("settings.orphanWarning")}</Note> : null}
+            {name === "demoMode" ? <Note>{t("settings.demoModeNote")}</Note> : null}
           </Box>
         ))}
       </Section>

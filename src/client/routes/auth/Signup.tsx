@@ -11,7 +11,16 @@ import { usePublicConfig } from "../../lib/query";
 import { useTurnstile } from "../../lib/turnstile";
 import { hf } from "../../theme/tokens";
 import { authErrorMessage, captchaOptions, useRedirectError } from "./errors";
-import { AuthCard, Field, FormError, FormNotice, GoogleIcon, OrDivider, TurnstileBox } from "./parts";
+import {
+  AuthCard,
+  DemoAssent,
+  Field,
+  FormError,
+  FormNotice,
+  GoogleIcon,
+  OrDivider,
+  TurnstileBox,
+} from "./parts";
 import {
   parseBirth,
   passwordStrength,
@@ -58,6 +67,8 @@ export function SignupPage() {
   const next = safeNext(params.get("next"));
   const config = usePublicConfig().data;
   const inviteRequired = config?.signupMode === "invite";
+  // The closed test: the notice must be accepted (the server refuses without it).
+  const demoMode = config?.demoMode === true;
   const turnstile = useTurnstile(config?.turnstileSiteKey);
   const [values, setValues] = useState<SignupValues>({
     name: "",
@@ -67,6 +78,7 @@ export function SignupPage() {
     birthMonth: "",
     birthYear: "",
     acceptTerms: false,
+    acceptDemo: false,
   });
   const [errors, setErrors] = useState<SignupErrors>({});
   const [passwordServerError, setPasswordServerError] = useState<string | null>(null);
@@ -82,7 +94,7 @@ export function SignupPage() {
     event.preventDefault();
     setFormError(null);
     setPasswordServerError(null);
-    const found = validateSignup(values, { inviteRequired });
+    const found = validateSignup(values, { inviteRequired, demoMode });
     setErrors(found);
     if (Object.keys(found).length > 0) return;
     if (config?.turnstileSiteKey && !turnstile.token) {
@@ -101,6 +113,7 @@ export function SignupPage() {
         birthYear: birth.year,
         birthMonth: birth.month,
         acceptTerms: true,
+        ...(demoMode ? { acceptDemo: true } : {}),
         callbackURL: "/login?reason=verified",
         fetchOptions: captchaOptions(turnstile.token),
       }),
@@ -124,7 +137,7 @@ export function SignupPage() {
   // Google sign-ups carry invite, age and assent through a signed intent cookie set first.
   const onGoogle = async () => {
     setFormError(null);
-    const found = validateIntent(values, { inviteRequired });
+    const found = validateIntent(values, { inviteRequired, demoMode });
     setErrors(found);
     if (Object.keys(found).length > 0) return;
     const birth = parseBirth(values);
@@ -138,6 +151,7 @@ export function SignupPage() {
           birthYear: birth.year,
           birthMonth: birth.month,
           acceptTerms: true,
+          ...(demoMode ? { acceptDemo: true } : {}),
         },
       });
     } catch (cause) {
@@ -285,6 +299,13 @@ export function SignupPage() {
           </Box>
           {errors.acceptTerms ? <FormError>{t(errors.acceptTerms)}</FormError> : null}
         </Box>
+        {demoMode ? (
+          <DemoAssent
+            checked={values.acceptDemo === true}
+            onChange={(checked) => set("acceptDemo", checked)}
+            error={errors.acceptDemo ? t(errors.acceptDemo) : null}
+          />
+        ) : null}
         {config?.turnstileSiteKey ? <TurnstileBox turnstile={turnstile} /> : null}
         <FormError>{formError}</FormError>
         <Button type="submit" variant="contained" size="large" disabled={busy}>

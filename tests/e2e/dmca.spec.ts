@@ -60,7 +60,9 @@ test.describe("/dmca", () => {
   // Never skips, in either state (a skip fails the gate run): while the sentinel is in agent.ts the
   // page says the registration is pending; at all times no sentinel reaches the served page —
   // text or attribute (DEMONOTICE, 2026-10-22).
-  test("@prod-safe no sentinel on the page; registration pending while agent.ts has one", async ({ page }) => {
+  test("@prod-safe no sentinel on the page; registration pending while agent.ts has one", async ({
+    page,
+  }) => {
     await openDmca(page);
     const agent = page.getByRole("region", { name: "Designated agent" });
     const pending = agent.getByText("Designated agent registration pending");

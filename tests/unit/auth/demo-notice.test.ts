@@ -12,7 +12,9 @@
 // The setting is given per client (helpers.ts `newClient({ settings })`), never written to the
 // shared table.
 import { describe, expect, it } from "vitest";
+import { en } from "../../../src/client/lib/en";
 import { testGoogleCode, type TestGoogleProfile } from "../../../src/worker/auth/test-outbound";
+import { SUPPORT_EMAIL } from "../../../src/worker/services/email";
 import { DEMO_NOTICE_VERSION, SIGNUP_REFUSALS } from "../../../src/worker/services/signup-policy";
 import {
   CAPTCHA,
@@ -44,6 +46,14 @@ async function expectDemoRefused(client: Client, acceptDemo: unknown, email = fr
   expect([...client.cookies.keys()].filter((name) => name.includes("session"))).toEqual([]);
   return { sent, email };
 }
+
+describe("the notice", () => {
+  it("is the brief's sentence and names the support address the app's mail already uses", () => {
+    expect(en["signup.demo.notice"]).toBe(
+      `Holdfast is in a closed test. Don't store anything important — files may be deleted when the test ends. Report problems to ${SUPPORT_EMAIL}.`,
+    );
+  });
+});
 
 describe("email sign-up", () => {
   it("demo mode off (the default): nothing is asked and nothing is written — as before", async () => {
@@ -130,7 +140,10 @@ async function googleRoundTrip(client: Client, profile: TestGoogleProfile) {
 describe("Google sign-up", () => {
   it("demo mode on: the intent without the assent is refused (400, reason DEMO_NOT_ACCEPTED) and sets no cookie", async () => {
     for (const acceptDemo of [undefined, false, "true"]) {
-      const { sent, inviteCode } = await intent(newClient(DEMO), acceptDemo === undefined ? {} : { acceptDemo });
+      const { sent, inviteCode } = await intent(
+        newClient(DEMO),
+        acceptDemo === undefined ? {} : { acceptDemo },
+      );
       expect(sent.status, sent.text).toBe(400);
       expect(sent.body).toMatchObject({ error: "validation", details: { reason: "DEMO_NOT_ACCEPTED" } });
       expect(sent.setCookies).toEqual([]);
@@ -155,7 +168,12 @@ describe("Google sign-up", () => {
     const { sent, inviteCode } = await intent(before);
     expect(sent.status, sent.text).toBe(200);
     // The same browser (its cookies), the setting now on.
-    const after = newClient({ ...DEMO, ip: before.ip, cookies: before.cookies, cookiePaths: before.cookiePaths });
+    const after = newClient({
+      ...DEMO,
+      ip: before.ip,
+      cookies: before.cookies,
+      cookiePaths: before.cookiePaths,
+    });
     const location = await googleRoundTrip(after, profileFor(email));
     const url = new URL(location, "http://localhost");
     expect(url.pathname).toBe("/signup");
