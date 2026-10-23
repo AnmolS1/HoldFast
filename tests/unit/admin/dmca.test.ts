@@ -183,6 +183,79 @@ describe("the removal mail quotes the notice's description of the material only 
   });
 });
 
+describe("who is told (safety-2, ruling Q2): the uploader gets the notice, the counter-notice path and the strike; the folder owner that a file in their folder was removed", () => {
+  const SUBSCRIBER = "Content removed following a copyright notice";
+  const FOLDER = "A file in your folder was removed following a copyright notice";
+  const STRIKE = "counts as one copyright strike";
+  const textOf = (mail: { text?: string; html?: string } | undefined) =>
+    `${mail?.text ?? ""} ${mail?.html ?? ""}`;
+
+  /** A file in the owner's folder whose current version an editor uploaded. */
+  async function editorsUpload() {
+    const owner = await member();
+    const editor = await member();
+    const folder = await makeFolder(owner.id);
+    await makeShare(folder.id, owner.id, editor.id, { role: "editor" });
+    const file = await makeFile(owner.id, folder.id, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      createdBy: editor.id,
+    });
+    await uploadAddress(file.id, file.versionId!, editor.id, "192.0.2.30");
+    return { owner, editor, file };
+  }
+
+  it("an editor's upload: the editor gets the subscriber mail with the strike and the /dmca link; the owner the folder mail; a second takedown mails nobody", async () => {
+    const who = await admin();
+    const t = await editorsUpload();
+    const made = await notice(who, [t.file.id]);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+    expect((await act(who, made.id, "takedown", { note: "Again." })).status).toBe(200);
+    const toEditor = mailTo(t.editor.row.email, "contentRemovedCopyright");
+    const toOwner = mailTo(t.owner.row.email, "contentRemovedCopyright");
+    expect(toEditor.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([SUBSCRIBER]);
+    expect(textOf(toEditor[0])).toContain(STRIKE);
+    expect(textOf(toEditor[0])).toContain("/dmca");
+    expect(toOwner.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([FOLDER]);
+    expect(textOf(toOwner[0])).not.toContain(STRIKE);
+    expect((await strikesOfUser(t.editor.id)).map((s) => s.kind)).toEqual(["dmca"]);
+  });
+
+  it("two takedowns at once: one mail each", async () => {
+    const who = await admin();
+    const t = await editorsUpload();
+    const made = await notice(who, [t.file.id]);
+    const answers = await Promise.all([
+      act(who, made.id, "takedown", { note: "One." }),
+      act(who, made.id, "takedown", { note: "Two." }),
+    ]);
+    expect(answers.map((a) => a.status)).toEqual([200, 200]);
+    expect(mailTo(t.editor.row.email, "contentRemovedCopyright")).toHaveLength(1);
+    expect(mailTo(t.owner.row.email, "contentRemovedCopyright")).toHaveLength(1);
+  });
+
+  it("the owner uploaded it: ONE mail, the subscriber's, with the strike", async () => {
+    const who = await admin();
+    const owner = await member();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
+    const made = await notice(who, [file.id]);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+    const mails = mailTo(owner.row.email, "contentRemovedCopyright");
+    expect(mails.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([SUBSCRIBER]);
+    expect(textOf(mails[0])).toContain(STRIKE);
+  });
+
+  it("withdrawn after the takedown: the editor and the owner are each told it was restored, once", async () => {
+    const who = await admin();
+    const t = await editorsUpload();
+    const made = await notice(who, [t.file.id]);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+    expect((await act(who, made.id, "withdraw", { note: "Withdrawn by the complainant." })).status).toBe(200);
+    expect(mailTo(t.editor.row.email, "contentRestored")).toHaveLength(1);
+    expect(mailTo(t.owner.row.email, "contentRestored")).toHaveLength(1);
+  });
+});
+
 describe("take down", () => {
   it("links are PAUSED (moderation), never revoked; the node is hidden; the uploader struck; the dmca entry listed; the owner mailed once", async () => {
     const who = await admin();

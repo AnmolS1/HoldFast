@@ -1120,7 +1120,7 @@ const TAKEDOWN_FROM: readonly DmcaNotice["status"][] = ["received", "incomplete"
  * subtree's links paused `moderation` (paused, not revoked), the `dmca` blocklist rows; (3) the
  * strike in the same transaction (`addStrike(…, { tx })`) and `strikeId` on the notice;
  * `ownerNotifiedAt` is set with the transition. After the commit: the strike's audit row and
- * threshold, then the owner's mail — sent by this call only. A repeat answers the notice as it stands.
+ * threshold, then the uploader's and the folder owner's mails (`notifyRemoval`) — sent by this call only. A repeat answers the notice as it stands.
  */
 async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes, note: string | null) {
   const uploader = await firstUploader(c, notice);
@@ -1184,7 +1184,7 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       reason: note,
     },
   );
-  await notifyOwner(c, current);
+  await notifyRemoval(c, current, uploader, outcome.strike !== null);
   return (await adminQ.noticeById(db(c), notice.id))!;
 }
 
@@ -1197,6 +1197,12 @@ async function firstUploader(c: C, notice: adminQ.NoticeWithNodes): Promise<stri
     }
   }
   return null;
+}
+
+/** The account the notice's strike went to (its uploader), else the current uploader. */
+async function strickenOf(c: C, notice: adminQ.NoticeWithNodes): Promise<string | null> {
+  const strike = notice.strikeId ? await adminQ.strikeById(db(c), notice.strikeId) : null;
+  return strike?.userId ?? (await firstUploader(c, notice));
 }
 
 async function ownerOf(c: C, notice: adminQ.NoticeWithNodes) {
@@ -1219,19 +1225,53 @@ const NO_DESCRIPTION = "The notice did not describe the material beyond naming t
  */
 const removalText = (notice: DmcaNotice) => notice.infringingDescription?.trim() || NO_DESCRIPTION;
 
-/** The "content removed" mail — sent by the one takedown that moved the notice. */
-async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
-  // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
+/**
+ * Who a notice's mails go to (R1 ruling Q2): the UPLOADER struck for it — the subscriber who
+ * posted the material, with the notice, the counter-notice path and the strike — and the folder
+ * OWNER when that is another account; when the uploader is unknown (anonymised, gone), the owner
+ * is the subscriber. Each account once.
+ */
+async function noticeRecipients(c: C, notice: adminQ.NoticeWithNodes, uploaderId: string | null) {
   const found = await ownerOf(c, notice);
-  if (!found) return;
-  deps(c).defer(
-    sendContentRemovedCopyright(deps(c), {
-      to: found.owner.email,
-      name: found.owner.name,
-      itemName: found.itemName,
-      noticeText: removalText(notice),
-    }),
-  );
+  const uploader = uploaderId ? await adminQ.adminUser(db(c), uploaderId) : null;
+  const itemName = found?.itemName ?? notice.nodes[0]?.nodeName ?? "";
+  const subscriber = uploader ?? found?.owner ?? null;
+  const owner = found && found.owner.id !== subscriber?.id ? found.owner : null;
+  return { itemName, subscriber, owner };
+}
+
+/** The "content removed" mails — sent by the one takedown that moved the notice. */
+async function notifyRemoval(
+  c: C,
+  notice: adminQ.NoticeWithNodes,
+  uploaderId: string | null,
+  struck: boolean,
+) {
+  // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
+  const { itemName, subscriber, owner } = await noticeRecipients(c, notice, uploaderId);
+  const noticeText = removalText(notice);
+  if (subscriber) {
+    deps(c).defer(
+      sendContentRemovedCopyright(deps(c), {
+        to: subscriber.email,
+        name: subscriber.name,
+        itemName,
+        noticeText,
+        strike: struck && subscriber.id === uploaderId,
+      }),
+    );
+  }
+  if (owner) {
+    deps(c).defer(
+      sendContentRemovedCopyright(deps(c), {
+        to: owner.email,
+        name: owner.name,
+        itemName,
+        noticeText,
+        folderOwner: true,
+      }),
+    );
+  }
 }
 
 /**
@@ -1239,7 +1279,7 @@ async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
  * only while no lawsuit notice is recorded. One transaction under the owners' tree locks:
  * `restoreTakedown`, the subtree's `moderation` pause lifted (T05 keeps it where the node is still
  * hidden otherwise), the `dmca` entry removed only if it is still `dmca`; status → `restored`.
- * After the commit: the strike lifted, a rescan for a node left `pending`, the owner's mail.
+ * After the commit: the strike lifted, a rescan for a node left `pending`, the uploader's and the folder owner's mails.
  * `withdraw` is the same restore with `closeNotice(…, 'withdrawn')` as the status change.
  */
 async function restoreNotice(
@@ -1365,15 +1405,10 @@ async function restoreNotice(
       sendDmcaRestoredComplainant(deps(c), { to, name: notice.complainantName, noticeId: notice.id }),
     );
   }
-  const found = await ownerOf(c, notice);
-  if (found) {
-    deps(c).defer(
-      sendContentRestored(deps(c), {
-        to: found.owner.email,
-        name: found.owner.name,
-        itemName: found.itemName,
-      }),
-    );
+  // The uploader the notice struck and the folder owner (ruling Q2), each once.
+  const { itemName, subscriber, owner } = await noticeRecipients(c, notice, await strickenOf(c, notice));
+  for (const to of [subscriber, owner]) {
+    if (to) deps(c).defer(sendContentRestored(deps(c), { to: to.email, name: to.name, itemName }));
   }
 }
 
