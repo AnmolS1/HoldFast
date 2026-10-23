@@ -107,7 +107,12 @@ describe("intake", () => {
     const who = await admin();
     const owner = await member();
     const sha256 = madeUpSha();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256, name: "photo.jpg" });
+    const file = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256,
+      name: "photo.jpg",
+    });
     const answer = await adminCall(who.as, "POST", "/dmca", { body: intake([file.id]) });
     expect(answer.status).toBe(200);
     expect(CreateDmcaNoticeResponse.safeParse(answer.body).success).toBe(true);
@@ -136,8 +141,12 @@ describe("intake", () => {
     const who = await admin();
     const owner = await member();
     const editor = await member();
-    const mine = await makeFile(owner.id, null, { scanStatus: "clean" });
-    const theirs = await makeFile(owner.id, null, { scanStatus: "clean", createdBy: editor.id });
+    const mine = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
+    const theirs = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      createdBy: editor.id,
+    });
     await uploadAddress(theirs.id, theirs.versionId!, editor.id, "192.0.2.20");
     const answer = await adminCall(who.as, "POST", "/dmca", { body: intake([mine.id, theirs.id]) });
     expect(answer.status).toBe(200);
@@ -153,7 +162,7 @@ describe("take down", () => {
     const who = await admin();
     const owner = await member();
     const sha256 = madeUpSha();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256 });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256 });
     const link = await makeLink(file.id, owner.id);
     const made = await notice(who, [file.id]);
     const answer = await act(who, made.id, "takedown", { note: "Complete notice." });
@@ -175,7 +184,7 @@ describe("take down", () => {
   it("a notice that never allowed a takedown (rejected) → 409, nothing taken down", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     expect((await act(who, made.id, "reject")).status).toBe(200);
     const answer = await act(who, made.id, "takedown");
@@ -189,7 +198,7 @@ describe("an open notice holds the node; a closed one releases it", () => {
   it("received and actioned hold it from purge; closed (taken down, no counter-notice) does not", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const purgeable = async () => {
       try {
         await assertPurgeable(testDb(), [file.id]);
@@ -222,7 +231,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("counted from the receipt, not the forward click; weekends and US federal holidays skipped; the end is the whole 14th day", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     // Forwarded the next Monday: a window from the click would run 21 to 28 November.
     const forwardAt = new Date("2028-11-06T09:00:00.000Z");
     const forwarded = await upToForward(who, [file.id], RECEIVED, forwardAt);
@@ -238,7 +247,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("a counter-notice recorded later with its real receipt date: the window is from that date", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2028-11-01T08:00:00.000Z"));
@@ -266,7 +275,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("a receipt date in the future, or before the takedown, is refused (it would move the window)", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2028-11-01T08:00:00.000Z"));
@@ -296,7 +305,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("forwarded once: a second forward is refused and the window does not move", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const forwarded = await upToForward(who, [file.id], RECEIVED);
     vi.setSystemTime(new Date("2028-11-07T12:00:00.000Z"));
     const again = await act(who, forwarded.id, "forward_counter");
@@ -307,7 +316,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("the window is fixed when the counter-notice is recorded (shown before any forward)", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     expect((await act(who, made.id, "takedown")).status).toBe(200);
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -324,7 +333,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("a window that would end past the holiday table is refused with its reason, nothing recorded", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2028-12-20T12:00:00.000Z"));
@@ -340,7 +349,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("restore before restoreNotBefore stays refused (409 before_window) — even with acknowledgeLate; inside the window it is allowed", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const link = await makeLink(file.id, owner.id);
     const forwarded = await upToForward(who, [file.id], RECEIVED);
     vi.setSystemTime(new Date(new Date(forwarded.restoreNotBefore!).getTime() - 60_000));
@@ -364,7 +373,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("restore after restoreNotAfter: 409 window_closed without acknowledgeLate; with it, restored, audited late with the dates, the complainant told", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const link = await makeLink(file.id, owner.id);
     const complainant = `legal-${rand(8)}@example.test`;
     const made = (
@@ -410,7 +419,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("a forward after the window closed is refused (409 forward_window_closed); the late restore still works without it", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const complainant = `legal-${rand(8)}@example.test`;
     const made = (
       await adminCall(who.as, "POST", "/dmca", { body: intake([file.id], { complainantEmail: complainant }) })
@@ -438,7 +447,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("inside the window a restore needs the forward first (409 not_forwarded)", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await notice(who, [file.id]);
     expect((await act(who, made.id, "takedown")).status).toBe(200);
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -454,7 +463,7 @@ describe("the counter-notice window: 10 and 14 business days after RECEIPT of th
   it("after a lawsuit notice the material stays down: restore 409 lawsuit, status upheld", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const forwardAt = nextFriday(new Date());
     const forwarded = await upToForward(who, [file.id], forwardAt);
     const lawsuit = await act(who, forwarded.id, "lawsuit_notice");
@@ -504,7 +513,11 @@ describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded
   it("forward: the complainant gets a copy of the counter-notice and the window; restore: the outcome; each recorded in the audit", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", name: "secret-name.jpg" });
+    const file = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      name: "secret-name.jpg",
+    });
     // Made up for the test: one address per test, so the outbox is read for this notice only.
     const complainant = `legal-${rand(8)}@example.test`;
     const made = await noticeFor(who, [file.id], complainant);
@@ -544,7 +557,7 @@ describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded
   it("a notice with no complainant address (received by post): nothing mailed, and the audit says so", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const made = await noticeFor(who, [file.id], undefined);
     expect(made.complainantEmail).toBeNull();
     await forwardFor(who, made.id);
@@ -556,7 +569,7 @@ describe("the complainant's mails (§512(g)(2)(B)): the counter-notice forwarded
   it("a refused restore (before the window) mails nobody", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const complainant = `legal-${rand(8)}@example.test`;
     const made = await noticeFor(who, [file.id], complainant);
     await forwardFor(who, made.id);
@@ -570,7 +583,7 @@ describe("a full DMCA cycle: notice → takedown → counter-notice → restore 
     const who = await admin();
     const owner = await member();
     const sha256 = madeUpSha();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256 });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256 });
     const link = await makeLink(file.id, owner.id);
     const forwardAt = nextFriday(new Date());
     const forwarded = await upToForward(who, [file.id], forwardAt);
@@ -603,10 +616,10 @@ describe("a FOLDER taken down and restored by subtree", () => {
     const grantee = await member();
     const folder = await makeFolder(owner.id);
     const sub = await makeFolder(owner.id, folder.id);
-    const inFolder = await makeFile(owner.id, folder.id, { scanStatus: "clean" });
-    const inSub = await makeFile(owner.id, sub.id, { scanStatus: "clean" });
-    const sibling = await makeFile(owner.id, folder.id, { scanStatus: "clean" });
-    const elsewhere = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const inFolder = await makeFile(owner.id, folder.id, { scanStatus: "clean", scannedAt: new Date() });
+    const inSub = await makeFile(owner.id, sub.id, { scanStatus: "clean", scannedAt: new Date() });
+    const sibling = await makeFile(owner.id, folder.id, { scanStatus: "clean", scannedAt: new Date() });
+    const elsewhere = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const onFolder = await makeLink(folder.id, owner.id);
     const onFile = await makeLink(inFolder.id, owner.id);
     const onSub = await makeLink(inSub.id, owner.id);

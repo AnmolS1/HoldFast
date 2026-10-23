@@ -47,6 +47,7 @@ import {
   setNodeLegalHold,
   setUserLegalHold,
   takedownNode,
+  verifiedSha256,
   type CsamClearResult,
 } from "../db/queries/moderation";
 import { keyReference } from "../db/queries/nodes";
@@ -256,7 +257,8 @@ export async function actionReport(
 
   const uploader = await currentUploader(c, node);
   if (!uploader) throw conflict("no_uploader");
-  const scanned = node.scanStatus !== "pending" ? node.sha256 : null;
+  // The strike's "same content never strikes twice" key: only a hash the server computed.
+  const scanned = verifiedSha256(node);
   const { report, strike } = await retryOnDeadlock(db(c), async (tx) => {
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     if (!locked || !OPEN_STATES.includes(locked.report.status)) throw conflict("state");
@@ -546,7 +548,12 @@ export async function ncmecFiled(c: C, reportId: string, body: { reportId: strin
     if (node && !filedBefore && (node.scanStatus !== "suspected_csam" || !node.legalHold)) {
       throw conflict("not_locked");
     }
-    const confirmed = node?.sha256 ? await blocklist.confirmCsam(tx, node.sha256) : false;
+    // The filing is recorded whatever the hash; the hash is CONFIRMED only when it is the
+    // server's (safety-1): a scan computed it, or it is listed `csam` already — a listing only a
+    // server hash reaches. A hash still the client's is confirmed by the scan that brings the
+    // server's (`listLockedOnScan`), which sees this filing.
+    const hash = node ? await filingHash(tx, node) : null;
+    const confirmed = hash ? await blocklist.confirmCsam(tx, hash) : false;
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     const report = locked!.report;
     if (report.status === "actioned" && report.ncmecFiledAt) return { report, changed: false, confirmed };
@@ -575,6 +582,14 @@ export async function ncmecFiled(c: C, reportId: string, body: { reportId: strin
   );
   metric("report", { outcome: "filed" });
   return outcome.report;
+}
+
+/** The node's hash a filing confirms, or null while it is still the client's (see `ncmecFiled`). */
+async function filingHash(tx: Parameters<typeof blocklist.lookup>[0], node: Node): Promise<string | null> {
+  const verified = verifiedSha256(node);
+  if (verified) return verified;
+  if (node.sha256 === null) return null;
+  return (await blocklist.lookup(tx, node.sha256))?.reason === "csam" ? node.sha256 : null;
 }
 
 type ReleaseState = { allowed: true } | { allowed: false; releasableAt: string | null };
@@ -857,7 +872,7 @@ export async function lockFromNotice(
     name: node.name,
     mimeSniffed: node.mimeSniffed,
     size: node.size,
-    sha256: node.scanStatus !== "pending" ? node.sha256 : null,
+    sha256: verifiedSha256(node),
     owner: ref(node.ownerId) ?? { id: node.ownerId, displayName: "" },
     uploaders: versions.map((v) => ({
       versionId: v.versionId,
@@ -1038,7 +1053,8 @@ export async function createNotices(c: C, admin: Admin, input: NoticeInput, node
         group.map((node) => ({
           id: node.id,
           name: node.name,
-          sha256: node.scanStatus !== "pending" ? node.sha256 : null,
+          // The snapshot keys "another notice names the same content": a server hash only.
+          sha256: verifiedSha256(node),
         })),
         admin.id,
       );
@@ -1082,7 +1098,8 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
     for (const { nodeId } of notice.nodes) {
       // A notice changes only what it changes (M1): a node already taken down — for abuse, by an
       // admin, as csam, or by another notice — keeps its takedown and its reason as they are.
-      const before = await adminQ.nodeRow(tx, nodeId);
+      // Locked (after the tree locks): the hash listed below is the one this row holds now.
+      const before = await adminQ.lockNodeRow(tx, nodeId);
       if (!before || before.takedownAt !== null) continue;
       if (!(await takedownNode(tx, nodeId, { reason: "dmca", by: admin.id }))) continue;
       // What this notice did, recorded on its own row (SEAM took_down): its restore lifts only this.
@@ -1090,9 +1107,11 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
       // The hash is listed `dmca` only when it is listed for nothing yet: an entry another
       // reason made is never rewritten (and so never removed by this notice's restore).
-      if (before.sha256 && before.scanStatus !== "pending" && !(await blocklist.lookup(tx, before.sha256))) {
+      // Only a hash the server computed (safety-1): a declared one is never listed.
+      const sha256 = verifiedSha256(before);
+      if (sha256 && !(await blocklist.lookup(tx, sha256))) {
         await blocklist.upsert(tx, {
-          sha256: before.sha256,
+          sha256,
           reason: "dmca",
           sourceNodeId: nodeId,
           addedBy: admin.id,
