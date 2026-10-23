@@ -103,7 +103,9 @@ describe("avatar on a cold scanner", () => {
     expect(getToasts()).toEqual([]);
 
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    await waitFor(() => expect(getToasts().map((toast) => toast.message)).toEqual(["Profile picture updated."]));
+    await waitFor(() =>
+      expect(getToasts().map((toast) => toast.message)).toEqual(["Profile picture updated."]),
+    );
     const inits = calls.filter((call) => call.path === "/api/uploads" && call.method === "POST");
     expect(inits).toHaveLength(2);
     expect(inits[1]!.body).toMatchObject({ purpose: "avatar", name: "me.png", size: 4 });

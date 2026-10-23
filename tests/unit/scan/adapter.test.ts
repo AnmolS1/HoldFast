@@ -351,7 +351,10 @@ describe("scanSmallObject waits out a scanner that is starting or busy (AVWARM)"
       .mockRejectedValueOnce(notReady())
       .mockResolvedValueOnce(shim({ sha256: await sha256Of(bytes), bytes: bytes.byteLength }));
     await scanSmallObject(OFF, bytes, time);
-    const timeouts = vi.mocked(scanSmall).mock.calls.slice(before).map((call) => call[2]?.timeoutMs);
+    const timeouts = vi
+      .mocked(scanSmall)
+      .mock.calls.slice(before)
+      .map((call) => call[2]?.timeoutMs);
     expect(timeouts).toEqual([120_000, 90_000, 60_000, 30_000]);
   });
 });
