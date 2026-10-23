@@ -69,6 +69,21 @@ describe("addBusinessDays", () => {
     expect(addBusinessDays(at("2027-12-23T12:00:00Z"), 5).toISOString()).toBe("2028-01-03T12:00:00.000Z");
   });
 
+  it("days are UTC days: a receipt either side of UTC midnight, with Veterans Day inside the window", () => {
+    // Fri 23:55 and Sat 00:05: the first day counted is Monday 2 Nov either way → Mon 16 Nov.
+    expect(addBusinessDays(at("2026-10-30T23:55:00Z"), 10).toISOString()).toBe("2026-11-16T23:55:00.000Z");
+    expect(addBusinessDays(at("2026-10-31T00:05:00Z"), 10).toISOString()).toBe("2026-11-16T00:05:00.000Z");
+    // Thu 23:55 and Fri 00:05: ten minutes apart, one business day apart — both ends of the window.
+    expect(addBusinessDays(at("2026-11-05T23:55:00Z"), 10).toISOString()).toBe("2026-11-20T23:55:00.000Z");
+    expect(addBusinessDays(at("2026-11-06T00:05:00Z"), 10).toISOString()).toBe("2026-11-23T00:05:00.000Z");
+    expect(endOfUtcDay(addBusinessDays(at("2026-11-05T23:55:00Z"), 14)).toISOString()).toBe(
+      "2026-11-27T23:59:59.999Z",
+    );
+    expect(endOfUtcDay(addBusinessDays(at("2026-11-06T00:05:00Z"), 14)).toISOString()).toBe(
+      "2026-11-30T23:59:59.999Z",
+    );
+  });
+
   it("the start day itself is not counted, whatever it is", () => {
     expect(addBusinessDays(at("2026-07-03T12:00:00Z"), 1).toISOString()).toBe("2026-07-06T12:00:00.000Z");
     expect(addBusinessDays(at("2026-07-04T12:00:00Z"), 1).toISOString()).toBe("2026-07-06T12:00:00.000Z");

@@ -638,8 +638,11 @@ describe("a FOLDER taken down and restored by subtree", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(forwardAt);
     expect((await counter(who, first.id)).status).toBe(200);
-    expect((await act(who, first.id, "forward_counter")).status).toBe(200);
-    vi.setSystemTime(new Date(forwardAt.getTime() + 15 * DAY));
+    const forwarded = await act(who, first.id, "forward_counter");
+    expect(forwarded.status).toBe(200);
+    // At the window's opening as the forward recorded it — never "+N calendar days": a federal
+    // holiday inside the window moves it (CI ec88714: Veterans Day, +15 days was a 409 before_window).
+    vi.setSystemTime(new Date((forwarded.body as DmcaNoticeDto).restoreNotBefore!));
     expect((await act(who, first.id, "restore")).status).toBe(200);
 
     expect(await reasons()).toEqual({

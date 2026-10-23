@@ -5,7 +5,9 @@
 //
 // A business day is a UTC calendar day that is neither a Saturday, a Sunday nor a US federal
 // holiday AS OBSERVED (5 U.S.C. §6103: a Saturday holiday is observed on the Friday before, a
-// Sunday one on the Monday after). The table below is copied from OPM's published lists
+// Sunday one on the Monday after). UTC, not America/New_York: every timestamp here (the receipt,
+// the Worker's clock, the stored window) is UTC and the statute names no zone; a receipt on a US
+// evening can therefore count from the next day, which moves both ends one day later. The table below is copied from OPM's published lists
 // (https://www.opm.gov/policy-data-oversight/pay-leave/federal-holidays/, read 2026-10-22). It ends
 // on HOLIDAYS_KNOWN_UNTIL: a count that would step past that day throws `HolidayTableEndedError`
 // rather than treat unknown days as working days — extend the table from OPM's next list
