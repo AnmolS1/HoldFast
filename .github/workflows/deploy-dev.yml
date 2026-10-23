@@ -108,19 +108,23 @@ jobs:
       - name: The build is a dev build
         run: bash .github/workflows/lib/deploy-lib.sh built-env dev
 
+      # The scanner image COPYs ClamAV signatures; they come from the R2 cache (or one freshclam run).
+      # BEFORE the migration: it depends on the signature CDN, and a failure here must stop the
+      # deploy while the database is untouched (R1 perfops-6). Only for a build: with `none`,
+      # wrangler builds no image and reads none of these files.
+      - name: Scanner signatures
+        if: steps.plan.outputs.rollout == 'build'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh cvd-cache
+
       # First asserts that the database keeps UTC time (zero offset in January and July); a
       # database that does not is not migrated and nothing is deployed.
       - name: Migrate the dev database
         env:
           DATABASE_URL_DIRECT: ${{ secrets.NEON_DIRECT_URL_DEV }}
         run: bash .github/workflows/lib/deploy-lib.sh migrate apply remote
-
-      # The scanner image COPYs ClamAV signatures; they come from the R2 cache (or one freshclam run).
-      - name: Scanner signatures
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: bash .github/workflows/lib/deploy-lib.sh cvd-cache
 
       # = the deploy half of `npm run deploy:dev` (the build half ran above so that the name check
       # sits between them). The log prints every `vars` value — public ones; no secret is a var.
@@ -129,10 +133,12 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           ROLLOUT: ${{ steps.plan.outputs.rollout }}
+          # The commit, on the Worker version: a rollback picks a version by it (incident-response.md).
+          MESSAGE: deploy-dev ${{ github.sha }}
         run: |
           case "$ROLLOUT" in
-            build) npx wrangler deploy ;;
-            none) npx wrangler deploy --containers-rollout none ;;
+            build) npx wrangler deploy --message "$MESSAGE" ;;
+            none) npx wrangler deploy --containers-rollout none --message "$MESSAGE" ;;
             *)
               echo "::error::no containers plan (got '$ROLLOUT'); refusing to guess"
               exit 1
