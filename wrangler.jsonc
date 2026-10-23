@@ -108,7 +108,10 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ScannerContainer"] }],
   // 17 */6: purge trash and stale versions · 3 *: stale uploads, abuse anomalies ·
   // 5 0: link unpause, retention · 0 2: nightly backup, then user purges, then reconcile.
-  "triggers": { "crons": ["17 */6 * * *", "3 * * * *", "5 0 * * *", "0 2 * * *"] },
+  // DEV runs only the two daily slots (Anmol, 2026-10-22: each run wakes Neon, and the hourly/6-hourly
+  // slots were most of dev's database cost). Prod keeps all four (env.production below). On dev, any
+  // job can still be run on demand from the admin console's "Run now".
+  "triggers": { "crons": ["5 0 * * *", "0 2 * * *"] },
   "limits": { "cpu_ms": 120000 },
   "env": {
     "production": {
