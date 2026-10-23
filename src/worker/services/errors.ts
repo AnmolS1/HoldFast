@@ -84,6 +84,25 @@ export class AppError extends Error {
   }
 }
 
+/** Validation issues an error answer names; the rest are only counted (R1 secweb-n6). */
+export const MAX_ECHOED_ISSUES = 20;
+
+/**
+ * The `details` of a `400 validation` for zod's issues: the first `MAX_ECHOED_ISSUES` of them,
+ * and how many there were — an answer never grows with the input it refuses.
+ */
+export function validationDetails(issues: ZodError["issues"]): {
+  issues: { path: string; message: string }[];
+  issueCount: number;
+} {
+  return {
+    issues: issues
+      .slice(0, MAX_ECHOED_ISSUES)
+      .map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+    issueCount: issues.length,
+  };
+}
+
 function requestIdOf(c: Context<AppEnv>): string {
   return c.get("requestId") ?? "unknown";
 }
@@ -133,9 +152,7 @@ function asAppError(error: unknown): AppError | null {
   const query = asQueryError(error);
   if (query) return fromQueryError(query);
   if (error instanceof ZodError) {
-    return new AppError("validation", undefined, {
-      issues: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
-    });
+    return new AppError("validation", undefined, validationDetails(error.issues));
   }
   if (error instanceof HTTPException) return fromHttpException(error);
   return null;
