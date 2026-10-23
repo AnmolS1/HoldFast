@@ -5,6 +5,7 @@ import { env } from "cloudflare:workers";
 import { like, sql } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { STATEMENT_BUDGET } from "../../../src/worker/auth/parity";
+import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
 import * as passwordWork from "../../../src/worker/auth/password";
 import { APIError } from "better-auth/api";
 import { createScope } from "../../../src/worker/auth/scope";
@@ -70,9 +71,8 @@ const ALLOW = { limit: async () => ({ success: true }) };
 const quiet = () => newClient({ env: { RL_AUTH: ALLOW, RL_API: ALLOW } });
 
 async function forgetAddressRule(client: Client) {
-  await testDb().execute(
-    sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${client.ip}%`}`,
-  );
+  const prefix = await authLimitClientPrefix(createKeys(env.FILES_TOKEN_SECRET), client.ip);
+  await testDb().execute(sql`DELETE FROM rate_limit WHERE key LIKE ${`${prefix}%`}`);
 }
 async function attempt(client: Client, email: string, password = WRONG) {
   await forgetAddressRule(client);

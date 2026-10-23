@@ -6,8 +6,12 @@
 //
 // Both are kept for whatever a hold keeps: a held user's session rows, and a report on a node the
 // purge gate protects. Each case has an un-held twin that IS changed in the same run (the control).
+//
+// And `rate_limit` (R1 legal-1): Better Auth's per-address limiter writes no raw address (the key
+// carries a keyed hash, auth/rate-limit-store.ts), and every row goes two days after its last use —
+// longer than the longest window of any key family in the table (the 24 h export day).
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { eq, like, sql } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { session } from "../../../src/worker/db/auth-schema";
 import { setNodeLegalHold, setUserLegalHold } from "../../../src/worker/db/queries/moderation";
@@ -15,8 +19,11 @@ import {
   REPORTER_HASH_RETENTION_DAYS,
   SESSION_EXPIRED_GRACE_DAYS,
 } from "../../../src/worker/db/queries/trash-jobs";
-import { reports } from "../../../src/worker/db/schema";
-import { job as retentionJob, RETENTION_STEPS } from "../../../src/worker/jobs/retention";
+import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
+import { rateLimit, reports } from "../../../src/worker/db/schema";
+import { job as retentionJob, RATE_LIMIT_RETENTION_MS, RETENTION_STEPS } from "../../../src/worker/jobs/retention";
+import { createKeys } from "../../../src/worker/services/keys";
+import { newClient, signIn } from "../auth/helpers";
 import { cronEvent, generationInStep, jobContext, makeFile, member, rand, setNode, testDb } from "./helpers";
 
 beforeAll(generationInStep);
@@ -163,10 +170,63 @@ describe("reports.reporter_ip_hash_stable", () => {
   });
 });
 
+describe("rate_limit", () => {
+  const rowsLike = (pattern: string) => db().select().from(rateLimit).where(like(rateLimit.key, pattern));
+
+  it("a request Better Auth's limiter counts leaves no raw client address in the table — its row is keyed by a hash", async () => {
+    const client = newClient();
+    // An address with no account: the limiter counts the attempt before anything is looked up.
+    const tried = await signIn(client, `nobody-${rand(8)}@example.test`, "made-up password 1!");
+    expect(tried.status).toBe(401);
+
+    expect(await rowsLike(`%${client.ip}%`)).toEqual([]);
+    // The control: the attempt WAS counted — under the hashed key.
+    const prefix = await authLimitClientPrefix(createKeys(env.FILES_TOKEN_SECRET), client.ip);
+    expect(await rowsLike(`${prefix}%`)).toEqual([
+      expect.objectContaining({ key: `${prefix}/sign-in/email`, count: 1 }),
+    ]);
+  });
+
+  it("rows go two days after their last use, never earlier — a 23-hour-old export day stays", async () => {
+    expect(RATE_LIMIT_RETENTION_MS).toBe(2 * DAY);
+    const tag = rand(10);
+    const at = (ms: number) => Date.now() - ms;
+    const keys = {
+      // Made-up keys of each family the table holds; none is a real address or account.
+      old: `rl:made-up-${tag}|/sign-in/email`,
+      oldDay: `account-export-day:made-up-${tag}`,
+      day: `account-export-day:made-up-other-${tag}`,
+      // (not `signin:` — the throttle's own test reads every row of that family)
+      recent: `2fa:made-up-${tag}:new`,
+    };
+    for (const [key, lastRequest] of [
+      [keys.old, at(2 * DAY + HOUR)],
+      [keys.oldDay, at(3 * DAY)],
+      [keys.day, at(23 * HOUR)],
+      [keys.recent, at(2 * DAY - HOUR)],
+    ] as const) {
+      await db().execute(
+        sql`INSERT INTO rate_limit (id, key, count, last_request) VALUES (gen_random_uuid()::text, ${key}, 3, ${lastRequest})`,
+      );
+    }
+
+    const { ctx, result } = await run();
+
+    expect(result).toEqual({ done: true });
+    expect(ctx.outcomes("retention")).not.toContain("error");
+    expect(await rowsLike(keys.old)).toEqual([]);
+    expect(await rowsLike(keys.oldDay)).toEqual([]);
+    expect(await rowsLike(keys.day)).toEqual([expect.objectContaining({ count: 3 })]);
+    expect(await rowsLike(keys.recent)).toEqual([expect.objectContaining({ count: 3 })]);
+    await db().execute(sql`DELETE FROM rate_limit WHERE key IN (${keys.day}, ${keys.recent})`);
+  });
+});
+
 describe("the job", () => {
-  it("lists both tables as steps", () => {
+  it("lists the tables as steps", () => {
     const tables = RETENTION_STEPS.map((step) => step.table);
     expect(tables).toContain("session");
     expect(tables).toContain("reports");
+    expect(tables).toContain("rate_limit");
   });
 });

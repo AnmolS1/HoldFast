@@ -39,6 +39,7 @@ import { hashPassword, verifyPassword } from "./password";
 import { cleanUpOrFlag, endPasswordStanding, passkeyAuthentication } from "./second-factor";
 import { asciiLower } from "../../shared/admin-emails";
 import { isStoredFormAddress } from "./preflight";
+import { authLimitStore } from "./rate-limit-store";
 import { COOKIE_HOST_PREFIX } from "./signed-cookie";
 import { provingVerify } from "./signin-throttle";
 import { afterAnswer, createScope, emptyFacts, type AuthScope } from "./scope";
@@ -131,7 +132,12 @@ export function buildAuthOptions(scope: AuthScope) {
     },
     rateLimit: {
       enabled: true,
+      // The table the rows live in (and what the schema is generated from: auth/config.ts) — but
+      // they are written by our own store, which keys them by a hash of the address, not the
+      // address (auth/rate-limit-store.ts). With it, Better Auth's own pruning is off: the rows
+      // go with the retention job.
       storage: "database" as const,
+      customStorage: authLimitStore(db, scope.keys),
       window: 60,
       max: 30,
       customRules: {

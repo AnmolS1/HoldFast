@@ -1,13 +1,16 @@
 // GET /api/account/export: what the file holds, what it never holds, and that a held account's
 // export is the same as an unheld one's.
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { generationInStep } from "../trash/helpers";
 import { ExportManifest } from "../../../src/shared/schemas/account";
+import { storedAuthLimitKey } from "../../../src/worker/auth/rate-limit-store";
+import { EXPORT_DAILY_LIMIT, exportSlotKeys } from "../../../src/worker/db/queries/account";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
 import { nodes, shareLinks, user } from "../../../src/worker/db/schema";
-import { makeLink } from "../auth/helpers";
+import { makeLink, newClient, signIn } from "../auth/helpers";
+import { testKeys } from "../sharing/helpers";
 import {
   api,
   auditRows,
@@ -260,5 +263,65 @@ describe("a held account", () => {
     // moved by the un-held file only"); the export answers it without them.
     expect(a.user.usedBytes).toBe(b.user.usedBytes);
     expect(a.user.usedBytes).toBe(100);
+  });
+});
+
+describe("the export's day budget", () => {
+  const HOUR = 3_600_000;
+  const dayCount = async (userId: string) =>
+    (
+      await testDb().execute<{ count: number }>(
+        sql`SELECT count FROM rate_limit WHERE key = ${exportSlotKeys(userId).day}`,
+      )
+    ).rows[0]?.count ?? null;
+
+  it("outlives Better Auth's limiter: a day spent two hours ago still refuses the next export after a sign-in window starts again (R1 V1-n1)", async () => {
+    const owner = await person();
+    // The day's exports were taken two hours ago (`last_request` is when the day began).
+    await testDb().execute(
+      sql`INSERT INTO rate_limit (id, key, count, last_request)
+          VALUES (gen_random_uuid()::text, ${exportSlotKeys(owner.id).day}, ${EXPORT_DAILY_LIMIT}, ${Date.now() - 2 * HOUR})`,
+    );
+    // Any client's sign-in whose window has run out starts it again — the moment Better Auth's own
+    // database storage pruned the WHOLE table of rows older than its longest window (one hour).
+    const client = newClient();
+    const nobody = `nobody-${rand()}@example.test`;
+    expect((await signIn(client, nobody, "made-up password 1!")).status).toBe(401);
+    const stored = [`${client.ip}|/sign-in/email`, await storedAuthLimitKey(testKeys(), `${client.ip}|/sign-in/email`)];
+    const aged = await testDb().execute(
+      sql`UPDATE rate_limit SET last_request = last_request - ${2 * HOUR}
+          WHERE key IN (${stored[0]}, ${stored[1]}) RETURNING key`,
+    );
+    expect(aged.rows).toHaveLength(1);
+    expect((await signIn(client, nobody, "made-up password 1!")).status).toBe(401);
+    // The control: the sign-in row's window did start again.
+    const [restarted] = (
+      await testDb().execute<{ count: number }>(
+        sql`SELECT count FROM rate_limit WHERE key IN (${stored[0]}, ${stored[1]})`,
+      )
+    ).rows;
+    expect(restarted?.count).toBe(1);
+
+    expect(await dayCount(owner.id)).toBe(EXPORT_DAILY_LIMIT);
+    const refused = await api(owner.as, "GET", "/account/export");
+    expect(refused.status).toBe(429);
+  });
+
+  it("is not spent by a cross-site navigation (R1 secsrv-3): cross-site and same-site are refused before counting; same-origin and none export", async () => {
+    const owner = await person();
+    for (const site of ["cross-site", "same-site"]) {
+      const answer = await api(owner.as, "GET", "/account/export", { headers: { "sec-fetch-site": site } });
+      expect(answer.status, site).toBe(403);
+      expect(answer.body).toMatchObject({ error: "forbidden" });
+      expect(await dayCount(owner.id), site).toBeNull();
+    }
+    expect(await auditRows({ action: "account.export", targetId: owner.id })).toHaveLength(0);
+    // The control: the app's own link (same-origin), a typed address (none) and a client that sends
+    // no Fetch Metadata at all are served — and counted.
+    for (const [i, headers] of [{ "sec-fetch-site": "same-origin" }, { "sec-fetch-site": "none" }, {}].entries()) {
+      const answer = await api(owner.as, "GET", "/account/export", { headers });
+      expect(answer.status, JSON.stringify(headers)).toBe(200);
+      expect(await dayCount(owner.id)).toBe(i + 1);
+    }
   });
 });

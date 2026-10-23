@@ -314,6 +314,12 @@ const exportNode = (row: ExportNodeRow) =>
 router.get("/account/export", async (c) => {
   const user = requireVerified(c);
   assertContentAccess(c);
+  // A GET, but it spends the day's budget: another site must not be able to spend it by navigating
+  // the owner's browser here (R1 secsrv-3; the session cookie is SameSite=Lax, csrf.ts passes GETs).
+  // The app's own link is same-origin; a typed address is `none`; no header at all is let through.
+  const site = c.req.header("sec-fetch-site");
+  if (site === "cross-site" || site === "same-site")
+    throw new AppError("forbidden", "Cross-site request refused.", { reason: "csrf" });
   const handle = db(c);
   const at = now(c);
   const admitted = await admitExport(handle, user.id);
