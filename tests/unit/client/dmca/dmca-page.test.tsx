@@ -20,7 +20,7 @@ setupShell();
 describe("agent.ts — the designated agent's details as data", () => {
   // THE SENTINEL. Anmol has not registered the agent with the Copyright Office yet (T29 §B.1,
   // deferred to Gate B on 2026-10-22). Until he supplies the details exactly as registered, every
-  // field carries `TODO_`; the page renders it as it is, and the Gate-B checks fail while it does:
+  // field carries `TODO_`; the page says the registration is pending, and the Gate-B checks fail:
   // the @prod-safe agent-details test in tests/e2e/dmca.spec.ts skips (and a skip fails the gate
   // run), and verify-gate-b.sh will grep agent.ts once T30 writes it. When the details arrive:
   // replace the four values in agent.ts AND, in the same commit, flip this first test (every field
@@ -77,15 +77,24 @@ describe("/dmca", () => {
   // Anmol's choice (DEMONOTICE, 2026-10-22): while agent.ts carries the sentinel the page says the
   // registration is pending — not a single `TODO_` reaches the DOM (text or attribute). The Gate-B
   // checks still fail on agent.ts itself; this only changes what the public sees meanwhile.
-  it("while agent.ts carries the sentinel: says the registration is pending, and no TODO_ reaches the DOM", async () => {
-    expect(agentHasSentinel).toBe(true);
-    await open();
-    const agent = screen.getByRole("region", { name: "Designated agent" });
+  // Made-up details with the sentinel in one field only, so this test holds before AND after agent.ts
+  // is filled (the e2e test checks the real AGENT in either state).
+  it("while the agent carries the sentinel: says the registration is pending, and no TODO_ reaches the DOM", async () => {
+    const pending = {
+      name: "Example Agent",
+      address: "1 Example St",
+      phone: "+1 555 0100",
+      email: `${SENTINEL}EMAIL`,
+    };
+    shellFetch({ session: null });
+    renderRoutes([{ path: "/dmca", element: <DmcaPage agent={pending} /> }], ["/dmca"]);
+    const agent = await screen.findByRole("region", { name: "Designated agent" });
     expect(agent.textContent).toContain("Designated agent registration pending");
     expect(agent.querySelector("[data-dmca-agent]")).toBeNull();
     expect(within(agent).queryByRole("link")).toBeNull();
     // The whole document, attributes included (a mailto: href is not text).
     expect(document.documentElement.outerHTML).not.toContain(SENTINEL);
+    expect(document.body.textContent).not.toContain("Example Agent");
     // The rest of the page is as built.
     expect(screen.getByRole("region", { name: "Sending a notice" })).toBeTruthy();
     expect(screen.getByRole("region", { name: "Counter-notice" })).toBeTruthy();

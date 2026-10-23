@@ -2,9 +2,11 @@
 // registered in the Copyright Office's DMCA Designated Agent Directory.
 //
 // NOT REGISTERED YET (T29 §B.1 is Anmol's step; deferred to Gate B). Until the registration is done
-// every field carries the sentinel (`SENTINEL` below), and the page renders it as it is: the Gate-B
-// checks fail while it does (tests/e2e/dmca.spec.ts's agent-details test skips, and a skip fails the
-// gate run; verify-gate-b.sh will grep this file once T30 writes it). Never put a guessed name, address or phone here.
+// every field carries the sentinel (`SENTINEL` below). The page then says "Designated agent
+// registration pending" instead of showing the fields (DmcaPage.tsx; Anmol, 2026-10-22), and the
+// Gate-B checks fail while the sentinel is here (tests/e2e/dmca.spec.ts's agent-details test skips,
+// and a skip fails the gate run; verify-gate-b.sh greps this file). Never put a guessed name,
+// address or phone here.
 //
 // Plain data on purpose: the e2e spec imports this file in Node.
 

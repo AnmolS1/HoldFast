@@ -8,6 +8,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { authClient } from "../../../../src/client/lib/auth-client";
 import { buildRoutes } from "../../../../src/client/router";
+import { redirectErrorMessage } from "../../../../src/client/routes/auth/errors";
 import {
   validateIntent,
   validateSignup,
@@ -58,6 +59,12 @@ describe("validation (pure)", () => {
   it("demo mode off: nothing is asked", () => {
     expect(validateSignup(valid, { inviteRequired: true, now: NOW })).toEqual({});
     expect(validateSignup(valid, { inviteRequired: true, demoMode: false, now: NOW })).toEqual({});
+  });
+});
+
+describe("a Google sign-up refused at the callback (?error=DEMO_NOT_ACCEPTED)", () => {
+  it("reads as our sentence, not the generic one", () => {
+    expect(redirectErrorMessage("DEMO_NOT_ACCEPTED")).toBe("Accept the closed-test notice to continue.");
   });
 });
 

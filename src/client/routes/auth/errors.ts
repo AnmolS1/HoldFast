@@ -24,6 +24,7 @@ const REDIRECT_ERRORS = new Map<string, MessageKey>([
   // The sign-up policy's refusals (src/worker/services/signup-policy.ts), as a Google sign-up meets them.
   ["SIGNUP_PAUSED", "auth.redirect.signupPaused"],
   ["TERMS_NOT_ACCEPTED", "signup.error.assent"],
+  ["DEMO_NOT_ACCEPTED", "signup.error.demo"],
   ["SIGNUP_NOT_AVAILABLE", "auth.redirect.notAvailable"],
   ["EMAIL_NOT_ALLOWED", "auth.redirect.emailNotAllowed"],
   ["SIGNUP_LIMIT", "auth.redirect.signupLimit"],
