@@ -344,6 +344,11 @@ describe("data: export", () => {
               usedBytes: 0,
               termsAcceptedAt: null,
               termsVersion: null,
+              demoNoticeAcceptedAt: null,
+              demoNoticeVersion: null,
+              ageVerifiedAt: null,
+              emailVerified: true,
+              twoFactorEnabled: false,
             },
             prefs: PREFS,
             nodes: [],
@@ -351,6 +356,9 @@ describe("data: export", () => {
             sharedWithMe: [],
             links: [],
             activity: [],
+            sessions: [],
+            passkeys: [],
+            signInMethods: [],
           })
         : undefined,
     );
