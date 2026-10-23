@@ -13,6 +13,10 @@ import { uuidv7 } from "../../../src/worker/db/ids";
 import { enqueueRescan } from "../../../src/worker/services/scanning";
 import {
   cleanBytes,
+  infectedBytes,
+  listing,
+  sha256Of,
+  strikesOf,
   serviceDeps,
   deliver,
   enc,
@@ -243,5 +247,46 @@ describe("acceptance: not_ready leaves the node pending, retries with backoff, a
     const row = (await nodeById(file.id))!;
     expect(row).toMatchObject({ scanStatus: "pending", scanReason: null });
     expect(sentryCalls()).toBe(0);
+  });
+});
+
+// R1 func-12 (SUSPECTED in review, settled here): every upload has two messages on one key (the R2
+// event and the route's own). The first dead-letters during an outage and marks the node
+// error/timeout; the second, still retrying, then brings a real verdict. That verdict used to be
+// only recorded (a "late message"): an infected file kept no strike, no blocklist entry, and its
+// owner could still download it as "unscanned".
+describe("func-12: a real verdict after a sibling message dead-lettered the node", () => {
+  it("infected: the node is infected, the uploader struck and the hash listed — as on a pending node", async () => {
+    const bytes = infectedBytes();
+    const { file, owner } = await uploadedFile(bytes);
+    await jobIn(file, { status: "failed", lastError: "timeout", verdict: { requeuedFromDlq: true } });
+    expect(await deliver([{ body: explicit(file) }], {}, DLQ)).toEqual(ack);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "error", scanReason: "timeout" });
+    // The sibling message's next delivery: the job is failed, so it is claimed and scanned.
+    expect(await deliver([{ body: explicit(file), attempts: 3 }])).toEqual(ack);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "infected" });
+    expect(await strikesOf(owner.id)).toHaveLength(1);
+    expect(await listing(await sha256Of(bytes))).toMatchObject({ reason: "malware" });
+  });
+
+  it("clean: the placeholder error gives way to the verdict", async () => {
+    const { file } = await uploadedFile(cleanBytes());
+    await jobIn(file, { status: "failed", lastError: "engine", verdict: { requeuedFromDlq: true } });
+    await deliver([{ body: explicit(file) }], {}, DLQ);
+    expect((await nodeById(file.id))!.scanStatus).toBe("error");
+    expect(await deliver([{ body: explicit(file), attempts: 3 }])).toEqual(ack);
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "clean", scanReason: null });
+  });
+
+  it("CONTROL: an error a scan decided (scannedAt set) is not overwritten by a late message", async () => {
+    for (const scanReason of ["hash_mismatch", "engine"] as const) {
+      const { file } = await uploadedFile(cleanBytes(), {
+        scanStatus: "error",
+        scanReason,
+        scannedAt: new Date(),
+      });
+      await deliver([{ body: explicit(file, true) }]);
+      expect(await nodeById(file.id), scanReason).toMatchObject({ scanStatus: "error", scanReason });
+    }
   });
 });

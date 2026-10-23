@@ -527,6 +527,15 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     };
     await recordDetection(bg, detection);
   }
+  /**
+   * An `error` no scan decided: the dead-letter consumer's (or a refusal's) `timeout`/`engine` on a
+   * version no scan has answered (`scannedAt` unset — a replace and a rescan clear it). An error a
+   * verdict wrote (`hash_mismatch`, a scanner `error` answer) carries its `scannedAt`.
+   */
+  const deadLettered = (node: Node) =>
+    node.scanStatus === "error" &&
+    (node.scanReason === "timeout" || node.scanReason === "engine") &&
+    node.scannedAt === null;
   type Decided =
     | { kind: "gone"; photodna?: PhotoDnaDetection | null }
     | {
@@ -592,8 +601,10 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);
-    } else if (node.scanStatus === "pending" || node.scanStatus === "under_review") {
-      // `pending`: the status. `under_review`: `setScanResult` stores the outcome as the status a
+    } else if (node.scanStatus === "pending" || node.scanStatus === "under_review" || deadLettered(node)) {
+      // `pending`: the status. A dead letter's `error` (`deadLettered`) is no verdict — the
+      // object's other message, still alive, brings the real one, and it is applied as on `pending`
+      // (R1 func-12: an infected file kept no strike, no listing, and stayed downloadable). `under_review`: `setScanResult` stores the outcome as the status a
       // dismissal restores — and the effects below still apply (Addendum 2): a blocklisted hash
       // is taken down NOW, so dismissing the report can never restore an accessible file, and an
       // infected verdict strikes and notifies as it would on a pending node.
