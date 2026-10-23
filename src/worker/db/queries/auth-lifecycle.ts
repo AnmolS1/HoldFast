@@ -10,6 +10,7 @@
 // `pending_user_purges` are ours (`timestamptz`) and compare with `now()` freely.
 
 import { and, eq, gt, isNotNull, isNull, like, ne, or, sql } from "drizzle-orm";
+import { hasAdminRole } from "../../../shared/roles";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import {
@@ -438,6 +439,85 @@ export async function clearSuspended(db: Executor, userId: string): Promise<bool
     .set({ suspendedAt: null, suspendedReason: null })
     .where(and(eq(user.id, userId), sql`${user.suspendedAt} IS NOT NULL`))
     .returning({ id: user.id });
+  return rows.length > 0;
+}
+
+// ── the admins that are left ────────────────────────────────────────────────────────────────
+
+/**
+ * Locks EVERY row whose role names `admin`, in id order, and returns the ids of those that can
+ * still act: not suspended, not banned, no deletion scheduled. Call it FIRST in the transaction
+ * that suspends or schedules the deletion of an admin — before that transaction locks any other
+ * user row — so two admins acting on each other at once are served one after the other, and the
+ * second sees the first's change (a waiting `FOR UPDATE` reads the row as it was committed).
+ */
+export async function lockActiveAdmins(tx: Executor, at: Date): Promise<string[]> {
+  const rows = await tx
+    .select({
+      id: user.id,
+      role: user.role,
+      suspendedAt: user.suspendedAt,
+      banned: user.banned,
+      banExpires: user.banExpires,
+      deleteScheduledAt: user.deleteScheduledAt,
+    })
+    .from(user)
+    .where(like(user.role, "%admin%"))
+    .orderBy(user.id)
+    .for("update");
+  return rows
+    .filter(
+      (row) =>
+        hasAdminRole(row.role) &&
+        row.suspendedAt === null &&
+        row.deleteScheduledAt === null &&
+        !(row.banned === true && (row.banExpires === null || row.banExpires.getTime() > at.getTime())),
+    )
+    .map((row) => row.id);
+}
+
+// ── a deletion an admin ordered ─────────────────────────────────────────────────────────────
+
+/**
+ * The mark of a deletion an ADMIN scheduled (R1 secsrv-1, ruling Q6): a `verification` row
+ * `admin-deletion:<user id>`, as `admin-bootstrap:` is the bootstrap list's. The identifier ends
+ * with the user id, so every path that removes an account's verification rows (`tokensOf`: the
+ * purge's `purgeAuthRows`, the unproven-address reset) removes it too; the value is NOT a user
+ * id, so no other account's cleanup can. Written and read under the user's row lock.
+ */
+const adminDeletionMarker = (userId: string) => `admin-deletion:${userId}`;
+
+export async function markAdminDeletion(tx: Executor, userId: string): Promise<void> {
+  const at = new Date();
+  await tx.delete(verification).where(eq(verification.identifier, adminDeletionMarker(userId)));
+  await tx.insert(verification).values({
+    id: crypto.randomUUID(),
+    identifier: adminDeletionMarker(userId),
+    value: "admin",
+    // Never, in practice: the nightly sweep removes only rows that have expired, and a held
+    // account's deletion can stay scheduled for as long as the hold lasts.
+    expiresAt: new Date(at.getTime() + 20 * 365 * 86_400_000),
+    createdAt: at,
+    updatedAt: at,
+  });
+}
+
+export async function clearAdminDeletion(tx: Executor, userId: string): Promise<void> {
+  await tx.delete(verification).where(eq(verification.identifier, adminDeletionMarker(userId)));
+}
+
+export async function adminDeletionMarked(db: Executor, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: verification.id })
+    .from(verification)
+    .where(eq(verification.identifier, adminDeletionMarker(userId)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/** Takes the user's row lock (the estate's lock order: the user row first). False: no such user. */
+export async function lockUser(tx: Executor, userId: string): Promise<boolean> {
+  const rows = await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
   return rows.length > 0;
 }
 
