@@ -3,7 +3,8 @@
 // 1. Recreate this checkout's local database (HOLDFAST_DB) and apply the migrations. A fresh
 //    checkout has no schema, and a missing schema surfaces as a 500 that looks like a missing env
 //    var. Runs after Playwright has started its dev server, which is fine: the Worker opens its
-//    database connection per request.
+//    database connection per request. Then the one settings row the run needs: `linksEnabled`
+//    true (with no row, public links are off — the default fails closed).
 //
 // 2. WARM THE DEV SERVER — the cause of the "two tests time out together" flake. Playwright
 //    considers the server ready when `/__meta` answers: the Worker is up, and NOTHING of the
@@ -29,7 +30,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type FullConfig } from "@playwright/test";
-import { localDbName } from "./local-env";
+import pg from "pg";
+import { localDbName, localDbUrl } from "./local-env";
 
 /** The local bucket (wrangler.jsonc, top-level `r2_buckets`) and the detector's key in it. */
 export const LOCAL_BUCKET = "holdfast-files-dev";
@@ -113,6 +115,22 @@ function forgetGenerationObject(root: string): void {
   }
 }
 
+/**
+ * Step 1b. Public links are on in the e2e database: with no `linksEnabled` row they are off
+ * (request-context.ts `resolveSettings` fails closed), and the fresh database has no rows.
+ */
+async function seedSettings(): Promise<void> {
+  const client = new pg.Client({ connectionString: localDbUrl() });
+  await client.connect();
+  try {
+    await client.query(
+      `insert into settings (key, value) values ('linksEnabled', 'true'::jsonb) on conflict (key) do nothing`,
+    );
+  } finally {
+    await client.end();
+  }
+}
+
 export default async function globalSetup(config: FullConfig): Promise<void> {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   execFileSync(resolve(root, "scripts/db-reset.sh"), {
@@ -120,6 +138,7 @@ export default async function globalSetup(config: FullConfig): Promise<void> {
     stdio: "inherit",
     env: { ...process.env, HOLDFAST_DB: localDbName() },
   });
+  await seedSettings();
   forgetGenerationObject(root);
   const baseURL = config.projects[0]?.use.baseURL;
   if (!baseURL) throw new Error("e2e warm-up: no baseURL");
