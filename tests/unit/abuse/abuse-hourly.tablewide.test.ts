@@ -48,6 +48,7 @@ afterEach(() => {
 async function rolledBack(body: (db: Db) => Promise<void>): Promise<void> {
   await testDb()
     .transaction(async (tx) => {
+      await pinClockToTransaction(tx as unknown as Db);
       await body(tx as unknown as Db);
       throw ROLLBACK;
     })
@@ -57,11 +58,12 @@ async function rolledBack(body: (db: Db) => Promise<void>): Promise<void> {
 }
 
 /**
- * Freezes the test's clock at the transaction's. Inside `rolledBack` Postgres `now()` is the
- * transaction's start for the whole test, so with JS `Date` frozen at that same instant the UTC
- * day the job's code computes (`utcDay()`) and the one its SQL computes (`now()`) are one day,
- * whatever the wall clock does meanwhile: a run that straddled 00:00 UTC failed "the next day:
- * one more" (the JS day moved on, the SQL day did not). `afterEach` restores the real clock.
+ * Freezes the test's clock at its transaction's (`rolledBack` calls it first). Inside one
+ * transaction Postgres `now()` is the transaction's start, so with JS `Date` frozen at that same
+ * instant the UTC day the job's code computes (`utcDay()`) and the one its SQL computes (`now()`)
+ * are one day, whatever the wall clock does meanwhile: a run that straddled 00:00 UTC failed
+ * "the next day: one more" (the JS day moved on, the SQL day did not). A test that fakes timers
+ * again replaces this; `afterEach` restores the real clock.
  */
 async function pinClockToTransaction(db: Db): Promise<void> {
   const [row] = (await db.execute(sql`select now() as at`)).rows as { at: string | Date }[];
@@ -159,7 +161,6 @@ async function lockedFile(db: Db, opsEnv: Record<string, unknown>) {
 describe("(0) the CSAM-alert sweep in abuse-hourly", () => {
   it("an open csam report on a locked file, unclaimed today → one run: exactly one critical mail, the marker claimed, one scan.csam_alert_sent (via sweep) and NO new scan.suspected_csam row; a second run the same day: none; the next day: one more; a report no longer open: none", async () => {
     await rolledBack(async (db) => {
-      await pinClockToTransaction(db);
       const ops = operators();
       only("sweepCsamAlerts");
       const { file, reportId } = await lockedFile(db, ops.env);
