@@ -276,13 +276,35 @@ describe("mobile frame", () => {
     );
   });
 
-  it("the FAB offers New folder and Upload in a sheet", async () => {
+  // Upload folder only where the browser can pick a folder (F01 step 4): jsdom's input has no
+  // `webkitdirectory`, so the first case is a browser without it; the second gives it one.
+  it("the FAB offers New folder and Upload in a sheet (no folder picking: no Upload folder)", async () => {
+    expect("webkitdirectory" in HTMLInputElement.prototype).toBe(false);
     await openAt(390);
     fireEvent.click(screen.getByRole("button", { name: "New" }));
     const sheet = await screen.findByRole("dialog", { name: "New" });
     expect(
       Array.from(sheet.querySelectorAll("[data-new-action]"), (n) => n.getAttribute("data-new-action")),
     ).toEqual(["new-folder", "upload"]);
+  });
+
+  it("the FAB offers Upload folder where folder picking works", async () => {
+    Object.defineProperty(HTMLInputElement.prototype, "webkitdirectory", {
+      configurable: true,
+      get: () => false,
+      set: () => {},
+    });
+    try {
+      await openAt(390);
+      fireEvent.click(screen.getByRole("button", { name: "New" }));
+      const sheet = await screen.findByRole("dialog", { name: "New" });
+      expect(
+        Array.from(sheet.querySelectorAll("[data-new-action]"), (n) => n.getAttribute("data-new-action")),
+      ).toEqual(["new-folder", "upload", "upload-folder"]);
+      expect(within(sheet).getByText("Upload folder…")).toBeTruthy();
+    } finally {
+      delete (HTMLInputElement.prototype as { webkitdirectory?: boolean }).webkitdirectory;
+    }
   });
 
   it("read-only disables New and says why", async () => {

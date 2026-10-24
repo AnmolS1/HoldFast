@@ -23,6 +23,13 @@ import {
   type UploadRequest,
 } from "../../../../src/client/lib/contracts";
 import { purgeUserState } from "../../../../src/client/lib/query";
+import {
+  isCharacterShortcut,
+  matchShortcut,
+  shortcutLabel,
+  SHORTCUTS,
+} from "../../../../src/client/lib/shortcuts";
+import { canPickFolders } from "../../../../src/client/routes/frame/new-actions";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import { FOLDER_ID, OTHER_USER_ID, usageDto } from "./fixtures";
 import { freshUploader, installServer, json, settle, smallFile, type Server } from "./helpers";
@@ -371,5 +378,59 @@ describe("the folder picker's mark of the user's action", () => {
     await act(() => settle());
     expect(server.inits.map((body) => body.name).sort()).toEqual(["a.jpg", "b.jpg"]);
     expect(folderCalls()).toEqual(["trip"]);
+  });
+});
+
+// ---- the entry points' own rules ----------------------------------------------------------------
+
+describe("⌘⇧U / Ctrl+Shift+U", () => {
+  const press = (key: string, mods: { meta?: boolean; ctrl?: boolean; shift?: boolean }) => ({
+    key,
+    metaKey: Boolean(mods.meta),
+    ctrlKey: Boolean(mods.ctrl),
+    shiftKey: Boolean(mods.shift),
+    altKey: false,
+  });
+
+  it("is Upload folder; ⌘U stays Upload files — on a Mac and elsewhere", () => {
+    expect(matchShortcut(press("U", { meta: true, shift: true }), true)).toBe("uploadFolder");
+    expect(matchShortcut(press("u", { meta: true }), true)).toBe("upload");
+    expect(matchShortcut(press("U", { ctrl: true, shift: true }), false)).toBe("uploadFolder");
+    expect(matchShortcut(press("u", { ctrl: true }), false)).toBe("upload");
+    expect(shortcutLabel("uploadFolder", true)).toBe("⌘⇧U");
+    expect(shortcutLabel("uploadFolder", false)).toBe("Ctrl+Shift+U");
+  });
+
+  it("works while the caret is in a text field, and the Single-key switch leaves it alone", () => {
+    const def = SHORTCUTS.find((shortcut) => shortcut.id === "uploadFolder")!;
+    expect(def.global).toBe(true);
+    expect(isCharacterShortcut(def)).toBe(false);
+  });
+});
+
+describe("canPickFolders (the FAB's guard)", () => {
+  const ua = navigator.userAgent;
+  const withPicker = () =>
+    Object.defineProperty(HTMLInputElement.prototype, "webkitdirectory", {
+      configurable: true,
+      get: () => false,
+      set: () => {},
+    });
+  const setUa = (value: string) =>
+    Object.defineProperty(navigator, "userAgent", { value, configurable: true });
+
+  it("no webkitdirectory: no; with it: yes; Samsung Internet: no", () => {
+    try {
+      expect(canPickFolders()).toBe(false);
+      withPicker();
+      expect(canPickFolders()).toBe(true);
+      setUa(
+        "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/25.0 Chrome/121.0.0.0 Mobile Safari/537.36",
+      );
+      expect(canPickFolders()).toBe(false);
+    } finally {
+      delete (HTMLInputElement.prototype as { webkitdirectory?: boolean }).webkitdirectory;
+      setUa(ua);
+    }
   });
 });
