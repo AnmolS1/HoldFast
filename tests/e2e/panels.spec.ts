@@ -313,6 +313,22 @@ test.describe("desktop side panels (mocked API)", () => {
     expect(await focused(page)).toBe("hf-toggle-sidebar");
   });
 
+  test("hidden from the palette while focus was on a link the rail drops (Manage storage): focus goes to the toggle, not <body>", async ({
+    page,
+    origins,
+  }) => {
+    await serve(page, origins.port);
+    await openFolder(page);
+    await page.locator('[data-sidebar] a[href="/storage"]').focus();
+    await page.keyboard.press(`${await modKey(page)}+k`);
+    const palette = page.getByRole("dialog", { name: "Command palette" });
+    await palette.getByRole("combobox").fill("Hide sidebar");
+    await page.keyboard.press("Enter");
+    await expect(palette).toBeHidden();
+    await expect(sidebar(page)).toHaveAttribute("data-rail", "true");
+    await expect(page.getByRole("button", { name: "Sidebar", exact: true })).toBeFocused();
+  });
+
   test("at 1024 px with both panels at their maximum the content keeps ≥ 480 px, and the stored widths stay; details:false routes are unaffected", async ({
     page,
     origins,

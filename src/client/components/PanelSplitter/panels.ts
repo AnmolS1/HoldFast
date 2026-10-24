@@ -40,20 +40,51 @@ export function isPanelShown(panel: PanelId, value: PanelLayout = getLayout()): 
 }
 
 /**
+ * The element that had focus before a dialog took it (the palette): a command run from the
+ * palette hides a panel while focus is in the palette, and on closing the palette hands focus
+ * back to this element — which may be inside the panel just hidden.
+ */
+let focusBeforeDialog: Element | null = null;
+if (typeof document !== "undefined")
+  document.addEventListener("focusin", (event) => {
+    if (event.target instanceof Element && !event.target.closest('[role="dialog"], [role="alertdialog"]'))
+      focusBeforeDialog = event.target;
+  });
+
+const dialogOpen = () => document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
+
+/** Whether `element` sits in `panel` (or, for details, on its splitter, which goes with it). */
+function holds(panel: PanelId, element: Element | null): boolean {
+  if (!element) return false;
+  return (
+    document.getElementById(PANEL_IDS[panel])?.contains(element) === true ||
+    (panel === "details" && element.closest('[data-splitter="details"]') !== null)
+  );
+}
+
+/**
  * Show or hide a panel (the sidebar hides to its icon rail). When the panel being hidden — or its
  * splitter, which goes with the details panel — holds focus, focus moves to the panel's toggle
- * first: once the panel is `display: none` the browser would drop focus on <body>.
+ * first: once the panel is `display: none` the browser would drop focus on <body>. Run from a
+ * dialog (the palette) whose return target is in that panel, the toggle takes focus once the
+ * dialog has closed and found its target gone.
  */
 export function setPanelShown(panel: PanelId, shown: boolean): void {
   const current = getLayout();
   if (isPanelShown(panel, current) === shown) return;
   if (!shown) {
     const active = document.activeElement;
-    const inside =
-      active instanceof Element &&
-      (document.getElementById(PANEL_IDS[panel])?.contains(active) === true ||
-        (panel === "details" && active.closest('[data-splitter="details"]') !== null));
-    if (inside) document.getElementById(TOGGLE_IDS[panel])?.focus();
+    const toggle = () => document.getElementById(TOGGLE_IDS[panel])?.focus();
+    if (holds(panel, active)) toggle();
+    else if (active?.closest('[role="dialog"], [role="alertdialog"]') && holds(panel, focusBeforeDialog)) {
+      // Bounded: about a second of frames for the dialog to close; only <body> is taken over.
+      let frames = 60;
+      const check = () => {
+        if (dialogOpen() && frames-- > 0) return void requestAnimationFrame(check);
+        if (document.activeElement === document.body || document.activeElement === null) toggle();
+      };
+      requestAnimationFrame(check);
+    }
   }
   setLayout(
     panel === "sidebar"
