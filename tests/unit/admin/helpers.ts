@@ -131,6 +131,7 @@ export async function call(
     RL_API: allow,
     RL_FILES: allow,
     RL_LINKS: allow,
+    RL_ADMIN: allow,
     ...options.env,
   } as unknown as Env;
   const headers: Record<string, string> = { ...options.headers };
