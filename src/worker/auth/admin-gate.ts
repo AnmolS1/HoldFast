@@ -124,11 +124,48 @@ export async function recordAdminDenial(
 
 type GateContext = Parameters<typeof getSessionFromCtx>[0] & { path?: string; method?: string };
 
-/** The plugin's role spelling (`parseRoles`): a list is stored comma-joined. Null = not a role. */
-function roleOf(value: unknown): string | null {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value) && value.every((item) => typeof item === "string")) return value.join(",");
-  return null;
+/** An account id as Better Auth makes them, and nothing the plugin's coercion could turn into one. */
+const ACCOUNT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** The two roles the console sets (the plugin is configured with no `roles`, so it checks none). */
+const CONSOLE_ROLES: readonly string[] = ["user", "admin"];
+
+const malformed = () => new AppError("validation", "This request is not valid.");
+
+/**
+ * The body as the plugin will act on it — read HERE, strictly, because the before-hook runs on
+ * the parsed but NOT yet validated body (better-auth api/dispatch.mjs: hooks, then the endpoint's
+ * schema), and that schema coerces `userId` (`z.coerce.string()`: `["id"]` is "id"). Anything
+ * this cannot read exactly as the plugin will — a `userId` that is not a plain id string, a ban
+ * field of the wrong type, a role the console does not set — is `400 validation` (fail closed),
+ * so the gate never checks one account while the plugin acts on another, and never writes a
+ * change the plugin's schema would then refuse.
+ */
+function pluginChange(
+  path: string,
+  body: unknown,
+): { userId: string; change: Parameters<typeof writeAdminPluginChange>[2] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw malformed();
+  const fields = body as { userId?: unknown; role?: unknown; banReason?: unknown; banExpiresIn?: unknown };
+  const userId = fields.userId;
+  if (typeof userId !== "string" || !ACCOUNT_ID.test(userId)) throw malformed();
+  if (path === "/admin/ban-user") {
+    const { banReason, banExpiresIn } = fields;
+    if (banReason !== undefined && typeof banReason !== "string") throw malformed();
+    if (banExpiresIn !== undefined && !(typeof banExpiresIn === "number" && Number.isFinite(banExpiresIn))) {
+      throw malformed();
+    }
+    // The plugin's own values (routes.mjs `banUser`; no default reason or expiry is configured).
+    return {
+      userId,
+      change: {
+        banned: true,
+        banReason: banReason || "No reason",
+        banExpires: banExpiresIn ? new Date(Date.now() + banExpiresIn * 1000) : null,
+      },
+    };
+  }
+  if (typeof fields.role !== "string" || !CONSOLE_ROLES.includes(fields.role)) throw malformed();
+  return { userId, change: { role: fields.role } };
 }
 
 /**
@@ -138,33 +175,11 @@ function roleOf(value: unknown): string | null {
  * transaction under `lockActiveAdmins`' lock — the change is written here, ahead of the plugin
  * (`writeAdminPluginChange`) — so two admins banning or demoting each other at once, or one
  * suspending while the other bans, are served one after the other and the second sees the first.
- * A promotion takes nothing away and is not checked; a malformed body is left to the plugin.
+ * A promotion takes nothing away and is not checked. The body is read first (`pluginChange`).
  */
 async function keepAnAdmin(scope: AuthScope, actorId: string, path: string, body: unknown): Promise<void> {
-  const fields = (body ?? {}) as {
-    userId?: unknown;
-    role?: unknown;
-    banReason?: unknown;
-    banExpiresIn?: unknown;
-  };
-  const userId = typeof fields.userId === "number" ? String(fields.userId) : fields.userId;
-  if (typeof userId !== "string" || userId === "") return;
-  let change: Parameters<typeof writeAdminPluginChange>[2];
-  if (path === "/admin/ban-user") {
-    // The plugin's own values (routes.mjs `banUser`; no default reason or expiry is configured).
-    const seconds = typeof fields.banExpiresIn === "number" ? fields.banExpiresIn : 0;
-    change = {
-      banned: true,
-      banReason:
-        typeof fields.banReason === "string" && fields.banReason !== "" ? fields.banReason : "No reason",
-      banExpires: seconds ? new Date(Date.now() + seconds * 1000) : null,
-    };
-  } else {
-    const role = roleOf(fields.role);
-    if (role === null) return;
-    change = { role };
-  }
   try {
+    const { userId, change } = pluginChange(path, body);
     refuseSelfAction({ type: "admin", userId: actorId }, userId);
     if ("role" in change && hasAdminRole(change.role)) return;
     await scope.db.transaction(async (tx) => {

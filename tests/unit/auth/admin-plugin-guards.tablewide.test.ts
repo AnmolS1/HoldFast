@@ -230,3 +230,89 @@ describe("two admins acting on each other at the same moment leave exactly one w
     }
   });
 });
+
+// Security review of the guard: the before-hook sees the body as JSON-parsed, NOT yet validated —
+// the plugin's zod schema runs after it (better-auth api/dispatch.mjs) and COERCES `userId`
+// (`z.coerce.string()`: `["id"]` becomes "id"). So the gate reads the body itself, strictly, and
+// refuses (400 validation) what it cannot read exactly as the plugin will; and it writes nothing
+// the plugin would then refuse.
+describe("the gate reads the body exactly as the plugin will, and refuses what it cannot", () => {
+  const post = (who: Admin, path: "ban-user" | "set-role", json: unknown) =>
+    send(who.client, `/api/auth/admin/${path}`, { json });
+
+  it.each([
+    ["an array", (id: string) => [id]],
+    ["an object", (id: string) => ({ id })],
+    ["an empty object", () => ({})],
+    ["true", () => true],
+    ["a number", () => 12345],
+    ["the id and a space", (id: string) => `${id} `],
+    ["a space and the id", (id: string) => ` ${id}`],
+  ] as const)(
+    "userId as %s: 400 validation from the gate — the last admin is not banned or demoted through it",
+    async (_what, shape) => {
+      const leaving = await admin();
+      const other = await admin();
+      await leave(leaving.user.id);
+      for (const path of ["ban-user", "set-role"] as const) {
+        const answer = await post(leaving, path, {
+          userId: shape(other.user.id),
+          role: "user",
+          banReason: "test",
+        });
+        expect(answer.status, `${path} ${answer.text}`).toBe(400);
+        expect(answer.body).toMatchObject({ error: "validation" });
+      }
+      const row = (await userById(other.user.id))!;
+      expect([row.banned === true, row.role]).toEqual([false, "admin"]);
+    },
+  );
+
+  it("a duplicate userId key is read as the plugin reads it (the last one): the last admin's 409 stands", async () => {
+    const leaving = await admin();
+    const other = await admin();
+    const plain = await verifiedUser();
+    made.push(plain.user.id);
+    await leave(leaving.user.id);
+    const answer = await send(leaving.client, "/api/auth/admin/ban-user", {
+      rawBody: `{"userId":"${plain.user.id}","userId":"${other.user.id}","banReason":"test"}`,
+      headers: { "content-type": "application/json" },
+    });
+    expect(answer.status, answer.text).toBe(409);
+    expect((await userById(other.user.id))!.banned).not.toBe(true);
+    expect((await userById(plain.user.id))!.banned).not.toBe(true);
+  });
+
+  it.each([
+    ["banExpiresIn as text", { banExpiresIn: "soon" }],
+    ["banExpiresIn not finite", { banExpiresIn: "Infinity" }],
+    ["banReason as a number", { banReason: 123 }],
+  ] as const)(
+    "a ban the plugin would refuse (%s): 400, nothing written, nothing audited",
+    async (_what, extra) => {
+      const one = await admin();
+      const target = await verifiedUser();
+      made.push(target.user.id);
+      const answer = await post(one, "ban-user", { userId: target.user.id, ...extra });
+      expect(answer.status, answer.text).toBe(400);
+      const row = (await userById(target.user.id))!;
+      expect([row.banned === true, row.banReason, row.banExpires]).toEqual([false, null, null]);
+      expect(await auditRows({ action: "account.banned", targetId: target.user.id })).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["a role nobody configured", "superuser"],
+    ["a role list", ["user"]],
+    ["a comma-joined pair", "admin,user"],
+    ["no role", undefined],
+  ] as const)("Set role to %s: 400, the role unchanged, no role-change audit", async (_what, role) => {
+    const one = await admin();
+    const target = await verifiedUser();
+    made.push(target.user.id);
+    const answer = await post(one, "set-role", { userId: target.user.id, role });
+    expect(answer.status, answer.text).toBe(400);
+    expect((await userById(target.user.id))!.role).toBe("user");
+    expect(await auditRows({ action: "auth.role_changed", targetId: target.user.id })).toHaveLength(0);
+  });
+});
