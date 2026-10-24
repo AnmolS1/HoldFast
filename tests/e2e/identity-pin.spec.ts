@@ -14,7 +14,8 @@ test.describe("the identity pin", () => {
     test.skip(testInfo.project.name !== "chromium", "one browser is enough; the sidebar names the account");
     const a = await signedInUser(page, { clientIp, name: "Ada Pinned" });
     await page.goto("/");
-    await expect(page.locator("[data-explorer]")).toBeVisible();
+    // New folder (button and Shift+N) is offered once the listing is in, not when the frame shows.
+    await expect(page.locator("[data-new-folder]")).toBeVisible();
     await expect(page.locator("[data-sidebar]")).toContainText("Ada Pinned");
 
     // Another tab of this browser signs in as B: the cookie jar is the context's, shared.
