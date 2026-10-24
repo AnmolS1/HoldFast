@@ -44,7 +44,7 @@ function Drawing({ type }: { type: EmptyStateType }) {
     return (
       <svg {...common}>
         <path
-          d="M20 30h32l8 8h80a6 6 0 0 1 6 6v36a6 6 0 0 1-6 6H20a6 6 0 0 1-6-6V36a6 6 0 0 1 6-6Z"
+          d="M44 15h20l8 8h44a6 6 0 0 1 6 6v46a6 6 0 0 1-6 6H44a6 6 0 0 1-6-6V21a6 6 0 0 1 6-6Z"
           strokeDasharray="4 3"
         />
       </svg>
