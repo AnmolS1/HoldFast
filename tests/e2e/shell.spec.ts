@@ -381,9 +381,10 @@ test.describe("navigation", () => {
     await expect(page.locator("[data-sidebar]")).toBeVisible();
     await expect(page.locator("[data-details-panel]")).toBeVisible();
     await expect(page.locator("[data-bottom-nav]")).toHaveCount(0);
-    // Sidebar 232, details 320, header 56 — the specification's numbers.
+    // Sidebar 232, header 56 — the specification's numbers; details 320 gives way to 312 at 1024 so
+    // the content keeps 480 px (F02: 1024 − 232 − 480).
     expect((await page.locator("[data-sidebar]").boundingBox())?.width).toBe(232);
-    expect((await page.locator("[data-details-panel]").boundingBox())?.width).toBe(320);
+    expect((await page.locator("[data-details-panel]").boundingBox())?.width).toBe(312);
     expect((await page.locator("[data-header]").boundingBox())?.height).toBe(56);
   });
 });
