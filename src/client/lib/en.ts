@@ -115,6 +115,14 @@ export const en = {
   "toast.featurePaused": "This feature is paused right now.",
   "toast.readOnly": "Holdfast is read-only for maintenance.",
   "toast.generic": "Something went wrong. Try again.",
+  // R1 error codes a person can meet: the client's own words (lib/api.ts OWN_WORDS).
+  "apiError.body_too_large": "That was too much to send at once. Try again with fewer items.",
+  "apiError.replace_in_progress":
+    "A new version of this file is still being uploaded. Wait for it to finish, then try again.",
+  "apiError.self_action": "You can't do this to your own account. Ask another admin.",
+  "apiError.last_admin": "This would leave no admin who can still act. Make someone else an admin first.",
+  "apiError.deletion_admin_scheduled":
+    "An administrator scheduled this deletion, so it can only be cancelled by contacting support.",
   "toast.dismiss": "Dismiss",
 
   "selection.count": "{count} selected",

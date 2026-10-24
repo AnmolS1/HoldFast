@@ -8,7 +8,7 @@ import type { ZodType } from "zod";
 import { HEADER_USER } from "../../shared/constants";
 import { toast } from "../components/Toaster/store";
 import { INTERNAL_ERROR, isErrorCode, type ErrorCode } from "./contracts";
-import { t } from "./i18n";
+import { t, type MessageKey } from "./i18n";
 
 /**
  * `ErrorCode` is what the server's table can answer. The rest are the client's own:
@@ -384,6 +384,18 @@ function parseJsonText(text: string | null | undefined): unknown {
   }
 }
 
+/**
+ * Codes whose sentence is the client's own rather than the server's (R1): each one a person can
+ * meet, said the same on every surface that shows `ApiError.message`.
+ */
+const OWN_WORDS: Partial<Record<ApiErrorCode, MessageKey>> = {
+  body_too_large: "apiError.body_too_large",
+  replace_in_progress: "apiError.replace_in_progress",
+  self_action: "apiError.self_action",
+  last_admin: "apiError.last_admin",
+  deletion_admin_scheduled: "apiError.deletion_admin_scheduled",
+};
+
 /** The error envelope (or its absence) as a typed ApiError; `fallback` is the client's own words. */
 function errorFrom(
   status: number,
@@ -397,10 +409,11 @@ function errorFrom(
   // The request id is kept in every case: it is what support uses to find the call.
   const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
   if (isErrorCode(body.error)) {
+    const own = OWN_WORDS[body.error];
     return new ApiError({
       status,
       code: body.error,
-      message: body.message,
+      message: own ? t(own) : body.message,
       requestId,
       details: isRecord(body.details) ? body.details : undefined,
       retryAfter,
