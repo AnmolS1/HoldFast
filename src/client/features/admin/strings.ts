@@ -528,6 +528,7 @@ export const messages = {
   "dmca.takedownAt": "Taken down",
   "dmca.notified": "Owner notified",
   "dmca.counterReceived": "Counter-notice received on",
+  "dmca.easternAt": "{at} (US Eastern)",
   "dmca.counterForwarded": "Counter-notice forwarded",
   "dmca.window": "Restore window",
   "dmca.windowValue": "From {from} to {to}",

@@ -123,6 +123,26 @@ describe("the counter-notice window in the detail", () => {
     view.unmount();
   });
 
+  it("the counter-notice's receipt is shown as a New York time with the zone named — day 0 of the window (safety-n1)", async () => {
+    // 02:00 UTC on 3 November is still 2 November in New York (EDT): never "Nov 3".
+    adminFetch((call) =>
+      call.method === "GET" && call.path === `/api/admin/dmca/${NOTICE}`
+        ? new Response(
+            JSON.stringify(
+              notice("counter_received", { ...FORWARDED, counterReceivedAt: "2028-11-03T02:00:00.000Z" }),
+            ),
+            { headers: { "content-type": "application/json" } },
+          )
+        : undefined,
+    );
+    const view = openConsole(`/admin/dmca/${NOTICE}`);
+    await untilConsole();
+    expect(
+      await screen.findByText("Nov 02, 2028, 22:00 (US Eastern)", undefined, { timeout: 10_000 }),
+    ).toBeTruthy();
+    view.unmount();
+  });
+
   it("shows when the counter-notice was received and the window; a refused restore says why", async () => {
     adminFetch((call) => {
       if (call.method === "GET" && call.path === `/api/admin/dmca/${NOTICE}`) {
