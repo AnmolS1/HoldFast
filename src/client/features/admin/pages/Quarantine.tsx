@@ -188,6 +188,8 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
     } catch (failure) {
       if (reasonOf(failure) === "held" && pending === "restore") {
         setError(t("q.restoreHeld"));
+      } else if ((failure as { code?: string }).code === "not_quarantined" && pending === "delete") {
+        setError(t("q.deleteRefused"));
       } else if (reasonOf(failure) === "held") {
         const holds = ((failure as { details?: { holds?: unknown } }).details?.holds ?? []) as string[];
         setError(t("q.held", { causes: holds.map((cause) => label("hold", cause)).join(", ") || "—" }));
@@ -197,6 +199,7 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
             destroy_paused: t("q.destroyPaused"),
             not_infected: t("q.releaseRefused"),
             use_lock: t("q.useLock"),
+            content_listed: t("q.contentListed"),
             hold_not_releasable: t("q.holdNotReleasable"),
           }) || t("common.failed"),
         );
