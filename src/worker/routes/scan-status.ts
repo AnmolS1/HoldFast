@@ -3,9 +3,8 @@
 //
 //   POST /api/nodes/scan-status   { ids: [≤ SCAN_STATUS_MAX_IDS node ids] }  →  { items: NodeDto[] }
 //
-// What the upload ribbon (and anything else following scans) asks instead of one
-// `GET /api/nodes/:id` per file and per second: ≈ 10 statements per file before, a handful per
-// request now.
+// What the upload ribbon and the explorer's scan poll ask instead of one `GET /api/nodes/:id` per
+// file: ≈ 10 statements per file before, a handful per request now.
 //
 // THE ANSWER IS `GET /api/nodes/:id`'S, FILE BY FILE. An item is there exactly when that route would
 // answer the id with a file — and as that route's `node`; every other id is simply LEFT OUT: one
@@ -16,14 +15,12 @@
 // decides), whatever the reason. Only the caller's own VISIBLE files take the fast path — one
 // statement for all of them — and those they can read one by one anyway.
 //
-// Bounded (zod: 1 … SCAN_STATUS_MAX_IDS ids, a repeated id asked once), behind RL_API and the
-// identity pin like every /api request.
+// Bounded (`ScanStatusBody`, shared/schemas/node.ts: 1 … SCAN_STATUS_MAX_IDS ids; a repeated id is
+// asked once), behind RL_API and the identity pin like every /api request.
 
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import { Hono } from "hono";
-import { z } from "zod";
-import { NodeId } from "../../shared/schemas/common";
-import { NodeDto } from "../../shared/schemas/node";
+import { ScanStatusBody, type NodeDto, type ScanStatusResponse } from "../../shared/schemas/node";
 import { nodes, type Node } from "../db/schema";
 import { notEffectivelyTrashedOrHidden } from "../db/queries/tree";
 import { requireVerified } from "../middleware/guards";
@@ -34,13 +31,6 @@ import { getAccess, type Access } from "../services/permissions";
 import { db, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
-
-/** The most ids one request may ask about (the client's batch is the same size). */
-export const SCAN_STATUS_MAX_IDS = 100;
-
-export const ScanStatusBody = z.strictObject({ ids: z.array(NodeId).min(1).max(SCAN_STATUS_MAX_IDS) });
-export const ScanStatusResponse = z.object({ items: z.array(NodeDto) });
-export type ScanStatusResponse = z.infer<typeof ScanStatusResponse>;
 
 router.post("/nodes/scan-status", async (c) => {
   const user = requireVerified(c);

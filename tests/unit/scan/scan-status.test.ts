@@ -3,9 +3,8 @@
 // out the same way, for the same work (no existence oracle).
 import { describe, expect, it } from "vitest";
 import { HEADER_USER } from "../../../src/shared/constants";
-import { NodeDto } from "../../../src/shared/schemas/node";
+import { NodeDto, SCAN_STATUS_MAX_IDS, type ScanStatusResponse } from "../../../src/shared/schemas/node";
 import { SCAN_BATCH_MAX } from "../../../src/client/features/upload/plan";
-import { SCAN_STATUS_MAX_IDS, ScanStatusResponse } from "../../../src/worker/routes/scan-status";
 import { makeFile, makeFolder, makeShare, testDb } from "../services-core/helpers";
 import { call, uploader } from "../uploads/helpers";
 import { uuidv7 } from "../../../src/worker/db/ids";

@@ -1,4 +1,5 @@
 // The uploader's arithmetic and rules, as pure functions.
+import { SCAN_STATUS_MAX_IDS } from "../../../shared/schemas/node";
 import type { UploadedPart } from "../../../shared/schemas/upload";
 
 /** Files in flight at once, and parts in flight per file: nine requests at most. */
@@ -28,8 +29,8 @@ export const COMPLETE_WAIT_LIMIT_MS = 120_000;
  * `SCAN_FOLLOW_LIMIT_MS`.
  */
 export const SCAN_INTERVAL_MS = 1_000;
-/** Files asked about in one request: the server's own limit (routes/scan-status.ts). */
-export const SCAN_BATCH_MAX = 100;
+/** Files asked about in one request: the server's own limit. */
+export const SCAN_BATCH_MAX = SCAN_STATUS_MAX_IDS;
 /**
  * One file is asked about again after these waits (the last repeats): quick at first, then once
  * every 30 s — a cold scanner takes minutes, and a file waiting on it costs two requests a minute.

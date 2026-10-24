@@ -16,9 +16,8 @@
 // everything, empties the queue and the resume list, and moves the epoch on. Every step that
 // outlives a request takes a `Mark` when it starts and does nothing once the mark is stale: no
 // write, no announcement, no request.
-import { z } from "zod";
 import { NodeId } from "../../../shared/schemas/common";
-import { NodeDto } from "../../../shared/schemas/node";
+import { ScanStatusResponse, type NodeDto } from "../../../shared/schemas/node";
 import type {
   CompleteUploadBody,
   InitUploadBody,
@@ -1205,15 +1204,13 @@ function nextScan(
   return soonest === Infinity ? null : { wait: soonest - now };
 }
 
-const ScanStatusAnswer = z.object({ items: z.array(NodeDto) });
-
 /** The scan state of these files in one request (`POST /api/nodes/scan-status`). */
 async function scanStatuses(ids: string[]): Promise<NodeDto[]> {
   if (ids.length === 0) return [];
   const answer = await api("/api/nodes/scan-status", {
     method: "POST",
     body: { ids },
-    schema: ScanStatusAnswer,
+    schema: ScanStatusResponse,
   });
   return answer.items;
 }

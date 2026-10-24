@@ -206,3 +206,12 @@ export type BatchDownloadUrlItem = z.infer<typeof BatchDownloadUrlItem>;
 
 export const BatchDownloadUrlsResponse = z.object({ items: z.array(BatchDownloadUrlItem) });
 export type BatchDownloadUrlsResponse = z.infer<typeof BatchDownloadUrlsResponse>;
+
+/** `POST /api/nodes/scan-status`: the scan state of these files, in one request (R1 m16). */
+export const SCAN_STATUS_MAX_IDS = 100;
+export const ScanStatusBody = z.strictObject({ ids: z.array(NodeId).min(1).max(SCAN_STATUS_MAX_IDS) });
+export type ScanStatusBody = z.infer<typeof ScanStatusBody>;
+
+/** Each file as `GET /api/nodes/:id` sends it; an id that route would not answer with a file is left out. */
+export const ScanStatusResponse = z.object({ items: z.array(NodeDto) });
+export type ScanStatusResponse = z.infer<typeof ScanStatusResponse>;
