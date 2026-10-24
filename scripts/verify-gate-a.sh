@@ -42,7 +42,9 @@ ALLOWED_STORAGE_KEYS="hf.prefs.v1"
 # MUI's colour-scheme store (mui-mode); React Router's view-transition record (sessionStorage);
 # prefs.ts's two writes (hf.prefs.v1 — density, view, the device-only shortcuts flag — and the
 # theme); Better Auth's cross-tab session signal (`better-auth.message`: {event: "session", data:
-# {trigger}, a random tab id, a timestamp}). None holds a token, cookie value or session id.
+# {trigger}, a random tab id, a timestamp}) — in the bundle but never run: lib/auth-client.ts gives
+# Better Auth a channel that writes nothing. Reachable today: the probe, mui-mode and prefs.ts only.
+# None holds a token, cookie value or session id.
 REVIEWED_NONLITERAL_STORAGE_SITES=8
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
