@@ -71,10 +71,23 @@ describe("a toast holds while it has focus or the pointer", () => {
     const undo = screen.getByRole("button", { name: "Undo" });
     act(() => outside.focus());
     act(() => undo.focus());
-    fireEvent.click(undo);
+    // A keyboard press: the click event carries no pointer (detail 0).
+    fireEvent.click(undo, { detail: 0 });
     expect(onUndo).toHaveBeenCalledTimes(1);
     expect(getToasts()).toHaveLength(0);
     expect(document.activeElement).toBe(outside);
+    cleanup();
+  });
+
+  it("a pointer press on Undo does not move focus back (a phone would raise a field's keyboard)", () => {
+    const { outside, cleanup } = setup();
+    act(() => void undoToast({ message: "1 item moved to trash", onUndo: () => {} }));
+    const undo = screen.getByRole("button", { name: "Undo" });
+    act(() => outside.focus());
+    act(() => undo.focus());
+    fireEvent.click(undo, { detail: 1 });
+    expect(getToasts()).toHaveLength(0);
+    expect(document.activeElement).not.toBe(outside);
     cleanup();
   });
 

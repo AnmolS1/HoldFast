@@ -374,14 +374,14 @@ export function createHoldfastTheme(): Theme {
       MuiSelect: {
         styleOverrides: {
           select: {
+            // Centred by line height, not flex: the select's text keeps its ellipsis.
             "&&": {
               minHeight: 40,
+              lineHeight: "40px",
               boxSizing: "border-box",
-              display: "flex",
-              alignItems: "center",
               paddingTop: 0,
               paddingBottom: 0,
-              [mobile]: { minHeight: layout.touchTarget },
+              [mobile]: { minHeight: layout.touchTarget, lineHeight: `${layout.touchTarget}px` },
             },
           },
         },

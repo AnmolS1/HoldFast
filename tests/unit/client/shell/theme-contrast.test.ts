@@ -31,8 +31,8 @@ const PAIRS: Pair[] = [
   { fg: "textSecondary", bg: "surface2", min: AA, why: "secondary text on a hovered row or banner" },
   { fg: "textSecondary", bg: "accentTint", min: AA, why: "meta text in a selected row" },
   { fg: "textSecondary", bg: "accentWash", min: AA, why: "Clear / Show details on the wash" },
-  { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control, hovered field outline on the page" },
-  { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control, hovered field outline on a pane" },
+  { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control on the page" },
+  { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control on a pane" },
   { fg: "textTertiary", bg: "surface2", min: UI, why: "disabled control on its disabled fill" },
   { fg: "accent", bg: "surface", min: UI, why: "bars, dots, rings (UI, not text, in light)" },
   { fg: "accent", bg: "accentTrack", min: 1.5, why: "progress fill against its track" },
@@ -83,7 +83,7 @@ describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
   });
 });
 
-describe("textTertiary (disabled controls and the hovered field outline — never body text)", () => {
+describe("textTertiary (disabled controls — never body text)", () => {
   it.each(Object.entries(tokenSets))("%s: sits between the surface and textSecondary", (_scheme, tokens) => {
     // The third level stays the faintest of the three text colours: below AA on purpose, and
     // clearly apart from the second level.

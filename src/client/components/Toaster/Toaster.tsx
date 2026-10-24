@@ -30,10 +30,12 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
       left.current = Math.max(0, left.current - (Date.now() - started));
     };
   }, [entry.id, held]);
-  const close = () => {
+  // `fromKeys`: a pointer press does not move focus back — on a phone that would raise the
+  // keyboard of a field the person had left.
+  const close = (fromKeys: boolean) => {
     const back = returnTo.current;
     dismissToast(entry.id);
-    if (focused && back?.isConnected) back.focus();
+    if (fromKeys && focused && back?.isConnected) back.focus();
   };
   return (
     <Box
@@ -77,9 +79,9 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
       {entry.action ? (
         <Button
           variant="text"
-          onClick={() => {
+          onClick={(event) => {
             entry.action?.onClick();
-            close();
+            close(event.detail === 0);
           }}
           sx={{
             color: "inherit",
@@ -93,7 +95,7 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
       ) : null}
       <IconButton
         aria-label={t("toast.dismiss")}
-        onClick={close}
+        onClick={(event) => close(event.detail === 0)}
         sx={{ color: "inherit", "&:hover": { backgroundColor: "transparent", opacity: 0.8 } }}
       >
         <X size={16} aria-hidden="true" />
