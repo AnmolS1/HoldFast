@@ -4,16 +4,18 @@ import Divider from "@mui/material/Divider";
 import ListItemButton from "@mui/material/ListItemButton";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
+import Tooltip from "@mui/material/Tooltip";
 import { useId, useState } from "react";
 import { Link as RouterLink, useLocation } from "react-router";
 import { Kbd } from "../../components/Kbd";
-import { Wordmark } from "../../components/Mark";
+import { Mark, Wordmark } from "../../components/Mark";
+import type { UsageSlotValue } from "../../components/slots";
 import { StorageBar } from "../../components/StorageBar";
 import { useUsageSummary } from "../../features/usage";
 import { t } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
 import { useSession } from "../../lib/query";
-import { hf, layout } from "../../theme/tokens";
+import { hf, layout, motion } from "../../theme/tokens";
 import { initialsOf, THEME_OPTIONS, useAccountActions } from "./account-actions";
 import { DESTINATIONS } from "./nav";
 
@@ -44,8 +46,11 @@ function Avatar({ size = 26 }: { size?: number }) {
 
 export { Avatar };
 
-/** The account button at the foot of the sidebar and its menu. Every item shows its shortcut. */
-export function UserMenu() {
+/**
+ * The account button at the foot of the sidebar and its menu. Every item shows its shortcut. On the
+ * rail (`compact`) the button is the avatar alone; its accessible name is the same.
+ */
+export function UserMenu({ compact = false }: { compact?: boolean }) {
   const user = useSession().data?.user;
   const actions = useAccountActions();
   const prefs = usePrefs();
@@ -64,10 +69,10 @@ export function UserMenu() {
         sx={{
           display: "flex",
           alignItems: "center",
-          justifyContent: "flex-start",
+          justifyContent: compact ? "center" : "flex-start",
           gap: "10px",
           minHeight: 44,
-          padding: "0 8px",
+          padding: compact ? 0 : "0 8px",
           borderRadius: `${layout.radius.control}px`,
           textAlign: "left",
           marginTop: 2,
@@ -78,7 +83,12 @@ export function UserMenu() {
         <Avatar />
         <Box
           component="span"
-          sx={{ display: "flex", flexDirection: "column", lineHeight: "16px", minWidth: 0 }}
+          sx={{
+            display: compact ? "none" : "flex",
+            flexDirection: "column",
+            lineHeight: "16px",
+            minWidth: 0,
+          }}
         >
           <Box
             component="span"
@@ -170,20 +180,53 @@ export function UserMenu() {
   );
 }
 
-/** Desktop sidebar: the six destinations, storage use, the account button. */
-export function Sidebar() {
+/** The rail's storage use: a 2 px sliver; the percentage is its accessible name and its tooltip. */
+function UsageSliver({ usage }: { usage: UsageSlotValue }) {
+  if (!usage || usage === "unavailable") return null;
+  const ratio = usage.quotaBytes > 0 ? Math.min(1, Math.max(0, usage.usedBytes / usage.quotaBytes)) : 0;
+  const label = t("panels.storage", { percent: String(Math.round(ratio * 100)) });
+  return (
+    <Tooltip title={label} placement="right">
+      <Box
+        role="img"
+        aria-label={label}
+        data-storage-sliver
+        sx={{
+          height: "2px",
+          margin: "8px 6px",
+          backgroundColor: hf.hairline,
+          borderRadius: "1px",
+          overflow: "hidden",
+        }}
+      >
+        <Box sx={{ width: `${ratio * 100}%`, height: "100%", backgroundColor: hf.textSecondary }} />
+      </Box>
+    </Tooltip>
+  );
+}
+
+/**
+ * Desktop sidebar: the six destinations, storage use, the account button. Collapsed (F02) it is an
+ * icon rail: the same landmark and links, each named by its label (and a tooltip); storage use is a
+ * sliver. Its width is the frame's `--hf-sidebar-w`.
+ */
+export function Sidebar({ id, collapsed = false }: { id?: string; collapsed?: boolean }) {
   const { pathname } = useLocation();
   const usage = useUsageSummary();
   return (
     <Box
       component="nav"
+      id={id}
       aria-label={t("nav.primary")}
       data-sidebar
+      data-rail={collapsed || undefined}
       sx={{
-        width: layout.sidebar,
+        width: `var(--hf-sidebar-w, ${layout.sidebar}px)`,
+        transition: `width ${motion.folder}ms ease-out`,
+        "body[data-panel-drag] &": { transition: "none" },
         flex: "none",
         boxSizing: "border-box",
-        padding: "16px 12px",
+        padding: collapsed ? "16px 8px" : "16px 12px",
         borderRight: `1px solid ${hf.hairline}`,
         display: "flex",
         flexDirection: "column",
@@ -191,6 +234,7 @@ export function Sidebar() {
         backgroundColor: hf.bg,
         minHeight: 0,
         overflowY: "auto",
+        overflowX: "hidden",
       }}
     >
       <Box
@@ -200,12 +244,13 @@ export function Sidebar() {
         sx={{
           display: "flex",
           alignItems: "center",
-          padding: "6px 8px 18px",
+          justifyContent: collapsed ? "center" : "flex-start",
+          padding: collapsed ? "6px 0 18px" : "6px 8px 18px",
           color: hf.text,
           textDecoration: "none",
         }}
       >
-        <Wordmark />
+        {collapsed ? <Mark /> : <Wordmark />}
       </Box>
       <Box
         component="ul"
@@ -214,51 +259,67 @@ export function Sidebar() {
         {DESTINATIONS.map((destination) => {
           const active = destination.matches(pathname);
           const Icon = destination.icon;
+          const label = t(destination.label);
+          const link = (
+            <ListItemButton
+              component={RouterLink}
+              to={destination.path}
+              selected={active}
+              aria-current={active ? "page" : undefined}
+              aria-label={collapsed ? label : undefined}
+              data-nav={destination.id}
+              sx={collapsed ? { justifyContent: "center", paddingLeft: 0, paddingRight: 0 } : undefined}
+            >
+              <Box
+                component="span"
+                aria-hidden="true"
+                sx={{ display: "inline-flex", color: hf.textSecondary }}
+              >
+                <Icon size={16} />
+              </Box>
+              {collapsed ? null : label}
+            </ListItemButton>
+          );
           return (
             <li key={destination.id}>
-              <ListItemButton
-                component={RouterLink}
-                to={destination.path}
-                selected={active}
-                aria-current={active ? "page" : undefined}
-                data-nav={destination.id}
-              >
-                <Box
-                  component="span"
-                  aria-hidden="true"
-                  sx={{ display: "inline-flex", color: hf.textSecondary }}
-                >
-                  <Icon size={16} />
-                </Box>
-                {t(destination.label)}
-              </ListItemButton>
+              {collapsed ? (
+                <Tooltip title={label} placement="right">
+                  {link}
+                </Tooltip>
+              ) : (
+                link
+              )}
             </li>
           );
         })}
       </Box>
       <Box sx={{ flex: "1 1 auto" }} />
-      <Box sx={{ padding: "8px 10px 4px" }}>
-        <StorageBar
-          usage={usage}
-          footer={
-            <Box
-              component={RouterLink}
-              to="/storage"
-              sx={{
-                fontSize: 12,
-                color: hf.textSecondary,
-                textDecoration: "underline",
-                textUnderlineOffset: "2px",
-                alignSelf: "flex-start",
-                "&:hover": { color: hf.text },
-              }}
-            >
-              {t("user.storage")}
-            </Box>
-          }
-        />
-      </Box>
-      <UserMenu />
+      {collapsed ? (
+        <UsageSliver usage={usage} />
+      ) : (
+        <Box sx={{ padding: "8px 10px 4px" }}>
+          <StorageBar
+            usage={usage}
+            footer={
+              <Box
+                component={RouterLink}
+                to="/storage"
+                sx={{
+                  fontSize: 12,
+                  color: hf.textSecondary,
+                  textDecoration: "underline",
+                  textUnderlineOffset: "2px",
+                  alignSelf: "flex-start",
+                  "&:hover": { color: hf.text },
+                }}
+              >
+                {t("user.storage")}
+              </Box>
+            }
+          />
+        </Box>
+      )}
+      <UserMenu compact={collapsed} />
     </Box>
   );
 }

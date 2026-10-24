@@ -1,6 +1,6 @@
 // Registers the shell's own palette commands and binds the global shortcuts. Renders nothing.
 import { hasAdminRole } from "../../../shared/roles";
-import { Moon, Sun } from "lucide-react";
+import { Moon, PanelLeft, PanelRight, Sun } from "lucide-react";
 import { useEffect } from "react";
 import { useNavigate } from "react-router";
 import {
@@ -10,9 +10,10 @@ import {
   togglePalette,
   type Command,
 } from "../../components/CommandPalette";
+import { togglePanel } from "../../components/PanelSplitter";
 import { requestUpload } from "../../features/upload";
 import { t } from "../../lib/i18n";
-import { usePrefs } from "../../lib/prefs";
+import { useLayout, usePrefs } from "../../lib/prefs";
 import { usePublicConfig, useSession } from "../../lib/query";
 import { useShortcut } from "../../lib/shortcuts";
 import { openShortcuts } from "../help";
@@ -20,9 +21,19 @@ import { SEARCH_INPUT_ID } from "./Header";
 import { DESTINATIONS } from "./nav";
 import { isDarkNow, toggleTheme } from "./theme-toggle";
 
-export function ShellCommands() {
+export interface ShellCommandsProps {
+  /** Desktop: the side panels exist, so their commands and shortcuts do (F02). */
+  panels?: boolean;
+  /** The page has a details panel (routes with `handle.details: false` don't). */
+  details?: boolean;
+}
+
+export function ShellCommands({ panels = false, details = false }: ShellCommandsProps) {
   const navigate = useNavigate();
   const prefs = usePrefs();
+  const layout = useLayout();
+  const sidebarShown = !layout.sidebar.collapsed;
+  const detailsShown = layout.details.open;
   const config = usePublicConfig().data;
   const role = useSession().data?.user.role;
 
@@ -82,8 +93,39 @@ export function ShellCommands() {
         run: openShortcuts,
       },
     );
+    if (panels)
+      commands.push({
+        id: "panels.sidebar",
+        section: "actions",
+        label: t(sidebarShown ? "panels.sidebar.hide" : "panels.sidebar.show"),
+        icon: <PanelLeft size={16} />,
+        shortcut: "sidebar",
+        keywords: ["sidebar", "panel", "rail", "navigation"],
+        run: () => togglePanel("sidebar"),
+      });
+    if (details)
+      commands.push({
+        id: "panels.details",
+        section: "actions",
+        label: t(detailsShown ? "panels.details.hide" : "panels.details.show"),
+        icon: <PanelRight size={16} />,
+        shortcut: "details",
+        keywords: ["details", "panel", "info"],
+        run: () => togglePanel("details"),
+      });
     return registerCommands("shell", commands);
-  }, [navigate, prefs.theme, config?.readOnly, config?.uploadsEnabled, role, config]);
+  }, [
+    navigate,
+    prefs.theme,
+    config?.readOnly,
+    config?.uploadsEnabled,
+    role,
+    config,
+    panels,
+    details,
+    sidebarShown,
+    detailsShown,
+  ]);
 
   useShortcut("palette", (event) => {
     event.preventDefault();
@@ -111,6 +153,22 @@ export function ShellCommands() {
     event.preventDefault();
     requestUpload({ kind: "folder" });
   });
+  useShortcut(
+    "sidebar",
+    (event) => {
+      event.preventDefault();
+      togglePanel("sidebar");
+    },
+    panels,
+  );
+  useShortcut(
+    "details",
+    (event) => {
+      event.preventDefault();
+      togglePanel("details");
+    },
+    details,
+  );
   // These three belong to the explorer; the shell only routes the key to the registered command.
   useShortcut("newFolder", (event) => {
     if (runCommand(COMMAND_IDS.newFolder)) event.preventDefault();

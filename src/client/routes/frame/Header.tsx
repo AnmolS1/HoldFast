@@ -5,16 +5,26 @@ import IconButton from "@mui/material/IconButton";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
 import Tooltip from "@mui/material/Tooltip";
-import { Command as CommandIcon, LayoutGrid, List as ListIcon, Plus, Search } from "lucide-react";
+import {
+  Command as CommandIcon,
+  LayoutGrid,
+  List as ListIcon,
+  PanelLeft,
+  PanelRight,
+  Plus,
+  Search,
+} from "lucide-react";
 import { useId, useRef, useState, type FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
 import { openPalette } from "../../components/CommandPalette";
 import { Kbd } from "../../components/Kbd";
+import { PANEL_IDS, TOGGLE_IDS, togglePanel } from "../../components/PanelSplitter";
+import type { PanelId } from "../../lib/layout-prefs";
 import { SearchSuggestions } from "../../features/search";
 import { t } from "../../lib/i18n";
 import { stamped } from "../../lib/history-state";
-import { usePrefs } from "../../lib/prefs";
+import { useLayout, usePrefs } from "../../lib/prefs";
 import { shortcutLabel } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { useNewActions } from "./new-actions";
@@ -216,8 +226,37 @@ export function NewMenu() {
   );
 }
 
-/** Desktop header, 56 px: title and breadcrumbs, search, palette, view toggle, New. */
-export function Header({ title }: { title: string }) {
+/**
+ * Show / hide a side panel (F02). A toggle button: its name stays the same and `aria-pressed` says
+ * whether the panel is shown (the palette's command is the one whose words change).
+ */
+function PanelToggle({ panel }: { panel: PanelId }) {
+  const value = useLayout();
+  const shown = panel === "sidebar" ? !value.sidebar.collapsed : value.details.open;
+  const label = t(panel === "sidebar" ? "header.sidebar" : "header.details");
+  const Icon = panel === "sidebar" ? PanelLeft : PanelRight;
+  return (
+    <Tooltip title={`${label} ${shortcutLabel(panel)}`}>
+      <IconButton
+        id={TOGGLE_IDS[panel]}
+        aria-label={label}
+        aria-pressed={shown}
+        aria-controls={PANEL_IDS[panel]}
+        onClick={() => togglePanel(panel)}
+        data-panel-toggle={panel}
+        sx={{ flex: "none", color: shown ? hf.text : hf.textSecondary }}
+      >
+        <Icon size={16} aria-hidden="true" />
+      </IconButton>
+    </Tooltip>
+  );
+}
+
+/**
+ * Desktop header, 56 px: the sidebar toggle, title and breadcrumbs, search, palette, view toggle,
+ * New, the details toggle (only where the page has a details panel).
+ */
+export function Header({ title, details = true }: { title: string; details?: boolean }) {
   return (
     <Box
       component="header"
@@ -233,6 +272,7 @@ export function Header({ title }: { title: string }) {
         flex: "none",
       }}
     >
+      <PanelToggle panel="sidebar" />
       <Box sx={{ flex: "1 1 auto", minWidth: 0 }}>
         <Breadcrumbs fallbackTitle={title} />
       </Box>
@@ -244,6 +284,7 @@ export function Header({ title }: { title: string }) {
       </Tooltip>
       <ViewToggle />
       <NewMenu />
+      {details ? <PanelToggle panel="details" /> : null}
     </Box>
   );
 }
