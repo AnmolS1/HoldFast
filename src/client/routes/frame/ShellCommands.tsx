@@ -57,6 +57,15 @@ export function ShellCommands() {
         run: () => requestUpload(),
       },
       {
+        id: "upload.folder",
+        section: "actions",
+        label: t("header.uploadFolder"),
+        shortcut: "uploadFolder",
+        keywords: ["folder", "directory"],
+        disabled: Boolean(config?.readOnly) || (config ? !config.uploadsEnabled : false),
+        run: () => requestUpload({ kind: "folder" }),
+      },
+      {
         id: "shell.theme",
         section: "actions",
         label: t(dark ? "user.theme.toLight" : "user.theme.toDark"),
@@ -96,6 +105,11 @@ export function ShellCommands() {
     if (config?.readOnly || (config && !config.uploadsEnabled)) return;
     event.preventDefault();
     requestUpload();
+  });
+  useShortcut("uploadFolder", (event) => {
+    if (config?.readOnly || (config && !config.uploadsEnabled)) return;
+    event.preventDefault();
+    requestUpload({ kind: "folder" });
   });
   // These three belong to the explorer; the shell only routes the key to the registered command.
   useShortcut("newFolder", (event) => {

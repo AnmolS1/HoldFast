@@ -6,6 +6,8 @@ export const messages = {
   "explorer.action.open": "Open",
   "explorer.action.newFolder": "New folder",
   "explorer.action.upload": "Upload files",
+  "explorer.action.uploadFolder": "Upload folder",
+  "explorer.action.uploadMenu": "More ways to upload",
   "explorer.action.rename": "Rename",
   "explorer.action.move": "Move to…",
   "explorer.action.star": "Star",

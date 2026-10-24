@@ -19,6 +19,7 @@ export type ShortcutId =
   | "rename"
   | "restore"
   | "upload"
+  | "uploadFolder"
   | "theme";
 
 interface Combo {
@@ -59,6 +60,12 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
   { id: "rename", combos: [{ key: "F2" }], description: "shortcuts.rename" },
   { id: "restore", combos: [{ key: "r", shift: true }], description: "shortcuts.restore" },
   { id: "upload", combos: [{ key: "u", mod: true }], description: "shortcuts.upload", global: true },
+  {
+    id: "uploadFolder",
+    combos: [{ key: "u", mod: true, shift: true }],
+    description: "shortcuts.uploadFolder",
+    global: true,
+  },
   {
     id: "theme",
     combos: [{ key: "l", mod: true, shift: true }],
