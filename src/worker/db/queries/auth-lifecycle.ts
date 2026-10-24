@@ -476,18 +476,63 @@ export async function lockActiveAdmins(tx: Executor, at: Date): Promise<string[]
     .map((row) => row.id);
 }
 
+export type AdminPluginChange =
+  { banned: true; banReason: string; banExpires: Date | null } | { role: string };
+/** What a `writeAdminPluginChange` replaced: put back by `undoAdminPluginChange`. */
+export type AdminPluginPrevious = {
+  banned: boolean | null;
+  banReason: string | null;
+  banExpires: Date | null;
+  role: string | null;
+};
+
 /**
  * The admin plugin's Ban or Set role, written AHEAD of the plugin in the transaction that ran the
  * last-admin check (auth/admin-gate.ts): the plugin's adapter has no transaction, so a check
  * whose locks are gone before the plugin writes would let two admins pass it at once. The plugin
- * then writes the same values again (and its update hooks run as they always did).
+ * then writes the same values again (and its update hooks run as they always did). Returns what
+ * the row held before (null: no such account, nothing written), for the undo when the plugin fails.
  */
 export async function writeAdminPluginChange(
   tx: Executor,
   userId: string,
-  change: { banned: true; banReason: string; banExpires: Date | null } | { role: string },
-): Promise<void> {
+  change: AdminPluginChange,
+): Promise<AdminPluginPrevious | null> {
+  const [previous] = await tx
+    .select({ banned: user.banned, banReason: user.banReason, banExpires: user.banExpires, role: user.role })
+    .from(user)
+    .where(eq(user.id, userId))
+    .for("update");
+  if (!previous) return null;
   await tx.update(user).set(change).where(eq(user.id, userId));
+  return previous;
+}
+
+/**
+ * Puts back what `writeAdminPluginChange` replaced, when the plugin's own write never landed (it
+ * failed or refused after the gate wrote) — and only while the row still holds the gate's value,
+ * so a change made since is not undone. True when it put something back.
+ */
+export async function undoAdminPluginChange(
+  db: Executor,
+  userId: string,
+  wrote: AdminPluginChange,
+  previous: AdminPluginPrevious,
+): Promise<boolean> {
+  const still =
+    "role" in wrote
+      ? eq(user.role, wrote.role)
+      : and(eq(user.banned, true), eq(user.banReason, wrote.banReason));
+  const restore =
+    "role" in wrote
+      ? { role: previous.role }
+      : { banned: previous.banned, banReason: previous.banReason, banExpires: previous.banExpires };
+  const rows = await db
+    .update(user)
+    .set(restore)
+    .where(and(eq(user.id, userId), still))
+    .returning({ id: user.id });
+  return rows.length > 0;
 }
 
 // ── a deletion an admin ordered ─────────────────────────────────────────────────────────────
