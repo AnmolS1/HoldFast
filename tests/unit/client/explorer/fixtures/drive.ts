@@ -9,6 +9,7 @@ import {
   NodeDto,
   NodePage,
   RestoreNodeResponse,
+  ScanStatusIds,
   ScanStatusResponse,
   ThumbUrlResponse,
   TrashNodeResponse,
@@ -162,9 +163,11 @@ export class FakeDrive {
       return { status: 200, body: NodeDto.parse(node) };
     }
     if (method === "GET" && path === "/api/nodes/scan-status") {
-      // Each asked id that is a file here, as the node's GET would show it; the rest left out.
-      const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
-      const items = ids.flatMap((id) => {
+      // As the real route: 1 … SCAN_STATUS_MAX_IDS well-formed ids or 400; each asked id that is a
+      // file here, once, as the node's GET would show it; any other id left out.
+      const parsed = ScanStatusIds.safeParse((url.searchParams.get("ids") ?? "").split(",").filter(Boolean));
+      if (!parsed.success) return driveEnvelope(400);
+      const items = [...new Set(parsed.data)].flatMap((id) => {
         const node = this.nodes.get(id);
         return node?.kind === "file" ? [node] : [];
       });

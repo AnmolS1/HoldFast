@@ -277,6 +277,8 @@ const EXAMPLES: Record<string, unknown> = {
       { nodeId: PARENT, error: "not_found" },
     ],
   },
+  "node.ScanStatusIds": [NODE, PARENT],
+  "node.ScanStatusResponse": { items: [nodeDto] },
 
   "upload.InitUploadBody": {
     parentId: null,
