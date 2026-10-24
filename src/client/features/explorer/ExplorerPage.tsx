@@ -15,6 +15,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  FolderUp,
   Info,
   Pencil,
   RefreshCw,
@@ -328,6 +329,10 @@ function Explorer({ folderId }: { folderId: string | null }) {
 
   const newFolder = useCallback(() => setDialog({ type: "new-folder", busy: false, error: null }), []);
   const upload = useCallback(() => requestUpload({ parentId: folderId ?? undefined }), [folderId]);
+  const uploadFolder = useCallback(
+    () => requestUpload({ parentId: folderId ?? undefined, kind: "folder" }),
+    [folderId],
+  );
 
   const closeDialog = useCallback((focusId?: string | null) => {
     setDialog(null);
@@ -447,8 +452,15 @@ function Explorer({ folderId }: { folderId: string | null }) {
         shortcut: "upload",
         run: upload,
       },
+      {
+        id: "upload-folder",
+        label: t("explorer.action.uploadFolder"),
+        icon: <FolderUp size={16} />,
+        shortcut: "uploadFolder",
+        run: uploadFolder,
+      },
     ];
-  }, [canAdd, newFolder, upload]);
+  }, [canAdd, newFolder, upload, uploadFolder]);
 
   // ---- focus that waits for the list ---------------------------------------------------------
 
@@ -777,6 +789,9 @@ function Explorer({ folderId }: { folderId: string | null }) {
             <Button variant="cta" onClick={upload} data-empty-upload>
               {t("explorer.action.upload")}
             </Button>
+            <Button onClick={uploadFolder} data-empty-upload-folder>
+              {t("explorer.action.uploadFolder")}
+            </Button>
             <Button onClick={newFolder}>{t("explorer.action.newFolder")}</Button>
           </>
         }
@@ -872,6 +887,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
             canAdd={canAdd && !failed}
             onNewFolder={newFolder}
             onUpload={upload}
+            onUploadFolder={uploadFolder}
           />
         ) : null}
       </Box>
