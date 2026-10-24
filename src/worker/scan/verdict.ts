@@ -50,7 +50,7 @@ import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import { auditLog, type Node, type ScanDetail } from "../db/schema";
+import { auditLog, nodes, type Node, type ScanDetail } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit, auditInTx } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
@@ -596,8 +596,11 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     let stale = false;
 
     if (outcome.status === "suspected_csam") {
-      // From ANY state: it only ever raises. The lock itself is the shared handler's, after commit.
+      // From ANY state: it only ever raises. The lock itself is the shared handler's, after commit
+      // — and it may fail and be retried for a while: the node is HELD now, in this transaction,
+      // so that no purge passes the gate in between (R1 func-n6(c)). The lock holds it as well.
       await recordScan(tx, node.id, key, seen);
+      await tx.update(nodes).set({ legalHold: true }).where(eq(nodes.id, node.id));
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);

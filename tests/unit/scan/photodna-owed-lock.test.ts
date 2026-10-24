@@ -107,7 +107,8 @@ describe("a PhotoDNA-matched file whose lock fails", () => {
     // Delivery 1: PhotoDNA matches; the lock (the write that makes the node suspected_csam) fails.
     vi.mocked(lockSuspectedCsam).mockRejectedValueOnce(new Error("test: the lock cannot be written"));
     expect(await deliver([{ body: explicit(file) }], ON)).toMatchObject([{ outcome: "retry" }]);
-    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "pending", legalHold: false });
+    // Not locked yet — but HELD by the verdict's own transaction (R1 func-n6(c)): no purge passes.
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "pending", legalHold: true });
     // Listed before the lock — the entry the lock itself writes, naming the node.
     expect(await blocklist.lookup(testDb(), server)).toEqual({ reason: "csam", sourceNodeId: file.id });
 
@@ -138,7 +139,8 @@ describe("a PhotoDNA-matched file whose lock fails", () => {
     // The dead letter, the lock failing there too: retried — the node is NOT ended `error`.
     vi.mocked(lockSuspectedCsam).mockRejectedValueOnce(new Error("test: the lock cannot be written"));
     expect(await deliver([{ body: explicit(file) }], {}, DLQ)).toMatchObject([{ outcome: "retry" }]);
-    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "pending", legalHold: false });
+    // Held since the verdict (R1 func-n6(c)), locked not yet.
+    expect(await nodeById(file.id)).toMatchObject({ scanStatus: "pending", legalHold: true });
 
     // The dead letter again: the lock runs.
     expect(await deliver([{ body: explicit(file), attempts: 2 }], {}, DLQ)).toEqual([{ outcome: "ack" }]);
