@@ -7,6 +7,7 @@ import { THUMB_SIZES } from "../../../src/shared/constants";
 import { NodeDto } from "../../../src/shared/schemas/node";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import * as sessions from "../../../src/worker/db/queries/upload-sessions";
+import { reserve } from "../../../src/worker/db/queries/quota";
 import { claimCompleting, markDone } from "../../../src/worker/db/queries/uploads";
 import {
   nodes,
@@ -28,6 +29,7 @@ import {
   makeFile,
   makeFolder,
   makeShare,
+  makeUpload,
   nodeById,
   putObject,
   r2Event,
@@ -282,7 +284,27 @@ describe("what a client cannot do with a finished or a second session", () => {
       replaceNodeId: file.id,
     };
     const a = await uploaded(owner, replace, new Uint8Array(1000).fill(1));
-    const b = await uploaded(owner, replace, new Uint8Array(2000).fill(2));
+    // Simulates two inits racing past the init check (R1 func-7: a second replace of a file that
+    // already has one under way is refused at init, 409 replace_in_progress): session b as that
+    // init would have left it — open, its object stored, its bytes reserved.
+    const aRow = (await sessionRow(a.uploadId))!;
+    const bRow = await makeUpload(owner.id, owner.id, {
+      parentId: folder.id,
+      nodeId: file.id,
+      versionId: uuidv7(),
+      replaceNodeId: file.id,
+      name: aRow.name,
+      size: 2000,
+      partBytes: aRow.partBytes,
+      partCount: aRow.partCount,
+      mimeDeclared: aRow.mimeDeclared,
+      purpose: aRow.purpose,
+      fileLastModified: aRow.fileLastModified,
+    });
+    const stored = await env.FILES.put(bRow.r2Key, new Uint8Array(2000).fill(2));
+    await sessions.upsertPart(testDb(), bRow.id, { n: 1, etag: stored!.etag, size: 2000 });
+    await reserve(testDb(), owner.id, 2000);
+    const b = { uploadId: bRow.id };
     const [rowA, rowB] = [(await sessionRow(a.uploadId))!, (await sessionRow(b.uploadId))!];
     expect(rowA.nodeId).toBe(rowB.nodeId);
     expect(new Set([rowA.r2Key, rowB.r2Key, file.r2Key]).size).toBe(3);
