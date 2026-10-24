@@ -4,6 +4,7 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openPalette } from "../../../../src/client/components/CommandPalette";
+import { detailsApi } from "../../../../src/client/components/DetailsPanel/store";
 import { keyWidth } from "../../../../src/client/components/PanelSplitter";
 import { DEFAULT_LAYOUT } from "../../../../src/client/lib/layout-prefs";
 import { getLayout, PREFS_KEY, setLayout, setShortcutsOn } from "../../../../src/client/lib/prefs";
@@ -140,6 +141,17 @@ describe("splitters in the frame", () => {
     expect(getLayout().details.open).toBe(false);
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Details panel" }));
     expect(screen.queryByRole("separator", { name: "Resize details" })).toBeNull();
+  });
+
+  it("hiding details while a control inside it has focus moves focus to the details toggle", async () => {
+    await open();
+    act(() => detailsApi.setContent(<button type="button">Share notes.md</button>));
+    const inside = await screen.findByRole("button", { name: "Share notes.md" });
+    inside.focus();
+    pressDocument("i");
+    expect(getLayout().details.open).toBe(false);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Details panel" }));
+    act(() => detailsApi.setContent(null));
   });
 
   it("double-click resets to the default width", async () => {
