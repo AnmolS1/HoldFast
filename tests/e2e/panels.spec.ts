@@ -102,6 +102,27 @@ const stored = (page: Page) =>
     () => (JSON.parse(localStorage.getItem("hf.prefs.v1") ?? "{}") as { layout?: unknown }).layout,
   );
 
+/**
+ * The header fits its column (review F02-1): nothing scrolls sideways, and the first and last
+ * controls keep the header's own padding.
+ */
+async function expectHeaderFits(page: Page): Promise<void> {
+  const fit = await page.locator("[data-header]").evaluate((header) => {
+    const box = header.getBoundingClientRect();
+    const padding = Number.parseFloat(getComputedStyle(header).paddingRight);
+    const children = [...header.children].map((child) => child.getBoundingClientRect());
+    return {
+      overflow: header.scrollWidth - header.clientWidth,
+      left: Math.round(Math.min(...children.map((r) => r.left)) - box.left),
+      right: Math.round(box.right - Math.max(...children.map((r) => r.right))),
+      padding,
+    };
+  });
+  expect(fit.overflow, JSON.stringify(fit)).toBe(0);
+  expect(fit.right, JSON.stringify(fit)).toBeGreaterThanOrEqual(fit.padding);
+  expect(fit.left, JSON.stringify(fit)).toBeGreaterThanOrEqual(fit.padding);
+}
+
 /** Drag a splitter by `dx` px with the mouse, in small steps (as a hand does). */
 async function drag(page: Page, handle: Locator, dx: number): Promise<void> {
   const box = (await handle.boundingBox())!;
@@ -185,6 +206,60 @@ test.describe("desktop side panels (mocked API)", () => {
     await expect.poll(() => widthOf(details(page))).toBe(320);
     // Back at the defaults, nothing is stored.
     expect(await stored(page)).toBeUndefined();
+  });
+
+  test("dragging the sidebar to its maximum at 1280 with details at 520: the content stays ≥ 480 px throughout, details gives way live, only the sidebar is stored", async ({
+    page,
+    origins,
+  }) => {
+    await serve(page, origins.port);
+    const wide = { sidebar: { collapsed: false, width: 232 }, details: { open: true, width: 520 } };
+    await page.addInitScript((layout) => {
+      if (!localStorage.getItem("hf.prefs.v1"))
+        localStorage.setItem("hf.prefs.v1", JSON.stringify({ density: "compact", viewMode: "list", layout }));
+    }, wide);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openFolder(page);
+    await expect.poll(() => widthOf(details(page))).toBe(520);
+
+    const box = (await splitter(page, "Resize sidebar").boundingBox())!;
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    // Sampled after a frame at every step, while the button is still down.
+    const samples: Array<{ main: number; sidebar: number; details: number }> = [];
+    for (let dx = 16; dx <= 160; dx += 16) {
+      await page.mouse.move(x + dx, y);
+      samples.push(
+        await page.evaluate(
+          () =>
+            new Promise<{ main: number; sidebar: number; details: number }>((resolve) =>
+              requestAnimationFrame(() =>
+                requestAnimationFrame(() => {
+                  const width = (selector: string) =>
+                    Math.round(document.querySelector(selector)!.getBoundingClientRect().width);
+                  resolve({
+                    main: width("[data-main]"),
+                    sidebar: width("[data-sidebar]"),
+                    details: width("[data-details-panel]"),
+                  });
+                }),
+              ),
+            ),
+        ),
+      );
+    }
+    expect(samples.at(-1)!.sidebar).toBe(360);
+    expect(samples.at(-1)!.details).toBe(440);
+    for (const sample of samples) expect(sample.main, JSON.stringify(samples)).toBeGreaterThanOrEqual(480);
+    // Nothing stored while the button is down.
+    expect(await stored(page)).toEqual(wide);
+    await page.mouse.up();
+    expect(await stored(page)).toEqual({ ...wide, sidebar: { collapsed: false, width: 360 } });
+    // No jump on release: details stays where the drag left it.
+    expect(await widthOf(details(page))).toBe(440);
+    expect(await widthOf(page.locator("[data-main]"))).toBeGreaterThanOrEqual(480);
   });
 
   test("keyboard: Tab to a splitter, ←/→ (Shift ×4), Home/End, Enter collapses to the rail and restores", async ({
@@ -353,6 +428,9 @@ test.describe("desktop side panels (mocked API)", () => {
     await page.setViewportSize({ width: 1024, height: 800 });
     await expect.poll(() => widthOf(sidebar(page))).toBe(264);
     await expect.poll(() => widthOf(details(page))).toBe(280);
+    // At the 480 px minimum the header still fits its column.
+    expect(await widthOf(page.locator("[data-header]"))).toBe(480);
+    await expectHeaderFits(page);
     expect(await stored(page)).toEqual(max);
     await page.setViewportSize({ width: 1920, height: 900 });
     await expect.poll(() => widthOf(details(page))).toBe(520);

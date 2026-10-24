@@ -229,6 +229,9 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
           onResize={(next) => setPanelWidth("sidebar", next)}
           onReset={() => resetPanelWidth("sidebar")}
           onToggle={() => togglePanel("sidebar")}
+          onPreview={(next) =>
+            giveWay({ ...panels, sidebar: { collapsed: false, width: next } }, width, detailsAvailable)
+          }
         />
       ) : null}
       <Box
@@ -265,6 +268,7 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
           onResize={(next) => setPanelWidth("details", next)}
           onReset={() => resetPanelWidth("details")}
           onToggle={() => setPanelShown("details", false)}
+          onPreview={(next) => giveWay({ ...panels, details: { ...panels.details, width: next } }, width)}
         />
       ) : null}
       {desktop && detailsAvailable ? (

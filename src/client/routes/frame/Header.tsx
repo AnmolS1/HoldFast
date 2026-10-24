@@ -66,7 +66,8 @@ export function SearchBox({ compact = false }: { compact?: boolean }) {
         // Let a click on a suggestion land before the slot closes.
         blurTimer.current = setTimeout(() => setFocused(false), 150);
       }}
-      sx={{ position: "relative", flex: compact ? "1 1 auto" : "0 1 320px", minWidth: compact ? 0 : 160 }}
+      // 120: with the two panel toggles (F02) the header still fits a 480 px content column.
+      sx={{ position: "relative", flex: compact ? "1 1 auto" : "0 1 320px", minWidth: compact ? 0 : 120 }}
     >
       <Box
         component="label"

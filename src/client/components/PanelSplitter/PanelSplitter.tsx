@@ -7,7 +7,7 @@
 // per pointer move) and is stored on pointer up.
 import Box from "@mui/material/Box";
 import { useEffect, useRef, type KeyboardEvent, type PointerEvent } from "react";
-import type { PanelId } from "../../lib/layout-prefs";
+import type { PanelId, RenderedLayout } from "../../lib/layout-prefs";
 import { t } from "../../lib/i18n";
 import { hf, layout } from "../../theme/tokens";
 import { keyWidth, PANEL_IDS, WIDTH_VAR } from "./panels";
@@ -25,7 +25,14 @@ export interface PanelSplitterProps {
   onReset(): void;
   /** Enter: collapse (the sidebar to its rail; details hides) or restore. */
   onToggle(): void;
+  /**
+   * Both panels' widths as they would be drawn with this panel at `width` (the frame's give-way):
+   * during a drag the other panel follows live, so the content never dips under its minimum.
+   */
+  onPreview?(width: number): RenderedLayout;
 }
+
+const PANELS: readonly PanelId[] = ["sidebar", "details"];
 
 interface Drag {
   pointerId: number;
@@ -46,12 +53,11 @@ export function PanelSplitter({
   onResize,
   onReset,
   onToggle,
+  onPreview,
 }: PanelSplitterProps) {
   const handle = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
   const toward = panel === "sidebar" ? 1 : -1;
-
-  const target = () => document.getElementById(PANEL_IDS[panel]);
 
   // A drag the component didn't see end (unmounted mid-drag): leave nothing behind.
   useEffect(() => () => finish(false), []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -65,8 +71,9 @@ export function PanelSplitter({
     delete document.body.dataset.panelDrag;
     document.body.style.userSelect = current.userSelect;
     if (commit && current.width !== current.startWidth) onResize(current.width);
-    // The stored width (drawn from the frame's variable) takes over from the drag's own value.
-    target()?.style.removeProperty(WIDTH_VAR[panel]);
+    // The stored widths (drawn from the frame's variables) take over from the drag's own values.
+    for (const each of PANELS)
+      document.getElementById(PANEL_IDS[each])?.style.removeProperty(WIDTH_VAR[each]);
     handle.current?.setAttribute("aria-valuenow", String(value));
   }
 
@@ -104,7 +111,13 @@ export function PanelSplitter({
     current.width = width;
     cancelAnimationFrame(current.frame);
     current.frame = requestAnimationFrame(() => {
-      target()?.style.setProperty(WIDTH_VAR[panel], `${width}px`);
+      // Each panel's own variable overrides the frame's for the length of the drag only.
+      const drawn = onPreview?.(width);
+      for (const each of PANELS) {
+        const px = each === panel ? width : drawn?.[each];
+        if (typeof px === "number")
+          document.getElementById(PANEL_IDS[each])?.style.setProperty(WIDTH_VAR[each], `${px}px`);
+      }
       handle.current?.setAttribute("aria-valuenow", String(width));
     });
   };

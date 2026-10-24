@@ -243,6 +243,20 @@ export function usePrefs(): UsePrefs {
 
 applyDensity();
 
+// Another tab of this device writes the same keys. Its write is re-read here (not pushed to the
+// server — that tab did), so this tab's next write rebuilds `hf.prefs.v1` from the newer values
+// instead of erasing them with its own stale copy.
+if (typeof window !== "undefined")
+  window.addEventListener("storage", (event) => {
+    if (event.storageArea !== null && event.storageArea !== localStorage) return;
+    if (event.key !== null && event.key !== PREFS_KEY && event.key !== MODE_KEY) return;
+    state = readLocal();
+    shortcutsOn = readShortcuts();
+    panelLayout = readLayout();
+    applyDensity();
+    emit();
+  });
+
 // The sync is bound to one account's prefs API: an identity change or sign-out removes it, and a
 // pending save for the previous account is dropped. The local values are device UI preferences.
 registerUserStatePurger(() => {

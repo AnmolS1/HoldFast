@@ -192,6 +192,69 @@ describe("prefs: the panel layout (F02, this device only)", () => {
   });
 });
 
+// Review F02-2: another tab of the same device writes hf.prefs.v1 too. This tab re-reads it on the
+// `storage` event, so its own next write keeps what the other tab stored.
+describe("prefs: another tab's write (storage event)", () => {
+  const otherTab = (value: Record<string, unknown>, theme?: string) => {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(value));
+    if (theme) localStorage.setItem(MODE_KEY, theme);
+    window.dispatchEvent(new StorageEvent("storage", { key: PREFS_KEY, storageArea: localStorage }));
+    if (theme)
+      window.dispatchEvent(new StorageEvent("storage", { key: MODE_KEY, storageArea: localStorage }));
+  };
+  const layout: PanelLayout = {
+    sidebar: { collapsed: true, width: 300 },
+    details: { open: false, width: 400 },
+  };
+
+  it("the other tab's layout and shortcuts flag survive this tab's next write", () => {
+    otherTab({ density: "comfortable", viewMode: "list", shortcuts: false, layout });
+    expect(getLayout()).toEqual(layout);
+    expect(getShortcutsOn()).toBe(false);
+    expect(getPrefs().density).toBe("comfortable");
+    setPrefs({ viewMode: "grid" });
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toEqual({
+      density: "comfortable",
+      viewMode: "grid",
+      shortcuts: false,
+      layout,
+    });
+    setShortcutsOn(true);
+  });
+
+  it("this tab's own layout write keeps the other tab's shortcuts flag, and the reverse", () => {
+    otherTab({ density: "compact", viewMode: "list", shortcuts: false });
+    setLayout(layout);
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toMatchObject({ shortcuts: false, layout });
+    otherTab({
+      density: "compact",
+      viewMode: "list",
+      layout: { ...layout, sidebar: { collapsed: false, width: 250 } },
+    });
+    setShortcutsOn(false);
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).toMatchObject({
+      shortcuts: false,
+      layout: { sidebar: { collapsed: false, width: 250 } },
+    });
+    setShortcutsOn(true);
+  });
+
+  it("the other tab's theme is not written back over by this tab", () => {
+    otherTab({ density: "compact", viewMode: "list" }, "dark");
+    expect(getPrefs().theme).toBe("dark");
+    setPrefs({ viewMode: "grid" });
+    expect(localStorage.getItem(MODE_KEY)).toBe("dark");
+  });
+
+  it("re-reading is not a change to push: nothing is saved to the server", async () => {
+    const save = vi.fn(async () => {});
+    await registerPrefsSync({ load: async () => null, save });
+    otherTab({ density: "comfortable", viewMode: "grid" });
+    await flush(SYNC_DEBOUNCE_MS + 50);
+    expect(save).not.toHaveBeenCalled();
+  });
+});
+
 describe("prefs: with a registered sync", () => {
   it("on registration the server copy wins and overwrites local", async () => {
     setPrefs({ viewMode: "grid", theme: "dark" });
