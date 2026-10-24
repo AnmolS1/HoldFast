@@ -95,7 +95,7 @@ import { SCANNER_INSTANCES, scannerHealth, type ScannerDeps } from "../scan/cont
 import { cancelDeletion, revokeSessions, scheduleDeletion, suspendUser } from "../services/account-state";
 import * as actions from "../services/admin-actions";
 import { audit, auditInTx } from "../services/audit";
-import { jsonBody } from "../services/body";
+import { DMCA_NOTICE_BODY_MAX_BYTES, jsonBody } from "../services/body";
 import { effectiveLimits } from "../services/ceilings";
 import { now } from "../services/clock";
 import { AppError } from "../services/errors";
@@ -834,7 +834,9 @@ router.get("/admin/dmca", async (c) => {
 
 router.post("/admin/dmca", async (c) => {
   const admin = requireAdmin(c);
-  const { nodeIds, receivedAt, ...fields } = CreateDmcaNoticeBody.parse(await jsonBody(c));
+  const { nodeIds, receivedAt, ...fields } = CreateDmcaNoticeBody.parse(
+    await jsonBody(c, DMCA_NOTICE_BODY_MAX_BYTES),
+  );
   const created = await actions.createNotices(
     c,
     admin,
@@ -861,7 +863,7 @@ router.post(`/admin/dmca/${ID}/action`, async (c) => {
 
 router.post(`/admin/dmca/${ID}/counter`, async (c) => {
   const admin = requireAdmin(c);
-  const body = CounterNoticeBody.parse(await jsonBody(c));
+  const body = CounterNoticeBody.parse(await jsonBody(c, DMCA_NOTICE_BODY_MAX_BYTES));
   return c.json(noticeDto(await actions.counterNotice(c, admin, c.req.param("id"), body)));
 });
 

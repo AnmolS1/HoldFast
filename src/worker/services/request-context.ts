@@ -165,7 +165,8 @@ export function resolveSettings(
     signupMode: stored.signupMode ?? (env.SIGNUP_MODE === "open" ? "open" : "invite"),
     termsVersion: stored.termsVersion ?? env.TERMS_VERSION,
     uploadsEnabled: stored.uploadsEnabled ?? true,
-    linksEnabled: stored.linksEnabled ?? true,
+    // Fails CLOSED (R1 secsrv-n1): no row, no public links — prod relies on links being off.
+    linksEnabled: stored.linksEnabled ?? false,
     readOnly: stored.readOnly ?? false,
     demoMode: stored.demoMode ?? false,
   };

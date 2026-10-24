@@ -56,7 +56,7 @@ import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
 import { consumeCeiling, effectiveLimits } from "../services/ceilings";
 import { now } from "../services/clock";
-import { AppError } from "../services/errors";
+import { AppError, validationDetails } from "../services/errors";
 import { hashLinkPassword } from "../services/link-password";
 import { metric } from "../services/metrics";
 import { requireRole, type Access } from "../services/permissions";
@@ -87,9 +87,7 @@ const target = (nodeId: string) => ({ type: "node", id: nodeId });
 export function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
   if (result.success) return result.data;
-  throw new AppError("validation", undefined, {
-    issues: result.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
-  });
+  throw new AppError("validation", undefined, validationDetails(result.error.issues));
 }
 
 /**

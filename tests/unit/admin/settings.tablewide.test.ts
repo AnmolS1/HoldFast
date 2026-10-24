@@ -187,6 +187,10 @@ describe("the kill switches take effect through the real pipeline", () => {
       while (pending.length) await Promise.allSettled(pending.splice(0));
       return { status: response.status, body };
     };
+    // On only with a row saying so (no row fails closed, R1 secsrv-n1).
+    expect(
+      (await adminCall(who.as, "PATCH", "/settings", { ...TABLE, body: { linksEnabled: true } })).status,
+    ).toBe(200);
     expect((await ask()).status).toBe(200);
     expect(
       (await adminCall(who.as, "PATCH", "/settings", { ...TABLE, body: { linksEnabled: false } })).status,

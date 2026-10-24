@@ -455,8 +455,14 @@ router.post(`${BASE}/download-url`, limited, async (c) => {
  * does not is an item with its code and no URL. Nothing is counted: the zip was, at its manifest.
  */
 router.post(`${BASE}/download-urls`, limited, async (c) => {
-  const body = parse(PublicDownloadUrlsBody, await jsonBody(c));
-  const resolved = await resolveLink(c, c.req.param("token"), { zipGrant: body.zipGrant });
+  // The link before the body (R1 secweb-1): an unknown token, links off or a paused link is
+  // answered without validating a body anyone can send. Only the grant is taken from it first.
+  const raw = await jsonBody(c);
+  const grant = (raw as { zipGrant?: unknown } | null)?.zipGrant;
+  const resolved = await resolveLink(c, c.req.param("token"), {
+    zipGrant: typeof grant === "string" ? grant : undefined,
+  });
+  const body = parse(PublicDownloadUrlsBody, raw);
   const { link, pwv } = resolved;
   if (!resolved.granted) {
     refuse(c, link, null, "denied_scan", new AppError("forbidden", undefined, { reason: "zip_grant" }));

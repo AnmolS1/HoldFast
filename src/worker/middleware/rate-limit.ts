@@ -22,6 +22,9 @@
 //             impersonate), 60 a minute, keyed by the signed-in user (`u:<id>`; by address when
 //             signed out, which the plugin's gate refuses anyway). An operator's bulk moderation
 //             must not spend the sign-in budget of the address they sign in from (T26B Q-B1).
+//             Also every WRITE under /api/admin/* (any method but GET and HEAD), in the same
+//             bucket (R1 secsrv-n3); the console's reads — several lists per page, and its polls —
+//             are under RL_API alone.
 //   RL_API    by user (`u:<id>`) when signed in, else by client address, on every /api/* path
 //             but the CSP report endpoint, which spends a bucket of its own (`csp:<address>`, in
 //             routes/csp-report.ts): a page with a repeating violation must not use up its
@@ -47,6 +50,7 @@
 // still passed through `getSession`, so a 429 can never hide a hung auth layer. Do not reorder.
 
 import { requestMethod, requestPath } from "./canonical";
+import { SAFE_METHODS } from "./csrf";
 import type { MiddlewareHandler } from "hono";
 import { AUTH_PREFIX, spendsAuthBudget } from "../auth/endpoint-policy";
 import { normalise } from "../services/ip-hash";
@@ -75,6 +79,9 @@ export function ipKey(ip: string): string {
 /** Better Auth's admin plugin: RL_ADMIN, never RL_AUTH (see the header). */
 const ADMIN_PLUGIN_PREFIX = `${AUTH_PREFIX}/admin/`;
 
+/** The console's own routes: their writes spend RL_ADMIN too (see the header). */
+const ADMIN_API_PREFIX = "/api/admin/";
+
 /** Limited by its own bucket in its route (see the header). */
 const CSP_REPORT_PATH = "/api/public/csp-report";
 
@@ -87,7 +94,10 @@ export const rateLimit: MiddlewareHandler<AppEnv> = async (c, next) => {
     await enforceRateLimit(c.env, "RL_AUTH", budget === "ip" ? key : `${budget}:${normalise(c.get("ip"))}`);
   if (path === CSP_REPORT_PATH) return next();
   const user = c.get("user");
-  if (path.startsWith(ADMIN_PLUGIN_PREFIX))
+  if (
+    path.startsWith(ADMIN_PLUGIN_PREFIX) ||
+    (path.startsWith(ADMIN_API_PREFIX) && !SAFE_METHODS.has(method))
+  )
     await enforceRateLimit(c.env, "RL_ADMIN", user ? `u:${user.id}` : key);
   await enforceRateLimit(c.env, "RL_API", user ? `u:${user.id}` : key);
   return next();

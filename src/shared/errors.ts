@@ -24,7 +24,13 @@ export type ErrorCode =
   | "link_paused"
   | "read_only"
   | "feature_disabled"
-  | "scanner_starting";
+  | "scanner_starting"
+  | "body_too_large"
+  | "deletion_admin_scheduled"
+  | "self_action"
+  | "last_admin"
+  | "not_quarantined"
+  | "replace_in_progress";
 
 /** HTTP status of every error code. 401 has one meaning only: the session is missing or expired. */
 export const ERROR_STATUS = {
@@ -54,7 +60,25 @@ export const ERROR_STATUS = {
   // routes/uploads.ts: an avatar's synchronous scan waited out its budget for a scanner that is
   // starting (or busy) — retryable, with `Retry-After`; nothing was kept.
   scanner_starting: 503,
+  // services/body.ts: a JSON request body over its byte cap — refused before it is parsed.
+  body_too_large: 413,
+  // An account deletion an admin scheduled, which the account itself cannot cancel.
+  deletion_admin_scheduled: 409,
+  // An admin action aimed at the admin's own account.
+  self_action: 400,
+  // An action that would leave no admin.
+  last_admin: 409,
+  // A quarantine action on an item that is not (or no longer) in quarantine.
+  not_quarantined: 409,
+  // A file whose replacement upload is still in progress.
+  replace_in_progress: 409,
 } as const satisfies Record<ErrorCode, number>;
+
+/**
+ * Why a guarded job's on-demand pass (`POST /api/admin/jobs/:name/run`) STOPPED rather than "not
+ * done yet": the `details.reason` of its `409 conflict`. Not error codes of their own.
+ */
+export type JobStopReason = "destroy_paused" | "rolled_back" | "orphans_disabled" | "orphan_threshold";
 
 export type ErrorEnvelope = {
   error: ErrorCode;

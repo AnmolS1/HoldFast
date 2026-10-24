@@ -54,6 +54,12 @@ const DEFAULT_MESSAGE: Record<ErrorCode, string> = {
   read_only: "Holdfast is read-only right now.",
   feature_disabled: "This feature is switched off right now.",
   scanner_starting: "The virus scanner is starting up. Try again in a minute.",
+  body_too_large: "The request is too large.",
+  deletion_admin_scheduled: "This deletion was scheduled by an admin and cannot be cancelled here.",
+  self_action: "You cannot do this to your own account.",
+  last_admin: "This would leave no admin.",
+  not_quarantined: "This item is not in quarantine.",
+  replace_in_progress: "A new version of this file is still being uploaded.",
 };
 
 export class AppError extends Error {
@@ -76,6 +82,25 @@ export class AppError extends Error {
     this.details = details;
     this.headers = headers;
   }
+}
+
+/** Validation issues an error answer names; the rest are only counted (R1 secweb-n6). */
+export const MAX_ECHOED_ISSUES = 20;
+
+/**
+ * The `details` of a `400 validation` for zod's issues: the first `MAX_ECHOED_ISSUES` of them,
+ * and how many there were — an answer never grows with the input it refuses.
+ */
+export function validationDetails(issues: ZodError["issues"]): {
+  issues: { path: string; message: string }[];
+  issueCount: number;
+} {
+  return {
+    issues: issues
+      .slice(0, MAX_ECHOED_ISSUES)
+      .map((issue) => ({ path: issue.path.join("."), message: issue.message })),
+    issueCount: issues.length,
+  };
 }
 
 function requestIdOf(c: Context<AppEnv>): string {
@@ -127,9 +152,7 @@ function asAppError(error: unknown): AppError | null {
   const query = asQueryError(error);
   if (query) return fromQueryError(query);
   if (error instanceof ZodError) {
-    return new AppError("validation", undefined, {
-      issues: error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
-    });
+    return new AppError("validation", undefined, validationDetails(error.issues));
   }
   if (error instanceof HTTPException) return fromHttpException(error);
   return null;

@@ -1180,11 +1180,17 @@ describe("the error table equals PLAN §10", () => {
     feature_disabled: 503,
   };
   // In src/shared/errors.ts and NOT in PLAN §10: added by the auth security pass, and by AVWARM
-  // (an avatar's scan waited out on a cold scanner). Reported.
+  // (an avatar's scan waited out on a cold scanner), and by the R1 fix packages. Reported.
   const NOT_IN_THE_PLAN: Record<string, number> = {
     second_factor_required: 403,
     second_factor_throttled: 429,
     scanner_starting: 503,
+    body_too_large: 413,
+    deletion_admin_scheduled: 409,
+    self_action: 400,
+    last_admin: 409,
+    not_quarantined: 409,
+    replace_in_progress: 409,
   };
 
   it("every row of the plan is in the table with its status", () => {
@@ -1201,7 +1207,7 @@ describe("the error table equals PLAN §10", () => {
     ]);
   });
 
-  it("the table has nothing else — except the three codes known to be missing from the plan", () => {
+  it("the table has nothing else — except the codes known to be missing from the plan", () => {
     expect(ERROR_STATUS).toEqual({ ...PLAN_10, ...NOT_IN_THE_PLAN });
     expect([...common.ErrorCode.options].sort()).toEqual(Object.keys(ERROR_STATUS).sort());
   });

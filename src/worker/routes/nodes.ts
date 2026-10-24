@@ -78,7 +78,7 @@ import { requireVerified } from "../middleware/guards";
 import { audit } from "../services/audit";
 import { jsonBody } from "../services/body";
 import { now } from "../services/clock";
-import { AppError } from "../services/errors";
+import { AppError, validationDetails } from "../services/errors";
 import { fitName, nameKeyOf, sanitizeName, uniqueZipPaths, zipPath } from "../services/filename";
 import { metric } from "../services/metrics";
 import { inlineKindAllowed, thumbEligible } from "../services/mime";
@@ -100,9 +100,7 @@ const RESCANNABLE: readonly ScanStatus[] = ["error", "skipped", "pending"];
 function parse<T>(schema: z.ZodType<T>, input: unknown): T {
   const result = schema.safeParse(input);
   if (result.success) return result.data;
-  throw new AppError("validation", undefined, {
-    issues: result.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
-  });
+  throw new AppError("validation", undefined, validationDetails(result.error.issues));
 }
 
 /**
