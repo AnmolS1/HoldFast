@@ -275,6 +275,18 @@ async function mockUploadApi(page: Page, port: number): Promise<UploadApi> {
         created += 1;
         return await answer(route, 200, folderDto({ id: rowId(0x7000 + created), ...sent }));
       }
+      if (method === "GET" && path === "/api/nodes/scan-status") {
+        // The ribbon's scan poll (R1 m16): every landed file it asks about, in one request.
+        const ids = (new URL(request.url()).searchParams.get("ids") ?? "").split(",").filter(Boolean);
+        const items = ids.flatMap((id) => {
+          const file = landed.get(id);
+          if (!file) return [];
+          file.polls += 1;
+          // Still pending on the first read, so "Scanning" is seen.
+          return [nodeDto({ id, name: file.name, scanStatus: file.polls < 2 ? "pending" : api.scan })];
+        });
+        return await answer(route, 200, { items });
+      }
       const node = /^\/api\/nodes\/([^/]+)$/.exec(path);
       if (method === "GET" && node) {
         if (node[1] === FOLDER_ID) return await answer(route, 200, nodeDetail({ ...folderDto() }));

@@ -54,7 +54,7 @@ describe("id patterns (src/shared/ids.ts)", () => {
 });
 
 describe("registry: the real routers", () => {
-  it("has the 20 files of the route table, in its order", () => {
+  it("has the 21 files of the route table, in its order", () => {
     expect(apiRouters.map((entry) => entry.name)).toEqual(routeTable.map((row) => row.name));
     expect(routeTable.map((row) => row.name)).toEqual([
       "health",
@@ -68,6 +68,7 @@ describe("registry: the real routers", () => {
       "account-lifecycle",
       "account",
       "nodes",
+      "scan-status",
       "trash",
       "shares",
       "links",
@@ -78,7 +79,7 @@ describe("registry: the real routers", () => {
       "public-links",
       "admin",
     ]);
-    expect(new Set(apiRouters.map((entry) => entry.router)).size).toBe(20);
+    expect(new Set(apiRouters.map((entry) => entry.router)).size).toBe(21);
   });
 
   it("passes every rule", () => {

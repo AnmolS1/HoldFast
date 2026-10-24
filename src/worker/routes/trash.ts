@@ -34,7 +34,7 @@ import { LegalHoldError, QueryError } from "../db/errors";
 import { getNode } from "../db/queries/nodes";
 import { listTrash, restore, trash } from "../db/queries/trash";
 import { countTrash, purgeWasRequested, requestPurge } from "../db/queries/trash-jobs";
-import { effectiveAccess, effectiveTrashed, lockOwnerTree } from "../db/queries/tree";
+import { effectiveAccess, lockOwnerTree } from "../db/queries/tree";
 import { retryOnDeadlock } from "../db/retry";
 import type { Node } from "../db/schema";
 import { purgeRoot, recordPurgeRequest, requestInstead } from "../jobs/purge";
@@ -196,15 +196,15 @@ router.post(`/nodes/${ID}/restore`, async (c) => {
     }
   }
   if (!isTrashedRoot(node)) throw refused();
-  // The folder it was in is in the trash too: it comes back at the owner's top level.
-  const toRoot = node.parentId !== null && (await effectiveTrashed(db(c), node.parentId));
-  if (toRoot && access.role !== "owner") throw refused();
 
   let row: Node | null;
   try {
     row = await retryOnDeadlock(db(c), async (tx) => {
       if (access.role !== "owner") await assertStillTheirs(tx, node, user.id);
-      return restore(tx, id, { toRoot });
+      // The folder it was in is in the trash too: the owner gets it back at the top level, an
+      // editor is refused (`conflict`). Decided under the tree lock, not before it: a folder
+      // another tab restored meanwhile takes its child back in place (R1 func-8).
+      return restore(tx, id, access.role === "owner" ? { toRoot: "if_parent_trashed" } : {});
     });
   } catch (error) {
     // Out from under a folder that protects it, or its folder was trashed in this instant: the
@@ -214,6 +214,7 @@ router.post(`/nodes/${ID}/restore`, async (c) => {
     throw error;
   }
   if (!row) throw refused();
+  const toRoot = node.parentId !== null && row.parentId === null;
   audit(c, "node.restore", { type: "node", id }, { toRoot });
   const view = { viewerId: user.id, role: access.role, shareRootId: access.viewRootId };
   return c.json(await toNodeDto(db(c), row, view));

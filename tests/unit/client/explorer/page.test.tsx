@@ -4,8 +4,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 import { COMMAND_IDS, findCommand, runCommand } from "../../../../src/client/components/CommandPalette";
 import { getToasts } from "../../../../src/client/components/Toaster";
-import { requestUpload } from "../../../../src/client/features/upload";
-import { emitNodesChanged } from "../../../../src/client/lib/contracts";
+import { emitNodesChanged, requestUpload } from "../../../../src/client/lib/contracts";
 import { setPrefs } from "../../../../src/client/lib/prefs";
 import type { NodeDto } from "../../../../src/shared/schemas/node";
 import { buildRoutes } from "../../../../src/client/router";
@@ -41,13 +40,12 @@ import {
   waitForRows,
 } from "./helpers";
 
-// The uploader is a sibling feature: its slot is a stub here, and the call is what is asserted.
-vi.mock("../../../../src/client/features/upload", () => ({
-  requestUpload: vi.fn(),
-  scanVerdictsSeen: vi.fn(),
-  UploadDropOverlay: () => null,
-  routes: [],
-}));
+// The uploader is a sibling feature, asked through lib/contracts: the slot is a stub here, and the
+// call is what is asserted.
+vi.mock("../../../../src/client/lib/contracts", async (original) => {
+  const real = await original<typeof import("../../../../src/client/lib/contracts")>();
+  return { ...real, requestUpload: vi.fn(), scanVerdictsSeen: vi.fn() };
+});
 
 setupExplorer();
 

@@ -94,6 +94,22 @@ export function apiError(status: number, code: string, details?: Record<string, 
   });
 }
 
+/** The scan loop's request: every file it asks about, in one `GET …?ids=` (R1 m16). */
+export const SCAN_ASK = /^\/api\/nodes\/scan-status(\?|$)/;
+
+/** The ids a scan request asked about (its query string). */
+export const askIds = (call: { path: string }): string[] =>
+  (new URL(call.path, "http://app.invalid").searchParams.get("ids") ?? "").split(",").filter(Boolean);
+
+/** The scan loop's requests so far, as the ids each one asked about. */
+export function scanAsks(server: Server): string[][] {
+  return server.calls.filter((call) => call.method === "GET" && SCAN_ASK.test(call.path)).map(askIds);
+}
+
+/** How many of those requests asked about `id`. */
+export const askedAbout = (server: Server, id: string): number =>
+  scanAsks(server).filter((ids) => ids.includes(id)).length;
+
 /** Install the stand-in API and transport. Call inside a test or `beforeEach`. */
 export function installServer(): Server {
   let uploads = 0;
@@ -161,6 +177,15 @@ export function installServer(): Server {
           parentId: body.parentId,
         }),
       );
+    }
+    if (call.method === "GET" && SCAN_ASK.test(call.path)) {
+      // The ribbon's batch: every id it asks about, as the server's GET would show it.
+      const ids = askIds(call);
+      return json({
+        items: ids.map((id) =>
+          nodeDto({ id, name: landed.get(id) ?? "notes.txt", scanStatus: server.scanStatus }),
+        ),
+      });
     }
     const node = /^\/api\/nodes\/([^/]+)$/.exec(call.path);
     if (call.method === "GET" && node) {

@@ -9,6 +9,8 @@ import {
   NodeDto,
   NodePage,
   RestoreNodeResponse,
+  ScanStatusIds,
+  ScanStatusResponse,
   ThumbUrlResponse,
   TrashNodeResponse,
   ZipManifest,
@@ -159,6 +161,17 @@ export class FakeDrive {
       const node = folderNode(this.nextNode++, { parentId, name, role: parent?.role ?? "owner" });
       this.nodes.set(node.id, node);
       return { status: 200, body: NodeDto.parse(node) };
+    }
+    if (method === "GET" && path === "/api/nodes/scan-status") {
+      // As the real route: 1 … SCAN_STATUS_MAX_IDS well-formed ids or 400; each asked id that is a
+      // file here, once, as the node's GET would show it; any other id left out.
+      const parsed = ScanStatusIds.safeParse((url.searchParams.get("ids") ?? "").split(",").filter(Boolean));
+      if (!parsed.success) return driveEnvelope(400);
+      const items = [...new Set(parsed.data)].flatMap((id) => {
+        const node = this.nodes.get(id);
+        return node?.kind === "file" ? [node] : [];
+      });
+      return { status: 200, body: ScanStatusResponse.parse({ items }) };
     }
     if (method === "POST" && path === "/api/nodes/zip-manifest") {
       const ids = (body.nodeIds as string[]) ?? [];

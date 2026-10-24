@@ -85,8 +85,10 @@ function restoredName(name: string, attempt: number): string {
 
 /**
  * Takes a trashed root out of the trash, in place — or, with `toRoot`, at the owner's top level
- * (the caller passes it when the parent is itself trashed). When the name is taken there, the
- * node comes back as "<name> (restored)".
+ * (the caller passes it when the parent is itself trashed). `toRoot: "if_parent_trashed"` decides
+ * that HERE, under the tree lock: a parent restored a moment ago (another tab restoring the
+ * folder, R1 func-8) gets its child back in place, not at the top level. When the name is taken
+ * there, the node comes back as "<name> (restored)".
  * Null when the node is not a restorable trashed root (not trashed, purge already requested);
  * `not_found` when it is HIDDEN — taken down itself or by a folder above it, or locked: decided
  * under the tree lock and the row's lock, like `nodes.move` (restored to the top level it would
@@ -98,7 +100,7 @@ function restoredName(name: string, attempt: number): string {
 export async function restore(
   db: Executor,
   nodeId: string,
-  opts: { toRoot?: boolean } = {},
+  opts: { toRoot?: boolean | "if_parent_trashed" } = {},
 ): Promise<Node | null> {
   if (!isUuid(nodeId)) return null;
   return db.transaction(async (tx) => {
@@ -110,7 +112,11 @@ export async function restore(
     if (!node) return null;
     if (await effectiveHidden(tx, nodeId)) throw new QueryError("not_found");
     if (node.deletedAt === null || !node.trashedRoot || node.purgeRequestedAt !== null) return null;
-    const parentId = opts.toRoot ? null : node.parentId;
+    const toRoot =
+      opts.toRoot === "if_parent_trashed"
+        ? node.parentId !== null && (await effectiveTrashed(tx, node.parentId))
+        : opts.toRoot === true;
+    const parentId = toRoot ? null : node.parentId;
     // Like `move`: not out from under a folder that is on legal hold or under an open notice.
     if (parentId !== node.parentId) {
       const lost = await lostByLeaving(tx, nodeId, parentId);

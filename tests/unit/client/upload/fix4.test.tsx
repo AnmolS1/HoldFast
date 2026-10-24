@@ -24,6 +24,7 @@ import {
   type Server,
   settle,
   smallFile,
+  SCAN_ASK,
 } from "./helpers";
 
 setupShell();
@@ -181,7 +182,7 @@ describe("nothing of the old account starts inside the purge window (4m3, 4m5)",
 });
 
 describe("the scan loop's wait outlives a remount and a tab switch (4m4)", () => {
-  const polls = () => server.count("GET", /^\/api\/nodes\//);
+  const polls = () => server.count("GET", SCAN_ASK);
 
   async function limitedOnce(): Promise<void> {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
@@ -189,7 +190,7 @@ describe("the scan loop's wait outlives a remount and a tab switch (4m4)", () =>
     let limit = false;
     const scanAnswer = server.onJson;
     server.onJson = (call) => {
-      if (call.method === "GET" && /^\/api\/nodes\//.test(call.path) && limit) {
+      if (call.method === "GET" && SCAN_ASK.test(call.path) && limit) {
         limit = false;
         return envelope("rate_limited", 429, undefined, { "retry-after": "30" });
       }

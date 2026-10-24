@@ -106,3 +106,76 @@ export function onNodesChanged(handler: (detail: NodesChangedDetail) => void): (
   bus().addEventListener(NODES_CHANGED_EVENT, listener);
   return () => bus().removeEventListener(NODES_CHANGED_EVENT, listener);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Scan verdicts between the uploader and the listings (R1 a11y-3: one owner per verdict). The
+// explorer tells what its listing learned (`scanVerdictsSeen`) and asks, before it says a verdict,
+// whether it is the uploader's to say (`scanVerdictOwned`) — without importing the uploader. The
+// uploader registers itself when it starts following a scan; the registration is the account's
+// and goes with the purge (the uploader's own state is purged by its own purger).
+
+/** What the registry needs of a node: its id, its version and its scan state. */
+export interface ScanVerdictNode {
+  id: string;
+  etag: string | null;
+  kind: "file" | "folder";
+  scanStatus: string | null;
+}
+
+export interface ScanVerdictOwner {
+  /** A listing learned the state of these nodes. */
+  seen(nodes: readonly ScanVerdictNode[]): void;
+  /** Is this node's verdict the owner's to say? */
+  owns(node: Pick<ScanVerdictNode, "id" | "etag">): boolean;
+}
+
+let scanVerdictOwner: ScanVerdictOwner | null = null;
+
+/** Become the owner of the verdicts you follow (idempotent); returns the function that steps down. */
+export function registerScanVerdictOwner(owner: ScanVerdictOwner): () => void {
+  scanVerdictOwner = owner;
+  return () => {
+    if (scanVerdictOwner === owner) scanVerdictOwner = null;
+  };
+}
+
+/** Tell the owner what a listing learned. Nothing happens without one. */
+export function scanVerdictsSeen(nodes: readonly ScanVerdictNode[]): void {
+  scanVerdictOwner?.seen(nodes);
+}
+
+/** True when the owner says this verdict is its to say; false without one. */
+export function scanVerdictOwned(node: Pick<ScanVerdictNode, "id" | "etag">): boolean {
+  return scanVerdictOwner?.owns(node) ?? false;
+}
+
+registerUserStatePurger(() => {
+  scanVerdictOwner = null;
+});
+
+// ---------------------------------------------------------------------------------------------
+// "Upload into this folder" from a page of another feature: the uploader's slot, asked without
+// importing the uploader. The uploader's host registers it while the frame shows it. A function
+// of the app, not of an account: the purge does not remove it (what it queues is the uploader's,
+// and that is purged by the uploader's own purger).
+
+/** The slot's options, structurally `RequestUploadOptions` (components/slots.ts). */
+export interface UploadRequest {
+  files?: File[];
+  parentId?: string;
+}
+
+let uploadRequester: ((opts?: UploadRequest) => void) | null = null;
+
+/** Answer upload requests; returns the function that stops answering them. */
+export function registerUploadRequester(requester: (opts?: UploadRequest) => void): () => void {
+  uploadRequester = requester;
+  return () => {
+    if (uploadRequester === requester) uploadRequester = null;
+  };
+}
+
+/** Ask the uploader to upload `files` into `parentId` (without files: the picker). Nothing without one. */
+export function requestUpload(opts?: UploadRequest): void {
+  uploadRequester?.(opts);
+}

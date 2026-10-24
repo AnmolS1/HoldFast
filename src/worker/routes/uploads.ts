@@ -83,6 +83,7 @@ import {
   findResumable,
   markAborted,
   markDone,
+  replaceUnderWay,
   type SealedIp,
 } from "../db/queries/uploads";
 import { retryOnDeadlock } from "../db/retry";
@@ -752,6 +753,11 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
       // Under the uploader's row lock: the same file initialised twice at once is one session.
       const again = await findResumable(tx, match);
       if (again) return { session: again, created: false };
+      // Another version of the file is on its way (another tab, another editor): its complete
+      // would make this one's refused at complete, after every byte was sent (R1 func-7).
+      if (replaceNodeId !== null && (await replaceUnderWay(tx, replaceNodeId))) {
+        throw new AppError("replace_in_progress");
+      }
       if ((await countOpen(tx, user.id)) >= MAX_OPEN_UPLOADS) {
         throw new AppError("ceiling_exceeded", "Too many uploads are in progress.", { kind: OPEN_UPLOADS });
       }

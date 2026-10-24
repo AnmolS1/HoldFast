@@ -58,11 +58,11 @@ import { ApiError } from "../../lib/api";
 import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
+import { requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
 import { queryClient } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ShareDialog } from "../share";
-import { requestUpload, scanVerdictsSeen } from "../upload";
 import { ActionMenu, type MenuAnchor, type MenuEntry } from "./ActionMenu";
 import {
   announce,
@@ -551,7 +551,11 @@ function Explorer({ folderId }: { folderId: string | null }) {
     pendingIds,
     {
       onSettled: (node) => {
+        // A file the upload queue follows (or just settled) has its verdict said by the queue —
+        // asked BEFORE the patch below hands the verdict to it (R1 a11y-3: one owner).
+        const theQueues = scanVerdictOwned(node);
         patchInListings(queryClient, folderId, node.id, (current) => withScanOf(current, node));
+        if (theQueues) return;
         // A scan that ended is said once: ready, or what the row now says — by the name the row
         // shows (a rename may be on its way).
         const name = nodes.find((item) => item.id === node.id)?.name ?? node.name;

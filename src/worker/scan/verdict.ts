@@ -50,7 +50,7 @@ import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
-import { auditLog, type Node, type ScanDetail } from "../db/schema";
+import { auditLog, nodes, type Node, type ScanDetail } from "../db/schema";
 import { captureError } from "../sentry";
 import { audit, auditInTx } from "../services/audit";
 import { sendQuarantineNotice, sendUploadNotIntact } from "../services/email";
@@ -527,6 +527,15 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     };
     await recordDetection(bg, detection);
   }
+  /**
+   * An `error` no scan decided: the dead-letter consumer's (or a refusal's) `timeout`/`engine` on a
+   * version no scan has answered (`scannedAt` unset — a replace and a rescan clear it). An error a
+   * verdict wrote (`hash_mismatch`, a scanner `error` answer) carries its `scannedAt`.
+   */
+  const deadLettered = (node: Node) =>
+    node.scanStatus === "error" &&
+    (node.scanReason === "timeout" || node.scanReason === "engine") &&
+    node.scannedAt === null;
   type Decided =
     | { kind: "gone"; photodna?: PhotoDnaDetection | null }
     | {
@@ -587,13 +596,18 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
     let stale = false;
 
     if (outcome.status === "suspected_csam") {
-      // From ANY state: it only ever raises. The lock itself is the shared handler's, after commit.
+      // From ANY state: it only ever raises. The lock itself is the shared handler's, after commit
+      // — and it may fail and be retried for a while: the node is HELD now, in this transaction,
+      // so that no purge passes the gate in between (R1 func-n6(c)). The lock holds it as well.
       await recordScan(tx, node.id, key, seen);
+      await tx.update(nodes).set({ legalHold: true }).where(eq(nodes.id, node.id));
       wrote = "lock";
     } else if (takenDown) {
       await recordScan(tx, node.id, key, seen);
-    } else if (node.scanStatus === "pending" || node.scanStatus === "under_review") {
-      // `pending`: the status. `under_review`: `setScanResult` stores the outcome as the status a
+    } else if (node.scanStatus === "pending" || node.scanStatus === "under_review" || deadLettered(node)) {
+      // `pending`: the status. A dead letter's `error` (`deadLettered`) is no verdict — the
+      // object's other message, still alive, brings the real one, and it is applied as on `pending`
+      // (R1 func-12: an infected file kept no strike, no listing, and stayed downloadable). `under_review`: `setScanResult` stores the outcome as the status a
       // dismissal restores — and the effects below still apply (Addendum 2): a blocklisted hash
       // is taken down NOW, so dismissing the report can never restore an accessible file, and an
       // infected verdict strikes and notifies as it would on a pending node.

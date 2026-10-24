@@ -29,6 +29,7 @@ import { router as publicConfig } from "./public";
 import { router as publicLinks } from "./public-links";
 import { router as recent } from "./recent";
 import { router as reports } from "./reports";
+import { router as scanStatus } from "./scan-status";
 import { router as search } from "./search";
 import { router as shares } from "./shares";
 import { router as signupIntent } from "./signup-intent";
@@ -83,6 +84,7 @@ export const routeTable: readonly RouteRow[] = [
     ],
     fallback: ["/nodes/:id", "/nodes/:id/*"],
   },
+  { name: "scan-status", task: "R1 P5", claims: ["GET /nodes/scan-status"] },
   {
     name: "trash",
     task: "T14",
@@ -115,6 +117,7 @@ export const apiRouters: Array<{ name: string; router: Hono<AppEnv> }> = [
   { name: "account-lifecycle", router: accountLifecycle },
   { name: "account", router: account },
   { name: "nodes", router: nodes },
+  { name: "scan-status", router: scanStatus },
   { name: "trash", router: trash },
   { name: "shares", router: shares },
   { name: "links", router: links },

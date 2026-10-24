@@ -1,4 +1,5 @@
 // The uploader's arithmetic and rules, as pure functions.
+import { SCAN_STATUS_MAX_IDS } from "../../../shared/schemas/node";
 import type { UploadedPart } from "../../../shared/schemas/upload";
 
 /** Files in flight at once, and parts in flight per file: nine requests at most. */
@@ -23,9 +24,13 @@ export const COMPLETE_WAIT_LIMIT_MS = 120_000;
 
 /**
  * The scan is followed by ONE loop for the whole queue: at most one request per interval however
- * many files wait, each file until its verdict or for at most `SCAN_FOLLOW_LIMIT_MS`.
+ * many files wait — every file that is due, up to `SCAN_BATCH_MAX`, in that one request
+ * (`GET /api/nodes/scan-status`) — each file until its verdict or for at most
+ * `SCAN_FOLLOW_LIMIT_MS`.
  */
 export const SCAN_INTERVAL_MS = 1_000;
+/** Files asked about in one request: the server's own limit. */
+export const SCAN_BATCH_MAX = SCAN_STATUS_MAX_IDS;
 /**
  * One file is asked about again after these waits (the last repeats): quick at first, then once
  * every 30 s — a cold scanner takes minutes, and a file waiting on it costs two requests a minute.
@@ -42,8 +47,7 @@ export const SCAN_MIN_ASKS = 3;
 /**
  * And whatever the asks, no file is followed longer than this (counted the same way): a long
  * queue waiting on a stuck scanner costs at most this many seconds of one request a second
- * (1,800), then every row says "still being checked". (Inside it, 600 files are each asked three
- * times.) A batch status route would be the real answer for long queues.
+ * (1,800, each about up to `SCAN_BATCH_MAX` files), then every row says "still being checked".
  */
 export const SCAN_HARD_LIMIT_MS = 30 * 60_000;
 export const SCAN_BACKOFF_MAX_MS = 60_000;
@@ -51,6 +55,14 @@ export const SCAN_BACKOFF_MAX_MS = 60_000;
 /** A rate limit pauses the queue for its `Retry-After`: this when none is given, and never longer than the cap. */
 export const RATE_PAUSE_DEFAULT_MS = 30_000;
 export const RATE_PAUSE_MAX_MS = 10 * 60_000;
+
+/**
+ * A verdict the queue said is the queue's to say for this long: an answer of the explorer's own
+ * poll that was already on its way stays quiet (one owner per verdict, R1 a11y-3).
+ */
+export const VERDICT_CLAIM_MS = 60_000;
+/** "Uploading" and "uploaded" are said file by file for a drop of at most this many files (R1 a11y-11). */
+export const SAY_EACH_FILE_MAX = 4;
 
 /** A drop of more files than this is refused whole. */
 export const MAX_DROP_FILES = 10_000;

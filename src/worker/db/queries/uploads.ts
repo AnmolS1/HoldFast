@@ -58,13 +58,40 @@ export async function findResumable(
   return row ?? null;
 }
 
-/** The uploader's sessions in `open` or `completing` (the open-session cap). */
+/**
+ * A session that can still finish: `open` and not past `expiresAt`, or `completing` and not yet
+ * `COMPLETING_STALE_MINUTES` old (a closed tab during the avatar's wait leaves one; the stale-uploads
+ * job ends those — hourly on prod, never on dev, R1 func-13). The rest are left to the jobs.
+ */
+const STILL_RUNNING = or(
+  and(eq(uploads.status, "open"), gt(uploads.expiresAt, sql`now()`)),
+  and(
+    eq(uploads.status, "completing"),
+    sql`COALESCE(${uploads.completingAt}, ${uploads.createdAt}) >= now() - make_interval(mins => ${COMPLETING_STALE_MINUTES})`,
+  ),
+)!;
+
+/** The uploader's sessions that can still finish (the open-session cap). */
 export async function countOpen(db: Executor, uploaderId: string): Promise<number> {
   const [row] = await db
     .select({ n: sql<number>`count(*)`.mapWith(Number) })
     .from(uploads)
-    .where(and(eq(uploads.uploaderId, uploaderId), inArray(uploads.status, [...UNFINISHED])));
+    .where(and(eq(uploads.uploaderId, uploaderId), STILL_RUNNING));
   return row?.n ?? 0;
+}
+
+/**
+ * Is a new version of this file being uploaded right now — a session that can still finish,
+ * replacing it, by anyone (R1 func-7)? A resume of the caller's own session never asks.
+ */
+export async function replaceUnderWay(db: Executor, replaceNodeId: string): Promise<boolean> {
+  if (!isUuid(replaceNodeId)) return false;
+  const [row] = await db
+    .select({ id: uploads.id })
+    .from(uploads)
+    .where(and(eq(uploads.replaceNodeId, replaceNodeId), STILL_RUNNING))
+    .limit(1);
+  return row !== undefined;
 }
 
 /**

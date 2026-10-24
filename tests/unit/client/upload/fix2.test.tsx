@@ -16,7 +16,12 @@ import {
   resumeAll,
   retryItem,
 } from "../../../../src/client/features/upload/manager";
-import { PANEL_ROWS, SCAN_FOLLOW_LIMIT_MS, SCAN_MIN_ASKS } from "../../../../src/client/features/upload/plan";
+import {
+  PANEL_ROWS,
+  SCAN_FOLLOW_LIMIT_MS,
+  SCAN_MIN_ASKS,
+  SCAN_BATCH_MAX,
+} from "../../../../src/client/features/upload/plan";
 import { readResumeRows } from "../../../../src/client/features/upload/resume-list";
 import { getUploads, type UploadItem } from "../../../../src/client/features/upload/store";
 import { describeItem, rowsToDraw, summarise } from "../../../../src/client/features/upload/summary";
@@ -37,6 +42,7 @@ import {
   type Server,
   settle,
   smallFile,
+  scanAsks,
 } from "./helpers";
 
 setupShell();
@@ -446,8 +452,7 @@ describe("the panel's rows when there are more than it draws", () => {
 });
 
 describe("the scan loop's bound and the queue's length", () => {
-  const polls = () =>
-    server.calls.filter((call) => call.method === "GET" && /^\/api\/nodes\//.test(call.path));
+  const polls = () => scanAsks(server);
 
   it("one stuck file costs a handful of requests a minute, not one a second", async () => {
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
@@ -462,10 +467,9 @@ describe("the scan loop's bound and the queue's length", () => {
     expect(items()[0]).toMatchObject({ state: "done", scanStatus: "pending" });
   });
 
-  it("a queue long enough that nobody can be asked three times inside the time bound: none is given up without having been asked about, and each at least three times", async () => {
+  it("a queue far longer than one request: none is given up without having been asked about, each at least three times, at most one request a second", async () => {
     keepResumeListInMemory();
-    // Long enough that, at one ask a second, no file has had its third ask when the time bound
-    // passes (two rounds take 2 × count s > the bound + 10 s): the asks, not the time, decide.
+    // Five requests' worth (R1 m16: every due file in one request, up to SCAN_BATCH_MAX).
     const count = Math.ceil((SCAN_FOLLOW_LIMIT_MS + 10_000) / 2_000) + 40;
     vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
     server.scanStatus = "pending";
@@ -475,19 +479,19 @@ describe("the scan loop's bound and the queue's length", () => {
     );
     for (let turn = 0; turn < count + 50; turn += 1) await settle(0);
     expect(items().filter((item) => item.state === "scanning").length).toBe(count);
-    await settle(SCAN_FOLLOW_LIMIT_MS + 10_000);
-    // Past the time bound, and still nobody is given up: not everyone has been asked three times.
+    await settle(SCAN_FOLLOW_LIMIT_MS - 10_000);
     expect(items().every((item) => item.state === "scanning")).toBe(true);
-    await settle(count * SCAN_MIN_ASKS * 1_000);
+    await settle(20_000 + count * SCAN_MIN_ASKS * 1_000);
     expect(items().every((item) => item.state === "done" && item.scanStatus === "pending")).toBe(true);
     const perFile = new Map<string, number>();
-    for (const call of polls()) perFile.set(call.path, (perFile.get(call.path) ?? 0) + 1);
+    for (const ids of polls()) for (const id of ids) perFile.set(id, (perFile.get(id) ?? 0) + 1);
     expect(perFile.size).toBe(count);
     expect(Math.min(...perFile.values())).toBeGreaterThanOrEqual(SCAN_MIN_ASKS);
-    // And still at most one request a second in all.
+    // At most one request a second in all, and never more than the server's limit in one.
     expect(polls().length).toBeLessThanOrEqual(
       (SCAN_FOLLOW_LIMIT_MS + 10_000 + count * SCAN_MIN_ASKS * 1_000) / 1_000 + 1,
     );
+    expect(Math.max(...polls().map((ids) => ids.length))).toBeLessThanOrEqual(SCAN_BATCH_MAX);
   });
 
   it("when the frame goes, the scan is not asked about either — also for a file that lands meanwhile; it goes on when the frame is back", async () => {

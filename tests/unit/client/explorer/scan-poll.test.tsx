@@ -1,5 +1,6 @@
-// Watching a pending scan: every 5 s for two minutes, then every 30 s with "Still scanning". The
-// answer polled is a NodeDetailDto — the status is `.node.scanStatus`.
+// Watching a pending scan: every 5 s for two minutes, then every 30 s with "Still scanning". Every
+// file that is due is asked in ONE request, `GET /api/nodes/scan-status?ids=…` (R1 m16); the answer is
+// `{ items }`, each the node as its GET would show it — the status is `.scanStatus`.
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -18,17 +19,26 @@ import { renameNode } from "../../../../src/client/features/explorer/actions";
 import { ApiError } from "../../../../src/client/lib/api";
 import { emitNodesChanged } from "../../../../src/client/lib/contracts";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
-import { NodeDetailDto } from "../../../../src/shared/schemas/node";
+import { ScanStatusResponse } from "../../../../src/shared/schemas/node";
 import { envelope, json } from "../shell/helpers";
 import { FakeDrive } from "./fixtures/drive";
-import { detailOf, fileNode } from "./fixtures/nodes";
+import { fileNode } from "./fixtures/nodes";
 import { renderExplorer, rowOf, rows, serveDrive, setupExplorer } from "./helpers";
 
 setupExplorer();
 
 const PENDING = fileNode(1, { name: "new.pdf", scanStatus: "pending" });
-const DETAIL = new RegExp(`/api/nodes/${PENDING.id}$`);
-const ANY = /\/api\/nodes\/[0-9a-f-]{36}$/;
+const SCAN = /\/api\/nodes\/scan-status$/;
+/** The same, on a path with its query string. */
+const SCAN_PATH = /\/api\/nodes\/scan-status(\?|$)/;
+const idsOf = (call: { path: string }) =>
+  (new URL(call.path, "http://app.invalid").searchParams.get("ids") ?? "").split(",").filter(Boolean);
+/** The scan requests that asked about `id`. */
+const asksAbout = (drive: FakeDrive, id: string) =>
+  drive.callsTo("GET", SCAN).filter((call) => idsOf(call).includes(id));
+/** The same, over every request the stand-in server saw (answered by the drive or not). */
+const callsAbout = (calls: Array<{ path: string; body: unknown }>, id: string) =>
+  calls.filter((call) => SCAN_PATH.test(call.path) && idsOf(call).includes(id));
 
 /** Let `ms` pass, with everything that was waiting on it. */
 async function pass(ms: number): Promise<void> {
@@ -74,22 +84,22 @@ describe("a pending file", () => {
     await mount(drive);
     expect(rowOf(PENDING.id)!.querySelector('[role="progressbar"]')).not.toBeNull();
     await before(5_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(0);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(0);
     await after(5_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("pending");
 
     drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
     await before(10_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     await after(10_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
     expect(rowOf(PENDING.id)!.querySelector('[role="progressbar"]')).toBeNull();
     expect(document.querySelector("[data-explorer-live]")!.textContent).toBe("new.pdf is scanned and ready");
     // Settled: nobody asks again.
     await after(70_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
   });
 
   it("a verdict of infected turns the row into the blocked state", async () => {
@@ -106,18 +116,20 @@ describe("a pending file", () => {
     );
   });
 
-  it("a bare NodeDto is not the answer's shape: it does not parse, and the row stays pending", async () => {
+  it("bare NodeDtos are not the answer's shape: they do not parse, and the row stays pending", async () => {
     const clean = { ...PENDING, scanStatus: "clean" as const };
-    expect(NodeDetailDto.safeParse(clean).success).toBe(false);
-    expect(NodeDetailDto.safeParse(detailOf(clean)).success).toBe(true);
+    expect(ScanStatusResponse.safeParse([clean]).success).toBe(false);
+    expect(ScanStatusResponse.safeParse({ items: [clean] }).success).toBe(true);
     const drive = new FakeDrive([PENDING]);
     let bare = true;
     await mount(drive, (call) =>
-      call.method === "GET" && DETAIL.test(call.path) ? json(bare ? clean : detailOf(clean)) : undefined,
+      call.method === "GET" && SCAN_PATH.test(call.path)
+        ? json(bare ? [clean] : { items: [clean] })
+        : undefined,
     );
     await after(5_000);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("pending");
-    // The same node inside `{ node, breadcrumbs }` is read.
+    // The same node inside `{ items }` is read.
     bare = false;
     await after(10_000);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
@@ -127,34 +139,34 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING]);
     await mount(drive);
     await before(120_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(23);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(23);
     expect(rowOf(PENDING.id)!.querySelector("[data-still-scanning]")).toBeNull();
     await after(120_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(24);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(24);
     const glyph = rowOf(PENDING.id)!.querySelector("[data-still-scanning]")!;
     expect(glyph.getAttribute("aria-label")).toBe("Still scanning");
     // From here every 30 s: nothing at 125 s … 145 s.
     await before(150_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(24);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(24);
     await after(150_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(25);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(25);
     await before(180_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(25);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(25);
     await after(180_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(26);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(26);
   });
 
-  it("a poll that fails with 500 is tried again; one answered 404 takes the row away", async () => {
-    const drive = new FakeDrive([PENDING]).fail("GET", DETAIL, 500, 1);
+  it("a poll that fails with 500 is tried again; a file the answer leaves out (gone) takes the row away", async () => {
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 500, 1);
     await mount(drive);
     await after(5_000);
     expect(rowOf(PENDING.id)).not.toBeNull();
     drive.nodes.delete(PENDING.id);
     await after(10_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
     expect(rowOf(PENDING.id)).toBeNull();
     await after(60_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
   });
 
   it("leaving the page stops the polling", async () => {
@@ -163,47 +175,59 @@ describe("a pending file", () => {
     await after(5_000);
     view.unmount();
     await after(70_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
   });
 
-  it(`many pending files: ${POLL_PER_TICK} questions a tick, in turns — never one loop per file`, async () => {
+  it(`many pending files: one request a tick with all of them (up to ${POLL_PER_TICK}) — never one loop per file`, async () => {
     const many = Array.from({ length: 30 }, (_, index) =>
       fileNode(index + 1, { name: `f${String(index).padStart(2, "0")}.pdf`, scanStatus: "pending" }),
     );
     const drive = new FakeDrive(many);
     await mount(drive);
-    const asked = () => drive.callsTo("GET", ANY).map((call) => call.path.split("/").pop()!);
+    const requests = () => drive.callsTo("GET", SCAN);
     await after(5_000);
-    expect(asked()).toHaveLength(POLL_PER_TICK);
+    expect(requests()).toHaveLength(1);
+    expect(new Set(idsOf(requests()[0]!))).toEqual(new Set(many.map((node) => node.id)));
     await after(10_000);
-    expect(asked()).toHaveLength(2 * POLL_PER_TICK);
-    // Turns: the second tick asked for four OTHER files.
-    expect(new Set(asked()).size).toBe(2 * POLL_PER_TICK);
-    // A whole minute: 12 ticks × 4 — 48 requests for 30 pending files, not 360.
+    expect(requests()).toHaveLength(2);
+    // A whole minute: 12 requests for 30 pending files (48 before, 360 one loop per file).
     await after(60_000);
-    expect(asked()).toHaveLength(12 * POLL_PER_TICK);
-    // Every file has had its turn by then (8 ticks suffice for 30).
-    expect(new Set(asked()).size).toBe(30);
+    expect(requests()).toHaveLength(12);
+    expect(requests().every((call) => idsOf(call).length === 30)).toBe(true);
+  });
+
+  it("a 100-file folder: at most one request per poll tick, every file in it", async () => {
+    const many = Array.from({ length: 100 }, (_, index) =>
+      fileNode(index + 1, { name: `g${String(index).padStart(3, "0")}.pdf`, scanStatus: "pending" }),
+    );
+    const drive = new FakeDrive(many);
+    await mount(drive);
+    for (let tick = 1; tick <= 6; tick += 1) {
+      await after(tick * POLL_FAST_MS);
+      expect(drive.callsTo("GET", SCAN)).toHaveLength(tick);
+    }
+    expect(drive.callsTo("GET", SCAN).every((call) => idsOf(call).length === 100)).toBe(true);
   });
 
   it("a clean file and a folder are never polled", async () => {
     const drive = new FakeDrive([fileNode(2, { name: "ok.pdf" })]);
     await mount(drive);
     await after(60_000);
-    expect(drive.callsTo("GET", ANY)).toHaveLength(0);
+    expect(drive.callsTo("GET", SCAN)).toHaveLength(0);
   });
 
-  it("403 ends the watch of that file: it is no longer ours to read, and it is never asked for again", async () => {
-    const other = fileNode(2, { name: "other.pdf", scanStatus: "pending" });
-    const drive = new FakeDrive([PENDING, other]).fail("GET", DETAIL, 403);
+  it("a 403 for the whole request says nothing about any one file: the loop backs off and asks again", async () => {
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 403, 1);
     await mount(drive);
     await after(5_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
-    await after(120_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
-    // The row stays as it was; its neighbour is still watched.
+    // The refused request reached the drive (and was answered 403 there).
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("pending");
-    expect(drive.callsTo("GET", new RegExp(`/api/nodes/${other.id}$`)).length).toBeGreaterThan(20);
+    // Backed off 5 s, then asked again.
+    drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
+    await after(15_000);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
+    expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
   });
 
   it("429 makes the whole loop wait Retry-After — for every file, not only the one refused", async () => {
@@ -211,19 +235,20 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING, other]);
     let refuse = true;
     await mount(drive, (call) =>
-      refuse && call.method === "GET" && ANY.test(call.path)
+      refuse && call.method === "GET" && SCAN_PATH.test(call.path)
         ? envelope("rate_limited", 429, undefined, { "retry-after": "40" })
         : undefined,
     );
     await after(5_000);
-    // The first question was refused; the second file was not even asked.
-    const asked = () => drive.callsTo("GET", ANY).length;
+    // The one request was refused (the drive answered nothing).
+    const asked = () => drive.callsTo("GET", SCAN).length;
     expect(asked()).toBe(0);
     refuse = false;
     await before(45_000);
     expect(asked()).toBe(0);
     await after(45_000);
-    expect(asked()).toBe(2);
+    expect(asked()).toBe(1);
+    expect(new Set(idsOf(drive.callsTo("GET", SCAN)[0]!))).toEqual(new Set([PENDING.id, other.id]));
   });
 
   it("Retry-After is honoured up to a bound, and a 429 without one waits half a minute", () => {
@@ -244,9 +269,9 @@ describe("a pending file", () => {
       POLL_BACKOFF_MAX_MS,
       POLL_BACKOFF_MAX_MS,
     ]);
-    const drive = new FakeDrive([PENDING]).fail("GET", DETAIL, 500);
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 500);
     await mount(drive);
-    const count = () => drive.callsTo("GET", DETAIL).length;
+    const count = () => asksAbout(drive, PENDING.id).length;
     // Questions at 5, 10, 20, 40, 80 s: five in the first 100 s where a fixed rate would send 20.
     for (const [at, expected] of [
       [5_000, 1],
@@ -268,33 +293,32 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING]);
     await mount(drive);
     await after(5_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
     await act(async () => void document.dispatchEvent(new Event("visibilitychange")));
     await after(60_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     hidden.mockReturnValue(false);
     await act(async () => void document.dispatchEvent(new Event("visibilitychange")));
     await pass(50);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(2);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
   });
 
   it(`a file is watched for ${POLL_MAX_MS / 60_000} minutes from the moment it became pending, then no longer asked for`, async () => {
     const drive = new FakeDrive([PENDING]);
     await mount(drive);
     await after(POLL_MAX_MS);
-    const total = drive.callsTo("GET", DETAIL).length;
+    const total = asksAbout(drive, PENDING.id).length;
     // 24 in the first two minutes, then one every 30 s.
     expect(total).toBeLessThanOrEqual(24 + (POLL_MAX_MS - POLL_FAST_FOR_MS) / POLL_SLOW_MS + 1);
     await after(POLL_MAX_MS + 10 * 60_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(total);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(total);
     expect(rowOf(PENDING.id)!.querySelector("[data-still-scanning]")).not.toBeNull();
   });
 
   it("a file that becomes pending 25 minutes into the visit is watched for its own span: it settles at minute 32 and its row follows", async () => {
     // The first file of the visit settles at once; the watch must not end with the visit's clock.
     const LATE = fileNode(2, { name: "later.pdf", scanStatus: "pending" });
-    const LATE_DETAIL = new RegExp(`/api/nodes/${LATE.id}$`);
     const drive = new FakeDrive([PENDING]);
     await mount(drive);
     drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
@@ -307,10 +331,10 @@ describe("a pending file", () => {
     await pass(1);
     await pass(1);
     expect(rowOf(LATE.id)!.getAttribute("data-scan")).toBe("pending");
-    const asked = drive.callsTo("GET", LATE_DETAIL).length;
+    const asked = asksAbout(drive, LATE.id).length;
     // Past the visit's 30 minutes it is still asked for, at its own pace (30 s after two minutes).
     await after(32 * 60_000);
-    expect(drive.callsTo("GET", LATE_DETAIL).length).toBeGreaterThan(asked + 20);
+    expect(asksAbout(drive, LATE.id).length).toBeGreaterThan(asked + 20);
     drive.nodes.set(LATE.id, { ...LATE, scanStatus: "clean" });
     await pass(POLL_SLOW_MS + 100);
     expect(rowOf(LATE.id)!.getAttribute("data-scan")).toBe("clean");
@@ -320,7 +344,7 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING]);
     let release: (response: Response) => void = () => {};
     await mount(drive, (call) =>
-      call.method === "GET" && DETAIL.test(call.path)
+      call.method === "GET" && SCAN_PATH.test(call.path)
         ? new Promise<Response>((resolve) => {
             release = resolve;
           })
@@ -330,7 +354,7 @@ describe("a pending file", () => {
     await act(async () => {
       await purgeUserState();
     });
-    await act(async () => release(json(detailOf({ ...PENDING, scanStatus: "clean" }))));
+    await act(async () => release(json({ items: [{ ...PENDING, scanStatus: "clean" }] })));
     await pass(50);
     // (The page is still mounted in this test and has read its listing again — from the drive,
     // where the file is pending. The late answer said "clean": had it been applied, a row would be.)
@@ -345,7 +369,7 @@ describe("a pending file", () => {
     // not change across the purge — only the account check can stop the answer.
     let release: (response: Response) => void = () => {};
     const calls = serveDrive(new FakeDrive([PENDING]), (call) =>
-      DETAIL.test(call.path)
+      SCAN_PATH.test(call.path)
         ? new Promise<Response>((resolve) => {
             release = resolve;
           })
@@ -358,7 +382,7 @@ describe("a pending file", () => {
     await act(async () => {
       await purgeUserState();
     });
-    await act(async () => release(json(detailOf({ ...PENDING, scanStatus: "clean" }))));
+    await act(async () => release(json({ items: [{ ...PENDING, scanStatus: "clean" }] })));
     await pass(50);
     expect(onSettled).not.toHaveBeenCalled();
     // …and it asks nothing more for the account that is gone.
@@ -377,7 +401,7 @@ describe("M8 — the watch counts only time the loop could ask", () => {
     const view = renderHook(({ active }) => useScanPolling([PENDING.id], handlers, active), {
       initialProps: initial,
     });
-    const asked = () => calls.filter((call) => DETAIL.test(call.path)).length;
+    const asked = () => callsAbout(calls, PENDING.id).length;
     return { view, asked };
   }
 
@@ -427,7 +451,6 @@ describe("M8 — the watch counts only time the loop could ask", () => {
 describe("m28 — a file first listed during a pause starts its watch when the pause ends", () => {
   it("A pending and covered; B listed 10 minutes into the pause; back in front 30 minutes later: B asked within 5 s", async () => {
     const LATE = fileNode(2, { name: "later.pdf", scanStatus: "pending" });
-    const LATE_DETAIL = new RegExp(`/api/nodes/${LATE.id}$`);
     const calls = serveDrive(new FakeDrive([PENDING, LATE]));
     const handlers = { onSettled: vi.fn(), onGone: vi.fn() };
     const view = renderHook(({ ids, active }) => useScanPolling(ids, handlers, active), {
@@ -436,10 +459,10 @@ describe("m28 — a file first listed during a pause starts its watch when the p
     await pass(10 * 60_000);
     view.rerender({ ids: [PENDING.id, LATE.id], active: false });
     await pass(30 * 60_000);
-    expect(calls.filter((call) => LATE_DETAIL.test(call.path))).toHaveLength(0);
+    expect(callsAbout(calls, LATE.id)).toHaveLength(0);
     view.rerender({ ids: [PENDING.id, LATE.id], active: true });
     await pass(POLL_FAST_MS + 50);
-    expect(calls.filter((call) => LATE_DETAIL.test(call.path)).length).toBeGreaterThanOrEqual(1);
+    expect(callsAbout(calls, LATE.id).length).toBeGreaterThanOrEqual(1);
   });
 });
 
@@ -464,7 +487,7 @@ describe("m29 — a scan's answer never draws back a rename in flight", () => {
     // The server has finished the scan (it still has the old name: the rename has not landed).
     drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
     await after(5_000);
-    expect(drive.callsTo("GET", DETAIL)).toHaveLength(1);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
     expect(rowOf(PENDING.id)!.textContent).toContain("renamed.pdf");
     expect(document.querySelector("[data-explorer-live]")!.textContent).toContain("renamed.pdf");

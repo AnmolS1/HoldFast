@@ -206,3 +206,20 @@ export type BatchDownloadUrlItem = z.infer<typeof BatchDownloadUrlItem>;
 
 export const BatchDownloadUrlsResponse = z.object({ items: z.array(BatchDownloadUrlItem) });
 export type BatchDownloadUrlsResponse = z.infer<typeof BatchDownloadUrlsResponse>;
+
+/**
+ * `GET /api/nodes/scan-status?ids=<id>,<id>,…`: the scan state of these files, in one request
+ * (R1 m16). A GET — a read like the node's own GET, so no read-only switch, impersonation or
+ * terms gate stops it. The ids, comma-separated, as `ScanStatusIds` reads them.
+ */
+export const SCAN_STATUS_MAX_IDS = 100;
+export const ScanStatusIds = z.array(NodeId).min(1).max(SCAN_STATUS_MAX_IDS);
+/** The longest `ids` value: SCAN_STATUS_MAX_IDS ids of 36 characters and their commas. */
+export const SCAN_STATUS_MAX_QUERY = SCAN_STATUS_MAX_IDS * 37 - 1;
+export type ScanStatusIds = z.infer<typeof ScanStatusIds>;
+/** The query string's value for these ids. */
+export const scanStatusQuery = (ids: readonly string[]): string => `ids=${ids.join(",")}`;
+
+/** Each file as `GET /api/nodes/:id` sends it; an id that route would not answer with a file is left out. */
+export const ScanStatusResponse = z.object({ items: z.array(NodeDto) });
+export type ScanStatusResponse = z.infer<typeof ScanStatusResponse>;

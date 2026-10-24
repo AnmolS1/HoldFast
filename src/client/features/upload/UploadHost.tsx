@@ -5,6 +5,7 @@
 import Box from "@mui/material/Box";
 import { Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { registerUploadRequester } from "../../lib/contracts";
 import { accountEpoch, sameAccount, useSession } from "../../lib/query";
 import { isEditableTarget } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
@@ -12,6 +13,8 @@ import { ConflictDialog } from "./ConflictDialog";
 import { carriesFiles, fromDrop, fromFileList } from "./intake";
 import { actionMark, addFiles, frameMounted, restoreUploads, sameActor } from "./manager";
 import { registerPicker, takePickerTarget, targetFromLocation } from "./picker";
+// The slot this host answers for (slots.tsx renders this host: a cycle only at call time).
+import { requestUpload } from "./slots";
 import { getNode } from "./protocol";
 import { useUploads } from "./store";
 import { t } from "./strings";
@@ -48,6 +51,9 @@ export function UploadHost() {
     frameMounted(true);
     return () => frameMounted(false);
   }, []);
+
+  // Other features ask for an upload through lib/contracts, never by importing this one.
+  useEffect(() => registerUploadRequester(requestUpload), []);
 
   useEffect(() => {
     const enter = (event: DragEvent) => {
