@@ -214,6 +214,8 @@ export type BatchDownloadUrlsResponse = z.infer<typeof BatchDownloadUrlsResponse
  */
 export const SCAN_STATUS_MAX_IDS = 100;
 export const ScanStatusIds = z.array(NodeId).min(1).max(SCAN_STATUS_MAX_IDS);
+/** The longest `ids` value: SCAN_STATUS_MAX_IDS ids of 36 characters and their commas. */
+export const SCAN_STATUS_MAX_QUERY = SCAN_STATUS_MAX_IDS * 37 - 1;
 export type ScanStatusIds = z.infer<typeof ScanStatusIds>;
 /** The query string's value for these ids. */
 export const scanStatusQuery = (ids: readonly string[]): string => `ids=${ids.join(",")}`;

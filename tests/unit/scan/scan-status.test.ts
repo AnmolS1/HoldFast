@@ -3,7 +3,12 @@
 // out the same way, for the same work (no existence oracle).
 import { describe, expect, it } from "vitest";
 import { HEADER_USER } from "../../../src/shared/constants";
-import { NodeDto, SCAN_STATUS_MAX_IDS, type ScanStatusResponse } from "../../../src/shared/schemas/node";
+import {
+  NodeDto,
+  SCAN_STATUS_MAX_IDS,
+  SCAN_STATUS_MAX_QUERY,
+  type ScanStatusResponse,
+} from "../../../src/shared/schemas/node";
 import { SCAN_BATCH_MAX } from "../../../src/client/features/upload/plan";
 import { makeFile, makeFolder, makeShare, testDb } from "../services-core/helpers";
 import { api as asCaller } from "../sharing/helpers";
@@ -143,6 +148,21 @@ describe("bounds and the request's guards", () => {
       expect(answer.status, JSON.stringify(ids).slice(0, 40)).toBe(400);
       expect(answer.body).toMatchObject({ error: "validation" });
     }
+  });
+
+  it("an over-long list is refused whole, never cut down: 400, also with the first 100 ids valid and mine", async () => {
+    const me = await uploader();
+    const mine = await makeFile(me.id, null, { scanStatus: "pending" });
+    const valid = [mine.id, ...Array.from({ length: SCAN_STATUS_MAX_IDS - 1 }, () => uuidv7())];
+    expect(valid.join(",").length).toBe(SCAN_STATUS_MAX_QUERY);
+    expect((await ask(me, valid)).status).toBe(200);
+    const longer = await ask(me, [...valid, uuidv7()]);
+    expect(longer.status).toBe(400);
+    expect(longer.body).toMatchObject({ error: "validation" });
+    // A value far past any valid list is refused before it is read as ids — also one that would
+    // read as a single valid id once its empty entries were dropped.
+    const huge = await call(me, "GET", `/nodes/scan-status?ids=${mine.id}${",".repeat(50_000)}`);
+    expect(huge.status).toBe(400);
   });
 
   it("a hundred of my own files cost a handful of statements, not one round of the access check each", async () => {

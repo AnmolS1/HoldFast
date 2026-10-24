@@ -196,6 +196,19 @@ describe("a pending file", () => {
     expect(requests().every((call) => idsOf(call).length === 30)).toBe(true);
   });
 
+  it("a 100-file folder: at most one request per poll tick, every file in it", async () => {
+    const many = Array.from({ length: 100 }, (_, index) =>
+      fileNode(index + 1, { name: `g${String(index).padStart(3, "0")}.pdf`, scanStatus: "pending" }),
+    );
+    const drive = new FakeDrive(many);
+    await mount(drive);
+    for (let tick = 1; tick <= 6; tick += 1) {
+      await after(tick * POLL_FAST_MS);
+      expect(drive.callsTo("GET", SCAN)).toHaveLength(tick);
+    }
+    expect(drive.callsTo("GET", SCAN).every((call) => idsOf(call).length === 100)).toBe(true);
+  });
+
   it("a clean file and a folder are never polled", async () => {
     const drive = new FakeDrive([fileNode(2, { name: "ok.pdf" })]);
     await mount(drive);

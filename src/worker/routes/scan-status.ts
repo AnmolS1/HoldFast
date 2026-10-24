@@ -21,7 +21,13 @@
 
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import { Hono } from "hono";
-import { ScanStatusIds, type NodeDto, type ScanStatusResponse } from "../../shared/schemas/node";
+import {
+  SCAN_STATUS_MAX_IDS,
+  SCAN_STATUS_MAX_QUERY,
+  ScanStatusIds,
+  type NodeDto,
+  type ScanStatusResponse,
+} from "../../shared/schemas/node";
 import { nodes, type Node } from "../db/schema";
 import { notEffectivelyTrashedOrHidden } from "../db/queries/tree";
 import { requireVerified } from "../middleware/guards";
@@ -34,7 +40,12 @@ export const router = new Hono<AppEnv>();
 
 router.get("/nodes/scan-status", async (c) => {
   const user = requireVerified(c);
-  const parsed = ScanStatusIds.safeParse((c.req.query("ids") ?? "").split(",").filter((id) => id !== ""));
+  // Refused whole above the longest list that can be valid — never cut down and answered in part.
+  const raw = c.req.query("ids") ?? "";
+  if (raw.length > SCAN_STATUS_MAX_QUERY) {
+    throw new AppError("validation", `At most ${SCAN_STATUS_MAX_IDS} ids.`);
+  }
+  const parsed = ScanStatusIds.safeParse(raw.split(",").filter((id) => id !== ""));
   if (!parsed.success) {
     throw new AppError("validation", undefined, {
       issues: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
