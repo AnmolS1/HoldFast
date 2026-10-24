@@ -402,6 +402,28 @@ describe("data: deletion", () => {
     expect(within(part).queryByRole("button", { name: "Cancel deletion" })).toBeNull();
   });
 
+  it("Cancel answering 409 deletion_admin_scheduled says an administrator scheduled it (not 'already started')", async () => {
+    api((call) => {
+      if (call.path === "/api/account/deletion-status") return json({ scheduledFor: WHEN });
+      if (call.path === "/api/account/deletion/cancel") return envelope("deletion_admin_scheduled", 409);
+      return undefined;
+    });
+    renderRoutes(buildRoutes(), ["/account/data"]);
+    const part = await waitFor(() => {
+      const node = document.querySelector("[data-deletion-scheduled]");
+      expect(node).not.toBeNull();
+      return node as HTMLElement;
+    });
+    fireEvent.click(within(part).getByRole("button", { name: "Cancel deletion" }));
+    expect(
+      await within(part).findByText(
+        "An administrator scheduled this deletion, so it can only be cancelled by contacting support.",
+      ),
+    ).toBeTruthy();
+    expect(within(part).queryByText(/already started/)).toBeNull();
+    expect(within(part).queryByRole("button", { name: "Cancel deletion" })).toBeNull();
+  });
+
   it("Cancel → T06's route; the section and the banner both lose the date", async () => {
     let scheduledFor: string | null = WHEN;
     const calls = api((call) => {

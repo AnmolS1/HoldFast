@@ -254,6 +254,8 @@ export const messages = {
   "data.delete.cancel": "Cancel deletion",
   "data.delete.cancelled": "Deletion cancelled.",
   "data.delete.started": "Deletion has already started and can no longer be cancelled. Contact support.",
+  "data.delete.adminScheduled":
+    "An administrator scheduled this deletion, so it can only be cancelled by contacting support.",
   "data.delete.statusError": "Couldn't load the deletion status.",
 } as const;
 

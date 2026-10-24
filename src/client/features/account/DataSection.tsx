@@ -84,7 +84,9 @@ function DeletePart() {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
-  const [started, setStarted] = useState(false);
+  // Why Cancel can no longer work here (a 409): the deletion has started, or an administrator
+  // scheduled it (`deletion_admin_scheduled`, which only an administrator can cancel).
+  const [stopped, setStopped] = useState<"started" | "adminScheduled" | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const scheduledFor = status.data?.scheduledFor ?? null;
 
@@ -117,7 +119,8 @@ function DeletePart() {
       void refreshSession().catch(() => {});
     } catch (cause) {
       if (!sameAccount(then)) return;
-      if (cause instanceof ApiError && cause.status === 409) setStarted(true);
+      if (cause instanceof ApiError && cause.status === 409)
+        setStopped(cause.code === "deletion_admin_scheduled" ? "adminScheduled" : "started");
       else toastApiError(cause);
     } finally {
       if (sameAccount(then)) setBusy(false);
@@ -130,13 +133,13 @@ function DeletePart() {
       {scheduledFor ? (
         <Box data-deletion-scheduled={scheduledFor} sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
           <StatusLine tone="error">
-            {started
-              ? t("data.delete.started")
+            {stopped
+              ? t(stopped === "adminScheduled" ? "data.delete.adminScheduled" : "data.delete.started")
               : t("data.delete.scheduled", {
                   date: formatDate(scheduledFor, { timeZone: session?.user.timezone, style: "long" }),
                 })}
           </StatusLine>
-          {started ? null : (
+          {stopped ? null : (
             <>
               <Note>{t("data.delete.scheduled.body")}</Note>
               <Box>
