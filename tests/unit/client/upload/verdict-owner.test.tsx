@@ -9,7 +9,8 @@ import { SAY_EACH_FILE_MAX, VERDICT_CLAIM_MS } from "../../../../src/client/feat
 import { getUploads } from "../../../../src/client/features/upload/store";
 import * as contracts from "../../../../src/client/lib/contracts";
 import { purgeUserState } from "../../../../src/client/lib/query";
-import { setupShell } from "../shell/helpers";
+import { UploadDropOverlay } from "../../../../src/client/features/upload";
+import { renderShell, setupShell } from "../shell/helpers";
 import { nodeDto } from "./fixtures";
 import {
   FAKED_TIMERS,
@@ -174,5 +175,19 @@ describe("a11y-11: a larger drop is told by the ribbon, not file by file", () =>
     await settle(1_000);
     expect(said().filter((text) => /^Uploading m\d|^m\d\.txt uploaded$/.test(text))).toEqual([]);
     expect(said().filter((text) => / was blocked /.test(text))).toHaveLength(SAY_EACH_FILE_MAX + 1);
+  });
+});
+
+describe("the upload slot through lib/contracts (no feature imports the uploader)", () => {
+  it("while the host is mounted, contracts.requestUpload with files queues them; unmounted, nothing", async () => {
+    server.scanStatus = "clean";
+    const view = renderShell(<UploadDropOverlay />);
+    contracts.requestUpload({ files: [smallFile("via-contract.txt")] });
+    await settle();
+    expect(server.inits.map((init) => init.name)).toContain("via-contract.txt");
+    view.unmount();
+    contracts.requestUpload({ files: [smallFile("after.txt")] });
+    await settle();
+    expect(server.inits.map((init) => init.name)).not.toContain("after.txt");
   });
 });

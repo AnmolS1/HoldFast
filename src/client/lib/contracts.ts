@@ -152,3 +152,30 @@ export function scanVerdictOwned(node: Pick<ScanVerdictNode, "id" | "etag">): bo
 registerUserStatePurger(() => {
   scanVerdictOwner = null;
 });
+
+// ---------------------------------------------------------------------------------------------
+// "Upload into this folder" from a page of another feature: the uploader's slot, asked without
+// importing the uploader. The uploader's host registers it while the frame shows it. A function
+// of the app, not of an account: the purge does not remove it (what it queues is the uploader's,
+// and that is purged by the uploader's own purger).
+
+/** The slot's options, structurally `RequestUploadOptions` (components/slots.ts). */
+export interface UploadRequest {
+  files?: File[];
+  parentId?: string;
+}
+
+let uploadRequester: ((opts?: UploadRequest) => void) | null = null;
+
+/** Answer upload requests; returns the function that stops answering them. */
+export function registerUploadRequester(requester: (opts?: UploadRequest) => void): () => void {
+  uploadRequester = requester;
+  return () => {
+    if (uploadRequester === requester) uploadRequester = null;
+  };
+}
+
+/** Ask the uploader to upload `files` into `parentId` (without files: the picker). Nothing without one. */
+export function requestUpload(opts?: UploadRequest): void {
+  uploadRequester?.(opts);
+}

@@ -58,12 +58,11 @@ import { ApiError } from "../../lib/api";
 import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
+import { requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
 import { queryClient } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ShareDialog } from "../share";
-import { requestUpload } from "../upload";
 import { ActionMenu, type MenuAnchor, type MenuEntry } from "./ActionMenu";
 import {
   announce,

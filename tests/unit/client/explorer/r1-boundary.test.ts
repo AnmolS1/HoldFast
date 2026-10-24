@@ -1,8 +1,7 @@
-// R1 a11y-3 follow-up (team-lead): the explorer reaches the uploader's scan verdicts through
-// lib/contracts only. No lint rule enforces feature boundaries (eslint.config.js restricts sinks
-// and the Data Grid, not feature folders), so this test does: no explorer file imports the
-// uploader's modules, and from the uploader's barrel only the shell's pre-wired slot
-// (`requestUpload`).
+// R1 a11y-3 follow-up (Addendum 11): the explorer reaches the uploader — its scan verdicts and its
+// upload slot — through lib/contracts only. No lint rule enforces feature boundaries
+// (eslint.config.js restricts observability sinks and the Data Grid, not feature folders), so this
+// test does: no explorer file imports features/upload by any path.
 import { describe, expect, it } from "vitest";
 
 const sources = import.meta.glob("../../../../src/client/features/explorer/**/*.{ts,tsx}", {
@@ -11,25 +10,21 @@ const sources = import.meta.glob("../../../../src/client/features/explorer/**/*.
   eager: true,
 }) as Record<string, string>;
 
+/** Every module a source imports statically (`import … from "x"`, `export … from "x"`). */
 const importsOf = (source: string) =>
-  [...source.matchAll(/import\s+(?:type\s+)?(\{[^}]*\}|[\w*\s,]+)\s+from\s+"([^"]+)"/g)].map(
-    ([, names, from]) => ({
-      names: names!
-        .replace(/[{}\s]/g, "")
-        .split(",")
-        .filter(Boolean),
-      from: from!,
-    }),
-  );
+  [...source.matchAll(/(?:import|export)\s+(?:type\s+)?[^"';]*?\s+from\s+"([^"]+)"/g)].map(([, from]) => ({
+    from: from!,
+  }));
 
 describe("the explorer never imports the uploader", () => {
-  it("no explorer file imports features/upload/*; from the barrel only requestUpload", () => {
+  it("no explorer file imports features/upload — not its barrel, not a module of it", () => {
     expect(Object.keys(sources).length).toBeGreaterThan(10);
     for (const [file, source] of Object.entries(sources)) {
-      for (const { names, from } of importsOf(source)) {
-        expect(from, file).not.toMatch(/(^|\/)upload\/./);
-        if (/(^|\/)upload$/.test(from)) expect(names, file).toEqual(["requestUpload"]);
+      for (const { from } of importsOf(source)) {
+        expect(from, file).not.toMatch(/(^|\/)(features\/)?upload(\/|$)/);
       }
+      // Dynamic imports too.
+      expect(source, file).not.toMatch(/import\(\s*["'][^"']*\/upload(\/|["'])/);
     }
   });
 });

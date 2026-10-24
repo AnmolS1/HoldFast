@@ -2,6 +2,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   registerScanVerdictOwner,
+  registerUploadRequester,
+  requestUpload,
   runUserStatePurgers,
   scanVerdictOwned,
   scanVerdictsSeen,
@@ -36,5 +38,18 @@ describe("the scan-verdict owner", () => {
     expect(scanVerdictOwned(node)).toBe(false);
     scanVerdictsSeen([node]);
     expect(second.seen).toHaveBeenCalled();
+  });
+});
+
+describe("the upload requester", () => {
+  it("asked through the contract, answered by whoever registered; nothing without one", () => {
+    expect(() => requestUpload({ parentId: "p" })).not.toThrow();
+    const requester = vi.fn();
+    const stop = registerUploadRequester(requester);
+    requestUpload({ parentId: "p" });
+    expect(requester).toHaveBeenCalledWith({ parentId: "p" });
+    stop();
+    requestUpload();
+    expect(requester).toHaveBeenCalledTimes(1);
   });
 });
