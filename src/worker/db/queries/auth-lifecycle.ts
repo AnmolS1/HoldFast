@@ -476,6 +476,20 @@ export async function lockActiveAdmins(tx: Executor, at: Date): Promise<string[]
     .map((row) => row.id);
 }
 
+/**
+ * The admin plugin's Ban or Set role, written AHEAD of the plugin in the transaction that ran the
+ * last-admin check (auth/admin-gate.ts): the plugin's adapter has no transaction, so a check
+ * whose locks are gone before the plugin writes would let two admins pass it at once. The plugin
+ * then writes the same values again (and its update hooks run as they always did).
+ */
+export async function writeAdminPluginChange(
+  tx: Executor,
+  userId: string,
+  change: { banned: true; banReason: string; banExpires: Date | null } | { role: string },
+): Promise<void> {
+  await tx.update(user).set(change).where(eq(user.id, userId));
+}
+
 // ── a deletion an admin ordered ─────────────────────────────────────────────────────────────
 
 /**

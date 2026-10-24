@@ -59,7 +59,7 @@ const DEFAULT_MESSAGE: Record<ErrorCode, string> = {
   self_action: "You cannot do this to your own account.",
   last_admin: "This would leave no admin.",
   not_quarantined: "This item is not in quarantine.",
-  replace_in_progress: "A new version of this file is still being uploaded.",
+  replace_in_progress: "Another new version of this file is on its way (someone else's, or one being saved).",
   already_taken_down: "This item is already taken down.",
   not_taken_down: "This item is not taken down.",
   dmca_restore_only: "A copyright notice holds this takedown: restore it from the notice.",

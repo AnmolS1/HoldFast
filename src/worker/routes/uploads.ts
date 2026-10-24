@@ -83,7 +83,7 @@ import {
   findResumable,
   markAborted,
   markDone,
-  replaceUnderWay,
+  lockReplaceSessions,
   type SealedIp,
 } from "../db/queries/uploads";
 import { retryOnDeadlock } from "../db/retry";
@@ -752,11 +752,25 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
       );
       // Under the uploader's row lock: the same file initialised twice at once is one session.
       const again = await findResumable(tx, match);
-      if (again) return { session: again, created: false };
+      if (again) return { session: again, created: false, superseded: [] };
       // Another version of the file is on its way (another tab, another editor): its complete
-      // would make this one's refused at complete, after every byte was sent (R1 func-7).
-      if (replaceNodeId !== null && (await replaceUnderWay(tx, replaceNodeId))) {
-        throw new AppError("replace_in_progress");
+      // would make this one's refused at complete, after every byte was sent (R1 func-7). An
+      // OPEN one is given up when the file's owner, or that session's own uploader, starts a new
+      // version — nothing tells an abandoned session from a slow one, and it would otherwise hold
+      // the file until it expires, a day or more (R1D rds-1). Its uploader's next part or
+      // complete is a 409 (the client's "session gone"). A completing one, or an editor's
+      // new version while someone else's is open, is refused.
+      const superseded: Upload[] = [];
+      if (replaceNodeId !== null) {
+        for (const { session: blocker, uploaderHeld } of await lockReplaceSessions(tx, replaceNodeId)) {
+          const own = blocker.uploaderId === user.id;
+          // Never someone else's session while its uploader is on legal hold (as the purge keeps it).
+          const mayGiveUp = blocker.status === "open" && (own || (uploaderIsOwner && !uploaderHeld));
+          if (!mayGiveUp || !(await releaseAndAbort(tx, blocker, "open"))) {
+            throw new AppError("replace_in_progress");
+          }
+          superseded.push(blocker);
+        }
       }
       if ((await countOpen(tx, user.id)) >= MAX_OPEN_UPLOADS) {
         throw new AppError("ceiling_exceeded", "Too many uploads are in progress.", { kind: OPEN_UPLOADS });
@@ -781,7 +795,7 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
         expiresAt: expiresAtFor(at, body.size),
         sealedIp,
       });
-      return { session, created: true };
+      return { session, created: true, superseded };
     });
   let admitted: Awaited<ReturnType<typeof admit>>;
   try {
@@ -796,7 +810,13 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
     // the first was being written. It is a resume, not a refusal.
     const raced = await findResumable(db(c), match);
     if (!raced) throw error;
-    admitted = { session: raced, created: false };
+    admitted = { session: raced, created: false, superseded: [] };
+  }
+  // What the superseded sessions stored, once their abort is committed (kept while the database
+  // reads as rolled back — `discardStored`).
+  for (const given of admitted.superseded) {
+    await discardStored(c, given, false);
+    metric("upload", { outcome: "aborted", kind: modeOf(given), reason: "superseded" });
   }
   const session = await withMultipart(c, admitted.session);
   if (admitted.created) metric("upload", { outcome: "init", kind: modeOf(session) });

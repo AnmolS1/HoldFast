@@ -20,6 +20,8 @@
 //     at once.
 //   stop-impersonating: called FROM the impersonated session, whose user is the target and not
 //     an admin — allowed exactly when the session carries the plugin's `impersonatedBy` marker.
+//   ban-user and set-role then keep the console's rules for your own account and the last admin
+//     (`keepAnAdmin`: `400 self_action`, `409 last_admin`) — they are not endpoint denials.
 //
 // A refusal is `403` and ONE audit row `auth.admin_endpoint_denied`, written and awaited before
 // the answer (`meta: { path, method }` — never the body, never an id from it).
@@ -33,7 +35,9 @@
 
 import { APIError, getSessionFromCtx } from "better-auth/api";
 import { hasAdminRole } from "../../shared/roles";
-import { getAccount } from "../db/queries/auth-lifecycle";
+import { getAccount, writeAdminPluginChange } from "../db/queries/auth-lifecycle";
+import { refuseLastAdmin, refuseSelfAction } from "../services/account-state";
+import { AppError } from "../services/errors";
 import type { ServiceDeps } from "../services/request-context";
 import { count, record, sinkPath } from "./observe";
 import { hasSecondFactor } from "./second-factor";
@@ -120,6 +124,79 @@ export async function recordAdminDenial(
 
 type GateContext = Parameters<typeof getSessionFromCtx>[0] & { path?: string; method?: string };
 
+/** An account id as Better Auth makes them, and nothing the plugin's coercion could turn into one. */
+const ACCOUNT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** The two roles the console sets (the plugin is configured with no `roles`, so it checks none). */
+const CONSOLE_ROLES: readonly string[] = ["user", "admin"];
+
+const malformed = () => new AppError("validation", "This request is not valid.");
+
+/**
+ * The body as the plugin will act on it — read HERE, strictly, because the before-hook runs on
+ * the parsed but NOT yet validated body (better-auth api/dispatch.mjs: hooks, then the endpoint's
+ * schema), and that schema coerces `userId` (`z.coerce.string()`: `["id"]` is "id"). Anything
+ * this cannot read exactly as the plugin will — a `userId` that is not a plain id string, a ban
+ * field of the wrong type, a role the console does not set — is `400 validation` (fail closed),
+ * so the gate never checks one account while the plugin acts on another, and never writes a
+ * change the plugin's schema would then refuse.
+ */
+function pluginChange(
+  path: string,
+  body: unknown,
+): { userId: string; change: Parameters<typeof writeAdminPluginChange>[2] } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) throw malformed();
+  const fields = body as { userId?: unknown; role?: unknown; banReason?: unknown; banExpiresIn?: unknown };
+  const userId = fields.userId;
+  if (typeof userId !== "string" || !ACCOUNT_ID.test(userId)) throw malformed();
+  if (path === "/admin/ban-user") {
+    const { banReason, banExpiresIn } = fields;
+    if (banReason !== undefined && typeof banReason !== "string") throw malformed();
+    if (banExpiresIn !== undefined && !(typeof banExpiresIn === "number" && Number.isFinite(banExpiresIn))) {
+      throw malformed();
+    }
+    // The plugin's own values (routes.mjs `banUser`; no default reason or expiry is configured).
+    return {
+      userId,
+      change: {
+        banned: true,
+        banReason: banReason || "No reason",
+        banExpires: banExpiresIn ? new Date(Date.now() + banExpiresIn * 1000) : null,
+      },
+    };
+  }
+  if (typeof fields.role !== "string" || !CONSOLE_ROLES.includes(fields.role)) throw malformed();
+  return { userId, change: { role: fields.role } };
+}
+
+/**
+ * Ban and Set role keep the console's two rules (ruling Q4, R1D auth-1), as Suspend does
+ * (services/account-state.ts): `400 self_action` on the admin's own account, and `409 last_admin`
+ * when the change leaves no admin who can still act. The check and the change share ONE
+ * transaction under `lockActiveAdmins`' lock — the change is written here, ahead of the plugin
+ * (`writeAdminPluginChange`) — so two admins banning or demoting each other at once, or one
+ * suspending while the other bans, are served one after the other and the second sees the first.
+ * A promotion takes nothing away and is not checked. The body is read first (`pluginChange`).
+ */
+async function keepAnAdmin(scope: AuthScope, actorId: string, path: string, body: unknown): Promise<void> {
+  try {
+    const { userId, change } = pluginChange(path, body);
+    refuseSelfAction({ type: "admin", userId: actorId }, userId);
+    if ("role" in change && hasAdminRole(change.role)) return;
+    await scope.db.transaction(async (tx) => {
+      await refuseLastAdmin(tx, userId);
+      await writeAdminPluginChange(tx, userId, change);
+    });
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    // In our own words (`error`, which the client's code table reads) and Better Auth's (`code`).
+    throw new APIError(error.status === 409 ? "CONFLICT" : "BAD_REQUEST", {
+      message: error.message,
+      code: error.code.toUpperCase(),
+      error: error.code,
+    });
+  }
+}
+
 /**
  * `hooks.before` for every Better Auth dispatch. Returns for a path outside /admin/ and for an
  * allowed call; otherwise writes the audit row and throws `403`.
@@ -163,6 +240,9 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
         const target = await getAccount(scope.db, userId);
         scope.facts.roleChange = { userId, from: target?.role ?? null };
       }
+    }
+    if (path === "/admin/ban-user" || path === "/admin/set-role") {
+      await keepAnAdmin(scope, session!.user.id, path, (ctx as { body?: unknown }).body);
     }
     return;
   }

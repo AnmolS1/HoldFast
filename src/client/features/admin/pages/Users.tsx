@@ -9,6 +9,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router";
 import type { AdminStrikeDto, AdminUserDetailDto, StrikeKind } from "../../../../shared/schemas/admin";
+import { t as appText } from "../../../lib/i18n";
 import { refreshSession, useSession } from "../../../lib/query";
 import {
   addStrike,
@@ -129,6 +130,12 @@ type Pending =
   | { kind: "role"; role: "user" | "admin" }
   | null;
 
+/** The plugin's `code`s for the console's own refusals, said as every other surface says them. */
+const PLUGIN_OWN_WORDS: Partial<Record<string, "apiError.self_action" | "apiError.last_admin">> = {
+  SELF_ACTION: "apiError.self_action",
+  LAST_ADMIN: "apiError.last_admin",
+};
+
 export function UserDetailPage() {
   const { userId = "" } = useParams();
   const query = useAdminQuery(adminKeys.user(userId), (signal) => fetchUser(userId, signal));
@@ -139,7 +146,8 @@ export function UserDetailPage() {
 
 function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
   const user = detail.user;
-  // Your own account (ruling Q4): no Suspend, Delete user or quota here — the server refuses them.
+  // Your own account (ruling Q4): no Suspend, Delete user, quota, Ban or role change here — the
+  // server refuses them.
   const own = useSession().data?.user.id === user.id;
   const client = useQueryClient();
   const navigate = useNavigate();
@@ -164,7 +172,11 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
   /** A Better Auth plugin call, as the account screens word its failure. */
   const plugin = async (run: () => Promise<AuthOutcome<unknown>>, done: string) => {
     const result = await run();
-    if (result.error) throw new Error(result.error.message ?? t("common.failed"));
+    if (result.error) {
+      // The console's own refusals (auth/admin-gate.ts `keepAnAdmin`), in the client's words.
+      const own = PLUGIN_OWN_WORDS[result.error.code ?? ""];
+      throw new Error(own ? appText(own) : (result.error.message ?? t("common.failed")));
+    }
     setStatus(done);
     refresh();
   };
@@ -387,14 +399,16 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
           )}
           {user.banned ? (
             <Button onClick={() => setPending({ kind: "unban" })}>{t("users.unban")}</Button>
-          ) : (
+          ) : own ? null : (
             <Button onClick={() => setPending({ kind: "ban" })}>{t("users.ban")}</Button>
           )}
-          <Button
-            onClick={() => setPending({ kind: "role", role: user.role === "admin" ? "user" : "admin" })}
-          >
-            {user.role === "admin" ? t("users.makeUser") : t("users.makeAdmin")}
-          </Button>
+          {own ? null : (
+            <Button
+              onClick={() => setPending({ kind: "role", role: user.role === "admin" ? "user" : "admin" })}
+            >
+              {user.role === "admin" ? t("users.makeUser") : t("users.makeAdmin")}
+            </Button>
+          )}
           <Button onClick={() => setPending({ kind: "revokeSessions" })}>{t("users.revokeSessions")}</Button>
           <Button onClick={() => setPending({ kind: "revokeLinks" })}>{t("users.revokeLinks")}</Button>
           <Button onClick={() => setPending({ kind: "hold" })}>
