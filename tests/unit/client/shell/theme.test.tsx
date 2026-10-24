@@ -106,6 +106,11 @@ describe("theme", () => {
     expect(theme.spacing(1)).toMatch(/4px/);
   });
 
+  it("icon buttons are a fixed box with no padding, so a 16 px icon is drawn at 16 px, not squeezed", () => {
+    const root = theme.components?.MuiIconButton?.styleOverrides?.root as Record<string, unknown>;
+    expect(root).toMatchObject({ width: 28, height: 28, padding: 0 });
+  });
+
   it("type scale: title 20/26 600, heading 15/22 600, body 13/20, secondary 12/16; no uppercase buttons", () => {
     expect(theme.typography.h1).toMatchObject({ fontSize: 20, lineHeight: "26px", fontWeight: 600 });
     expect(theme.typography.h2).toMatchObject({ fontSize: 15, lineHeight: "22px", fontWeight: 600 });

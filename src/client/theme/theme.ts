@@ -231,6 +231,8 @@ export function createHoldfastTheme(): Theme {
           root: {
             width: 28,
             height: 28,
+            // MUI's 8 px padding would leave a 16 px icon 12 px wide inside the fixed 28 px box.
+            padding: 0,
             borderRadius: layout.radius.control,
             color: hf.textSecondary,
             "&:hover": { backgroundColor: hf.navActive },

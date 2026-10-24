@@ -215,7 +215,8 @@ export function SearchPage() {
           flexWrap: "wrap",
           alignItems: "center",
           gap: 3,
-          padding: desktop ? "12px 20px" : "4px 16px 12px",
+          // The field's label floats half above its border: the top padding keeps it inside the page.
+          padding: desktop ? "12px 20px" : "12px 16px",
           borderBottom: `1px solid ${hf.hairline}`,
           flex: "none",
         }}
