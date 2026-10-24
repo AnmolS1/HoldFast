@@ -115,8 +115,8 @@ export function StatusLine({ tone, children }: { tone: "ok" | "error"; children:
 
 const hiddenRegion = {
   position: "absolute",
-  width: 1,
-  height: 1,
+  width: "1px",
+  height: "1px",
   overflow: "hidden",
   clipPath: "inset(50%)",
   whiteSpace: "nowrap",
