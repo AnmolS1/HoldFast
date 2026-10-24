@@ -3,7 +3,10 @@
 // `killSwitch` (in the pipeline): `readOnly` → every state-changing /api/* request answers
 // 503 read_only. Exempt: ALL of /api/auth/* (signing in needs the TOTP, backup-code, passkey and
 // admin endpoints too — exempting only sign-in would lock out the admins who must switch
-// read-only off; sign-up is refused by the sign-up policy), /api/admin/*, and the CSP report.
+// read-only off; sign-up is refused by the sign-up policy), /api/admin/*, the CSP report, and
+// the account's two ways out (R1 func-2, ruling Q5): cancelling a scheduled deletion — the purge
+// keeps running under read-only, so the cancel must too — and accepting the current terms, without
+// which the terms gate holds every page. Exact paths: nothing else under /api/account.
 //
 // `requireSwitch(name)` (used by route files): 503 feature_disabled when that switch is off.
 //     router.post("/uploads", requireSwitch("uploadsEnabled"), handler)
@@ -15,8 +18,15 @@ import { AppError } from "../services/errors";
 import { settings, type AppEnv } from "../services/request-context";
 import { SAFE_METHODS } from "./csrf";
 
+/** Writes read-only does not stop, by exact path. */
+const EXEMPT_PATHS: ReadonlySet<string> = new Set([
+  "/api/public/csp-report",
+  "/api/account/deletion/cancel",
+  "/api/account/accept-terms",
+]);
+
 function exempt(path: string): boolean {
-  return path.startsWith("/api/auth/") || path.startsWith("/api/admin/") || path === "/api/public/csp-report";
+  return path.startsWith("/api/auth/") || path.startsWith("/api/admin/") || EXEMPT_PATHS.has(path);
 }
 
 export const killSwitch: MiddlewareHandler<AppEnv> = async (c, next) => {

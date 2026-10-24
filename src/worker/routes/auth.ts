@@ -21,6 +21,11 @@
 // And two failures inside the handler that are a lost RACE, not an error, are answered as what
 // they are: a unique violation on a verification link (the address was taken a moment ago) and
 // on an OAuth callback (the identity was linked a moment ago) — a redirect each, never a 500.
+//
+// THE DELETION LINK (GET /delete-user/callback, R1 func-9) is a link in an email, so it answers
+// with a page, never Better Auth's 404 JSON: signed out → the sign-in page saying so; another
+// account's session → the account page, and Better Auth is NOT called (it consumes the token
+// before it compares users, which burned the owner's link); a dead link → the account page.
 
 import { requestMethod, requestPath } from "../middleware/canonical";
 import { Hono } from "hono";
@@ -35,6 +40,7 @@ import { LINK_ERROR_BUDGET, padStatements, STATEMENT_BUDGET } from "../auth/pari
 import { preflight } from "../auth/preflight";
 import { HANG, hungAnswer, watched } from "../auth/watchdog";
 import { isUniqueViolation } from "../db/errors";
+import { deletionTokenOwner } from "../db/queries/auth-lifecycle";
 import { AppError } from "../services/errors";
 import { auth, db, type AppEnv } from "../services/request-context";
 
@@ -47,6 +53,13 @@ const PROVIDER_IDENTITY_INDEX = "account_provider_account_uidx";
 export const ALREADY_LINKED = "/login?error=unable_to_link_account";
 /** The one error a verification link answers with (the client has one sentence for it). */
 export const LINK_INVALID = "LINK_INVALID";
+/** Where the deletion link sends a browser that is not signed in (R1 func-9). */
+export const DELETION_SIGN_IN = "/login?error=DELETION_SIGN_IN";
+/** … one signed in to ANOTHER account (the link is left unused for its owner). */
+export const DELETION_OTHER_ACCOUNT = "/account?deletion=other_account";
+/** … and the owner, when the link is used, expired or unknown. */
+export const DELETION_LINK_INVALID = "/account?deletion=link_invalid";
+const DELETION_CALLBACK = "/delete-user/callback";
 
 /** `request` with the client address the pipeline resolved, when the edge did not send one. */
 function withClientAddress(request: Request, ip: string): Request {
@@ -65,16 +78,23 @@ function linkFailed(relativePath: string, response: Response): boolean {
   return /[?&]error=/.test(response.headers.get("location") ?? "");
 }
 
+/** The one error a verification link may name: the link was ours (signed) and has expired. */
+const LINK_EXPIRED = "TOKEN_EXPIRED";
+
 /**
- * ONE answer for a verification link that did not work — unknown, expired, tampered, for an
- * address no account has any more, or for another account: Better Auth names each
- * (`TOKEN_EXPIRED`, `INVALID_TOKEN`, `USER_NOT_FOUND`, `INVALID_USER`), which tells whoever holds
- * a link things about the account behind it. They all become `LINK_INVALID`.
+ * ONE answer for a verification link that did not work — unknown, tampered, for an address no
+ * account has any more, or for another account: Better Auth names each (`INVALID_TOKEN`,
+ * `USER_NOT_FOUND`, `INVALID_USER`), which tells whoever holds a link things about the account
+ * behind it. They all become `LINK_INVALID`. EXCEPT `TOKEN_EXPIRED` (R1 func-11): Better Auth
+ * reads expiry only after the signature holds (jose checks the signature first, so a forged
+ * expired token is `INVALID_TOKEN`) and before any account is looked up — it says only that the
+ * link was once really ours, so "expired" is shown as such. Same work either way (parity.test.ts).
  */
 function genericLinkError(response: Response): Response {
   if (response.status !== 302) return response;
   const location = response.headers.get("location");
   if (!location || !/[?&]error=/.test(location)) return response;
+  if (new RegExp(`[?&]error=${LINK_EXPIRED}(?:[&#]|$)`).test(location)) return response;
   const headers = new Headers(response.headers);
   headers.set("location", location.replace(/([?&]error=)[^&#]*/, `$1${LINK_INVALID}`));
   return new Response(null, { status: 302, headers });
@@ -126,6 +146,17 @@ router.all(
     // hooks get it from here.
     if (scope && REAUTH_PATHS.has(relativePath)) {
       scope.reauthPassword = (checked.body as { password?: unknown } | null)?.password;
+    }
+
+    // (b) The deletion link, before Better Auth sees it (the header comment).
+    if (method === "GET" && relativePath === DELETION_CALLBACK) {
+      const viewer = c.get("user")?.id ?? null;
+      if (viewer === null) return c.redirect(`${c.env.APP_ORIGIN}${DELETION_SIGN_IN}`, 302);
+      const token = c.req.query("token") ?? "";
+      const owner = token ? await deletionTokenOwner(db(c), token) : null;
+      if (owner !== null && owner !== viewer) {
+        return c.redirect(`${c.env.APP_ORIGIN}${DELETION_OTHER_ACCOUNT}`, 302);
+      }
     }
 
     // Mail this request causes waits until it has been answered (auth/scope.ts `afterAnswer`).
@@ -183,6 +214,10 @@ router.all(
       // work: one that Better Auth's own limiter or the captcha turned away is not padded (it
       // would be work to be had for nothing). `hooks.before` sets the endpoint once it runs.
       if (method === "GET" && relativePath === "/verify-email") response = genericLinkError(response);
+      // A deletion link Better Auth refused (used, expired, unknown): a page, not its JSON.
+      if (method === "GET" && relativePath === DELETION_CALLBACK && response.status === 404) {
+        response = c.redirect(`${c.env.APP_ORIGIN}${DELETION_LINK_INVALID}`, 302);
+      }
       // … and not one the sign-in throttle turned away (its answer depends on the request alone).
       const reached = scope !== null && scope.facts.endpointPath !== null && !scope.facts.throttled;
       const budget = linkFailed(relativePath, response) ? LINK_ERROR_BUDGET : STATEMENT_BUDGET[relativePath];

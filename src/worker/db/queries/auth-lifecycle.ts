@@ -10,6 +10,7 @@
 // `pending_user_purges` are ours (`timestamptz`) and compare with `now()` freely.
 
 import { and, eq, gt, isNotNull, isNull, like, ne, or, sql } from "drizzle-orm";
+import { hasAdminRole } from "../../../shared/roles";
 import type { Executor } from "../client";
 import { isUniqueViolation } from "../errors";
 import {
@@ -441,6 +442,101 @@ export async function clearSuspended(db: Executor, userId: string): Promise<bool
   return rows.length > 0;
 }
 
+// ── the admins that are left ────────────────────────────────────────────────────────────────
+
+/**
+ * Locks EVERY row whose role names `admin`, in id order, and returns the ids of those that can
+ * still act: not suspended, not banned, no deletion scheduled. Call it FIRST in the transaction
+ * that suspends or schedules the deletion of an admin — before that transaction locks any other
+ * user row — so two admins acting on each other at once are served one after the other, and the
+ * second sees the first's change (a waiting `FOR UPDATE` reads the row as it was committed).
+ */
+export async function lockActiveAdmins(tx: Executor, at: Date): Promise<string[]> {
+  const rows = await tx
+    .select({
+      id: user.id,
+      role: user.role,
+      suspendedAt: user.suspendedAt,
+      banned: user.banned,
+      banExpires: user.banExpires,
+      deleteScheduledAt: user.deleteScheduledAt,
+    })
+    .from(user)
+    .where(like(user.role, "%admin%"))
+    .orderBy(user.id)
+    .for("update");
+  return rows
+    .filter(
+      (row) =>
+        hasAdminRole(row.role) &&
+        row.suspendedAt === null &&
+        row.deleteScheduledAt === null &&
+        !(row.banned === true && (row.banExpires === null || row.banExpires.getTime() > at.getTime())),
+    )
+    .map((row) => row.id);
+}
+
+// ── a deletion an admin ordered ─────────────────────────────────────────────────────────────
+
+/**
+ * The mark of a deletion an ADMIN scheduled (R1 secsrv-1, ruling Q6): a `verification` row
+ * `admin-deletion:<user id>`, as `admin-bootstrap:` is the bootstrap list's. Removed ONLY by an
+ * admin's cancel (`clearAdminDeletion`) and the purge (`purgeAuthRows`): `tokensOf` leaves it out,
+ * so the unproven-address resets — which a stranger's or the prover's sign-in can trigger — do
+ * not lift the order; the value is NOT a user id, so no other account's cleanup can either.
+ * Written and read under the user's row lock.
+ */
+const adminDeletionMarker = (userId: string) => `admin-deletion:${userId}`;
+
+export async function markAdminDeletion(tx: Executor, userId: string): Promise<void> {
+  const at = new Date();
+  await tx.delete(verification).where(eq(verification.identifier, adminDeletionMarker(userId)));
+  await tx.insert(verification).values({
+    id: crypto.randomUUID(),
+    identifier: adminDeletionMarker(userId),
+    value: "admin",
+    // Never, in practice: the nightly sweep removes only rows that have expired, and a held
+    // account's deletion can stay scheduled for as long as the hold lasts.
+    expiresAt: new Date(at.getTime() + 20 * 365 * 86_400_000),
+    createdAt: at,
+    updatedAt: at,
+  });
+}
+
+export async function clearAdminDeletion(tx: Executor, userId: string): Promise<void> {
+  await tx.delete(verification).where(eq(verification.identifier, adminDeletionMarker(userId)));
+}
+
+export async function adminDeletionMarked(db: Executor, userId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: verification.id })
+    .from(verification)
+    .where(eq(verification.identifier, adminDeletionMarker(userId)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/**
+ * Whose deletion link this is (the user id Better Auth stored with `delete-account-<token>`), or
+ * null for a token it does not know. READS only: Better Auth's callback consumes the token BEFORE
+ * it compares users, so a link opened in another account's session would burn it (R1 func-9) —
+ * routes/auth.ts asks this first. (Identifiers are stored plain: no `verification.storeIdentifier`.)
+ */
+export async function deletionTokenOwner(db: Executor, token: string): Promise<string | null> {
+  const [row] = await db
+    .select({ value: verification.value })
+    .from(verification)
+    .where(eq(verification.identifier, `delete-account-${token}`))
+    .limit(1);
+  return row?.value ?? null;
+}
+
+/** Takes the user's row lock (the estate's lock order: the user row first). False: no such user. */
+export async function lockUser(tx: Executor, userId: string): Promise<boolean> {
+  const rows = await tx.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("update");
+  return rows.length > 0;
+}
+
 // ── terms ───────────────────────────────────────────────────────────────────────────────────
 
 export async function setTermsAccepted(
@@ -545,12 +641,19 @@ export async function takePendingChange(
  *     `{"type":"registration","userData":{"id":…}}`, @better-auth/passkey/dist/index.mjs:192);
  *   - the IDENTIFIER ends with the user id (`totp-step:<id>`, the newest TOTP step it used).
  * A user id is 32 URL-safe characters, so it cannot contain a LIKE wildcard.
+ *
+ * EXCEPT the mark of an admin-ordered deletion (`admin-deletion:<id>`): it is not a token the
+ * account could use but the operator's order about it, so an account reset (the unproven-address
+ * cleanups below) keeps it — only an admin's cancel and the purge (`purgeAuthRows`) remove it.
  */
 function tokensOf(userId: string) {
-  return or(
-    eq(verification.value, userId),
-    and(like(verification.value, "{%"), like(verification.value, `%"${userId}"%`)),
-    like(verification.identifier, `%:${userId}`),
+  return and(
+    or(
+      eq(verification.value, userId),
+      and(like(verification.value, "{%"), like(verification.value, `%"${userId}"%`)),
+      like(verification.identifier, `%:${userId}`),
+    ),
+    ne(verification.identifier, adminDeletionMarker(userId)),
   );
 }
 
@@ -1152,6 +1255,8 @@ export async function purgeAuthRows(db: Executor, userId: string): Promise<boole
     await tx.delete(twoFactor).where(eq(twoFactor.userId, userId));
     // Reset, delete-account, two-factor and trusted-device tokens carry the user id as value.
     await tx.delete(verification).where(tokensOf(userId));
+    // … and the operator's order, which `tokensOf` keeps: the account it was about is gone.
+    await clearAdminDeletion(tx, userId);
     const removed = await tx.delete(user).where(eq(user.id, userId)).returning({ id: user.id });
     return removed.length > 0;
   });

@@ -499,7 +499,7 @@ test.describe("the verification link, opened in a browser that did not sign up",
     await elsewhere.dispose();
   });
 
-  test("an expired link and a tampered one get one answer, sign nobody in and leave the account as it was", async ({
+  test("a tampered link is 'not valid', an expired one of ours says 'expired'; neither signs anybody in or changes the account", async ({
     page,
     browser,
     clientIp,
@@ -526,8 +526,9 @@ test.describe("the verification link, opened in a browser that did not sign up",
     link.searchParams.set("token", expiredVerificationToken(email));
     await other.goto(link.toString());
     await expectSignInScreen(other);
-    // The SAME sentence as for a tampered one: a link that does not work does not say why.
-    await expect(other.getByRole("alert")).toContainText("That confirmation link isn't valid any more.");
+    // A link we signed that has expired says so (R1 func-11): expiry is read after the signature
+    // and before any account, so it tells nothing about the address (parity.test.ts).
+    await expect(other.getByRole("alert")).toContainText("That confirmation link has expired.");
     expect(await sessionOf(other.request)).toBeNull();
     // Nothing was verified and nothing removed: the sign-up's own password is still the account's.
     expect((await userRow(email))?.email_verified).toBe(false);

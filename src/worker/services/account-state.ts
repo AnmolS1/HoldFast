@@ -20,18 +20,26 @@
 // every request reads the session row (there is no cookie cache).
 
 import {
+  adminDeletionMarked,
+  clearAdminDeletion,
   clearSuspended,
   deleteUserSessions,
   revokeAccess,
   getAccount,
+  lockActiveAdmins,
+  lockUser,
+  markAdminDeletion,
   purgeAuthRows as deleteAuthRows,
   setSuspended,
   setTermsAccepted,
 } from "../db/queries/auth-lifecycle";
 import type { Executor } from "../db/client";
+import { hasAdminRole } from "../../shared/roles";
 import { pauseLinks, unpauseLinks } from "../db/queries/links";
 import { cancel, schedule } from "../db/queries/user-purge";
 import { userState } from "../db/queries/users";
+import { user } from "../db/schema";
+import { eq } from "drizzle-orm";
 import { record } from "../auth/observe";
 import { now } from "./clock";
 import { sendAccountSuspended, sendDeletionCancelled, sendDeletionScheduled } from "./email";
@@ -47,6 +55,34 @@ export const DELETION_WINDOW_DAYS = 7;
 
 const target = (userId: string) => ({ type: "user", id: userId });
 const by = (actor: Actor) => ({ actorUserId: actor.userId, actorType: actor.type });
+
+// ── what the console may not do (R1 secsrv-2 / func-4, ruling Q4) ───────────────────────────
+//
+// An admin does not suspend, schedule the deletion of, or change the quota of their OWN account
+// (`400 self_action`): a sole admin who suspended themself was locked out, with only SQL to get
+// back in. And no admin is suspended or scheduled for deletion when that leaves no admin who can
+// still act (`409 last_admin`) — which, the actor being one, happens when the actor is leaving
+// too (their own deletion is scheduled) or when two admins act on each other at the same moment.
+// Acting on ANOTHER admin stays allowed. Both apply to the console (an `admin` actor) only: the
+// strikes helper and the holder's own deletion request are not the console.
+
+/** `400 self_action` when an admin aims the console at their own account. */
+export function refuseSelfAction(actor: Actor, userId: string): void {
+  if (actor.type === "admin" && actor.userId === userId) throw new AppError("self_action");
+}
+
+/**
+ * `409 last_admin` when the target is an admin and no OTHER admin could still act after it.
+ * Call it FIRST inside the transaction that makes the change (`lockActiveAdmins`' lock order).
+ */
+async function refuseLastAdmin(tx: Executor, userId: string): Promise<void> {
+  const [row] = await tx.select({ role: user.role }).from(user).where(eq(user.id, userId)).limit(1);
+  if (!hasAdminRole(row?.role)) return;
+  const active = await lockActiveAdmins(tx, now());
+  // An admin who cannot act already (suspended, leaving) loses nothing more: the change is a no-op.
+  if (!active.includes(userId)) return;
+  if (!active.some((id) => id !== userId)) throw new AppError("last_admin");
+}
 
 /**
  * Ends every session of the user (deletes the rows). Returns how many there were.
@@ -78,7 +114,11 @@ export async function suspendUser(
   reason: string,
   actor: Actor,
 ): Promise<boolean> {
+  refuseSelfAction(actor, userId);
   const suspended = await deps.db.transaction(async (tx) => {
+    // The console's last-admin check locks every admin row first, in id order (and with them the
+    // target's, when it is one).
+    if (actor.type === "admin") await refuseLastAdmin(tx, userId);
     // The UPDATE takes the user's row lock first (the estate's lock order: user, then the rest).
     if (!(await setSuspended(tx, userId, now(), reason))) return null;
     // Sessions, device proofs and key marks — one function, under the user's row lock.
@@ -168,23 +208,46 @@ export type ScheduleOutcome = {
  *
  * An account on legal hold is treated exactly like any other here — same row, same email, same
  * answer. The purge job is what skips it, silently.
+ *
+ * BY AN ADMIN (the console's "Delete user", ruling Q6): the deletion is MARKED as the admin's
+ * (`markAdminDeletion`), and the holder can no longer cancel it — only an admin can. A deletion
+ * the holder had already asked for becomes the admin's the same way (same date, `changed: false`).
+ * The console cannot schedule its own admin's deletion, nor the last admin's (ruling Q4).
  */
 export async function scheduleDeletion(
   deps: ServiceDeps,
   userId: string,
   actor: Actor = { userId, type: "user" },
 ): Promise<ScheduleOutcome> {
+  const byAdmin = actor.type === "admin";
+  if (byAdmin) refuseSelfAction(actor, userId);
   const account = await getAccount(deps.db, userId);
   if (!account) return { scheduledFor: null, changed: false };
-  if (account.deleteScheduledAt) return { scheduledFor: account.deleteScheduledAt, changed: false };
 
   const scheduledFor = new Date(now().getTime() + DELETION_WINDOW_DAYS * 86_400_000);
-  // False: a purge of this account has already begun (or the row vanished). Not an error: the
-  // account is being deleted, which is what was asked for.
-  if (!(await schedule(deps.db, userId, scheduledFor))) {
-    const current = await getAccount(deps.db, userId);
-    return { scheduledFor: current?.deleteScheduledAt ?? null, changed: false };
-  }
+  const outcome = await deps.db.transaction(async (tx): Promise<ScheduleOutcome> => {
+    if (byAdmin) await refuseLastAdmin(tx, userId);
+    // The user's row lock (as `schedule` and `cancel` take it, first): the date read here and the
+    // mark written below cannot cross a cancel.
+    if (!(await lockUser(tx, userId))) return { scheduledFor: null, changed: false };
+    const current = await getAccount(tx, userId);
+    if (current?.deleteScheduledAt) {
+      if (byAdmin) await markAdminDeletion(tx, userId);
+      return { scheduledFor: current.deleteScheduledAt, changed: false };
+    }
+    // False: a purge of this account has already begun (or the row vanished). Not an error: the
+    // account is being deleted, which is what was asked for.
+    if (!(await schedule(tx, userId, scheduledFor))) {
+      const after = await getAccount(tx, userId);
+      return { scheduledFor: after?.deleteScheduledAt ?? null, changed: false };
+    }
+    // A holder's own request carries no mark — and a stale one (left by a path that ended the
+    // schedule without `cancelDeletion`) does not make it the admin's.
+    if (byAdmin) await markAdminDeletion(tx, userId);
+    else await clearAdminDeletion(tx, userId);
+    return { scheduledFor, changed: true };
+  });
+  if (!outcome.changed) return outcome;
   record(
     deps,
     "account.deletion_scheduled",
@@ -200,6 +263,10 @@ export async function scheduleDeletion(
  * Cancels a scheduled deletion — the only way one is ever cancelled. Clears the date, deletes
  * the pending row and removes the `owner_deletion` pause (a link that carries another reason
  * stays paused). `409 conflict` once the purge has begun. False when nothing was scheduled.
+ *
+ * A deletion an admin scheduled (`scheduleDeletion`) is cancelled by ANOTHER admin only: its
+ * subject — an admin's own console included — gets `409 deletion_admin_scheduled` and nothing
+ * changes (ruling Q6).
  */
 export async function cancelDeletion(
   deps: ServiceDeps,
@@ -208,8 +275,22 @@ export async function cancelDeletion(
 ): Promise<boolean> {
   const account = await getAccount(deps.db, userId);
   if (!account) return false;
-  // `cancel` re-checks under the row locks; it is what closes the race with the purge job.
-  if (!(await cancel(deps.db, userId))) {
+  const outcome = await deps.db.transaction(async (tx) => {
+    // The user's row lock first — `cancel`'s own order — and the mark read under it.
+    await lockUser(tx, userId);
+    // Not by its subject — also when the subject is an admin using the console.
+    const subject = actor.type !== "admin" || actor.userId === userId;
+    if (subject && (await adminDeletionMarked(tx, userId))) {
+      const current = await getAccount(tx, userId);
+      if (current?.deleteScheduledAt) return "admin_scheduled" as const;
+    }
+    // `cancel` re-checks under the row locks; it is what closes the race with the purge job.
+    if (!(await cancel(tx, userId))) return "started" as const;
+    await clearAdminDeletion(tx, userId);
+    return "cancelled" as const;
+  });
+  if (outcome === "admin_scheduled") throw new AppError("deletion_admin_scheduled");
+  if (outcome === "started") {
     throw new AppError("conflict", "The deletion has already started and can no longer be cancelled.");
   }
   if (!account.deleteScheduledAt) return false;

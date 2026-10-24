@@ -39,7 +39,7 @@ import { auditInTx } from "../services/audit";
 import type { BackgroundContext } from "../services/request-context";
 import { AVATAR_PREFIX, storage } from "../services/storage";
 import type { Job } from "./index";
-import { mayDestroy } from "./reconcile";
+import { mayDestroy, readPauseSwitch } from "./reconcile";
 import { purgeRoot } from "./purge";
 
 /** Accounts taken from the queue at once. */
@@ -144,6 +144,13 @@ export const job: Job = {
       const rows = (await due(bg.db, USER_PURGE_BATCH)).filter((row) => !seen.has(row.userId));
       if (rows.length === 0) return { done: true };
       for (const row of rows) {
+        // The slot read the detector ONCE, minutes ago perhaps: the operator's pause switch is
+        // read again before every account (R1 func-n3), and on — or unreadable — stops the run.
+        // What is left stays due, untouched, for the next run that may destroy.
+        if ((await readPauseSwitch(bg.env)) !== "off") {
+          bg.metric("job", { kind: "user-purge", outcome: "paused_stopped" });
+          return { done: false };
+        }
         seen.add(row.userId);
         try {
           bg.metric("job", { kind: "user-purge", outcome: await purgeAccount(bg, row.userId) });
