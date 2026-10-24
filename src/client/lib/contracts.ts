@@ -163,6 +163,8 @@ registerUserStatePurger(() => {
 export interface UploadRequest {
   files?: File[];
   parentId?: string;
+  /** Without `files`: which picker opens (default `"files"`). */
+  kind?: "files" | "folder";
 }
 
 let uploadRequester: ((opts?: UploadRequest) => void) | null = null;

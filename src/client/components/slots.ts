@@ -89,6 +89,8 @@ export type UsageSlotValue = UsageSummary | "unavailable" | null;
 export interface RequestUploadOptions {
   files?: File[];
   parentId?: string;
+  /** Without `files`: which picker opens (default `"files"`). */
+  kind?: "files" | "folder";
 }
 
 export type RequestUpload = (opts?: RequestUploadOptions) => void;
