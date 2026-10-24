@@ -237,6 +237,22 @@ export function safeLabel(value: unknown, max = LABEL_MAX): string {
   return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : stripped;
 }
 
+/** How many item names one mail lists before "and N more". */
+const ITEMS_NAMED = 10;
+
+/**
+ * The items a mail is about, each a quoted `safeLabel`: “A”, “B” and “C” — at most `ITEMS_NAMED`,
+ * then "and N more". `itemNames` when given (a notice over several items), else `itemName`.
+ */
+function itemsText(d: { itemName: unknown; itemNames?: unknown[] }): string {
+  const names = d.itemNames && d.itemNames.length > 0 ? d.itemNames : [d.itemName];
+  const shown = names.slice(0, ITEMS_NAMED).map((name) => `“${safeLabel(name)}”`);
+  const more = names.length - shown.length;
+  if (more > 0) return `${shown.join(", ")} and ${more} more`;
+  if (shown.length === 1) return shown[0]!;
+  return `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)!}`;
+}
+
 /** As `safeLabel`, for a longer passage whose line breaks matter (a notice quoted in full). */
 function safeQuote(value: unknown, max = 8000): string {
   const text = typeof value === "string" ? value : "";
@@ -779,6 +795,8 @@ export const templates = {
   contentRemovedCopyright: (d: {
     name?: unknown;
     itemName: unknown;
+    /** Every item the mail is about, when more than one (R2 mod-6); `itemName` is then the first. */
+    itemNames?: unknown[];
     noticeText: unknown;
     counterNoticeUrl: string;
     strike?: boolean;
@@ -791,7 +809,7 @@ export const templates = {
           blocks: [
             { text: greeting(d.name) },
             {
-              text: `We received a copyright notice about “${safeLabel(d.itemName)}”, which someone you share a folder with uploaded, and have removed access to it. The notice's description of the material is quoted below.`,
+              text: `We received a copyright notice about ${itemsText(d)}, which someone you share a folder with uploaded, and have removed access to it. The notice's description of the material is quoted below.`,
             },
             { quote: safeQuote(d.noticeText) },
             { text: "We have told the person who uploaded it. They can respond with a counter-notice." },
@@ -803,7 +821,7 @@ export const templates = {
           blocks: [
             { text: greeting(d.name) },
             {
-              text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice's description of the material is quoted below.`,
+              text: `We received a copyright notice about ${itemsText(d)} and have removed access to it. The notice's description of the material is quoted below.`,
             },
             { quote: safeQuote(d.noticeText) },
             ...(d.strike === true
@@ -819,10 +837,10 @@ export const templates = {
             { link: { label: "How to send a counter-notice", url: d.counterNoticeUrl } },
           ],
         },
-  contentRestored: (d: { name?: unknown; itemName: unknown }): Draft => ({
+  contentRestored: (d: { name?: unknown; itemName: unknown; itemNames?: unknown[] }): Draft => ({
     subject: "Your content has been restored",
     heading: "Content restored",
-    blocks: [{ text: greeting(d.name) }, { text: `Access to “${safeLabel(d.itemName)}” has been restored.` }],
+    blocks: [{ text: greeting(d.name) }, { text: `Access to ${itemsText(d)} has been restored.` }],
   }),
   /**
    * To the complainant of a copyright notice, §512(g)(2)(B): a copy of the counter-notice and the
@@ -1601,7 +1619,13 @@ export const sendReportReviewed = (deps: ServiceDeps, d: { to: string }) =>
   deliver(deps, "reportReviewed", d.to, () => templates.reportReviewed(), SYSTEM);
 export const sendContentRemovedCopyright = (
   deps: ServiceDeps,
-  d: To & { itemName: string; noticeText: string; strike?: boolean; folderOwner?: boolean },
+  d: To & {
+    itemName: string;
+    itemNames?: string[];
+    noticeText: string;
+    strike?: boolean;
+    folderOwner?: boolean;
+  },
 ) =>
   deliver(
     deps,
@@ -1610,7 +1634,7 @@ export const sendContentRemovedCopyright = (
     () => templates.contentRemovedCopyright({ ...d, counterNoticeUrl: appUrl(deps.env, "/dmca") }),
     SYSTEM,
   );
-export const sendContentRestored = (deps: ServiceDeps, d: To & { itemName: string }) =>
+export const sendContentRestored = (deps: ServiceDeps, d: To & { itemName: string; itemNames?: string[] }) =>
   deliver(deps, "contentRestored", d.to, () => templates.contentRestored(d), SYSTEM);
 export const sendDmcaCounterForwarded = (
   deps: ServiceDeps,

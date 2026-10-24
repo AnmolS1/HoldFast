@@ -14,7 +14,9 @@
 //   (b)  anomaly_report         reportAnomalies (below) — findings filed and digested, nothing paused
 //   then the admin digest, one mail per operator per run, when there is anything in it.
 // (A pending-scan sweep is inserted after (a) by the scanner task's integration: one more call in
-// its own `try`, nothing else changes.)
+// its own `try`, nothing else changes. After it, R2 mod-2's `locked_hash_sweep` —
+// sweepLockedUnhashed: a LOCKED file still without its server hash gets its scan re-sent, hash
+// only, and the digest names how many.)
 //
 // NOT `guarded` (ruling T22-a): the registry's rollback reading would stop the whole job during a
 // restore — and with it the CSAM steps, which matter most then. The one part that may delete an
@@ -79,6 +81,7 @@ import type { BackgroundContext } from "../services/request-context";
 import {
   lockSuspectedCsam,
   sweepCsamAlerts,
+  sweepLockedUnhashed,
   sweepPendingScans,
   sweepUnrecordedCsamLocks,
 } from "../services/scanning";
@@ -99,6 +102,7 @@ export const ABUSE_HOURLY_LIMITS = {
   owedDetections: 50,
   strikes: 200,
   pendingScans: 100,
+  lockedHashes: 50,
   /** Findings per anomaly kind. */
   findings: 100,
 } as const;
@@ -127,6 +131,7 @@ export const parts = {
   sweepOwedDetections,
   sweepStrikeThresholds,
   sweepPendingScans,
+  sweepLockedUnhashed,
   reportAnomalies,
 };
 
@@ -628,6 +633,14 @@ export const job: Job = {
     await part(bg, "pending_scan_sweep", async () => {
       const swept = await parts.sweepPendingScans(bg, { limit: ABUSE_HOURLY_LIMITS.pendingScans });
       ok("pending_scan_sweep", swept.requeued);
+    });
+
+    await part(bg, "locked_hash_sweep", async () => {
+      const swept = await parts.sweepLockedUnhashed(bg, { limit: ABUSE_HOURLY_LIMITS.lockedHashes });
+      ok("locked_hash_sweep", swept.requeued);
+      // An outstanding listing is named (R2 mod-2): a locked file still waiting for its server hash.
+      if (swept.requeued > 0)
+        digest.push({ label: "Locked files re-sent for their server hash", value: swept.requeued });
     });
 
     await part(bg, "anomaly_report", async () => {

@@ -35,7 +35,7 @@ import {
   lockSuspectedCsam as lockRows,
 } from "../db/queries/moderation";
 import { findByR2Key, getNode, hasLiveScanJob, resetToPending } from "../db/queries/nodes";
-import { clearRequeuedFromDlq, pendingScanCandidates } from "../db/queries/scan";
+import { clearRequeuedFromDlq, lockedUnhashedCandidates, pendingScanCandidates } from "../db/queries/scan";
 import { effectiveHidden, lockOwnerTree } from "../db/queries/tree";
 import type { ScanReason } from "../db/schema";
 import { scannerOver } from "../scan/adapter";
@@ -488,6 +488,53 @@ export async function sweepPendingScans(
     }
   }
   if (requeued > 0) writeMetric(deps.env, "scan", { outcome: "requeued", kind: "sweep" }, requeued);
+  return { checked: due.length, requeued };
+}
+
+/**
+ * R2 mod-2 — the scan a LOCKED file is still owed. An admin's lock of a file whose hash is still
+ * the client's lists nothing (safety-1); the scan that brings the server's hash lists it on arrival
+ * (`listLockedOnScan`, scan/verdict.ts). When that scan never arrives — its message dead-lettered
+ * while the scanner was down, or the forced scan `lockAsAdmin` sent for an `error` file did —
+ * nothing else re-sends it: the dead-letter branches, `sweepPendingScans` and Rescan all want a
+ * `pending` node. This re-sends the scan of every locked file with no server hash
+ * (`lockedUnhashedCandidates`) that nothing is scanning: forced, HASH-ONLY — the status is not
+ * reset and nothing is released or served; the verdict on a locked node records the scan (the
+ * server's hash with `scannedAt`) and lists that hash as the lock's entry.
+ *
+ * Decided again under the owner's TREE LOCK and the LOCKED row (`enqueueRescan`'s order): still
+ * the key's file, still `suspected_csam`, still no `scannedAt`, no live job. Oldest first, at most
+ * `limit` (a body the scanner refused is left out for good); one failure is counted in
+ * `checked` and does not stop the rest; idempotent as the
+ * pending sweep is (one job row per key). Called by the hourly abuse job, as its own part, which
+ * names what it re-sent in the operators' digest. Nothing is deleted.
+ */
+export async function sweepLockedUnhashed(
+  deps: ServiceDeps,
+  opts: { limit?: number } = {},
+): Promise<{ checked: number; requeued: number }> {
+  const limit = Math.max(1, Math.min(opts.limit ?? PENDING_SCAN_SWEEP_DEFAULT_LIMIT, 1_000));
+  const due = await lockedUnhashedCandidates(deps.db, PENDING_SCAN_SWEEP_MINUTES, limit);
+  let requeued = 0;
+  for (const candidate of due) {
+    try {
+      const key = await deps.db.transaction(async (tx) => {
+        await lockOwnerTree(tx, candidate.ownerId);
+        const locked = await findByR2Key(tx, candidate.r2Key, { forUpdate: true });
+        if (!locked || locked.id !== candidate.nodeId || locked.kind !== "file") return null;
+        if (locked.scanStatus !== "suspected_csam" || locked.scannedAt !== null) return null;
+        if (await hasLiveScanJob(tx, candidate.r2Key)) return null;
+        return candidate.r2Key;
+      });
+      if (key === null) continue;
+      await enqueueScan(deps, { nodeId: candidate.nodeId, key, force: true });
+      requeued += 1;
+    } catch (error) {
+      captureError(error, { kind: "scan", reason: "locked_hash_sweep" });
+      writeMetric(deps.env, "error", { kind: "scan", reason: "locked_hash_sweep" });
+    }
+  }
+  if (requeued > 0) writeMetric(deps.env, "scan", { outcome: "requeued", kind: "locked_hash" }, requeued);
   return { checked: due.length, requeued };
 }
 

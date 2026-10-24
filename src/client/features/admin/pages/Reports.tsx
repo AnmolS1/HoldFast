@@ -467,7 +467,9 @@ function ReleasePreview({ preview }: { preview: ReleaseHoldsResponse }) {
       <span>
         {preview.node.released
           ? t("release.node")
-          : t("release.nodeKept", { why: preview.node.keptBecause ?? "—" })}
+          : t("release.nodeKept", {
+              why: preview.node.keptBecause ? label("keptBecause", preview.node.keptBecause) : "—",
+            })}
       </span>
       <span>{t("release.users", { ids: preview.releasedUserIds.join(", ") || "—" })}</span>
       {preview.kept.map((entry) => (

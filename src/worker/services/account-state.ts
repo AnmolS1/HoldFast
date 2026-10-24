@@ -64,7 +64,8 @@ const by = (actor: Actor) => ({ actorUserId: actor.userId, actorType: actor.type
 // still act (`409 last_admin`) — which, the actor being one, happens when the actor is leaving
 // too (their own deletion is scheduled) or when two admins act on each other at the same moment.
 // Acting on ANOTHER admin stays allowed. Both apply to the console (an `admin` actor) only: the
-// strikes helper and the holder's own deletion request are not the console.
+// strikes helper and the holder's own deletion request are not the console — except that a
+// strike's suspension, whoever's, honours the last-admin rule too (`lastAdminGuard`, R2 auth-2).
 
 /** `400 self_action` when an admin aims the console at their own account. */
 export function refuseSelfAction(actor: Actor, userId: string): void {
@@ -82,6 +83,19 @@ async function refuseLastAdmin(tx: Executor, userId: string): Promise<void> {
   // An admin who cannot act already (suspended, leaving) loses nothing more: the change is a no-op.
   if (!active.includes(userId)) return;
   if (!active.some((id) => id !== userId)) throw new AppError("last_admin");
+}
+
+/**
+ * Is `userId` the LAST admin who can act — an admin, and no other admin can (R2 auth-2: a strike
+ * that would suspend them is refused before it is written)? `refuseLastAdmin`'s question without
+ * the throw, for a caller that decides only once it has counted. Locks every admin row first
+ * (`lockActiveAdmins`, id order) when the user is an admin: call it FIRST inside the transaction.
+ */
+export async function isLastActiveAdmin(tx: Executor, userId: string): Promise<boolean> {
+  const [row] = await tx.select({ role: user.role }).from(user).where(eq(user.id, userId)).limit(1);
+  if (!hasAdminRole(row?.role)) return false;
+  const active = await lockActiveAdmins(tx, now());
+  return active.includes(userId) && !active.some((id) => id !== userId);
 }
 
 /**
@@ -113,12 +127,14 @@ export async function suspendUser(
   userId: string,
   reason: string,
   actor: Actor,
+  opts: { lastAdminGuard?: boolean } = {},
 ): Promise<boolean> {
   refuseSelfAction(actor, userId);
   const suspended = await deps.db.transaction(async (tx) => {
     // The console's last-admin check locks every admin row first, in id order (and with them the
-    // target's, when it is one).
-    if (actor.type === "admin") await refuseLastAdmin(tx, userId);
+    // target's, when it is one). `lastAdminGuard`: the same for a system actor — the strikes
+    // helper's threshold (R2 auth-2: three strikes never lock out the last admin who can act).
+    if (actor.type === "admin" || opts.lastAdminGuard === true) await refuseLastAdmin(tx, userId);
     // The UPDATE takes the user's row lock first (the estate's lock order: user, then the rest).
     if (!(await setSuspended(tx, userId, now(), reason))) return null;
     // Sessions, device proofs and key marks — one function, under the user's row lock.

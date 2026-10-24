@@ -383,6 +383,8 @@ describe("the four cron expressions, with the real jobs", () => {
           // T21 (R4, Addendum 3 Q5): abuse-hourly runs for real here, but its pending-scan part
           // would send real scan messages for whatever pending nodes other runs left behind.
           vi.spyOn(abuseParts, "sweepPendingScans").mockResolvedValue({ checked: 0, requeued: 0 });
+          // (And R2 mod-2's locked-hash part, for whatever other runs left locked.)
+          vi.spyOn(abuseParts, "sweepLockedUnhashed").mockResolvedValue({ checked: 0, requeued: 0 });
           const job = jobContext();
           await expect(entry(cronEvent(cron), env, ctx, job.bg)).resolves.toBeUndefined();
           await job.settle();

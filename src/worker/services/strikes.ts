@@ -2,10 +2,17 @@
 // editor who uploads malware into someone else's folder earns the strike, not the folder's owner.
 //
 // THE INVARIANT: an account with `STRIKES_TO_SUSPEND` or more unlifted strikes within
-// `STRIKE_WINDOW_DAYS` is suspended. Nothing here may leave a committed strike without that being
-// true — and because a process can die between a commit and what follows it, the invariant can be
-// re-established at any time: `enforceStrikeThreshold` for one user (a redelivered queue message
-// calls it), `sweepStrikeThresholds` for everyone (a scheduled job calls it).
+// `STRIKE_WINDOW_DAYS` is suspended — EXCEPT the last admin who can act (ruling Q4, R2 auth-2):
+// suspending them would leave nobody to run the console, so they are kept and the operators told
+// (`captureError`, every time the threshold is checked) until another admin can act. Nothing here
+// may leave a committed strike without that being true — and because a process can die between a
+// commit and what follows it, the invariant can be re-established at any time:
+// `enforceStrikeThreshold` for one user (a redelivered queue message calls it),
+// `sweepStrikeThresholds` for everyone (a scheduled job calls it).
+//
+// AN ADMIN'S STRIKE BY HAND (no `tx`, `issuedBy` set) is refused BEFORE anything is written: on the
+// admin's own account `400 self_action`; when it would reach the threshold on the last admin who
+// can act `409 last_admin` — decided in the strike's own transaction, every admin row locked first.
 //
 // This file suspends nobody itself: it calls `suspendUser` (services/account-state.ts), the only
 // implementation of suspension — sessions ended, links paused with `owner_suspended`, one email.
@@ -48,7 +55,7 @@ import {
   usersAtThreshold,
 } from "../db/queries/strikes";
 import { captureError } from "../sentry";
-import { suspendUser, SYSTEM_ACTOR, type Actor } from "./account-state";
+import { isLastActiveAdmin, refuseSelfAction, suspendUser, SYSTEM_ACTOR, type Actor } from "./account-state";
 import { audit } from "./audit";
 import { AppError } from "./errors";
 import { metric } from "./metrics";
@@ -93,10 +100,27 @@ const actorOf = (issuedBy: string | undefined): Actor =>
 
 async function enforce(deps: ServiceDeps, userId: string, actor: Actor, counted?: number) {
   const activeStrikes = counted ?? (await countActive(deps.db, userId, STRIKE_WINDOW_DAYS));
-  const suspended = activeStrikes >= STRIKES_TO_SUSPEND;
-  // `changed`: this call is the one that suspended (false for an account that already was).
-  const changed = suspended ? await suspendUser(deps, userId, STRIKE_SUSPENSION_REASON, actor) : false;
-  return { activeStrikes, suspended, changed };
+  if (activeStrikes < STRIKES_TO_SUSPEND) return { activeStrikes, suspended: false, changed: false };
+  try {
+    // `changed`: this call is the one that suspended (false for an account that already was).
+    const changed = await suspendUser(deps, userId, STRIKE_SUSPENSION_REASON, actor, {
+      lastAdminGuard: true,
+    });
+    return { activeStrikes, suspended: true, changed };
+  } catch (error) {
+    // The last admin who can act is kept (the invariant's one exception), and so — until the sweep,
+    // as the system — is an admin whose own takedown struck them (`self_action`). Neither is a
+    // failure to retry: a queue message or a sweep that threw here would retry it for ever.
+    if (error instanceof AppError && (error.code === "last_admin" || error.code === "self_action")) {
+      captureError(new Error(`strikes: at the threshold, not suspended (${error.code})`), {
+        kind: "strike_kept",
+        reason: error.code,
+      });
+      metric("error", { kind: "strike_kept", reason: error.code });
+      return { activeStrikes, suspended: false, changed: false };
+    }
+    throw error;
+  }
 }
 
 /**
@@ -214,6 +238,22 @@ export async function addStrike(
         }
       },
     };
+  }
+  // An admin's strike by hand: refused before anything is written (R2 auth-2) — their own account,
+  // or the strike that would suspend the last admin who can act (its own transaction: every admin
+  // row locked FIRST, then the insert, then the count it decides on).
+  if (input.issuedBy) {
+    refuseSelfAction(actorOf(input.issuedBy), input.userId);
+    const guarded = await deps.db.transaction(async (tx) => {
+      const last = await isLastActiveAdmin(tx, input.userId);
+      const written = await insert(tx, input, STRIKE_WINDOW_DAYS);
+      if (last && (await countActive(tx, input.userId, STRIKE_WINDOW_DAYS)) >= STRIKES_TO_SUSPEND) {
+        throw new AppError("last_admin");
+      }
+      return written;
+    });
+    const after = await afterCommit(deps, input, guarded);
+    return { strikeId: guarded.id, created: guarded.created, ...after, applySuspension: null };
   }
   // No transaction of its own: a new strike is one statement. When it meets an EXPIRED strike for
   // the same file or content it lifts that one first, and a lift that outlives a failed insert

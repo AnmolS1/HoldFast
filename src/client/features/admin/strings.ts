@@ -305,6 +305,8 @@ export const messages = {
   "q.delete": "Delete now",
   "q.deleteBody": "The file and everything under it are deleted for good. The hash stays on the blocklist.",
   "q.deleted": "Deleted.",
+  "q.deleteRefused":
+    "Not deleted: Delete now is for what the scanner put here (a scan result, or its takedown for a blocklist hit). A takedown a person made is restored or kept, never deleted from here.",
   "q.held": "Not deleted: {causes}.",
   "q.destroyPaused": "Deleting is stopped: the database reads as rolled back or the pause switch is on.",
   "q.liftStrike": "Lift the uploader's malware strike",
@@ -326,6 +328,8 @@ export const messages = {
   "q.restored": "Restored.",
   "q.restored.removed": "Restored. The blocklist entry behind the takedown was removed.",
   "q.restoreHeld": "This takedown keeps a legal hold. Clear the legal hold first.",
+  "q.contentListed":
+    "Not restored: the content is on the blocklist as suspected CSAM or malware. If it is CSAM, lock it (Lock from a notice).",
   "q.reportStrikes":
     "The uploader has {count} report strike(s) for this item. Lift them separately if they were wrong.",
   "q.liftReportStrike": "Lift a report strike",

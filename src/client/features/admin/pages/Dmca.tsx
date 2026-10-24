@@ -328,7 +328,13 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
               t("dmca.statements"),
               `${notice.statementGoodFaith ? t("common.yes") : t("common.no")} / ${notice.statementAccuracy ? t("common.yes") : t("common.no")}`,
             ],
-            [t("dmca.nodes"), notice.nodes.map((node) => node.nodeName ?? node.nodeId).join(", ") || "—"],
+            // Each with its id (R2 mod-7): Quarantine → "Find an item" takes it, and shows owner and uploader.
+            [
+              t("dmca.nodes"),
+              notice.nodes
+                .map((node) => (node.nodeName ? `${node.nodeName} (${node.nodeId})` : node.nodeId))
+                .join(", ") || "—",
+            ],
             [t("dmca.takedownAt"), when(notice.takedownAt)],
             [t("dmca.notified"), when(notice.ownerNotifiedAt)],
             // Day 0 of the window is the receipt's New York date: shown on that calendar (safety-n1).

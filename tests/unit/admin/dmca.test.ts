@@ -14,6 +14,7 @@ import { CreateDmcaNoticeResponse, DmcaNoticeDto } from "../../../src/shared/sch
 import { LegalHoldError } from "../../../src/worker/db/errors";
 import { assertPurgeable } from "../../../src/worker/db/queries/trash";
 import { dmcaNoticeNodes, shares } from "../../../src/worker/db/schema";
+import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
 import { mailTo } from "../auth/helpers";
 import { api as nodesApi } from "../nodes/helpers";
 import {
@@ -29,7 +30,9 @@ import {
   makeShare,
   member,
   nodeRowOf,
+  operators,
   rand,
+  serviceDeps,
   strikesOfUser,
   testDb,
   uploadAddress,
@@ -243,6 +246,88 @@ describe("who is told (safety-2, ruling Q2): the uploader gets the notice, the c
     const mails = mailTo(owner.row.email, "contentRemovedCopyright");
     expect(mails.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([SUBSCRIBER]);
     expect(textOf(mails[0])).toContain(STRIKE);
+  });
+
+  it("R2 mod-6: one notice over two owners' folders (one uploader) — the uploader's mail names BOTH items; each owner is told about their OWN item only; so is the restore", async () => {
+    const who = await admin();
+    const editor = await member();
+    const files: { owner: Awaited<ReturnType<typeof member>>; name: string; id: string }[] = [];
+    for (const label of ["first", "second"]) {
+      const owner = await member();
+      const folder = await makeFolder(owner.id);
+      await makeShare(folder.id, owner.id, editor.id, { role: "editor" });
+      const name = `${label} ${rand(6)}`;
+      const file = await makeFile(owner.id, folder.id, {
+        name,
+        scanStatus: "clean",
+        scannedAt: new Date(),
+        createdBy: editor.id,
+      });
+      await uploadAddress(file.id, file.versionId!, editor.id, "192.0.2.31");
+      files.push({ owner, name, id: file.id });
+    }
+    const [x, y] = files as [(typeof files)[0], (typeof files)[0]];
+    const made = await notice(who, [x.id, y.id]);
+    expect(made.nodes).toHaveLength(2);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+
+    const toEditor = mailTo(editor.row.email, "contentRemovedCopyright");
+    expect(toEditor.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([SUBSCRIBER]);
+    expect(textOf(toEditor[0])).toContain(x.name);
+    expect(textOf(toEditor[0])).toContain(y.name);
+    for (const [mine, theirs] of [
+      [x, y],
+      [y, x],
+    ] as const) {
+      const toOwner = mailTo(mine.owner.row.email, "contentRemovedCopyright");
+      expect(
+        toOwner.map((m) => m.subject.replace(/^\[dev\] /, "")),
+        mine.name,
+      ).toEqual([FOLDER]);
+      expect(textOf(toOwner[0])).toContain(mine.name);
+      expect(textOf(toOwner[0])).not.toContain(theirs.name);
+    }
+
+    expect((await act(who, made.id, "withdraw", { note: "Withdrawn by the complainant." })).status).toBe(200);
+    const restoredEditor = mailTo(editor.row.email, "contentRestored");
+    expect(restoredEditor).toHaveLength(1);
+    expect(textOf(restoredEditor[0])).toContain(x.name);
+    expect(textOf(restoredEditor[0])).toContain(y.name);
+    for (const [mine, theirs] of [
+      [x, y],
+      [y, x],
+    ] as const) {
+      const restored = mailTo(mine.owner.row.email, "contentRestored");
+      expect(restored, mine.name).toHaveLength(1);
+      expect(textOf(restored[0])).toContain(mine.name);
+      expect(textOf(restored[0])).not.toContain(theirs.name);
+    }
+  });
+
+  it("R2 mod-1: withdrawn after the takedown while the content is now listed csam (another account's copy locked) → the notice ends, but the file STAYS DOWN (audited keptListed)", async () => {
+    const who = await admin();
+    const owner = await member();
+    const sha = madeUpSha();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
+    const made = await notice(who, [file.id]);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+    expect((await blocklistRow(sha))?.reason).toBe("dmca");
+    const other = await member();
+    const copy = await makeFile(other.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
+    const service = serviceDeps(operators().env);
+    await lockSuspectedCsam(service.deps, copy.id, { source: "admin", onlyVerifiedHash: true });
+    await service.settle();
+    expect((await blocklistRow(sha))?.reason).toBe("csam");
+
+    const answer = await act(who, made.id, "withdraw", { note: "Withdrawn by the complainant." });
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.body.status).toBe("withdrawn");
+    expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
+    expect((await nodesApi(owner.as, "GET", `/nodes/${file.id}`)).status).toBe(404);
+    expect((await blocklistRow(sha))?.reason).toBe("csam");
+    const [row] = await auditOf("admin.dmca_withdraw", made.id);
+    expect(row!.meta).toMatchObject({ keptListed: [file.id] });
+    expect(mailTo(owner.row.email, "contentRestored")).toEqual([]);
   });
 
   it("withdrawn after the takedown: the editor and the owner are each told it was restored, once", async () => {
