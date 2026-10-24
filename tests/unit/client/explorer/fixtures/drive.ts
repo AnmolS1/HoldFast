@@ -9,6 +9,7 @@ import {
   NodeDto,
   NodePage,
   RestoreNodeResponse,
+  ScanStatusResponse,
   ThumbUrlResponse,
   TrashNodeResponse,
   ZipManifest,
@@ -159,6 +160,15 @@ export class FakeDrive {
       const node = folderNode(this.nextNode++, { parentId, name, role: parent?.role ?? "owner" });
       this.nodes.set(node.id, node);
       return { status: 200, body: NodeDto.parse(node) };
+    }
+    if (method === "POST" && path === "/api/nodes/scan-status") {
+      // Each asked id that is a file here, as the node's GET would show it; the rest left out.
+      const ids = (body.ids as string[]) ?? [];
+      const items = ids.flatMap((id) => {
+        const node = this.nodes.get(id);
+        return node?.kind === "file" ? [node] : [];
+      });
+      return { status: 200, body: ScanStatusResponse.parse({ items }) };
     }
     if (method === "POST" && path === "/api/nodes/zip-manifest") {
       const ids = (body.nodeIds as string[]) ?? [];
