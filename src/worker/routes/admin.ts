@@ -897,9 +897,23 @@ const escapeHtml = (text: string) =>
     (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!,
   );
 
+/**
+ * An export GET is a navigation another site could start in an admin's browser (the session
+ * cookie is SameSite=Lax, and the CSRF middleware passes every GET): each one is audited and
+ * hands over personal data. `Sec-Fetch-Site: cross-site | same-site` is refused before anything
+ * runs (secsrv-3, as `GET /account/export`); `same-origin`, `none` and no header are served.
+ */
+function refuseCrossSite(c: C): void {
+  const site = c.req.header("sec-fetch-site");
+  if (site === "cross-site" || site === "same-site") {
+    throw new AppError("forbidden", "Cross-site request refused.", { reason: "csrf" });
+  }
+}
+
 /** The notice as printable HTML (v1's export). Every value escaped; no script, no external resource. */
 router.get(`/admin/dmca/${ID}/export`, async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const notice = await adminQ.noticeById(db(c), c.req.param("id"));
   if (!notice) throw new AppError("not_found");
   const dto = noticeDto(notice);
@@ -1022,6 +1036,7 @@ const csvLine = (cells: unknown[]) => `${cells.map(csvCell).join(",")}\r\n`;
 
 router.get("/admin/invites/export", async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const rows = await adminQ.allInvites(db(c));
   const head = csvLine(["code", "maxUses", "uses", "expiresAt", "revokedAt", "note", "createdAt"]);
   const body =
@@ -1071,6 +1086,7 @@ export const AUDIT_EXPORT_BATCH = 500;
  */
 router.get("/admin/audit/export", async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const query = AuditQuery.parse(c.req.query());
   const filter = {
     actorUserId: query.actorUserId,
