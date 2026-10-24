@@ -196,10 +196,12 @@ function draftsWith(value: string): Record<TemplateName, ReturnType<(typeof temp
     contentRemovedCopyright: templates.contentRemovedCopyright({
       name: value,
       itemName: value,
+      // R2 mod-6: a notice over several items names each — every name through the same label.
+      itemNames: [value, value],
       noticeText: `${value}\n${value}`,
       counterNoticeUrl: `${APP}/dmca`,
     }),
-    contentRestored: templates.contentRestored({ name: value, itemName: value }),
+    contentRestored: templates.contentRestored({ name: value, itemName: value, itemNames: [value, value] }),
     dmcaCounterForwarded: templates.dmcaCounterForwarded({
       name: value,
       noticeId: value,
