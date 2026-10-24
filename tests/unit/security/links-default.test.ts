@@ -3,7 +3,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { resolveSettings } from "../../../src/worker/services/request-context";
-import { errorOf, makeFile, makeFolder, member } from "../sharing/helpers";
+import { api, asCaller, errorOf, linksOn, makeFile, makeFolder, member } from "../sharing/helpers";
 import { linkTo, visit } from "../sharing/public-helpers";
 
 describe("linksEnabled with no settings row", () => {
@@ -23,5 +23,20 @@ describe("linksEnabled with no settings row", () => {
       "link_paused",
       "unavailable",
     ]);
+  });
+
+  it("creating a link is 503 links_disabled when the settings table has no linksEnabled row; no row is written", async () => {
+    const owner = await member();
+    const folder = await makeFolder(owner.id);
+    const answer = await api(asCaller(owner), `/nodes/${folder.id}/links`, {
+      json: { allowPreview: true },
+      settings: {},
+    });
+    expect([answer.status, errorOf(answer).error, errorOf(answer).details]).toEqual([
+      503,
+      "feature_disabled",
+      { reason: "links_disabled" },
+    ]);
+    expect(await linksOn(folder.id)).toHaveLength(0);
   });
 });
