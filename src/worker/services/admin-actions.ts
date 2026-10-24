@@ -71,7 +71,7 @@ import {
   type PauseSwitch,
 } from "../jobs/reconcile";
 import { captureError } from "../sentry";
-import { unsuspendUser } from "./account-state";
+import { isLastActiveAdmin, unsuspendUser } from "./account-state";
 import { audit, auditInTx } from "./audit";
 import { addBusinessDays, endOfNewYorkDay, HolidayTableEndedError } from "./business-days";
 import { now } from "./clock";
@@ -282,9 +282,14 @@ export async function actionReport(
 
   const uploader = await currentUploader(c, node);
   if (!uploader) throw conflict("no_uploader");
+  // Not on the admin's own account (R2 auth-2, ruling Q4): refused before anything is written.
+  if (uploader === admin.id) throw new AppError("self_action");
   // The strike's "same content never strikes twice" key: only a hash the server computed.
   const scanned = verifiedSha256(node);
   const { report, strike } = await retryOnDeadlock(db(c), async (tx) => {
+    // FIRST (the `user` rows before the rest): every admin row, when the uploader is one — a strike
+    // that would suspend the last admin who can act is `409 last_admin`, the report left open.
+    const lastAdmin = await isLastActiveAdmin(tx, uploader);
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     if (!locked || !OPEN_STATES.includes(locked.report.status)) throw conflict("state");
     const updated = await adminQ.setReportStatus(tx, reportId, {
@@ -306,6 +311,7 @@ export async function actionReport(
       },
       { tx: tx as Tx },
     );
+    if (lastAdmin && struck.activeStrikes >= STRIKES_TO_SUSPEND) throw new AppError("last_admin");
     return { report: updated, strike: struck };
   });
   // After the commit: the strike's audit row and the threshold.
