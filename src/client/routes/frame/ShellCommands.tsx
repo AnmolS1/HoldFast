@@ -47,6 +47,12 @@ export function ShellCommands() {
     if (hasAdminRole(role))
       commands.push({ id: "go.admin", section: "goto", label: t("nav.admin"), run: go("/admin") });
     const dark = prefs.theme === "dark" || (prefs.theme === "system" && isDarkNow());
+    // Why the two upload commands are unavailable, shown on their rows (review F01-2).
+    const uploadOff = config?.readOnly
+      ? t("header.readOnlyDisabled")
+      : config && !config.uploadsEnabled
+        ? t("header.uploadsDisabled")
+        : undefined;
     commands.push(
       {
         id: COMMAND_IDS.upload,
@@ -54,7 +60,18 @@ export function ShellCommands() {
         label: t("header.upload"),
         shortcut: "upload",
         disabled: Boolean(config?.readOnly) || (config ? !config.uploadsEnabled : false),
+        hint: uploadOff,
         run: () => requestUpload(),
+      },
+      {
+        id: "upload.folder",
+        section: "actions",
+        label: t("header.uploadFolder"),
+        shortcut: "uploadFolder",
+        keywords: ["folder", "directory"],
+        disabled: Boolean(config?.readOnly) || (config ? !config.uploadsEnabled : false),
+        hint: uploadOff,
+        run: () => requestUpload({ kind: "folder" }),
       },
       {
         id: "shell.theme",
@@ -96,6 +113,11 @@ export function ShellCommands() {
     if (config?.readOnly || (config && !config.uploadsEnabled)) return;
     event.preventDefault();
     requestUpload();
+  });
+  useShortcut("uploadFolder", (event) => {
+    if (config?.readOnly || (config && !config.uploadsEnabled)) return;
+    event.preventDefault();
+    requestUpload({ kind: "folder" });
   });
   // These three belong to the explorer; the shell only routes the key to the registered command.
   useShortcut("newFolder", (event) => {

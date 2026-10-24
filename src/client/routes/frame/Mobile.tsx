@@ -18,6 +18,7 @@ import { useSession } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
 import { THEME_OPTIONS, useAccountActions } from "./account-actions";
 import { SearchBox, ViewToggle } from "./Header";
+import { canPickFolders } from "../../lib/contracts";
 import { useNewActions } from "./new-actions";
 import { DESTINATIONS, destinationFor, FILES_SWITCHER, groupFor, type NavGroup } from "./nav";
 import { Avatar } from "./Sidebar";
@@ -346,7 +347,8 @@ export function BottomNav({ onAccount }: { onAccount(): void }) {
 
 /** The mobile "New" button, floating above the bottom nav. */
 export function NewFab() {
-  const actions = useNewActions();
+  // Upload folder only where the browser can pick one; the uploader refuses a flat pick anyway.
+  const actions = useNewActions().filter((action) => action.id !== "upload-folder" || canPickFolders());
   const [open, setOpen] = useState(false);
   return (
     <>

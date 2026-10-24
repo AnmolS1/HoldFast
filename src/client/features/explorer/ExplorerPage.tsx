@@ -15,6 +15,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  FolderUp,
   Info,
   Pencil,
   RefreshCw,
@@ -58,8 +59,8 @@ import { ApiError } from "../../lib/api";
 import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
-import { queryClient } from "../../lib/query";
+import { canPickFolders, requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
+import { queryClient, usePublicConfig } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
 import { ShareDialog } from "../share";
@@ -133,6 +134,9 @@ type DialogState =
   | { type: "rename"; node: NodeDto }
   | { type: "move"; nodes: NodeDto[] }
   | null;
+
+/** The empty state's line saying why its upload buttons are unavailable. */
+const UPLOAD_OFF_ID = "explorer-upload-off";
 
 interface MenuState {
   /** Empty = the folder's own menu (right-click on the background). */
@@ -327,7 +331,22 @@ function Explorer({ folderId }: { folderId: string | null }) {
   }, []);
 
   const newFolder = useCallback(() => setDialog({ type: "new-folder", busy: false, error: null }), []);
-  const upload = useCallback(() => requestUpload({ parentId: folderId ?? undefined }), [folderId]);
+  // Uploading follows the New menu's rules (F01): off while read-only or with uploads paused, and
+  // says why — a pick that would only be refused afterwards is never opened.
+  const config = usePublicConfig().data;
+  const uploadOff = config?.readOnly
+    ? shellT("header.readOnlyDisabled")
+    : config && !config.uploadsEnabled
+      ? shellT("header.uploadsDisabled")
+      : undefined;
+  const upload = useCallback(() => {
+    if (uploadOff) return;
+    requestUpload({ parentId: folderId ?? undefined });
+  }, [folderId, uploadOff]);
+  const uploadFolder = useCallback(() => {
+    if (uploadOff) return;
+    requestUpload({ parentId: folderId ?? undefined, kind: "folder" });
+  }, [folderId, uploadOff]);
 
   const closeDialog = useCallback((focusId?: string | null) => {
     setDialog(null);
@@ -445,10 +464,26 @@ function Explorer({ folderId }: { folderId: string | null }) {
         label: t("explorer.action.upload"),
         icon: <Upload size={16} />,
         shortcut: "upload",
+        disabled: Boolean(uploadOff),
+        hint: uploadOff,
         run: upload,
       },
+      // Only where this browser can pick a folder (as the FAB; lib/contracts `canPickFolders`).
+      ...(canPickFolders()
+        ? [
+            {
+              id: "upload-folder",
+              label: t("explorer.action.uploadFolder"),
+              icon: <FolderUp size={16} />,
+              shortcut: "uploadFolder" as const,
+              disabled: Boolean(uploadOff),
+              hint: uploadOff,
+              run: uploadFolder,
+            },
+          ]
+        : []),
     ];
-  }, [canAdd, newFolder, upload]);
+  }, [canAdd, newFolder, upload, uploadFolder, uploadOff]);
 
   // ---- focus that waits for the list ---------------------------------------------------------
 
@@ -774,10 +809,38 @@ function Explorer({ folderId }: { folderId: string | null }) {
         body={t("explorer.empty.first")}
         actions={
           <>
-            <Button variant="cta" onClick={upload} data-empty-upload>
+            {/* Unavailable but still focusable, with its reason shown under them (R1 a11y-1). */}
+            <Button
+              variant="cta"
+              onClick={upload}
+              aria-disabled={uploadOff ? true : undefined}
+              aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
+              className={uploadOff ? "Mui-disabled" : undefined}
+              data-empty-upload
+            >
               {t("explorer.action.upload")}
             </Button>
+            {canPickFolders() ? (
+              <Button
+                onClick={uploadFolder}
+                aria-disabled={uploadOff ? true : undefined}
+                aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
+                className={uploadOff ? "Mui-disabled" : undefined}
+                data-empty-upload-folder
+              >
+                {t("explorer.action.uploadFolder")}
+              </Button>
+            ) : null}
             <Button onClick={newFolder}>{t("explorer.action.newFolder")}</Button>
+            {uploadOff ? (
+              <Box
+                id={UPLOAD_OFF_ID}
+                data-upload-off
+                sx={{ flexBasis: "100%", textAlign: "center", typography: "body2", color: hf.textSecondary }}
+              >
+                {uploadOff}
+              </Box>
+            ) : null}
           </>
         }
       />
@@ -872,6 +935,8 @@ function Explorer({ folderId }: { folderId: string | null }) {
             canAdd={canAdd && !failed}
             onNewFolder={newFolder}
             onUpload={upload}
+            onUploadFolder={uploadFolder}
+            uploadOff={uploadOff}
           />
         ) : null}
       </Box>

@@ -193,6 +193,7 @@ describe("shortcuts", () => {
       "theme",
       "trash",
       "upload",
+      "uploadFolder",
     ]);
   });
 

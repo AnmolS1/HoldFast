@@ -54,6 +54,7 @@ export const en = {
   "header.new": "New",
   "header.newFolder": "New folder",
   "header.upload": "Upload files…",
+  "header.uploadFolder": "Upload folder…",
   "header.readOnlyDisabled": "Not available while Holdfast is read-only.",
   "header.uploadsDisabled": "Uploads are paused right now.",
 
@@ -202,6 +203,7 @@ export const en = {
   "shortcuts.rename": "Rename",
   "shortcuts.restore": "Restore from trash",
   "shortcuts.upload": "Upload files",
+  "shortcuts.uploadFolder": "Upload folder",
   "shortcuts.theme": "Switch theme",
 
   "help.title": "Help",

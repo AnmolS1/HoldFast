@@ -5,9 +5,21 @@ import Button from "@mui/material/Button";
 import Divider from "@mui/material/Divider";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
-import { ArrowDown, ArrowUp, ArrowUpDown, Check, FolderPlus, Upload } from "lucide-react";
+import Tooltip from "@mui/material/Tooltip";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  Check,
+  ChevronDown,
+  FolderPlus,
+  FolderUp,
+  Upload,
+} from "lucide-react";
 import { useId, useState } from "react";
+import { Kbd } from "../../components/Kbd";
 import { t as shellT } from "../../lib/i18n";
+import { shortcutLabel } from "../../lib/shortcuts";
 import type { ViewMode } from "../../lib/prefs";
 import { hf } from "../../theme/tokens";
 import type { SortDir, SortKey } from "./api";
@@ -32,6 +44,10 @@ export interface ToolbarProps {
   canAdd: boolean;
   onNewFolder(): void;
   onUpload(): void;
+  /** The folder picker, for the same folder as `onUpload`. */
+  onUploadFolder(): void;
+  /** Why uploading is unavailable (read-only, uploads paused); absent while it works. */
+  uploadOff?: string;
 }
 
 const tick = (on: boolean) => (
@@ -49,6 +65,10 @@ export function Toolbar(props: ToolbarProps) {
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const menuId = useId();
   const close = () => setAnchor(null);
+  const [uploadAnchor, setUploadAnchor] = useState<HTMLElement | null>(null);
+  const uploadMenuId = useId();
+  const uploadOffId = useId();
+  const closeUpload = () => setUploadAnchor(null);
   const countText = more
     ? t("explorer.count.more", { count })
     : count === 1
@@ -86,14 +106,91 @@ export function Toolbar(props: ToolbarProps) {
           >
             {t("explorer.action.newFolder")}
           </Button>
-          <Button
-            variant="text"
-            onClick={props.onUpload}
-            startIcon={<Upload size={16} aria-hidden="true" />}
-            data-upload
+          {/* A split button: the main half uploads files as before, the arrow offers the folder too. */}
+          <Box sx={{ display: "inline-flex", alignItems: "center" }} data-upload-split>
+            {/* Unavailable but still focusable (R1 a11y-1); its reason is a tooltip on hover and
+                on keyboard focus — on the wrapper, as a disabled button takes no pointer events. */}
+            <Tooltip title={props.uploadOff ?? ""} describeChild>
+              <Box component="span" sx={{ display: "inline-flex" }} data-upload-tip>
+                <Button
+                  variant="text"
+                  onClick={() => {
+                    if (!props.uploadOff) props.onUpload();
+                  }}
+                  aria-disabled={props.uploadOff ? true : undefined}
+                  aria-describedby={props.uploadOff ? uploadOffId : undefined}
+                  className={props.uploadOff ? "Mui-disabled" : undefined}
+                  startIcon={<Upload size={16} aria-hidden="true" />}
+                  data-upload
+                  sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
+                >
+                  {t("explorer.action.upload")}
+                </Button>
+                {props.uploadOff ? (
+                  <Box component="span" id={uploadOffId} hidden>
+                    {props.uploadOff}
+                  </Box>
+                ) : null}
+              </Box>
+            </Tooltip>
+            <Button
+              variant="text"
+              aria-label={t("explorer.action.uploadMenu")}
+              aria-haspopup="menu"
+              aria-controls={uploadAnchor ? uploadMenuId : undefined}
+              aria-expanded={uploadAnchor ? true : undefined}
+              onClick={(event) => setUploadAnchor(event.currentTarget)}
+              data-upload-menu
+              sx={{ minWidth: 0, paddingX: 2, borderTopLeftRadius: 0, borderBottomLeftRadius: 0 }}
+            >
+              <ChevronDown size={16} aria-hidden="true" />
+            </Button>
+          </Box>
+          <Menu
+            id={uploadMenuId}
+            anchorEl={uploadAnchor}
+            open={Boolean(uploadAnchor)}
+            onClose={closeUpload}
+            anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+            transformOrigin={{ vertical: "top", horizontal: "right" }}
+            slotProps={{ list: { "aria-label": t("explorer.action.uploadMenu") } }}
           >
-            {t("explorer.action.upload")}
-          </Button>
+            {(
+              [
+                ["files", Upload, "explorer.action.upload", "upload", props.onUpload],
+                ["folder", FolderUp, "explorer.action.uploadFolder", "uploadFolder", props.onUploadFolder],
+              ] as const
+            ).map(([kind, Icon, label, shortcut, run]) => (
+              <MenuItem
+                key={kind}
+                data-upload-kind={kind}
+                disabled={Boolean(props.uploadOff)}
+                title={props.uploadOff}
+                onClick={() => {
+                  // The picker opens inside this click; the menu closes around it.
+                  run();
+                  closeUpload();
+                }}
+              >
+                <Box
+                  component="span"
+                  aria-hidden="true"
+                  sx={{ display: "inline-flex", color: hf.textSecondary }}
+                >
+                  <Icon size={16} />
+                </Box>
+                <Box component="span" sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto" }}>
+                  {t(label)}
+                  {props.uploadOff ? (
+                    <Box component="span" sx={{ typography: "body2", color: hf.textSecondary }}>
+                      {props.uploadOff}
+                    </Box>
+                  ) : null}
+                </Box>
+                <Kbd>{shortcutLabel(shortcut)}</Kbd>
+              </MenuItem>
+            ))}
+          </Menu>
         </>
       ) : null}
       <Button

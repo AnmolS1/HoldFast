@@ -28,6 +28,10 @@ export const messages = {
   "intake.unreadable.other": "{count} items could not be read and were left out: {names}",
   "intake.listMore": "{names} and {more} more",
   "intake.tooMany": "That is more than 10,000 files. Nothing was uploaded — upload it in smaller parts.",
+  "intake.skipped.one": "1 system file skipped (.DS_Store and similar)",
+  "intake.skipped.other": "{count} system files skipped (.DS_Store and similar)",
+  "intake.flatFolder":
+    "This browser picked files, not a folder. Drag the folder in instead, or use Upload files.",
 
   // The ribbon's one sentence.
   "ribbon.uploading": "Uploading {n} of {total} · {left} left",

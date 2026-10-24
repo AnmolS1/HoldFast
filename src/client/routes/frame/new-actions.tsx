@@ -1,4 +1,4 @@
-import { FolderPlus, Upload } from "lucide-react";
+import { FolderPlus, FolderUp, Upload } from "lucide-react";
 import type { ReactNode } from "react";
 import { COMMAND_IDS, runCommand, useCommand } from "../../components/CommandPalette";
 import { requestUpload } from "../../features/upload";
@@ -7,7 +7,7 @@ import { usePublicConfig } from "../../lib/query";
 import { shortcutLabel } from "../../lib/shortcuts";
 
 export interface NewAction {
-  id: "new-folder" | "upload";
+  id: "new-folder" | "upload" | "upload-folder";
   label: string;
   icon: ReactNode;
   shortcut: string;
@@ -16,7 +16,10 @@ export interface NewAction {
   run(): void;
 }
 
-/** New folder and Upload, with the reasons they may be unavailable. Shared by the menu and the FAB. */
+/**
+ * New folder, Upload files and Upload folder, with the reasons they may be unavailable. Shared by
+ * the menu and the FAB (which offers Upload folder only where `canPickFolders`).
+ */
 export function useNewActions(): NewAction[] {
   const config = usePublicConfig().data;
   const newFolder = useCommand(COMMAND_IDS.newFolder);
@@ -41,6 +44,15 @@ export function useNewActions(): NewAction[] {
       disabled: readOnly || uploadsOff,
       reason: readOnly ? t("header.readOnlyDisabled") : uploadsOff ? t("header.uploadsDisabled") : undefined,
       run: () => requestUpload(),
+    },
+    {
+      id: "upload-folder",
+      label: t("header.uploadFolder"),
+      icon: <FolderUp size={16} />,
+      shortcut: shortcutLabel("uploadFolder"),
+      disabled: readOnly || uploadsOff,
+      reason: readOnly ? t("header.readOnlyDisabled") : uploadsOff ? t("header.uploadsDisabled") : undefined,
+      run: () => requestUpload({ kind: "folder" }),
     },
   ];
 }
