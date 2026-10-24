@@ -83,6 +83,28 @@ describe("S16 — the upload routes delete nothing while the database reads as r
     expect(inStep).toEqual({ status: 204, aborts: 1 });
   });
 
+  it("discardStored (a replace superseded at init, R1D rds-1): its multipart is not aborted; the same 201, the old session aborted", async () => {
+    const [rolled, inStep] = await bothWays(async () => {
+      const user = await uploader();
+      const file = await makeFile(user.id, null, { name: "plan.txt", scanStatus: "clean" });
+      const body = (size: number) =>
+        initBody({ name: "plan.txt", replaceNodeId: file.id, onConflict: "replace", size });
+      const first = await init(user, body(TWO_PARTS));
+      const watched = watchedBucket();
+      const answer = await call(user, "POST", "/uploads", {
+        json: body(20),
+        env: { FILES: watched.bucket },
+      });
+      return {
+        status: answer.status,
+        first: (await sessionRow(first.uploadId))!.status,
+        aborts: watched.calls["upload.abort"] ?? 0,
+      };
+    });
+    expect(rolled).toEqual({ status: 201, first: "aborted", aborts: 0 });
+    expect(inStep).toEqual({ status: 201, first: "aborted", aborts: 1 });
+  });
+
   it("refuseBlocked (a malware-listed file at complete): the object stays; the same 403, the session aborted", async () => {
     const [rolled, inStep] = await bothWays(async () => {
       const user = await uploader();
