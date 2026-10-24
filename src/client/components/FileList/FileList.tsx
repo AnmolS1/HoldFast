@@ -5,7 +5,7 @@ import Box from "@mui/material/Box";
 import Skeleton from "@mui/material/Skeleton";
 import useMediaQuery from "@mui/material/useMediaQuery";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Link2, Users } from "lucide-react";
+import { Link2, Link2Off, Users } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -139,9 +139,15 @@ function ShareCell({ item }: { item: FileListItem }) {
         role="img"
         aria-label={label}
         title={label}
-        sx={{ display: "inline-flex", opacity: sharing.link === "active" ? 1 : 0.6 }}
+        sx={{ display: "inline-flex" }}
       >
-        <Link2 size={14} aria-hidden="true" />
+        {/* A glyph of its own, never the active one dimmed: state is not shown by lightness alone
+            (D01 §7, R1 a11y-9). */}
+        {sharing.link === "active" ? (
+          <Link2 size={14} aria-hidden="true" />
+        ) : (
+          <Link2Off size={14} aria-hidden="true" />
+        )}
       </Box>,
     );
   }
@@ -619,9 +625,10 @@ export function FileList<T extends FileListItem>(props: FileListProps<T>) {
           padding: 2,
           minWidth: 0,
           height: TILE_HEIGHT - 8,
+          // Uploading shows as a dashed edge and the progress, never by dimming the tile: that took
+          // its meta text under 4.5:1 (R1 a11y-8).
           border: `1px ${uploading ? "dashed" : "solid"} ${hf.hairline}`,
           borderRadius: `${layout.radius.card}px`,
-          opacity: uploading ? 0.75 : 1,
           outlineOffset: -2,
           cursor: "default",
           userSelect: "none",

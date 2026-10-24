@@ -3,7 +3,7 @@
 // "The virus scanner is starting up. Try again in a minute." with a "Try again" that sends the same
 // picture again — never the generic "Couldn't check" and never a toast.
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sync";
 import { buildRoutes } from "../../../../src/client/router";
@@ -76,11 +76,23 @@ async function choosePicture() {
 describe("avatar on a cold scanner", () => {
   it("while the server scans: 'Checking your picture…' on the button and in a status line", async () => {
     let answer!: (response: Response) => void;
-    api(() => new Promise<Response>((resolve) => (answer = resolve)));
+    const calls = api(() => new Promise<Response>((resolve) => (answer = resolve)));
     renderRoutes(buildRoutes(), ["/account"]);
+    (await screen.findByRole("button", { name: "Upload picture" })).focus();
     await choosePicture();
     const button = await screen.findByRole("button", { name: "Checking your picture…" });
-    expect((button as HTMLButtonElement).disabled).toBe(true);
+    // Unavailable but focusable (R1 a11y-1): `disabled` dropped the keyboard focus to <body>.
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(button);
+    const picker = vi.spyOn(document.querySelector<HTMLInputElement>("[data-avatar-input]")!, "click");
+    fireEvent.click(button);
+    for (const key of ["Enter", " "]) {
+      fireEvent.keyDown(button, { key });
+      fireEvent.keyUp(button, { key });
+    }
+    expect(picker).not.toHaveBeenCalled();
+    expect(calls.filter((call) => call.path === "/api/uploads" && call.method === "POST")).toHaveLength(1);
+    expect(document.activeElement).toBe(button);
     const status = screen.getByText("Checking your picture… This can take up to two minutes.");
     expect(status.getAttribute("role")).toBe("status");
     answer(json(fileNode(1, { scanStatus: "clean", name: "me.png" }), 201));

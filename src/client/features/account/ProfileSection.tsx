@@ -58,6 +58,10 @@ function Initials({ profile }: { profile: ProfileDto }) {
 function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }) {
   const queryClient = useQueryClient();
   const input = useRef<HTMLInputElement | null>(null);
+  const button = useRef<HTMLButtonElement | null>(null);
+  const retryButton = useRef<HTMLButtonElement | null>(null);
+  /** "Try again" takes focus when it appears, if the person was still on the picture's button. */
+  const [focusRetry, setFocusRetry] = useState(false);
   /** Where the upload is: the bytes going up, then the server scanning them. */
   const [phase, setPhase] = useState<"idle" | "uploading" | "checking">("idle");
   const busy = phase !== "idle";
@@ -68,6 +72,12 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
    */
   const [retry, setRetry] = useState<{ file: File; epoch: ReturnType<typeof accountEpoch> } | null>(null);
   const retryable = retry !== null && sameAccount(retry.epoch) ? retry.file : null;
+
+  useEffect(() => {
+    if (!focusRetry || !retryButton.current) return;
+    retryButton.current.focus();
+    setFocusRetry(false);
+  }, [focusRetry]);
 
   const onFile = async (file: File | undefined) => {
     if (!file) return;
@@ -88,7 +98,10 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
     }
     // The initials stay: nothing became the avatar.
     setProblem(t(AVATAR_TEXT[outcome]));
-    if (outcome === "scanner_starting") setRetry({ file, epoch: then });
+    if (outcome === "scanner_starting") {
+      setRetry({ file, epoch: then });
+      if (document.activeElement === button.current) setFocusRetry(true);
+    }
   };
 
   return (
@@ -120,7 +133,18 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
       </Box>
       <Box sx={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: "1 1 240px" }}>
         <Box>
-          <Button variant="outlined" onClick={() => input.current?.click()} disabled={busy}>
+          {/* Unavailable while busy, but still focusable: `disabled` would drop the keyboard focus to
+              <body> for the whole check — up to two minutes (R1 a11y-1). */}
+          <Button
+            ref={button}
+            variant="outlined"
+            data-avatar-change
+            aria-disabled={busy || undefined}
+            className={busy ? "Mui-disabled" : undefined}
+            onClick={() => {
+              if (!busy) input.current?.click();
+            }}
+          >
             {phase === "checking"
               ? t("profile.avatar.checking")
               : phase === "uploading"
@@ -147,9 +171,12 @@ function AvatarPart({ profile, userId }: { profile: ProfileDto; userId: string }
         {retryable && !busy ? (
           <Box>
             <Button
+              ref={retryButton}
               variant="outlined"
               data-avatar-retry
               onClick={() => {
+                // This button goes away while the picture is sent again: focus its own button.
+                button.current?.focus();
                 if (retry && sameAccount(retry.epoch)) void onFile(retry.file);
                 else setRetry(null);
               }}

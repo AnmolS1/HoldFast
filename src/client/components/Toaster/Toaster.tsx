@@ -2,7 +2,7 @@ import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import IconButton from "@mui/material/IconButton";
 import { X } from "lucide-react";
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { t } from "../../lib/i18n";
 import { hf, layout, shadows } from "../../theme/tokens";
 import { dismissToast, getToasts, subscribeToasts, type ToastEntry } from "./store";
@@ -10,14 +10,46 @@ import { dismissToast, getToasts, subscribeToasts, type ToastEntry } from "./sto
 /** How long a toast — the shell's standard status message — stays, in ms. */
 export const DEFAULT_DURATION = 6000;
 
+/**
+ * One toast. Its time runs only while neither the keyboard focus nor the pointer is on it (WCAG
+ * 2.2.1, R1 a11y-5): entering pauses it, and the rest runs once both have left. A button pressed
+ * in it hands the focus back to where it came from, so it does not fall to <body> (a11y-1).
+ */
 function ToastItem({ entry }: { entry: ToastEntry }) {
+  const [focused, setFocused] = useState(false);
+  const [hovered, setHovered] = useState(false);
+  const held = focused || hovered;
+  const left = useRef(entry.duration ?? DEFAULT_DURATION);
+  const returnTo = useRef<HTMLElement | null>(null);
   useEffect(() => {
-    const timer = setTimeout(() => dismissToast(entry.id), entry.duration ?? DEFAULT_DURATION);
-    return () => clearTimeout(timer);
-  }, [entry.id, entry.duration]);
+    if (held) return;
+    const started = Date.now();
+    const timer = setTimeout(() => dismissToast(entry.id), left.current);
+    return () => {
+      clearTimeout(timer);
+      left.current = Math.max(0, left.current - (Date.now() - started));
+    };
+  }, [entry.id, held]);
+  // `fromKeys`: a pointer press does not move focus back — on a phone that would raise the
+  // keyboard of a field the person had left.
+  const close = (fromKeys: boolean) => {
+    const back = returnTo.current;
+    dismissToast(entry.id);
+    if (fromKeys && focused && back?.isConnected) back.focus();
+  };
   return (
     <Box
       data-toast={entry.key ?? "toast"}
+      onFocus={(event) => {
+        const from = event.relatedTarget;
+        if (from instanceof HTMLElement && !event.currentTarget.contains(from)) returnTo.current = from;
+        setFocused(true);
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocused(false);
+      }}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
       sx={{
         display: "flex",
         alignItems: "center",
@@ -47,9 +79,9 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
       {entry.action ? (
         <Button
           variant="text"
-          onClick={() => {
+          onClick={(event) => {
             entry.action?.onClick();
-            dismissToast(entry.id);
+            close(event.detail === 0);
           }}
           sx={{
             color: "inherit",
@@ -63,7 +95,7 @@ function ToastItem({ entry }: { entry: ToastEntry }) {
       ) : null}
       <IconButton
         aria-label={t("toast.dismiss")}
-        onClick={() => dismissToast(entry.id)}
+        onClick={(event) => close(event.detail === 0)}
         sx={{ color: "inherit", "&:hover": { backgroundColor: "transparent", opacity: 0.8 } }}
       >
         <X size={16} aria-hidden="true" />

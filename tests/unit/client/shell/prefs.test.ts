@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   getPrefs,
+  getShortcutsOn,
   MODE_KEY,
   PREFS_KEY,
   registerPrefsSync,
   resetPrefsForTests,
   sanitizePrefs,
   setPrefs,
+  setShortcutsOn,
   SYNC_DEBOUNCE_MS,
   type Prefs,
 } from "../../../../src/client/lib/prefs";
@@ -61,6 +63,30 @@ describe("prefs: local only", () => {
     setPrefs({ theme: "light", viewMode: "grid", density: "comfortable" });
     expect(Object.keys(localStorage).sort()).toEqual([PREFS_KEY, MODE_KEY].sort());
     expect(Object.keys(sessionStorage)).toEqual([]);
+  });
+
+  it("the single-key shortcuts flag (R1 a11y-6): local only, in hf.prefs.v1, anything but false reads as on", () => {
+    for (const stored of ['"no"', "0", "null", '"false"', "{}"]) {
+      localStorage.setItem(PREFS_KEY, `{"density":"compact","viewMode":"list","shortcuts":${stored}}`);
+      resetPrefsForTests();
+      expect(getShortcutsOn(), stored).toBe(true);
+    }
+    localStorage.setItem(PREFS_KEY, '{"shortcuts":false}');
+    resetPrefsForTests();
+    expect(getShortcutsOn()).toBe(false);
+    expect(getPrefs()).not.toHaveProperty("shortcuts");
+    setShortcutsOn(true);
+    expect(JSON.parse(localStorage.getItem(PREFS_KEY)!)).not.toHaveProperty("shortcuts");
+    expect(Object.keys(localStorage).sort()).toEqual([PREFS_KEY, MODE_KEY].sort());
+  });
+
+  it("an account switch keeps the shortcuts flag, like density and view: device settings, not account state", async () => {
+    setPrefs({ viewMode: "grid" });
+    setShortcutsOn(false);
+    await purgeUserState();
+    expect(getPrefs().viewMode).toBe("grid");
+    expect(getShortcutsOn()).toBe(false);
+    setShortcutsOn(true);
   });
 
   it("works when storage throws", () => {

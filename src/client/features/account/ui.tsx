@@ -7,7 +7,7 @@ import DialogActions from "@mui/material/DialogActions";
 import DialogContent from "@mui/material/DialogContent";
 import DialogTitle from "@mui/material/DialogTitle";
 import TextField, { type TextFieldProps } from "@mui/material/TextField";
-import { useId, useState, type FormEvent, type ReactNode } from "react";
+import { useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { hf, layout } from "../../theme/tokens";
 import { t } from "./strings";
 
@@ -83,27 +83,44 @@ export function LabeledField({
   );
 }
 
-/** A line under a form: a confirmation (status) or a refusal (alert). */
+/**
+ * A line under a form: a confirmation (status) or a refusal (alert). The region is mounted while
+ * empty, so a screen reader hears the text arrive (one inserted with its text is not reliably
+ * read: R1 a11y-12); empty, it is out of the layout.
+ */
 export function StatusLine({ tone, children }: { tone: "ok" | "error"; children: ReactNode }) {
-  if (!children) return null;
+  const empty = !children;
   return (
     <Box
       role={tone === "error" ? "alert" : "status"}
       data-account-status={tone}
-      sx={{
-        padding: "8px 12px",
-        borderRadius: `${layout.radius.control}px`,
-        backgroundColor: hf.surface2,
-        boxShadow: `inset 2px 0 0 ${tone === "error" ? hf.danger : hf.textSecondary}`,
-        color: hf.text,
-        fontSize: 13,
-        lineHeight: "20px",
-      }}
+      sx={
+        empty
+          ? hiddenRegion
+          : {
+              padding: "8px 12px",
+              borderRadius: `${layout.radius.control}px`,
+              backgroundColor: hf.surface2,
+              boxShadow: `inset 2px 0 0 ${tone === "error" ? hf.danger : hf.textSecondary}`,
+              color: hf.text,
+              fontSize: 13,
+              lineHeight: "20px",
+            }
+      }
     >
-      {children}
+      {empty ? null : children}
     </Box>
   );
 }
+
+const hiddenRegion = {
+  position: "absolute",
+  width: "1px",
+  height: "1px",
+  overflow: "hidden",
+  clipPath: "inset(50%)",
+  whiteSpace: "nowrap",
+} as const;
 
 /** A dialog that asks for the account's password, then hands it to `onSubmit`. */
 export function PasswordDialog({
@@ -126,6 +143,7 @@ export function PasswordDialog({
   onCancel(): void;
 }) {
   const [password, setPassword] = useState("");
+  const field = useRef<HTMLInputElement | null>(null);
   const titleId = useId();
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -138,6 +156,9 @@ export function PasswordDialog({
       aria-labelledby={titleId}
       fullWidth
       maxWidth="xs"
+      // `autoFocus` alone loses to the focus trap in a browser: the trap focuses the dialog once
+      // it has opened, so typing went nowhere until a Tab (R1 a11y-13). Focus the field then.
+      slotProps={{ transition: { onEntered: () => field.current?.focus() } }}
     >
       <Box component="form" onSubmit={submit} noValidate>
         <DialogTitle id={titleId}>{title}</DialogTitle>
@@ -149,6 +170,7 @@ export function PasswordDialog({
             name="password"
             autoComplete="current-password"
             autoFocus
+            inputRef={field}
             value={password}
             onChange={(event) => setPassword(event.target.value)}
             error={error}

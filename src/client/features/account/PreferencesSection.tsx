@@ -9,7 +9,14 @@ import Switch from "@mui/material/Switch";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { ApiError } from "../../lib/api";
-import { usePrefs, type Density, type ThemePref, type ViewMode } from "../../lib/prefs";
+import {
+  setShortcutsOn,
+  usePrefs,
+  useShortcutsOn,
+  type Density,
+  type ThemePref,
+  type ViewMode,
+} from "../../lib/prefs";
 import { accountEpoch, sameAccount } from "../../lib/query";
 import { hf } from "../../theme/tokens";
 import { patchPrefs, prefsQuery } from "./api";
@@ -100,6 +107,34 @@ function Appearance() {
   );
 }
 
+/** The single-key shortcuts' off switch (WCAG 2.1.4, R1 a11y-6): this device only. */
+function Keyboard() {
+  const on = useShortcutsOn();
+  const helpId = useId();
+  return (
+    <Section id="keyboard" title={t("prefs.keyboard")}>
+      <FormControlLabel
+        control={
+          <Switch
+            checked={on}
+            onChange={(event) => setShortcutsOn(event.target.checked)}
+            slotProps={{ input: { "aria-describedby": helpId } }}
+          />
+        }
+        label={t("prefs.shortcuts")}
+        data-pref="shortcuts"
+      />
+      <Box
+        id={helpId}
+        component="p"
+        sx={{ margin: 0, color: hf.textSecondary, fontSize: 13, lineHeight: "20px" }}
+      >
+        {t("prefs.shortcuts.help")}
+      </Box>
+    </Section>
+  );
+}
+
 function Notifications() {
   const queryClient = useQueryClient();
   const prefs = useQuery(prefsQuery);
@@ -149,6 +184,7 @@ export function PreferencesSection() {
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 5 }}>
       <Appearance />
+      <Keyboard />
       <Notifications />
     </Box>
   );

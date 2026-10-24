@@ -5,7 +5,7 @@
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type RefObject } from "react";
 import { toast } from "../../components/Toaster";
 import { accountEpoch, refreshSession, sameAccount, useSession } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
@@ -24,10 +24,20 @@ import { useStepUp } from "./step-up";
 import { t } from "./strings";
 import { LabeledField, Note, PasswordDialog, Section, StatusLine } from "./ui";
 
-function BackupCodes({ codes, email, onDone }: { codes: string[]; email: string; onDone(): void }) {
+function BackupCodes({
+  codes,
+  email,
+  onDone,
+  headingRef,
+}: {
+  codes: string[];
+  email: string;
+  onDone(): void;
+  headingRef: RefObject<HTMLHeadingElement | null>;
+}) {
   return (
     <Box data-backup-codes sx={{ display: "flex", flexDirection: "column", gap: 3 }}>
-      <Box component="h3" sx={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+      <Box component="h3" ref={headingRef} tabIndex={-1} sx={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
         {t("twoFactor.backup.title")}
       </Box>
       <Note>{t("twoFactor.backup.body")}</Note>
@@ -74,7 +84,14 @@ type Stage =
 
 type Asking = "enable" | "regenerate" | "disable" | null;
 
-export function TwoFactorPart() {
+/** Where keyboard focus goes once the block it was in has been swapped out (R1 a11y-1). */
+type FocusTo = "setup" | "codes" | "actions" | null;
+
+/**
+ * `hasPassword`: Better Auth asks for the password to enrol (second-factor.ts, ENROLMENT), so an
+ * account without one is told how to get one instead of being offered a prompt it cannot answer.
+ */
+export function TwoFactorPart({ hasPassword }: { hasPassword: boolean }) {
   const queryClient = useQueryClient();
   const stepUp = useStepUp();
   const email = useSession().data?.user.email ?? "";
@@ -86,8 +103,27 @@ export function TwoFactorPart() {
   const [failure, setFailure] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [codeError, setCodeError] = useState<string | null>(null);
+  const [focusTo, setFocusTo] = useState<FocusTo>(null);
+  const setupHeading = useRef<HTMLHeadingElement | null>(null);
+  const codesHeading = useRef<HTMLHeadingElement | null>(null);
+  const actions = useRef<HTMLDivElement | null>(null);
 
   const enabled = state.data === true;
+
+  // A swap unmounts the control that had focus: focus the block that replaced it (its heading, or
+  // the first button) once it is on the page — "actions" can wait for the factor's state to load.
+  useEffect(() => {
+    if (focusTo === null) return;
+    const target =
+      focusTo === "setup"
+        ? setupHeading.current
+        : focusTo === "codes"
+          ? codesHeading.current
+          : (actions.current?.querySelector<HTMLElement>("button") ?? null);
+    if (!target) return;
+    target.focus();
+    setFocusTo(null);
+  }, [focusTo, stage, state.data]);
 
   const changed = async () => {
     await queryClient.invalidateQueries({ queryKey: accountKeys.twoFactor });
@@ -121,12 +157,16 @@ export function TwoFactorPart() {
     if (doing === "enable") {
       const data = result.data as { totpURI: string; backupCodes: string[] };
       setStage({ at: "verify", uri: data.totpURI, codes: data.backupCodes });
+      setFocusTo("setup");
     } else if (doing === "regenerate") {
       setStage({ at: "codes", codes: (result.data as { backupCodes: string[] }).backupCodes });
+      setFocusTo("codes");
     } else {
       setStage({ at: "idle" });
       toast({ message: t("twoFactor.disabled"), key: "two-factor" });
       await changed();
+      // Only now: until the factor is read again the old Turn off is still the button there.
+      if (sameAccount(then)) setFocusTo("actions");
     }
   };
 
@@ -149,6 +189,7 @@ export function TwoFactorPart() {
     }
     setCode("");
     setStage({ at: "codes", codes });
+    setFocusTo("codes");
     toast({ message: t("twoFactor.enabled"), key: "two-factor" });
     await changed();
   };
@@ -162,7 +203,7 @@ export function TwoFactorPart() {
       )}
       <StatusLine tone="error">{failure}</StatusLine>
       {stage.at === "idle" && state.data !== undefined ? (
-        <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+        <Box ref={actions} sx={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
           {enabled ? (
             <>
               <Button variant="outlined" onClick={() => setAsking("regenerate")}>
@@ -172,10 +213,12 @@ export function TwoFactorPart() {
                 {t("twoFactor.disable")}
               </Button>
             </>
-          ) : (
+          ) : hasPassword ? (
             <Button variant="contained" onClick={() => setAsking("enable")}>
               {t("twoFactor.enable")}
             </Button>
+          ) : (
+            <Note>{t("twoFactor.needsPassword")}</Note>
           )}
         </Box>
       ) : null}
@@ -187,7 +230,12 @@ export function TwoFactorPart() {
           onSubmit={(event) => void onVerify(event, stage.codes)}
           sx={{ display: "flex", flexDirection: "column", gap: 3 }}
         >
-          <Box component="h3" sx={{ margin: 0, fontSize: 14, fontWeight: 600 }}>
+          <Box
+            component="h3"
+            ref={setupHeading}
+            tabIndex={-1}
+            sx={{ margin: 0, fontSize: 14, fontWeight: 600 }}
+          >
             {t("twoFactor.setup.title")}
           </Box>
           <Note>{t("twoFactor.setup.step1")}</Note>
@@ -220,14 +268,28 @@ export function TwoFactorPart() {
             <Button type="submit" variant="contained" disabled={busy}>
               {t("twoFactor.verify")}
             </Button>
-            <Button onClick={() => setStage({ at: "idle" })} disabled={busy}>
+            <Button
+              onClick={() => {
+                setStage({ at: "idle" });
+                setFocusTo("actions");
+              }}
+              disabled={busy}
+            >
               {t("account.cancel")}
             </Button>
           </Box>
         </Box>
       ) : null}
       {stage.at === "codes" ? (
-        <BackupCodes codes={stage.codes} email={email} onDone={() => setStage({ at: "idle" })} />
+        <BackupCodes
+          codes={stage.codes}
+          email={email}
+          headingRef={codesHeading}
+          onDone={() => {
+            setStage({ at: "idle" });
+            setFocusTo("actions");
+          }}
+        />
       ) : null}
       <PasswordDialog
         open={asking !== null}

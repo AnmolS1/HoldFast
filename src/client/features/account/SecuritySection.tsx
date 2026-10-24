@@ -2,8 +2,6 @@
 // ./auth-calls.ts. The step-up prompt (./StepUp.tsx) wraps the section.
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
-import Checkbox from "@mui/material/Checkbox";
-import FormControlLabel from "@mui/material/FormControlLabel";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -56,9 +54,6 @@ function PasswordPart({ hasPassword }: { hasPassword: boolean }) {
   const queryClient = useQueryClient();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
-  // Checked unless the person unticks it: a password is changed most often because a session is
-  // suspected — that one must not stay signed in (T23 review m1). This browser stays signed in.
-  const [revoke, setRevoke] = useState(true);
   const [currentError, setCurrentError] = useState<string | null>(null);
   const [nextError, setNextError] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
@@ -94,7 +89,9 @@ function PasswordPart({ hasPassword }: { hasPassword: boolean }) {
     const result = await changePassword({
       currentPassword: current,
       newPassword: next,
-      revokeOtherSessions: revoke,
+      // Always: a password is changed most often because a session is suspected — that one must
+      // not stay signed in (T23 review m1; the server forces it too, hooks.ts). This browser stays.
+      revokeOtherSessions: true,
     });
     if (!sameAccount(then)) return;
     setBusy(false);
@@ -107,7 +104,7 @@ function PasswordPart({ hasPassword }: { hasPassword: boolean }) {
     setCurrent("");
     setNext("");
     toast({ message: t("password.changed"), key: "password" });
-    if (revoke) await queryClient.invalidateQueries({ queryKey: accountKeys.sessions });
+    await queryClient.invalidateQueries({ queryKey: accountKeys.sessions });
   };
 
   return (
@@ -140,10 +137,7 @@ function PasswordPart({ hasPassword }: { hasPassword: boolean }) {
           slotProps={{ htmlInput: { maxLength: PASSWORD_MAX } }}
         />
         <StrengthMeter password={next} />
-        <FormControlLabel
-          control={<Checkbox checked={revoke} onChange={(event) => setRevoke(event.target.checked)} />}
-          label={t("password.revokeOthers")}
-        />
+        <Note>{t("password.revokeOthers")}</Note>
         <StatusLine tone="error">{failure}</StatusLine>
         <Box>
           <Button type="submit" variant="contained" disabled={busy}>
@@ -303,7 +297,7 @@ export function SecuritySection() {
       <Box sx={{ display: "flex", flexDirection: "column", gap: 5 }}>
         <PasswordPart hasPassword={hasPassword} />
         <PasskeysPart />
-        <TwoFactorPart />
+        <TwoFactorPart hasPassword={hasPassword} />
         <LinkedPart hasPassword={hasPassword} />
       </Box>
     </StepUpProvider>

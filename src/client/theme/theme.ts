@@ -56,6 +56,15 @@ const touch = `@media ${TOUCH_QUERY}`;
 const reducedMotion = "@media (prefers-reduced-motion: reduce)";
 const focusRing = { outline: `2px solid ${hfAccent.main}`, outlineOffset: 2 } as const;
 
+/**
+ * The admin grid's column headers (sort buttons) at the 44 px touch target (D01 §7, R1 a11y-7).
+ * The grid sizes its header in script — `columnHeaderHeight` × the density factor, 0.7 for the
+ * compact density the admin grid uses — so the height is given as that prop, never as CSS, which
+ * the grid's own layout would not follow: ⌊63 × 0.7⌋ = 44. Typed loosely: the grid's theme types
+ * are not imported outside its one wrapper (features/admin/components/AdminDataGrid.tsx).
+ */
+const dataGridDefaults = { MuiDataGrid: { defaultProps: { columnHeaderHeight: 63 } } };
+
 export function createHoldfastTheme(): Theme {
   return createTheme({
     cssVariables: { colorSchemeSelector: "data", nativeColor: true },
@@ -105,6 +114,7 @@ export function createHoldfastTheme(): Theme {
       button: { fontSize: 13, lineHeight: "20px", fontWeight: 500, textTransform: "none", letterSpacing: 0 },
     },
     components: {
+      ...dataGridDefaults,
       MuiCssBaseline: {
         styleOverrides: {
           ":root": { ...tokenDeclarations(lightTokens), "--hf-row-h": `${layout.rowHeight}px` },
@@ -343,8 +353,10 @@ export function createHoldfastTheme(): Theme {
           root: {
             backgroundColor: hf.surface,
             borderRadius: layout.radius.control,
-            "& .MuiOutlinedInput-notchedOutline": { borderColor: hf.hairline },
-            "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: hf.textTertiary },
+            // The outline is what shows where a field is (its fill is the pane's colour), so it
+            // meets 3:1 on every ground (R1 a11y-2; theme-contrast.test.ts reads these two).
+            "& .MuiOutlinedInput-notchedOutline": { borderColor: hf.textSecondary },
+            "&:hover .MuiOutlinedInput-notchedOutline": { borderColor: hf.text },
             "&.Mui-focused .MuiOutlinedInput-notchedOutline": { borderColor: hf.text, borderWidth: 1 },
             "&.Mui-focused": focusRing,
             "&.Mui-error .MuiOutlinedInput-notchedOutline": { borderColor: hf.danger },
@@ -357,6 +369,26 @@ export function createHoldfastTheme(): Theme {
           },
         },
       },
+      // The select's own box (role="combobox") fills the field, so the target is the field's
+      // size — 40 px, 44 on a phone — not one line of text (R1 a11y-4, a11y-7).
+      MuiSelect: {
+        styleOverrides: {
+          select: {
+            // Centred by line height, not flex: the select's text keeps its ellipsis.
+            "&&": {
+              minHeight: 40,
+              lineHeight: "40px",
+              boxSizing: "border-box",
+              paddingTop: 0,
+              paddingBottom: 0,
+              [mobile]: { minHeight: layout.touchTarget, lineHeight: `${layout.touchTarget}px` },
+            },
+          },
+        },
+      },
+      // Radio, checkbox and switch rows: the label is the target, at least 44 px tall on a phone
+      // (D01 §7; R1 a11y-7).
+      MuiFormControlLabel: { styleOverrides: { root: { [mobile]: { minHeight: layout.touchTarget } } } },
       MuiFormLabel: {
         styleOverrides: {
           root: {

@@ -7,6 +7,9 @@
 // Storage: density and view mode live under `hf.prefs.v1`; the theme lives under the UI library's
 // own key (`mui-mode`), because `public/color-scheme-init.js` and the theme provider both read
 // that key and there must be exactly one source. Nothing else is ever written to Web Storage.
+//
+// One more device setting rides in `hf.prefs.v1` and is never synced: whether the single-key
+// shortcuts (`/`, `?`, Shift+N, Shift+R) are on (R1 a11y-6, WCAG 2.1.4). Stored only when off.
 import { useSyncExternalStore } from "react";
 import { registerUserStatePurger } from "./contracts";
 
@@ -46,6 +49,15 @@ export function sanitizePrefs(input: unknown): Partial<Prefs> {
   return out;
 }
 
+function readShortcuts(): boolean {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    return !(raw && (JSON.parse(raw) as { shortcuts?: unknown }).shortcuts === false);
+  } catch {
+    return true;
+  }
+}
+
 function readLocal(): Prefs {
   let stored: Partial<Prefs> = {};
   let theme: ThemePref = DEFAULTS.theme;
@@ -67,7 +79,14 @@ function readLocal(): Prefs {
 
 function writeLocal(prefs: Prefs): void {
   try {
-    localStorage.setItem(PREFS_KEY, JSON.stringify({ density: prefs.density, viewMode: prefs.viewMode }));
+    localStorage.setItem(
+      PREFS_KEY,
+      JSON.stringify({
+        density: prefs.density,
+        viewMode: prefs.viewMode,
+        ...(shortcutsOn ? {} : { shortcuts: false }),
+      }),
+    );
     // The theme is written by the theme provider when PrefsEffects calls setMode; writing it here
     // too keeps the key right when no provider is mounted (tests, the first paint script).
     localStorage.setItem(MODE_KEY, prefs.theme);
@@ -77,6 +96,7 @@ function writeLocal(prefs: Prefs): void {
 }
 
 let state: Prefs = typeof localStorage === "undefined" ? DEFAULTS : readLocal();
+let shortcutsOn = typeof localStorage === "undefined" ? true : readShortcuts();
 let sync: PrefsSync | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
@@ -116,6 +136,22 @@ export function setPrefs(patch: Partial<Prefs>, options: { fromServer?: boolean 
   if (!options.fromServer) scheduleSave();
 }
 
+/** Whether the single-key shortcuts are on (this device only; lib/shortcuts.ts asks). */
+export function getShortcutsOn(): boolean {
+  return shortcutsOn;
+}
+
+export function setShortcutsOn(on: boolean): void {
+  if (on === shortcutsOn) return;
+  shortcutsOn = on;
+  writeLocal(state);
+  emit();
+}
+
+export function useShortcutsOn(): boolean {
+  return useSyncExternalStore(subscribePrefs, getShortcutsOn, getShortcutsOn);
+}
+
 export function subscribePrefs(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
@@ -146,6 +182,7 @@ export function resetPrefsForTests(): void {
   sync = null;
   clearTimeout(timer);
   state = readLocal();
+  shortcutsOn = readShortcuts();
   applyDensity();
   emit();
 }

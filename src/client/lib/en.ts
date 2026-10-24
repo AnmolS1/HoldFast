@@ -243,6 +243,7 @@ export const en = {
   "auth.error.rate": "Too many attempts. Wait a minute and try again.",
   "auth.error.passkey": "The passkey sign-in didn't complete. Try again or use your password.",
   "auth.redirect.generic": "That didn't work. Try again.",
+  "auth.redirect.deletionSignIn": "Sign in, then open the deletion link from your email again.",
   "auth.redirect.signupPaused": "Sign-up is paused right now. Try again later.",
   "auth.redirect.notAvailable": "We can't create an account with these details.",
   "auth.redirect.emailNotAllowed": "This email address can't be used to sign up.",
@@ -258,7 +259,6 @@ export const en = {
     "That confirmation link isn't valid any more. Sign in and we'll send a new one.",
   "auth.redirect.linkOtherAccount":
     "That confirmation link is for another account. Sign out first, then open it again.",
-  "auth.redirect.deletionSignIn": "Sign in, then open the deletion link from your email again.",
 
   "login.title": "Sign in",
   "login.submit": "Sign in",

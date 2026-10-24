@@ -2,7 +2,14 @@
 // Dark mode is asserted here (not with axe in a browser): a dark-mode axe scan can hang the
 // Playwright worker. The numbers are read from the same token objects the stylesheet is built from.
 import { describe, expect, it } from "vitest";
-import { darkTokens, lightTokens, tokenSets, type TokenSet } from "../../../../src/client/theme/tokens";
+import { createHoldfastTheme } from "../../../../src/client/theme/theme";
+import {
+  darkTokens,
+  lightTokens,
+  tokenSets,
+  tokenVarName,
+  type TokenSet,
+} from "../../../../src/client/theme/tokens";
 import { composite, contrast, deltaE, parseColor } from "./color";
 
 type Pair = { fg: keyof TokenSet; bg: keyof TokenSet; min: number; why: string };
@@ -24,8 +31,8 @@ const PAIRS: Pair[] = [
   { fg: "textSecondary", bg: "surface2", min: AA, why: "secondary text on a hovered row or banner" },
   { fg: "textSecondary", bg: "accentTint", min: AA, why: "meta text in a selected row" },
   { fg: "textSecondary", bg: "accentWash", min: AA, why: "Clear / Show details on the wash" },
-  { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control, hovered field outline on the page" },
-  { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control, hovered field outline on a pane" },
+  { fg: "textTertiary", bg: "bg", min: UI, why: "disabled control on the page" },
+  { fg: "textTertiary", bg: "surface", min: UI, why: "disabled control on a pane" },
   { fg: "textTertiary", bg: "surface2", min: UI, why: "disabled control on its disabled fill" },
   { fg: "accent", bg: "surface", min: UI, why: "bars, dots, rings (UI, not text, in light)" },
   { fg: "accent", bg: "accentTrack", min: 1.5, why: "progress fill against its track" },
@@ -76,13 +83,45 @@ describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
   });
 });
 
-describe("textTertiary (disabled controls and the hovered field outline — never body text)", () => {
+describe("textTertiary (disabled controls — never body text)", () => {
   it.each(Object.entries(tokenSets))("%s: sits between the surface and textSecondary", (_scheme, tokens) => {
     // The third level stays the faintest of the three text colours: below AA on purpose, and
     // clearly apart from the second level.
     expect(contrast(tokens.textTertiary, tokens.surface)).toBeLessThan(AA);
     expect(contrast(tokens.textSecondary, tokens.surface)).toBeGreaterThan(
       contrast(tokens.textTertiary, tokens.surface) + 1,
+    );
+  });
+});
+
+// R1 a11y-2 (WCAG 1.4.11): a text field's resting outline is what shows where the field is — its
+// fill is the pane's own colour. Read from the built theme, so the test follows the stylesheet.
+describe("the text-field outline", () => {
+  const root = (
+    createHoldfastTheme().components?.MuiOutlinedInput?.styleOverrides as {
+      root: Record<string, { borderColor?: string }>;
+    }
+  ).root;
+  const outline = {
+    resting: root["& .MuiOutlinedInput-notchedOutline"]!.borderColor!,
+    hovered: root["&:hover .MuiOutlinedInput-notchedOutline"]!.borderColor!,
+  };
+  /** `var(--hf-x)` → the token's value in that scheme; anything else is not a token and fails. */
+  const resolve = (value: string, tokens: TokenSet) => {
+    const key = (Object.keys(tokens) as Array<keyof TokenSet>).find(
+      (name) => value === `var(${tokenVarName(name)})`,
+    );
+    expect(key, `${value} is a token reference`).toBeDefined();
+    return tokens[key!];
+  };
+  const grounds = ["surface", "bg", "surface2"] as const;
+  describe.each(Object.entries(tokenSets))("%s scheme", (scheme, tokens) => {
+    it.each(Object.entries(outline).flatMap(([state, value]) => grounds.map((bg) => ({ state, value, bg }))))(
+      "$state outline on $bg ≥ 3:1",
+      ({ value, bg }) => {
+        const ratio = contrast(resolve(value, tokens), tokens[bg], tokens.bg);
+        expect(ratio, `${scheme}: ${value} on ${bg} = ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(UI);
+      },
     );
   });
 });
