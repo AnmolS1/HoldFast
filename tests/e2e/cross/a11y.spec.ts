@@ -85,6 +85,9 @@ test.describe("phone targets", () => {
     const admin = await roles.admin();
     await admin.page.goto("/admin/users");
     await settled(admin.page);
+    // The grid may not have mounted yet when no skeleton is left (the skeletons come and go with
+    // the users query): measure once its headers are there.
+    await expect(admin.page.getByRole("columnheader").first()).toBeVisible();
     await expectTall(admin.page.getByRole("combobox"), TOUCH_TARGET, "admin selects");
     await expectTall(admin.page.getByRole("columnheader"), TOUCH_TARGET, "admin column headers");
   });
