@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { addFiles, scanVerdictOwned, scanVerdictsSeen } from "../../../../src/client/features/upload/manager";
 import { SAY_EACH_FILE_MAX, VERDICT_CLAIM_MS } from "../../../../src/client/features/upload/plan";
 import { getUploads } from "../../../../src/client/features/upload/store";
+import * as contracts from "../../../../src/client/lib/contracts";
 import { purgeUserState } from "../../../../src/client/lib/query";
 import { setupShell } from "../shell/helpers";
 import { nodeDto } from "./fixtures";
@@ -109,6 +110,18 @@ describe("a blocked verdict is said once, whoever learns it first", () => {
     held!("error");
     await settle(0);
     expect(said().filter((text) => text === "Couldn't scan a.txt")).toHaveLength(1);
+  });
+});
+
+describe("through lib/contracts, as the explorer asks", () => {
+  it("a file landed: the queue owns its verdict and takes the listing's; after the purge nothing is the queue's", async () => {
+    const id = await landOne();
+    expect(contracts.scanVerdictOwned(verdict(id))).toBe(true);
+    contracts.scanVerdictsSeen([verdict(id)]);
+    expect(blockedSaid()).toBe(1);
+    await purgeUserState({ keepSession: true });
+    await settle(0);
+    expect(contracts.scanVerdictOwned(verdict(id))).toBe(false);
   });
 });
 

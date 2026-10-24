@@ -1,20 +1,23 @@
 // One source of truth for a scan's verdict: what the listing learns — from its own poll or from a
-// refetch — is handed to the uploader, whose ribbon rows take it (tests/unit/client/upload/
+// refetch — is handed to the uploader (through lib/contracts), whose ribbon rows take it (tests/unit/client/upload/
 // ribbon-scan.test.tsx covers what the uploader does with it).
 import { act } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { scanVerdictsSeen } from "../../../../src/client/features/upload";
-import { emitNodesChanged } from "../../../../src/client/lib/contracts";
+import { emitNodesChanged, scanVerdictsSeen } from "../../../../src/client/lib/contracts";
 import { FakeDrive } from "./fixtures/drive";
 import { fileNode } from "./fixtures/nodes";
 import { renderExplorer, rows, serveDrive, setupExplorer } from "./helpers";
 
 vi.mock("../../../../src/client/features/upload", () => ({
   requestUpload: vi.fn(),
-  scanVerdictsSeen: vi.fn(),
   UploadDropOverlay: () => null,
   routes: [],
 }));
+// The listing reaches the uploader through lib/contracts (R1: no feature imports another).
+vi.mock("../../../../src/client/lib/contracts", async (original) => {
+  const real = await original<typeof import("../../../../src/client/lib/contracts")>();
+  return { ...real, scanVerdictsSeen: vi.fn() };
+});
 
 setupExplorer();
 

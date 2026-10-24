@@ -1,14 +1,15 @@
 // R1 a11y-3: the explorer's own scan poll leaves the verdict of a file the upload queue follows to
-// the queue (said once, in the upload log); every other file's verdict it says itself.
+// the queue (said once, in the upload log) — asked through lib/contracts, never by importing the
+// uploader; every other file's verdict it says itself.
 import { act } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { scanVerdictOwned } from "../../../../src/client/features/upload/manager";
+import { scanVerdictOwned } from "../../../../src/client/lib/contracts";
 import { FakeDrive } from "./fixtures/drive";
 import { fileNode } from "./fixtures/nodes";
 import { renderExplorer, rowOf, rows, serveDrive, setupExplorer } from "./helpers";
 
-vi.mock("../../../../src/client/features/upload/manager", async (original) => {
-  const real = await original<typeof import("../../../../src/client/features/upload/manager")>();
+vi.mock("../../../../src/client/lib/contracts", async (original) => {
+  const real = await original<typeof import("../../../../src/client/lib/contracts")>();
   return { ...real, scanVerdictOwned: vi.fn(() => false) };
 });
 

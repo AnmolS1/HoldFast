@@ -26,7 +26,7 @@ import type {
 } from "../../../shared/schemas/upload";
 import { toast } from "../../components/Toaster";
 import { api, ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT, currentAccount } from "../../lib/api";
-import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
+import { emitNodesChanged, registerScanVerdictOwner, registerUserStatePurger } from "../../lib/contracts";
 import { formatBytes } from "../../lib/format";
 import { accountEpoch, getCachedSession, publicConfigQuery, queryClient, sameAccount } from "../../lib/query";
 import { reportError } from "../../lib/sentry";
@@ -983,9 +983,18 @@ function forgetFolderProblems(item: UploadItem): void {
 // the frame is gone (and that time does not count), and stops asking about a file after a bound —
 // where the row offers "Check again". A verdict the explorer's listing learns settles the row too.
 
+/** The listings reach the queue through lib/contracts (no feature imports another). */
+function ownScanVerdicts(): void {
+  registerScanVerdictOwner({
+    seen: (nodes) => scanVerdictsSeen(nodes as readonly NodeDto[]),
+    owns: scanVerdictOwned,
+  });
+}
+
 function landed(id: string, node: NodeDto): void {
   const item = findItem(id);
   if (!item) return;
+  ownScanVerdicts();
   void dropResumeRow(id);
   workOf(id).etag = node.etag;
   patchItem(id, {
@@ -1116,6 +1125,7 @@ export function recheckItem(id: string): void {
   if (!live(queueOwner)) return;
   const item = findItem(id);
   if (!item || item.state !== "done" || item.scanStatus !== "pending" || !item.nodeId) return;
+  ownScanVerdicts();
   patchItem(id, { state: "scanning" });
   syncScanClock();
   const now = Date.now();
