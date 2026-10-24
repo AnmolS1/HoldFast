@@ -9,6 +9,7 @@
 // every admin other tests left behind — given back afterwards, row by row.
 import { eq, inArray, like, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import * as lifecycle from "../../../src/worker/db/queries/auth-lifecycle";
 import { user } from "../../../src/worker/db/schema";
 import { auditRows, promoteToAdmin, send, sessionsOf, testDb, userById, verifiedUser } from "./helpers";
 
@@ -389,5 +390,72 @@ describe("the plugin failing after the gate wrote", () => {
     });
     expect(answer.status, answer.text).toBe(400);
     expect((await userById(target.user.id))!.banned).not.toBe(true);
+  });
+});
+
+/** The undo as the request runs it when its plugin write never landed (auth/admin-gate.ts). */
+const undoA = (
+  userId: string,
+  change: lifecycle.AdminPluginChange,
+  wrote: NonNullable<Awaited<ReturnType<typeof lifecycle.writeAdminPluginChange>>>,
+) => lifecycle.undoAdminPluginChange(testDb(), userId, change, wrote);
+
+describe("the undo puts back only its own write", () => {
+  it("A writes a ban ahead of its plugin, B bans the same account with the SAME values, A's plugin fails: B's ban stays, nothing audited by the undo", async () => {
+    const a = await admin();
+    const b = await admin();
+    const target = await admin();
+    const change = { banned: true as const, banReason: "test", banExpires: null };
+    // A's gate: the write ahead of the plugin (as keepAnAdmin makes it).
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    expect(aWrote).not.toBeNull();
+    // B's whole request, the same ban.
+    const bAnswer = await send(b.client, "/api/auth/admin/ban-user", {
+      json: { userId: target.user.id, banReason: "test" },
+    });
+    expect(bAnswer.status, bAnswer.text).toBe(200);
+    const auditedBefore = (await auditRows({ action: "account.unbanned", targetId: target.user.id })).length;
+    // A's plugin failed: A's undo runs.
+    await undoA(target.user.id, change, aWrote!);
+    const row = (await userById(target.user.id))!;
+    expect([row.banned, row.banReason]).toEqual([true, "test"]);
+    // The undo itself is no account action: no audit row of any kind for it.
+    expect((await auditRows({ action: "account.unbanned", targetId: target.user.id })).length).toBe(
+      auditedBefore,
+    );
+    void a;
+  });
+
+  it("…and the same for a demotion: B's identical Set role between A's write and A's undo stays", async () => {
+    const b = await admin();
+    const target = await admin();
+    const third = await admin();
+    const change = { role: "user" };
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    // B demotes an account that is already "user" in the row: through the gate (a no-op guard) and the plugin.
+    const bAnswer = await send(b.client, "/api/auth/admin/set-role", {
+      json: { userId: target.user.id, role: "user" },
+    });
+    expect(bAnswer.status, bAnswer.text).toBe(200);
+    await undoA(target.user.id, change, aWrote!);
+    expect((await userById(target.user.id))!.role).toBe("user");
+    void third;
+  });
+
+  it("CONTROL: with no write in between, A's undo puts the account back (and audits nothing)", async () => {
+    const target = await admin();
+    const change = { banned: true as const, banReason: "test", banExpires: null };
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    await undoA(target.user.id, change, aWrote!);
+    const row = (await userById(target.user.id))!;
+    expect([row.banned, row.banReason]).toEqual([false, null]);
+    expect(await auditRows({ action: "account.unbanned", targetId: target.user.id })).toHaveLength(0);
+    expect(await auditRows({ action: "account.banned", targetId: target.user.id })).toHaveLength(0);
   });
 });
