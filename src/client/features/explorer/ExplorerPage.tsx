@@ -59,7 +59,7 @@ import { ApiError } from "../../lib/api";
 import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
+import { canPickFolders, requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
 import { queryClient, usePublicConfig } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
@@ -468,15 +468,20 @@ function Explorer({ folderId }: { folderId: string | null }) {
         hint: uploadOff,
         run: upload,
       },
-      {
-        id: "upload-folder",
-        label: t("explorer.action.uploadFolder"),
-        icon: <FolderUp size={16} />,
-        shortcut: "uploadFolder",
-        disabled: Boolean(uploadOff),
-        hint: uploadOff,
-        run: uploadFolder,
-      },
+      // Only where this browser can pick a folder (as the FAB; lib/contracts `canPickFolders`).
+      ...(canPickFolders()
+        ? [
+            {
+              id: "upload-folder",
+              label: t("explorer.action.uploadFolder"),
+              icon: <FolderUp size={16} />,
+              shortcut: "uploadFolder" as const,
+              disabled: Boolean(uploadOff),
+              hint: uploadOff,
+              run: uploadFolder,
+            },
+          ]
+        : []),
     ];
   }, [canAdd, newFolder, upload, uploadFolder, uploadOff]);
 
@@ -815,15 +820,17 @@ function Explorer({ folderId }: { folderId: string | null }) {
             >
               {t("explorer.action.upload")}
             </Button>
-            <Button
-              onClick={uploadFolder}
-              aria-disabled={uploadOff ? true : undefined}
-              aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
-              className={uploadOff ? "Mui-disabled" : undefined}
-              data-empty-upload-folder
-            >
-              {t("explorer.action.uploadFolder")}
-            </Button>
+            {canPickFolders() ? (
+              <Button
+                onClick={uploadFolder}
+                aria-disabled={uploadOff ? true : undefined}
+                aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
+                className={uploadOff ? "Mui-disabled" : undefined}
+                data-empty-upload-folder
+              >
+                {t("explorer.action.uploadFolder")}
+              </Button>
+            ) : null}
             <Button onClick={newFolder}>{t("explorer.action.newFolder")}</Button>
             {uploadOff ? (
               <Box

@@ -237,6 +237,33 @@ test.describe("Upload folder (mocked API)", () => {
     ]);
   });
 
+  test("a browser that cannot pick folders is offered Upload folder nowhere: FAB, empty state, folder menu", async ({
+    page,
+    origins,
+  }) => {
+    const seen = await serve(page, origins.port);
+    seen.drive.nodes.delete(PROJECT.id);
+    // As Samsung Internet: no folder picking (the same detection the FAB uses, lib/contracts).
+    await page.addInitScript(() => {
+      delete (HTMLInputElement.prototype as { webkitdirectory?: boolean }).webkitdirectory;
+    });
+    await page.goto("/");
+    await expect(page.locator("[data-empty-upload]")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("[data-empty-upload-folder]")).toHaveCount(0);
+    await page.locator("[data-explorer-list]").click({ button: "right", position: { x: 8, y: 8 } });
+    // A menu on the desktop, a sheet named after the folder on a phone.
+    const menu = isMobile(page) ? page.getByRole("dialog", { name: "Files" }) : page.getByRole("menu");
+    await expect(menu.getByText(/Upload files/)).toBeVisible();
+    await expect(menu.getByText(/Upload folder/)).toHaveCount(0);
+    await page.keyboard.press("Escape");
+    if (isMobile(page)) {
+      await page.locator("[data-new-fab]").click();
+      const sheet = page.getByRole("dialog", { name: "New" });
+      await expect(sheet.locator('[data-new-action="upload"]')).toBeVisible();
+      await expect(sheet.locator('[data-new-action="upload-folder"]')).toHaveCount(0);
+    }
+  });
+
   for (const [what, config, reason] of [
     ["read-only", { readOnly: true }, "Not available while Holdfast is read-only."],
     ["uploads paused", { uploadsEnabled: false }, "Uploads are paused right now."],
