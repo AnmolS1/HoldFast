@@ -92,6 +92,8 @@ export const en = {
   "banner.deletion.cancelled": "Deletion cancelled.",
   "banner.deletion.started": "Deletion has already started — contact support.",
   "banner.deletion.failed": "Couldn't cancel the deletion. Try again.",
+  "banner.deletion.adminScheduled":
+    "An admin scheduled this deletion, so it can't be cancelled here. Contact support.",
   "banner.impersonation": "Viewing as {name} — read-only",
   "banner.impersonation.stop": "Stop",
 
@@ -237,6 +239,7 @@ export const en = {
   "auth.error.rate": "Too many attempts. Wait a minute and try again.",
   "auth.error.passkey": "The passkey sign-in didn't complete. Try again or use your password.",
   "auth.redirect.generic": "That didn't work. Try again.",
+  "auth.redirect.deletionSignIn": "Sign in, then open the deletion link from your email again.",
   "auth.redirect.signupPaused": "Sign-up is paused right now. Try again later.",
   "auth.redirect.notAvailable": "We can't create an account with these details.",
   "auth.redirect.emailNotAllowed": "This email address can't be used to sign up.",
