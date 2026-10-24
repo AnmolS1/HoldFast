@@ -32,6 +32,7 @@ import {
 } from "../services/email";
 import type { AuthContext, ServiceDeps } from "../services/request-context";
 import { sessionAdditionalFields, userAdditionalFields } from "./fields";
+import { undoUnlandedPreWrite } from "./admin-gate";
 import { buildHooks, releaseUnusedReservation } from "./hooks";
 import { authLog } from "./logger";
 import { setFirstPassword, VERIFY_LINK_EXPIRES_IN_S } from "./mailbox-proof";
@@ -396,6 +397,8 @@ export function createAuth(env: Env, db: Db, ctx: AuthContext): Auth {
       try {
         return await instance.handler(request);
       } finally {
+        // A ban / role change the admin gate wrote whose plugin write never landed is put back.
+        await undoUnlandedPreWrite(scope);
         // A sign-up that took an invite and velocity counts but did not create its account
         // (it failed, or threw) gives them back.
         await releaseUnusedReservation(scope);

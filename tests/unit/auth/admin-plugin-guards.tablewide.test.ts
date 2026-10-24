@@ -7,10 +7,11 @@
 // TABLE-WIDE: "the admins that are left" is a question about every `user` row, so this file
 // runs alone (`*.tablewide.test.ts`) and, for its own duration, takes the admin role away from
 // every admin other tests left behind — given back afterwards, row by row.
-import { eq, inArray, like } from "drizzle-orm";
+import { eq, inArray, like, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import * as lifecycle from "../../../src/worker/db/queries/auth-lifecycle";
 import { user } from "../../../src/worker/db/schema";
-import { auditRows, promoteToAdmin, send, testDb, userById, verifiedUser } from "./helpers";
+import { auditRows, promoteToAdmin, send, sessionsOf, testDb, userById, verifiedUser } from "./helpers";
 
 let parked: Array<{ id: string; role: string | null }> = [];
 
@@ -314,5 +315,147 @@ describe("the gate reads the body exactly as the plugin will, and refuses what i
     expect(answer.status, answer.text).toBe(400);
     expect((await userById(target.user.id))!.role).toBe("user");
     expect(await auditRows({ action: "auth.role_changed", targetId: target.user.id })).toHaveLength(0);
+  });
+});
+
+// The gate's write lands BEFORE the plugin's own (the adapter has no transaction). When the
+// plugin then fails — here its own UPDATE of the account, refused by a test-only trigger that
+// fires on exactly that second write — the request is a 5xx and NOTHING of it persists: the gate's
+// write is put back (auth/create-auth.ts, after the handler), no session is ended, nothing audited.
+describe("the plugin failing after the gate wrote", () => {
+  /** Fails every UPDATE of `id` that writes the value the row already has (the plugin's repeat). */
+  async function failPluginWrite(id: string) {
+    if (!/^[A-Za-z0-9]+$/.test(id)) throw new Error("unexpected id");
+    await testDb().execute(
+      sql.raw(`CREATE OR REPLACE FUNCTION test_fail_plugin_write() RETURNS trigger AS $$
+      BEGIN RAISE EXCEPTION 'test: the plugin write fails'; END $$ LANGUAGE plpgsql`),
+    );
+    await testDb().execute(
+      sql.raw(`CREATE TRIGGER test_fail_plugin_write BEFORE UPDATE ON "user" FOR EACH ROW
+        WHEN (OLD.id = '${id}' AND ((OLD.banned AND NEW.banned) OR (OLD.role = 'user' AND NEW.role = 'user')))
+        EXECUTE FUNCTION test_fail_plugin_write()`),
+    );
+  }
+  afterEach(async () => {
+    await testDb().execute(sql.raw(`DROP TRIGGER IF EXISTS test_fail_plugin_write ON "user"`));
+  });
+
+  it("Ban: 5xx, the target not banned, its sessions kept, no account.banned", async () => {
+    const one = await admin();
+    const target = await admin();
+    const before = (await sessionsOf(target.user.id)).length;
+    await failPluginWrite(target.user.id);
+    const answer = await send(one.client, "/api/auth/admin/ban-user", {
+      json: { userId: target.user.id, banReason: "test", banExpiresIn: 3600 },
+    });
+    expect(answer.status, answer.text).toBeGreaterThanOrEqual(500);
+    const row = (await userById(target.user.id))!;
+    expect([row.banned === true, row.banReason, row.banExpires]).toEqual([false, null, null]);
+    expect((await sessionsOf(target.user.id)).length).toBe(before);
+    expect(await auditRows({ action: "account.banned", targetId: target.user.id })).toHaveLength(0);
+  });
+
+  it("Set role (a demotion): 5xx, the role still admin, sessions kept, no role-change audit", async () => {
+    const one = await admin();
+    const target = await admin();
+    const before = (await sessionsOf(target.user.id)).length;
+    await failPluginWrite(target.user.id);
+    const answer = await send(one.client, "/api/auth/admin/set-role", {
+      json: { userId: target.user.id, role: "user" },
+    });
+    expect(answer.status, answer.text).toBeGreaterThanOrEqual(500);
+    expect((await userById(target.user.id))!.role).toBe("admin");
+    expect((await sessionsOf(target.user.id)).length).toBe(before);
+    expect(await auditRows({ action: "auth.role_changed", targetId: target.user.id })).toHaveLength(0);
+  });
+
+  it("CONTROL: the same calls with no trigger go through (200)", async () => {
+    const one = await admin();
+    const target = await admin();
+    expect(
+      (await send(one.client, "/api/auth/admin/set-role", { json: { userId: target.user.id, role: "user" } }))
+        .status,
+    ).toBe(200);
+    expect(
+      (await send(one.client, "/api/auth/admin/ban-user", { json: { userId: target.user.id } })).status,
+    ).toBe(200);
+  });
+
+  it("a ban whose expiry is no date (banExpiresIn 1e300): 400 before anything is written", async () => {
+    const one = await admin();
+    const target = await verifiedUser();
+    made.push(target.user.id);
+    const answer = await send(one.client, "/api/auth/admin/ban-user", {
+      json: { userId: target.user.id, banExpiresIn: 1e300 },
+    });
+    expect(answer.status, answer.text).toBe(400);
+    expect((await userById(target.user.id))!.banned).not.toBe(true);
+  });
+});
+
+/** The undo as the request runs it when its plugin write never landed (auth/admin-gate.ts). */
+const undoA = (
+  userId: string,
+  change: lifecycle.AdminPluginChange,
+  wrote: NonNullable<Awaited<ReturnType<typeof lifecycle.writeAdminPluginChange>>>,
+) => lifecycle.undoAdminPluginChange(testDb(), userId, change, wrote);
+
+describe("the undo puts back only its own write", () => {
+  it("A writes a ban ahead of its plugin, B bans the same account with the SAME values, A's plugin fails: B's ban stays, nothing audited by the undo", async () => {
+    const a = await admin();
+    const b = await admin();
+    const target = await admin();
+    const change = { banned: true as const, banReason: "test", banExpires: null };
+    // A's gate: the write ahead of the plugin (as keepAnAdmin makes it).
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    expect(aWrote).not.toBeNull();
+    // B's whole request, the same ban.
+    const bAnswer = await send(b.client, "/api/auth/admin/ban-user", {
+      json: { userId: target.user.id, banReason: "test" },
+    });
+    expect(bAnswer.status, bAnswer.text).toBe(200);
+    const auditedBefore = (await auditRows({ action: "account.unbanned", targetId: target.user.id })).length;
+    // A's plugin failed: A's undo runs.
+    await undoA(target.user.id, change, aWrote!);
+    const row = (await userById(target.user.id))!;
+    expect([row.banned, row.banReason]).toEqual([true, "test"]);
+    // The undo itself is no account action: no audit row of any kind for it.
+    expect((await auditRows({ action: "account.unbanned", targetId: target.user.id })).length).toBe(
+      auditedBefore,
+    );
+    void a;
+  });
+
+  it("…and the same for a demotion: B's identical Set role between A's write and A's undo stays", async () => {
+    const b = await admin();
+    const target = await admin();
+    const third = await admin();
+    const change = { role: "user" };
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    // B demotes an account that is already "user" in the row: through the gate (a no-op guard) and the plugin.
+    const bAnswer = await send(b.client, "/api/auth/admin/set-role", {
+      json: { userId: target.user.id, role: "user" },
+    });
+    expect(bAnswer.status, bAnswer.text).toBe(200);
+    await undoA(target.user.id, change, aWrote!);
+    expect((await userById(target.user.id))!.role).toBe("user");
+    void third;
+  });
+
+  it("CONTROL: with no write in between, A's undo puts the account back (and audits nothing)", async () => {
+    const target = await admin();
+    const change = { banned: true as const, banReason: "test", banExpires: null };
+    const aWrote = await testDb().transaction((tx) =>
+      lifecycle.writeAdminPluginChange(tx, target.user.id, change),
+    );
+    await undoA(target.user.id, change, aWrote!);
+    const row = (await userById(target.user.id))!;
+    expect([row.banned, row.banReason]).toEqual([false, null]);
+    expect(await auditRows({ action: "account.unbanned", targetId: target.user.id })).toHaveLength(0);
+    expect(await auditRows({ action: "account.banned", targetId: target.user.id })).toHaveLength(0);
   });
 });

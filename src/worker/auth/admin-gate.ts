@@ -35,11 +35,11 @@
 
 import { APIError, getSessionFromCtx } from "better-auth/api";
 import { hasAdminRole } from "../../shared/roles";
-import { getAccount, writeAdminPluginChange } from "../db/queries/auth-lifecycle";
+import { getAccount, undoAdminPluginChange, writeAdminPluginChange } from "../db/queries/auth-lifecycle";
 import { refuseLastAdmin, refuseSelfAction } from "../services/account-state";
 import { AppError } from "../services/errors";
 import type { ServiceDeps } from "../services/request-context";
-import { count, record, sinkPath } from "./observe";
+import { count, record, reportError, sinkPath } from "./observe";
 import { hasSecondFactor } from "./second-factor";
 import type { AuthScope } from "./scope";
 
@@ -154,13 +154,16 @@ function pluginChange(
     if (banExpiresIn !== undefined && !(typeof banExpiresIn === "number" && Number.isFinite(banExpiresIn))) {
       throw malformed();
     }
+    const banExpires = banExpiresIn ? new Date(Date.now() + banExpiresIn * 1000) : null;
+    // An expiry that is no date (1e300 seconds) would fail the plugin's write after the gate's.
+    if (banExpires !== null && Number.isNaN(banExpires.getTime())) throw malformed();
     // The plugin's own values (routes.mjs `banUser`; no default reason or expiry is configured).
     return {
       userId,
       change: {
         banned: true,
         banReason: banReason || "No reason",
-        banExpires: banExpiresIn ? new Date(Date.now() + banExpiresIn * 1000) : null,
+        banExpires,
       },
     };
   }
@@ -182,10 +185,12 @@ async function keepAnAdmin(scope: AuthScope, actorId: string, path: string, body
     const { userId, change } = pluginChange(path, body);
     refuseSelfAction({ type: "admin", userId: actorId }, userId);
     if ("role" in change && hasAdminRole(change.role)) return;
-    await scope.db.transaction(async (tx) => {
+    const previous = await scope.db.transaction(async (tx) => {
       await refuseLastAdmin(tx, userId);
-      await writeAdminPluginChange(tx, userId, change);
+      return writeAdminPluginChange(tx, userId, change);
     });
+    // Until the plugin's own write lands; put back if it never does (auth/create-auth.ts).
+    if (previous) scope.facts.adminPreWrite = { userId, wrote: change, previous };
   } catch (error) {
     if (!(error instanceof AppError)) throw error;
     // In our own words (`error`, which the client's code table reads) and Better Auth's (`code`).
@@ -194,6 +199,23 @@ async function keepAnAdmin(scope: AuthScope, actorId: string, path: string, body
       code: error.code.toUpperCase(),
       error: error.code,
     });
+  }
+}
+
+/**
+ * After the handler: a ban / role the gate wrote whose plugin write never landed (the plugin
+ * refused or failed after the gate) is put back, so a failed request leaves nothing behind — the
+ * plugin ended no session and audited nothing either (both follow its write). A failure here is
+ * reported and the request's own answer stands.
+ */
+export async function undoUnlandedPreWrite(scope: AuthScope): Promise<void> {
+  const pending = scope.facts.adminPreWrite;
+  if (!pending) return;
+  scope.facts.adminPreWrite = null;
+  try {
+    await undoAdminPluginChange(scope.db, pending.userId, pending.wrote, pending.previous);
+  } catch (error) {
+    reportError(error, { kind: "auth", reason: "admin_prewrite_undo" });
   }
 }
 

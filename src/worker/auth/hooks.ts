@@ -429,6 +429,8 @@ export function buildHooks(scope: AuthScope) {
         ) => {
           if (!user || typeof user !== "object" || typeof user.id !== "string") return;
           const userId = user.id;
+          // The admin plugin's own write of the account the gate wrote ahead of it: it landed.
+          if (scope.facts.adminPreWrite?.userId === userId) scope.facts.adminPreWrite = null;
           const banned = user.banned === true;
           const banIndex = scope.userUpdates.findIndex((m) => m.banned !== undefined && m.banned === banned);
           if (banIndex !== -1) {

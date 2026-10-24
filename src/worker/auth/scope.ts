@@ -8,7 +8,7 @@
 // audit rows and send the security emails (auth/audit.ts).
 
 import type { Db } from "../db/client";
-import type { SignupReservation } from "../db/queries/auth-lifecycle";
+import type { AdminPluginChange, AdminPluginPrevious, SignupReservation } from "../db/queries/auth-lifecycle";
 import { getSettings } from "../db/queries/settings";
 import { createKeys, type Keys } from "../services/keys";
 import {
@@ -71,6 +71,12 @@ export type AuthFacts = {
   impersonatorId: string | null;
   /** A `/admin/set-role` the gate allowed: whose role, and what it was before (the audit's `from`). */
   roleChange: { userId: string; from: string | null } | null;
+  /**
+   * The ban / role the admin gate wrote ahead of the plugin (auth/admin-gate.ts), until the
+   * plugin's own write of that account lands (auth/hooks.ts `update.after` clears it). Still set
+   * when the handler is done: the plugin failed, and the gate's write is put back.
+   */
+  adminPreWrite: { userId: string; wrote: AdminPluginChange; previous: AdminPluginPrevious } | null;
   /** The sign-in throttle turned this request away (auth/signin-throttle.ts). */
   throttled: boolean;
   /** The throttle's pair key of the sign-in attempt in flight, to give back if it succeeds. */
@@ -154,6 +160,7 @@ export function emptyFacts(): AuthFacts {
     secondFactor: null,
     impersonatorId: null,
     roleChange: null,
+    adminPreWrite: null,
     throttled: false,
     signInAttempt: null,
     signInProved: false,
