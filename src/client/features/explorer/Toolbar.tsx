@@ -45,6 +45,8 @@ export interface ToolbarProps {
   onUpload(): void;
   /** The folder picker, for the same folder as `onUpload`. */
   onUploadFolder(): void;
+  /** Why Upload folder is unavailable (read-only, uploads paused); absent while it works. */
+  uploadFolderOff?: string;
 }
 
 const tick = (on: boolean) => (
@@ -144,6 +146,8 @@ export function Toolbar(props: ToolbarProps) {
               <MenuItem
                 key={kind}
                 data-upload-kind={kind}
+                disabled={kind === "folder" && Boolean(props.uploadFolderOff)}
+                title={kind === "folder" ? props.uploadFolderOff : undefined}
                 onClick={() => {
                   // The picker opens inside this click; the menu closes around it.
                   run();
@@ -157,8 +161,13 @@ export function Toolbar(props: ToolbarProps) {
                 >
                   <Icon size={16} />
                 </Box>
-                <Box component="span" sx={{ flex: "1 1 auto" }}>
+                <Box component="span" sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto" }}>
                   {t(label)}
+                  {kind === "folder" && props.uploadFolderOff ? (
+                    <Box component="span" sx={{ typography: "body2", color: hf.textSecondary }}>
+                      {props.uploadFolderOff}
+                    </Box>
+                  ) : null}
                 </Box>
                 <Kbd>{shortcutLabel(shortcut)}</Kbd>
               </MenuItem>

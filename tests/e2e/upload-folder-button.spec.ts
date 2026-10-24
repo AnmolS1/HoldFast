@@ -174,6 +174,14 @@ test.describe("Upload folder (mocked API)", () => {
           await palette.getByRole("option", { name: /Upload folder/ }).click();
         },
       ],
+      [
+        "via-context-menu",
+        async () => {
+          // The folder's own menu: a right-click on the list's background, not on a row.
+          await page.locator("[data-explorer-list]").click({ button: "right", position: { x: 8, y: 8 } });
+          await page.getByRole("menuitem", { name: /Upload folder/ }).click();
+        },
+      ],
       ["via-shortcut", async () => page.keyboard.press(`${await modKey(page)}+Shift+U`)],
     ];
     for (const [root, open] of ways) {
@@ -183,7 +191,7 @@ test.describe("Upload folder (mocked API)", () => {
       await expect.poll(() => folderPosts(seen).map((post) => post.name)).toContain(root);
       expect(folderPosts(seen).find((post) => post.name === root)!.parentId).toBe(PROJECT.id);
     }
-    await expect.poll(() => seen.completes).toBe(4);
+    await expect.poll(() => seen.completes).toBe(5);
   });
 
   test("the empty state and the FAB open the folder picker; a 3-level tree lands without its clutter, and the user is told", async ({
@@ -233,23 +241,45 @@ test.describe("Upload folder (mocked API)", () => {
     ["uploads paused", { uploadsEnabled: false }, "Uploads are paused right now."],
   ] as const) {
     test(`${what}: Upload folder is offered disabled, with the reason`, async ({ page, origins }) => {
-      await serve(page, origins.port, config);
+      const seen = await serve(page, origins.port, config);
+      seen.drive.nodes.delete(PROJECT.id);
+      let opened = false;
+      page.on("filechooser", () => (opened = true));
       await page.goto("/");
+      // The empty state's button: still focusable (R1 a11y-1), says why, and opens nothing.
+      const empty = page.locator("[data-empty-upload-folder]");
+      await expect(empty).toHaveAttribute("aria-disabled", "true", { timeout: 15_000 });
+      await expect(empty).toHaveAttribute("title", reason);
+      // Playwright will not click an aria-disabled element: the keyboard reaches it and presses it.
+      await empty.focus();
+      await expect(empty).toBeFocused();
+      await page.keyboard.press("Enter");
       if (isMobile(page)) {
-        await page.locator("[data-new-fab]").click({ timeout: 15_000 });
+        await page.locator("[data-new-fab]").click();
         const item = page.getByRole("dialog", { name: "New" }).locator('[data-new-action="upload-folder"]');
         await expect(item).toHaveAttribute("aria-disabled", "true");
         await expect(item).toContainText(reason);
+        expect(opened).toBe(false);
         return;
       }
-      await page.getByRole("button", { name: "New", exact: true }).click({ timeout: 15_000 });
+      await page.getByRole("button", { name: "New", exact: true }).click();
       const item = page.locator('[data-new-action="upload-folder"]');
       await expect(item).toHaveAttribute("aria-disabled", "true");
       await expect(item).toHaveAttribute("title", reason);
       await page.keyboard.press("Escape");
+      // The toolbar's menu: Upload folder disabled with its reason.
+      await page.locator("[data-upload-menu]").click();
+      const toolbarItem = page.locator('[data-upload-kind="folder"]');
+      await expect(toolbarItem).toHaveAttribute("aria-disabled", "true");
+      await expect(toolbarItem).toContainText(reason);
+      await page.keyboard.press("Escape");
+      // The folder's own menu, likewise.
+      await page.locator("[data-explorer-list]").click({ button: "right", position: { x: 8, y: 8 } });
+      const contextItem = page.getByRole("menuitem", { name: /Upload folder/ });
+      await expect(contextItem).toHaveAttribute("aria-disabled", "true");
+      await expect(contextItem).toContainText(reason);
+      await page.keyboard.press("Escape");
       // The shortcut does nothing: no picker opens.
-      let opened = false;
-      page.on("filechooser", () => (opened = true));
       await page.keyboard.press(`${await modKey(page)}+Shift+U`);
       await page.locator("[data-palette-button]").click();
       const palette = page.getByRole("dialog", { name: "Command palette" });
