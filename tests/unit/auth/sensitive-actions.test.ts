@@ -7,9 +7,12 @@
 // (Already held elsewhere, and not repeated: a role change ends the account's sessions and a new
 // set of backup codes needs the password — second-factor.test.ts; the impersonation audit rows,
 // the 15-minute lifetime and its read-only rule — admin-gate.test.ts.)
+import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
+import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
 import { session, twoFactor } from "../../../src/worker/db/schema";
+import { createKeys } from "../../../src/worker/services/keys";
 import { MAX_DEFERRED_TASKS } from "../../../src/worker/services/request-context";
 import {
   CAPTCHA,
@@ -45,7 +48,8 @@ const NEW_PASSWORD = "another perfectly fine password 7!";
 
 /** Better Auth's own per-address request rules (3 in 10 s on these paths) are not the subject. */
 async function act(client: Client, path: string, options: SendOptions) {
-  await testDb().execute(sql`DELETE FROM rate_limit WHERE key LIKE ${`${client.ip}|%`}`);
+  const prefix = await authLimitClientPrefix(createKeys(env.FILES_TOKEN_SECRET), client.ip);
+  await testDb().execute(sql`DELETE FROM rate_limit WHERE key LIKE ${`${prefix}%`}`);
   return send(client, path, options);
 }
 

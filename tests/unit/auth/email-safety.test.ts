@@ -47,6 +47,8 @@ import { testOutbound } from "../../../src/worker/auth/test-outbound";
 import { purgeAuthRows } from "../../../src/worker/db/queries/auth-lifecycle";
 import * as outbox from "../../../src/worker/services/outbox";
 import { STATEMENT_BUDGET } from "../../../src/worker/auth/parity";
+import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
+import { createKeys } from "../../../src/worker/services/keys";
 import {
   CAPTCHA,
   eventually,
@@ -795,9 +797,8 @@ const ALLOW = { limit: async () => ({ success: true }) };
 /** A client whose per-address request limits are out of the way: the MAIL budget is the subject. */
 const quiet = () => newClient({ env: { RL_AUTH: ALLOW, RL_API: ALLOW } });
 async function forgetAddressRule(client: Client) {
-  await testDb().execute(
-    sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${client.ip}%`}`,
-  );
+  const prefix = await authLimitClientPrefix(createKeys(env.FILES_TOKEN_SECRET), client.ip);
+  await testDb().execute(sql`DELETE FROM rate_limit WHERE key LIKE ${`${prefix}%`}`);
 }
 /** This hour's count under a ledger key. */
 async function counted(key: string | null): Promise<number> {

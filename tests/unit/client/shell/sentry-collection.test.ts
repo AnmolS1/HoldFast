@@ -84,4 +84,51 @@ describe("the browser SDK with the app's options", () => {
     expect(network.mock.calls.every(([url]) => String(url).startsWith("/api/"))).toBe(true);
     await client.close(100);
   });
+
+  it("keeps no click or key-press crumbs: a file name in an element's label never reaches Sentry (R1 legal-7)", async () => {
+    resetSentryForTests();
+    sent.length = 0;
+    const real = await import("@sentry/react");
+    const transport = () =>
+      real.createTransport({ recordDroppedEvent: () => {} }, async (request) => {
+        sent.push(typeof request.body === "string" ? request.body : new TextDecoder().decode(request.body));
+        return { statusCode: 200 };
+      });
+    await initSentry(
+      {
+        sentryDsnWeb: "https://public@o0.ingest.sentry.example.test/1",
+        sentryEnvironment: "test",
+        release: "abc",
+      },
+      async () =>
+        ({
+          ...real,
+          init: (options: Record<string, unknown>) =>
+            real.init({ ...options, transport } as Parameters<typeof real.init>[0]),
+        }) as typeof real,
+    );
+    const client = real.getClient()!;
+    // Labels built from file names, as the upload panel and the previews build them (made-up names).
+    const button = document.createElement("button");
+    button.setAttribute("aria-label", "Select zz divorce settlement draft.pdf");
+    const input = document.createElement("input");
+    input.setAttribute("aria-label", "Rename zz therapy session notes.m4a");
+    document.body.append(button, input);
+    button.click();
+    input.dispatchEvent(new KeyboardEvent("keypress", { key: "a", bubbles: true }));
+    // The control: a crumb that is not a DOM one still travels.
+    real.addBreadcrumb({ category: "navigation", message: "zz-control crumb" });
+    real.captureException(new Error("after a click"));
+    await client.flush(2000);
+    const wire = sent.join("\n");
+    expect(wire).toContain("after a click");
+    expect(wire).toContain("zz-control crumb");
+    expect(wire).not.toContain("ui.click");
+    expect(wire).not.toContain("ui.input");
+    for (const needle of ["divorce settlement", "therapy session"])
+      expect(wire, needle).not.toContain(needle);
+    button.remove();
+    input.remove();
+    await client.close(100);
+  });
 });

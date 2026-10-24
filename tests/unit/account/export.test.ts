@@ -1,13 +1,16 @@
 // GET /api/account/export: what the file holds, what it never holds, and that a held account's
 // export is the same as an unheld one's.
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { generationInStep } from "../trash/helpers";
 import { ExportManifest } from "../../../src/shared/schemas/account";
+import { storedAuthLimitKey } from "../../../src/worker/auth/rate-limit-store";
+import { EXPORT_DAILY_LIMIT, exportSlotKeys } from "../../../src/worker/db/queries/account";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
-import { nodes, shareLinks, user } from "../../../src/worker/db/schema";
-import { makeLink } from "../auth/helpers";
+import { account, nodes, passkey, session, shareLinks, twoFactor, user } from "../../../src/worker/db/schema";
+import { makeLink, newClient, signIn } from "../auth/helpers";
+import { testKeys } from "../sharing/helpers";
 import {
   api,
   auditRows,
@@ -221,6 +224,19 @@ describe("a held account", () => {
     const doomed = await makeFile(who.id, null, { name: "doomed.txt", scanStatus: "clean", size: 100 });
     const folder = await makeFolder(who.id, null, { name: "folder" });
     await makeFile(who.id, folder.id, { name: "in-folder.txt", scanStatus: "clean", size: 100 });
+    // A session that expired a month ago: the retention job deleted the unheld account's and kept
+    // the held one's (jobs/retention.ts) — the export lists live sessions only, so the hold does not show.
+    if (legalHold) {
+      await testDb()
+        .insert(session)
+        .values({
+          id: `sess${rand(14)}`,
+          token: `made-up-token-${rand(8)}`,
+          userId: who.id,
+          expiresAt: new Date(Date.now() - 30 * 86_400_000),
+          updatedAt: new Date(),
+        });
+    }
     // The counter as uploads would have left it: the three files.
     await testDb().update(user).set({ usedBytes: 300 }).where(eq(user.id, who.id));
     expect((await api(who.as, "POST", `/nodes/${doomed.id}/trash`)).status).toBe(200);
@@ -233,7 +249,7 @@ describe("a held account", () => {
   /** Everything but what differs by construction: ids, the address, the instants — and usedBytes (see below). */
   function shape(manifest: Manifest) {
     return {
-      user: { ...manifest.user, id: "", email: "", createdAt: "" },
+      user: { ...manifest.user, id: "", email: "", createdAt: "", ageVerifiedAt: "" },
       prefs: manifest.prefs,
       nodes: manifest.nodes
         .map((node) => [node.name, node.kind, node.deletedAt !== null, node.scanStatus])
@@ -242,6 +258,9 @@ describe("a held account", () => {
       sharedWithMe: manifest.sharedWithMe.length,
       links: manifest.links.length,
       activity: manifest.activity.map((row) => row.action),
+      sessions: manifest.sessions.length,
+      passkeys: manifest.passkeys.length,
+      signInMethods: manifest.signInMethods.map((method) => method.provider),
     };
   }
 
@@ -260,5 +279,209 @@ describe("a held account", () => {
     // moved by the un-held file only"); the export answers it without them.
     expect(a.user.usedBytes).toBe(b.user.usedBytes);
     expect(a.user.usedBytes).toBe(100);
+  });
+});
+
+describe("what the export says about the account itself (R1 legal-8)", () => {
+  it("the demo and age assent, verification and two-factor state, each file's last opening, live sessions, passkeys and sign-in methods — no secret of any", async () => {
+    const owner = await person({ name: "Complete Owner" });
+    const DEMO_AT = new Date("2099-01-02T03:04:05.000Z");
+    await testDb()
+      .update(user)
+      .set({
+        demoNoticeAcceptedAt: DEMO_AT,
+        demoNoticeVersion: "demo-zz-1",
+        ageVerifiedAt: DEMO_AT,
+        twoFactorEnabled: true,
+      })
+      .where(eq(user.id, owner.id));
+    const OPENED = new Date("2099-02-03T04:05:06.000Z");
+    const file = await makeFile(owner.id, null, { name: `opened-${rand()}.txt`, scanStatus: "clean" });
+    await testDb().update(nodes).set({ lastAccessedAt: OPENED }).where(eq(nodes.id, file.id));
+    const live = (over: Partial<typeof session.$inferInsert> = {}) => ({
+      id: `sess${rand(14)}`,
+      // Made-up: no real token or address (198.51.100.0/24 is documentation space).
+      token: `zz-secret-token-${rand(8)}`,
+      userId: owner.id,
+      expiresAt: new Date(Date.now() + 86_400_000),
+      updatedAt: new Date(),
+      ipAddress: "198.51.100.23",
+      userAgent: "zz-agent/1.0",
+      country: "NL",
+      ...over,
+    });
+    await testDb()
+      .insert(session)
+      .values([
+        live(),
+        live({ expiresAt: new Date(Date.now() - 86_400_000), ipAddress: "198.51.100.99" }),
+        // An operator's impersonation session is not the user's (as Settings → Devices).
+        live({ impersonatedBy: owner.id, ipAddress: "198.51.100.77" }),
+      ]);
+    await testDb()
+      .insert(passkey)
+      .values({
+        id: `pk${rand(14)}`,
+        name: "zz laptop key",
+        publicKey: "zz-secret-public-key",
+        userId: owner.id,
+        credentialID: "zz-secret-credential",
+        counter: 3,
+        deviceType: "multiDevice",
+        backedUp: true,
+        createdAt: DEMO_AT,
+        aaguid: "00000000-0000-0000-0000-00000000aaaa",
+      });
+    const googleSub = `zz-google-sub-${rand()}`;
+    await testDb()
+      .insert(account)
+      .values([
+        {
+          id: `acc${rand(14)}`,
+          accountId: googleSub,
+          providerId: "google",
+          userId: owner.id,
+          idToken: "zz-secret-id-token",
+          accessToken: "zz-secret-access-token",
+          refreshToken: "zz-secret-refresh-token",
+          createdAt: DEMO_AT,
+          updatedAt: DEMO_AT,
+        },
+        {
+          id: `acc${rand(14)}`,
+          accountId: owner.id,
+          providerId: "credential",
+          userId: owner.id,
+          password: "zz-secret-scrypt",
+          createdAt: DEMO_AT,
+          updatedAt: DEMO_AT,
+        },
+      ]);
+
+    await testDb()
+      .insert(twoFactor)
+      .values({
+        id: `tf${rand(14)}`,
+        secret: "zz-secret-totp",
+        backupCodes: "zz-secret-backup-codes",
+        userId: owner.id,
+      });
+
+    const answer = await exportOf(owner);
+    expect(answer.status).toBe(200);
+    const manifest = ExportManifest.parse(answer.body);
+    expect(manifest.user).toMatchObject({
+      demoNoticeAcceptedAt: DEMO_AT.toISOString(),
+      demoNoticeVersion: "demo-zz-1",
+      ageVerifiedAt: DEMO_AT.toISOString(),
+      twoFactorEnabled: true,
+    });
+    expect(typeof manifest.user.emailVerified).toBe("boolean");
+    expect(manifest.nodes.find((node) => node.id === file.id)?.lastAccessedAt).toBe(OPENED.toISOString());
+    // Sessions: created, expires, address, agent — nothing else (never the token or the row id).
+    expect(manifest.sessions).toHaveLength(1);
+    expect(Object.keys(manifest.sessions[0]!).sort()).toEqual([
+      "createdAt",
+      "expiresAt",
+      "ipAddress",
+      "userAgent",
+    ]);
+    expect(manifest.sessions[0]).toMatchObject({ ipAddress: "198.51.100.23", userAgent: "zz-agent/1.0" });
+    // Passkeys: name, created, device type — never the key or the credential id.
+    expect(manifest.passkeys).toEqual([
+      { name: "zz laptop key", createdAt: DEMO_AT.toISOString(), deviceType: "multiDevice" },
+    ]);
+    expect(manifest.signInMethods.sort((a, b) => a.provider.localeCompare(b.provider))).toEqual([
+      { provider: "credential", accountId: null, createdAt: DEMO_AT.toISOString() },
+      { provider: "google", accountId: googleSub, createdAt: DEMO_AT.toISOString() },
+    ]);
+    const text = JSON.stringify(answer.body);
+    // No secret or credential material, by value (every secret fixture above is `zz-secret-…`) and
+    // by field name, anywhere in the file.
+    expect(text).not.toContain("zz-secret");
+    const names = new Set<string>();
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === "object")
+        for (const [name, inner] of Object.entries(value)) {
+          names.add(name);
+          walk(inner);
+        }
+    };
+    walk(answer.body);
+    expect(
+      [...names].filter((name) =>
+        /token|secret|hash|password|credential|publickey|backup|totp|otp|aaguid/i.test(name),
+      ),
+    ).toEqual([]);
+    expect(text).not.toMatch(/198\.51\.100\.(99|77)/);
+  });
+});
+
+describe("the export's day budget", () => {
+  const HOUR = 3_600_000;
+  const dayCount = async (userId: string) =>
+    (
+      await testDb().execute<{ count: number }>(
+        sql`SELECT count FROM rate_limit WHERE key = ${exportSlotKeys(userId).day}`,
+      )
+    ).rows[0]?.count ?? null;
+
+  it("outlives Better Auth's limiter: a day spent two hours ago still refuses the next export after a sign-in window starts again (R1 V1-n1)", async () => {
+    const owner = await person();
+    // The day's exports were taken two hours ago (`last_request` is when the day began).
+    await testDb().execute(
+      sql`INSERT INTO rate_limit (id, key, count, last_request)
+          VALUES (gen_random_uuid()::text, ${exportSlotKeys(owner.id).day}, ${EXPORT_DAILY_LIMIT}, ${Date.now() - 2 * HOUR})`,
+    );
+    // Any client's sign-in whose window has run out starts it again — the moment Better Auth's own
+    // database storage pruned the WHOLE table of rows older than its longest window (one hour).
+    const client = newClient();
+    const nobody = `nobody-${rand()}@example.test`;
+    expect((await signIn(client, nobody, "made-up password 1!")).status).toBe(401);
+    const stored = [
+      `${client.ip}|/sign-in/email`,
+      await storedAuthLimitKey(testKeys(), `${client.ip}|/sign-in/email`),
+    ];
+    const aged = await testDb().execute(
+      sql`UPDATE rate_limit SET last_request = last_request - ${2 * HOUR}
+          WHERE key IN (${stored[0]}, ${stored[1]}) RETURNING key`,
+    );
+    expect(aged.rows).toHaveLength(1);
+    expect((await signIn(client, nobody, "made-up password 1!")).status).toBe(401);
+    // The control: the sign-in row's window did start again.
+    const [restarted] = (
+      await testDb().execute<{ count: number }>(
+        sql`SELECT count FROM rate_limit WHERE key IN (${stored[0]}, ${stored[1]})`,
+      )
+    ).rows;
+    expect(restarted?.count).toBe(1);
+
+    expect(await dayCount(owner.id)).toBe(EXPORT_DAILY_LIMIT);
+    const refused = await api(owner.as, "GET", "/account/export");
+    expect(refused.status).toBe(429);
+  });
+
+  it("is not spent by a cross-site navigation (R1 secsrv-3): cross-site and same-site are refused before counting; same-origin and none export", async () => {
+    const owner = await person();
+    for (const site of ["cross-site", "same-site"]) {
+      const answer = await api(owner.as, "GET", "/account/export", { headers: { "sec-fetch-site": site } });
+      expect(answer.status, site).toBe(403);
+      expect(answer.body).toMatchObject({ error: "forbidden" });
+      expect(await dayCount(owner.id), site).toBeNull();
+    }
+    expect(await auditRows({ action: "account.export", targetId: owner.id })).toHaveLength(0);
+    // The control: the app's own link (same-origin), a typed address (none) and a client that sends
+    // no Fetch Metadata at all are served — and counted.
+    const allowed: Record<string, string>[] = [
+      { "sec-fetch-site": "same-origin" },
+      { "sec-fetch-site": "none" },
+      {},
+    ];
+    for (const [i, headers] of allowed.entries()) {
+      const answer = await api(owner.as, "GET", "/account/export", { headers });
+      expect(answer.status, JSON.stringify(headers)).toBe(200);
+      expect(await dayCount(owner.id)).toBe(i + 1);
+    }
   });
 });

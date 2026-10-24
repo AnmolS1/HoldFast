@@ -10,6 +10,7 @@ import { env } from "cloudflare:workers";
 import { eq, sql } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { testGoogleCode } from "../../../src/worker/auth/test-outbound";
+import { authLimitClientPrefix } from "../../../src/worker/auth/rate-limit-store";
 import { FREE_ATTEMPTS, throttleKeys } from "../../../src/worker/auth/signin-throttle";
 import { rateLimit, session, user } from "../../../src/worker/db/schema";
 import { createKeys } from "../../../src/worker/services/keys";
@@ -70,16 +71,16 @@ describe("POST /change-email needs the owner again (N1a)", () => {
       );
       return (await testDb().select().from(rateLimit).where(eq(rateLimit.key, pair)))[0]?.count ?? 0;
     };
+    const forgetAddressRule = async () => {
+      const prefix = await authLimitClientPrefix(createKeys(env.FILES_TOKEN_SECRET), thief.ip);
+      await testDb().execute(sql`DELETE FROM rate_limit WHERE key LIKE ${`${prefix}%`}`);
+    };
     for (let n = 1; n <= FREE_ATTEMPTS; n++) {
-      await testDb().execute(
-        sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${thief.ip}%`}`,
-      );
+      await forgetAddressRule();
       expect((await ask(thief, freshEmail(), { password: `wrong guess number ${n} !!` })).status).toBe(400);
       expect(await row()).toBe(n);
     }
-    await testDb().execute(
-      sql`DELETE FROM rate_limit WHERE key NOT LIKE 'signin:%' AND key LIKE ${`%${thief.ip}%`}`,
-    );
+    await forgetAddressRule();
     const throttled = await ask(thief, freshEmail(), { password: PASSWORD });
     expect(throttled.status).toBe(429);
     expect(throttled.body).toMatchObject({ code: "SIGN_IN_THROTTLED" });

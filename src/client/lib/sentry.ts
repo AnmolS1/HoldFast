@@ -31,8 +31,20 @@ export function redactOrDrop<T>(item: T): T | null {
   }
 }
 
-/** The redacted breadcrumb, or null: a breadcrumb that cannot be redacted is dropped. */
+/**
+ * A click or key-press crumb (`ui.click`, `ui.input`, …) is never kept: the SDK describes the
+ * element by its `aria-label`, `title`, `name` and `alt` (@sentry/browser-utils htmlTreeAsString),
+ * and the app labels rows, previews and upload buttons with file names — user content that no
+ * redaction can tell from an ordinary word (R1 legal-7).
+ */
+const isDomCrumb = (item: unknown): boolean => {
+  const category = (item as { category?: unknown } | null)?.category;
+  return typeof category === "string" && category.startsWith("ui.");
+};
+
+/** The redacted breadcrumb, or null: a DOM crumb, or one that cannot be redacted, is dropped. */
 export function redactCrumbOrDrop<T>(item: T): T | null {
+  if (isDomCrumb(item)) return null;
   try {
     return redactBreadcrumb(item, failed);
   } catch {
@@ -71,7 +83,7 @@ export function initSentry(
         // strings, and — `userInfo: false` — Sentry is told NEVER to infer the client's IP
         // address from the connection (`sdk.settings.infer_ip`), which no `beforeSend` could
         // remove afterwards. No replay, feedback or HTTP-client integration is added either:
-        // the SDK's defaults only.
+        // the SDK's defaults only — and their click and key-press crumbs are dropped (below).
         dataCollection: SENTRY_DATA_COLLECTION,
         beforeSend: (event, hint) => (isRecovered(hint?.originalException) ? null : redactOrDrop(event)),
         beforeBreadcrumb: (breadcrumb) => redactCrumbOrDrop(breadcrumb),

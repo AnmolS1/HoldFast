@@ -6,6 +6,7 @@
 //   upload_ips               90 days
 //   session                  1 day after it expired (the raw IP and user agent go with the row)
 //   reports                  reporter_ip_hash_stable set NULL 90 days after the report was resolved
+//   rate_limit               2 days after its last use (`last_request`)
 //
 // NOTHING THAT CONCERNS A HELD ACCOUNT OR A PROTECTED NODE IS DELETED. What that means is one
 // definition (queries/holds.ts), applied inside each deleting statement: this job never deletes
@@ -21,7 +22,16 @@
 // read it): a raw session IP goes at sign-out, or 1–2 days after its session expires (deleted once
 // more than a day past, by a daily run); a session expires 13–14 days after last use (renewed at most
 // daily). Privacy text: "within 2 days after the session expires … about 14 days after you last used it".
+//
+// `rate_limit` holds counters, never a raw address (Better Auth's limiter writes through
+// auth/rate-limit-store.ts, which hashes it, and which turns Better Auth's own pruning off). Every
+// family of key in it has a window of at most a day — the export's day budget (db/queries/account.ts),
+// the sign-in throttle and second-factor budgets (15 min), the export slot (30 min), Better Auth's
+// rules (≤ 1 h) — and a row past its window is never read again; two days resets no live budget.
+// Like the mail-cap windows these rows go with their age, holds or not: a budget is not evidence,
+// and Better Auth deleted the same rows hourly before (decision R1FIX-p4).
 
+import { sql } from "drizzle-orm";
 import type { Executor } from "../db/client";
 import {
   deleteExpiredSessions,
@@ -42,6 +52,20 @@ import { mayDestroy } from "./reconcile";
 export const RETENTION_BATCH = 5_000;
 export const FINISHED_UPLOAD_RETENTION_DAYS = 7;
 const DEFAULT_SOFT_DEADLINE_MS = 60_000;
+/** A `rate_limit` row goes this long after its last use: longer than any window in the table. */
+export const RATE_LIMIT_RETENTION_MS = 2 * 24 * 60 * 60 * 1000;
+
+/** Deletes at most `limit` `rate_limit` rows last used more than RATE_LIMIT_RETENTION_MS ago. */
+async function deleteOldRateLimits(db: Executor, limit: number): Promise<number> {
+  const result = await db.execute(sql`
+    DELETE FROM rate_limit WHERE id IN (
+      SELECT id FROM rate_limit
+      WHERE last_request < (extract(epoch FROM clock_timestamp()) * 1000)::bigint - ${RATE_LIMIT_RETENTION_MS}
+      LIMIT ${limit}
+    )
+    RETURNING 1`);
+  return result.rows.length;
+}
 
 /** Each deletes at most `limit` rows that are past their period and kept by nothing. */
 export const RETENTION_STEPS: ReadonlyArray<{
@@ -58,6 +82,7 @@ export const RETENTION_STEPS: ReadonlyArray<{
   { table: "session", delete: (db, limit) => deleteExpiredSessions(db, limit) },
   // Not a delete: the row stays, its address hash goes. Rows already nulled no longer match.
   { table: "reports", delete: (db, limit) => nullStaleReporterHashes(db, limit) },
+  { table: "rate_limit", delete: (db, limit) => deleteOldRateLimits(db, limit) },
 ];
 
 export const job: Job = {

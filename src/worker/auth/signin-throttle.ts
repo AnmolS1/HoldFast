@@ -61,8 +61,8 @@
 // ends in `ctx.context.password.verify` — utils/password.mjs `validatePassword` /
 // `checkPassword`, api/routes/update-user.mjs:168 and :287.)
 //
-// The rows are pruned by Better Auth's own limiter (api/rate-limiter/index.mjs:174 — rows older
-// than its longest window, one hour), which is longer than this window.
+// The rows go with the retention job (jobs/retention.ts, `rate_limit`: two days after their last
+// use), which is longer than this window. (Better Auth's own pruning is off: auth/rate-limit-store.ts.)
 
 import { APIError, getSessionFromCtx } from "better-auth/api";
 import { admitSignIn, forgetSignInFailures } from "../db/queries/auth-lifecycle";
