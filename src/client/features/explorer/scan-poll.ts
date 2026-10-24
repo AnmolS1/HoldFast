@@ -1,11 +1,13 @@
 // Watching files that are still being scanned. A pending file is asked for every 5 s for two
-// minutes, then every 30 s and the row says "Still scanning". The answer is a `NodeDetailDto`:
-// the status is `.node.scanStatus`.
+// minutes, then every 30 s and the row says "Still scanning". Every file that is due is asked in
+// ONE request (`POST /api/nodes/scan-status`, R1 m16): each answer is the file as
+// `GET /api/nodes/:id` sends it; a file the answer leaves out is not there for us any more.
 //
 // ONE loop for the whole listing, and it is bounded every way round:
-//  - at most POLL_PER_TICK requests a tick, one after another (the files take turns, the one
-//    asked longest ago first) — 48 requests a minute at most, however many files are pending;
-//  - `404` ends the watch of that file (it is gone), `403` too (it is no longer ours to read);
+//  - at most one request a tick, with at most POLL_PER_TICK files in it (the one asked longest
+//    ago first) — 12 requests a minute at most, however many files are pending;
+//  - a file left out of the answer ends its watch (it is gone, or no longer ours to read); a `4xx`
+//    other than `429` for the request ends the watch of the files in it;
 //  - `429` makes the whole loop wait `Retry-After`; `5xx` and a dead network back it off,
 //    doubling up to a minute — never the same rate against a server that is refusing;
 //  - nothing is asked while the tab is hidden or the page is not the one in front;
@@ -17,15 +19,15 @@
 //  - an answer that arrives after the account changed is dropped.
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeDto } from "../../../shared/schemas/node";
-import { ApiError } from "../../lib/api";
+import { SCAN_STATUS_MAX_IDS, ScanStatusResponse } from "../../../shared/schemas/node";
+import { api, ApiError } from "../../lib/api";
 import { accountEpoch, sameAccount } from "../../lib/query";
-import { getNode } from "./api";
 
 export const POLL_FAST_MS = 5_000;
 export const POLL_FAST_FOR_MS = 120_000;
 export const POLL_SLOW_MS = 30_000;
-/** Files asked for in one tick. */
-export const POLL_PER_TICK = 4;
+/** Files asked for in one tick: one request, the server's limit. */
+export const POLL_PER_TICK = SCAN_STATUS_MAX_IDS;
 /** How long one file is watched, from the moment it became pending in the listing. */
 export const POLL_MAX_MS = 30 * 60_000;
 /** The longest back-off after repeated `5xx` / network failures. */
@@ -46,6 +48,16 @@ export function penaltyAfter(cause: unknown, failures: number): number {
     return Math.min(POLL_RETRY_AFTER_MAX_MS, Math.max(POLL_FAST_MS, asked));
   }
   return Math.min(POLL_BACKOFF_MAX_MS, POLL_FAST_MS * 2 ** Math.max(0, failures - 1));
+}
+
+/** The scan state of these files, in one request. */
+async function scanStatuses(ids: readonly string[]): Promise<NodeDto[]> {
+  const answer = await api("/api/nodes/scan-status", {
+    method: "POST",
+    body: { ids },
+    schema: ScanStatusResponse,
+  });
+  return answer.items;
 }
 
 /**
@@ -69,7 +81,7 @@ export function withScanOf(current: NodeDto, answer: NodeDto): NodeDto {
 export interface ScanPollHandlers {
   /** The scan ended: the node as it is now. */
   onSettled(node: NodeDto): void;
-  /** The node is no longer there (`404`). */
+  /** The node is no longer there (left out of the answer). */
   onGone(id: string): void;
 }
 
@@ -81,7 +93,7 @@ interface LoopState {
   since: Map<string, number>;
   /** When each was last asked for. */
   asked: Map<string, number>;
-  /** Files the server refused to show (`403`): not asked again. */
+  /** Files the server refused to be asked about (a `4xx` for their request): not asked again. */
   refused: Set<string>;
   lastTick: number;
   /** Since when the loop has been paused (hidden, or not the page in front); null while it runs. */
@@ -203,31 +215,36 @@ export function useScanPolling(
         .filter((id) => at - last(id) >= waitOf(id) - 50)
         .sort((a, b) => last(a) - last(b))
         .slice(0, POLL_PER_TICK);
-      for (const id of due) {
-        state.asked.set(id, at);
+      if (due.length > 0) {
+        for (const id of due) state.asked.set(id, at);
         try {
-          const detail = await getNode(id);
+          const answered = new Map((await scanStatuses(due)).map((node) => [node.id, node]));
           if (!live()) return;
           state.failures = 0;
-          if (detail.node.scanStatus !== "pending") {
-            forget(id);
-            latest.current.onSettled(detail.node);
+          for (const id of due) {
+            const node = answered.get(id);
+            if (!node) {
+              forget(id);
+              latest.current.onGone(id);
+            } else if (node.scanStatus !== "pending") {
+              forget(id);
+              latest.current.onSettled(node);
+            }
           }
         } catch (cause) {
           if (!live()) return;
-          if (cause instanceof ApiError && cause.status === 404) {
-            forget(id);
-            latest.current.onGone(id);
-            continue;
+          if (
+            cause instanceof ApiError &&
+            cause.status >= 400 &&
+            cause.status < 500 &&
+            cause.status !== 429
+          ) {
+            for (const id of due) state.refused.add(id);
+          } else {
+            // Too many requests, a failing server, no network: the whole loop goes quiet for a while.
+            state.failures += 1;
+            state.notBefore = Date.now() + penaltyAfter(cause, state.failures);
           }
-          if (cause instanceof ApiError && cause.status === 403) {
-            state.refused.add(id);
-            continue;
-          }
-          // Too many requests, a failing server, no network: the whole loop goes quiet for a while.
-          state.failures += 1;
-          state.notBefore = Date.now() + penaltyAfter(cause, state.failures);
-          break;
         }
       }
       plan();
