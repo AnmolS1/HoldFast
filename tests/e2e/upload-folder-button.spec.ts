@@ -256,7 +256,8 @@ test.describe("Upload folder (mocked API)", () => {
       const pressDisabled = async (selector: string) => {
         const control = page.locator(selector);
         await expect(control).toHaveAttribute("aria-disabled", "true", { timeout: 15_000 });
-        await expect(control).toHaveAttribute("title", reason);
+        // The reason is its accessible description…
+        await expect(control).toHaveAccessibleDescription(reason);
         await control.focus();
         await expect(control).toBeFocused();
         await page.keyboard.press("Enter");
@@ -264,6 +265,9 @@ test.describe("Upload folder (mocked API)", () => {
       // The empty state: the files CTA and the folder button.
       await pressDisabled("[data-empty-upload]");
       await pressDisabled("[data-empty-upload-folder]");
+      // …and, in the empty state, a line anyone can read (review F01-2): no hover needed.
+      await expect(page.locator("[data-upload-off]")).toBeVisible();
+      await expect(page.locator("[data-upload-off]")).toHaveText(reason);
       if (isMobile(page)) {
         await page.locator("[data-new-fab]").click();
         const sheet = page.getByRole("dialog", { name: "New" });
@@ -284,6 +288,8 @@ test.describe("Upload folder (mocked API)", () => {
       await page.keyboard.press("Escape");
       // The toolbar: the split button's main half, and both items of its menu.
       await pressDisabled("[data-upload]");
+      // The toolbar's main half: on keyboard focus its reason shows as a tooltip.
+      await expect(page.getByRole("tooltip")).toHaveText(reason);
       await page.locator("[data-upload-menu]").click();
       for (const kind of ["files", "folder"]) {
         const item = page.locator(`[data-upload-kind="${kind}"]`);
@@ -307,6 +313,7 @@ test.describe("Upload folder (mocked API)", () => {
       await palette.getByRole("combobox").fill("Upload");
       for (const name of [/Upload files/, /Upload folder/]) {
         await expect(palette.getByRole("option", { name })).toHaveAttribute("aria-disabled", "true");
+        await expect(palette.getByRole("option", { name })).toContainText(reason);
       }
       expect(opened).toBe(false);
     });

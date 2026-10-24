@@ -135,6 +135,9 @@ type DialogState =
   | { type: "move"; nodes: NodeDto[] }
   | null;
 
+/** The empty state's line saying why its upload buttons are unavailable. */
+const UPLOAD_OFF_ID = "explorer-upload-off";
+
 interface MenuState {
   /** Empty = the folder's own menu (right-click on the background). */
   ids: string[];
@@ -801,13 +804,13 @@ function Explorer({ folderId }: { folderId: string | null }) {
         body={t("explorer.empty.first")}
         actions={
           <>
-            {/* Unavailable but still focusable, with its reason (R1 a11y-1). */}
+            {/* Unavailable but still focusable, with its reason shown under them (R1 a11y-1). */}
             <Button
               variant="cta"
               onClick={upload}
               aria-disabled={uploadOff ? true : undefined}
+              aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
               className={uploadOff ? "Mui-disabled" : undefined}
-              title={uploadOff}
               data-empty-upload
             >
               {t("explorer.action.upload")}
@@ -815,13 +818,22 @@ function Explorer({ folderId }: { folderId: string | null }) {
             <Button
               onClick={uploadFolder}
               aria-disabled={uploadOff ? true : undefined}
+              aria-describedby={uploadOff ? UPLOAD_OFF_ID : undefined}
               className={uploadOff ? "Mui-disabled" : undefined}
-              title={uploadOff}
               data-empty-upload-folder
             >
               {t("explorer.action.uploadFolder")}
             </Button>
             <Button onClick={newFolder}>{t("explorer.action.newFolder")}</Button>
+            {uploadOff ? (
+              <Box
+                id={UPLOAD_OFF_ID}
+                data-upload-off
+                sx={{ flexBasis: "100%", textAlign: "center", typography: "body2", color: hf.textSecondary }}
+              >
+                {uploadOff}
+              </Box>
+            ) : null}
           </>
         }
       />

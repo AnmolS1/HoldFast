@@ -5,6 +5,7 @@ import Button from "@mui/material/Button";
 import Divider from "@mui/material/Divider";
 import Menu from "@mui/material/Menu";
 import MenuItem from "@mui/material/MenuItem";
+import Tooltip from "@mui/material/Tooltip";
 import {
   ArrowDown,
   ArrowUp,
@@ -66,6 +67,7 @@ export function Toolbar(props: ToolbarProps) {
   const close = () => setAnchor(null);
   const [uploadAnchor, setUploadAnchor] = useState<HTMLElement | null>(null);
   const uploadMenuId = useId();
+  const uploadOffId = useId();
   const closeUpload = () => setUploadAnchor(null);
   const countText = more
     ? t("explorer.count.more", { count })
@@ -106,21 +108,31 @@ export function Toolbar(props: ToolbarProps) {
           </Button>
           {/* A split button: the main half uploads files as before, the arrow offers the folder too. */}
           <Box sx={{ display: "inline-flex", alignItems: "center" }} data-upload-split>
-            {/* Unavailable but still focusable, with its reason (R1 a11y-1). */}
-            <Button
-              variant="text"
-              onClick={() => {
-                if (!props.uploadOff) props.onUpload();
-              }}
-              aria-disabled={props.uploadOff ? true : undefined}
-              className={props.uploadOff ? "Mui-disabled" : undefined}
-              title={props.uploadOff}
-              startIcon={<Upload size={16} aria-hidden="true" />}
-              data-upload
-              sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
-            >
-              {t("explorer.action.upload")}
-            </Button>
+            {/* Unavailable but still focusable (R1 a11y-1); its reason is a tooltip on hover and
+                on keyboard focus — on the wrapper, as a disabled button takes no pointer events. */}
+            <Tooltip title={props.uploadOff ?? ""} describeChild>
+              <Box component="span" sx={{ display: "inline-flex" }} data-upload-tip>
+                <Button
+                  variant="text"
+                  onClick={() => {
+                    if (!props.uploadOff) props.onUpload();
+                  }}
+                  aria-disabled={props.uploadOff ? true : undefined}
+                  aria-describedby={props.uploadOff ? uploadOffId : undefined}
+                  className={props.uploadOff ? "Mui-disabled" : undefined}
+                  startIcon={<Upload size={16} aria-hidden="true" />}
+                  data-upload
+                  sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
+                >
+                  {t("explorer.action.upload")}
+                </Button>
+                {props.uploadOff ? (
+                  <Box component="span" id={uploadOffId} hidden>
+                    {props.uploadOff}
+                  </Box>
+                ) : null}
+              </Box>
+            </Tooltip>
             <Button
               variant="text"
               aria-label={t("explorer.action.uploadMenu")}
