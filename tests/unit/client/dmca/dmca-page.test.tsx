@@ -133,6 +133,15 @@ describe("/dmca", () => {
     expect(items.join("\n")).toMatch(/penalty of perjury/i);
   });
 
+  it("says who is told of a takedown: the person who uploaded it, and the folder's owner when that is someone else (R1 ruling Q2)", async () => {
+    await open();
+    const section = screen.getByRole("region", { name: "Sending a notice" });
+    expect(section.textContent).toContain(
+      "tell the person who uploaded it, with a copy of the notice's description of the material and how to send a counter-notice. If someone else owns the folder it was in, we tell them too.",
+    );
+    expect(section.textContent).not.toContain("tell the account owner");
+  });
+
   it("explains the counter-notice: its four elements, the consent to jurisdiction, and the 10–14 business-day window", async () => {
     await open();
     const section = screen.getByRole("region", { name: "Counter-notice" });

@@ -31,7 +31,7 @@ export const messages = {
   "dmca.notice.accuracy":
     "A statement that the information in the notice is accurate and, under penalty of perjury, that you are authorised to act for the copyright owner.",
   "dmca.notice.after":
-    "When a notice is complete we disable access to the material, pause its share links and tell the account owner, with a copy of the notice's description of the material.",
+    "When a notice is complete we disable access to the material, pause its share links and tell the person who uploaded it, with a copy of the notice's description of the material and how to send a counter-notice. If someone else owns the folder it was in, we tell them too.",
 
   "dmca.counter.title": "Counter-notice",
   "dmca.counter.lead":
