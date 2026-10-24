@@ -262,6 +262,27 @@ export async function legalHoldSetByHand(db: Executor, userId: string): Promise<
   return row?.action === "admin.legal_hold_set";
 }
 
+/**
+ * The same question for a file's or a folder's hold (R2 mod-4): the newest of the node's
+ * `admin.node_legal_hold_set` / `_cleared` rows is a set. A set on a node a lock already held
+ * (`changed: false`) counts — from then on the hold is the operator's, not the lock's.
+ */
+export async function nodeLegalHoldSetByHand(db: Executor, nodeId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ action: auditLog.action })
+    .from(auditLog)
+    .where(
+      and(
+        eq(auditLog.targetType, "node"),
+        eq(auditLog.targetId, nodeId),
+        inArray(auditLog.action, ["admin.node_legal_hold_set", "admin.node_legal_hold_cleared"]),
+      ),
+    )
+    .orderBy(desc(auditLog.at), desc(auditLog.id))
+    .limit(1);
+  return row?.action === "admin.node_legal_hold_set";
+}
+
 /** Sets the account's quota. Returns the value before and after, or null for no such user. */
 export async function setQuota(db: Executor, userId: string, quotaBytes: number) {
   return db.transaction(async (tx) => {

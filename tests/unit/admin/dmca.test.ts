@@ -245,6 +245,62 @@ describe("who is told (safety-2, ruling Q2): the uploader gets the notice, the c
     expect(textOf(mails[0])).toContain(STRIKE);
   });
 
+  it("R2 mod-6: one notice over two owners' folders (one uploader) — the uploader's mail names BOTH items; each owner is told about their OWN item only; so is the restore", async () => {
+    const who = await admin();
+    const editor = await member();
+    const files: { owner: Awaited<ReturnType<typeof member>>; name: string; id: string }[] = [];
+    for (const label of ["first", "second"]) {
+      const owner = await member();
+      const folder = await makeFolder(owner.id);
+      await makeShare(folder.id, owner.id, editor.id, { role: "editor" });
+      const name = `${label} ${rand(6)}`;
+      const file = await makeFile(owner.id, folder.id, {
+        name,
+        scanStatus: "clean",
+        scannedAt: new Date(),
+        createdBy: editor.id,
+      });
+      await uploadAddress(file.id, file.versionId!, editor.id, "192.0.2.31");
+      files.push({ owner, name, id: file.id });
+    }
+    const [x, y] = files as [(typeof files)[0], (typeof files)[0]];
+    const made = await notice(who, [x.id, y.id]);
+    expect(made.nodes).toHaveLength(2);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+
+    const toEditor = mailTo(editor.row.email, "contentRemovedCopyright");
+    expect(toEditor.map((m) => m.subject.replace(/^\[dev\] /, ""))).toEqual([SUBSCRIBER]);
+    expect(textOf(toEditor[0])).toContain(x.name);
+    expect(textOf(toEditor[0])).toContain(y.name);
+    for (const [mine, theirs] of [
+      [x, y],
+      [y, x],
+    ] as const) {
+      const toOwner = mailTo(mine.owner.row.email, "contentRemovedCopyright");
+      expect(
+        toOwner.map((m) => m.subject.replace(/^\[dev\] /, "")),
+        mine.name,
+      ).toEqual([FOLDER]);
+      expect(textOf(toOwner[0])).toContain(mine.name);
+      expect(textOf(toOwner[0])).not.toContain(theirs.name);
+    }
+
+    expect((await act(who, made.id, "withdraw", { note: "Withdrawn by the complainant." })).status).toBe(200);
+    const restoredEditor = mailTo(editor.row.email, "contentRestored");
+    expect(restoredEditor).toHaveLength(1);
+    expect(textOf(restoredEditor[0])).toContain(x.name);
+    expect(textOf(restoredEditor[0])).toContain(y.name);
+    for (const [mine, theirs] of [
+      [x, y],
+      [y, x],
+    ] as const) {
+      const restored = mailTo(mine.owner.row.email, "contentRestored");
+      expect(restored, mine.name).toHaveLength(1);
+      expect(textOf(restored[0])).toContain(mine.name);
+      expect(textOf(restored[0])).not.toContain(theirs.name);
+    }
+  });
+
   it("withdrawn after the takedown: the editor and the owner are each told it was restored, once", async () => {
     const who = await admin();
     const t = await editorsUpload();
