@@ -5,18 +5,19 @@
 import Box from "@mui/material/Box";
 import { Upload } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { toast } from "../../components/Toaster";
 import { registerUploadRequester } from "../../lib/contracts";
 import { accountEpoch, sameAccount, useSession } from "../../lib/query";
 import { isEditableTarget } from "../../lib/shortcuts";
 import { hf, layout } from "../../theme/tokens";
 import { ConflictDialog } from "./ConflictDialog";
-import { carriesFiles, fromDrop, fromFileList } from "./intake";
+import { carriesFiles, folderPickWasFlat, fromDrop, fromFileList } from "./intake";
 import { actionMark, addFiles, frameMounted, restoreUploads, sameActor } from "./manager";
-import { registerPicker, takePickerTarget, targetFromLocation } from "./picker";
+import { registerPicker, takePickerTarget, targetFromLocation, type PickerKind } from "./picker";
 // The slot this host answers for (slots.tsx renders this host: a cycle only at call time).
 import { requestUpload } from "./slots";
 import { getNode } from "./protocol";
-import { useUploads } from "./store";
+import { announce, useUploads } from "./store";
 import { t } from "./strings";
 
 const hidden = {
@@ -119,11 +120,22 @@ export function UploadHost() {
     };
   }, []);
 
-  const picked = (input: HTMLInputElement) => {
-    const intake = fromFileList(Array.from(input.files ?? []));
+  const picked = (input: HTMLInputElement, kind: PickerKind) => {
+    // The user's action is this change: its mark and its target are taken before anything else.
+    const then = actionMark();
+    const parentId = takePickerTarget();
+    const files = Array.from(input.files ?? []);
     // Emptied, so choosing the same file again is a change again.
     input.value = "";
-    void addFiles(intake.files, takePickerTarget(), intake.folders, intake, actionMark());
+    if (kind === "folder" && folderPickWasFlat(files)) {
+      // Hundreds of files dumped flat into the folder would be a silent wrong outcome.
+      const sentence = t("intake.flatFolder");
+      toast({ message: sentence, key: "upload-flat-folder", duration: 12_000 });
+      announce(sentence);
+      return;
+    }
+    const intake = fromFileList(files);
+    void addFiles(intake.files, parentId, intake.folders, intake, then);
   };
 
   return (
@@ -135,7 +147,7 @@ export function UploadHost() {
         hidden
         data-upload-input="files"
         aria-label={t("input.files")}
-        onChange={(event) => picked(event.currentTarget)}
+        onChange={(event) => picked(event.currentTarget, "files")}
       />
       <input
         ref={(node) => registerPicker("folder", node)}
@@ -144,7 +156,7 @@ export function UploadHost() {
         hidden
         data-upload-input="folder"
         aria-label={t("input.folder")}
-        onChange={(event) => picked(event.currentTarget)}
+        onChange={(event) => picked(event.currentTarget, "folder")}
         {...{ webkitdirectory: "" }}
       />
       <Box role="log" aria-live="polite" aria-label={t("live.label")} data-upload-live sx={hidden}>

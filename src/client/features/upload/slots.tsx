@@ -12,8 +12,8 @@ export function UploadDropOverlay() {
 }
 
 /**
- * Upload `files` into `parentId`; without files, open the file picker. Without a folder the one
- * in the address is used, else the top level.
+ * Upload `files` into `parentId`; without files, open the picker `kind` names (the file picker
+ * unless it is `"folder"`). Without a folder the one in the address is used, else the top level.
  */
 // eslint-disable-next-line react-refresh/only-export-components -- the slot file exports both by contract
 export const requestUpload: RequestUpload = (opts) => {
@@ -28,5 +28,5 @@ export const requestUpload: RequestUpload = (opts) => {
     );
     return;
   }
-  openPicker("files", parentId);
+  openPicker(opts?.kind ?? "files", parentId);
 };
