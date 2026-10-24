@@ -637,6 +637,9 @@ export const messages = {
   "sys.done": "Done in {passes} passes.",
   "sys.stoppedRollback": "Stopped: the database reads as rolled back. See the detector below.",
   "sys.stoppedPaused": "Stopped: the pause switch is on. See the detector below.",
+  "sys.stoppedOrphansOff": "Done apart from orphans: orphan deletion is off in Settings.",
+  "sys.stoppedOrphanThreshold":
+    "Stopped: more objects look orphaned than the threshold allows. Nothing was deleted. Check them before running it again.",
   "sys.detector": "Rollback detector",
   "gen.object": "Object's number",
   "gen.database": "Database's number",

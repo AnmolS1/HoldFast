@@ -118,6 +118,13 @@ function Scanner({ available }: { available: boolean }) {
   );
 }
 
+const STOPPED = {
+  rolled_back: "sys.stoppedRollback",
+  destroy_paused: "sys.stoppedPaused",
+  orphans_disabled: "sys.stoppedOrphansOff",
+  orphan_threshold: "sys.stoppedOrphanThreshold",
+} as const;
+
 function JobRow({ job, onStopped }: { job: AdminSystemDto["jobs"][number]; onStopped(): void }) {
   const [confirm, setConfirm] = useState(false);
   const [running, setRunning] = useState(false);
@@ -154,7 +161,7 @@ function JobRow({ job, onStopped }: { job: AdminSystemDto["jobs"][number]; onSto
           {outcome.kind === "done"
             ? t("sys.done", { passes: outcome.passes })
             : outcome.kind === "stopped"
-              ? t(outcome.reason === "destroy_paused" ? "sys.stoppedPaused" : "sys.stoppedRollback")
+              ? t(STOPPED[outcome.reason])
               : outcome.kind === "error"
                 ? refusalText(outcome.error)
                 : ""}

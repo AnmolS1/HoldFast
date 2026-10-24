@@ -49,6 +49,12 @@ describe("Run now", () => {
   it.each([
     ["rolled_back", "Stopped: the database reads as rolled back. See the detector below."],
     ["destroy_paused", "Stopped: the pause switch is on. See the detector below."],
+    // func-3: reconcile's stops another pass cannot change (the purge row stands in for it here).
+    ["orphans_disabled", "Done apart from orphans: orphan deletion is off in Settings."],
+    [
+      "orphan_threshold",
+      "Stopped: more objects look orphaned than the threshold allows. Nothing was deleted. Check them before running it again.",
+    ],
   ])(
     "a guarded job stopped by %s: exactly one call, and the detector panel is shown",
     async (reason, sentence) => {

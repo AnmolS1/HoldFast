@@ -1,9 +1,11 @@
 // "Run now": one bounded pass per call of `POST /api/admin/jobs/:name/run`, repeated while the
 // answer is `202 { done: false }` — and NEVER on anything else: `200 { done: true }` ends it, a
-// `409` (the rollback detector or the pause switch stopped a guarded job) ends it and the System
-// screen shows the detector panel, any error ends it, and so does an account change (the purger
+// `409` (the rollback detector or the pause switch stopped a guarded job; reconcile's orphan
+// deletion is off or over its threshold) ends it and the System screen shows the detector panel,
+// any error ends it, and so does an account change (the purger
 // below aborts every loop; a loop also checks the epoch before each call — no call is ever made
 // for an identity that did not start it).
+import type { JobStopReason } from "../../../shared/errors";
 import { registerUserStatePurger } from "../../lib/contracts";
 import { accountEpoch, sameAccount } from "../../lib/query";
 import { runJobPass } from "./api";
@@ -11,9 +13,16 @@ import { reasonOf } from "./words";
 
 export type LoopOutcome =
   | { kind: "done"; passes: number }
-  | { kind: "stopped"; reason: "rolled_back" | "destroy_paused"; passes: number }
+  | { kind: "stopped"; reason: JobStopReason; passes: number }
   | { kind: "error"; error: unknown; passes: number }
   | { kind: "aborted"; passes: number };
+
+const STOPS = [
+  "rolled_back",
+  "destroy_paused",
+  "orphans_disabled",
+  "orphan_threshold",
+] as const satisfies readonly JobStopReason[];
 
 const active = new Set<AbortController>();
 
@@ -36,8 +45,8 @@ export async function runUntilDone(name: string, onPass: (passes: number) => voi
       } catch (error) {
         passes += 1;
         const reason = reasonOf(error);
-        if (reason === "rolled_back" || reason === "destroy_paused")
-          return { kind: "stopped", reason, passes };
+        if (reason && (STOPS as readonly string[]).includes(reason))
+          return { kind: "stopped", reason: reason as JobStopReason, passes };
         return { kind: "error", error, passes };
       }
       passes += 1;

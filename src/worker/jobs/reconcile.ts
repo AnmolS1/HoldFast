@@ -49,6 +49,7 @@
 // Rows first, objects second everywhere else is what makes an unreferenced old object garbage:
 // a purge deletes its rows and then its objects, an upload writes its session row first.
 
+import type { JobStopReason } from "../../shared/errors";
 import type { Executor } from "../db/client";
 import { getSettings } from "../db/queries/settings";
 import { reconcileUsedBytes } from "../db/queries/quota";
@@ -513,7 +514,7 @@ async function recordQuotaPass(bg: BackgroundContext, pass: QuotaPass): Promise<
 // ── orphans ─────────────────────────────────────────────────────────────────────────────────
 
 export type OrphanSweep = {
-  outcome: "swept" | "disabled" | "orphan_threshold";
+  outcome: "swept" | "disabled" | "orphan_threshold" | "destroy_paused";
   listed: number;
   candidates: number;
   deleted: number;
@@ -628,6 +629,12 @@ export async function sweepOrphans(
     return { outcome: "orphan_threshold", ...idle, listed, candidates: candidates.length };
   }
 
+  // The pause switch asked again right before the delete (func-n3): the slot read it once, and
+  // its sweep can run minutes later. Turned on meanwhile → nothing is deleted, the place is kept.
+  if ((await readPauseSwitch(bg.env)) !== "off") {
+    bg.metric("job", { kind: "reconcile", outcome: "orphan_paused" });
+    return { outcome: "destroy_paused", ...idle, listed, candidates: candidates.length };
+  }
   await store.delete(candidates);
   bg.metric("job", { kind: "reconcile", outcome: "orphans" }, candidates.length);
   return {
@@ -642,6 +649,13 @@ export async function sweepOrphans(
 }
 
 // ── the job ─────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The stop reason of the last run a context made (`reconcileStopReason`), for "Run now", which
+ * runs the job through the registry (its answer carries `done` only).
+ */
+const stops = new WeakMap<BackgroundContext, JobStopReason>();
+export const reconcileStopOf = (bg: BackgroundContext): JobStopReason | null => stops.get(bg) ?? null;
 
 export type ReconcileRun = {
   done: boolean;
@@ -705,11 +719,26 @@ async function reconcileOnce(
   // A rolled-back (or unread) database is never counted up by the job: only an operator acts.
   // Counted from a reading taken now, under the lock (the slot's one only gated the sweep).
   if (completed && (detection.state === "ok" || detection.state === "first")) await advanceGeneration(bg);
+  const stop = reconcileStopReason(quota !== null && quota.done, sweep);
+  if (stop) stops.set(bg, stop);
   return {
     done: quota !== null && quota.done && sweep !== null && sweep.outcome === "swept" && sweep.done,
     generation: detection.state,
     sweep,
   };
+}
+
+/**
+ * Why a run is not done for a reason ANOTHER PASS CANNOT CHANGE (func-3) — for "Run now", which
+ * repeats a pass while the answer is "not done yet": orphan deletion is off (once the quota half
+ * has reached the end, every further pass does nothing), or the sweep stopped at the orphan
+ * threshold (it keeps its place, and each pass would list the same objects and alert again).
+ * Null for a run that is only not finished yet. (Rolled back / paused: the route asks itself.)
+ */
+export function reconcileStopReason(quotaDone: boolean, sweep: OrphanSweep | null): JobStopReason | null {
+  if (sweep?.outcome === "orphan_threshold") return "orphan_threshold";
+  if (sweep?.outcome === "disabled" && quotaDone) return "orphans_disabled";
+  return null;
 }
 
 export const job: Job = {

@@ -88,7 +88,7 @@ import { revokeLink } from "../db/queries/sharing";
 import { EXPIRED_NOTE } from "../db/queries/strikes";
 import type { Node, Report, Strike } from "../db/schema";
 import { jobNames, jobs, runJob, softDeadlineOf } from "../jobs/index";
-import { readPauseSwitch, readsRolledBack } from "../jobs/reconcile";
+import { readPauseSwitch, readsRolledBack, reconcileStopOf } from "../jobs/reconcile";
 import { buildMeta } from "../meta";
 import { requireAdmin } from "../middleware/guards";
 import { SCANNER_INSTANCES, scannerHealth, type ScannerDeps } from "../scan/container";
@@ -1268,10 +1268,21 @@ router.post("/admin/jobs/:name{[a-z-]+}/run", async (c) => {
   audit(c, "admin.job_run", { type: "job", id: name }, { name });
   if (STREAMED_JOBS.has(name)) return streamedRun(c, name);
 
-  const result = await runBackground(c.env, c.executionCtx, (bg) =>
-    runJob(name, bg, { softDeadlineMs: RUN_NOW_SOFT_DEADLINE_MS }),
-  );
+  const result = await runBackground(c.env, c.executionCtx, async (bg) => ({
+    ...(await runJob(name, bg, { softDeadlineMs: RUN_NOW_SOFT_DEADLINE_MS })),
+    stop: name === "reconcile" ? reconcileStopOf(bg) : null,
+  }));
   if (result.done) return c.json({ name, done: true }, 200);
+  // A stop another pass cannot change (func-3): the console ends its loop on it.
+  if (result.stop === "orphans_disabled" || result.stop === "orphan_threshold") {
+    throw new AppError(
+      "conflict",
+      result.stop === "orphans_disabled"
+        ? "Orphan deletion is off in Settings: the rest of the pass is done."
+        : "More objects look orphaned than the threshold allows. Nothing was deleted.",
+      { reason: result.stop },
+    );
+  }
   if (job.guarded) {
     const reason = await stoppedBecause(c);
     if (reason) {
