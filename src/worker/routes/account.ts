@@ -401,11 +401,9 @@ router.get("/account/export", async (c) => {
       activity: activity.map(toActivityDto),
       sessions: sessions.map((row) => ({
         createdAt: iso(row.createdAt),
-        lastActiveAt: iso(row.updatedAt),
         expiresAt: iso(row.expiresAt),
         ipAddress: row.ipAddress,
         userAgent: row.userAgent,
-        country: row.country,
       })),
       passkeys: passkeys.map((row) => ({ ...row, createdAt: row.createdAt ? iso(row.createdAt) : null })),
       // A password's "account id" is the user's own id: nothing to say.

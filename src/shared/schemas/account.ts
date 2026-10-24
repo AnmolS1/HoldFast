@@ -155,21 +155,13 @@ export const ExportManifest = z.object({
   sessions: z.array(
     z.object({
       createdAt: Timestamp,
-      lastActiveAt: Timestamp,
       expiresAt: Timestamp,
       ipAddress: z.string().nullable(),
       userAgent: z.string().nullable(),
-      country: z.string().nullable(),
     }),
   ),
   passkeys: z.array(
-    z.object({
-      name: z.string().nullable(),
-      createdAt: Timestamp.nullable(),
-      deviceType: z.string(),
-      backedUp: z.boolean(),
-      aaguid: z.string().nullable(),
-    }),
+    z.object({ name: z.string().nullable(), createdAt: Timestamp.nullable(), deviceType: z.string() }),
   ),
   /** `accountId`: the provider's id for the person (Google's); null for a password. */
   signInMethods: z.array(

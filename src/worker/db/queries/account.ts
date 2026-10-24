@@ -334,8 +334,6 @@ export async function exportPasskeys(db: Executor, userId: string) {
       name: passkey.name,
       createdAt: passkey.createdAt,
       deviceType: passkey.deviceType,
-      backedUp: passkey.backedUp,
-      aaguid: passkey.aaguid,
     })
     .from(passkey)
     .where(eq(passkey.userId, userId))

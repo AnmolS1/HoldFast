@@ -8,7 +8,7 @@ import { storedAuthLimitKey } from "../../../src/worker/auth/rate-limit-store";
 import { EXPORT_DAILY_LIMIT, exportSlotKeys } from "../../../src/worker/db/queries/account";
 import { insertAudit } from "../../../src/worker/db/queries/audit";
 import { takedownNode } from "../../../src/worker/db/queries/moderation";
-import { account, nodes, passkey, session, shareLinks, user } from "../../../src/worker/db/schema";
+import { account, nodes, passkey, session, shareLinks, twoFactor, user } from "../../../src/worker/db/schema";
 import { makeLink, newClient, signIn } from "../auth/helpers";
 import { testKeys } from "../sharing/helpers";
 import {
@@ -342,6 +342,8 @@ describe("what the export says about the account itself (R1 legal-8)", () => {
           providerId: "google",
           userId: owner.id,
           idToken: "zz-secret-id-token",
+          accessToken: "zz-secret-access-token",
+          refreshToken: "zz-secret-refresh-token",
           createdAt: DEMO_AT,
           updatedAt: DEMO_AT,
         },
@@ -356,6 +358,15 @@ describe("what the export says about the account itself (R1 legal-8)", () => {
         },
       ]);
 
+    await testDb()
+      .insert(twoFactor)
+      .values({
+        id: `tf${rand(14)}`,
+        secret: "zz-secret-totp",
+        backupCodes: "zz-secret-backup-codes",
+        userId: owner.id,
+      });
+
     const answer = await exportOf(owner);
     expect(answer.status).toBe(200);
     const manifest = ExportManifest.parse(answer.body);
@@ -367,24 +378,42 @@ describe("what the export says about the account itself (R1 legal-8)", () => {
     });
     expect(typeof manifest.user.emailVerified).toBe("boolean");
     expect(manifest.nodes.find((node) => node.id === file.id)?.lastAccessedAt).toBe(OPENED.toISOString());
-    expect(manifest.sessions).toEqual([
-      expect.objectContaining({ ipAddress: "198.51.100.23", userAgent: "zz-agent/1.0", country: "NL" }),
+    // Sessions: created, expires, address, agent — nothing else (never the token or the row id).
+    expect(manifest.sessions).toHaveLength(1);
+    expect(Object.keys(manifest.sessions[0]!).sort()).toEqual([
+      "createdAt",
+      "expiresAt",
+      "ipAddress",
+      "userAgent",
     ]);
+    expect(manifest.sessions[0]).toMatchObject({ ipAddress: "198.51.100.23", userAgent: "zz-agent/1.0" });
+    // Passkeys: name, created, device type — never the key or the credential id.
     expect(manifest.passkeys).toEqual([
-      {
-        name: "zz laptop key",
-        createdAt: DEMO_AT.toISOString(),
-        deviceType: "multiDevice",
-        backedUp: true,
-        aaguid: "00000000-0000-0000-0000-00000000aaaa",
-      },
+      { name: "zz laptop key", createdAt: DEMO_AT.toISOString(), deviceType: "multiDevice" },
     ]);
     expect(manifest.signInMethods.sort((a, b) => a.provider.localeCompare(b.provider))).toEqual([
       { provider: "credential", accountId: null, createdAt: DEMO_AT.toISOString() },
       { provider: "google", accountId: googleSub, createdAt: DEMO_AT.toISOString() },
     ]);
     const text = JSON.stringify(answer.body);
+    // No secret or credential material, by value (every secret fixture above is `zz-secret-…`) and
+    // by field name, anywhere in the file.
     expect(text).not.toContain("zz-secret");
+    const names = new Set<string>();
+    const walk = (value: unknown): void => {
+      if (Array.isArray(value)) value.forEach(walk);
+      else if (value && typeof value === "object")
+        for (const [name, inner] of Object.entries(value)) {
+          names.add(name);
+          walk(inner);
+        }
+    };
+    walk(answer.body);
+    expect(
+      [...names].filter((name) =>
+        /token|secret|hash|password|credential|publickey|backup|totp|otp|aaguid/i.test(name),
+      ),
+    ).toEqual([]);
     expect(text).not.toMatch(/198\.51\.100\.(99|77)/);
   });
 });
