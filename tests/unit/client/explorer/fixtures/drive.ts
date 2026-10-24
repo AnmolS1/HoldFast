@@ -161,9 +161,9 @@ export class FakeDrive {
       this.nodes.set(node.id, node);
       return { status: 200, body: NodeDto.parse(node) };
     }
-    if (method === "POST" && path === "/api/nodes/scan-status") {
+    if (method === "GET" && path === "/api/nodes/scan-status") {
       // Each asked id that is a file here, as the node's GET would show it; the rest left out.
-      const ids = (body.ids as string[]) ?? [];
+      const ids = (url.searchParams.get("ids") ?? "").split(",").filter(Boolean);
       const items = ids.flatMap((id) => {
         const node = this.nodes.get(id);
         return node?.kind === "file" ? [node] : [];
