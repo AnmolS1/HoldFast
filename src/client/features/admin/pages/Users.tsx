@@ -258,8 +258,14 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
 
   const saveQuota = async (event: FormEvent) => {
     event.preventDefault();
-    const value = Math.round(Number(quotaGb) * 1e9);
-    if (!Number.isFinite(value) || value < 0) return;
+    // Read as typed: an empty field is NOT 0 (func-5) — `Number("")` is — and a decimal comma
+    // is a decimal point.
+    const typed = quotaGb.trim().replace(",", ".");
+    if (!/^\d+(\.\d+)?$/.test(typed)) {
+      setStatus(t("users.quotaInvalid"));
+      return;
+    }
+    const value = Math.round(Number(typed) * 1e9);
     try {
       refresh(await setQuota(user.id, value));
       setStatus(t("users.done.quota"));

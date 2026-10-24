@@ -198,6 +198,7 @@ export const messages = {
   "users.egressOf": "{used} of {cap}",
   "users.quotaGb": "Quota (GB)",
   "users.setQuota": "Set quota",
+  "users.quotaInvalid": "Enter the quota in GB, for example 5 or 2.5.",
   "users.actions": "Actions",
   "users.suspend": "Suspend",
   "users.unsuspend": "Lift suspension",
