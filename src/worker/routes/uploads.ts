@@ -762,8 +762,10 @@ router.post("/uploads", verified, uploadsOn, async (c) => {
       // new version while someone else's is open, is refused.
       const superseded: Upload[] = [];
       if (replaceNodeId !== null) {
-        for (const blocker of await lockReplaceSessions(tx, replaceNodeId)) {
-          const mayGiveUp = blocker.status === "open" && (uploaderIsOwner || blocker.uploaderId === user.id);
+        for (const { session: blocker, uploaderHeld } of await lockReplaceSessions(tx, replaceNodeId)) {
+          const own = blocker.uploaderId === user.id;
+          // Never someone else's session while its uploader is on legal hold (as the purge keeps it).
+          const mayGiveUp = blocker.status === "open" && (own || (uploaderIsOwner && !uploaderHeld));
           if (!mayGiveUp || !(await releaseAndAbort(tx, blocker, "open"))) {
             throw new AppError("replace_in_progress");
           }

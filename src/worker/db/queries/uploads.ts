@@ -6,7 +6,21 @@
 // (`deleteForUser`, which says so): the caller releases with `quota.release` in the same
 // transaction as the status change.
 
-import { and, eq, gt, inArray, isNull, lt, lte, ne, not, or, sql, type SQL } from "drizzle-orm";
+import {
+  and,
+  eq,
+  getTableColumns,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  ne,
+  not,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { nodes, type Upload, uploadParts, uploads, user } from "../schema";
@@ -84,13 +98,20 @@ export async function countOpen(db: Executor, uploaderId: string): Promise<numbe
  * The sessions replacing this file that can still finish, by anyone (R1 func-7) — read under the
  * FILE's row lock, taken here first, so two inits of a new version of one file are served one
  * after the other whoever uploads (R1D rds-1). Call it in the init's transaction, after the user
- * rows (lock order). A resume of the caller's own session never asks.
+ * rows (lock order). A resume of the caller's own session never asks. `uploaderHeld`: the
+ * session's uploader is on legal hold (what a hold protects, someone else does not destroy).
  */
-export async function lockReplaceSessions(tx: Executor, replaceNodeId: string): Promise<Upload[]> {
+export async function lockReplaceSessions(
+  tx: Executor,
+  replaceNodeId: string,
+): Promise<Array<{ session: Upload; uploaderHeld: boolean }>> {
   if (!isUuid(replaceNodeId)) return [];
   await tx.select({ id: nodes.id }).from(nodes).where(eq(nodes.id, replaceNodeId)).for("update");
   return tx
-    .select()
+    .select({
+      session: getTableColumns(uploads),
+      uploaderHeld: userHeld(sql`${uploads.uploaderId}`).mapWith(Boolean),
+    })
     .from(uploads)
     .where(and(eq(uploads.replaceNodeId, replaceNodeId), STILL_RUNNING));
 }

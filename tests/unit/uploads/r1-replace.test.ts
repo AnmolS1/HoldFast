@@ -7,7 +7,7 @@
 // check runs under the FILE's row lock, so two uploaders starting at once are one after the other.
 import { and, eq, inArray } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
-import { uploads } from "../../../src/worker/db/schema";
+import { uploads, user as userTable } from "../../../src/worker/db/schema";
 import { makeFile, makeFolder, makeShare, testDb } from "../services-core/helpers";
 import {
   call,
@@ -132,6 +132,20 @@ describe("rds-1: whose session may be superseded", () => {
     expect(part.body).toMatchObject({ error: "conflict" });
     const done = await complete(editor, left.uploadId, { parts: [{ n: 1, etag: "x" }] });
     expect(done.status).toBe(409);
+  });
+
+  it("…but not a session whose uploader is on LEGAL HOLD: what a hold protects is not destroyed by someone else (409, nothing aborted)", async () => {
+    const { owner, editor, file, body } = await shared();
+    const left = await init(editor, body(TWO_PARTS));
+    await testDb().update(userTable).set({ legalHold: true }).where(eq(userTable.id, editor.id));
+    const watched = watchedBucket();
+    const refused = await post(owner, body(30), { FILES: watched.bucket });
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ error: "replace_in_progress" });
+    expect(await sessionRow(left.uploadId)).toMatchObject({ status: "open" });
+    expect(watched.calls["upload.abort"] ?? 0).toBe(0);
+    expect((await unfinished(file.id)).map((row) => row.id)).toEqual([left.uploadId]);
+    await testDb().update(userTable).set({ legalHold: false }).where(eq(userTable.id, editor.id));
   });
 
   it("an editor blocked by the OWNER's open replace: 409 replace_in_progress, the owner's session untouched", async () => {
