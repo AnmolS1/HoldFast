@@ -12,6 +12,7 @@
 //
 // Every link password and address here is made up.
 import { describe, expect, it } from "vitest";
+import { ZIP_URL_BATCH } from "../../../src/shared/constants";
 import {
   DMCA_NOTICE_BODY_MAX_BYTES,
   JSON_BODY_MAX_BYTES,
@@ -95,9 +96,22 @@ describe("a validation answer echoes at most the first issues", () => {
     const answer = await api(asCaller(owner), "/nodes/download-urls", { json: { nodeIds: badIds(10_000) } });
     expect(answer.status).toBe(400);
     const details = errorOf(answer).details as { issues: unknown[]; issueCount: number };
-    expect(details.issues.length).toBe(MAX_ECHOED_ISSUES);
-    expect(details.issueCount).toBeGreaterThan(MAX_ECHOED_ISSUES);
+    // zod ≥ 4.6.6 (GHSA-mrhx-c7xc-m3w5) stops an over-long array at its length check: one issue.
+    expect(details.issues.length).toBeLessThanOrEqual(MAX_ECHOED_ISSUES);
+    expect(details.issueCount).toBe(details.issues.length);
     expect(sizeOf(answer)).toBeLessThan(16_384);
+  });
+
+  it("nodes.ts parse: a full batch of bad ids (every element its own issue) → exactly MAX_ECHOED_ISSUES echoed, all counted", async () => {
+    const owner = await member();
+    const answer = await api(asCaller(owner), "/nodes/download-urls", {
+      json: { nodeIds: badIds(ZIP_URL_BATCH) },
+    });
+    expect(answer.status).toBe(400);
+    const details = errorOf(answer).details as { issues: unknown[]; issueCount: number };
+    expect(ZIP_URL_BATCH).toBeGreaterThan(MAX_ECHOED_ISSUES);
+    expect(details.issues.length).toBe(MAX_ECHOED_ISSUES);
+    expect(details.issueCount).toBe(ZIP_URL_BATCH);
   });
 
   it("links.ts parse (a public route): 10,000 bad ids under a real link → a small 400", async () => {
