@@ -11,6 +11,7 @@
 #   deploy-lib.sh containers-plan <base-url> <sha>   build the scanner image, or leave containers alone?
 #   deploy-lib.sh worker-ready <worker>              the Worker exists, has a deployment and its secrets
 #   deploy-lib.sh cvd-cache                          fill containers/clamav/cvd/ (R2 cache, else one freshclam)
+#   deploy-lib.sh prune-images <app> <worker> [--delete]   drop registry tags no rollback can need
 #   deploy-lib.sh secrets <worker>                   the Worker has the nine secret names
 #   deploy-lib.sh utc-zone                           the database in DATABASE_URL_DIRECT keeps UTC time
 #   deploy-lib.sh migrate <apply|none-pending> <local|remote>   utc-zone, then drizzle migrations, counted
@@ -621,6 +622,83 @@ cmd_cvd_cache() {
   echo "cvd-cache: OK ($(du -sh "$dir" | cut -f1) in containers/clamav/cvd)"
 }
 
+# ── prune-images ─────────────────────────────────────────────────────────────────────────────────
+# The account's container registry holds 50 GB, and every image build pushes a ~250 MB image that
+# nothing removes (R1 perfops-4: the daily scanner refresh alone fills it in about 200 days, after
+# which every push fails — a deploy that has already migrated included). This removes the tags of
+# ONE repository (the container application's own) that no rollback can need, and nothing on doubt:
+#   - kept: the image the live application runs (named in `containers list`; a `--containers-rollout
+#     none` deploy pushes nothing, so it can be older than every version), and the tag of every
+#     version `versions list` shows (wrangler tags an image with the first segment of the version
+#     id that pushed it) — the rollback window is those versions;
+#   - only tags shaped like a version-id segment (8 hex) are ever deleted;
+#   - any listing that cannot be read or does not look as expected → exit 1 and nothing deleted
+#     (a live image named by digest, the repository missing or listed twice, the live tag absent
+#     from the registry, no tag matching any version — a changed tag format).
+# Cloudflare: deleting an image breaks a later rollback to a version that uses it
+# (containers/guides/image-management, "Registry limits").
+plan_prune() { # <application name> <containers list.json> <versions list.json> <images list.json>
+  local app="$1" apps="$2" versions="$3" images="$4" f count live_ref live repo tag kept
+  for f in "$apps" "$versions" "$images"; do
+    [ -f "$f" ] && json_tail <"$f" | jq -e 'type == "array"' >/dev/null 2>&1 ||
+      { echo "prune-images: $(basename "$f") is not a JSON list"; return 1; }
+  done
+  count="$(json_tail <"$apps" | jq --arg app "$app" '[.[] | select(.name == $app)] | length')"
+  [ "$count" = 1 ] || { echo "prune-images: $count container applications named '$app' (expected 1)"; return 1; }
+  live_ref="$(json_tail <"$apps" | jq -r --arg app "$app" '.[] | select(.name == $app) | .image // ""')"
+  case "$live_ref" in
+    "") echo "prune-images: '$app' names no image"; return 1 ;;
+    *@*) echo "prune-images: the live image is named by digest ($live_ref): its tag cannot be told"; return 1 ;;
+  esac
+  live="${live_ref##*/}"
+  repo="${live%%:*}"
+  tag="${live#*:}"
+  [ -n "$repo" ] && [ -n "$tag" ] && [ "$tag" != "$live" ] ||
+    { echo "prune-images: the live image '$live_ref' is not REPOSITORY:TAG"; return 1; }
+  [ "$repo" = "$app" ] || { echo "prune-images: the live image is in '$repo', not '$app'"; return 1; }
+  kept="$(json_tail <"$versions" | jq -r '.[].id // empty | split("-")[0]' | sort -u)"
+  [ -n "$kept" ] || { echo "prune-images: no version could be read"; return 1; }
+  count="$(json_tail <"$images" | jq --arg repo "$repo" '[.[] | select(.name == $repo)] | length')"
+  [ "$count" = 1 ] || { echo "prune-images: '$repo' is listed $count times in the registry (expected 1)"; return 1; }
+  json_tail <"$images" | jq -r --arg repo "$repo" '.[] | select(.name == $repo) | .tags[]' | sort -u >"$images.tags"
+  grep -qxF -- "$tag" "$images.tags" || { echo "prune-images: the live tag $tag is not in the registry"; return 1; }
+  printf '%s\n' "$kept" | grep -qxFf - "$images.tags" ||
+    { echo "prune-images: no tag in '$repo' belongs to a listed version — has the tag format changed?"; return 1; }
+  { printf '%s\n' "$kept"; echo "$tag"; } | grep -vxFf - "$images.tags" | grep -E '^[0-9a-f]{8}$' | sed "s|^|$repo:|" || true
+}
+
+cmd_prune_images() {
+  [ "$#" -ge 2 ] || fail "usage: deploy-lib.sh prune-images <container application> <worker> [--delete]"
+  need jq npx
+  local app="$1" worker="$2" mode="${3:-}" tmp ref plan deleted=0
+  [ -z "$mode" ] || [ "$mode" = "--delete" ] || fail "prune-images: unknown option '$mode'"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/holdfast-prune.XXXXXX")"
+  (cd "$repo_root" && npx wrangler containers list --json) >"$tmp/apps.json" 2>/dev/null ||
+    { rm -rf "$tmp" && fail "prune-images: the container applications cannot be listed; nothing was deleted"; }
+  (cd "$repo_root" && npx wrangler versions list --name "$worker" --json) >"$tmp/versions.json" 2>/dev/null ||
+    { rm -rf "$tmp" && fail "prune-images: the versions of '$worker' cannot be listed; nothing was deleted"; }
+  # wrangler matches --filter against "<account id>/<repository>".
+  (cd "$repo_root" && npx wrangler containers images list --json --filter "/${app//./\\.}\$") >"$tmp/images.json" 2>/dev/null ||
+    { rm -rf "$tmp" && fail "prune-images: the registry cannot be listed; nothing was deleted"; }
+  plan="$(plan_prune "$app" "$tmp/apps.json" "$tmp/versions.json" "$tmp/images.json")" ||
+    { echo "$plan"; rm -rf "$tmp"; fail "prune-images: in doubt; nothing was deleted"; }
+  rm -rf "$tmp"
+  if [ -z "$plan" ]; then
+    echo "prune-images: nothing to delete in '$app'"
+    return 0
+  fi
+  if [ "$mode" != "--delete" ]; then
+    printf 'prune-images: would delete %s (dry run)\n' $plan
+    return 0
+  fi
+  for ref in $plan; do
+    (cd "$repo_root" && npx wrangler containers images delete "$ref" -y) ||
+      fail "prune-images: deleting $ref failed after $deleted deletion(s)"
+    deleted=$((deleted + 1))
+  done
+  echo "prune-images: deleted $deleted tag(s) from '$app'"
+}
+
 # ── migrate ──────────────────────────────────────────────────────────────────────────────────────
 # drizzle-kit prints the same success line whether it applied ten files or none, so this counts
 # the rows of its bookkeeping table against the journal instead of reading its prose.
@@ -1160,6 +1238,85 @@ STUB
   expect fail "no DATABASE_URL_DIRECT → not checked" env -u DATABASE_URL_DIRECT bash "${BASH_SOURCE[0]}" utc-zone
   expect fail "DATABASE_URL_DIRECT that is not a postgres URL → not checked" env DATABASE_URL_DIRECT=mysql://localhost/x bash "${BASH_SOURCE[0]}" utc-zone
 
+  echo "prune-images (which registry tags may go):"
+  # Made-up listings in the shapes wrangler 4.148 prints for `containers list --json`,
+  # `versions list --json` and `containers images list --json`. Tags are the first segment of the
+  # version id that pushed them. The LIVE image sits on an OLD tag (aaaaaaaa): a run of
+  # `--containers-rollout none` deploys pushes no image, so the running one can be older than
+  # every listed version.
+  local app="holdfast-scannercontainer-production" pr="$tmp/prune"
+  mkdir -p "$pr"
+  jq -n --arg app "$app" '[{id:"a03d8c88-0000",name:$app,image:("registry.cloudflare.com/0123abcd/" + $app + ":aaaaaaaa")},
+    {id:"a035c648-0000",name:"holdfast-dev-scannercontainer",image:"registry.cloudflare.com/0123abcd/holdfast-dev-scannercontainer:dddddddd"}]' >"$pr/apps.json"
+  jq -n '[{id:"11111111-2222-4333-8444-555555555555"},{id:"22222222-2222-4333-8444-555555555555"},{id:"33333333-2222-4333-8444-555555555555"}]' >"$pr/versions.json"
+  jq -n --arg app "$app" '[{name:$app,tags:["11111111","22222222","33333333","aaaaaaaa","bbbbbbbb","cccccccc","latest"]}]' >"$pr/images.json"
+  prune_is() { # <expected deletions, space-separated, sorted> <apps> <versions> <images>
+    local want="$1" got
+    shift
+    got="$(plan_prune "$app" "$@" | tr '\n' ' ' | sed 's/ $//')" || return 1
+    [ "$got" = "$want" ] || { echo "planned: '$got' expected: '$want'"; return 1; }
+  }
+  expect pass "deletes only tags of no listed version and not live; keeps the live image on its old tag; never a non-version tag" \
+    prune_is "$app:bbbbbbbb $app:cccccccc" "$pr/apps.json" "$pr/versions.json" "$pr/images.json"
+  jq --arg app "$app" '[{name:$app,tags:["11111111","aaaaaaaa"]}]' -n >"$pr/images-none.json"
+  expect pass "nothing to delete is a pass with an empty plan" prune_is "" "$pr/apps.json" "$pr/versions.json" "$pr/images-none.json"
+  jq --arg app "$app" 'map(if .name == $app then .image = ("registry.cloudflare.com/0123abcd/" + $app + "@sha256:" + ("0" * 64)) else . end)' "$pr/apps.json" >"$pr/apps-digest.json"
+  expect fail "live image named by digest (which tag it is cannot be told)" plan_prune "$app" "$pr/apps-digest.json" "$pr/versions.json" "$pr/images.json"
+  jq --arg app "$app" 'map(select(.name != $app))' "$pr/apps.json" >"$pr/apps-none.json"
+  expect fail "no container application of that name" plan_prune "$app" "$pr/apps-none.json" "$pr/versions.json" "$pr/images.json"
+  jq '. + [.[0]]' "$pr/apps.json" >"$pr/apps-two.json"
+  expect fail "two container applications of that name" plan_prune "$app" "$pr/apps-two.json" "$pr/versions.json" "$pr/images.json"
+  jq --arg app "$app" 'map(if .name == $app then .image = "registry.cloudflare.com/0123abcd/other-repo:aaaaaaaa" else . end)' "$pr/apps.json" >"$pr/apps-otherrepo.json"
+  expect fail "the live image is in another repository" plan_prune "$app" "$pr/apps-otherrepo.json" "$pr/versions.json" "$pr/images.json"
+  jq --arg app "$app" 'map(if .name == $app then .image = "" else . end)' "$pr/apps.json" >"$pr/apps-noimage.json"
+  expect fail "the application names no image" plan_prune "$app" "$pr/apps-noimage.json" "$pr/versions.json" "$pr/images.json"
+  echo '[]' >"$pr/versions-empty.json"
+  expect fail "no version could be read" plan_prune "$app" "$pr/apps.json" "$pr/versions-empty.json" "$pr/images.json"
+  jq --arg app "$app" '[{name:$app,tags:["11111111","22222222","33333333","bbbbbbbb"]}]' -n >"$pr/images-nolive.json"
+  expect fail "the live tag is not in the registry listing" plan_prune "$app" "$pr/apps.json" "$pr/versions.json" "$pr/images-nolive.json"
+  jq --arg app "$app" '[{name:$app,tags:["aaaaaaaa","bbbbbbbb","cccccccc"]}]' -n >"$pr/images-noversion.json"
+  expect fail "no tag is a listed version's (the tag format changed?)" plan_prune "$app" "$pr/apps.json" "$pr/versions.json" "$pr/images-noversion.json"
+  echo '[]' >"$pr/images-empty.json"
+  expect fail "the repository is not in the registry listing" plan_prune "$app" "$pr/apps.json" "$pr/versions.json" "$pr/images-empty.json"
+  jq '. + .' "$pr/images.json" >"$pr/images-two.json"
+  expect fail "the repository is listed twice" plan_prune "$app" "$pr/apps.json" "$pr/versions.json" "$pr/images-two.json"
+  echo 'not json' >"$pr/garbage.json"
+  expect fail "a listing that is not JSON" plan_prune "$app" "$pr/garbage.json" "$pr/versions.json" "$pr/images.json"
+  expect fail "a listing that is not there" plan_prune "$app" "$pr/apps.json" "$pr/versions.json" "$pr/absent.json"
+
+  # The command end to end, against a stub `npx` that answers from the files above and records
+  # every call; no Cloudflare token is in its environment. A dry run (the default) deletes nothing.
+  mkdir -p "$pr/bin"
+  cat >"$pr/bin/npx" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$PRUNE_STUB_DIR/calls"
+case "$*" in
+  "wrangler containers list --json") [ -n "${PRUNE_STUB_FAIL_APPS:-}" ] && exit 1; cat "$PRUNE_STUB_DIR/apps.json" ;;
+  "wrangler versions list --name "*" --json") cat "$PRUNE_STUB_DIR/versions.json" ;;
+  "wrangler containers images list --json --filter "*) cat "$PRUNE_STUB_DIR/images.json" ;;
+  "wrangler containers images delete "*" -y") echo "Deleted ${4}" ;;
+  *) echo "stub npx: unexpected call: $*" >&2; exit 3 ;;
+esac
+STUB
+  chmod +x "$pr/bin/npx"
+  prune_run() { # <expected delete calls, space-separated> <args...>
+    local want="$1" got
+    shift
+    : >"$pr/calls"
+    env -u CLOUDFLARE_API_TOKEN -u CLOUDFLARE_ACCOUNT_ID PATH="$pr/bin:$PATH" PRUNE_STUB_DIR="$pr" \
+      bash "${BASH_SOURCE[0]}" prune-images "$app" holdfast "$@" || return 1
+    got="$(sed -n 's/^wrangler containers images delete \(.*\) -y$/\1/p' "$pr/calls" | tr '\n' ' ' | sed 's/ $//')"
+    [ "$got" = "$want" ] || { echo "delete calls: '$got' expected: '$want'"; cat "$pr/calls"; return 1; }
+  }
+  expect pass "dry run (the default): lists, deletes nothing" prune_run ""
+  expect pass "--delete: one call per planned tag, each with -y" prune_run "$app:bbbbbbbb $app:cccccccc" --delete
+  prune_unreadable() { PRUNE_STUB_FAIL_APPS=1 prune_run "" --delete; }
+  expect fail "the application list cannot be read → fails, deletes nothing" prune_unreadable
+  [ ! -s "$pr/calls" ] || ! grep -q 'images delete' "$pr/calls" || { echo "  WRONG an unreadable list still deleted"; failures=$((failures + 1)); }
+  cp "$pr/apps-digest.json" "$pr/apps.json"
+  expect fail "a doubt (digest live image) → fails, deletes nothing" prune_run "" --delete
+  if grep -q 'images delete' "$pr/calls"; then echo "  WRONG a doubt still deleted"; failures=$((failures + 1)); else echo "  ok    no delete call after a doubt"; fi
+
   echo "redaction:"
   redacts() { [ "$(printf 'error connecting to postgresql://user:pw@ep-x.neon.tech/neondb?sslmode=require now\n' | redact)" = "error connecting to <database-url> now" ]; }
   expect pass "a database URL in tool output is replaced" redacts
@@ -1179,6 +1336,7 @@ case "$command" in
   branch-head) cmd_branch_head "$@" ;;
   containers-plan) cmd_containers_plan "$@" ;;
   cvd-cache) cmd_cvd_cache "$@" ;;
+  prune-images) cmd_prune_images "$@" ;;
   live-migration-rule) cmd_live_migration_rule "$@" ;;
   worker-ready) cmd_worker_ready "$@" ;;
   secrets) cmd_secrets "$@" ;;
@@ -1187,7 +1345,7 @@ case "$command" in
   utc-zone-self-test) cmd_utc_zone_self_test "$@" ;;
   self-test) cmd_self_test "$@" ;;
   *)
-    sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 2
     ;;
 esac

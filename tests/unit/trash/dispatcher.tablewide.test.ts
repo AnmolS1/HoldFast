@@ -5,11 +5,11 @@
 // calls `scheduled()` or `runScheduled` with an expression a job listens to. The reconcile job
 // persists `settings.reconcileCursor`; the value found is put back in `afterAll`.
 import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sweepExpiredVerifications } from "../../../src/worker/db/queries/auth-lifecycle";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
-import { settings as settingsTable, verification } from "../../../src/worker/db/schema";
+import { downloadLedger, settings as settingsTable, verification } from "../../../src/worker/db/schema";
 import {
   JOB_SOFT_DEADLINE_MS,
   jobNames,
@@ -20,12 +20,14 @@ import {
   type Job,
 } from "../../../src/worker/jobs/index";
 import { parts as abuseParts } from "../../../src/worker/jobs/abuse-hourly";
+import { backupMissingAlarm } from "../../../src/worker/jobs/backup";
 import { job as operatorDigests } from "../../../src/worker/jobs/operator-digests";
 import { detectRollback } from "../../../src/worker/jobs/reconcile";
 import { job as verificationSweep } from "../../../src/worker/jobs/verification-sweep";
 import { HOURLY_CRON, NIGHTLY_CRON, scheduled } from "../../../src/worker/scheduled";
 import { captureError } from "../../../src/worker/sentry";
 import { flushOperatorDigests } from "../../../src/worker/services/email";
+import { list as outbox } from "../../../src/worker/services/outbox";
 import { cronEvent, gate, generationInStep, jobContext, makeUpload, member, rand, testDb } from "./helpers";
 
 // The rollback detector reads "ok" for the guarded jobs this file runs.
@@ -41,6 +43,12 @@ vi.mock("../../../src/worker/sentry", async (original) => {
   return { ...real, captureError: vi.fn(real.captureError) };
 });
 
+// The watchdog's alarm (R1 perfops-5), counted where the dispatcher calls it. The backup job's own
+// tail calls the module-internal binding, which this does not see.
+vi.mock("../../../src/worker/jobs/backup", async (original) => {
+  const real = await original<typeof import("../../../src/worker/jobs/backup")>();
+  return { ...real, backupMissingAlarm: vi.fn(real.backupMissingAlarm) };
+});
 vi.mock("../../../src/worker/services/email", async (original) => {
   const real = await original<typeof import("../../../src/worker/services/email")>();
   return { ...real, flushOperatorDigests: vi.fn(real.flushOperatorDigests) };
@@ -101,6 +109,15 @@ function watch(stub: boolean) {
   }
   return ran;
 }
+
+/** The jobs the dispatcher counted as having run to their end (`job{kind:"slot", outcome:"ran"}`). */
+const ranJobs = (job: ReturnType<typeof jobContext>) =>
+  job.metric.mock.calls
+    .filter(([name, tags]) => name === "job" && (tags as { kind?: string }).kind === "slot")
+    .map(
+      ([, tags]) =>
+        `${(tags as { outcome?: string }).outcome === "ran" ? "" : "?"}${(tags as { reason?: string }).reason}`,
+    );
 
 async function plantExpired(): Promise<string> {
   const id = `dispatch${rand(12)}`;
@@ -168,6 +185,9 @@ describe("the registry", () => {
       // One reading, handed to every guarded job of the slot; this file's numbers are in step.
       expect(readings.size).toBe(1);
       expect([...readings][0]).toMatchObject({ state: "ok" });
+      // Each job that returned is counted as having run (R1 perfops-5: a slot killed mid-way, or a
+      // trigger that stopped firing, shows as a missing `ran` — alerts.md C10); its own outcomes untouched.
+      expect(ranJobs(job)).toEqual(names);
       expect(job.outcomes(names[0]!)).toEqual([]);
     },
   );
@@ -208,6 +228,8 @@ describe("the registry", () => {
     expect(ran).toEqual(["restore-heartbeat", "abuse-hourly", "operator-digests"]);
     expect(job.metric.mock.calls).toContainEqual(["job", { kind: "stale-uploads", outcome: "error" }]);
     expect(job.outcomes("abuse-hourly")).toEqual([]);
+    // The one that threw did not run to its end: counted as an error, never as run.
+    expect(ranJobs(job)).toEqual(["restore-heartbeat", "abuse-hourly", "operator-digests"]);
   });
 
   it("does not resolve before a slow job has finished, and starts the next only after it", async () => {
@@ -250,6 +272,97 @@ describe("the registry", () => {
     expect(reconcile[2].cron).toBe("0 2 * * *");
     expect(reconcile[3]).toEqual({ softDeadlineMs: 120_000 });
     expect(vi.mocked(jobs[0]!.run).mock.calls[0]![3]).toEqual({ softDeadlineMs: 5 });
+  });
+});
+
+// R1 perfops-5: a 02:00 pass that is killed (CPU or wall time) never reaches the backup's tail, so
+// its own `backup_missing` alarm never runs — and a slot that dies every night reports nothing.
+// The 00:05 slot (on dev and prod alike) asks the same question about the night before, after its
+// own jobs; `claimDaily` keeps it to one mail a day with the 02:00 tail.
+describe("the watchdog: the 00:05 slot asks whether last night's backup completed", () => {
+  const OPERATOR = `p7-watchdog-${rand()}@example.test`; // made up, reserved domain
+  const claimedDays: string[] = [];
+  afterAll(async () => {
+    for (const day of claimedDays) {
+      await testDb()
+        .delete(downloadLedger)
+        .where(and(eq(downloadLedger.day, day), eq(downloadLedger.subjectId, "backup_missing")));
+    }
+  });
+
+  it("only the 00:05 slot runs it, once, AFTER its own jobs, at the slot's scheduled time", async () => {
+    const ran = watch(true);
+    const alarm = vi.mocked(backupMissingAlarm);
+    alarm.mockClear();
+    alarm.mockImplementationOnce(async () => {
+      ran.push("watchdog");
+      return "quiet";
+    });
+    for (const cron of Object.keys(SLOTS)) {
+      ran.length = 0;
+      const event = cronEvent(cron);
+      const job = jobContext();
+      await runScheduled(event, env, ctx, job.bg);
+      if (cron === "5 0 * * *") {
+        expect(ran, cron).toEqual([...SLOTS[cron]!, "watchdog"]);
+        expect(alarm).toHaveBeenCalledTimes(1);
+        expect(alarm.mock.calls[0]![0]).toBe(job.bg);
+        expect(alarm.mock.calls[0]![1]).toEqual(new Date(event.scheduledTime));
+      } else {
+        expect(ran, cron).toEqual(SLOTS[cron]);
+      }
+    }
+    expect(alarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("a watchdog that throws is reported and counted; the slot still resolves", async () => {
+    watch(true);
+    vi.mocked(backupMissingAlarm).mockRejectedValueOnce(new Error("bucket unreadable"));
+    const reported = vi.mocked(captureError).mock.calls.length;
+    const job = jobContext();
+    await expect(runScheduled(cronEvent("5 0 * * *"), env, ctx, job.bg)).resolves.toBeUndefined();
+    expect(job.metric.mock.calls).toContainEqual([
+      "job",
+      { kind: "watchdog", outcome: "error", reason: "backup_missing" },
+    ]);
+    expect(vi.mocked(captureError).mock.calls.slice(reported)).toContainEqual([
+      expect.objectContaining({ message: "bucket unreadable" }),
+      { kind: "job", job: "watchdog", reason: "backup_missing" },
+    ]);
+  });
+
+  it("for real: a night with no backup set → the next 00:05 mails backup_missing once, and that day's 02:00 tail finds the day claimed", async () => {
+    watch(true);
+    // A far-future day this test owns (2100–2199; the alarm file draws 2200–2999): no backup set
+    // exists for the day before it, and no marker for it.
+    let at: Date;
+    for (;;) {
+      const year = 2100 + (crypto.getRandomValues(new Uint32Array(1))[0]! % 100);
+      const day = 1 + (crypto.getRandomValues(new Uint8Array(1))[0]! % 28);
+      at = new Date(Date.UTC(year, 5, day, 0, 5, 0));
+      const iso = at.toISOString().slice(0, 10);
+      const [taken] = await testDb()
+        .select({ day: downloadLedger.day })
+        .from(downloadLedger)
+        .where(eq(downloadLedger.day, iso))
+        .limit(1);
+      if (!taken) break;
+    }
+    claimedDays.push(at.toISOString().slice(0, 10));
+    const criticals = () =>
+      outbox({ to: OPERATOR }).filter(
+        (mail) =>
+          mail.template === "operatorCritical" && (mail.text ?? "").includes("backup did not complete"),
+      );
+    const job = jobContext({ env: { ADMIN_EMAILS: OPERATOR } });
+    await runScheduled({ cron: "5 0 * * *", scheduledTime: at.getTime(), noRetry() {} }, env, ctx, job.bg);
+    expect(criticals()).toHaveLength(1);
+    // The same day's 02:00 tail: already said.
+    const tail = new Date(at.getTime() + (2 * 60 - 5) * 60_000);
+    expect(await backupMissingAlarm(jobContext({ env: { ADMIN_EMAILS: OPERATOR } }).bg, tail)).toBe(
+      "claimed",
+    );
+    expect(criticals()).toHaveLength(1);
   });
 });
 

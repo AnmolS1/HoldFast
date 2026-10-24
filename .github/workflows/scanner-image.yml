@@ -55,6 +55,8 @@ jobs:
     env:
       CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
       WORKER: holdfast
+      # The production container application, and its image repository (EXECUTION 2026-10-22 02:12).
+      SCANNER_APP: holdfast-scannercontainer-production
       APP_URL: https://holdfast.ponderance.dev
       FILES_URL: https://holdfastusercontent.com
     steps:
@@ -144,7 +146,9 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy --env production
+          # The commit, on the Worker version; a daily refresh redeploys the same commit, so it says so.
+          MESSAGE: scanner-image ${{ steps.commit.outputs.sha }} (daily signature refresh)
+        run: npx wrangler deploy --env production --message "$MESSAGE"
 
       - name: Build stamp is unchanged
         if: steps.guard.outputs.real == 'true'
@@ -157,3 +161,13 @@ jobs:
         run: |
           bash .github/workflows/lib/deploy-lib.sh health "$APP_URL"
           bash .github/workflows/lib/deploy-lib.sh files-host "$FILES_URL/"
+
+      # A daily push of a ~250 MB image fills the account's 50 GB registry in about 200 days, and then
+      # every push fails (R1 perfops-4). Keeps the live image and every listed version's (the
+      # rollback window); deletes nothing, and goes red, on any doubt. Last, after the checks.
+      - name: Drop registry images no rollback can need
+        if: steps.guard.outputs.real == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash .github/workflows/lib/deploy-lib.sh prune-images "$SCANNER_APP" "$WORKER" --delete
