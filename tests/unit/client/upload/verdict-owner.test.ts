@@ -20,6 +20,7 @@ import {
   settle,
   smallFile,
   type Server,
+  askIds,
 } from "./helpers";
 
 setupShell();
@@ -36,8 +37,8 @@ beforeEach(async () => {
   held = null;
   holding = false;
   server.onJson = (call) => {
-    if (!holding || call.method !== "POST" || !SCAN_ASK.test(call.path)) return undefined;
-    const { ids } = call.body as { ids: string[] };
+    if (!holding || call.method !== "GET" || !SCAN_ASK.test(call.path)) return undefined;
+    const ids = askIds(call);
     return new Promise<Response>((resolve) => {
       held = (status) =>
         resolve(

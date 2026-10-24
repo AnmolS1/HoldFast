@@ -1,5 +1,5 @@
 // Watching a pending scan: every 5 s for two minutes, then every 30 s with "Still scanning". Every
-// file that is due is asked in ONE request, `POST /api/nodes/scan-status` (R1 m16); the answer is
+// file that is due is asked in ONE request, `GET /api/nodes/scan-status?ids=…` (R1 m16); the answer is
 // `{ items }`, each the node as its GET would show it — the status is `.scanStatus`.
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -29,13 +29,16 @@ setupExplorer();
 
 const PENDING = fileNode(1, { name: "new.pdf", scanStatus: "pending" });
 const SCAN = /\/api\/nodes\/scan-status$/;
-const idsOf = (call: { body: unknown }) => (call.body as { ids: string[] }).ids;
+/** The same, on a path with its query string. */
+const SCAN_PATH = /\/api\/nodes\/scan-status(\?|$)/;
+const idsOf = (call: { path: string }) =>
+  (new URL(call.path, "http://app.invalid").searchParams.get("ids") ?? "").split(",").filter(Boolean);
 /** The scan requests that asked about `id`. */
 const asksAbout = (drive: FakeDrive, id: string) =>
-  drive.callsTo("POST", SCAN).filter((call) => idsOf(call).includes(id));
+  drive.callsTo("GET", SCAN).filter((call) => idsOf(call).includes(id));
 /** The same, over every request the stand-in server saw (answered by the drive or not). */
 const callsAbout = (calls: Array<{ path: string; body: unknown }>, id: string) =>
-  calls.filter((call) => SCAN.test(call.path) && idsOf(call).includes(id));
+  calls.filter((call) => SCAN_PATH.test(call.path) && idsOf(call).includes(id));
 
 /** Let `ms` pass, with everything that was waiting on it. */
 async function pass(ms: number): Promise<void> {
@@ -120,7 +123,9 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING]);
     let bare = true;
     await mount(drive, (call) =>
-      call.method === "POST" && SCAN.test(call.path) ? json(bare ? [clean] : { items: [clean] }) : undefined,
+      call.method === "GET" && SCAN_PATH.test(call.path)
+        ? json(bare ? [clean] : { items: [clean] })
+        : undefined,
     );
     await after(5_000);
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("pending");
@@ -152,7 +157,7 @@ describe("a pending file", () => {
   });
 
   it("a poll that fails with 500 is tried again; a file the answer leaves out (gone) takes the row away", async () => {
-    const drive = new FakeDrive([PENDING]).fail("POST", SCAN, 500, 1);
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 500, 1);
     await mount(drive);
     await after(5_000);
     expect(rowOf(PENDING.id)).not.toBeNull();
@@ -179,7 +184,7 @@ describe("a pending file", () => {
     );
     const drive = new FakeDrive(many);
     await mount(drive);
-    const requests = () => drive.callsTo("POST", SCAN);
+    const requests = () => drive.callsTo("GET", SCAN);
     await after(5_000);
     expect(requests()).toHaveLength(1);
     expect(new Set(idsOf(requests()[0]!))).toEqual(new Set(many.map((node) => node.id)));
@@ -195,26 +200,21 @@ describe("a pending file", () => {
     const drive = new FakeDrive([fileNode(2, { name: "ok.pdf" })]);
     await mount(drive);
     await after(60_000);
-    expect(drive.callsTo("POST", SCAN)).toHaveLength(0);
+    expect(drive.callsTo("GET", SCAN)).toHaveLength(0);
   });
 
-  it("a 403 for the request ends the watch of the files in it: they are never asked for again; a file pending later is", async () => {
-    const other = fileNode(2, { name: "other.pdf", scanStatus: "pending" });
-    const drive = new FakeDrive([PENDING]).fail("POST", SCAN, 403, 1);
+  it("a 403 for the whole request says nothing about any one file: the loop backs off and asks again", async () => {
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 403, 1);
     await mount(drive);
     await after(5_000);
+    // The refused request reached the drive (and was answered 403 there).
     expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
-    await after(120_000);
-    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
-    // The row stays as it was.
     expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("pending");
-    drive.add(other);
-    act(() => emitNodesChanged([null]));
-    await pass(1);
-    await pass(1);
-    await pass(60_000);
-    expect(asksAbout(drive, other.id).length).toBeGreaterThan(5);
-    expect(asksAbout(drive, PENDING.id)).toHaveLength(1);
+    // Backed off 5 s, then asked again.
+    drive.nodes.set(PENDING.id, { ...PENDING, scanStatus: "clean" });
+    await after(15_000);
+    expect(asksAbout(drive, PENDING.id)).toHaveLength(2);
+    expect(rowOf(PENDING.id)!.getAttribute("data-scan")).toBe("clean");
   });
 
   it("429 makes the whole loop wait Retry-After — for every file, not only the one refused", async () => {
@@ -222,20 +222,20 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING, other]);
     let refuse = true;
     await mount(drive, (call) =>
-      refuse && call.method === "POST" && SCAN.test(call.path)
+      refuse && call.method === "GET" && SCAN_PATH.test(call.path)
         ? envelope("rate_limited", 429, undefined, { "retry-after": "40" })
         : undefined,
     );
     await after(5_000);
     // The one request was refused (the drive answered nothing).
-    const asked = () => drive.callsTo("POST", SCAN).length;
+    const asked = () => drive.callsTo("GET", SCAN).length;
     expect(asked()).toBe(0);
     refuse = false;
     await before(45_000);
     expect(asked()).toBe(0);
     await after(45_000);
     expect(asked()).toBe(1);
-    expect(new Set(idsOf(drive.callsTo("POST", SCAN)[0]!))).toEqual(new Set([PENDING.id, other.id]));
+    expect(new Set(idsOf(drive.callsTo("GET", SCAN)[0]!))).toEqual(new Set([PENDING.id, other.id]));
   });
 
   it("Retry-After is honoured up to a bound, and a 429 without one waits half a minute", () => {
@@ -256,7 +256,7 @@ describe("a pending file", () => {
       POLL_BACKOFF_MAX_MS,
       POLL_BACKOFF_MAX_MS,
     ]);
-    const drive = new FakeDrive([PENDING]).fail("POST", SCAN, 500);
+    const drive = new FakeDrive([PENDING]).fail("GET", SCAN, 500);
     await mount(drive);
     const count = () => asksAbout(drive, PENDING.id).length;
     // Questions at 5, 10, 20, 40, 80 s: five in the first 100 s where a fixed rate would send 20.
@@ -331,7 +331,7 @@ describe("a pending file", () => {
     const drive = new FakeDrive([PENDING]);
     let release: (response: Response) => void = () => {};
     await mount(drive, (call) =>
-      call.method === "POST" && SCAN.test(call.path)
+      call.method === "GET" && SCAN_PATH.test(call.path)
         ? new Promise<Response>((resolve) => {
             release = resolve;
           })
@@ -356,7 +356,7 @@ describe("a pending file", () => {
     // not change across the purge — only the account check can stop the answer.
     let release: (response: Response) => void = () => {};
     const calls = serveDrive(new FakeDrive([PENDING]), (call) =>
-      SCAN.test(call.path)
+      SCAN_PATH.test(call.path)
         ? new Promise<Response>((resolve) => {
             release = resolve;
           })

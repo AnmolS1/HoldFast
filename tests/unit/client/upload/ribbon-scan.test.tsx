@@ -26,6 +26,7 @@ import {
   askedAbout,
   SCAN_ASK,
   scanAsks,
+  askIds,
 } from "./helpers";
 
 setupShell();
@@ -49,10 +50,10 @@ beforeEach(async () => {
   // A verdict per node, at its own time: the scanner answers each file when it is done with it.
   // The loop asks about every due file in one request (R1 m16).
   server.onJson = (call) => {
-    if (call.method !== "POST" || !SCAN_ASK.test(call.path)) return undefined;
+    if (call.method !== "GET" || !SCAN_ASK.test(call.path)) return undefined;
     asking += 1;
     peak = Math.max(peak, asking);
-    const items = (call.body as { ids: string[] }).ids.map((id) => {
+    const items = askIds(call).map((id) => {
       const at = verdictAt.get(id);
       return nodeDto({ id, scanStatus: at !== undefined && Date.now() >= at ? verdict : "pending" });
     });
@@ -80,7 +81,7 @@ function openWindow(): () => Promise<void> {
     await purging;
   };
 }
-const polls = () => server.count("POST", SCAN_ASK);
+const polls = () => server.count("GET", SCAN_ASK);
 const ribbon = () => summarise(getUploads());
 const hide = (hidden: boolean) => {
   vi.spyOn(document, "visibilityState", "get").mockReturnValue(hidden ? "hidden" : "visible");

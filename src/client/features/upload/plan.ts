@@ -25,7 +25,7 @@ export const COMPLETE_WAIT_LIMIT_MS = 120_000;
 /**
  * The scan is followed by ONE loop for the whole queue: at most one request per interval however
  * many files wait — every file that is due, up to `SCAN_BATCH_MAX`, in that one request
- * (`POST /api/nodes/scan-status`) — each file until its verdict or for at most
+ * (`GET /api/nodes/scan-status`) — each file until its verdict or for at most
  * `SCAN_FOLLOW_LIMIT_MS`.
  */
 export const SCAN_INTERVAL_MS = 1_000;

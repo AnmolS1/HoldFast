@@ -1,4 +1,4 @@
-// POST /api/nodes/scan-status (R1 m16): the scan state of many files in one request, answered as
+// GET /api/nodes/scan-status?ids=… (R1 m16): the scan state of many files in one request, answered as
 // `GET /api/nodes/:id` answers each — and every id that route would not answer with a file is left
 // out the same way, for the same work (no existence oracle).
 import { describe, expect, it } from "vitest";
@@ -6,7 +6,9 @@ import { HEADER_USER } from "../../../src/shared/constants";
 import { NodeDto, SCAN_STATUS_MAX_IDS, type ScanStatusResponse } from "../../../src/shared/schemas/node";
 import { SCAN_BATCH_MAX } from "../../../src/client/features/upload/plan";
 import { makeFile, makeFolder, makeShare, testDb } from "../services-core/helpers";
-import { call, uploader } from "../uploads/helpers";
+import { api as asCaller } from "../sharing/helpers";
+import { call, ROOMY, uploader } from "../uploads/helpers";
+import type { SessionUser } from "../../../src/worker/auth/types";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { nodes } from "../../../src/worker/db/schema";
 import { eq } from "drizzle-orm";
@@ -15,8 +17,7 @@ type Caller = Awaited<ReturnType<typeof uploader>>;
 
 async function ask(caller: Caller, ids: string[], options: Parameters<typeof call>[3] = {}) {
   const statements = { n: 0 };
-  const answer = await call<ScanStatusResponse>(caller, "POST", "/nodes/scan-status", {
-    json: { ids },
+  const answer = await call<ScanStatusResponse>(caller, "GET", `/nodes/scan-status?ids=${ids.join(",")}`, {
     statements,
     ...options,
   });
@@ -137,7 +138,7 @@ describe("bounds and the request's guards", () => {
     const me = await uploader();
     const many = Array.from({ length: SCAN_STATUS_MAX_IDS }, () => uuidv7());
     expect((await ask(me, many)).status).toBe(200);
-    for (const ids of [[], [...many, uuidv7()], ["not-an-id"]]) {
+    for (const ids of [[], [...many, uuidv7()], ["not-an-id"], [`${uuidv7()};drop`]]) {
       const answer = await ask(me, ids);
       expect(answer.status, JSON.stringify(ids).slice(0, 40)).toBe(400);
       expect(answer.body).toMatchObject({ error: "validation" });
@@ -161,11 +162,29 @@ describe("bounds and the request's guards", () => {
   it("signed out: 401; the identity pin: another account's header is refused", async () => {
     const me = await uploader();
     const other = await uploader();
-    expect((await call(null, "POST", "/nodes/scan-status", { json: { ids: [uuidv7()] } })).status).toBe(401);
+    expect((await call(null, "GET", `/nodes/scan-status?ids=${uuidv7()}`)).status).toBe(401);
     const pinned = await ask(me, [uuidv7()], { headers: { [HEADER_USER]: other.id } });
     expect(pinned.status).toBe(403);
     expect(pinned.body).toMatchObject({ details: { reason: "identity_mismatch" } });
     expect((await ask(me, [uuidv7()], { headers: { [HEADER_USER]: me.id } })).status).toBe(200);
+  });
+
+  it("a read: answered with the read-only switch on, for an impersonated session, and before new terms are accepted", async () => {
+    const me = await uploader();
+    const mine = await makeFile(me.id, null, { scanStatus: "pending" });
+    const readOnly = await ask(me, [mine.id], { settings: { ...ROOMY, readOnly: true } });
+    expect(readOnly.status).toBe(200);
+    expect(idsOf(readOnly)).toEqual([mine.id]);
+    const stale = await uploader({ termsVersion: "2000-01" });
+    const theirs = await makeFile(stale.id, null, { scanStatus: "pending" });
+    expect(idsOf(await ask(stale, [theirs.id]))).toEqual([theirs.id]);
+    const admin = await uploader();
+    const impersonated = await asCaller(
+      { user: me as unknown as SessionUser, impersonatedBy: admin.id },
+      `/nodes/scan-status?ids=${mine.id}`,
+    );
+    expect(impersonated.status).toBe(200);
+    expect((impersonated.body as ScanStatusResponse).items.map((item) => item.id)).toEqual([mine.id]);
   });
 
   it("behind RL_API: a refused limit is 429", async () => {

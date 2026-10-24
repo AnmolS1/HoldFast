@@ -1,5 +1,5 @@
 // Following the scan: ONE loop for the whole queue. However many files wait, it sends at most one
-// request a second — every file that is due in it (`POST /api/nodes/scan-status`, R1 m16) — backs
+// request a second — every file that is due in it (`GET /api/nodes/scan-status`, R1 m16) — backs
 // off when told to, stops asking about a file that is gone, does not ask while the tab is hidden,
 // and gives a file up after a bound.
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,7 @@ import {
   settle,
   smallFile,
   type Server,
+  askIds,
 } from "./helpers";
 
 setupShell();
@@ -120,7 +121,7 @@ describe("the scan loop", () => {
     server.onJson = (call) =>
       SCAN_ASK.test(call.path)
         ? json({
-            items: (call.body as { ids: string[] }).ids
+            items: askIds(call)
               .filter((id) => id !== first)
               .map((id) => nodeDto({ id, scanStatus: "pending" })),
           })
@@ -134,14 +135,16 @@ describe("the scan loop", () => {
     expect(about(second!)).toBeGreaterThan(1);
   });
 
-  it("the whole request refused with a 4xx (not 429): the files in it are followed no more", async () => {
+  it("the whole request refused with a 4xx says nothing about any one file: the loop backs off and the rows stay", async () => {
     await land(2);
     server.onJson = (call) => (SCAN_ASK.test(call.path) ? envelope("forbidden", 403) : undefined);
     await settle(2_000);
-    // Done with no verdict (and so no longer on the list once nothing is on its way).
-    expect(items().filter((item) => item.state === "scanning")).toEqual([]);
-    await settle(30_000);
+    expect(items().map((item) => item.state)).toEqual(["scanning", "scanning"]);
     expect(polls()).toHaveLength(1);
+    server.onJson = undefined;
+    server.scanStatus = "clean";
+    await settle(10_000);
+    expect(items()).toEqual([]);
   });
 
   it("nothing is asked while the tab is hidden; it goes on when the tab is back", async () => {

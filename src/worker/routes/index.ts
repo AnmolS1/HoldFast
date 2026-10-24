@@ -84,7 +84,7 @@ export const routeTable: readonly RouteRow[] = [
     ],
     fallback: ["/nodes/:id", "/nodes/:id/*"],
   },
-  { name: "scan-status", task: "R1 P5", claims: ["POST /nodes/scan-status"] },
+  { name: "scan-status", task: "R1 P5", claims: ["GET /nodes/scan-status"] },
   {
     name: "trash",
     task: "T14",

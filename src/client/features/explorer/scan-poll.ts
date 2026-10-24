@@ -1,15 +1,15 @@
 // Watching files that are still being scanned. A pending file is asked for every 5 s for two
 // minutes, then every 30 s and the row says "Still scanning". Every file that is due is asked in
-// ONE request (`POST /api/nodes/scan-status`, R1 m16): each answer is the file as
+// ONE request (`GET /api/nodes/scan-status`, R1 m16): each answer is the file as
 // `GET /api/nodes/:id` sends it; a file the answer leaves out is not there for us any more.
 //
 // ONE loop for the whole listing, and it is bounded every way round:
 //  - at most one request a tick, with at most POLL_PER_TICK files in it (the one asked longest
 //    ago first) — 12 requests a minute at most, however many files are pending;
-//  - a file left out of the answer ends its watch (it is gone, or no longer ours to read); a `4xx`
-//    other than `429` for the request ends the watch of the files in it;
-//  - `429` makes the whole loop wait `Retry-After`; `5xx` and a dead network back it off,
-//    doubling up to a minute — never the same rate against a server that is refusing;
+//  - a file left out of the answer ends its watch (it is gone, or no longer ours to read);
+//  - `429` makes the whole loop wait `Retry-After`; any other failure of the request (`5xx`, a
+//    dead network, a `4xx`) backs it off, doubling up to a minute — never the same rate against a
+//    server that is refusing;
 //  - nothing is asked while the tab is hidden or the page is not the one in front;
 //  - each file is watched for POLL_MAX_MS of time the loop could ASK — from the moment it became
 //    pending in this listing, not counting any time the loop was paused (tab hidden, page covered)
@@ -19,7 +19,7 @@
 //  - an answer that arrives after the account changed is dropped.
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeDto } from "../../../shared/schemas/node";
-import { SCAN_STATUS_MAX_IDS, ScanStatusResponse } from "../../../shared/schemas/node";
+import { SCAN_STATUS_MAX_IDS, ScanStatusResponse, scanStatusQuery } from "../../../shared/schemas/node";
 import { api, ApiError } from "../../lib/api";
 import { accountEpoch, sameAccount } from "../../lib/query";
 
@@ -52,11 +52,7 @@ export function penaltyAfter(cause: unknown, failures: number): number {
 
 /** The scan state of these files, in one request. */
 async function scanStatuses(ids: readonly string[]): Promise<NodeDto[]> {
-  const answer = await api("/api/nodes/scan-status", {
-    method: "POST",
-    body: { ids },
-    schema: ScanStatusResponse,
-  });
+  const answer = await api(`/api/nodes/scan-status?${scanStatusQuery(ids)}`, { schema: ScanStatusResponse });
   return answer.items;
 }
 
@@ -93,8 +89,6 @@ interface LoopState {
   since: Map<string, number>;
   /** When each was last asked for. */
   asked: Map<string, number>;
-  /** Files the server refused to be asked about (a `4xx` for their request): not asked again. */
-  refused: Set<string>;
   lastTick: number;
   /** Since when the loop has been paused (hidden, or not the page in front); null while it runs. */
   pausedSince: number | null;
@@ -121,7 +115,6 @@ export function useScanPolling(
   const loop = useRef<LoopState>({
     since: new Map(),
     asked: new Map(),
-    refused: new Set(),
     lastTick: 0,
     pausedSince: null,
     failures: 0,
@@ -149,7 +142,6 @@ export function useScanPolling(
       if (listed.has(id)) continue;
       state.since.delete(id);
       state.asked.delete(id);
-      state.refused.delete(id);
     }
     if (paused) return;
     if (state.pausedSince !== null) {
@@ -169,10 +161,7 @@ export function useScanPolling(
     // A file is asked for while its own watch lasts; one past it stays in `since` (so that it is
     // not taken for a new one) but is not asked for again.
     const watched = () =>
-      ids.filter(
-        (id) =>
-          state.since.has(id) && !state.refused.has(id) && Date.now() - state.since.get(id)! < POLL_MAX_MS,
-      );
+      ids.filter((id) => state.since.has(id) && Date.now() - state.since.get(id)! < POLL_MAX_MS);
     const last = (id: string) => state.asked.get(id) ?? state.since.get(id)!;
     // The wait after a question is decided by how long the file had been watched when it was asked.
     const waitOf = (id: string) => pollDelay(last(id) - state.since.get(id)!);
@@ -185,8 +174,7 @@ export function useScanPolling(
     // out included, so a file is never left without it once it is no longer asked about.
     const markSlow = (at: number) => {
       const overdue = ids.filter(
-        (id) =>
-          state.since.has(id) && !state.refused.has(id) && at - state.since.get(id)! >= POLL_FAST_FOR_MS,
+        (id) => state.since.has(id) && at - state.since.get(id)! >= POLL_FAST_FOR_MS,
       );
       if (overdue.length === 0) return;
       setSlow((current) =>
@@ -233,18 +221,10 @@ export function useScanPolling(
           }
         } catch (cause) {
           if (!live()) return;
-          if (
-            cause instanceof ApiError &&
-            cause.status >= 400 &&
-            cause.status < 500 &&
-            cause.status !== 429
-          ) {
-            for (const id of due) state.refused.add(id);
-          } else {
-            // Too many requests, a failing server, no network: the whole loop goes quiet for a while.
-            state.failures += 1;
-            state.notBefore = Date.now() + penaltyAfter(cause, state.failures);
-          }
+          // Too many requests, a failing server, no network, a refusal of the whole request (it
+          // says nothing about any one file): the whole loop goes quiet for a while.
+          state.failures += 1;
+          state.notBefore = Date.now() + penaltyAfter(cause, state.failures);
         }
       }
       plan();

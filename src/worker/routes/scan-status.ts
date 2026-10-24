@@ -1,7 +1,7 @@
 // The scan state of many files in one request (R1 m16: perfops-2, func-n2). Paths are relative to
 // /api.
 //
-//   POST /api/nodes/scan-status   { ids: [≤ SCAN_STATUS_MAX_IDS node ids] }  →  { items: NodeDto[] }
+//   GET /api/nodes/scan-status?ids=<id>,…   (≤ SCAN_STATUS_MAX_IDS node ids)  →  { items: NodeDto[] }
 //
 // What the upload ribbon and the explorer's scan poll ask instead of one `GET /api/nodes/:id` per
 // file: ≈ 10 statements per file before, a handful per request now.
@@ -15,16 +15,16 @@
 // decides), whatever the reason. Only the caller's own VISIBLE files take the fast path — one
 // statement for all of them — and those they can read one by one anyway.
 //
-// Bounded (`ScanStatusBody`, shared/schemas/node.ts: 1 … SCAN_STATUS_MAX_IDS ids; a repeated id is
-// asked once), behind RL_API and the identity pin like every /api request.
+// Bounded (`ScanStatusIds`, shared/schemas/node.ts: 1 … SCAN_STATUS_MAX_IDS ids; a repeated id is
+// asked once), behind RL_API and the identity pin like every /api request. A GET: a read, which
+// the read-only switch, an impersonated session and stale terms all allow (as the node's GET).
 
 import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import { Hono } from "hono";
-import { ScanStatusBody, type NodeDto, type ScanStatusResponse } from "../../shared/schemas/node";
+import { ScanStatusIds, type NodeDto, type ScanStatusResponse } from "../../shared/schemas/node";
 import { nodes, type Node } from "../db/schema";
 import { notEffectivelyTrashedOrHidden } from "../db/queries/tree";
 import { requireVerified } from "../middleware/guards";
-import { jsonBody } from "../services/body";
 import { AppError } from "../services/errors";
 import { toNodeDtos } from "../services/node-dto";
 import { getAccess, type Access } from "../services/permissions";
@@ -32,15 +32,15 @@ import { db, type AppEnv } from "../services/request-context";
 
 export const router = new Hono<AppEnv>();
 
-router.post("/nodes/scan-status", async (c) => {
+router.get("/nodes/scan-status", async (c) => {
   const user = requireVerified(c);
-  const parsed = ScanStatusBody.safeParse(await jsonBody(c));
+  const parsed = ScanStatusIds.safeParse((c.req.query("ids") ?? "").split(",").filter((id) => id !== ""));
   if (!parsed.success) {
     throw new AppError("validation", undefined, {
       issues: parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message })),
     });
   }
-  const ids = [...new Set(parsed.data.ids)];
+  const ids = [...new Set(parsed.data)];
 
   // The caller's own files that `GET /api/nodes/:id` would show them — the owner's rules of
   // `getAccess` as one statement: not hidden (itself, or a folder above), not locked, not in the

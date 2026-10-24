@@ -89,9 +89,9 @@ describe("late work after the account changed", () => {
     server.scanStatus = "pending";
     await addFiles([{ file: smallFile("a.txt") }], null);
     await settle(0);
-    const answer = hold(SCAN_ASK, "POST");
+    const answer = hold(SCAN_ASK, "GET");
     await settle(1_100);
-    expect(server.count("POST", SCAN_ASK)).toBe(1);
+    expect(server.count("GET", SCAN_ASK)).toBe(1);
     await switchAccount();
     const changed: unknown[] = [];
     const stop = onNodesChanged((detail) => changed.push(detail));

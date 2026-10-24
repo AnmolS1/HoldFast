@@ -17,7 +17,7 @@
 // outlives a request takes a `Mark` when it starts and does nothing once the mark is stale: no
 // write, no announcement, no request.
 import { NodeId } from "../../../shared/schemas/common";
-import { ScanStatusResponse, type NodeDto } from "../../../shared/schemas/node";
+import { ScanStatusResponse, scanStatusQuery, type NodeDto } from "../../../shared/schemas/node";
 import type {
   CompleteUploadBody,
   InitUploadBody,
@@ -1204,14 +1204,10 @@ function nextScan(
   return soonest === Infinity ? null : { wait: soonest - now };
 }
 
-/** The scan state of these files in one request (`POST /api/nodes/scan-status`). */
+/** The scan state of these files in one request (`GET /api/nodes/scan-status`). */
 async function scanStatuses(ids: string[]): Promise<NodeDto[]> {
   if (ids.length === 0) return [];
-  const answer = await api("/api/nodes/scan-status", {
-    method: "POST",
-    body: { ids },
-    schema: ScanStatusResponse,
-  });
+  const answer = await api(`/api/nodes/scan-status?${scanStatusQuery(ids)}`, { schema: ScanStatusResponse });
   return answer.items;
 }
 
@@ -1260,16 +1256,12 @@ async function scanTick(then: Mark): Promise<void> {
   } catch (cause) {
     if (!live(then)) return;
     scanAsking = [];
-    const status = cause instanceof ApiError ? cause.status : 0;
-    if (status >= 400 && status < 500 && status !== 429) {
-      // Refused whole (not ours to ask any more): there is nothing left to follow.
-      for (const { item } of asked) lostSight(item.id);
-    } else {
-      // Told to slow down, or no answer: the whole loop waits longer, and asks about the same files.
-      scanQueue.unshift(...asked.map(({ entry }) => entry));
-      scanBackoff = Math.min(SCAN_BACKOFF_MAX_MS, Math.max(2 * SCAN_INTERVAL_MS, scanBackoff * 2));
-      wait = Math.max(scanBackoff, retryAfterMs(cause, RATE_PAUSE_MAX_MS));
-    }
+    // Told to slow down, no answer, or a refusal of the whole request (which says nothing about
+    // any one file — a file that is gone is one the answer leaves out): the whole loop waits
+    // longer and asks about the same files; the bound still ends the following.
+    scanQueue.unshift(...asked.map(({ entry }) => entry));
+    scanBackoff = Math.min(SCAN_BACKOFF_MAX_MS, Math.max(2 * SCAN_INTERVAL_MS, scanBackoff * 2));
+    wait = Math.max(scanBackoff, retryAfterMs(cause, RATE_PAUSE_MAX_MS));
   }
   if (!live(then)) return;
   scanBusy = false;
