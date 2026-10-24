@@ -92,7 +92,13 @@ import { readPauseSwitch, readsRolledBack, reconcileStopOf } from "../jobs/recon
 import { buildMeta } from "../meta";
 import { requireAdmin } from "../middleware/guards";
 import { SCANNER_INSTANCES, scannerHealth, type ScannerDeps } from "../scan/container";
-import { cancelDeletion, revokeSessions, scheduleDeletion, suspendUser } from "../services/account-state";
+import {
+  cancelDeletion,
+  refuseSelfAction,
+  revokeSessions,
+  scheduleDeletion,
+  suspendUser,
+} from "../services/account-state";
 import * as actions from "../services/admin-actions";
 import { audit, auditInTx } from "../services/audit";
 import { DMCA_NOTICE_BODY_MAX_BYTES, jsonBody } from "../services/body";
@@ -487,8 +493,9 @@ router.post(`/admin/users/${USER}/revoke-links`, async (c) => {
 });
 
 router.patch(`/admin/users/${USER}/quota`, async (c) => {
-  requireAdmin(c);
+  const admin = requireAdmin(c);
   const userId = c.req.param("userId");
+  refuseSelfAction(actor(admin), userId);
   const { quotaBytes } = SetQuotaBody.parse(await jsonBody(c));
   const changed = await adminQ.setQuota(db(c), userId, quotaBytes);
   if (!changed) throw new AppError("not_found");

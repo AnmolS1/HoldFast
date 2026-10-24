@@ -53,6 +53,23 @@ describe("an admin acting on their own account", () => {
     expect(await markers(me.id)).toHaveLength(0);
   });
 
+  it("cannot change its own quota: 400 self_action, the quota unchanged; another admin can change it", async () => {
+    const me = await admin();
+    const before = (await userRowOf(me.id))!.quotaBytes;
+    const answer = await adminCall(me.as, "PATCH", `/users/${me.id}/quota`, {
+      body: { quotaBytes: before + 1 },
+    });
+    expect(answer.status, answer.text).toBe(400);
+    expect(answer.body).toMatchObject({ error: "self_action" });
+    expect((await userRowOf(me.id))!.quotaBytes).toBe(before);
+    const peer = await admin();
+    const other = await adminCall(peer.as, "PATCH", `/users/${me.id}/quota`, {
+      body: { quotaBytes: before + 1 },
+    });
+    expect(other.status, other.text).toBe(200);
+    expect((await userRowOf(me.id))!.quotaBytes).toBe(before + 1);
+  });
+
   it("can still suspend another admin, and schedule another admin's deletion", async () => {
     const me = await admin();
     const peer = await admin();
