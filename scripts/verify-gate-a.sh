@@ -37,7 +37,13 @@ ALLOWED_STORAGE_KEYS="hf.prefs.v1"
 # number — more OR fewer — fails until they are read again. 0 = none reviewed yet.
 # 7 = the sites of the build at 8145d5d, read on 2026-10-12: theme and UI preferences are the only
 # live writes; the Sentry, router and auth-client sites are unreachable with the current configuration.
-REVIEWED_NONLITERAL_STORAGE_SITES=7
+# 8 = re-read on 2026-10-24 at dev 8eb5139: the Data Grid's storage-availability probe (writes and
+# removes a fixed test key); Sentry's two sessionStorage writes (session sampling, previous trace);
+# MUI's colour-scheme store (mui-mode); React Router's view-transition record (sessionStorage);
+# prefs.ts's two writes (hf.prefs.v1 — density, view, the device-only shortcuts flag — and the
+# theme); Better Auth's cross-tab session signal (`better-auth.message`: {event: "session", data:
+# {trigger}, a random tab id, a timestamp}). None holds a token, cookie value or session id.
+REVIEWED_NONLITERAL_STORAGE_SITES=8
 OUTBOX_MARKER="_test/outbox"
 # The number of live checks the gate must complete. A run that completes fewer cannot pass.
 ADMIN_MATCHER="src/shared/admin-emails.ts"
