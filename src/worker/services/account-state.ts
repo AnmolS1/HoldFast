@@ -77,12 +77,8 @@ export function refuseSelfAction(actor: Actor, userId: string): void {
  * Call it FIRST inside the transaction that makes the change (`lockActiveAdmins`' lock order).
  */
 export async function refuseLastAdmin(tx: Executor, userId: string): Promise<void> {
-  const [row] = await tx.select({ role: user.role }).from(user).where(eq(user.id, userId)).limit(1);
-  if (!hasAdminRole(row?.role)) return;
-  const active = await lockActiveAdmins(tx, now());
   // An admin who cannot act already (suspended, leaving) loses nothing more: the change is a no-op.
-  if (!active.includes(userId)) return;
-  if (!active.some((id) => id !== userId)) throw new AppError("last_admin");
+  if (await isLastActiveAdmin(tx, userId)) throw new AppError("last_admin");
 }
 
 /**
