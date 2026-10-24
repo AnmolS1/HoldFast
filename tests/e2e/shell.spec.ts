@@ -381,14 +381,27 @@ test.describe("navigation", () => {
     await expect(page.locator("[data-sidebar]")).toBeVisible();
     await expect(page.locator("[data-details-panel]")).toBeVisible();
     await expect(page.locator("[data-bottom-nav]")).toHaveCount(0);
-    // Sidebar 232, header 56 — the specification's numbers; details 320 gives way to 312 at 1024 so
-    // the content keeps 480 px (F02: 1024 − 232 − 480).
-    expect((await page.locator("[data-sidebar]").boundingBox())?.width).toBe(232);
-    expect((await page.locator("[data-details-panel]").boundingBox())?.width).toBe(312);
+    // Sidebar 232 and header 56, the specification's numbers. Details defaults to 320, but at 1024
+    // the content column would get only 472 px, so details gives way (F02): it is drawn at what the
+    // window leaves after the sidebar and 480 px of content. The expected width is computed from
+    // the real layout (the viewport's client width excludes any scrollbar; each panel's 1 px
+    // hairline is inside its own box), and the stored width stays the default.
+    const sidebarWidth = (await page.locator("[data-sidebar]").boundingBox())!.width;
+    expect(sidebarWidth).toBe(232);
+    const viewport = await page.evaluate(() => document.documentElement.clientWidth);
+    const detailsWidth = (await page.locator("[data-details-panel]").boundingBox())!.width;
+    expect(detailsWidth).toBe(Math.min(320, viewport - sidebarWidth - 480));
+    expect(detailsWidth).toBeLessThan(320);
+    // The content column is what the header spans: never under 480 px.
+    expect((await page.locator("[data-header]").boundingBox())!.width).toBeGreaterThanOrEqual(480);
+    // The give-way is drawn only: nothing is stored, so the stored details width is still 320.
+    const stored = await page.evaluate(() => {
+      const raw = localStorage.getItem("hf.prefs.v1");
+      return (JSON.parse(raw ?? "{}") as { layout?: { details?: { width?: number } } }).layout ?? null;
+    });
+    expect(stored?.details?.width ?? 320).toBe(320);
+    expect(stored).toBeNull();
     expect((await page.locator("[data-header]").boundingBox())?.height).toBe(56);
-    // Giving way is drawing only: the stored layout is untouched (no layout key = the 320 default).
-    const stored = await page.evaluate(() => localStorage.getItem("hf.prefs.v1"));
-    expect(stored === null ? undefined : (JSON.parse(stored) as { layout?: unknown }).layout).toBeUndefined();
   });
 });
 
