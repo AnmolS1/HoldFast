@@ -18,6 +18,8 @@ import {
   settle,
   smallFile,
   type Server,
+  askedAbout,
+  SCAN_ASK,
 } from "./helpers";
 
 setupShell();
@@ -277,7 +279,7 @@ describe("after the file has landed", () => {
     await settle(0);
     expect(items()[0]).toMatchObject({ state: "scanning", progress: 1 });
     const nodeId = items()[0]!.nodeId!;
-    const polls = () => server.count("GET", new RegExp(`^/api/nodes/${nodeId}$`));
+    const polls = () => askedAbout(server, nodeId);
     expect(polls()).toBe(0);
     await settle(SCAN_INTERVAL_MS);
     expect(polls()).toBe(1);
@@ -301,11 +303,9 @@ describe("after the file has landed", () => {
     await addFiles([{ file: smallFile("a.txt") }], null);
     await settle(0);
     const nodeId = items()[0]!.nodeId!;
-    // A bare NodeDto, as the endpoint answered before it was given its envelope.
+    // Bare NodeDtos, not the `{ items }` envelope: not the contract.
     server.onJson = (call) =>
-      call.path === `/api/nodes/${nodeId}`
-        ? json(nodeDto({ id: nodeId, scanStatus: "infected" }))
-        : undefined;
+      SCAN_ASK.test(call.path) ? json([nodeDto({ id: nodeId, scanStatus: "infected" })]) : undefined;
     await settle(SCAN_INTERVAL_MS);
     await settle(SCAN_INTERVAL_MS);
     expect(items()[0]!.state).toBe("scanning");

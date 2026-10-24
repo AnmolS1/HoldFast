@@ -31,6 +31,7 @@ import {
   type Server,
   settle,
   smallFile,
+  SCAN_ASK,
 } from "./helpers";
 
 setupShell();
@@ -293,7 +294,7 @@ describe("a timer asks whether its work is still wanted when it sends (3m2)", ()
     await act(() => addFiles([{ file: smallFile("a.txt") }], null));
     for (let turn = 0; turn < 5 && items()[0]?.state !== "scanning"; turn += 1) await act(() => settle(0));
     expect(items()[0]!.state).toBe("scanning");
-    const polls = () => server.count("GET", /^\/api\/nodes\//);
+    const polls = () => server.count("POST", SCAN_ASK);
     const before = polls();
     const close = openWindow();
     await act(() => settle(30_000));
@@ -340,7 +341,7 @@ describe("rows waiting on the scanner (3m1)", () => {
       await settle(0);
     }
     expect(items().filter((row) => row.state === "scanning").length).toBe(count);
-    const polls = () => server.count("GET", /^\/api\/nodes\//);
+    const polls = () => server.count("POST", SCAN_ASK);
     await settle(SCAN_HARD_LIMIT_MS + 5_000);
     expect(items().every((row) => row.state === "done" && row.scanStatus === "pending")).toBe(true);
     const asked = polls();

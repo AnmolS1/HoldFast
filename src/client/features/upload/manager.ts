@@ -16,7 +16,9 @@
 // everything, empties the queue and the resume list, and moves the epoch on. Every step that
 // outlives a request takes a `Mark` when it starts and does nothing once the mark is stale: no
 // write, no announcement, no request.
-import type { NodeDto } from "../../../shared/schemas/node";
+import { z } from "zod";
+import { NodeId } from "../../../shared/schemas/common";
+import { NodeDto } from "../../../shared/schemas/node";
 import type {
   CompleteUploadBody,
   InitUploadBody,
@@ -24,7 +26,7 @@ import type {
   UploadedPart,
 } from "../../../shared/schemas/upload";
 import { toast } from "../../components/Toaster";
-import { ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT, currentAccount } from "../../lib/api";
+import { api, ApiError, AUTH_EXPIRED_EVENT, AUTH_RESTORED_EVENT, currentAccount } from "../../lib/api";
 import { emitNodesChanged, registerUserStatePurger } from "../../lib/contracts";
 import { formatBytes } from "../../lib/format";
 import { accountEpoch, getCachedSession, publicConfigQuery, queryClient, sameAccount } from "../../lib/query";
@@ -49,13 +51,16 @@ import {
   RATE_PAUSE_MAX_MS,
   RETRY_AFTER_CAP_MS,
   RETRY_DELAYS_MS,
+  SAY_EACH_FILE_MAX,
   SCAN_BACKOFF_MAX_MS,
+  SCAN_BATCH_MAX,
   SCAN_FILE_WAIT_MS,
   SCAN_FOLLOW_LIMIT_MS,
   SCAN_HARD_LIMIT_MS,
   SCAN_INTERVAL_MS,
   SCAN_MIN_ASKS,
   sortedParts,
+  VERDICT_CLAIM_MS,
 } from "./plan";
 import {
   abortUpload,
@@ -218,8 +223,14 @@ let scanQueue: ScanEntry[] = [];
 let frameUp = true;
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let scanBusy = false;
-/** The file whose request is on its way (it is out of the queue meanwhile). */
-let scanAsking: ScanEntry | null = null;
+/** The files whose request is on its way (they are out of the queue meanwhile). */
+let scanAsking: ScanEntry[] = [];
+/**
+ * Verdicts this queue has said (or will say, from the listing), by node: the explorer's own poll
+ * asks `scanVerdictOwned` before it says one, so a verdict is spoken ONCE (R1 a11y-3). Kept
+ * `VERDICT_CLAIM_MS`, and taken by the first question about it.
+ */
+const verdictsSaid = new Map<string, { etag: string | null; at: number }>();
 /** Since when the loop cannot ask (tab hidden, frame gone); null while it can. */
 let scanPausedSince: number | null = null;
 let scanBackoff = 0;
@@ -593,7 +604,7 @@ async function run(id: string, signal: AbortSignal, then: Mark): Promise<void> {
 
   if (!work.started) {
     work.started = true;
-    announce(t("live.start", { name: item.name }));
+    if (saysEachFile(item)) announce(t("live.start", { name: item.name }));
   }
   patchItem(id, {
     state: item.completeSent ? "completing" : "uploading",
@@ -988,7 +999,7 @@ function landed(id: string, node: NodeDto): void {
     eta: null,
   });
   emitNodesChanged([item.parentId]);
-  announce(t("live.done", { name: node.name }));
+  if (saysEachFile(item)) announce(t("live.done", { name: node.name }));
   if (node.scanStatus !== "pending") {
     settleScan(id, node);
     return;
@@ -1017,14 +1028,36 @@ function landedUnseen(id: string, uploadId: string): void {
   sweep();
 }
 
-/** `fromListing`: the verdict came from the explorer's listing, which needs no telling. */
+/** Still waiting for its verdict: followed by the loop, or given up as still being checked. */
+const awaitsVerdict = (item: UploadItem): boolean =>
+  item.state === "scanning" || (item.state === "done" && item.scanStatus === "pending");
+
+/**
+ * Uploading and uploaded are said file by file for a few files; a larger drop is told by the
+ * ribbon's sentence (R1 a11y-11: a 100-file folder was 200 polite utterances). A verdict that
+ * needs telling (blocked, couldn't scan) and a failure are always said for the file.
+ */
+function saysEachFile(item: UploadItem): boolean {
+  let files = 0;
+  for (const other of currentItems()) {
+    if (other.batchId === item.batchId && other.kind === "file" && ++files > SAY_EACH_FILE_MAX) return false;
+  }
+  return true;
+}
+
+/**
+ * The verdict, said once: a row that is no longer waiting for it (the listing or another answer
+ * settled it first) takes nothing more, and says nothing more (R1 a11y-3).
+ * `fromListing`: the verdict came from the explorer's listing, which needs no telling.
+ */
 function settleScan(
   id: string,
-  node: Pick<NodeDto, "scanStatus" | "scanReason" | "name">,
+  node: Pick<NodeDto, "id" | "etag" | "scanStatus" | "scanReason" | "name">,
   { fromListing = false } = {},
 ): void {
   const item = findItem(id);
-  if (!item) return;
+  if (!item || !awaitsVerdict(item)) return;
+  verdictsSaid.set(node.id, { etag: node.etag, at: Date.now() });
   patchItem(id, { state: "done", scanStatus: node.scanStatus, scanReason: node.scanReason });
   if (node.scanStatus === "infected") announce(t("live.blocked", { name: node.name }));
   else if (node.scanStatus === "error" || node.scanStatus === "skipped")
@@ -1052,13 +1085,30 @@ export function scanVerdictsSeen(nodes: readonly NodeDto[]): void {
   }
   if (verdicts.size === 0) return;
   for (const item of currentItems()) {
-    const waiting = item.state === "scanning" || (item.state === "done" && item.scanStatus === "pending");
-    const node = waiting && item.nodeId ? verdicts.get(item.nodeId) : undefined;
+    const node = awaitsVerdict(item) && item.nodeId ? verdicts.get(item.nodeId) : undefined;
     // A listing read before this upload replaced the file shows the old version's verdict.
     if (!node || node.etag !== works.get(item.id)?.etag) continue;
     // Its entry in the loop's queue is dropped when the loop next looks (the row is no longer scanning).
     settleScan(item.id, node, { fromListing: true });
   }
+}
+
+/**
+ * Is this verdict the upload queue's to say? True while a row waits for the verdict on this
+ * version of the file — the listing's patch settles it, and the row says it — and once for a
+ * verdict a row said in the last `VERDICT_CLAIM_MS` (an answer of the explorer's poll that was
+ * already on its way). The explorer says the verdicts of every other file. Nothing is the queue's
+ * once it is no longer the account's.
+ */
+export function scanVerdictOwned(node: Pick<NodeDto, "id" | "etag">): boolean {
+  if (!live(queueOwner)) return false;
+  for (const item of currentItems()) {
+    if (item.nodeId === node.id && awaitsVerdict(item) && works.get(item.id)?.etag === node.etag) return true;
+  }
+  const said = verdictsSaid.get(node.id);
+  if (!said || said.etag !== node.etag || Date.now() - said.at >= VERDICT_CLAIM_MS) return false;
+  verdictsSaid.delete(node.id);
+  return true;
 }
 
 /** "Check again" on a row the bound gave up on: the file is followed again, for a whole new bound. */
@@ -1104,8 +1154,7 @@ function syncScanClock(): void {
   if (scanPausedSince === null) return;
   const pause = now - scanPausedSince;
   scanPausedSince = null;
-  for (const entry of scanQueue) entry.since += pause;
-  if (scanAsking) scanAsking.since += pause;
+  for (const entry of [...scanQueue, ...scanAsking]) entry.since += pause;
 }
 
 function scheduleScan(wait: number): void {
@@ -1117,13 +1166,16 @@ function scheduleScan(wait: number): void {
 }
 
 /**
- * The next file that is due, taken out of the queue — or how long until one is. Files that are
- * gone or past their bound are dealt with on the way. The bound is time AND asks — a file is not
- * given up without having been asked about — up to a hard time limit that holds however long the
- * queue.
+ * The files that are due — at most `SCAN_BATCH_MAX`, taken out of the queue — or how long until
+ * one is. Files that are gone or past their bound are dealt with on the way. The bound is time
+ * AND asks — a file is not given up without having been asked about — up to a hard time limit
+ * that holds however long the queue.
  */
-function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait: number } | null {
+function nextScan(
+  now: number,
+): { due: Array<{ entry: ScanEntry; item: UploadItem }> } | { wait: number } | null {
   let soonest = Infinity;
+  const due: Array<{ entry: ScanEntry; item: UploadItem }> = [];
   for (let index = 0; index < scanQueue.length;) {
     const entry = scanQueue[index]!;
     const item = findItem(entry.id);
@@ -1138,9 +1190,10 @@ function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait:
       patchItem(entry.id, { state: "done", scanStatus: "pending" });
       continue;
     }
-    if (entry.nextAt <= now) {
+    if (entry.nextAt <= now && due.length < SCAN_BATCH_MAX) {
       scanQueue.splice(index, 1);
-      return { entry, item };
+      due.push({ entry, item });
+      continue;
     }
     // Woken at its bound too, so that the row says "still being checked" then — not up to a
     // whole wait later.
@@ -1148,7 +1201,27 @@ function nextScan(now: number): { entry: ScanEntry; item: UploadItem } | { wait:
     soonest = Math.min(soonest, entry.nextAt, bound);
     index += 1;
   }
+  if (due.length > 0) return { due };
   return soonest === Infinity ? null : { wait: soonest - now };
+}
+
+const ScanStatusAnswer = z.object({ items: z.array(NodeDto) });
+
+/** The scan state of these files in one request (`POST /api/nodes/scan-status`). */
+async function scanStatuses(ids: string[]): Promise<NodeDto[]> {
+  if (ids.length === 0) return [];
+  const answer = await api("/api/nodes/scan-status", {
+    method: "POST",
+    body: { ids },
+    schema: ScanStatusAnswer,
+  });
+  return answer.items;
+}
+
+/** No longer there for the caller (gone, or no longer theirs to see): there is nothing left to follow. */
+function lostSight(id: string): void {
+  const item = findItem(id);
+  if (item && awaitsVerdict(item)) patchItem(id, { state: "done", scanStatus: null });
 }
 
 async function scanTick(then: Mark): Promise<void> {
@@ -1164,30 +1237,39 @@ async function scanTick(then: Mark): Promise<void> {
     scheduleScan(Math.max(SCAN_INTERVAL_MS, next.wait));
     return;
   }
-  const { entry, item } = next;
+  // Every file that is due, in ONE request (R1 perfops-2): an id the server leaves out of the
+  // answer is not there for this account any more.
+  const asked = next.due.filter(({ item }) => NodeId.safeParse(item.nodeId).success);
+  for (const { item } of next.due) if (!asked.some((due) => due.item === item)) lostSight(item.id);
   scanBusy = true;
-  scanAsking = entry;
+  scanAsking = asked.map(({ entry }) => entry);
   let wait: number = SCAN_INTERVAL_MS;
   try {
-    const detail = await getNode(item.nodeId ?? "");
+    const answered = new Map(
+      (await scanStatuses(asked.map(({ item }) => item.nodeId!))).map((node) => [node.id, node]),
+    );
     if (!live(then)) return;
-    scanAsking = null;
+    scanAsking = [];
     scanBackoff = 0;
-    if (detail.node.scanStatus === "pending") {
-      entry.asks += 1;
-      entry.nextAt = Date.now() + SCAN_FILE_WAIT_MS[Math.min(entry.asks, SCAN_FILE_WAIT_MS.length - 1)]!;
-      scanQueue.push(entry);
-    } else settleScan(item.id, detail.node);
+    for (const { entry, item } of asked) {
+      const node = answered.get(item.nodeId!);
+      if (!node) lostSight(item.id);
+      else if (node.scanStatus === "pending") {
+        entry.asks += 1;
+        entry.nextAt = Date.now() + SCAN_FILE_WAIT_MS[Math.min(entry.asks, SCAN_FILE_WAIT_MS.length - 1)]!;
+        scanQueue.push(entry);
+      } else settleScan(item.id, node);
+    }
   } catch (cause) {
     if (!live(then)) return;
-    scanAsking = null;
+    scanAsking = [];
     const status = cause instanceof ApiError ? cause.status : 0;
     if (status >= 400 && status < 500 && status !== 429) {
-      // The file is gone, or no longer ours to see: there is nothing left to follow.
-      patchItem(item.id, { state: "done", scanStatus: null });
+      // Refused whole (not ours to ask any more): there is nothing left to follow.
+      for (const { item } of asked) lostSight(item.id);
     } else {
-      // Told to slow down, or no answer: the whole loop waits longer — it does not ask the next file instead.
-      scanQueue.unshift(entry);
+      // Told to slow down, or no answer: the whole loop waits longer, and asks about the same files.
+      scanQueue.unshift(...asked.map(({ entry }) => entry));
       scanBackoff = Math.min(SCAN_BACKOFF_MAX_MS, Math.max(2 * SCAN_INTERVAL_MS, scanBackoff * 2));
       wait = Math.max(scanBackoff, retryAfterMs(cause, RATE_PAUSE_MAX_MS));
     }
@@ -2057,7 +2139,8 @@ function dropQueue(): void {
   clearTimeout(scanTimer);
   scanTimer = undefined;
   scanBusy = false;
-  scanAsking = null;
+  scanAsking = [];
+  verdictsSaid.clear();
   scanPausedSince = null;
   scanBackoff = 0;
   scanNotBefore = 0;

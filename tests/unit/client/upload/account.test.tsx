@@ -24,6 +24,7 @@ import {
   settle,
   smallFile,
   type Server,
+  SCAN_ASK,
 } from "./helpers";
 
 setupShell();
@@ -88,13 +89,13 @@ describe("late work after the account changed", () => {
     server.scanStatus = "pending";
     await addFiles([{ file: smallFile("a.txt") }], null);
     await settle(0);
-    const answer = hold(/^\/api\/nodes\//);
+    const answer = hold(SCAN_ASK, "POST");
     await settle(1_100);
-    expect(server.count("GET", /^\/api\/nodes\//)).toBe(1);
+    expect(server.count("POST", SCAN_ASK)).toBe(1);
     await switchAccount();
     const changed: unknown[] = [];
     const stop = onNodesChanged((detail) => changed.push(detail));
-    answer(json(nodeDetail({ id: rowId(0x2001), name: "a.txt", scanStatus: "infected" })));
+    answer(json({ items: [nodeDto({ id: rowId(0x2001), name: "a.txt", scanStatus: "infected" })] }));
     await settle();
     stop();
     expect(items()).toEqual([]);

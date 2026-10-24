@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { HEADER_USER } from "../../../src/shared/constants";
 import { NodeDto } from "../../../src/shared/schemas/node";
+import { SCAN_BATCH_MAX } from "../../../src/client/features/upload/plan";
 import { SCAN_STATUS_MAX_IDS, ScanStatusResponse } from "../../../src/worker/routes/scan-status";
 import { makeFile, makeFolder, makeShare, testDb } from "../services-core/helpers";
 import { call, uploader } from "../uploads/helpers";
@@ -129,6 +130,10 @@ describe("no existence oracle: every id GET /api/nodes/:id would not answer is l
 });
 
 describe("bounds and the request's guards", () => {
+  it("the upload ribbon's batch is the server's limit", () => {
+    expect(SCAN_BATCH_MAX).toBe(SCAN_STATUS_MAX_IDS);
+  });
+
   it(`1 … ${SCAN_STATUS_MAX_IDS} well-formed ids; anything else is 400 validation`, async () => {
     const me = await uploader();
     const many = Array.from({ length: SCAN_STATUS_MAX_IDS }, () => uuidv7());

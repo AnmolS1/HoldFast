@@ -13,7 +13,7 @@ import { summarise } from "../../../../src/client/features/upload/summary";
 import { UploadPanel } from "../../../../src/client/features/upload/UploadPanel";
 import { purgeUserState, queryClient } from "../../../../src/client/lib/query";
 import { renderShell, setupShell } from "../shell/helpers";
-import { nodeDetail, nodeDto } from "./fixtures";
+import { nodeDto } from "./fixtures";
 import {
   FAKED_TIMERS,
   freshUploader,
@@ -23,6 +23,9 @@ import {
   settle,
   smallFile,
   type Server,
+  askedAbout,
+  SCAN_ASK,
+  scanAsks,
 } from "./helpers";
 
 setupShell();
@@ -44,16 +47,18 @@ beforeEach(async () => {
   asking = 0;
   peak = 0;
   // A verdict per node, at its own time: the scanner answers each file when it is done with it.
+  // The loop asks about every due file in one request (R1 m16).
   server.onJson = (call) => {
-    const node = /^\/api\/nodes\/([^/]+)$/.exec(call.path);
-    if (call.method !== "GET" || !node) return undefined;
+    if (call.method !== "POST" || !SCAN_ASK.test(call.path)) return undefined;
     asking += 1;
     peak = Math.max(peak, asking);
-    const at = verdictAt.get(node[1]!);
-    const status = at !== undefined && Date.now() >= at ? verdict : "pending";
+    const items = (call.body as { ids: string[] }).ids.map((id) => {
+      const at = verdictAt.get(id);
+      return nodeDto({ id, scanStatus: at !== undefined && Date.now() >= at ? verdict : "pending" });
+    });
     return Promise.resolve().then(() => {
       asking -= 1;
-      return json(nodeDetail({ id: node[1]!, scanStatus: status }));
+      return json({ items });
     });
   };
   vi.useFakeTimers({ toFake: [...FAKED_TIMERS] });
@@ -75,7 +80,7 @@ function openWindow(): () => Promise<void> {
     await purging;
   };
 }
-const polls = () => server.count("GET", /^\/api\/nodes\//);
+const polls = () => server.count("POST", SCAN_ASK);
 const ribbon = () => summarise(getUploads());
 const hide = (hidden: boolean) => {
   vi.spyOn(document, "visibilityState", "get").mockReturnValue(hidden ? "hidden" : "visible");
@@ -162,12 +167,14 @@ describe("the ribbon follows the scan to its verdict", () => {
     expect(polls() - before).toBeGreaterThanOrEqual(9);
   });
 
-  it("100 files waiting: one request at a time, at most one a second, for the whole bound — then nothing more", async () => {
+  it("100 files waiting: one request at a time, all of them in it, for the whole bound — then nothing more", async () => {
     keepResumeListInMemory();
     await land(100);
     await settle(SCAN_FOLLOW_LIMIT_MS + 60_000);
     expect(peak).toBe(1);
-    expect(polls()).toBeLessThanOrEqual((SCAN_FOLLOW_LIMIT_MS + 60_000) / 1_000 + 1);
+    // Every 30 s once they have waited a while: ≈ 40 requests in the bound, not one a second (≈ 960).
+    expect(polls()).toBeLessThanOrEqual(45);
+    expect(scanAsks(server).every((ids) => ids.length === 100)).toBe(true);
     expect(items().every((row) => row.state === "done" && row.scanStatus === "pending")).toBe(true);
     expect(ribbon()?.sentence).toBe("100 files are still being checked");
     const asked = polls();
@@ -223,7 +230,7 @@ describe("one source of truth: a verdict the listing learns", () => {
       [first, "done", "clean"],
       [second, "scanning", null],
     ]);
-    const asked = () => server.count("GET", new RegExp(`^/api/nodes/${first}$`));
+    const asked = () => askedAbout(server, first!);
     const before = asked();
     await settle(60_000);
     expect(asked()).toBe(before);
