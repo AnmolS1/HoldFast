@@ -46,6 +46,14 @@ describe("the R1 error codes in the client's own words", () => {
     expect(error.message).toBe(SERVER_WORDS);
   });
 
+  it('replace_in_progress names who can meet it now (R1D rds-1) — not "wait for it to finish" of your own abandoned upload', () => {
+    // Since rds-1 the owner, or the session's own uploader, supersedes an open replace: the 409
+    // is met by someone whose new version waits for someone ELSE's, or for one being saved.
+    expect(en["apiError.replace_in_progress"]).toBe(
+      "Another new version of this file is on its way: someone else's upload, or one being saved right now. Try again once it has finished.",
+    );
+  });
+
   it("the deletion sentence is the one the banner and Settings show", () => {
     expect(en["apiError.deletion_admin_scheduled"]).toBe(en["banner.deletion.adminScheduled"]);
   });
