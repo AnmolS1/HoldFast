@@ -219,7 +219,8 @@ test.describe("Upload folder (mocked API)", () => {
     );
     const sentence = "2 system files skipped (.DS_Store and similar)";
     await expect(page.locator("[data-toaster]")).toContainText(sentence);
-    await expect(page.locator("[data-upload-live]")).toContainText(sentence);
+    // Heard once: the toast region is the live region that says it, the uploader's log does not repeat it.
+    await expect(page.locator("[data-upload-live]")).not.toContainText(sentence);
     await expect.poll(() => seen.completes).toBe(4);
     expect(seen.inits.map((init) => init.name).sort()).toEqual([".env", "a.txt", "b.txt", "c.txt"]);
     // The tree as picked: trip at the top level, day1 in it, night in day1 — each once.

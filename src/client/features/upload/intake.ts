@@ -52,8 +52,12 @@ export function fromFileList(list: Iterable<File>): Intake {
   let skipped = 0;
   for (const file of list) {
     const path = parentPath(file.webkitRelativePath ?? "");
-    // A folder that held only clutter is still made: it is a folder the user chose.
-    if (path && !segments(path).includes("__MACOSX")) folders.add(path);
+    // A folder that held only clutter is still made: it is a folder the user chose — for
+    // `__MACOSX`, the folder it sits in (a drop lists that one too).
+    const kept = segments(path);
+    const cut = kept.indexOf("__MACOSX");
+    const folder = cut === -1 ? path : kept.slice(0, cut).join("/");
+    if (folder) folders.add(folder);
     if (path && isSystemClutter(file.name, segments(path))) skipped += 1;
     else files.push({ file, path });
   }

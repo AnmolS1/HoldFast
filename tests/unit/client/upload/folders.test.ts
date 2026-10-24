@@ -157,7 +157,8 @@ describe("what a drop could not hand over", () => {
     const sentence =
       "5 items could not be read and were left out: trip/broken.jpg, trip/raw/x.dng, trip/raw/y.dng and 2 more";
     expect(getToasts().map((toast) => toast.message)).toEqual([sentence]);
-    expect(getUploads().announcements[0]!.text).toBe(sentence);
+    // Heard once, from the toast's live region — not again from the uploader's (F01 review F01-1).
+    expect(getUploads().announcements.map((entry) => entry.text)).not.toContain(sentence);
     expect(server.completes.length).toBe(1);
   });
 

@@ -64,7 +64,7 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
     id: "uploadFolder",
     combos: [{ key: "u", mod: true, shift: true }],
     description: "shortcuts.uploadFolder",
-    global: true,
+    // Not global: in a text field Ctrl+Shift+U is Unicode entry (GTK/IBus, ChromeOS).
   },
   {
     id: "theme",

@@ -17,7 +17,7 @@ import { registerPicker, takePickerTarget, targetFromLocation, type PickerKind }
 // The slot this host answers for (slots.tsx renders this host: a cycle only at call time).
 import { requestUpload } from "./slots";
 import { getNode } from "./protocol";
-import { announce, useUploads } from "./store";
+import { useUploads } from "./store";
 import { t } from "./strings";
 
 const hidden = {
@@ -130,8 +130,8 @@ export function UploadHost() {
     if (kind === "folder" && folderPickWasFlat(files)) {
       // Hundreds of files dumped flat into the folder would be a silent wrong outcome.
       const sentence = t("intake.flatFolder");
+      // Heard once, from the toast's own live region (review F01-1).
       toast({ message: sentence, key: "upload-flat-folder", duration: 12_000 });
-      announce(sentence);
       return;
     }
     const intake = fromFileList(files);

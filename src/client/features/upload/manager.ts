@@ -1898,15 +1898,14 @@ export async function addFiles(
       unreadable.length === 1
         ? t("intake.unreadable.one", { names: listed(unreadable) })
         : t("intake.unreadable.other", { count: unreadable.length, names: listed(unreadable) });
+    // The toast region is a polite live region: it is heard there, once (review F01-1).
     toast({ message: sentence, key: "upload-unreadable", duration: 12_000 });
-    announce(sentence);
   }
   const skipped = problems.skipped ?? 0;
   if (skipped > 0) {
     // Said once for the whole intake, apart from the ribbon (whose sentence counts uploads only).
     const sentence = skipped === 1 ? t("intake.skipped.one") : t("intake.skipped.other", { count: skipped });
     toast({ message: sentence, key: "upload-skipped" });
-    announce(sentence);
   }
   // A page that was opened offline never saw the event.
   if (typeof navigator !== "undefined" && navigator.onLine === false) queuePauses.add("offline");

@@ -3,7 +3,7 @@
 // many. A file the user chose on its own is theirs, whatever its name; no other dotfile is ever
 // left out. A folder picker that hands back plain files is refused, never uploaded flat.
 import "fake-indexeddb/auto";
-import { act } from "@testing-library/react";
+import { act, render } from "@testing-library/react";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
 import { getToasts } from "../../../../src/client/components/Toaster";
@@ -24,10 +24,12 @@ import {
 } from "../../../../src/client/lib/contracts";
 import { purgeUserState } from "../../../../src/client/lib/query";
 import {
+  isApplePlatform,
   isCharacterShortcut,
   matchShortcut,
   shortcutLabel,
   SHORTCUTS,
+  useShortcut,
 } from "../../../../src/client/lib/shortcuts";
 import { canPickFolders } from "../../../../src/client/routes/frame/new-actions";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
@@ -44,6 +46,11 @@ beforeEach(async () => {
 });
 
 const said = () => getUploads().announcements.map((entry) => entry.text);
+/**
+ * How often a sentence reaches a screen reader: the toast region and the uploader's live region
+ * are both polite live regions, so each copy is heard (review F01-1: exactly once).
+ */
+const heard = (sentence: string) => [...toasts(), ...said()].filter((text) => text === sentence).length;
 const toasts = () => getToasts().map((toast) => toast.message);
 const folderCalls = () =>
   server.calls
@@ -137,6 +144,13 @@ describe("a folder picker's files", () => {
     expect(intake.folders).toEqual(["trip"]);
   });
 
+  it("a folder whose only content is under __MACOSX/ is still listed (as a drop lists it)", () => {
+    const intake = fromFileList([picked("trip/__MACOSX/._a.jpg"), picked("trip/sub/__MACOSX/x/b.txt")]);
+    expect(intake.files).toEqual([]);
+    expect(intake.folders.sort()).toEqual(["trip", "trip/sub"]);
+    expect(intake.skipped).toBe(2);
+  });
+
   it("a folder that held only clutter is still listed: it is a folder the user chose", () => {
     const intake = fromFileList([picked("trip/empty-ish/.DS_Store"), picked("trip/a.jpg")]);
     expect(intake.files.map((entry) => entry.file.name)).toEqual(["a.jpg"]);
@@ -198,14 +212,14 @@ describe("a dropped folder", () => {
 });
 
 describe("the user is told how many were left out", () => {
-  it("toast and live region, once per intake — the folders and the rest still upload", async () => {
+  it("a toast, heard exactly once — the folders and the rest still upload", async () => {
     await addFiles([{ file: smallFile("a.jpg"), path: "trip" }], null, ["trip", "trip/only-clutter"], {
       skipped: 3,
     });
     await settle();
     const sentence = "3 system files skipped (.DS_Store and similar)";
     expect(toasts()).toEqual([sentence]);
-    expect(said().filter((text) => text === sentence)).toHaveLength(1);
+    expect(heard(sentence)).toBe(1);
     expect(folderCalls().sort()).toEqual(["only-clutter", "trip"]);
     expect(server.inits.map((body) => body.name)).toEqual(["a.jpg"]);
   });
@@ -213,6 +227,13 @@ describe("the user is told how many were left out", () => {
   it("one: the singular sentence", async () => {
     await addFiles([], null, ["trip"], { skipped: 1 });
     expect(toasts()).toEqual(["1 system file skipped (.DS_Store and similar)"]);
+  });
+
+  it("the unreadable notice is heard exactly once too", async () => {
+    await addFiles([], null, [], { unreadable: ["broken.jpg"] });
+    const sentence = "1 item could not be read and was left out: broken.jpg";
+    expect(toasts()).toEqual([sentence]);
+    expect(heard(sentence)).toBe(1);
   });
 
   it("none: nothing is said", async () => {
@@ -252,7 +273,7 @@ describe("a folder picker that hands back plain files", () => {
     choose(folderInput(), [smallFile("a.jpg"), smallFile("b.jpg")]);
     await act(() => settle());
     expect(toasts()).toEqual([FLAT]);
-    expect(said()).toContain(FLAT);
+    expect(heard(FLAT)).toBe(1);
     expect(getUploads().items).toEqual([]);
     expect(server.inits).toEqual([]);
     expect(folderCalls()).toEqual([]);
@@ -401,10 +422,28 @@ describe("⌘⇧U / Ctrl+Shift+U", () => {
     expect(shortcutLabel("uploadFolder", false)).toBe("Ctrl+Shift+U");
   });
 
-  it("works while the caret is in a text field, and the Single-key switch leaves it alone", () => {
+  it("is not global — Ctrl+Shift+U in a text field stays the system's (Unicode entry) — and the Single-key switch leaves it alone", () => {
     const def = SHORTCUTS.find((shortcut) => shortcut.id === "uploadFolder")!;
-    expect(def.global).toBe(true);
+    expect(def.global).toBeFalsy();
     expect(isCharacterShortcut(def)).toBe(false);
+  });
+
+  it("fires on the page, never from a text field", () => {
+    const fired: string[] = [];
+    function Bound() {
+      useShortcut("uploadFolder", () => fired.push("folder"));
+      return createElement("input", { "aria-label": "Name" });
+    }
+    const view = render(createElement(Bound));
+    const chord = { key: "U", ctrlKey: true, metaKey: true, shiftKey: true, bubbles: true, cancelable: true };
+    // Whichever of ⌘ and Ctrl this platform reads as the modifier: only one may be held.
+    const apple = isApplePlatform();
+    const event = () => new KeyboardEvent("keydown", { ...chord, ctrlKey: !apple, metaKey: apple });
+    view.getByRole("textbox").dispatchEvent(event());
+    expect(fired).toEqual([]);
+    document.body.dispatchEvent(event());
+    expect(fired).toEqual(["folder"]);
+    view.unmount();
   });
 });
 
