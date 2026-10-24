@@ -150,6 +150,9 @@ export const fetchQuarantineItem = (id: string, signal?: AbortSignal) =>
   adminApi(`/quarantine/${enc(id)}`, { schema: AdminQuarantineDetailDto, signal });
 export const quarantineAction = (id: string, body: QuarantineActionBody) =>
   post(`/quarantine/${enc(id)}`, QuarantineActionResponse, body);
+/** A file's or a folder's legal hold; answers the item's detail as it now is. */
+export const setNodeLegalHold = (id: string, body: SetLegalHoldBody) =>
+  post(`/quarantine/${enc(id)}/legal-hold`, AdminQuarantineDetailDto, body);
 export const fetchKeptUploads = (signal?: AbortSignal) =>
   adminApi("/kept-uploads", { schema: KeptUploadPage, signal });
 export const resolveKeptUpload = (id: string, body: ResolveKeptUploadBody) =>

@@ -108,6 +108,7 @@
 // No `send*` function throws.
 
 import { Resend } from "resend";
+import { STRIKE_WINDOW_DAYS, STRIKES_TO_SUSPEND } from "../../shared/constants";
 import {
   heldAlertMailboxes,
   holdAlert,
@@ -769,26 +770,55 @@ export const templates = {
       { text: "We cannot share what action, if any, was taken." },
     ],
   }),
+  /**
+   * A copyright takedown. To the SUBSCRIBER — the person who uploaded the material (§512(g)(2)(A))
+   * — the notice's description, the counter-notice path and, when one was issued, the strike. To a
+   * FOLDER OWNER who did not upload it (`folderOwner`), only that a file in their folder was
+   * removed and that its uploader was told (R1 ruling Q2).
+   */
   contentRemovedCopyright: (d: {
     name?: unknown;
     itemName: unknown;
     noticeText: unknown;
     counterNoticeUrl: string;
-  }): Draft => ({
-    subject: "Content removed following a copyright notice",
-    heading: "Content removed following a copyright notice",
-    blocks: [
-      { text: greeting(d.name) },
-      {
-        text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice is quoted below.`,
-      },
-      { quote: safeQuote(d.noticeText) },
-      {
-        text: "If you believe the content was removed by mistake or misidentification, you can send a counter-notice. It must identify the content, state under penalty of perjury that you believe in good faith it was removed by mistake, give your name, address and telephone number, consent to the jurisdiction of the federal court for your address, and be signed.",
-      },
-      { link: { label: "How to send a counter-notice", url: d.counterNoticeUrl } },
-    ],
-  }),
+    strike?: boolean;
+    folderOwner?: boolean;
+  }): Draft =>
+    d.folderOwner === true
+      ? {
+          subject: "A file in your folder was removed following a copyright notice",
+          heading: "A file in your folder was removed",
+          blocks: [
+            { text: greeting(d.name) },
+            {
+              text: `We received a copyright notice about “${safeLabel(d.itemName)}”, which someone you share a folder with uploaded, and have removed access to it. The notice's description of the material is quoted below.`,
+            },
+            { quote: safeQuote(d.noticeText) },
+            { text: "We have told the person who uploaded it. They can respond with a counter-notice." },
+          ],
+        }
+      : {
+          subject: "Content removed following a copyright notice",
+          heading: "Content removed following a copyright notice",
+          blocks: [
+            { text: greeting(d.name) },
+            {
+              text: `We received a copyright notice about “${safeLabel(d.itemName)}” and have removed access to it. The notice's description of the material is quoted below.`,
+            },
+            { quote: safeQuote(d.noticeText) },
+            ...(d.strike === true
+              ? [
+                  {
+                    text: `This counts as one copyright strike on your account. ${STRIKES_TO_SUSPEND} strikes within ${STRIKE_WINDOW_DAYS} days suspend an account. A strike is lifted if the content is restored after a counter-notice.`,
+                  },
+                ]
+              : []),
+            {
+              text: "If you believe the content was removed by mistake or misidentification, you can send a counter-notice. It must identify the content, state under penalty of perjury that you believe in good faith it was removed by mistake, give your name, address and telephone number, consent to the jurisdiction of the federal court for your address, and be signed.",
+            },
+            { link: { label: "How to send a counter-notice", url: d.counterNoticeUrl } },
+          ],
+        },
   contentRestored: (d: { name?: unknown; itemName: unknown }): Draft => ({
     subject: "Your content has been restored",
     heading: "Content restored",
@@ -1571,7 +1601,7 @@ export const sendReportReviewed = (deps: ServiceDeps, d: { to: string }) =>
   deliver(deps, "reportReviewed", d.to, () => templates.reportReviewed(), SYSTEM);
 export const sendContentRemovedCopyright = (
   deps: ServiceDeps,
-  d: To & { itemName: string; noticeText: string },
+  d: To & { itemName: string; noticeText: string; strike?: boolean; folderOwner?: boolean },
 ) =>
   deliver(
     deps,

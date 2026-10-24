@@ -7,7 +7,8 @@
 // pause switch is put there and taken away again. No setting is written.
 import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
-import { hashBlocklist } from "../../../src/worker/db/schema";
+import { eq } from "drizzle-orm";
+import { hashBlocklist, nodes } from "../../../src/worker/db/schema";
 import { DESTROY_PAUSED_KEY } from "../../../src/worker/jobs/reconcile";
 import { generationInStep, objectExists, openNoticeOn } from "../trash/helpers";
 import {
@@ -126,6 +127,31 @@ describe("refused for each hold cause: 409 held, the cause named, nothing delete
     expect(await stillThere(file)).toEqual({ row: true, object: true });
     expect(await auditOf("admin.node_purged", file.id)).toHaveLength(0);
     expect(await auditOf("system.purge", file.id)).toHaveLength(0);
+  });
+});
+
+describe("only a member of the quarantine (safety-7)", () => {
+  it("a clean file, and a folder that is not taken down → 409 not_quarantined, nothing deleted; control: the same folder taken down → purged", async () => {
+    const who = await admin();
+    const owner = await member();
+    const clean = await storedFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
+    const folder = await makeFolder(owner.id);
+    const inside = await storedFile(owner.id, folder.id, { scanStatus: "clean", scannedAt: new Date() });
+    for (const target of [clean, folder]) {
+      const answer = await adminCall(who.as, "POST", `/quarantine/${target.id}`, { body: DELETE });
+      expect([answer.status, answer.body.error]).toEqual([409, "not_quarantined"]);
+      expect(await auditOf("admin.node_purged", target.id)).toHaveLength(0);
+    }
+    expect(await stillThere(clean)).toEqual({ row: true, object: true });
+    expect(await stillThere(inside)).toEqual({ row: true, object: true });
+
+    await testDb()
+      .update(nodes)
+      .set({ takedownAt: new Date(), takedownReason: "admin" })
+      .where(eq(nodes.id, folder.id));
+    const purged = await adminCall(who.as, "POST", `/quarantine/${folder.id}`, { body: DELETE });
+    expect(purged.status).toBe(200);
+    expect(await stillThere(inside)).toEqual({ row: false, object: false });
   });
 });
 

@@ -331,7 +331,13 @@ function NoticeDetail({ notice }: { notice: DmcaNoticeDto }) {
             [t("dmca.nodes"), notice.nodes.map((node) => node.nodeName ?? node.nodeId).join(", ") || "—"],
             [t("dmca.takedownAt"), when(notice.takedownAt)],
             [t("dmca.notified"), when(notice.ownerNotifiedAt)],
-            [t("dmca.counterReceived"), when(notice.counterReceivedAt)],
+            // Day 0 of the window is the receipt's New York date: shown on that calendar (safety-n1).
+            [
+              t("dmca.counterReceived"),
+              notice.counterReceivedAt
+                ? t("dmca.easternAt", { at: eastern(notice.counterReceivedAt, "dateTime") })
+                : "—",
+            ],
             [t("dmca.counterForwarded"), when(notice.counterForwardedAt)],
             [
               t("dmca.window"),

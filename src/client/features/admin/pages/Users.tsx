@@ -9,7 +9,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { Link as RouterLink, useNavigate, useParams } from "react-router";
 import type { AdminStrikeDto, AdminUserDetailDto, StrikeKind } from "../../../../shared/schemas/admin";
-import { refreshSession } from "../../../lib/query";
+import { refreshSession, useSession } from "../../../lib/query";
 import {
   addStrike,
   adminKeys,
@@ -139,6 +139,8 @@ export function UserDetailPage() {
 
 function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
   const user = detail.user;
+  // Your own account (ruling Q4): no Suspend, Delete user or quota here — the server refuses them.
+  const own = useSession().data?.user.id === user.id;
   const client = useQueryClient();
   const navigate = useNavigate();
   const [pending, setPending] = useState<Pending>(null);
@@ -258,8 +260,14 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
 
   const saveQuota = async (event: FormEvent) => {
     event.preventDefault();
-    const value = Math.round(Number(quotaGb) * 1e9);
-    if (!Number.isFinite(value) || value < 0) return;
+    // Read as typed: an empty field is NOT 0 (func-5) — `Number("")` is — and a decimal comma
+    // is a decimal point.
+    const typed = quotaGb.trim().replace(",", ".");
+    if (!/^\d+(\.\d+)?$/.test(typed)) {
+      setStatus(t("users.quotaInvalid"));
+      return;
+    }
+    const value = Math.round(Number(typed) * 1e9);
     try {
       refresh(await setQuota(user.id, value));
       setStatus(t("users.done.quota"));
@@ -356,23 +364,25 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
             ],
           ]}
         />
-        <Box component="form" onSubmit={saveQuota} sx={{ display: "flex", gap: 2, alignItems: "center" }}>
-          <Box sx={{ width: 200 }}>
-            <Field
-              label={t("users.quotaGb")}
-              name="quota"
-              value={quotaGb}
-              onChange={(event) => setQuotaGb(event.target.value)}
-            />
+        {own ? null : (
+          <Box component="form" onSubmit={saveQuota} sx={{ display: "flex", gap: 2, alignItems: "center" }}>
+            <Box sx={{ width: 200 }}>
+              <Field
+                label={t("users.quotaGb")}
+                name="quota"
+                value={quotaGb}
+                onChange={(event) => setQuotaGb(event.target.value)}
+              />
+            </Box>
+            <Button type="submit">{t("users.setQuota")}</Button>
           </Box>
-          <Button type="submit">{t("users.setQuota")}</Button>
-        </Box>
+        )}
       </Section>
       <Section id="actions" title={t("users.actions")}>
         <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
           {user.suspendedAt ? (
             <Button onClick={() => setPending({ kind: "unsuspend" })}>{t("users.unsuspend")}</Button>
-          ) : (
+          ) : own ? null : (
             <Button onClick={() => setPending({ kind: "suspend" })}>{t("users.suspend")}</Button>
           )}
           {user.banned ? (
@@ -393,7 +403,7 @@ function UserDetail({ detail }: { detail: AdminUserDetailDto }) {
           <Button onClick={() => setPending({ kind: "impersonate" })}>{t("users.impersonate")}</Button>
           {user.deleteScheduledAt ? (
             <Button onClick={() => setPending({ kind: "cancelDelete" })}>{t("users.cancelDelete")}</Button>
-          ) : (
+          ) : own ? null : (
             <Button color="error" onClick={() => setPending({ kind: "delete" })}>
               {t("users.delete")}
             </Button>

@@ -47,6 +47,7 @@ import {
   setNodeLegalHold,
   setUserLegalHold,
   takedownNode,
+  verifiedSha256,
   type CsamClearResult,
 } from "../db/queries/moderation";
 import { keyReference } from "../db/queries/nodes";
@@ -85,7 +86,7 @@ import {
 import { AppError } from "./errors";
 import { metric } from "./metrics";
 import { db, deps, type AppEnv } from "./request-context";
-import { enqueueRescan, lockSuspectedCsam } from "./scanning";
+import { enqueueRescan, enqueueScan, lockSuspectedCsam } from "./scanning";
 import { storage } from "./storage";
 import { addStrike, enforceStrikeThreshold, liftStrike, type StrikeKind } from "./strikes";
 import { openIp } from "./tokens";
@@ -189,6 +190,29 @@ export async function dismissReport(c: C, reportId: string, resolution: string) 
   return done.report;
 }
 
+/**
+ * An admin's suspected-CSAM lock (escalation, the NCMEC start, lock from a notice): T10's one
+ * handler, with the hash listed ONLY if the server computed it (safety-1, Anmol's ruling Q8: the
+ * lock, the holds and the report now; the listing once the server has the hash). A file no scan
+ * will come for any more — `error`, `skipped`, never scanned — is sent one forced scan: its
+ * verdict brings the server's hash, which the verdict then lists (scan/verdict.ts). A file still
+ * waiting for its scan (`pending`, or under review over `pending`) gets that scan anyway.
+ */
+async function lockAsAdmin(c: C, node: Node): Promise<{ reportId: string }> {
+  const locked = await lockSuspectedCsam(deps(c), node.id, { source: "admin", onlyVerifiedHash: true });
+  const awaitingScan =
+    node.scanStatus === "pending" ||
+    (node.scanStatus === "under_review" && node.scanStatusPrev === "pending");
+  if (node.scannedAt === null && !awaitingScan && node.r2Key) {
+    try {
+      await enqueueScan(deps(c), { nodeId: node.id, key: node.r2Key, force: true });
+    } catch (error) {
+      captureError(error, { kind: "admin", reason: "lock_scan" });
+    }
+  }
+  return locked;
+}
+
 /** A rescan whose refusal is not this caller's business (a folder, a node gone meanwhile). */
 async function rescanQuietly(c: C, nodeId: string): Promise<void> {
   try {
@@ -256,7 +280,8 @@ export async function actionReport(
 
   const uploader = await currentUploader(c, node);
   if (!uploader) throw conflict("no_uploader");
-  const scanned = node.scanStatus !== "pending" ? node.sha256 : null;
+  // The strike's "same content never strikes twice" key: only a hash the server computed.
+  const scanned = verifiedSha256(node);
   const { report, strike } = await retryOnDeadlock(db(c), async (tx) => {
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     if (!locked || !OPEN_STATES.includes(locked.report.status)) throw conflict("state");
@@ -318,7 +343,7 @@ export async function escalateReport(c: C, reportId: string, resolution: string)
   if (!node || node.system !== null) throw conflict("no_node");
   if (node.kind !== "file") throw conflict("folder");
 
-  const { reportId: csamReportId } = await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+  const { reportId: csamReportId } = await lockAsAdmin(c, node);
   let report = seen;
   if (seen.category !== "csam") {
     report = await retryOnDeadlock(db(c), async (tx) => {
@@ -388,7 +413,7 @@ export async function ncmecStart(c: C, reportId: string) {
     const node = await adminQ.nodeRow(db(c), seen.nodeId);
     if (node && node.scanStatus !== "suspected_csam") {
       if (node.kind !== "file" || node.system !== null) throw conflict("folder");
-      await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+      await lockAsAdmin(c, node);
     }
   }
   const { report, changed } = await retryOnDeadlock(db(c), async (tx) => {
@@ -546,7 +571,12 @@ export async function ncmecFiled(c: C, reportId: string, body: { reportId: strin
     if (node && !filedBefore && (node.scanStatus !== "suspected_csam" || !node.legalHold)) {
       throw conflict("not_locked");
     }
-    const confirmed = node?.sha256 ? await blocklist.confirmCsam(tx, node.sha256) : false;
+    // The filing is recorded whatever the hash; the hash is CONFIRMED only when it is the
+    // server's (safety-1): a scan computed it, or it is listed `csam` already — a listing only a
+    // server hash reaches. A hash still the client's is confirmed by the scan that brings the
+    // server's (`listLockedOnScan`), which sees this filing.
+    const hash = node ? await filingHash(tx, node) : null;
+    const confirmed = hash ? await blocklist.confirmCsam(tx, hash) : false;
     const locked = await adminQ.lockReportAndNode(tx, reportId);
     const report = locked!.report;
     if (report.status === "actioned" && report.ncmecFiledAt) return { report, changed: false, confirmed };
@@ -575,6 +605,14 @@ export async function ncmecFiled(c: C, reportId: string, body: { reportId: strin
   );
   metric("report", { outcome: "filed" });
   return outcome.report;
+}
+
+/** The node's hash a filing confirms, or null while it is still the client's (see `ncmecFiled`). */
+async function filingHash(tx: Parameters<typeof blocklist.lookup>[0], node: Node): Promise<string | null> {
+  const verified = verifiedSha256(node);
+  if (verified) return verified;
+  if (node.sha256 === null) return null;
+  return (await blocklist.lookup(tx, node.sha256))?.reason === "csam" ? node.sha256 : null;
 }
 
 type ReleaseState = { allowed: true } | { allowed: false; releasableAt: string | null };
@@ -857,7 +895,7 @@ export async function lockFromNotice(
     name: node.name,
     mimeSniffed: node.mimeSniffed,
     size: node.size,
-    sha256: node.scanStatus !== "pending" ? node.sha256 : null,
+    sha256: verifiedSha256(node),
     owner: ref(node.ownerId) ?? { id: node.ownerId, displayName: "" },
     uploaders: versions.map((v) => ({
       versionId: v.versionId,
@@ -866,7 +904,7 @@ export async function lockFromNotice(
     scanStatus: node.scanStatus,
   };
   if (!confirm) return { confirmed: false, referenceKind: resolved.kind, match, reportId: null };
-  const { reportId } = await lockSuspectedCsam(deps(c), node.id, { source: "admin" });
+  const { reportId } = await lockAsAdmin(c, node);
   audit(
     c,
     "admin.csam_lock_manual",
@@ -913,13 +951,17 @@ export async function markFalsePositive(c: C, nodeId: string, reason: string) {
 
 /**
  * Confirm delete: purge now through T14's `purgeRoot` (`"account"` — the one rule that takes a
- * root that is not in the trash), keeping the hash in the blocklist. FIRST `readsRolledBack`
+ * root that is not in the trash), keeping the hash in the blocklist. Only a member of the
+ * quarantine (`409 not_quarantined`, nothing written). Then `readsRolledBack`
  * (rolled back or paused → `409 destroy_paused`, nothing written: an admin is the operator, so
  * the refusal needs no disguise). A held node is `409 held` with every cause.
  */
 export async function confirmDelete(c: C, nodeId: string, reason: string) {
   const node = await adminQ.nodeRow(db(c), nodeId);
   if (!node || node.system !== null) throw new AppError("not_found");
+  // Only what the quarantine lists (safety-7): an id pasted from elsewhere — anyone's clean file,
+  // a whole folder — is not purged from here.
+  if (!inQuarantine(node)) throw new AppError("not_quarantined");
   if (await readsRolledBack(c.env, db(c))) {
     throw conflict(
       "destroy_paused",
@@ -945,6 +987,19 @@ export async function confirmDelete(c: C, nodeId: string, reason: string) {
   return { purged: true };
 }
 
+/** The scan statuses the quarantine lists (db/queries/admin.ts `listQuarantine`), besides a takedown. */
+const QUARANTINE_STATUSES: readonly Node["scanStatus"][] = [
+  "infected",
+  "suspected_csam",
+  "under_review",
+  "error",
+  "skipped",
+];
+
+/** A member of the quarantine: one of its statuses, or taken down itself (`listQuarantine`). */
+const inQuarantine = (node: Node) =>
+  node.takedownAt !== null || QUARANTINE_STATUSES.includes(node.scanStatus);
+
 /** The node's own and inherited causes, and its subtree's (the gate's view), by the console's names. */
 async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause[]> {
   const own = await adminQ.holdCausesOf(db(c), nodeId);
@@ -967,6 +1022,159 @@ async function heldCauses(c: C, nodeId: string): Promise<adminQ.ConsoleHoldCause
     }
   }
   return [...found];
+}
+
+// ── the console's takedown, restore and node legal hold (safety-4, R1 ruling Q9) ───────────
+//
+// For ANY file or folder, not only a quarantine member. ONE transaction each, in the moderation
+// lock order: the owner's TREE LOCK, then the node's row — every check is made on that row, and
+// every refusal is thrown before the first write — then the T05 helper (it takes the same tree
+// lock again: re-entrant), the links, the blocklist entry. Audited after the commit. Nothing here
+// deletes an object.
+
+/** "Any notice": `otherActiveNoticeNames` excludes the one id it is given — this is no notice's. */
+const ANY_NOTICE = "00000000-0000-0000-0000-000000000000";
+
+/** The node to act on, or 404 (unknown, malformed, a system node). */
+async function consoleNode(c: C, nodeId: string): Promise<Node> {
+  const node = await adminQ.nodeRow(db(c), nodeId);
+  if (!node || node.system !== null) throw new AppError("not_found");
+  return node;
+}
+
+/**
+ * Take down a file or a folder — hidden from its owner and every partner and visitor, every link
+ * in its subtree paused `moderation` (paused, never revoked). Reason `admin`; `csam` (a FOLDER
+ * only) also puts it on legal hold, and so everything under it (T05 `takedownNode`). A FILE
+ * suspected as CSAM is LOCKED instead — that holds its owner and uploaders and opens the case —
+ * so a csam takedown of a file is `409 use_lock`. Already down: `409 already_taken_down`.
+ */
+export async function takedownByAdmin(c: C, admin: Admin, nodeId: string, reason: string, csam: boolean) {
+  const node = await consoleNode(c, nodeId);
+  if (csam && node.kind !== "folder") {
+    throw conflict(
+      "use_lock",
+      {},
+      "A file suspected as CSAM is locked (Lock from a notice), not taken down.",
+    );
+  }
+  const row = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const locked = await adminQ.lockNodeRow(tx, nodeId);
+    if (!locked) throw new AppError("not_found");
+    if (locked.takedownAt !== null) throw new AppError("already_taken_down");
+    await takedownNode(tx, nodeId, { reason: csam ? "csam" : "admin", by: admin.id });
+    await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
+    return (await adminQ.nodeRow(tx, nodeId))!;
+  });
+  audit(c, "admin.takedown", { type: "node", id: nodeId }, { reason, csam, kind: node.kind });
+  return row;
+}
+
+/**
+ * Restore a takedown that is not a copyright notice's: an abuse report's, an admin's, the
+ * scanner's for a `dmca`/`admin` blocklist hit, a csam one (a folder's) once its hold is cleared.
+ * Refused, nothing written:
+ *   - `409 not_taken_down`;
+ *   - `409 dmca_restore_only` — a notice's own takedown, or a node any notice still holds a
+ *     takedown on (`otherActiveNoticeNames`: also one that found it already down, and an upheld or
+ *     closed one): only the notice's restore lifts it, inside its window;
+ *   - `409 held` — a csam takedown whose legal hold is still set ("Clear legal hold" first).
+ * The scanner's takedown for a blocklist hit also REMOVES that entry (ruling Q9) — the node's
+ * verified hash, only while its reason is still the takedown's (a raised or confirmed csam entry
+ * is never touched), and `409 dmca_restore_only` while a notice in force names that content.
+ * Then the subtree's `moderation` pause is lifted (kept where something else still hides a node).
+ * After the commit: audited; a node left `pending` is scanned. An abuse takedown issued no strike
+ * (a report is actioned by a takedown OR a strike): the node's unlifted report strikes are
+ * RETURNED for the console to offer "Lift strike" — nothing is lifted here.
+ */
+export async function restoreByAdmin(c: C, nodeId: string, reason: string) {
+  const node = await consoleNode(c, nodeId);
+  const done = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const row = await adminQ.lockNodeRow(tx, nodeId);
+    if (!row) throw new AppError("not_found");
+    if (row.takedownAt === null) throw new AppError("not_taken_down");
+    const noticeTakedown = row.takedownReason === "dmca" && row.takedownBy !== null;
+    if (noticeTakedown || (await adminQ.otherActiveNoticeNames(tx, ANY_NOTICE, { nodeId }))) {
+      throw new AppError("dmca_restore_only");
+    }
+    if (row.takedownReason === "csam" && row.legalHold) {
+      throw conflict("held", {}, "The takedown keeps a legal hold: clear the legal hold first.");
+    }
+    const hit =
+      row.takedownBy === null && (row.takedownReason === "dmca" || row.takedownReason === "admin")
+        ? row.takedownReason
+        : null;
+    const sha256 = verifiedSha256(row);
+    let listed: string | null = null;
+    if (hit && sha256 && (await blocklist.lookup(tx, sha256))?.reason === hit) {
+      if (await adminQ.otherActiveNoticeNames(tx, ANY_NOTICE, { sha256 }))
+        throw new AppError("dmca_restore_only");
+      listed = sha256;
+    }
+    await restoreTakedown(tx, nodeId);
+    await unpauseLinks(tx, { subtreeOf: nodeId }, "moderation");
+    const removed = hit && listed ? await blocklist.remove(tx, listed, { onlyIfReason: hit }) : false;
+    return { before: row, removed };
+  });
+  audit(
+    c,
+    "admin.takedown_restored",
+    { type: "node", id: nodeId },
+    {
+      reason,
+      takedownReason: done.before.takedownReason,
+      byScanner: done.before.takedownBy === null,
+      blocklistRemoved: done.removed,
+    },
+  );
+  const after = (await adminQ.nodeRow(db(c), nodeId))!;
+  if (after.scanStatus === "pending") await rescanQuietly(c, nodeId);
+  return { node: after, blocklistRemoved: done.removed, reportStrikeIds: await reportStrikesOn(c, after) };
+}
+
+/** The unlifted strikes report actions gave the node's current uploader for this node. */
+async function reportStrikesOn(c: C, node: Node): Promise<string[]> {
+  const uploader = await currentUploader(c, node);
+  if (!uploader) return [];
+  return (await adminQ.strikesOf(db(c), uploader))
+    .filter((s) => s.nodeId === node.id && s.reportId !== null && s.liftedAt === null)
+    .filter((s) => s.kind === "abuse" || s.kind === "malware")
+    .map((s) => s.id);
+}
+
+/**
+ * A file's or a folder's legal hold — on a folder it protects everything under it (T05
+ * `setNodeLegalHold`, under the owner's tree lock). Clearing is `409 hold_not_releasable` while a
+ * CSAM lock's hold applies: the node is `suspected_csam`, or a `csam` report on it is not yet
+ * releasable — "Release holds" on the report does that. Audited (`admin.node_legal_hold_set` /
+ * `_cleared`, `{ reason, changed }`).
+ */
+export async function setNodeHold(c: C, nodeId: string, held: boolean, reason: string) {
+  const node = await consoleNode(c, nodeId);
+  const at = now(c);
+  const changed = await retryOnDeadlock(db(c), async (tx) => {
+    await lockOwnerTree(tx, node.ownerId);
+    const row = await adminQ.lockNodeRow(tx, nodeId);
+    if (!row) throw new AppError("not_found");
+    if (!held) {
+      const lockHolds =
+        row.scanStatus === "suspected_csam" ||
+        (await adminQ.csamReportsOn(tx, nodeId)).some((report) => !releaseStateOf(report, at).allowed);
+      if (lockHolds) throw conflict("hold_not_releasable");
+    }
+    if (row.legalHold === held) return false;
+    await setNodeLegalHold(tx, nodeId, held);
+    return true;
+  });
+  audit(
+    c,
+    held ? "admin.node_legal_hold_set" : "admin.node_legal_hold_cleared",
+    { type: "node", id: nodeId },
+    { reason, changed, kind: node.kind },
+  );
+  return (await adminQ.nodeRow(db(c), nodeId))!;
 }
 
 // ── copyright notices (section 7) ───────────────────────────────────────────────────────────
@@ -1038,7 +1246,8 @@ export async function createNotices(c: C, admin: Admin, input: NoticeInput, node
         group.map((node) => ({
           id: node.id,
           name: node.name,
-          sha256: node.scanStatus !== "pending" ? node.sha256 : null,
+          // The snapshot keys "another notice names the same content": a server hash only.
+          sha256: verifiedSha256(node),
         })),
         admin.id,
       );
@@ -1064,7 +1273,7 @@ const TAKEDOWN_FROM: readonly DmcaNotice["status"][] = ["received", "incomplete"
  * subtree's links paused `moderation` (paused, not revoked), the `dmca` blocklist rows; (3) the
  * strike in the same transaction (`addStrike(…, { tx })`) and `strikeId` on the notice;
  * `ownerNotifiedAt` is set with the transition. After the commit: the strike's audit row and
- * threshold, then the owner's mail — sent by this call only. A repeat answers the notice as it stands.
+ * threshold, then the uploader's and the folder owner's mails (`notifyRemoval`) — sent by this call only. A repeat answers the notice as it stands.
  */
 async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes, note: string | null) {
   const uploader = await firstUploader(c, notice);
@@ -1082,7 +1291,8 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
     for (const { nodeId } of notice.nodes) {
       // A notice changes only what it changes (M1): a node already taken down — for abuse, by an
       // admin, as csam, or by another notice — keeps its takedown and its reason as they are.
-      const before = await adminQ.nodeRow(tx, nodeId);
+      // Locked (after the tree locks): the hash listed below is the one this row holds now.
+      const before = await adminQ.lockNodeRow(tx, nodeId);
       if (!before || before.takedownAt !== null) continue;
       if (!(await takedownNode(tx, nodeId, { reason: "dmca", by: admin.id }))) continue;
       // What this notice did, recorded on its own row (SEAM took_down): its restore lifts only this.
@@ -1090,9 +1300,11 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       await pauseLinks(tx, { subtreeOf: nodeId }, "moderation");
       // The hash is listed `dmca` only when it is listed for nothing yet: an entry another
       // reason made is never rewritten (and so never removed by this notice's restore).
-      if (before.sha256 && before.scanStatus !== "pending" && !(await blocklist.lookup(tx, before.sha256))) {
+      // Only a hash the server computed (safety-1): a declared one is never listed.
+      const sha256 = verifiedSha256(before);
+      if (sha256 && !(await blocklist.lookup(tx, sha256))) {
         await blocklist.upsert(tx, {
-          sha256: before.sha256,
+          sha256,
           reason: "dmca",
           sourceNodeId: nodeId,
           addedBy: admin.id,
@@ -1125,7 +1337,7 @@ async function takedownNotice(c: C, admin: Admin, notice: adminQ.NoticeWithNodes
       reason: note,
     },
   );
-  await notifyOwner(c, current);
+  await notifyRemoval(c, current, uploader, outcome.strike !== null);
   return (await adminQ.noticeById(db(c), notice.id))!;
 }
 
@@ -1140,6 +1352,12 @@ async function firstUploader(c: C, notice: adminQ.NoticeWithNodes): Promise<stri
   return null;
 }
 
+/** The account the notice's strike went to (its uploader), else the current uploader. */
+async function strickenOf(c: C, notice: adminQ.NoticeWithNodes): Promise<string | null> {
+  const strike = notice.strikeId ? await adminQ.strikeById(db(c), notice.strikeId) : null;
+  return strike?.userId ?? (await firstUploader(c, notice));
+}
+
 async function ownerOf(c: C, notice: adminQ.NoticeWithNodes) {
   for (const { nodeId, nodeName } of notice.nodes) {
     const node = await adminQ.nodeRow(db(c), nodeId);
@@ -1151,19 +1369,62 @@ async function ownerOf(c: C, notice: adminQ.NoticeWithNodes) {
   return null;
 }
 
-/** The "content removed" mail — sent by the one takedown that moved the notice. */
-async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
-  // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
+/** What a removal mail quotes when the notice did not describe the material (safety-8). */
+const NO_DESCRIPTION = "The notice did not describe the material beyond naming this item.";
+
+/**
+ * The notice's description of the material — all a removal mail quotes (`/dmca` promises exactly
+ * that). NEVER the notice as received (`rawText`: the complainant's address, phone, signature).
+ */
+const removalText = (notice: DmcaNotice) => notice.infringingDescription?.trim() || NO_DESCRIPTION;
+
+/**
+ * Who a notice's mails go to (R1 ruling Q2): the UPLOADER struck for it — the subscriber who
+ * posted the material, with the notice, the counter-notice path and the strike — and the folder
+ * OWNER when that is another account; when the uploader is unknown (anonymised, gone), the owner
+ * is the subscriber. Each account once.
+ */
+async function noticeRecipients(c: C, notice: adminQ.NoticeWithNodes, uploaderId: string | null) {
   const found = await ownerOf(c, notice);
-  if (!found) return;
-  deps(c).defer(
-    sendContentRemovedCopyright(deps(c), {
-      to: found.owner.email,
-      name: found.owner.name,
-      itemName: found.itemName,
-      noticeText: notice.infringingDescription ?? notice.rawText ?? "",
-    }),
-  );
+  const uploader = uploaderId ? await adminQ.adminUser(db(c), uploaderId) : null;
+  const itemName = found?.itemName ?? notice.nodes[0]?.nodeName ?? "";
+  const subscriber = uploader ?? found?.owner ?? null;
+  const owner = found && found.owner.id !== subscriber?.id ? found.owner : null;
+  return { itemName, subscriber, owner };
+}
+
+/** The "content removed" mails — sent by the one takedown that moved the notice. */
+async function notifyRemoval(
+  c: C,
+  notice: adminQ.NoticeWithNodes,
+  uploaderId: string | null,
+  struck: boolean,
+) {
+  // Only the call whose transition moved the notice gets here: `ownerNotifiedAt` was set with it.
+  const { itemName, subscriber, owner } = await noticeRecipients(c, notice, uploaderId);
+  const noticeText = removalText(notice);
+  if (subscriber) {
+    deps(c).defer(
+      sendContentRemovedCopyright(deps(c), {
+        to: subscriber.email,
+        name: subscriber.name,
+        itemName,
+        noticeText,
+        strike: struck && subscriber.id === uploaderId,
+      }),
+    );
+  }
+  if (owner) {
+    deps(c).defer(
+      sendContentRemovedCopyright(deps(c), {
+        to: owner.email,
+        name: owner.name,
+        itemName,
+        noticeText,
+        folderOwner: true,
+      }),
+    );
+  }
 }
 
 /**
@@ -1171,7 +1432,7 @@ async function notifyOwner(c: C, notice: adminQ.NoticeWithNodes) {
  * only while no lawsuit notice is recorded. One transaction under the owners' tree locks:
  * `restoreTakedown`, the subtree's `moderation` pause lifted (T05 keeps it where the node is still
  * hidden otherwise), the `dmca` entry removed only if it is still `dmca`; status → `restored`.
- * After the commit: the strike lifted, a rescan for a node left `pending`, the owner's mail.
+ * After the commit: the strike lifted, a rescan for a node left `pending`, the uploader's and the folder owner's mails.
  * `withdraw` is the same restore with `closeNotice(…, 'withdrawn')` as the status change.
  */
 async function restoreNotice(
@@ -1297,15 +1558,10 @@ async function restoreNotice(
       sendDmcaRestoredComplainant(deps(c), { to, name: notice.complainantName, noticeId: notice.id }),
     );
   }
-  const found = await ownerOf(c, notice);
-  if (found) {
-    deps(c).defer(
-      sendContentRestored(deps(c), {
-        to: found.owner.email,
-        name: found.owner.name,
-        itemName: found.itemName,
-      }),
-    );
+  // The uploader the notice struck and the folder owner (ruling Q2), each once.
+  const { itemName, subscriber, owner } = await noticeRecipients(c, notice, await strickenOf(c, notice));
+  for (const to of [subscriber, owner]) {
+    if (to) deps(c).defer(sendContentRestored(deps(c), { to: to.email, name: to.name, itemName }));
   }
 }
 

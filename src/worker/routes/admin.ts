@@ -18,7 +18,7 @@
 //   POST /admin/users/:userId/{suspend,unsuspend,revoke-sessions,revoke-links,strikes,legal-hold,deletion,deletion/cancel}
 //   PATCH /admin/users/:userId/quota  ·  POST /admin/strikes/:strikeId/lift
 //   GET|PATCH /admin/settings
-//   GET  /admin/quarantine  ·  GET|POST /admin/quarantine/:nodeId
+//   GET  /admin/quarantine  ·  GET|POST /admin/quarantine/:nodeId  ·  POST /admin/quarantine/:nodeId/legal-hold
 //   GET  /admin/kept-uploads  ·  POST /admin/kept-uploads/:uploadId/resolve
 //   GET  /admin/reports  ·  GET /admin/reports/:id  ·  POST /admin/reports/:id/{assign,action,ncmec/start,ncmec/evidence,ncmec/filed,release-holds,clear-lock}
 //   POST /admin/moderation/lock-csam
@@ -88,7 +88,7 @@ import { revokeLink } from "../db/queries/sharing";
 import { EXPIRED_NOTE } from "../db/queries/strikes";
 import type { Node, Report, Strike } from "../db/schema";
 import { jobNames, jobs, runJob, softDeadlineOf } from "../jobs/index";
-import { readPauseSwitch, readsRolledBack } from "../jobs/reconcile";
+import { readPauseSwitch, readsRolledBack, reconcileStopOf } from "../jobs/reconcile";
 import { buildMeta } from "../meta";
 import { requireAdmin } from "../middleware/guards";
 import { SCANNER_INSTANCES, scannerHealth, type ScannerDeps } from "../scan/container";
@@ -645,8 +645,13 @@ router.get(`/admin/quarantine/${NODE}`, async (c) => {
   requireAdmin(c);
   const node = await adminQ.nodeRow(db(c), c.req.param("nodeId"));
   if (!node || node.system !== null) throw new AppError("not_found");
+  return c.json(await quarantineDetail(c, node));
+});
+
+/** The quarantine item's detail (`AdminQuarantineDetailDto`) — any file or folder. */
+async function quarantineDetail(c: C, node: Node) {
   const [item] = await quarantineItems(c, [node]);
-  return c.json({
+  return {
     item: item!,
     owner: item!.node.owner,
     scanReason: node.scanReason,
@@ -655,11 +660,11 @@ router.get(`/admin/quarantine/${NODE}`, async (c) => {
     holds: await adminQ.holdCausesOf(db(c), node.id),
     links: (await adminQ.linksOnNode(db(c), node.id)).map(linkDto),
     malwareStrikeId: await adminQ.malwareStrikeFor(db(c), node.createdBy, node.id),
-  });
-});
+  };
+}
 
 router.post(`/admin/quarantine/${NODE}`, async (c) => {
-  requireAdmin(c);
+  const admin = requireAdmin(c);
   const nodeId = c.req.param("nodeId");
   const body = QuarantineActionBody.parse(await jsonBody(c));
   if (body.action === "rescan") {
@@ -671,6 +676,18 @@ router.post(`/admin/quarantine/${NODE}`, async (c) => {
     return c.json({ node: node ? (await toAdminNodeDtos(db(c), [node]))[0]! : null, rescan });
   }
   const reason = requiredReason(body.note);
+  if (body.action === "takedown") {
+    const node = await actions.takedownByAdmin(c, admin, nodeId, reason, body.csam === true);
+    return c.json({ node: (await toAdminNodeDtos(db(c), [node]))[0]! });
+  }
+  if (body.action === "restore") {
+    const done = await actions.restoreByAdmin(c, nodeId, reason);
+    return c.json({
+      node: (await toAdminNodeDtos(db(c), [done.node]))[0]!,
+      blocklistRemoved: done.blocklistRemoved,
+      reportStrikeIds: done.reportStrikeIds,
+    });
+  }
   if (body.action === "release") {
     const done = await actions.markFalsePositive(c, nodeId, reason);
     return c.json({
@@ -681,6 +698,15 @@ router.post(`/admin/quarantine/${NODE}`, async (c) => {
   }
   await actions.confirmDelete(c, nodeId, reason);
   return c.json({ node: null, purged: true });
+});
+
+/** A file's or a folder's legal hold (R1 ruling Q9); answers the item's detail as it now is. */
+router.post(`/admin/quarantine/${NODE}/legal-hold`, async (c) => {
+  requireAdmin(c);
+  const nodeId = c.req.param("nodeId");
+  const body = SetLegalHoldBody.parse(await jsonBody(c));
+  const node = await actions.setNodeHold(c, nodeId, body.held, requiredReason(body.note));
+  return c.json(await quarantineDetail(c, node));
 });
 
 // ── uploads kept under "keep and alert" ─────────────────────────────────────────────────────
@@ -873,9 +899,23 @@ const escapeHtml = (text: string) =>
     (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!,
   );
 
+/**
+ * An export GET is a navigation another site could start in an admin's browser (the session
+ * cookie is SameSite=Lax, and the CSRF middleware passes every GET): each one is audited and
+ * hands over personal data. `Sec-Fetch-Site: cross-site | same-site` is refused before anything
+ * runs (secsrv-3, as `GET /account/export`); `same-origin`, `none` and no header are served.
+ */
+function refuseCrossSite(c: C): void {
+  const site = c.req.header("sec-fetch-site");
+  if (site === "cross-site" || site === "same-site") {
+    throw new AppError("forbidden", "Cross-site request refused.", { reason: "csrf" });
+  }
+}
+
 /** The notice as printable HTML (v1's export). Every value escaped; no script, no external resource. */
 router.get(`/admin/dmca/${ID}/export`, async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const notice = await adminQ.noticeById(db(c), c.req.param("id"));
   if (!notice) throw new AppError("not_found");
   const dto = noticeDto(notice);
@@ -998,6 +1038,7 @@ const csvLine = (cells: unknown[]) => `${cells.map(csvCell).join(",")}\r\n`;
 
 router.get("/admin/invites/export", async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const rows = await adminQ.allInvites(db(c));
   const head = csvLine(["code", "maxUses", "uses", "expiresAt", "revokedAt", "note", "createdAt"]);
   const body =
@@ -1047,6 +1088,7 @@ export const AUDIT_EXPORT_BATCH = 500;
  */
 router.get("/admin/audit/export", async (c) => {
   requireAdmin(c);
+  refuseCrossSite(c);
   const query = AuditQuery.parse(c.req.query());
   const filter = {
     actorUserId: query.actorUserId,
@@ -1244,10 +1286,21 @@ router.post("/admin/jobs/:name{[a-z-]+}/run", async (c) => {
   audit(c, "admin.job_run", { type: "job", id: name }, { name });
   if (STREAMED_JOBS.has(name)) return streamedRun(c, name);
 
-  const result = await runBackground(c.env, c.executionCtx, (bg) =>
-    runJob(name, bg, { softDeadlineMs: RUN_NOW_SOFT_DEADLINE_MS }),
-  );
+  const result = await runBackground(c.env, c.executionCtx, async (bg) => ({
+    ...(await runJob(name, bg, { softDeadlineMs: RUN_NOW_SOFT_DEADLINE_MS })),
+    stop: name === "reconcile" ? reconcileStopOf(bg) : null,
+  }));
   if (result.done) return c.json({ name, done: true }, 200);
+  // A stop another pass cannot change (func-3): the console ends its loop on it.
+  if (result.stop === "orphans_disabled" || result.stop === "orphan_threshold") {
+    throw new AppError(
+      "conflict",
+      result.stop === "orphans_disabled"
+        ? "Orphan deletion is off in Settings: the rest of the pass is done."
+        : "More objects look orphaned than the threshold allows. Nothing was deleted.",
+      { reason: result.stop },
+    );
+  }
   if (job.guarded) {
     const reason = await stoppedBecause(c);
     if (reason) {

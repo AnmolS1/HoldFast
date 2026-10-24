@@ -40,6 +40,7 @@ async function twoUploaders() {
   const [owner, first, second] = await Promise.all([member(), member(), member()]);
   const file = await makeFile(owner.id, null, {
     scanStatus: "clean",
+    scannedAt: new Date(),
     sha256: madeUpSha(),
     createdBy: second.id,
   });
@@ -159,7 +160,11 @@ describe("a folder cannot be locked", () => {
     const op = await admin();
     const owner = await member();
     const folder = await makeFolder(owner.id);
-    const inside = await makeFile(owner.id, folder.id, { scanStatus: "clean", sha256: madeUpSha() });
+    const inside = await makeFile(owner.id, folder.id, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256: madeUpSha(),
+    });
     const ops = operators();
     for (const reference of [folder.id, `http://files.localhost/d/${folder.id}/${TOKEN}`]) {
       for (const confirm of [false, true]) {

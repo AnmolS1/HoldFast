@@ -14,7 +14,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { uuidv7 } from "../../../src/worker/db/ids";
 import { getSettings, setSetting } from "../../../src/worker/db/queries/settings";
 import { settings as settingsTable } from "../../../src/worker/db/schema";
-import { DESTROY_PAUSED_KEY, GENERATION_KEY, runReconcile } from "../../../src/worker/jobs/reconcile";
+import {
+  DESTROY_PAUSED_KEY,
+  GENERATION_KEY,
+  reconcileStopReason,
+  runReconcile,
+  sweepOrphans,
+  type OrphanSweep,
+} from "../../../src/worker/jobs/reconcile";
 import { keyFor } from "../../../src/worker/services/storage";
 import { generationInStep, jobContext, objectExists, putObject, testDb } from "../trash/helpers";
 import { adminCall, admin, member, operators } from "./helpers";
@@ -103,6 +110,83 @@ describe("R-a: Run now reconcile with the switch on deletes no orphan", () => {
       });
       await live.settle();
       expect(swept.sweep?.outcome).toBe("swept");
+      expect(await objectExists(orphan)).toBe(false);
+    },
+    REAL_RUN_MS,
+  );
+});
+
+describe("func-3: Run now reconcile ends on a stop another pass cannot change", () => {
+  it(
+    "orphan deletion off: once the quota half is done the answer is 409 orphans_disabled — never 202 for ever",
+    async () => {
+      await generationInStep();
+      const who = await admin();
+      const statuses: number[] = [];
+      let last: Awaited<ReturnType<typeof adminCall>> | null = null;
+      for (let pass = 0; pass < 12; pass++) {
+        last = await adminCall(who.as, "POST", "/jobs/reconcile/run", {
+          env: ops.env,
+          settings: { orphanDeleteEnabled: false },
+        });
+        statuses.push(last.status);
+        if (last.status !== 202) break;
+      }
+      expect([last!.status, last!.body.details], statuses.join(",")).toEqual([
+        409,
+        { reason: "orphans_disabled" },
+      ]);
+    },
+    REAL_RUN_MS,
+  );
+
+  it("the stop reasons, from a run: the threshold at once; disabled once the quota half is done; otherwise none", () => {
+    const sweep = (outcome: OrphanSweep["outcome"]): OrphanSweep => ({
+      outcome,
+      listed: 0,
+      candidates: 0,
+      deleted: 0,
+      area: 0,
+      object: null,
+      done: false,
+    });
+    expect(reconcileStopReason(false, sweep("orphan_threshold"))).toBe("orphan_threshold");
+    expect(reconcileStopReason(true, sweep("disabled"))).toBe("orphans_disabled");
+    expect(reconcileStopReason(false, sweep("disabled"))).toBeNull();
+    expect(reconcileStopReason(true, sweep("swept"))).toBeNull();
+    expect(reconcileStopReason(true, null)).toBeNull();
+  });
+});
+
+describe("func-n3: the orphan sweep asks the pause switch again right before it deletes", () => {
+  it(
+    "switch on when the sweep runs (after the slot's reading): nothing deleted, `destroy_paused`; control: off → swept",
+    async () => {
+      await generationInStep();
+      const owner = await member();
+      const orphan = keyFor(owner.id, uuidv7(), uuidv7());
+      await putObject(orphan, "nobody's");
+      await env.FILES.put(DESTROY_PAUSED_KEY, "paused by a test");
+      const later = new Date(Date.now() + 72 * HOUR);
+      const paused = jobContext({ env: ops.env });
+      const stopped = await sweepOrphans(paused.bg, {
+        from: { area: 0, object: null },
+        stopAt: Date.now() + 60_000,
+        now: later,
+      });
+      await paused.settle();
+      expect(stopped.outcome).toBe("destroy_paused");
+      expect(await objectExists(orphan)).toBe(true);
+
+      await env.FILES.delete(DESTROY_PAUSED_KEY);
+      const live = jobContext({ env: ops.env });
+      const swept = await sweepOrphans(live.bg, {
+        from: { area: 0, object: null },
+        stopAt: Date.now() + 60_000,
+        now: later,
+      });
+      await live.settle();
+      expect(swept.outcome).toBe("swept");
       expect(await objectExists(orphan)).toBe(false);
     },
     REAL_RUN_MS,

@@ -49,7 +49,11 @@ afterEach(async () => {
 /** A user's csam-category report from the intake: the node is merely `under_review`, nothing held. */
 async function userCsamReport() {
   const owner = await member();
-  const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+  const file = await makeFile(owner.id, null, {
+    scanStatus: "clean",
+    scannedAt: new Date(),
+    sha256: madeUpSha(),
+  });
   await uploadAddress(file.id, file.versionId!, owner.id, "192.0.2.77");
   const reportId = await reported(file.id, owner.id, "csam");
   return { owner, file, reportId };
@@ -120,6 +124,7 @@ describe("B1 — the NCMEC procedure runs on a LOCKED node only", () => {
         name: `f-${rand()}`,
         nameKey: `f-${rand()}`,
         scanStatus: "clean",
+        scannedAt: new Date(),
       })
       .returning();
     const reportId = await reported(folder[0]!.id, owner.id, "csam");
@@ -284,7 +289,7 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
   it("P2a: an abuse takedown, then a notice that took no action is withdrawn → the node stays down, its link stays paused", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const link = await makeLink(file.id, owner.id);
     const reportId = await reported(file.id, owner.id, "spam");
     expect(
@@ -306,7 +311,7 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
   it("an actioned notice on a node already taken down for abuse does not overwrite the reason, and its restore leaves it down", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const reportId = await reported(file.id, owner.id, "spam");
     await adminCall(who.as, "POST", `/reports/${reportId}/action`, {
       body: { action: "takedown", resolution: "Abuse." },
@@ -322,7 +327,7 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
     const who = await admin();
     const owner = await member();
     const sha = madeUpSha();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: sha });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
     const link = await makeLink(file.id, owner.id);
     const a = await noticeOn(who, file.id);
     const b = await noticeOn(who, file.id);
@@ -343,7 +348,11 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
     for (const ending of ["lawsuit_notice", "close"] as const) {
       const owner = await member();
       const sha = madeUpSha();
-      const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: sha });
+      const file = await makeFile(owner.id, null, {
+        scanStatus: "clean",
+        scannedAt: new Date(),
+        sha256: sha,
+      });
       const a = await noticeOn(who, file.id);
       const b = await noticeOn(who, file.id);
       expect((await act(who, a, "takedown")).status).toBe(200);
@@ -357,7 +366,11 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
     }
     // Control: B ended by a withdraw of its own (its takedown lifted) — A's withdraw restores.
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const file = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256: madeUpSha(),
+    });
     const a = await noticeOn(who, file.id);
     const b = await noticeOn(who, file.id);
     await act(who, a, "takedown");
@@ -374,7 +387,7 @@ describe("M1 — a DMCA notice undoes only what it did", () => {
     const who = await admin();
     const owner = await member();
     const sha = madeUpSha();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: sha });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
     await blocklist.upsert(testDb(), { sha256: sha, reason: "malware" });
     const notice = await noticeOn(who, file.id);
     expect((await act(who, notice, "takedown")).status).toBe(200);
@@ -390,7 +403,11 @@ describe("M2 — clearing a hold by hand cannot erase a lock's hold", () => {
   it("a lock racing the clear: the clear holds the user row; the lock waits, then sets the hold — it stands", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const file = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256: madeUpSha(),
+    });
     await adminCall(who.as, "POST", `/users/${owner.id}/legal-hold`, {
       body: { held: true, note: "By hand." },
     });
@@ -432,7 +449,7 @@ describe("m4 — bulk revoke commits only with its audit row", () => {
   it("an audit insert that fails rolls the revokes back (500, the links still live)", async () => {
     const who = await admin();
     const owner = await member();
-    const file = await makeFile(owner.id, null, { scanStatus: "clean" });
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date() });
     const link = await makeLink(file.id, owner.id);
     const answer = await adminCall(who.as, "POST", `/users/${owner.id}/revoke-links`, {
       body: { reason: "Abuse." },
@@ -493,12 +510,20 @@ describe("M1 residual — a scanner-made dmca takedown is not a notice's to lift
   it("the scanner took the file down (dmca, takedownBy null); a notice naming it is taken down and withdrawn → the file stays down; control: a file the notice itself took down is lifted", async () => {
     const who = await admin();
     const owner = await member();
-    const scanned = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const scanned = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256: madeUpSha(),
+    });
     await testDb()
       .update(nodes)
       .set({ takedownAt: new Date(), takedownReason: "dmca", takedownBy: null })
       .where(eq(nodes.id, scanned.id));
-    const own = await makeFile(owner.id, null, { scanStatus: "clean", sha256: madeUpSha() });
+    const own = await makeFile(owner.id, null, {
+      scanStatus: "clean",
+      scannedAt: new Date(),
+      sha256: madeUpSha(),
+    });
     const made = await adminCall(who.as, "POST", "/dmca", { body: intake([scanned.id, own.id]) });
     expect(made.status, made.text).toBe(200);
     const notice = made.body.notices[0].id as string;

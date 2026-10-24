@@ -653,15 +653,19 @@ export async function sweepCsamAlerts(
  * repeats it (this function, again), and `sweepCsamAlerts` records a lock whose marker was never
  * claimed and tells the operators about a report nobody was told about.
  *
+ * `onlyVerifiedHash` (the admin console's locks): the hash is listed only if a scan computed it;
+ * otherwise the scan that brings it lists it (db/queries/moderation.ts, safety-1). The system's
+ * callers lock nodes whose hash they computed and leave it unset.
+ *
  * It never deletes anything, never notifies the owner and issues no strike. Safe to repeat: the
  * same report is returned. `404 not_found` when there is no such node.
  */
 export async function lockSuspectedCsam(
   deps: ServiceDeps,
   nodeId: string,
-  opts: { source: "photodna" | "system" | "admin" },
+  opts: { source: "photodna" | "system" | "admin"; onlyVerifiedHash?: boolean },
 ): Promise<{ reportId: string }> {
-  const locked = await lockAndOwe(deps, nodeId, opts.source, "lock");
+  const locked = await lockAndOwe(deps, nodeId, opts.source, "lock", opts.onlyVerifiedHash === true);
   if (!locked) throw new AppError("not_found");
   if (locked.owed) deps.defer(locked.owed);
   return { reportId: locked.reportId };
@@ -677,8 +681,9 @@ async function lockAndOwe(
   nodeId: string,
   source: "photodna" | "system" | "admin",
   via: "lock" | "sweep",
+  onlyVerifiedHash = false,
 ): Promise<{ reportId: string; owed: Promise<void> | null } | null> {
-  const locked = await lockRows(deps.db, nodeId, { source });
+  const locked = await lockRows(deps.db, nodeId, { source, onlyVerifiedHash });
   if (!locked) return null;
   return { reportId: locked.reportId, owed: owedAfterLock(deps, nodeId, source, via, locked) };
 }

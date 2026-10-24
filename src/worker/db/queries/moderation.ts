@@ -42,6 +42,7 @@ import {
   uploadIps,
   user,
 } from "../schema";
+import { confirmCsam } from "./blocklist";
 import { pauseLinks, unpauseLinks } from "./links";
 import { lockOwnerTree } from "./tree";
 
@@ -256,12 +257,24 @@ class SubjectsGrew extends Error {
 export async function lockSuspectedCsam(
   db: Executor,
   nodeId: string,
-  opts: { source: "photodna" | "system" | "admin" },
+  opts: { source: "photodna" | "system" | "admin"; onlyVerifiedHash?: boolean },
 ): Promise<CsamLockResult | null> {
   if (!isUuid(nodeId)) return null;
-  return retryOnDeadlock(db, (tx) => lockInOneTransaction(tx, nodeId, opts.source), {
+  const only = opts.onlyVerifiedHash === true;
+  return retryOnDeadlock(db, (tx) => lockInOneTransaction(tx, nodeId, opts.source, false, only), {
     attempts: CSAM_LOCK_ATTEMPTS,
   });
+}
+
+/**
+ * The node's hash when THIS SERVER computed it — a scan recorded a verdict (`scannedAt` set: the
+ * scan writes the hash of the stored bytes with it; a replace and a rescan clear both) — else
+ * null: until then `nodes.sha256` is what the client declared (routes/uploads.ts hashes only a
+ * declared hash that is listed). The one definition every reader that LISTS a node's hash, or
+ * keys on it, uses: a declared hash is never put on the blocklist (safety-1).
+ */
+export function verifiedSha256(node: { sha256: string | null; scannedAt: Date | null }): string | null {
+  return node.scannedAt !== null ? node.sha256 : null;
 }
 
 /**
@@ -292,6 +305,8 @@ async function lockInOneTransaction(
   tx: Executor,
   nodeId: string,
   source: "photodna" | "system" | "admin",
+  onlyUnrecorded: false,
+  onlyVerifiedHash: boolean,
 ): Promise<CsamLockResult | null>;
 async function lockInOneTransaction(
   tx: Executor,
@@ -303,7 +318,8 @@ async function lockInOneTransaction(
   tx: Executor,
   nodeId: string,
   source: "photodna" | "system" | "admin",
-  onlyUnrecorded = false,
+  onlyUnrecorded: boolean,
+  onlyVerifiedHash = false,
 ): Promise<CsamLockResult | CsamCompletionSkipped | null> {
   // LOCK ORDER: `user` rows first — every one this transaction will write, LOWEST ID FIRST
   // (the order of `enforceUploadCeilings`) — then the node: the order of the purge
@@ -330,7 +346,9 @@ async function lockInOneTransaction(
   let userIds = subjectUserIds(first);
   for (let attempt = 1; ; attempt++) {
     try {
-      return await tx.transaction((sp) => lockRows(sp, nodeId, userIds, source, onlyUnrecorded));
+      return await tx.transaction((sp) =>
+        lockRows(sp, nodeId, userIds, source, onlyUnrecorded, onlyVerifiedHash),
+      );
     } catch (error) {
       if (!(error instanceof SubjectsGrew)) throw error;
       if (attempt >= 2) throw new Error("csam lock: the node's uploader set grew twice while locking");
@@ -352,13 +370,20 @@ async function lockRows(
   userIds: string[],
   source: "photodna" | "system" | "admin",
   onlyUnrecorded: boolean,
+  onlyVerifiedHash: boolean,
 ): Promise<CsamLockResult | CsamCompletionSkipped | null> {
   // One at a time, in order. An account deleted since the read locks nothing and is skipped.
   for (const userId of userIds) {
     await sp.select({ id: user.id }).from(user).where(eq(user.id, userId)).for("no key update");
   }
   const [node] = await sp
-    .select({ ownerId: nodes.ownerId, sha256: nodes.sha256, kind: nodes.kind, scanStatus: nodes.scanStatus })
+    .select({
+      ownerId: nodes.ownerId,
+      sha256: nodes.sha256,
+      scannedAt: nodes.scannedAt,
+      kind: nodes.kind,
+      scanStatus: nodes.scanStatus,
+    })
     .from(nodes)
     .where(eq(nodes.id, nodeId))
     .for("update");
@@ -389,7 +414,15 @@ async function lockRows(
     .where(eq(nodes.id, nodeId));
   await pauseLinks(sp, { nodeId }, "moderation");
   await sp.update(uploadIps).set({ legalHold: true }).where(eq(uploadIps.nodeId, nodeId));
-  if (node.sha256 !== null) await listAsLocked(sp, node.sha256, nodeId);
+  // THE HASH IS LISTED ONLY WHEN THE SERVER COMPUTED IT (safety-1). The system's callers lock a
+  // node whose hash they computed themselves (a verdict, the upload route's own hash, the owed
+  // sweep's) and list `nodes.sha256`. An admin's lock (`onlyVerifiedHash`) may name a file whose
+  // hash is still the client's word — listing that would let anyone get an innocent file's hash
+  // listed as csam. It lists only a hash a scan recorded, decided HERE, on the row this
+  // transaction holds; otherwise the scan that brings the server's hash lists it on arrival
+  // (`listLockedOnScan`, under the same row lock — so either order lists it once).
+  const listed = onlyVerifiedHash ? verifiedSha256(node) : node.sha256;
+  if (listed !== null) await listAsLocked(sp, listed, nodeId);
 
   const existing = await liveCsamCase(sp, nodeId);
   // A REPEAT is a node that was locked AND has its case: a node that is `suspected_csam` with no
@@ -431,6 +464,38 @@ export async function listAsLocked(db: Executor, sha256: string, nodeId: string)
       set: { reason: "csam", raisedFrom: sql`${hashBlocklist.reason}`, raisedByNodeId: nodeId },
       setWhere: sql`${hashBlocklist.reason} <> 'csam'`,
     });
+}
+
+/**
+ * A scan brought the server's hash of a node that is ALREADY LOCKED (`suspected_csam`): what the
+ * lock left unlisted because the hash was still the client's (an admin's lock of an unscanned
+ * file, safety-1) is listed now — `listAsLocked` with this node as the lock behind the entry —
+ * and, when a `csam` report on the node was FILED meanwhile, confirmed (`blocklist.confirmCsam`):
+ * the filing's confirmation that waited for a verified hash. The caller is the verdict, in its
+ * transaction, holding the node's row (lock order: node, then the reports and the entry — the
+ * reports are only READ here); `sha256` is the hash the scan computed. Nothing for a node that
+ * is not locked, or is locked with no case (see below). Safe to repeat.
+ */
+export async function listLockedOnScan(tx: Executor, nodeId: string, sha256: string): Promise<void> {
+  if (!isUuid(nodeId)) return;
+  const [node] = await tx
+    .select({ scanStatus: nodes.scanStatus })
+    .from(nodes)
+    .where(eq(nodes.id, nodeId))
+    .for("update");
+  if (!node || node.scanStatus !== "suspected_csam") return;
+  // Only a lock that has its case: every lock files it in its own transaction. A node that is
+  // `suspected_csam` with none was written locked by the upload route with the SERVER's hash,
+  // already listed (the hit that locked it); the repair sweep completes it, and lists that hash.
+  const live = await liveCsamCase(tx, nodeId);
+  if (!live) return;
+  await listAsLocked(tx, sha256, nodeId);
+  const [filed] = await tx
+    .select({ id: reports.id })
+    .from(reports)
+    .where(and(eq(reports.nodeId, nodeId), eq(reports.category, "csam"), eq(reports.status, "actioned")))
+    .limit(1);
+  if (filed) await confirmCsam(tx, sha256);
 }
 
 /**

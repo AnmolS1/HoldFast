@@ -45,7 +45,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { THUMB_INPUT_MAX_BYTES } from "../../shared/constants";
 import * as blocklist from "../db/queries/blocklist";
 import { pauseLinks } from "../db/queries/links";
-import { insertReport, listAsLocked, takedownNode } from "../db/queries/moderation";
+import { insertReport, listAsLocked, listLockedOnScan, takedownNode } from "../db/queries/moderation";
 import { findByR2Key, setScanResult } from "../db/queries/nodes";
 import { declaredHashOf, emailsOf, lockJob, recordScan } from "../db/queries/scan";
 import { finish } from "../db/queries/scan-jobs";
@@ -654,6 +654,13 @@ export async function applyVerdict(bg: BackgroundContext, input: VerdictInput): 
       // `suspected_csam`, or settled already: a duplicate or late message.
       await recordScan(tx, node.id, key, seen);
       stale = node.scanStatus !== "suspected_csam";
+    }
+    // A node an admin locked while its hash was still the client's (safety-1): the lock listed
+    // nothing, and this scan brings the server's hash — listed now as that lock's entry (and
+    // confirmed when its report was filed meanwhile). Decided on the row this transaction holds,
+    // as the lock decides on it: whichever commits first, the hash is listed once.
+    if (node.scanStatus === "suspected_csam" && outcome.status !== "suspected_csam" && sha256) {
+      await listLockedOnScan(tx, node.id, sha256);
     }
 
     if (outcome.status !== "suspected_csam") {

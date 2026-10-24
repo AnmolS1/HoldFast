@@ -1,7 +1,8 @@
 // Section 4: the quarantine queue. Metadata only — the console never mints or requests a content
 // URL, and shows no thumbnail or preview. Actions: rescan, mark false positive (release), confirm
 // delete (asks the rollback detector and the pause switch first; a held node is refused with the
-// cause shown).
+// cause shown). Any file or folder can be opened here by id (R1 ruling Q9) and taken down,
+// restored (a takedown that is not a copyright notice's) or put on legal hold.
 import Box from "@mui/material/Box";
 import Button from "@mui/material/Button";
 import MenuItem from "@mui/material/MenuItem";
@@ -16,12 +17,44 @@ import {
   liftStrike,
   quarantineAction,
   queryString,
+  setNodeLegalHold,
 } from "../api";
 import { AdminDataGrid, type GridColDef } from "../components/AdminDataGrid";
 import { useAdminQuery } from "../query";
 import { t } from "../strings";
 import { ErrorState, Facts, Field, Loading, Mono, ReasonDialog, Section, StatusLine } from "../ui";
-import { bytes, label, reasonOf, refusalText, rescanText, when } from "../words";
+import { bytes, label, nodeIdOf, reasonOf, refusalText, rescanText, when } from "../words";
+
+function FindItem() {
+  const navigate = useNavigate();
+  const [reference, setReference] = useState("");
+  const [invalid, setInvalid] = useState(false);
+  const open = () => {
+    const id = nodeIdOf(reference);
+    setInvalid(id === null);
+    if (id) void navigate(`/admin/quarantine/${id}`);
+  };
+  return (
+    <Box
+      component="form"
+      sx={{ display: "flex", gap: 1, alignItems: "flex-start", flexWrap: "wrap" }}
+      onSubmit={(event) => {
+        event.preventDefault();
+        open();
+      }}
+    >
+      <Box sx={{ flex: "1 1 280px", maxWidth: 520 }}>
+        <Field
+          label={t("q.findLabel")}
+          value={reference}
+          onChange={(event) => setReference(event.target.value)}
+          error={invalid ? t("q.findInvalid") : null}
+        />
+      </Box>
+      <Button type="submit">{t("q.findOpen")}</Button>
+    </Box>
+  );
+}
 
 export function QuarantinePage() {
   const [status, setStatus] = useState("");
@@ -41,6 +74,9 @@ export function QuarantinePage() {
       title={t("nav.quarantine")}
       action={<Button onClick={() => void query.refetch()}>{t("common.refresh")}</Button>}
     >
+      <Section id="find" title={t("q.find")}>
+        <FindItem />
+      </Section>
       <Box sx={{ width: 220 }}>
         <Field
           select
@@ -88,14 +124,18 @@ export function QuarantineDetailPage() {
   return <QuarantineDetail detail={query.data} />;
 }
 
+type Pending = QuarantineActionBody["action"] | "lift" | "liftReport" | "takedownCsam" | "hold" | "unhold";
+
 function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
   const node = detail.item.node;
   const client = useQueryClient();
-  const [pending, setPending] = useState<QuarantineActionBody["action"] | "lift" | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [strikeId, setStrikeId] = useState<string | null>(null);
+  const [reportStrikes, setReportStrikes] = useState<string[]>([]);
+  const held = detail.holds.includes("node_legal_hold");
 
   const act = async (reason: string) => {
     if (!pending) return;
@@ -106,6 +146,33 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
         if (strikeId) await liftStrike(strikeId, reason);
         setStatus(t("q.strikeLifted"));
         setStrikeId(null);
+      } else if (pending === "liftReport") {
+        const [next, ...rest] = reportStrikes;
+        if (next) await liftStrike(next, reason);
+        setStatus(t("q.strikeLifted"));
+        setReportStrikes(rest);
+      } else if (pending === "hold" || pending === "unhold") {
+        await setNodeLegalHold(node.id, { held: pending === "hold", note: reason });
+        setStatus(pending === "hold" ? t("q.done.holdSet") : t("q.done.holdCleared"));
+      } else if (pending === "takedown" || pending === "takedownCsam") {
+        await quarantineAction(node.id, {
+          action: "takedown",
+          note: reason,
+          ...(pending === "takedownCsam" ? { csam: true } : {}),
+        });
+        setStatus(t("q.takenDown"));
+      } else if (pending === "restore") {
+        const result = await quarantineAction(node.id, { action: "restore", note: reason });
+        const strikes = result.reportStrikeIds ?? [];
+        setReportStrikes(strikes);
+        setStatus(
+          [
+            result.blocklistRemoved ? t("q.restored.removed") : t("q.restored"),
+            strikes.length > 0 ? t("q.reportStrikes", { count: strikes.length }) : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        );
       } else {
         const result = await quarantineAction(node.id, { action: pending, note: reason });
         if (pending === "rescan" && result.rescan)
@@ -119,7 +186,9 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
       void client.invalidateQueries({ queryKey: adminKeys.quarantineItem(node.id) });
       setPending(null);
     } catch (failure) {
-      if (reasonOf(failure) === "held") {
+      if (reasonOf(failure) === "held" && pending === "restore") {
+        setError(t("q.restoreHeld"));
+      } else if (reasonOf(failure) === "held") {
         const holds = ((failure as { details?: { holds?: unknown } }).details?.holds ?? []) as string[];
         setError(t("q.held", { causes: holds.map((cause) => label("hold", cause)).join(", ") || "—" }));
       } else {
@@ -127,6 +196,8 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
           refusalText(failure, {
             destroy_paused: t("q.destroyPaused"),
             not_infected: t("q.releaseRefused"),
+            use_lock: t("q.useLock"),
+            hold_not_releasable: t("q.holdNotReleasable"),
           }) || t("common.failed"),
         );
         if ((failure as { status?: number }).status === 409 && pending === "release")
@@ -137,12 +208,26 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
     }
   };
 
-  const titles = {
+  const titles: Record<Pending, string> = {
     rescan: t("q.rescan"),
     release: t("q.release"),
     delete: t("q.delete"),
     lift: t("q.liftStrike"),
-  } as const;
+    liftReport: t("q.liftReportStrike"),
+    takedown: t("q.takedownAct"),
+    takedownCsam: t("q.takedownCsam"),
+    restore: t("q.restoreAct"),
+    hold: t("q.holdSet"),
+    unhold: t("q.holdClear"),
+  };
+  const bodies: Partial<Record<Pending, string>> = {
+    delete: t("q.deleteBody"),
+    release: t("q.releaseBody"),
+    takedown: t("q.takedownBody"),
+    takedownCsam: t("q.takedownCsamBody"),
+    restore: t("q.restoreBody"),
+    hold: t("q.holdBody"),
+  };
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 3 }} data-admin-quarantine-item={node.id}>
@@ -177,16 +262,36 @@ function QuarantineDetail({ detail }: { detail: AdminQuarantineDetailDto }) {
           </Button>
           {strikeId ? <Button onClick={() => setPending("lift")}>{t("q.liftStrike")}</Button> : null}
         </Box>
+        <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap" }}>
+          {node.takedown ? (
+            <Button onClick={() => setPending("restore")}>{t("q.restoreAct")}</Button>
+          ) : (
+            <>
+              <Button color="error" onClick={() => setPending("takedown")}>
+                {t("q.takedownAct")}
+              </Button>
+              {node.kind === "folder" ? (
+                <Button color="error" onClick={() => setPending("takedownCsam")}>
+                  {t("q.takedownCsam")}
+                </Button>
+              ) : null}
+            </>
+          )}
+          <Button onClick={() => setPending(held ? "unhold" : "hold")}>
+            {held ? t("q.holdClear") : t("q.holdSet")}
+          </Button>
+          {reportStrikes.length > 0 ? (
+            <Button onClick={() => setPending("liftReport")}>{t("q.liftReportStrike")}</Button>
+          ) : null}
+        </Box>
         <StatusLine tone="ok">{status}</StatusLine>
       </Section>
       <ReasonDialog
         open={pending !== null}
         title={pending ? titles[pending] : ""}
-        body={
-          pending === "delete" ? t("q.deleteBody") : pending === "release" ? t("q.releaseBody") : undefined
-        }
+        body={pending ? bodies[pending] : undefined}
         confirmLabel={pending ? titles[pending] : ""}
-        destructive={pending === "delete"}
+        destructive={pending === "delete" || pending === "takedown" || pending === "takedownCsam"}
         busy={busy}
         error={error}
         onSubmit={(reason) => void act(reason)}

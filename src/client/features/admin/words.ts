@@ -125,3 +125,18 @@ export function actorName(
   const known = actors[entry.actorUserId];
   return known ? known.displayName : t("audit.deletedAccount");
 }
+
+/**
+ * The node id a reference names: an id, an object key (`u/<owner>/<node>/<version>`) or a files
+ * link (`/d/`, `/i/`, `/t/<node>/…`). Read here, in the browser: a files link carries a token, and
+ * only the id ever reaches a URL or a request.
+ */
+export function nodeIdOf(reference: string): string | null {
+  const value = reference.trim();
+  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+  const match =
+    new RegExp(`^(${uuid})$`, "i").exec(value) ??
+    new RegExp(`^u/[A-Za-z0-9]+/(${uuid})/`, "i").exec(value) ??
+    new RegExp(`/(?:d|i|t)/(${uuid})/`, "i").exec(value);
+  return match ? match[1]!.toLowerCase() : null;
+}
