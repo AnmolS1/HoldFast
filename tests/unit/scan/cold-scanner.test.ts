@@ -158,13 +158,24 @@ describe("perfops-1: a container loading clamd is waited out in the delivery", (
     expect(SCANNER_WAIT_POLL_MS).toBeLessThanOrEqual(5_000);
   });
 
-  it("a health answer that fails ends the wait at once: the queue's retry", async () => {
+  it("a health call that fails is asked again like a 'not yet' (the instance restarting): ready later, the verdict lands", async () => {
+    const bytes = cleanBytes();
+    const { file } = await uploadedFile(bytes);
+    vi.mocked(scanObject)
+      .mockRejectedValueOnce(loading())
+      .mockResolvedValueOnce(await verdictFor(bytes));
+    healthSays(new ScannerTransportError("engine", "scanner health call failed"), true);
+    expect(await deliver([{ body: explicit(file) }], OFF)).toEqual(ack);
+    expect(asked).toBe(2);
+    expect(slept).toEqual([SCANNER_WAIT_POLL_MS]);
+  });
+
+  it("health failing throughout: the wait runs out, then the queue's retry", async () => {
     const { file } = await uploadedFile(cleanBytes());
     vi.mocked(scanObject).mockRejectedValueOnce(loading());
     healthSays(new ScannerTransportError("engine", "scanner health call failed"));
     expect(await deliver([{ body: explicit(file) }], OFF)).toEqual([{ outcome: "retry", delaySeconds: 30 }]);
-    expect(asked).toBe(1);
-    expect(slept).toEqual([]);
+    expect(slept.reduce((a, b) => a + b, 0)).toBe(SCANNER_WAIT_MS);
   });
 
   it("CONTROL: stale signatures, busy and transport failures are not waited for (they are no cold start)", async () => {

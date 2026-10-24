@@ -39,7 +39,7 @@
 // whose message is younger than `SCANNER_COLD_WINDOW_MS` and that is answered `not_ready` with
 // clamd still LOADING asks the instance's health every `SCANNER_WAIT_POLL_MS`, for at most
 // `SCANNER_WAIT_MS`, and scans again — the object read again — once it is ready. Anything else (stale
-// signatures, busy, a health call that fails, the wait run out) is the retry above. No keep-warm.
+// signatures, busy, the wait run out) is the retry above. No keep-warm.
 // An UNEXPECTED failure (not the scanner's weather) goes to Sentry on a message's first delivery
 // only; the dead letter reports it again (perfops-10: one database outage must not use up the
 // quota that also carries the operator alerts). Every retry is still a metric.
@@ -170,14 +170,18 @@ export const scannerWait = {
     (await scannerHealth(env, preferredInstance(key))).ready,
 };
 
-/** True once the instance says it is ready, within `SCANNER_WAIT_MS`; false when the wait runs out or health fails. */
+/**
+ * True once the instance says it is ready, within `SCANNER_WAIT_MS`; false when the wait runs out.
+ * The shim's `/health` answers 200 throughout (containers/clamav/Dockerfile); a health call that
+ * fails anyway (the instance restarting under us) is asked again, like a "not yet".
+ */
 async function readyWithin(env: Env, key: string): Promise<boolean> {
   const deadline = scannerWait.now() + SCANNER_WAIT_MS;
   for (;;) {
     try {
       if (await scannerWait.ready(env, key)) return true;
     } catch {
-      return false;
+      // Not ready yet, as far as this wait can tell.
     }
     const left = deadline - scannerWait.now();
     if (left <= 0) return false;
