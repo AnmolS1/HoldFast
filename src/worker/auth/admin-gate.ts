@@ -20,6 +20,8 @@
 //     at once.
 //   stop-impersonating: called FROM the impersonated session, whose user is the target and not
 //     an admin — allowed exactly when the session carries the plugin's `impersonatedBy` marker.
+//   ban-user and set-role then keep the console's rules for your own account and the last admin
+//     (`keepAnAdmin`: `400 self_action`, `409 last_admin`) — they are not endpoint denials.
 //
 // A refusal is `403` and ONE audit row `auth.admin_endpoint_denied`, written and awaited before
 // the answer (`meta: { path, method }` — never the body, never an id from it).
@@ -33,7 +35,9 @@
 
 import { APIError, getSessionFromCtx } from "better-auth/api";
 import { hasAdminRole } from "../../shared/roles";
-import { getAccount } from "../db/queries/auth-lifecycle";
+import { getAccount, writeAdminPluginChange } from "../db/queries/auth-lifecycle";
+import { refuseLastAdmin, refuseSelfAction } from "../services/account-state";
+import { AppError } from "../services/errors";
 import type { ServiceDeps } from "../services/request-context";
 import { count, record, sinkPath } from "./observe";
 import { hasSecondFactor } from "./second-factor";
@@ -120,6 +124,64 @@ export async function recordAdminDenial(
 
 type GateContext = Parameters<typeof getSessionFromCtx>[0] & { path?: string; method?: string };
 
+/** The plugin's role spelling (`parseRoles`): a list is stored comma-joined. Null = not a role. */
+function roleOf(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) return value.join(",");
+  return null;
+}
+
+/**
+ * Ban and Set role keep the console's two rules (ruling Q4, R1D auth-1), as Suspend does
+ * (services/account-state.ts): `400 self_action` on the admin's own account, and `409 last_admin`
+ * when the change leaves no admin who can still act. The check and the change share ONE
+ * transaction under `lockActiveAdmins`' lock — the change is written here, ahead of the plugin
+ * (`writeAdminPluginChange`) — so two admins banning or demoting each other at once, or one
+ * suspending while the other bans, are served one after the other and the second sees the first.
+ * A promotion takes nothing away and is not checked; a malformed body is left to the plugin.
+ */
+async function keepAnAdmin(scope: AuthScope, actorId: string, path: string, body: unknown): Promise<void> {
+  const fields = (body ?? {}) as {
+    userId?: unknown;
+    role?: unknown;
+    banReason?: unknown;
+    banExpiresIn?: unknown;
+  };
+  const userId = typeof fields.userId === "number" ? String(fields.userId) : fields.userId;
+  if (typeof userId !== "string" || userId === "") return;
+  let change: Parameters<typeof writeAdminPluginChange>[2];
+  if (path === "/admin/ban-user") {
+    // The plugin's own values (routes.mjs `banUser`; no default reason or expiry is configured).
+    const seconds = typeof fields.banExpiresIn === "number" ? fields.banExpiresIn : 0;
+    change = {
+      banned: true,
+      banReason:
+        typeof fields.banReason === "string" && fields.banReason !== "" ? fields.banReason : "No reason",
+      banExpires: seconds ? new Date(Date.now() + seconds * 1000) : null,
+    };
+  } else {
+    const role = roleOf(fields.role);
+    if (role === null) return;
+    change = { role };
+  }
+  try {
+    refuseSelfAction({ type: "admin", userId: actorId }, userId);
+    if ("role" in change && hasAdminRole(change.role)) return;
+    await scope.db.transaction(async (tx) => {
+      await refuseLastAdmin(tx, userId);
+      await writeAdminPluginChange(tx, userId, change);
+    });
+  } catch (error) {
+    if (!(error instanceof AppError)) throw error;
+    // In our own words (`error`, which the client's code table reads) and Better Auth's (`code`).
+    throw new APIError(error.status === 409 ? "CONFLICT" : "BAD_REQUEST", {
+      message: error.message,
+      code: error.code.toUpperCase(),
+      error: error.code,
+    });
+  }
+}
+
 /**
  * `hooks.before` for every Better Auth dispatch. Returns for a path outside /admin/ and for an
  * allowed call; otherwise writes the audit row and throws `403`.
@@ -163,6 +225,9 @@ export async function adminGate(scope: AuthScope, ctx: GateContext): Promise<voi
         const target = await getAccount(scope.db, userId);
         scope.facts.roleChange = { userId, from: target?.role ?? null };
       }
+    }
+    if (path === "/admin/ban-user" || path === "/admin/set-role") {
+      await keepAnAdmin(scope, session!.user.id, path, (ctx as { body?: unknown }).body);
     }
     return;
   }
