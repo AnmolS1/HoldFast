@@ -386,6 +386,9 @@ test.describe("navigation", () => {
     expect((await page.locator("[data-sidebar]").boundingBox())?.width).toBe(232);
     expect((await page.locator("[data-details-panel]").boundingBox())?.width).toBe(312);
     expect((await page.locator("[data-header]").boundingBox())?.height).toBe(56);
+    // Giving way is drawing only: the stored layout is untouched (no layout key = the 320 default).
+    const stored = await page.evaluate(() => localStorage.getItem("hf.prefs.v1"));
+    expect(stored === null ? undefined : (JSON.parse(stored) as { layout?: unknown }).layout).toBeUndefined();
   });
 });
 
