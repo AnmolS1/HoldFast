@@ -79,7 +79,7 @@ export const messages = {
   "prefs.keyboard": "Keyboard",
   "prefs.shortcuts": "Single-key shortcuts",
   "prefs.shortcuts.help":
-    "/ to search, ? for the list of shortcuts, Shift+N for a new folder, Shift+R to restore. Turn them off if you use speech input or they get in your way; shortcuts with Ctrl or ⌘ stay on.",
+    "/ to search, ? for the list of shortcuts, i to show or hide details, Shift+N for a new folder, Shift+R to restore. Turn them off if you use speech input or they get in your way; shortcuts with Ctrl or ⌘ stay on.",
   "prefs.notifications": "Notifications",
   "prefs.emailShares": "Email me when something is shared with me",
   "prefs.emailSecurity": "Security alerts",

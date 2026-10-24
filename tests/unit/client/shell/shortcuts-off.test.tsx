@@ -1,4 +1,4 @@
-// R1 a11y-6 (WCAG 2.1.4): the single-key shortcuts — `/`, `?`, Shift+N, Shift+R — can be turned off
+// R1 a11y-6 (WCAG 2.1.4): the single-key shortcuts — `/`, `?`, Shift+N, Shift+R, `i` — can be turned off
 // in Preferences, on this device. Off, they do nothing; shortcuts with Ctrl/⌘ and keys that are
 // not characters (Delete, F2) keep working, and the setting survives a reload without a new key.
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -39,13 +39,35 @@ afterEach(() => {
 });
 
 describe("single-key shortcuts can be turned off", () => {
-  it("the character shortcuts are exactly / ? Shift+N Shift+R", () => {
+  it("the character shortcuts are exactly / ? Shift+N Shift+R i", () => {
     expect(SHORTCUTS.filter(isCharacterShortcut).map((def) => def.id)).toEqual([
       "search",
       "help",
       "newFolder",
       "restore",
+      "details",
     ]);
+  });
+
+  it("F02 off: i (show or hide details) does nothing; ⌘\\ / Ctrl+\\ still toggles the sidebar", () => {
+    const fired = vi.fn();
+    render(
+      <>
+        <Probe id="details" onFire={() => fired("details")} />
+        <Probe id="sidebar" onFire={() => fired("sidebar")} />
+      </>,
+    );
+    const both = () => {
+      press("i");
+      press("\\", { ctrlKey: true });
+      press("\\", { metaKey: true });
+    };
+    both();
+    expect(fired.mock.calls.map(([id]) => id)).toEqual(["details", "sidebar"]);
+    fired.mockClear();
+    setShortcutsOn(false);
+    both();
+    expect(fired.mock.calls.map(([id]) => id)).toEqual(["sidebar"]);
   });
 
   it("off: / ? Shift+N Shift+R do nothing; Ctrl/⌘+K and Delete still act", () => {

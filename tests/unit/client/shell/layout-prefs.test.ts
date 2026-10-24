@@ -117,11 +117,14 @@ describe("giveWay: content keeps 480 px; details shrinks, then the sidebar, then
     [1280, max, 360, 440],
     [1100, max, 340, 280],
     [1024, max, 264, 280],
-  ] as const)("%i px → sidebar %i, details %i (content ≥ 480)", (width, stored, sidebar, details) => {
-    const out = giveWay(stored, width);
-    expect(out).toEqual({ sidebar, details });
-    expect(width - out.sidebar - (out.details ?? 0)).toBeGreaterThanOrEqual(panelLimits.contentMin);
-  });
+  ] as const)(
+    "%i px, stored %j → sidebar %i, details %i (content ≥ 480)",
+    (width, stored, sidebar, details) => {
+      const out = giveWay(stored, width);
+      expect(out).toEqual({ sidebar, details });
+      expect(width - out.sidebar - (out.details ?? 0)).toBeGreaterThanOrEqual(panelLimits.contentMin);
+    },
+  );
 
   it("every desktop width from 1024 to 2560 leaves the content ≥ 480 px, both panels at max", () => {
     for (let width = 1024; width <= 2560; width += 1) {
