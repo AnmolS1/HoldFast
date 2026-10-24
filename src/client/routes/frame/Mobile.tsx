@@ -18,7 +18,8 @@ import { useSession } from "../../lib/query";
 import { hf, layout } from "../../theme/tokens";
 import { THEME_OPTIONS, useAccountActions } from "./account-actions";
 import { SearchBox, ViewToggle } from "./Header";
-import { canPickFolders, useNewActions } from "./new-actions";
+import { canPickFolders } from "../../lib/contracts";
+import { useNewActions } from "./new-actions";
 import { DESTINATIONS, destinationFor, FILES_SWITCHER, groupFor, type NavGroup } from "./nav";
 import { Avatar } from "./Sidebar";
 

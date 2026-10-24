@@ -17,17 +17,6 @@ export interface NewAction {
 }
 
 /**
- * Can this browser pick a folder? There is no reliable test (the property can exist while the
- * system's picker hands back plain files — the uploader refuses such a pick), so this only keeps
- * the FAB from offering it where it is known not to work: no `webkitdirectory`, or Samsung
- * Internet (caniuse "input-file-directory", 2026-10-23).
- */
-export function canPickFolders(): boolean {
-  if (typeof HTMLInputElement === "undefined" || typeof navigator === "undefined") return false;
-  return "webkitdirectory" in HTMLInputElement.prototype && !/SamsungBrowser/i.test(navigator.userAgent);
-}
-
-/**
  * New folder, Upload files and Upload folder, with the reasons they may be unavailable. Shared by
  * the menu and the FAB (which offers Upload folder only where `canPickFolders`).
  */

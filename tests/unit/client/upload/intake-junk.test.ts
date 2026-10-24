@@ -18,6 +18,7 @@ import { addFiles } from "../../../../src/client/features/upload/manager";
 import { requestUpload as slotRequestUpload } from "../../../../src/client/features/upload/slots";
 import { getUploads } from "../../../../src/client/features/upload/store";
 import {
+  canPickFolders,
   registerUploadRequester,
   requestUpload,
   type UploadRequest,
@@ -31,7 +32,6 @@ import {
   SHORTCUTS,
   useShortcut,
 } from "../../../../src/client/lib/shortcuts";
-import { canPickFolders } from "../../../../src/client/routes/frame/new-actions";
 import { renderShell, seedConfig, seedSession, sessionOf, setupShell } from "../shell/helpers";
 import { FOLDER_ID, OTHER_USER_ID, usageDto } from "./fixtures";
 import { freshUploader, installServer, json, settle, smallFile, type Server } from "./helpers";
