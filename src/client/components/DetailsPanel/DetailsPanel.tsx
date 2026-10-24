@@ -1,28 +1,36 @@
-// The details slot of the frame: a persistent 320 px panel on desktop, a bottom sheet on mobile.
+// The details slot of the frame: a persistent panel on desktop (320 px by default; the user may hide
+// it or resize it, F02), a bottom sheet on mobile.
 import Box from "@mui/material/Box";
 import { useSyncExternalStore } from "react";
 import { t } from "../../lib/i18n";
-import { hf, layout } from "../../theme/tokens";
+import { hf, layout, motion } from "../../theme/tokens";
 import { BottomSheet } from "../BottomSheet";
 import { EmptyState } from "../EmptyState";
 import { detailsApi, getDetails, subscribeDetails } from "./store";
 
-/** Desktop: the persistent panel. */
-export function DetailsPanel() {
+/**
+ * Desktop: the persistent panel. Its width is the frame's `--hf-details-w`; hidden, it is
+ * `display: none` — out of the accessibility tree, not just zero wide.
+ */
+export function DetailsPanel({ id, hidden = false }: { id?: string; hidden?: boolean }) {
   const current = useSyncExternalStore(subscribeDetails, getDetails, getDetails);
   return (
     <Box
       component="aside"
+      id={id}
       aria-label={t("details.label")}
       data-details-panel
+      data-hidden={hidden || undefined}
       sx={{
-        width: layout.details,
+        width: `var(--hf-details-w, ${layout.details}px)`,
+        transition: `width ${motion.folder}ms ease-out`,
+        "body[data-panel-drag] &": { transition: "none" },
         flex: "none",
         boxSizing: "border-box",
         borderLeft: `1px solid ${hf.hairline}`,
         backgroundColor: hf.bg,
         padding: 5,
-        display: "flex",
+        display: hidden ? "none" : "flex",
         flexDirection: "column",
         gap: 4,
         overflowY: "auto",

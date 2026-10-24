@@ -137,8 +137,20 @@ export const layout = {
   header: 56,
   sidebar: 232,
   details: 320,
+  /** The sidebar collapsed to its icon rail (F02). */
+  rail: 56,
   touchTarget: 44,
   radius: { control: 6, card: 8, dialog: 10, sheet: 14 },
+} as const;
+
+/**
+ * The desktop side panels' resize limits (F02): stored widths are clamped to these, and the
+ * content column between them never gets narrower than `contentMin`.
+ */
+export const panelLimits = {
+  sidebar: { min: 200, max: 360 },
+  details: { min: 280, max: 520 },
+  contentMin: 480,
 } as const;
 
 /** The only shadows in the product: dialogs and the palette, toasts, the FAB, sheets. */

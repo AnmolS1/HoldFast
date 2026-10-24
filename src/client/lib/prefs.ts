@@ -10,8 +10,17 @@
 //
 // One more device setting rides in `hf.prefs.v1` and is never synced: whether the single-key
 // shortcuts (`/`, `?`, Shift+N, Shift+R) are on (R1 a11y-6, WCAG 2.1.4). Stored only when off.
+// And a second: the desktop side panels' layout (F02) — shown or hidden, and widths. Stored only
+// when it differs from the default; never synced.
 import { useSyncExternalStore } from "react";
 import { registerUserStatePurger } from "./contracts";
+import {
+  DEFAULT_LAYOUT,
+  isDefaultLayout,
+  sameLayout,
+  sanitizeLayout,
+  type PanelLayout,
+} from "./layout-prefs";
 
 export type ThemePref = "system" | "light" | "dark";
 export type Density = "compact" | "comfortable";
@@ -58,6 +67,15 @@ function readShortcuts(): boolean {
   }
 }
 
+function readLayout(): PanelLayout {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    return raw ? sanitizeLayout((JSON.parse(raw) as { layout?: unknown } | null)?.layout) : DEFAULT_LAYOUT;
+  } catch {
+    return DEFAULT_LAYOUT;
+  }
+}
+
 function readLocal(): Prefs {
   let stored: Partial<Prefs> = {};
   let theme: ThemePref = DEFAULTS.theme;
@@ -85,6 +103,7 @@ function writeLocal(prefs: Prefs): void {
         density: prefs.density,
         viewMode: prefs.viewMode,
         ...(shortcutsOn ? {} : { shortcuts: false }),
+        ...(isDefaultLayout(panelLayout) ? {} : { layout: panelLayout }),
       }),
     );
     // The theme is written by the theme provider when PrefsEffects calls setMode; writing it here
@@ -97,6 +116,7 @@ function writeLocal(prefs: Prefs): void {
 
 let state: Prefs = typeof localStorage === "undefined" ? DEFAULTS : readLocal();
 let shortcutsOn = typeof localStorage === "undefined" ? true : readShortcuts();
+let panelLayout = typeof localStorage === "undefined" ? DEFAULT_LAYOUT : readLayout();
 let sync: PrefsSync | null = null;
 let timer: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
@@ -152,6 +172,24 @@ export function useShortcutsOn(): boolean {
   return useSyncExternalStore(subscribePrefs, getShortcutsOn, getShortcutsOn);
 }
 
+/** The desktop side panels' layout (this device only; F02). */
+export function getLayout(): PanelLayout {
+  return panelLayout;
+}
+
+/** Store a layout (sanitised). Written locally only — the server payload never carries it. */
+export function setLayout(next: PanelLayout): void {
+  const clean = sanitizeLayout(next);
+  if (sameLayout(clean, panelLayout)) return;
+  panelLayout = clean;
+  writeLocal(state);
+  emit();
+}
+
+export function useLayout(): PanelLayout {
+  return useSyncExternalStore(subscribePrefs, getLayout, getLayout);
+}
+
 export function subscribePrefs(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
@@ -183,6 +221,7 @@ export function resetPrefsForTests(): void {
   clearTimeout(timer);
   state = readLocal();
   shortcutsOn = readShortcuts();
+  panelLayout = readLayout();
   applyDensity();
   emit();
 }

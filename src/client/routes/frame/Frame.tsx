@@ -1,17 +1,38 @@
 // The application frame every signed-in page renders in.
 //   Desktop (>= 1024): sidebar 232 · content (ribbon, header 56, banners, page) · details 320.
+//     The two side panels hide (the sidebar to a 56 px icon rail) and resize by drag or keyboard
+//     (F02); the content keeps ≥ 480 px — when it can't, the panels give way, drawn narrower
+//     without changing what is stored.
 //   Mobile  (<  1024): header · title row · page · FAB · ribbon · three-item bottom nav.
 import Box from "@mui/material/Box";
-import { Fragment, useEffect, useState, type ReactElement, type ReactNode } from "react";
+import {
+  Fragment,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { useLocation, useMatches, useOutlet, useRoutes, type RouteObject } from "react-router";
 import { CommandPalette } from "../../components/CommandPalette";
 import { DetailsPanel, DetailsSheet } from "../../components/DetailsPanel";
 import { ErrorBoundary } from "../../components/ErrorBoundary";
+import {
+  PANEL_IDS,
+  PanelSplitter,
+  resetPanelWidth,
+  setPanelShown,
+  setPanelWidth,
+  togglePanel,
+} from "../../components/PanelSplitter";
 import type { RouteHandle } from "../../components/slots";
 import { TransferRibbon } from "../../components/TransferRibbon";
 import { UploadDropOverlay } from "../../features/upload";
 import { t } from "../../lib/i18n";
 import { ownHistoryState } from "../../lib/history-state";
+import { giveWay, panelBounds } from "../../lib/layout-prefs";
+import { useLayout } from "../../lib/prefs";
 import { getKnownUserId, useSession } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf } from "../../theme/tokens";
@@ -38,6 +59,17 @@ interface Background {
   key: string;
   element: ReactElement | null;
   handle: RouteHandle;
+}
+
+const subscribeResize = (listener: () => void) => {
+  window.addEventListener("resize", listener);
+  return () => window.removeEventListener("resize", listener);
+};
+const windowWidth = () => window.innerWidth;
+
+/** The window's width, re-read on resize: what the panels give way to. */
+function useWindowWidth(): number {
+  return useSyncExternalStore(subscribeResize, windowWidth, windowWidth);
 }
 
 function ColdBackground({ routes, from }: { routes: RouteObject[]; from: string }) {
@@ -73,6 +105,8 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
   const matches = useMatches();
   const outlet = useOutlet();
   const [accountOpen, setAccountOpen] = useState(false);
+  const panels = useLayout();
+  const width = useWindowWidth();
   useDeletionCue();
 
   const handle = (matches[matches.length - 1]?.handle ?? {}) as RouteHandle;
@@ -90,6 +124,14 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
   const shown = overlay ? background : { element: outlet, handle };
   const pageHandle = shown?.handle ?? {};
   const title = pageHandle.title ?? t("app.name");
+  const detailsAvailable = pageHandle.details !== false;
+  const drawn = giveWay(panels, width, detailsAvailable);
+  const sidebarBounds = panelBounds("sidebar", panels, width, detailsAvailable);
+  const detailsBounds = panelBounds("details", panels, width, detailsAvailable);
+  const panelWidths = {
+    "--hf-sidebar-w": `${drawn.sidebar}px`,
+    "--hf-details-w": `${drawn.details ?? 0}px`,
+  } as CSSProperties;
   const backgroundPath = overlay && !shown ? coldFrom : location.pathname;
 
   // The toaster floats above the bottom nav on mobile.
@@ -154,6 +196,7 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
   return (
     <Box
       data-frame={desktop ? "desktop" : "mobile"}
+      style={desktop ? panelWidths : undefined}
       sx={{ display: "flex", height: "100dvh", overflow: "hidden", backgroundColor: hf.bg, color: hf.text }}
     >
       <Box
@@ -173,9 +216,21 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
       >
         {t("app.skip")}
       </Box>
-      <ShellCommands />
+      <ShellCommands panels={desktop} details={desktop && detailsAvailable} />
       <UploadDropOverlay />
-      {desktop ? <Sidebar /> : null}
+      {desktop ? <Sidebar id={PANEL_IDS.sidebar} collapsed={panels.sidebar.collapsed} /> : null}
+      {desktop ? (
+        <PanelSplitter
+          panel="sidebar"
+          value={drawn.sidebar}
+          min={sidebarBounds.min}
+          max={sidebarBounds.max}
+          collapsed={panels.sidebar.collapsed}
+          onResize={(next) => setPanelWidth("sidebar", next)}
+          onReset={() => resetPanelWidth("sidebar")}
+          onToggle={() => togglePanel("sidebar")}
+        />
+      ) : null}
       <Box
         sx={{
           flex: "1 1 auto",
@@ -186,7 +241,11 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
         }}
       >
         {desktop ? <TransferRibbon /> : null}
-        {desktop ? <Header title={title} /> : <MobileHeader onAccount={() => setAccountOpen(true)} />}
+        {desktop ? (
+          <Header title={title} details={detailsAvailable} />
+        ) : (
+          <MobileHeader onAccount={() => setAccountOpen(true)} />
+        )}
         <FrameBanners />
         {desktop ? null : <MobileTitle title={title} />}
         {page}
@@ -197,7 +256,20 @@ function FrameBody({ backgroundRoutes }: FrameProps) {
           </>
         )}
       </Box>
-      {desktop && pageHandle.details !== false ? <DetailsPanel /> : null}
+      {desktop && detailsAvailable && drawn.details !== null ? (
+        <PanelSplitter
+          panel="details"
+          value={drawn.details}
+          min={detailsBounds.min}
+          max={detailsBounds.max}
+          onResize={(next) => setPanelWidth("details", next)}
+          onReset={() => resetPanelWidth("details")}
+          onToggle={() => setPanelShown("details", false)}
+        />
+      ) : null}
+      {desktop && detailsAvailable ? (
+        <DetailsPanel id={PANEL_IDS.details} hidden={drawn.details === null} />
+      ) : null}
       {desktop ? null : <DetailsSheet />}
       {desktop ? null : <AccountSheet open={accountOpen} onClose={() => setAccountOpen(false)} />}
       <CommandPalette />

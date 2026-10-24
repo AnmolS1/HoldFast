@@ -20,7 +20,9 @@ export type ShortcutId =
   | "restore"
   | "upload"
   | "uploadFolder"
-  | "theme";
+  | "theme"
+  | "sidebar"
+  | "details";
 
 interface Combo {
   /** `KeyboardEvent.key`, compared case-insensitively for letters. */
@@ -72,6 +74,9 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
     description: "shortcuts.theme",
     global: true,
   },
+  // F02: the desktop side panels. `i` is a character shortcut (the Preferences switch turns it off).
+  { id: "sidebar", combos: [{ key: "\\", mod: true }], description: "shortcuts.sidebar" },
+  { id: "details", combos: [{ key: "i" }], description: "shortcuts.details" },
 ];
 
 export function isApplePlatform(): boolean {
@@ -146,7 +151,7 @@ function matches(combo: Combo, event: KeyLike, apple: boolean): boolean {
 }
 
 /**
- * A shortcut typed with a character key and no ⌘/Ctrl (`/`, `?`, Shift+N, Shift+R): the kind a
+ * A shortcut typed with a character key and no ⌘/Ctrl (`/`, `?`, Shift+N, Shift+R, `i`): the kind a
  * speech-input user can set off by saying a word. They can be turned off in Preferences (WCAG
  * 2.1.4, R1 a11y-6); list-only keys act only on the focused list, so they stay.
  */

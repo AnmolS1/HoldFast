@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { DEFAULT_LAYOUT, type PanelLayout } from "../../../../src/client/lib/layout-prefs";
 import {
+  getLayout,
   getPrefs,
   getShortcutsOn,
   MODE_KEY,
@@ -7,6 +9,7 @@ import {
   registerPrefsSync,
   resetPrefsForTests,
   sanitizePrefs,
+  setLayout,
   setPrefs,
   setShortcutsOn,
   SYNC_DEBOUNCE_MS,
@@ -96,6 +99,96 @@ describe("prefs: local only", () => {
     expect(() => setPrefs({ viewMode: "grid" })).not.toThrow();
     expect(getPrefs().viewMode).toBe("grid");
     spy.mockRestore();
+  });
+});
+
+// F02 (R-104): the panel layout rides in hf.prefs.v1 beside the shortcuts flag; prefs.ts rebuilds
+// that object on every write, so it must be the one writer of both.
+describe("prefs: the panel layout (F02, this device only)", () => {
+  const custom: PanelLayout = {
+    sidebar: { collapsed: true, width: 300 },
+    details: { open: false, width: 400 },
+  };
+  const stored = () => JSON.parse(localStorage.getItem(PREFS_KEY)!) as Record<string, unknown>;
+
+  it("defaults, and is not written while it is the default", () => {
+    expect(getLayout()).toEqual(DEFAULT_LAYOUT);
+    setPrefs({ viewMode: "grid" });
+    expect(stored()).toEqual({ density: "compact", viewMode: "grid" });
+  });
+
+  it("setLayout then setShortcutsOn(false) keeps both in storage, and the reverse", () => {
+    setLayout(custom);
+    setShortcutsOn(false);
+    expect(stored()).toEqual({ density: "compact", viewMode: "list", shortcuts: false, layout: custom });
+    setShortcutsOn(true);
+    setLayout(DEFAULT_LAYOUT);
+    expect(stored()).toEqual({ density: "compact", viewMode: "list" });
+    setShortcutsOn(false);
+    setLayout(custom);
+    expect(stored()).toEqual({ density: "compact", viewMode: "list", shortcuts: false, layout: custom });
+    setShortcutsOn(true);
+  });
+
+  it("setPrefs({ density }) keeps both", () => {
+    setShortcutsOn(false);
+    setLayout(custom);
+    setPrefs({ density: "comfortable" });
+    expect(stored()).toEqual({ density: "comfortable", viewMode: "list", shortcuts: false, layout: custom });
+    setShortcutsOn(true);
+  });
+
+  it("storage keys unchanged: still only hf.prefs.v1 and the theme's key", () => {
+    setLayout(custom);
+    setPrefs({ theme: "dark" });
+    expect(Object.keys(localStorage).sort()).toEqual([PREFS_KEY, MODE_KEY].sort());
+    expect(Object.keys(sessionStorage)).toEqual([]);
+  });
+
+  it("resetPrefsForTests re-reads the layout (a reload), sanitised", () => {
+    setLayout(custom);
+    resetPrefsForTests();
+    expect(getLayout()).toEqual(custom);
+    localStorage.setItem(PREFS_KEY, JSON.stringify({ layout: { sidebar: { width: -5 }, details: "x" } }));
+    resetPrefsForTests();
+    expect(getLayout()).toEqual({ ...DEFAULT_LAYOUT, sidebar: { collapsed: false, width: 200 } });
+  });
+
+  it("setLayout sanitises, and an equal layout is no change (the same object back, nothing written)", () => {
+    setLayout({ sidebar: { collapsed: false, width: 9999 }, details: { open: true, width: 1 } });
+    expect(getLayout()).toEqual({
+      sidebar: { collapsed: false, width: 360 },
+      details: { open: true, width: 280 },
+    });
+    const before = getLayout();
+    const writes = vi.spyOn(Storage.prototype, "setItem");
+    setLayout(structuredClone(before));
+    expect(getLayout()).toBe(before);
+    expect(writes).not.toHaveBeenCalled();
+  });
+
+  it("an account switch keeps it: a device setting, not account state", async () => {
+    setLayout(custom);
+    await purgeUserState();
+    expect(getLayout()).toEqual(custom);
+  });
+
+  it("the server payload is exactly theme/density/viewMode — never the layout", async () => {
+    vi.useFakeTimers();
+    const saved: unknown[] = [];
+    await registerPrefsSync({ load: async () => null, save: async (prefs) => void saved.push({ ...prefs }) });
+    setLayout(custom);
+    setShortcutsOn(false);
+    setPrefs({ viewMode: "grid" });
+    vi.advanceTimersByTime(SYNC_DEBOUNCE_MS + 1);
+    expect(saved).toHaveLength(1);
+    expect(Object.keys(saved[0] as object).sort()).toEqual(["density", "theme", "viewMode"]);
+    // A layout change alone is never sent.
+    setLayout(DEFAULT_LAYOUT);
+    vi.advanceTimersByTime(SYNC_DEBOUNCE_MS + 1);
+    expect(saved).toHaveLength(1);
+    setShortcutsOn(true);
+    vi.useRealTimers();
   });
 });
 

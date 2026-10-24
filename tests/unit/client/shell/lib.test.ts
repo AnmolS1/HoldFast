@@ -167,6 +167,28 @@ describe("shortcuts", () => {
     expect(matchShortcut(key("k", { ctrlKey: true, altKey: true }), false)).toBeNull();
   });
 
+  it("F02: ⌘\\ / Ctrl+\\ toggles the sidebar, i toggles details (no modifier)", () => {
+    expect(matchShortcut(key("\\", { metaKey: true }), true)).toBe("sidebar");
+    expect(matchShortcut(key("\\", { ctrlKey: true }), false)).toBe("sidebar");
+    expect(matchShortcut(key("\\"), false)).toBeNull();
+    expect(matchShortcut(key("i"), true)).toBe("details");
+    expect(matchShortcut(key("I"), false)).toBe("details");
+    expect(matchShortcut(key("i", { metaKey: true }), true)).toBeNull();
+    expect(matchShortcut(key("I", { shiftKey: true }), false)).toBeNull();
+    expect(shortcutLabel("sidebar", true)).toBe("⌘\\");
+    expect(shortcutLabel("sidebar", false)).toBe("Ctrl+\\");
+    expect(shortcutLabel("details", true)).toBe("I");
+    const sidebar = SHORTCUTS.find((s) => s.id === "sidebar")!;
+    const details = SHORTCUTS.find((s) => s.id === "details")!;
+    // Page-level keys: never typed into a text field, not list-only.
+    expect([sidebar.global, sidebar.listOnly, details.global, details.listOnly]).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
   it("labels for menus", () => {
     expect(shortcutLabel("palette", true)).toBe("⌘K");
     expect(shortcutLabel("palette", false)).toBe("Ctrl+K");
@@ -178,6 +200,7 @@ describe("shortcuts", () => {
 
   it("covers the whole keyboard map of the specification", () => {
     expect(SHORTCUTS.map((s) => s.id).sort()).toEqual([
+      "details",
       "escape",
       "help",
       "newFolder",
@@ -190,6 +213,7 @@ describe("shortcuts", () => {
       "restore",
       "search",
       "selectAll",
+      "sidebar",
       "theme",
       "trash",
       "upload",
