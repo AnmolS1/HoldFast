@@ -1,12 +1,12 @@
 // F02: the desktop side panels in the frame — the splitters (WAI-ARIA APG Window Splitter:
 // https://www.w3.org/WAI/ARIA/apg/patterns/windowsplitter/), the header toggles, the shortcuts and
 // the palette commands; focus is never dropped on <body>.
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openPalette } from "../../../../src/client/components/CommandPalette";
 import { detailsApi } from "../../../../src/client/components/DetailsPanel/store";
-import { keyWidth } from "../../../../src/client/components/PanelSplitter";
-import { DEFAULT_LAYOUT } from "../../../../src/client/lib/layout-prefs";
+import { keyWidth, PanelSplitter } from "../../../../src/client/components/PanelSplitter";
+import { DEFAULT_LAYOUT, type RenderedLayout } from "../../../../src/client/lib/layout-prefs";
 import { getLayout, PREFS_KEY, setLayout, setShortcutsOn } from "../../../../src/client/lib/prefs";
 import { buildRoutes } from "../../../../src/client/router";
 import { renderRoutes, sessionOf, setupShell, shellFetch } from "./helpers";
@@ -269,5 +269,146 @@ describe("toggles: header button, shortcut, palette", () => {
     expect(screen.getByRole("button", { name: "Sidebar" })).toBeTruthy();
     act(() => openPalette());
     expect(within(screen.getByRole("dialog")).queryByRole("option", { name: /details/i })).toBeNull();
+  });
+});
+
+// Review F02-3 / F02-4: a drag ends cleanly however it ends, and the other panel gives way live.
+describe("a drag: clean-up and live give-way", () => {
+  let frames = new Map<number, FrameRequestCallback>();
+  let nextFrame = 0;
+  const flushFrames = () => {
+    const pending = [...frames.values()];
+    frames.clear();
+    for (const callback of pending) callback(0);
+  };
+  beforeEach(() => {
+    frames = new Map();
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      nextFrame += 1;
+      frames.set(nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+  });
+
+  function mount(preview?: (width: number) => RenderedLayout) {
+    const onResize = vi.fn();
+    const view = render(
+      <>
+        <div id="hf-sidebar" />
+        <div id="hf-details" />
+        <PanelSplitter
+          panel="sidebar"
+          value={232}
+          min={200}
+          max={360}
+          onResize={onResize}
+          onReset={() => {}}
+          onToggle={() => {}}
+          onPreview={preview}
+        />
+      </>,
+    );
+    const handle = screen.getByRole("separator");
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 1, clientX: 100 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 160 });
+    return { view, handle, onResize };
+  }
+  const shield = () => document.querySelector("[data-panel-drag-shield]");
+  const sidebarVar = () =>
+    document.getElementById("hf-sidebar")?.style.getPropertyValue("--hf-sidebar-w") ?? "";
+
+  it("mid-drag: the shield is up, text selection off, a frame pending (the setup the others undo)", () => {
+    mount();
+    expect(shield()).not.toBeNull();
+    expect(document.body.style.userSelect).toBe("none");
+    expect(frames.size).toBe(1);
+    flushFrames();
+    expect(sidebarVar()).toBe("292px");
+  });
+
+  it("pointercancel: nothing stored, no shield, selection back, no frame pending, the drag's width dropped", () => {
+    const { handle, onResize } = mount();
+    flushFrames();
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 170 });
+    fireEvent.pointerCancel(handle, { pointerId: 1 });
+    expect(shield()).toBeNull();
+    expect(document.body.style.userSelect).toBe("");
+    expect(document.body.dataset.panelDrag).toBeUndefined();
+    expect(frames.size).toBe(0);
+    expect(sidebarVar()).toBe("");
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
+  it("lostpointercapture without a pointerup: the width is stored once and everything is cleaned up", () => {
+    const { handle, onResize } = mount();
+    fireEvent.lostPointerCapture(handle, { pointerId: 1 });
+    expect(onResize).toHaveBeenCalledTimes(1);
+    expect(onResize).toHaveBeenCalledWith(292);
+    expect(shield()).toBeNull();
+    expect(document.body.style.userSelect).toBe("");
+    expect(frames.size).toBe(0);
+  });
+
+  it("unmounted mid-drag: no shield, selection back, the pending frame cancelled", () => {
+    const { view, onResize } = mount();
+    expect(frames.size).toBe(1);
+    view.unmount();
+    expect(shield()).toBeNull();
+    expect(document.body.style.userSelect).toBe("");
+    expect(document.body.dataset.panelDrag).toBeUndefined();
+    expect(frames.size).toBe(0);
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
+  it("live give-way: the other panel is drawn at the give-way width during the drag, and handed back after", () => {
+    const preview = vi.fn((width: number): RenderedLayout => ({ sidebar: width, details: 440 }));
+    const { handle } = mount(preview);
+    flushFrames();
+    expect(preview).toHaveBeenCalledWith(292);
+    const details = document.getElementById("hf-details")!;
+    expect(details.style.getPropertyValue("--hf-details-w")).toBe("440px");
+    fireEvent.pointerUp(handle, { pointerId: 1 });
+    expect(details.style.getPropertyValue("--hf-details-w")).toBe("");
+    expect(sidebarVar()).toBe("");
+  });
+});
+
+describe("the frame's live give-way (review F02-3)", () => {
+  it("dragging the sidebar wider at 1280 with details at 520: details is drawn narrower during the drag; only the sidebar is stored", async () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => frames.push(callback));
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    Object.defineProperty(HTMLElement.prototype, "setPointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+    setLayout({ ...DEFAULT_LAYOUT, details: { open: true, width: 520 } });
+    await open();
+    const handle = splitter("Resize sidebar");
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 1, clientX: 232 });
+    fireEvent.pointerMove(handle, { pointerId: 1, clientX: 360 });
+    for (const callback of frames.splice(0)) callback(0);
+    const sidebar = document.querySelector<HTMLElement>("[data-sidebar]")!;
+    const details = document.querySelector<HTMLElement>("[data-details-panel]")!;
+    const drawn = (el: HTMLElement, name: string) =>
+      Number.parseInt(el.style.getPropertyValue(name) || frameVar(name), 10);
+    const sidebarWidth = drawn(sidebar, "--hf-sidebar-w");
+    const detailsWidth = drawn(details, "--hf-details-w");
+    expect(sidebarWidth).toBe(360);
+    expect(1280 - sidebarWidth - detailsWidth).toBeGreaterThanOrEqual(480);
+    expect(getLayout().details.width).toBe(520);
+    act(() => {
+      fireEvent.pointerUp(handle, { pointerId: 1 });
+    });
+    expect(getLayout()).toEqual({
+      sidebar: { collapsed: false, width: 360 },
+      details: { open: true, width: 520 },
+    });
+    expect(frameVar("--hf-details-w")).toBe("440px");
   });
 });
