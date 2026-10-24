@@ -17,8 +17,8 @@ import {
 import { addFiles } from "../../../../src/client/features/upload/manager";
 import { requestUpload as slotRequestUpload } from "../../../../src/client/features/upload/slots";
 import { getUploads } from "../../../../src/client/features/upload/store";
+import { canPickFolders } from "../../../../src/client/lib/capabilities";
 import {
-  canPickFolders,
   registerUploadRequester,
   requestUpload,
   type UploadRequest,

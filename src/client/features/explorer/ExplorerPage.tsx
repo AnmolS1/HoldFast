@@ -59,7 +59,8 @@ import { ApiError } from "../../lib/api";
 import { stamped } from "../../lib/history-state";
 import { t as shellT } from "../../lib/i18n";
 import { usePrefs } from "../../lib/prefs";
-import { canPickFolders, requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
+import { canPickFolders } from "../../lib/capabilities";
+import { requestUpload, scanVerdictOwned, scanVerdictsSeen } from "../../lib/contracts";
 import { queryClient, usePublicConfig } from "../../lib/query";
 import { useIsDesktop } from "../../theme/breakpoints";
 import { hf, layout } from "../../theme/tokens";
@@ -468,7 +469,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
         hint: uploadOff,
         run: upload,
       },
-      // Only where this browser can pick a folder (as the FAB; lib/contracts `canPickFolders`).
+      // Only where this browser can pick a folder (as the FAB; lib/capabilities `canPickFolders`).
       ...(canPickFolders()
         ? [
             {
