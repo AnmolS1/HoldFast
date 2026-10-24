@@ -683,11 +683,15 @@ describe("abuse-hourly runs the sweep (part 0c)", () => {
   // T21 (R4, Addendum 3 Q5): the pending-scan part is a no-op here — the real one would re-send
   // whatever pending nodes other runs left in the shared database to this file's queue.
   const realPendingSweep = parts.sweepPendingScans;
+  const realLockedSweep = parts.sweepLockedUnhashed;
   beforeEach(() => {
     parts.sweepPendingScans = async () => ({ checked: 0, requeued: 0 });
+    // (The same for R2 mod-2's locked-hash part: whatever other runs left locked.)
+    parts.sweepLockedUnhashed = async () => ({ checked: 0, requeued: 0 });
   });
   afterEach(() => {
     parts.sweepPendingScans = realPendingSweep;
+    parts.sweepLockedUnhashed = realLockedSweep;
   });
 
   it("one run of the job: the owed session becomes one locked, held node of the uploader's; nothing deleted; a second run changes nothing", async () => {

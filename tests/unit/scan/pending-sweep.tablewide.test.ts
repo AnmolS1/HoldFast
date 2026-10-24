@@ -210,6 +210,8 @@ describe("abuse-hourly runs it (R4)", () => {
       failed: 0,
     });
     parts.sweepStrikeThresholds = async () => ({ checked: 0, suspended: 0, failed: 0 });
+    // (R2 mod-2's locked-hash part would re-send what other runs left locked.)
+    parts.sweepLockedUnhashed = async () => ({ checked: 0, requeued: 0 });
     parts.reportAnomalies = async () => [];
   };
 

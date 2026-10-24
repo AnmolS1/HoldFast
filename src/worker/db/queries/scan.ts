@@ -12,7 +12,7 @@
 // status writes made without a server hash (`markScanError`) never touch it, and `recordScan`
 // writes the hash and the time together.
 
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Executor } from "../client";
 import { isUuid } from "../ids";
 import { type Node, nodes, type ScanDetail, type ScanJob, scanJobs, uploads, user } from "../schema";
@@ -182,6 +182,37 @@ export async function pendingScanCandidates(
         // node is never sent, and must never take a place in the batch either — oldest first,
         // a hundred of them would hold the sweep off every other node for good (review M1).
         notEffectivelyHidden("nodes"),
+        sql`starts_with(${nodes.r2Key}, 'u/')`,
+        sql`${quietSince} < now() - make_interval(mins => ${olderThanMinutes})`,
+      ),
+    )
+    .orderBy(asc(quietSince), asc(nodes.id))
+    .limit(limit);
+}
+
+/**
+ * The locked-hash sweep's candidates (R2 mod-2), oldest first, at most `limit`: current file
+ * versions under `u/` that are LOCKED (`suspected_csam`) with NO server hash yet (`scannedAt`
+ * null — an admin's lock of a file whose scan never came; it listed nothing, safety-1) and quiet
+ * for more than `olderThanMinutes`, measured as `pendingScanCandidates` measures it. Taken down or
+ * not — itself or by a folder above: the verdict records a locked node's scan and lists its hash
+ * all the same. The caller re-decides everything under the row's lock.
+ */
+export async function lockedUnhashedCandidates(
+  db: Executor,
+  olderThanMinutes: number,
+  limit: number,
+): Promise<PendingScanCandidate[]> {
+  const quietSince = sql`GREATEST(${nodes.createdAt}, ${nodes.updatedAt}, ${scanJobs.startedAt}, ${scanJobs.finishedAt})`;
+  return db
+    .select({ nodeId: nodes.id, ownerId: nodes.ownerId, r2Key: sql<string>`${nodes.r2Key}` })
+    .from(nodes)
+    .leftJoin(scanJobs, eq(scanJobs.r2Key, nodes.r2Key))
+    .where(
+      and(
+        eq(nodes.kind, "file"),
+        eq(nodes.scanStatus, "suspected_csam"),
+        isNull(nodes.scannedAt),
         sql`starts_with(${nodes.r2Key}, 'u/')`,
         sql`${quietSince} < now() - make_interval(mins => ${olderThanMinutes})`,
       ),
