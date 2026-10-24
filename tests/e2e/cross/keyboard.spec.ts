@@ -132,7 +132,9 @@ test("an Undo toast holds while it has focus; once focus leaves, its time runs o
   test.slow();
   await signedInUser(page, { clientIp });
   await page.goto("/");
-  await expect(page.locator("[data-explorer]")).toBeVisible();
+  // The page frame shows before the folder's listing answers, and until it does there is nothing
+  // to add to: New folder (its button and Shift+N) waits for it. The button is the signal.
+  await expect(page.locator("[data-new-folder]")).toBeVisible();
   await page.keyboard.press("Shift+N");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("textbox", { name: "Name" })).toBeFocused();
