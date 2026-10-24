@@ -205,8 +205,14 @@ export function NewMenu() {
             <Box component="span" aria-hidden="true" sx={{ display: "inline-flex", color: hf.textSecondary }}>
               {action.icon}
             </Box>
-            <Box component="span" sx={{ flex: "1 1 auto" }}>
+            <Box component="span" sx={{ flex: "1 1 auto", display: "flex", flexDirection: "column" }}>
               {action.label}
+              {/* A disabled item takes no pointer events, so its reason is shown, not left in a title. */}
+              {action.reason ? (
+                <Box component="span" sx={{ fontSize: 12, color: hf.textSecondary }}>
+                  {action.reason}
+                </Box>
+              ) : null}
             </Box>
             <Kbd>{action.shortcut}</Kbd>
           </MenuItem>
