@@ -213,6 +213,9 @@ export async function lockedUnhashedCandidates(
         eq(nodes.kind, "file"),
         eq(nodes.scanStatus, "suspected_csam"),
         isNull(nodes.scannedAt),
+        // A body the scanner REFUSED gets the same answer every time (consumer.ts `refused`): never
+        // re-sent, or it would be sent every hour for good. (Its listing waits for an operator.)
+        sql`${scanJobs.lastError} IS DISTINCT FROM 'refused'`,
         sql`starts_with(${nodes.r2Key}, 'u/')`,
         sql`${quietSince} < now() - make_interval(mins => ${olderThanMinutes})`,
       ),

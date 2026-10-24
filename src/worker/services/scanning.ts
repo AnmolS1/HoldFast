@@ -504,7 +504,8 @@ export async function sweepPendingScans(
  *
  * Decided again under the owner's TREE LOCK and the LOCKED row (`enqueueRescan`'s order): still
  * the key's file, still `suspected_csam`, still no `scannedAt`, no live job. Oldest first, at most
- * `limit`; one failure is counted in `checked` and does not stop the rest; idempotent as the
+ * `limit` (a body the scanner refused is left out for good); one failure is counted in
+ * `checked` and does not stop the rest; idempotent as the
  * pending sweep is (one job row per key). Called by the hourly abuse job, as its own part, which
  * names what it re-sent in the operators' digest. Nothing is deleted.
  */

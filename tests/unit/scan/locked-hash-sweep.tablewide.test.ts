@@ -162,7 +162,7 @@ describe("a locked file whose scan dead-lettered still gets its server hash list
     expect(mine(again.sent, [t.file.id])).toEqual([]);
   });
 
-  it("a locked unhashed file under a TAKEN-DOWN folder is sent too; one with a live job, one young, one already hashed, and a merely pending one are not", async () => {
+  it("a locked unhashed file under a TAKEN-DOWN folder is sent too; one with a live job, one young, one already hashed, one the scanner refused, and a merely pending one are not", async () => {
     const owner = await makeUser();
     const folder = await makeFolder(owner.id, null, { takedownAt: new Date(), takedownReason: "abuse" });
     made.push(folder.id);
@@ -178,7 +178,14 @@ describe("a locked file whose scan dead-lettered still gets its server hash list
     const young = await mallorysUpload({ scanStatus: "suspected_csam", legalHold: true });
     const hashed = await mallorysUpload({ ...lockedRow, scannedAt: LONG_AGO });
     const pending = await mallorysUpload({ createdAt: LONG_AGO, updatedAt: LONG_AGO });
-    const ids = [hidden, running, young, hashed, pending].map((x) => x.file.id);
+    // The scanner REFUSED its body (the same body always gets the same answer): re-sent never.
+    const refused = await mallorysUpload(lockedRow);
+    await claim(testDb(), { nodeId: refused.file.id, r2Key: refused.file.r2Key! });
+    await testDb()
+      .update(scanJobs)
+      .set({ status: "failed", lastError: "refused", startedAt: LONG_AGO, finishedAt: LONG_AGO })
+      .where(eq(scanJobs.r2Key, refused.file.r2Key!));
+    const ids = [hidden, running, young, hashed, pending, refused].map((x) => x.file.id);
 
     const run = recording();
     const result = await sweepLockedUnhashed(run.deps);
@@ -187,7 +194,7 @@ describe("a locked file whose scan dead-lettered still gets its server hash list
     ]);
     expect(result.requeued).toBeGreaterThanOrEqual(1);
     // Hash-only: nothing about any of them changed.
-    for (const x of [hidden, running, young, hashed, pending]) {
+    for (const x of [hidden, running, young, hashed, pending, refused]) {
       expect(await nodeById(x.file.id), x.file.id).toEqual(x.file);
     }
   });
