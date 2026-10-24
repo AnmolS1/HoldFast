@@ -702,6 +702,10 @@ describe("?error= on the sign-in and sign-up screens", () => {
     expect(redirectErrorMessage("INVITE_INVALID")).toBe("This invite code isn't valid.");
     expect(redirectErrorMessage("TOKEN_EXPIRED")).toBe(en["auth.redirect.linkExpired"]);
     expect(redirectErrorMessage("access_denied")).toBe("The Google sign-in was cancelled.");
+    // The deletion link opened while signed out (src/worker/routes/auth.ts DELETION_SIGN_IN).
+    expect(redirectErrorMessage("DELETION_SIGN_IN")).toBe(
+      "Sign in, then open the deletion link from your email again.",
+    );
     for (const unknown of [
       HOSTILE,
       "",

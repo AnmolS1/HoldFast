@@ -27,7 +27,9 @@ export function DeletionBanner() {
   // again only if a different (new) deletion is scheduled later.
   const [cancelled, setCancelled] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [started, setStarted] = useState(false);
+  // Why the deletion can no longer be cancelled here (a 409): it has started, or an administrator
+  // scheduled it (`deletion_admin_scheduled`, which only an administrator can cancel).
+  const [stopped, setStopped] = useState<"started" | "adminScheduled" | null>(null);
   const scheduledFor = status.data ? status.data.scheduledFor : (session?.user.deleteScheduledAt ?? null);
 
   if (!session || !scheduledFor || cancelled === scheduledFor) return null;
@@ -38,7 +40,8 @@ export function DeletionBanner() {
       await api("/api/account/deletion/cancel", { method: "POST" });
     } catch (cause) {
       setBusy(false);
-      if (cause instanceof ApiError && cause.status === 409) setStarted(true);
+      if (cause instanceof ApiError && cause.status === 409)
+        setStopped(cause.code === "deletion_admin_scheduled" ? "adminScheduled" : "started");
       else
         toast({
           message: t("banner.deletion.failed"),
@@ -59,15 +62,15 @@ export function DeletionBanner() {
       tone="danger"
       icon={<CalendarClock size={16} />}
       action={
-        started ? null : (
+        stopped ? null : (
           <Button onClick={onCancel} disabled={busy}>
             {t("banner.deletion.cancel")}
           </Button>
         )
       }
     >
-      {started
-        ? t("banner.deletion.started")
+      {stopped
+        ? t(stopped === "adminScheduled" ? "banner.deletion.adminScheduled" : "banner.deletion.started")
         : t("banner.deletion", {
             date: formatDate(scheduledFor, { timeZone: session.user.timezone, style: "long" }),
           })}

@@ -76,6 +76,47 @@ describe("deletion banner", () => {
     expect(getToasts()).toEqual([]);
   });
 
+  it("409 deletion_admin_scheduled → the administrator sentence (not 'already started'), no cancel button, no toast", async () => {
+    shellFetch({
+      session: sessionOf({ deleteScheduledAt: WHEN }),
+      extra: (call) => {
+        if (call.path === "/api/account/deletion-status") return json({ scheduledFor: WHEN });
+        if (call.path === "/api/account/deletion/cancel") return envelope("deletion_admin_scheduled", 409);
+        return undefined;
+      },
+    });
+    renderRoutes(buildRoutes(), ["/"]);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel deletion" }));
+    await waitFor(() =>
+      expect(banner()!.textContent).toContain(
+        "An administrator scheduled this deletion, so it can only be cancelled by contacting support.",
+      ),
+    );
+    expect(banner()!.textContent).not.toContain("already started");
+    expect(screen.queryByRole("button", { name: "Cancel deletion" })).toBeNull();
+    expect(getToasts()).toEqual([]);
+  });
+
+  it.each([
+    [
+      "other_account",
+      "That deletion link is for another account. Sign out, sign in to that account, then open it again.",
+    ],
+    [
+      "link_invalid",
+      "That deletion link has expired or was already used. To delete your account, ask for a new link in Settings.",
+    ],
+  ])(
+    "?deletion=%s (the deletion link's own answers) toasts its sentence and drops the parameter",
+    async (cue, sentence) => {
+      shellFetch({ session: sessionOf() });
+      const { router } = renderRoutes(buildRoutes(), [`/account?deletion=${cue}&tab=x`]);
+      await waitFor(() => expect(getToasts().map((toast) => toast.message)).toEqual([sentence]));
+      await waitFor(() => expect(router.state.location.search).toBe("?tab=x"));
+      expect(router.state.location.pathname).toBe("/account");
+    },
+  );
+
   it("?deletion=scheduled re-reads the status and the session, shows the banner, and drops the parameter", async () => {
     // The session cookie is cached: it does not carry the date yet. The status route does.
     const calls = shellFetch({

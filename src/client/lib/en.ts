@@ -92,6 +92,12 @@ export const en = {
   "banner.deletion.cancelled": "Deletion cancelled.",
   "banner.deletion.started": "Deletion has already started — contact support.",
   "banner.deletion.failed": "Couldn't cancel the deletion. Try again.",
+  "banner.deletion.adminScheduled":
+    "An administrator scheduled this deletion, so it can only be cancelled by contacting support.",
+  "banner.deletion.linkOtherAccount":
+    "That deletion link is for another account. Sign out, sign in to that account, then open it again.",
+  "banner.deletion.linkInvalid":
+    "That deletion link has expired or was already used. To delete your account, ask for a new link in Settings.",
   "banner.impersonation": "Viewing as {name} — read-only",
   "banner.impersonation.stop": "Stop",
 
@@ -252,6 +258,7 @@ export const en = {
     "That confirmation link isn't valid any more. Sign in and we'll send a new one.",
   "auth.redirect.linkOtherAccount":
     "That confirmation link is for another account. Sign out first, then open it again.",
+  "auth.redirect.deletionSignIn": "Sign in, then open the deletion link from your email again.",
 
   "login.title": "Sign in",
   "login.submit": "Sign in",
