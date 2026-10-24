@@ -290,12 +290,13 @@ describe("an address that has an account, and one that has none: the same answer
 });
 
 describe("a link or a token that does not work: one answer, whatever is wrong with it", () => {
-  it("the verification link — garbage, tampered, expired, for an address nobody has, for somebody else's change", async () => {
+  it("the verification link — garbage, tampered, expired with a bad signature, for an address nobody has, for somebody else's change", async () => {
     const { email } = await signUp(newClient());
     const good = new URL(
       linkIn(await waitForMail(email, "verification")),
       "http://localhost",
     ).searchParams.get("token")!;
+    const stale = verificationToken(email, -3600);
     const open =
       (token: string, client = newClient()) =>
       () =>
@@ -304,7 +305,8 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
       ["garbage", open("garbage")],
       ["not a token at all", open("a.b.c")],
       ["tampered", open(`${good.slice(0, -4)}${good.endsWith("AAAA") ? "BBBB" : "AAAA"}`)],
-      ["expired", open(verificationToken(email, -3600))],
+      // Expired AND not ours: the signature is checked first, so expiry is not revealed.
+      ["expired, bad signature", open(`${stale.slice(0, -4)}${stale.endsWith("AAAA") ? "BBBB" : "AAAA"}`)],
       ["an address nobody has", open(verificationToken(freshEmail(), 3600))],
       // (An address-change CONFIRMATION token is not in this list any more: its GET is inert
       // and lands on our page whatever the token says — change-email-consent.test.ts.)
@@ -316,6 +318,24 @@ describe("a link or a token that does not work: one answer, whatever is wrong wi
       statements: LINK_ERROR_BUDGET,
       scrypt: 0,
     });
+  });
+
+  it("a link WE signed that has expired says so (R1 func-11) — for the same work as every other refusal", async () => {
+    const { email } = await signUp(newClient());
+    // Expiry is read only after the signature holds, and before any account is looked up: it
+    // says the link was once really ours, nothing about the address.
+    for (const address of [email, freshEmail()]) {
+      const expired = await outline(() =>
+        measured(newClient(), verifyLink(verificationToken(address, -3600))),
+      );
+      expect(expired).toMatchObject({
+        status: 302,
+        location: "/login?reason=verified&error=TOKEN_EXPIRED",
+        cookies: [],
+        statements: LINK_ERROR_BUDGET,
+        scrypt: 0,
+      });
+    }
   });
 
   it("choosing a password with a token — unknown, already used, another kind of token: one refusal, the round trips of a good one, and NO hash", async () => {

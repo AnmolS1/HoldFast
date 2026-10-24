@@ -78,16 +78,23 @@ function linkFailed(relativePath: string, response: Response): boolean {
   return /[?&]error=/.test(response.headers.get("location") ?? "");
 }
 
+/** The one error a verification link may name: the link was ours (signed) and has expired. */
+const LINK_EXPIRED = "TOKEN_EXPIRED";
+
 /**
- * ONE answer for a verification link that did not work — unknown, expired, tampered, for an
- * address no account has any more, or for another account: Better Auth names each
- * (`TOKEN_EXPIRED`, `INVALID_TOKEN`, `USER_NOT_FOUND`, `INVALID_USER`), which tells whoever holds
- * a link things about the account behind it. They all become `LINK_INVALID`.
+ * ONE answer for a verification link that did not work — unknown, tampered, for an address no
+ * account has any more, or for another account: Better Auth names each (`INVALID_TOKEN`,
+ * `USER_NOT_FOUND`, `INVALID_USER`), which tells whoever holds a link things about the account
+ * behind it. They all become `LINK_INVALID`. EXCEPT `TOKEN_EXPIRED` (R1 func-11): Better Auth
+ * reads expiry only after the signature holds (jose checks the signature first, so a forged
+ * expired token is `INVALID_TOKEN`) and before any account is looked up — it says only that the
+ * link was once really ours, so "expired" is shown as such. Same work either way (parity.test.ts).
  */
 function genericLinkError(response: Response): Response {
   if (response.status !== 302) return response;
   const location = response.headers.get("location");
   if (!location || !/[?&]error=/.test(location)) return response;
+  if (new RegExp(`[?&]error=${LINK_EXPIRED}(?:[&#]|$)`).test(location)) return response;
   const headers = new Headers(response.headers);
   headers.set("location", location.replace(/([?&]error=)[^&#]*/, `$1${LINK_INVALID}`));
   return new Response(null, { status: 302, headers });
