@@ -264,8 +264,9 @@ export async function scheduleDeletion(
  * the pending row and removes the `owner_deletion` pause (a link that carries another reason
  * stays paused). `409 conflict` once the purge has begun. False when nothing was scheduled.
  *
- * A deletion an admin scheduled (`scheduleDeletion`) is cancelled by an admin only: anyone else
- * gets `409 deletion_admin_scheduled` and nothing changes (ruling Q6).
+ * A deletion an admin scheduled (`scheduleDeletion`) is cancelled by ANOTHER admin only: its
+ * subject — an admin's own console included — gets `409 deletion_admin_scheduled` and nothing
+ * changes (ruling Q6).
  */
 export async function cancelDeletion(
   deps: ServiceDeps,
@@ -277,7 +278,9 @@ export async function cancelDeletion(
   const outcome = await deps.db.transaction(async (tx) => {
     // The user's row lock first — `cancel`'s own order — and the mark read under it.
     await lockUser(tx, userId);
-    if (actor.type !== "admin" && (await adminDeletionMarked(tx, userId))) {
+    // Not by its subject — also when the subject is an admin using the console.
+    const subject = actor.type !== "admin" || actor.userId === userId;
+    if (subject && (await adminDeletionMarked(tx, userId))) {
       const current = await getAccount(tx, userId);
       if (current?.deleteScheduledAt) return "admin_scheduled" as const;
     }

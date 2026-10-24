@@ -9,7 +9,8 @@
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { pendingUserPurges, verification } from "../../../src/worker/db/schema";
-import { purgeAuthRows, scheduleDeletion } from "../../../src/worker/services/account-state";
+import { purgeAuthRows, revokeAllAccess, scheduleDeletion } from "../../../src/worker/services/account-state";
+import { endStandingProofs } from "../../../src/worker/auth/second-factor";
 import { admin, adminCall, call, member, serviceDeps, testDb, userRowOf } from "../admin/helpers";
 
 const pendingRow = async (userId: string) =>
@@ -84,6 +85,30 @@ describe("a deletion an admin scheduled", () => {
     const own = await ownCancel(holder);
     expect(own.status, own.text).toBe(200);
     expect((await userRowOf(holder.id))!.deleteScheduledAt).toBeNull();
+  });
+
+  it("an admin whose deletion another admin ordered cannot cancel it either — not from the console, not from the banner", async () => {
+    const operator = await admin();
+    const subject = await admin();
+    expect((await consoleDelete(operator, subject.id)).status).toBe(200);
+    const fromConsole = await consoleCancel(subject, subject.id);
+    expect(fromConsole.status, fromConsole.text).toBe(409);
+    expect(fromConsole.body).toMatchObject({ error: "deletion_admin_scheduled" });
+    const fromBanner = await call(subject.as, "POST", "/account/deletion/cancel");
+    expect(fromBanner.status).toBe(409);
+    expect((await userRowOf(subject.id))!.deleteScheduledAt).not.toBeNull();
+    expect(await markers(subject.id)).toHaveLength(1);
+  });
+
+  it("the mark survives the holder's password change and a suspension lifted (every other cleanup of verification rows)", async () => {
+    const operator = await admin();
+    const holder = await member();
+    expect((await consoleDelete(operator, holder.id)).status).toBe(200);
+    const { deps } = serviceDeps();
+    await revokeAllAccess(deps, holder.id);
+    await endStandingProofs(testDb(), holder.id);
+    expect(await markers(holder.id)).toHaveLength(1);
+    expect((await ownCancel(holder)).status).toBe(409);
   });
 
   it("the console's Delete on a deletion the holder already asked for makes it the admin's: same date, changed false, the holder can no longer cancel", async () => {
