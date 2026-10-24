@@ -45,8 +45,8 @@ export interface ToolbarProps {
   onUpload(): void;
   /** The folder picker, for the same folder as `onUpload`. */
   onUploadFolder(): void;
-  /** Why Upload folder is unavailable (read-only, uploads paused); absent while it works. */
-  uploadFolderOff?: string;
+  /** Why uploading is unavailable (read-only, uploads paused); absent while it works. */
+  uploadOff?: string;
 }
 
 const tick = (on: boolean) => (
@@ -106,9 +106,15 @@ export function Toolbar(props: ToolbarProps) {
           </Button>
           {/* A split button: the main half uploads files as before, the arrow offers the folder too. */}
           <Box sx={{ display: "inline-flex", alignItems: "center" }} data-upload-split>
+            {/* Unavailable but still focusable, with its reason (R1 a11y-1). */}
             <Button
               variant="text"
-              onClick={props.onUpload}
+              onClick={() => {
+                if (!props.uploadOff) props.onUpload();
+              }}
+              aria-disabled={props.uploadOff ? true : undefined}
+              className={props.uploadOff ? "Mui-disabled" : undefined}
+              title={props.uploadOff}
               startIcon={<Upload size={16} aria-hidden="true" />}
               data-upload
               sx={{ borderTopRightRadius: 0, borderBottomRightRadius: 0 }}
@@ -146,8 +152,8 @@ export function Toolbar(props: ToolbarProps) {
               <MenuItem
                 key={kind}
                 data-upload-kind={kind}
-                disabled={kind === "folder" && Boolean(props.uploadFolderOff)}
-                title={kind === "folder" ? props.uploadFolderOff : undefined}
+                disabled={Boolean(props.uploadOff)}
+                title={props.uploadOff}
                 onClick={() => {
                   // The picker opens inside this click; the menu closes around it.
                   run();
@@ -163,9 +169,9 @@ export function Toolbar(props: ToolbarProps) {
                 </Box>
                 <Box component="span" sx={{ display: "flex", flexDirection: "column", flex: "1 1 auto" }}>
                   {t(label)}
-                  {kind === "folder" && props.uploadFolderOff ? (
+                  {props.uploadOff ? (
                     <Box component="span" sx={{ typography: "body2", color: hf.textSecondary }}>
-                      {props.uploadFolderOff}
+                      {props.uploadOff}
                     </Box>
                   ) : null}
                 </Box>

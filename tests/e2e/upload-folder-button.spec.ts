@@ -240,54 +240,73 @@ test.describe("Upload folder (mocked API)", () => {
     ["read-only", { readOnly: true }, "Not available while Holdfast is read-only."],
     ["uploads paused", { uploadsEnabled: false }, "Uploads are paused right now."],
   ] as const) {
-    test(`${what}: Upload folder is offered disabled, with the reason`, async ({ page, origins }) => {
+    test(`${what}: Upload files and Upload folder are offered disabled everywhere, with the reason`, async ({
+      page,
+      origins,
+    }) => {
       const seen = await serve(page, origins.port, config);
       seen.drive.nodes.delete(PROJECT.id);
       let opened = false;
       page.on("filechooser", () => (opened = true));
       await page.goto("/");
-      // The empty state's button: still focusable (R1 a11y-1), says why, and opens nothing.
-      const empty = page.locator("[data-empty-upload-folder]");
-      await expect(empty).toHaveAttribute("aria-disabled", "true", { timeout: 15_000 });
-      await expect(empty).toHaveAttribute("title", reason);
+      const mod = await modKey(page);
+      // Unavailable but still focusable (R1 a11y-1), says why, and pressing it opens nothing.
       // Playwright will not click an aria-disabled element: the keyboard reaches it and presses it.
-      await empty.focus();
-      await expect(empty).toBeFocused();
-      await page.keyboard.press("Enter");
+      const pressDisabled = async (selector: string) => {
+        const control = page.locator(selector);
+        await expect(control).toHaveAttribute("aria-disabled", "true", { timeout: 15_000 });
+        await expect(control).toHaveAttribute("title", reason);
+        await control.focus();
+        await expect(control).toBeFocused();
+        await page.keyboard.press("Enter");
+      };
+      // The empty state: the files CTA and the folder button.
+      await pressDisabled("[data-empty-upload]");
+      await pressDisabled("[data-empty-upload-folder]");
       if (isMobile(page)) {
         await page.locator("[data-new-fab]").click();
-        const item = page.getByRole("dialog", { name: "New" }).locator('[data-new-action="upload-folder"]');
-        await expect(item).toHaveAttribute("aria-disabled", "true");
-        await expect(item).toContainText(reason);
+        const sheet = page.getByRole("dialog", { name: "New" });
+        for (const id of ["upload", "upload-folder"]) {
+          const item = sheet.locator(`[data-new-action="${id}"]`);
+          await expect(item).toHaveAttribute("aria-disabled", "true");
+          await expect(item).toContainText(reason);
+        }
         expect(opened).toBe(false);
         return;
       }
       await page.getByRole("button", { name: "New", exact: true }).click();
-      const item = page.locator('[data-new-action="upload-folder"]');
-      await expect(item).toHaveAttribute("aria-disabled", "true");
-      await expect(item).toHaveAttribute("title", reason);
+      for (const id of ["upload", "upload-folder"]) {
+        const item = page.locator(`[data-new-action="${id}"]`);
+        await expect(item).toHaveAttribute("aria-disabled", "true");
+        await expect(item).toHaveAttribute("title", reason);
+      }
       await page.keyboard.press("Escape");
-      // The toolbar's menu: Upload folder disabled with its reason.
+      // The toolbar: the split button's main half, and both items of its menu.
+      await pressDisabled("[data-upload]");
       await page.locator("[data-upload-menu]").click();
-      const toolbarItem = page.locator('[data-upload-kind="folder"]');
-      await expect(toolbarItem).toHaveAttribute("aria-disabled", "true");
-      await expect(toolbarItem).toContainText(reason);
+      for (const kind of ["files", "folder"]) {
+        const item = page.locator(`[data-upload-kind="${kind}"]`);
+        await expect(item).toHaveAttribute("aria-disabled", "true");
+        await expect(item).toContainText(reason);
+      }
       await page.keyboard.press("Escape");
       // The folder's own menu, likewise.
       await page.locator("[data-explorer-list]").click({ button: "right", position: { x: 8, y: 8 } });
-      const contextItem = page.getByRole("menuitem", { name: /Upload folder/ });
-      await expect(contextItem).toHaveAttribute("aria-disabled", "true");
-      await expect(contextItem).toContainText(reason);
+      for (const name of [/Upload files/, /Upload folder/]) {
+        const item = page.getByRole("menuitem", { name });
+        await expect(item).toHaveAttribute("aria-disabled", "true");
+        await expect(item).toContainText(reason);
+      }
       await page.keyboard.press("Escape");
-      // The shortcut does nothing: no picker opens.
-      await page.keyboard.press(`${await modKey(page)}+Shift+U`);
+      // The shortcuts do nothing; the palette offers both disabled.
+      await page.keyboard.press(`${mod}+U`);
+      await page.keyboard.press(`${mod}+Shift+U`);
       await page.locator("[data-palette-button]").click();
       const palette = page.getByRole("dialog", { name: "Command palette" });
-      await palette.getByRole("combobox").fill("Upload folder");
-      await expect(palette.getByRole("option", { name: /Upload folder/ })).toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      await palette.getByRole("combobox").fill("Upload");
+      for (const name of [/Upload files/, /Upload folder/]) {
+        await expect(palette.getByRole("option", { name })).toHaveAttribute("aria-disabled", "true");
+      }
       expect(opened).toBe(false);
     });
   }

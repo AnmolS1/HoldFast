@@ -328,19 +328,22 @@ function Explorer({ folderId }: { folderId: string | null }) {
   }, []);
 
   const newFolder = useCallback(() => setDialog({ type: "new-folder", busy: false, error: null }), []);
-  const upload = useCallback(() => requestUpload({ parentId: folderId ?? undefined }), [folderId]);
-  // Upload folder follows the New menu's rules (F01): off while read-only or with uploads paused,
-  // and says why — a folder pick that would only be refused afterwards is never opened.
+  // Uploading follows the New menu's rules (F01): off while read-only or with uploads paused, and
+  // says why — a pick that would only be refused afterwards is never opened.
   const config = usePublicConfig().data;
-  const uploadFolderOff = config?.readOnly
+  const uploadOff = config?.readOnly
     ? shellT("header.readOnlyDisabled")
     : config && !config.uploadsEnabled
       ? shellT("header.uploadsDisabled")
       : undefined;
+  const upload = useCallback(() => {
+    if (uploadOff) return;
+    requestUpload({ parentId: folderId ?? undefined });
+  }, [folderId, uploadOff]);
   const uploadFolder = useCallback(() => {
-    if (uploadFolderOff) return;
+    if (uploadOff) return;
     requestUpload({ parentId: folderId ?? undefined, kind: "folder" });
-  }, [folderId, uploadFolderOff]);
+  }, [folderId, uploadOff]);
 
   const closeDialog = useCallback((focusId?: string | null) => {
     setDialog(null);
@@ -458,6 +461,8 @@ function Explorer({ folderId }: { folderId: string | null }) {
         label: t("explorer.action.upload"),
         icon: <Upload size={16} />,
         shortcut: "upload",
+        disabled: Boolean(uploadOff),
+        hint: uploadOff,
         run: upload,
       },
       {
@@ -465,12 +470,12 @@ function Explorer({ folderId }: { folderId: string | null }) {
         label: t("explorer.action.uploadFolder"),
         icon: <FolderUp size={16} />,
         shortcut: "uploadFolder",
-        disabled: Boolean(uploadFolderOff),
-        hint: uploadFolderOff,
+        disabled: Boolean(uploadOff),
+        hint: uploadOff,
         run: uploadFolder,
       },
     ];
-  }, [canAdd, newFolder, upload, uploadFolder, uploadFolderOff]);
+  }, [canAdd, newFolder, upload, uploadFolder, uploadOff]);
 
   // ---- focus that waits for the list ---------------------------------------------------------
 
@@ -796,15 +801,22 @@ function Explorer({ folderId }: { folderId: string | null }) {
         body={t("explorer.empty.first")}
         actions={
           <>
-            <Button variant="cta" onClick={upload} data-empty-upload>
-              {t("explorer.action.upload")}
-            </Button>
             {/* Unavailable but still focusable, with its reason (R1 a11y-1). */}
             <Button
+              variant="cta"
+              onClick={upload}
+              aria-disabled={uploadOff ? true : undefined}
+              className={uploadOff ? "Mui-disabled" : undefined}
+              title={uploadOff}
+              data-empty-upload
+            >
+              {t("explorer.action.upload")}
+            </Button>
+            <Button
               onClick={uploadFolder}
-              aria-disabled={uploadFolderOff ? true : undefined}
-              className={uploadFolderOff ? "Mui-disabled" : undefined}
-              title={uploadFolderOff}
+              aria-disabled={uploadOff ? true : undefined}
+              className={uploadOff ? "Mui-disabled" : undefined}
+              title={uploadOff}
               data-empty-upload-folder
             >
               {t("explorer.action.uploadFolder")}
@@ -905,7 +917,7 @@ function Explorer({ folderId }: { folderId: string | null }) {
             onNewFolder={newFolder}
             onUpload={upload}
             onUploadFolder={uploadFolder}
-            uploadFolderOff={uploadFolderOff}
+            uploadOff={uploadOff}
           />
         ) : null}
       </Box>
