@@ -195,7 +195,8 @@ describe("GET /api/public/config against the real settings table", () => {
       signupMode: workerEnv.SIGNUP_MODE === "open" ? "open" : "invite",
       termsVersion: workerEnv.TERMS_VERSION,
       uploadsEnabled: true,
-      linksEnabled: true,
+      // No row: public links are OFF (fails closed, R1 secsrv-n1).
+      linksEnabled: false,
       readOnly: false,
       turnstileSiteKey: workerEnv.TURNSTILE_SITEKEY,
       appOrigin: TEST_APP_ORIGIN,
@@ -219,7 +220,7 @@ describe("GET /api/public/config against the real settings table", () => {
       signupMode: flipped,
       termsVersion,
       uploadsEnabled: false,
-      linksEnabled: true,
+      linksEnabled: false,
       readOnly: false,
     });
 

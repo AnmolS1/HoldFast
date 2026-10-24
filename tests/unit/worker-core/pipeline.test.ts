@@ -814,6 +814,8 @@ describe("kill switches", () => {
 
   it("requireSwitch → 503 feature_disabled with the reason", async () => {
     const { fake, post } = setup();
+    // Public links are on only with a row saying so (no row fails closed, R1 secsrv-n1).
+    fake.state.settings = { ...fake.state.settings, linksEnabled: true };
     expect((await post("/api/_switch/uploads")).status).toBe(200);
     expect((await post("/api/_switch/links")).status).toBe(200);
     fake.state.settings = { uploadsEnabled: false, linksEnabled: false };
@@ -842,7 +844,8 @@ describe("GET /api/public/config", () => {
       appOrigin: TEST_APP_ORIGIN,
       filesOrigin: "http://files.localhost",
       uploadsEnabled: true,
-      linksEnabled: true,
+      // No row: public links are OFF (fails closed, R1 secsrv-n1).
+      linksEnabled: false,
       readOnly: false,
       // The closed-test notice is off unless the settings table says otherwise (DEMONOTICE).
       demoMode: false,
