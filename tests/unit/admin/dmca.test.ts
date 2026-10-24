@@ -14,6 +14,7 @@ import { CreateDmcaNoticeResponse, DmcaNoticeDto } from "../../../src/shared/sch
 import { LegalHoldError } from "../../../src/worker/db/errors";
 import { assertPurgeable } from "../../../src/worker/db/queries/trash";
 import { dmcaNoticeNodes, shares } from "../../../src/worker/db/schema";
+import { lockSuspectedCsam } from "../../../src/worker/services/scanning";
 import { mailTo } from "../auth/helpers";
 import { api as nodesApi } from "../nodes/helpers";
 import {
@@ -29,7 +30,9 @@ import {
   makeShare,
   member,
   nodeRowOf,
+  operators,
   rand,
+  serviceDeps,
   strikesOfUser,
   testDb,
   uploadAddress,
@@ -299,6 +302,32 @@ describe("who is told (safety-2, ruling Q2): the uploader gets the notice, the c
       expect(textOf(restored[0])).toContain(mine.name);
       expect(textOf(restored[0])).not.toContain(theirs.name);
     }
+  });
+
+  it("R2 mod-1: withdrawn after the takedown while the content is now listed csam (another account's copy locked) → the notice ends, but the file STAYS DOWN (audited keptListed)", async () => {
+    const who = await admin();
+    const owner = await member();
+    const sha = madeUpSha();
+    const file = await makeFile(owner.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
+    const made = await notice(who, [file.id]);
+    expect((await act(who, made.id, "takedown", { note: "Complete notice." })).status).toBe(200);
+    expect((await blocklistRow(sha))?.reason).toBe("dmca");
+    const other = await member();
+    const copy = await makeFile(other.id, null, { scanStatus: "clean", scannedAt: new Date(), sha256: sha });
+    const service = serviceDeps(operators().env);
+    await lockSuspectedCsam(service.deps, copy.id, { source: "admin", onlyVerifiedHash: true });
+    await service.settle();
+    expect((await blocklistRow(sha))?.reason).toBe("csam");
+
+    const answer = await act(who, made.id, "withdraw", { note: "Withdrawn by the complainant." });
+    expect(answer.status, answer.text).toBe(200);
+    expect(answer.body.status).toBe("withdrawn");
+    expect((await nodeRowOf(file.id))!.takedownAt).not.toBeNull();
+    expect((await nodesApi(owner.as, "GET", `/nodes/${file.id}`)).status).toBe(404);
+    expect((await blocklistRow(sha))?.reason).toBe("csam");
+    const [row] = await auditOf("admin.dmca_withdraw", made.id);
+    expect(row!.meta).toMatchObject({ keptListed: [file.id] });
+    expect(mailTo(owner.row.email, "contentRestored")).toEqual([]);
   });
 
   it("withdrawn after the takedown: the editor and the owner are each told it was restored, once", async () => {

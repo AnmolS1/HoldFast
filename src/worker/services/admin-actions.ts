@@ -1542,9 +1542,11 @@ async function restoreNotice(
     }
   }
   const moved = await retryOnDeadlock(db(c), async (tx) => {
+    // R2 mod-1: the notice's own nodes whose server hash is now listed csam/malware stay down.
+    const keptListed: string[] = [];
     if (mode === "withdraw") {
       // closeNotice takes every owner's tree lock itself, FIRST.
-      if (!(await closeNotice(tx, notice.id, "withdrawn"))) return false;
+      if (!(await closeNotice(tx, notice.id, "withdrawn"))) return null;
       await adminQ.updateNotice(tx, notice.id, { restoredAt: now(c), restoredBy: admin.id });
     } else {
       await adminQ.lockOwnerTrees(tx, await adminQ.noticeOwners(tx, notice.id));
@@ -1553,7 +1555,7 @@ async function restoreNotice(
         restoredAt: now(c),
         restoredBy: admin.id,
       });
-      if (!row) return false;
+      if (!row) return null;
     }
     // Only the nodes THIS notice took down (its recorded effect, SEAM took_down) are its to lift.
     const ours = new Set(notice.nodes.filter((n) => n.tookDown).map((n) => n.nodeId));
@@ -1566,6 +1568,14 @@ async function restoreNotice(
       if (await adminQ.otherActiveNoticeNames(tx, notice.id, { nodeId })) {
         // Kept down for the other notice: the takedown is handed to it, to lift when it ends.
         await adminQ.handOverTakedown(tx, notice.id, nodeId);
+        continue;
+      }
+      // Content a lock elsewhere has since listed as suspected CSAM (or that is listed malware) is
+      // never put back: the notice ends as asked, the file stays down — lock it (csam-procedure §3).
+      const verified = verifiedSha256(node);
+      const listing = verified ? (await blocklist.lookup(tx, verified))?.reason : undefined;
+      if (listing === "csam" || listing === "malware") {
+        keptListed.push(nodeId);
         continue;
       }
       await restoreTakedown(tx, nodeId);
@@ -1587,11 +1597,16 @@ async function restoreNotice(
         }
       }
     }
-    return true;
+    return { keptListed };
   });
   if (!moved) throw conflict("state", { status: notice.status });
   // Recorded now that it has committed — before the steps that follow, which may fail (m5).
-  audit(c, `admin.dmca_${mode}`, { type: "dmca_notice", id: notice.id }, { reason: note });
+  audit(
+    c,
+    `admin.dmca_${mode}`,
+    { type: "dmca_notice", id: notice.id },
+    { reason: note, ...(moved.keptListed.length > 0 ? { keptListed: moved.keptListed } : {}) },
+  );
   if (late) {
     const iso = (at: Date | null) => (at ? at.toISOString() : null);
     const window = notice.restoreNotBefore
@@ -1628,7 +1643,11 @@ async function restoreNotice(
     );
   }
   // The uploader the notice struck and each folder owner (ruling Q2, R2 mod-6), each once.
-  for (const { account, itemNames } of await noticeRecipients(c, notice, await strickenOf(c, notice))) {
+  // A file kept down for its listing (R2 mod-1) is not announced as restored.
+  const announced = { ...notice, nodes: notice.nodes.filter((n) => !moved.keptListed.includes(n.nodeId)) };
+  const recipients =
+    announced.nodes.length > 0 ? await noticeRecipients(c, announced, await strickenOf(c, notice)) : [];
+  for (const { account, itemNames } of recipients) {
     deps(c).defer(
       sendContentRestored(deps(c), {
         to: account.email,
