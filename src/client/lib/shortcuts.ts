@@ -2,6 +2,7 @@
 // shortcut) and by the `?` overlay.
 import { useEffect, useRef } from "react";
 import type { MessageKey } from "./i18n";
+import { getShortcutsOn } from "./prefs";
 
 export type ShortcutId =
   | "search"
@@ -137,6 +138,17 @@ function matches(combo: Combo, event: KeyLike, apple: boolean): boolean {
   return combo.key.length === 1 ? true : Boolean(combo.shift) === event.shiftKey;
 }
 
+/**
+ * A shortcut typed with a character key and no ⌘/Ctrl (`/`, `?`, Shift+N, Shift+R): the kind a
+ * speech-input user can set off by saying a word. They can be turned off in Preferences (WCAG
+ * 2.1.4, R1 a11y-6); list-only keys act only on the focused list, so they stay.
+ */
+export function isCharacterShortcut(def: ShortcutDef): boolean {
+  return (
+    !def.listOnly && def.combos.some((combo) => !combo.mod && combo.key.length === 1 && combo.key !== " ")
+  );
+}
+
 /** The shortcut an event stands for, or null. Pure. */
 export function matchShortcut(event: KeyLike, apple: boolean = isApplePlatform()): ShortcutId | null {
   for (const def of SHORTCUTS) {
@@ -161,6 +173,7 @@ export function useShortcut(id: ShortcutId, handler: (event: KeyboardEvent) => v
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing) return;
       if (!def.combos.some((combo) => matches(combo, event, isApplePlatform()))) return;
+      if (isCharacterShortcut(def) && !getShortcutsOn()) return;
       if (!def.global && isEditableTarget(event.target)) return;
       // A page's shortcut never acts through a modal dialog: with a Move / Rename / confirm
       // dialog open, Backspace or F2 would otherwise act on the selection underneath it.

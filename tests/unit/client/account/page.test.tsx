@@ -6,6 +6,8 @@ import { resetPrefsSync } from "../../../../src/client/features/account/prefs-sy
 import { getToasts } from "../../../../src/client/components/Toaster";
 import { IDENTITY_HEADER } from "../../../../src/client/lib/api";
 import { getPrefs } from "../../../../src/client/lib/prefs";
+import { queryClient } from "../../../../src/client/lib/query";
+import { accountKeys } from "../../../../src/client/features/account/api";
 import { buildRoutes } from "../../../../src/client/router";
 import { fileNode } from "../explorer/fixtures/nodes";
 import {
@@ -215,15 +217,20 @@ describe("profile", () => {
 });
 
 describe("security: password", () => {
-  it("a password change signs out every OTHER device unless the person unticks it", async () => {
+  it("a password change always signs out every OTHER device, says so, and the devices list is read again", async () => {
     const calls = api((call) =>
       call.path === "/api/auth/change-password" ? json({ token: null }) : undefined,
     );
+    // A devices list read before the change: it must not be kept as it was.
+    queryClient.setQueryData(accountKeys.sessions, []);
     renderRoutes(buildRoutes(), ["/account/security"]);
-    const box = (await screen.findByRole("checkbox", {
-      name: "Sign out of all other devices",
-    })) as HTMLInputElement;
-    expect(box.checked).toBe(true);
+    expect(
+      await screen.findByText(
+        "Changing your password signs you out on all your other devices. This one stays signed in.",
+      ),
+    ).toBeTruthy();
+    // R1 func-6: no checkbox that the server would ignore.
+    expect(screen.queryByRole("checkbox")).toBeNull();
     fireEvent.change(screen.getByLabelText("Current password"), { target: { value: "made-up old one 1" } });
     fireEvent.change(screen.getByLabelText("New password"), {
       target: { value: "made-up new passphrase 2" },
@@ -233,6 +240,7 @@ describe("security: password", () => {
     expect(calls.find((call) => call.path === "/api/auth/change-password")!.body).toMatchObject({
       revokeOtherSessions: true,
     });
+    await waitFor(() => expect(queryClient.getQueryState(accountKeys.sessions)?.isInvalidated).toBe(true));
   });
 });
 

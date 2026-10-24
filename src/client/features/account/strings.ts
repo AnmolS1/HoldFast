@@ -76,6 +76,10 @@ export const messages = {
   "prefs.view": "Default view",
   "prefs.view.list": "List",
   "prefs.view.grid": "Grid",
+  "prefs.keyboard": "Keyboard",
+  "prefs.shortcuts": "Single-key shortcuts",
+  "prefs.shortcuts.help":
+    "/ to search, ? for the list of shortcuts, Shift+N for a new folder, Shift+R to restore. Turn them off if you use speech input or they get in your way; shortcuts with Ctrl or ⌘ stay on.",
   "prefs.notifications": "Notifications",
   "prefs.emailShares": "Email me when something is shared with me",
   "prefs.emailSecurity": "Security alerts",
@@ -95,7 +99,8 @@ export const messages = {
   "password.strength.3": "Good",
   "password.strength.4": "Strong",
   "password.strength.label": "Strength: {strength}",
-  "password.revokeOthers": "Sign out of all other devices",
+  "password.revokeOthers":
+    "Changing your password signs you out on all your other devices. This one stays signed in.",
   "password.submit": "Change password",
   "password.changed": "Password changed.",
   "password.compromised": "That password has appeared in a data breach. Choose a different one.",
@@ -130,6 +135,8 @@ export const messages = {
   "twoFactor.off": "Off. Add a code from an authenticator app to every password sign-in.",
   "twoFactor.on": "On. Signing in with your password also asks for a code.",
   "twoFactor.enable": "Turn on",
+  "twoFactor.needsPassword":
+    "Two-factor authentication needs a password, and your account has none. To set one, sign out and use “Forgot password?” on the sign-in page; then turn it on here.",
   "twoFactor.enable.password": "Enter your password to set up two-factor authentication.",
   "twoFactor.setup.title": "Set up two-factor authentication",
   "twoFactor.setup.step1":
@@ -215,7 +222,7 @@ export const messages = {
   // ── data ──
   "data.export.title": "Export your data",
   "data.export.body":
-    "A file with your profile, settings, the list of your files and folders, your shares and links, and recent sign-in activity. It doesn't contain the files themselves, or any link addresses.",
+    "A file with your profile, settings, the list of your files and folders, your shares and links, your signed-in devices and passkeys, and recent sign-in activity. It doesn't contain the files themselves, or any link addresses.",
   "data.export.action": "Download export",
   "data.export.busy": "Preparing export…",
   "data.export.done": "Export downloaded.",
@@ -233,11 +240,11 @@ export const messages = {
     "This zip holds the first {count} files of your account, not all of them. Download the rest folder by folder from Files.",
   "data.delete.title": "Delete account",
   "data.delete.body":
-    "Your account and all your files are deleted 7 days after you confirm. Until then your links are paused and files shared with others stop working, and you can cancel at any time from this page or the banner.",
+    "Your account and all your files are deleted 7 days after you confirm. Until then your links are paused and files shared with others stop working, and you can cancel at any time from this page or the banner. If a file of yours is under review after an abuse report or a copyright notice, or under a legal hold, the deletion waits until that ends.",
   "data.delete.action": "Delete account",
   "data.delete.confirm.title": "Delete your account?",
   "data.delete.confirm.body":
-    "We'll email you a link to confirm. Open it in this browser, where you're signed in — it works once. After you confirm, everything is deleted in 7 days unless you cancel.",
+    "We'll email you a link to confirm. Open it in this browser, where you're signed in — it works once. After you confirm, everything is deleted in 7 days unless you cancel — later only while a file of yours is under review or on hold.",
   "data.delete.confirm.action": "Email me the link",
   "data.delete.sent":
     "Check your email. Open the link in this browser, where you're signed in, to schedule the deletion.",
