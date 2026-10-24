@@ -19,6 +19,7 @@ import { onNodesChanged } from "../../../../src/client/lib/contracts";
 import { renderShell, setupShell } from "../shell/helpers";
 import { nodeDto, rowId } from "./fixtures";
 import {
+  apiError,
   bigFile,
   envelope,
   FAKED_TIMERS,
@@ -204,5 +205,17 @@ describe("the server says the session is gone", () => {
     expect(server.puts.length).toBe(2);
     expect(server.completes.length).toBe(2);
     expect(items()).toEqual([]);
+  });
+
+  it("409 on a PART (a replace the file's owner superseded, R1D rds-1): one error row with Retry at once — no retry loop, no complete", async () => {
+    server.partBytes = 100;
+    server.onPut = (_call, nth) => (nth === 1 ? apiError(409, "conflict") : undefined);
+    await addFiles([{ file: bigFile("video.mp4", 250) }], null);
+    await settle(0);
+    await settle(60_000);
+    // The three parts went out together; none is sent again after the 409.
+    expect(server.puts.length).toBeLessThanOrEqual(3);
+    expect(server.completes.length).toBe(0);
+    expect(items()[0]).toMatchObject({ state: "error", uploadId: null, canRetry: true });
   });
 });
