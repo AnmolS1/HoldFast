@@ -480,10 +480,11 @@ export async function lockActiveAdmins(tx: Executor, at: Date): Promise<string[]
 
 /**
  * The mark of a deletion an ADMIN scheduled (R1 secsrv-1, ruling Q6): a `verification` row
- * `admin-deletion:<user id>`, as `admin-bootstrap:` is the bootstrap list's. The identifier ends
- * with the user id, so every path that removes an account's verification rows (`tokensOf`: the
- * purge's `purgeAuthRows`, the unproven-address reset) removes it too; the value is NOT a user
- * id, so no other account's cleanup can. Written and read under the user's row lock.
+ * `admin-deletion:<user id>`, as `admin-bootstrap:` is the bootstrap list's. Removed ONLY by an
+ * admin's cancel (`clearAdminDeletion`) and the purge (`purgeAuthRows`): `tokensOf` leaves it out,
+ * so the unproven-address resets — which a stranger's or the prover's sign-in can trigger — do
+ * not lift the order; the value is NOT a user id, so no other account's cleanup can either.
+ * Written and read under the user's row lock.
  */
 const adminDeletionMarker = (userId: string) => `admin-deletion:${userId}`;
 
@@ -640,12 +641,19 @@ export async function takePendingChange(
  *     `{"type":"registration","userData":{"id":…}}`, @better-auth/passkey/dist/index.mjs:192);
  *   - the IDENTIFIER ends with the user id (`totp-step:<id>`, the newest TOTP step it used).
  * A user id is 32 URL-safe characters, so it cannot contain a LIKE wildcard.
+ *
+ * EXCEPT the mark of an admin-ordered deletion (`admin-deletion:<id>`): it is not a token the
+ * account could use but the operator's order about it, so an account reset (the unproven-address
+ * cleanups below) keeps it — only an admin's cancel and the purge (`purgeAuthRows`) remove it.
  */
 function tokensOf(userId: string) {
-  return or(
-    eq(verification.value, userId),
-    and(like(verification.value, "{%"), like(verification.value, `%"${userId}"%`)),
-    like(verification.identifier, `%:${userId}`),
+  return and(
+    or(
+      eq(verification.value, userId),
+      and(like(verification.value, "{%"), like(verification.value, `%"${userId}"%`)),
+      like(verification.identifier, `%:${userId}`),
+    ),
+    ne(verification.identifier, adminDeletionMarker(userId)),
   );
 }
 
@@ -1247,6 +1255,8 @@ export async function purgeAuthRows(db: Executor, userId: string): Promise<boole
     await tx.delete(twoFactor).where(eq(twoFactor.userId, userId));
     // Reset, delete-account, two-factor and trusted-device tokens carry the user id as value.
     await tx.delete(verification).where(tokensOf(userId));
+    // … and the operator's order, which `tokensOf` keeps: the account it was about is gone.
+    await clearAdminDeletion(tx, userId);
     const removed = await tx.delete(user).where(eq(user.id, userId)).returning({ id: user.id });
     return removed.length > 0;
   });

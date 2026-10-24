@@ -11,6 +11,11 @@ import { describe, expect, it } from "vitest";
 import { pendingUserPurges, verification } from "../../../src/worker/db/schema";
 import { purgeAuthRows, revokeAllAccess, scheduleDeletion } from "../../../src/worker/services/account-state";
 import { endStandingProofs } from "../../../src/worker/auth/second-factor";
+import {
+  clearForMailboxProof,
+  clearUnprovenAccount,
+  sweepAfterLink,
+} from "../../../src/worker/db/queries/auth-lifecycle";
 import { admin, adminCall, call, member, serviceDeps, testDb, userRowOf } from "../admin/helpers";
 
 const pendingRow = async (userId: string) =>
@@ -110,6 +115,43 @@ describe("a deletion an admin scheduled", () => {
     expect(await markers(holder.id)).toHaveLength(1);
     expect((await ownCancel(holder)).status).toBe(409);
   });
+
+  // The three resets of an UNVERIFIED account whose address is then proven (a Google sign-up
+  // with the intent: clearUnprovenAccount, then sweepAfterLink; a mailbox proof:
+  // clearForMailboxProof) empty every token of the account — not the mark (security review of
+  // d4b40a3): an admin who ordered the deletion of an unverified account keeps it ordered.
+  const statement = {
+    termsAcceptedAt: new Date(),
+    termsVersion: "2026-10",
+    demoNoticeAcceptedAt: null,
+    demoNoticeVersion: null,
+    ageVerifiedAt: new Date(),
+  };
+  for (const [name, reset] of [
+    [
+      "clearUnprovenAccount",
+      (id: string) =>
+        clearUnprovenAccount(testDb(), id, { ...statement, invitedBy: null, quotaBytes: 1, name: "x" }),
+    ],
+    [
+      "clearForMailboxProof",
+      async (id: string, email: string) => clearForMailboxProof(testDb(), id, email, statement),
+    ],
+    ["sweepAfterLink", (id: string) => sweepAfterLink(testDb(), id)],
+  ] as const) {
+    it(`an unverified account's ${name} leaves the mark: the holder's cancel is still 409`, async () => {
+      const operator = await admin();
+      const holder = await member({ emailVerified: false });
+      expect((await consoleDelete(operator, holder.id)).status).toBe(200);
+      const done = await reset(holder.id, holder.row.email);
+      expect(done).not.toBeNull();
+      expect(await markers(holder.id)).toHaveLength(1);
+      const refused = await ownCancel(holder);
+      expect(refused.status, refused.text).toBe(409);
+      expect(refused.body).toMatchObject({ error: "deletion_admin_scheduled" });
+      expect((await userRowOf(holder.id))!.deleteScheduledAt).not.toBeNull();
+    });
+  }
 
   it("the console's Delete on a deletion the holder already asked for makes it the admin's: same date, changed false, the holder can no longer cancel", async () => {
     const operator = await admin();
