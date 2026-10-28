@@ -80,7 +80,7 @@ RUN test -z "$(gofmt -l .)" \
  && go test -count=1 ./... \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/hf-scanner .
 
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS fixtures
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS fixtures
 RUN apk add --no-cache zip
 COPY test/make-fixtures.sh test/holdfast-test.ndb /build/
 RUN /build/make-fixtures.sh /fixtures /build/holdfast-test.ndb
