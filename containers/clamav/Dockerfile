@@ -80,13 +80,13 @@ RUN test -z "$(gofmt -l .)" \
  && go test -count=1 ./... \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/hf-scanner .
 
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS fixtures
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS fixtures
 RUN apk add --no-cache zip
 COPY test/make-fixtures.sh test/holdfast-test.ndb /build/
 RUN /build/make-fixtures.sh /fixtures /build/holdfast-test.ndb
 
 # A literal FROM (not an ARG) so a digest-bump bot can update it; fetch-cvd.sh reads this line.
-FROM clamav/clamav:stable_base@sha256:751df8dc649cc977696f107c80db4960b6317a7cb511aebc8066f3b91db6b631 AS runtime
+FROM clamav/clamav:stable_base@sha256:64ca916618842ba469ef38a501e6c2f42a68281c064c03749b0126c0fb085ce5 AS runtime
 ENV TZ=Etc/UTC \
     SIG_FRESH_HOURS=24
 COPY clamd.conf freshclam.conf /etc/clamav/
