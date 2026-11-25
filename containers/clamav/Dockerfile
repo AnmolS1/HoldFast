@@ -70,7 +70,7 @@
 # Integration run (containers enabled in a local `wrangler dev`, the only place they are):
 #   containers/clamav/test/integration.sh      (exits non-zero when Docker or containers are unavailable)
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS shim
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS shim
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -80,7 +80,7 @@ RUN test -z "$(gofmt -l .)" \
  && go test -count=1 ./... \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/hf-scanner .
 
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS fixtures
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS fixtures
 RUN apk add --no-cache zip
 COPY test/make-fixtures.sh test/holdfast-test.ndb /build/
 RUN /build/make-fixtures.sh /fixtures /build/holdfast-test.ndb
